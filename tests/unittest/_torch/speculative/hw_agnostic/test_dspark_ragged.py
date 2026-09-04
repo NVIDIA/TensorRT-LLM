@@ -21,12 +21,10 @@ from tensorrt_llm._torch.speculative.dspark_ragged import (
     RaggedVerifyLayout,
     build_qo_indptr,
     build_row_maps_device,
-    choose_ragged_capture_shape,
     count_accepted_ragged,
     fill_bucket_device,
     fill_padded_rows_onehot,
     resolve_ragged_pad_split,
-    round_up_to_bucket,
     row_ids_from_lens,
     scatter_ragged_to_padded,
 )
@@ -34,10 +32,11 @@ from tensorrt_llm._torch.speculative.dspark_ragged import (
 BLOCK = 7
 
 
-def _layout(lens, bucket=None, buckets=None):
+def _layout(lens, bucket=None):
     t = torch.tensor(lens, dtype=torch.int32)
+    bucket = sum(lens) if bucket is None else bucket
     return RaggedVerifyLayout.from_verify_lens(
-        t, graph_num_tokens=bucket, buckets=buckets, total_verify_tokens=sum(lens)
+        t, graph_num_tokens=bucket, total_verify_tokens=sum(lens)
     )
 
 
@@ -60,39 +59,6 @@ def test_qo_indptr_is_the_exclusive_prefix_sum(lens, expected):
 def test_build_qo_indptr_rejects_2d():
     with pytest.raises(ValueError, match="1-D"):
         build_qo_indptr(torch.ones(2, 3, dtype=torch.int32))
-
-
-# --------------------------------------------------------------------------
-# bucket selection
-# --------------------------------------------------------------------------
-
-
-def test_round_up_picks_the_smallest_fitting_bucket():
-    b = [8, 16, 32, 64]
-    assert round_up_to_bucket(1, b) == 8
-    assert round_up_to_bucket(8, b) == 8
-    assert round_up_to_bucket(9, b) == 16
-    assert round_up_to_bucket(64, b) == 64
-
-
-def test_round_up_raises_past_the_largest_bucket():
-    """Clamping would silently drop the step out of graph replay into eager."""
-    with pytest.raises(ValueError, match="exceeds the largest captured bucket"):
-        round_up_to_bucket(65, [8, 16, 32, 64])
-
-
-def test_layout_derives_the_bucket_from_the_host_total():
-    lay = RaggedVerifyLayout.from_verify_lens(
-        torch.tensor([3, 1, 4], dtype=torch.int32), buckets=[8, 16, 32], total_verify_tokens=8
-    )
-    assert lay.graph_num_tokens == 8
-    # extend_start_loc is the offset form some attention backends want directly.
-    assert torch.equal(lay.extend_start_loc, lay.qo_indptr[:-1])
-
-
-def test_layout_refuses_to_sync_for_the_total():
-    with pytest.raises(ValueError, match="would sync"):
-        RaggedVerifyLayout.from_verify_lens(torch.tensor([3, 1], dtype=torch.int32))
 
 
 # --------------------------------------------------------------------------
@@ -281,150 +247,6 @@ def test_accept_count_rejects_mismatched_shapes():
 
 
 # ---------------------------------------------------------------------------
-# choose_ragged_capture_shape
-# ---------------------------------------------------------------------------
-
-BS_BUCKETS = [1, 2, 4, 8, 16]
-TOK_BUCKETS = [8, 16, 32, 64, 128]
-
-
-def _shape(num_real, total, peers=None):
-    return choose_ragged_capture_shape(
-        num_real_requests=num_real,
-        total_verify_tokens=total,
-        bs_buckets=BS_BUCKETS,
-        token_buckets=TOK_BUCKETS,
-        peer_stats=peers,
-    )
-
-
-@pytest.mark.parametrize(
-    "num_real, total, want_bs, want_bucket",
-    [
-        # 5 -> 8 rows; slack = 20 - 5 = 15; needed = 8 + 15 = 23 -> 32.
-        (5, 20, 8, 32),
-        # exact captured values are not rounded further: 8 requests with
-        # slack 8 -> needed 16, both axes already captured.
-        (8, 16, 8, 16),
-    ],
-)
-def test_shape_rounds_both_axes_up_to_captured_values(num_real, total, want_bs, want_bucket):
-    got = _shape(num_real=num_real, total=total)
-    assert got.padded_bs == want_bs
-    assert got.bucket == want_bucket
-
-
-def test_every_rank_computes_the_same_shape():
-    # The ADP invariant: ranks with different batches must agree. Each rank
-    # passes the same peer list and must get an identical answer.
-    peers = [(3, 9), (6, 30), (5, 11)]
-    shapes = {_shape(num_real=real, total=total, peers=peers) for real, total in peers}
-    assert len(shapes) == 1
-
-
-@pytest.mark.parametrize(
-    "num_real, total, peers, want_bs, want_bucket",
-    [
-        # This rank is small (3 requests, 9 tokens) but must size for the
-        # widest peer: rows from max real (6 -> 8), slack from the max
-        # (30 - 6 = 24) -> 8 + 24 = 32, exactly a captured bucket.
-        (3, 9, [(3, 9), (6, 30), (5, 11)], 8, 32),
-        # The widest axes can come from different ranks: rank A has the most
-        # rows (7 -> 8), rank B the most slack (18) -> 8 + 18 = 26 -> 32.
-        (7, 8, [(7, 8), (2, 20)], 8, 32),
-    ],
-)
-def test_shape_is_driven_by_the_widest_rank_not_the_local_one(
-    num_real, total, peers, want_bs, want_bucket
-):
-    got = _shape(num_real=num_real, total=total, peers=peers)
-    assert got.padded_bs == want_bs
-    assert got.bucket == want_bucket
-
-
-@pytest.mark.parametrize(
-    "num_real, total, match",
-    [
-        (17, 17, "exceed the largest captured batch"),  # rows overflow
-        (16, 1000, "exceeds the largest captured bucket"),  # tokens overflow
-        (5, 4, "cannot be below"),  # fewer tokens than requests
-    ],
-)
-def test_shape_raises_when_the_batch_exceeds_captured_rows(num_real, total, match):
-    with pytest.raises(ValueError, match=match):
-        _shape(num_real=num_real, total=total)
-
-
-def test_shape_requires_bs_buckets():
-    with pytest.raises(ValueError, match="requires bs_buckets"):
-        choose_ragged_capture_shape(
-            num_real_requests=1, total_verify_tokens=1, bs_buckets=[], token_buckets=TOK_BUCKETS
-        )
-
-
-# ---------------------------------------------------------------------------
-# group-consistent bucket choice (max_verify_len given): pad rows share one
-# window, so decomposability is a divisibility question every rank must answer
-# identically -- a lone decline used to take the whole ADP group eager.
-# ---------------------------------------------------------------------------
-
-MAXLEN_BUCKETS = [16, 24, 32, 40, 48]  # padded_bs 8, tiers 1..5 -> 8*(t+1)
-
-
-def _shape6(num_real, total, peers):
-    return choose_ragged_capture_shape(
-        num_real_requests=num_real,
-        total_verify_tokens=total,
-        bs_buckets=BS_BUCKETS,
-        token_buckets=MAXLEN_BUCKETS,
-        peer_stats=peers,
-        max_verify_len=6,
-    )
-
-
-def test_pinned_ranks_agree_on_a_bucket_every_rank_can_decompose():
-    """Full-block-pinned ranks must land together on a bucket every rank can
-    decompose (48 here), not split the group at the first fitting bucket (40)."""
-    peers = [(5, 30), (4, 24)]
-    shapes = {_shape6(num_real=r, total=t, peers=peers) for r, t in peers}
-    assert len(shapes) == 1
-    assert shapes.pop().bucket == 48
-
-
-def test_slacky_batch_keeps_the_smallest_bucket():
-    """Feasibility filtering must not grow the bucket when real rows have slack
-    to absorb the remainder -- the trimmed batch keeps the ungated answer."""
-    peers = [(3, 9), (6, 30), (5, 11)]
-    got = _shape6(num_real=3, total=9, peers=peers)
-    ungated = choose_ragged_capture_shape(
-        num_real_requests=3,
-        total_verify_tokens=9,
-        bs_buckets=BS_BUCKETS,
-        token_buckets=MAXLEN_BUCKETS,
-        peer_stats=peers,
-    )
-    assert got.bucket == ungated.bucket == 32
-    assert got.padded_bs == ungated.padded_bs == 8
-
-
-def test_group_declines_together_when_nothing_decomposes():
-    """When no captured bucket works for every rank, every rank must see the
-    same ValueError -- a group-consistent decline replays the uniform graph."""
-    truncated = [16, 24, 32, 40]  # top tier 48 not captured
-    peers = [(5, 30), (4, 24)]  # pinned: 40 fails (5,30), 32 fails it too
-    for r, t in peers:
-        with pytest.raises(ValueError, match="decomposable by every rank"):
-            choose_ragged_capture_shape(
-                num_real_requests=r,
-                total_verify_tokens=t,
-                bs_buckets=BS_BUCKETS,
-                token_buckets=truncated,
-                peer_stats=peers,
-                max_verify_len=6,
-            )
-
-
-# ---------------------------------------------------------------------------
 # fill_padded_rows_onehot
 # ---------------------------------------------------------------------------
 
@@ -539,14 +361,6 @@ def test_pad_length_never_yields_an_infeasible_real_target():
     # Declining is safe (the step stays uniform) but should stay rare, or the
     # bucket grid is too coarse to be worth capturing.
     assert declined / checked < 0.15, f"{declined}/{checked} shapes have no valid split"
-
-
-def test_extra_peer_stat_fields_are_ignored_here():
-    """peer_stats may grow extra elements consumed by the caller; a rigid
-    two-element unpack here would raise on the first ragged step."""
-    two = _shape(num_real=3, total=12, peers=[[3, 12], [4, 16]])
-    three = _shape(num_real=3, total=12, peers=[[3, 12, 1], [4, 16, 1]])
-    assert (three.padded_bs, three.bucket) == (two.padded_bs, two.bucket)
 
 
 # ---------------------------------------------------------------------------
