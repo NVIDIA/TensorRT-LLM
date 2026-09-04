@@ -1791,12 +1791,32 @@ def _stages(NDENSE, NLOC, SCAP, RBT):
     return int(s)
 
 
-@torch.no_grad()
-def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indices, values):
-    B, MAXB = block_table.shape
+_cfg = {}
+_ptrs = {}
+
+
+def _ptr(t, dtype):
+    # pointer objects are cached per (address, dtype): decode steps reuse the same buffers
+    k = (t.data_ptr(), dtype)
+    p = _ptrs.get(k)
+    if p is None:
+        if len(_ptrs) > 4096:
+            _ptrs.clear()
+        p = make_ptr(dtype, t.data_ptr(), GMEM, assumed_align=16)
+        _ptrs[k] = p
+    return p
+
+
+def _raw_stream(device):
+    try:
+        return torch._C._cuda_getCurrentRawStream(device.index)
+    except Exception:
+        return torch.cuda.current_stream(device).cuda_stream
+
+
+def _config(B, MAXB, NPAGES, KTOP):
+    """Launch configuration for a shape; environment knobs are read on first use."""
     NCOMP = MAXB * 32
-    NPAGES = kv_cache.numel() // PGB
-    KTOP = indices.shape[1]
     # split one row across a cluster of CTAs when the batch cannot fill the GPU;
     # scores stay in each CTA's SMEM and the top-K is reduced through DSMEM.
     assert NCOMP % TOK == 0, f"block_table width {NCOMP} must be a multiple of {TOK}"
@@ -1828,9 +1848,7 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     )
     # dense prefix of NDENSE tiles; longer CTAs filter the rest by the safe
     # line into a compact survivor buffer that can never overflow:
-    # SCAP >= KTOP + CHUNK*TOK (one chunk of appends after a shrink to <= KTOP)
-    # rows that fit stay dense; longer rows keep a 128-tile dense prefix so the
-    # pipeline keeps 16 stages next to the survivor buffer
+    # SCAP >= KTOP + TIECAP + CHUNK*TOK (one chunk of appends after a shrink)
     ndense_max = int(os.environ.get("TRTLLM_FUSED_TOPK_NDENSE", NDENSE_MAX))
     NDENSE = NLOC if NLOC <= ndense_max else min(ndense_max, 128)
     SCAP = 0
@@ -1844,19 +1862,42 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
         "tie lists reuse the histogram and candidate buffers"
     )
     key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP)
-    kv_ptr = make_ptr(U8, kv_cache.data_ptr(), GMEM, assumed_align=16)
-    q_ptr = make_ptr(U8, q_fp4.data_ptr(), GMEM, assumed_align=16)
-    sfq_ptr = make_ptr(U32, sf_q.data_ptr(), GMEM, assumed_align=16)
-    w_ptr = make_ptr(F32, weights.data_ptr(), GMEM, assumed_align=16)
-    clen_ptr = make_ptr(I32, context_lens.data_ptr(), GMEM, assumed_align=16)
-    bt_ptr = make_ptr(I32, block_table.data_ptr(), GMEM, assumed_align=16)
-    oi_ptr = make_ptr(I32, indices.data_ptr(), GMEM, assumed_align=16)
-    ov_ptr = make_ptr(F32, values.data_ptr(), GMEM, assumed_align=16)
+    return key, NREP, nsm
+
+
+@torch.no_grad()
+def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indices, values):
+    B, MAXB = block_table.shape
+    NPAGES = kv_cache.numel() // PGB
+    KTOP = indices.shape[1]
+    ck = (
+        B,
+        MAXB,
+        NPAGES,
+        KTOP,
+        os.environ.get("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "auto"),
+        os.environ.get("TRTLLM_FUSED_TOPK_NDENSE", ""),
+        os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "1"),
+    )
+    cfg = _cfg.get(ck)
+    if cfg is None:
+        cfg = _config(B, MAXB, NPAGES, KTOP)
+        _cfg[ck] = cfg
+    key, NREP, nsm = cfg
+    kv_ptr = _ptr(kv_cache, U8)
+    q_ptr = _ptr(q_fp4, U8)
+    sfq_ptr = _ptr(sf_q, U32)
+    w_ptr = _ptr(weights, F32)
+    clen_ptr = _ptr(context_lens, I32)
+    bt_ptr = _ptr(block_table, I32)
+    oi_ptr = _ptr(indices, I32)
+    ov_ptr = _ptr(values, F32)
     ws = _workspace(indices.device, NREP, nsm, key)
-    ws_ptr = make_ptr(I32, ws.data_ptr(), GMEM, assumed_align=16)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    ws_ptr = _ptr(ws, I32)
+    stream = cuda.CUstream(_raw_stream(indices.device))
     fn = _cache.get(key)
     if fn is None:
+        (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP) = key
         fn = cute.compile(
             _launch,
             kv_ptr,
