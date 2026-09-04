@@ -536,16 +536,13 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
         return "ok"
 
     monkeypatch.setattr(TrtllmAttention, "forward", fake_forward)
-    monkeypatch.setattr(
-        DeepseekV4TrtllmAttention,
-        "_prepare_sparse_forward_args",
-        lambda self, metadata, forward_args: None,
-    )
     attn = object.__new__(DeepseekV4TrtllmAttention)
+    attn.compress_ratio = 2
+    attn.sparse_attention_config = SimpleNamespace(window_size=64)
     sink = torch.ones(4, dtype=torch.float32)
     attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
 
-    metadata = object()
+    metadata = SimpleNamespace(max_compressed_indices={2: 32})
     assert DeepseekV4TrtllmAttention.forward(attn, "q", None, None, metadata) == "ok"
     assert "attention_sinks" not in captured
     assert captured["forward_args"].attention_sinks.data_ptr() == sink.data_ptr()

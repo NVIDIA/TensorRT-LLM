@@ -86,6 +86,8 @@ def run_flashinfer_sparse_mla(
     positions = metadata.token_positions_cuda[start_idx:end_idx]
 
     sparse_runtime_params = forward_args.sparse_runtime_params
+    if sparse_runtime_params is None:
+        raise RuntimeError("Sparse attention prediction must be prepared before FMHA dispatch")
     swa_indices = sparse_runtime_params.sparse_attn_indices
     extra_indices = sparse_runtime_params.sparse_attn_offsets
     if swa_indices is None:

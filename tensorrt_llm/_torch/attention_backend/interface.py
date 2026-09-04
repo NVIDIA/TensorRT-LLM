@@ -965,8 +965,7 @@ class AttentionForwardArgs:
     timestep: Optional[torch.Tensor] = None
 
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
-    sparse_runtime_params: SparseRuntimeParams = field(
-        default_factory=SparseRuntimeParams)
+    sparse_runtime_params: Optional[SparseRuntimeParams] = None
 
     @property
     def mask_type(self) -> int:

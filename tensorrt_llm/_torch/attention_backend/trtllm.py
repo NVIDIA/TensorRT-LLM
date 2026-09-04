@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -47,9 +47,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
-from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.params import SparseParams
-from .sparse.skip_softmax import SkipSoftmaxParams
+from .sparse.hooks import prepare_sparse_attention_prediction
+from .sparse.params import SparseParams, SparseRuntimeParams
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
@@ -1961,8 +1960,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     seq_start=num_ctx,
                 )
 
-        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
-            self, q, k, metadata, forward_args)
+        sparse_runtime_params = prepare_sparse_attention_prediction(
+            self, q, k, v, metadata, forward_args)
+        forward_args = replace(
+            forward_args,
+            sparse_runtime_params=sparse_runtime_params,
+        )
+        has_block_sparse_inputs = sparse_runtime_params.block_sparse_inputs is not None
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata
@@ -2016,10 +2020,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
             if k is not None and not metadata.is_cross:
-                assert k.shape[0] == num_tokens
-                assert v.shape[0] == num_tokens
+                if has_block_sparse_inputs:
+                    assert v is not None and v.shape[0] == k.shape[0]
+                else:
+                    assert k.shape[0] == num_tokens
+                    assert v.shape[0] == num_tokens
         else:
-            sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
+            sparse_attn_indices = sparse_runtime_params.sparse_attn_indices
             is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
@@ -2091,14 +2098,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
-
-        sparse_params = self.sparse_params
-        if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.sparse_runtime_params = (
-                sparse_params.scheduler.get_runtime_params(
-                    runtime_params=forward_args.sparse_runtime_params,
-                    timestep=forward_args.timestep,
-                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
@@ -2318,6 +2317,33 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Predict sparse KV indices when required by an algorithm."""
         return None, None
+
+    def predict_sparse_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> SparseRuntimeParams:
+        """Predict all sparse inputs for one attention call."""
+        del v
+        if self.sparse_params is None:
+            return SparseRuntimeParams()
+
+        kv_indices, kv_offsets = self.sparse_kv_predict(q, k, metadata,
+                                                        forward_args)
+        attn_indices, attn_offsets = self.sparse_attn_predict(
+            q, k, metadata, forward_args)
+        block_size = (self.sparse_params.indices_block_size if attn_indices
+                      is not None or attn_offsets is not None else 0)
+        return SparseRuntimeParams(
+            sparse_kv_indices=kv_indices,
+            sparse_kv_offsets=kv_offsets,
+            sparse_attn_indices=attn_indices,
+            sparse_attn_offsets=attn_offsets,
+            sparse_attn_indices_block_size=block_size,
+        )
 
     def sparse_attn_predict(
         self,

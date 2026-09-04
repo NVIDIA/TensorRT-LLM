@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from typing import Optional, Tuple
 
 import torch
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..params import SparseRuntimeParams
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -152,6 +154,33 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
+    def predict_sparse_attention(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: DSAtrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> SparseRuntimeParams:
+        """Predict DSA indices and attach the active NVFP4 scratch buffer."""
+        prediction = super().predict_sparse_attention(q, k, v, metadata, forward_args)
+        kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
+        if kv_cache_dtype != tensorrt_llm.bindings.DataType.NVFP4:
+            return prediction
+
+        is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
+        scratch = (
+            metadata.nvfp4_mla_fp8_scratch
+            if is_generation
+            else metadata.nvfp4_mla_context_fp8_scratch
+        )
+        if scratch is None:
+            raise RuntimeError("NVFP4 MLA scratch buffer was not allocated")
+        return replace(
+            prediction,
+            aux_kv_cache_pool_ptr=scratch.data_ptr(),
+        )
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -230,7 +259,6 @@ class DSATrtllmAttention(TrtllmAttention):
                 metadata._cached_num_pool_tokens,
             )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
-            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
         topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
@@ -261,7 +289,6 @@ class DSATrtllmAttention(TrtllmAttention):
             )
             # Static sparse MLA treats indices as offsets from kvPtr. Feed it
             # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
-            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
         return topk_indices_global, None

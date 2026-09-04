@@ -19,6 +19,8 @@ from typing import Optional
 
 import torch
 
+from ..block_sparse import BlockSparseForwardInputs
+
 
 class SparseParams:
     """Base parameters for a sparse attention backend."""
@@ -40,7 +42,7 @@ class SparseBackendForwardArgs:
 
 @dataclass(kw_only=True, slots=True)
 class SparseRuntimeParams:
-    """Flat optional sparse inputs passed from a backend to ``AttentionOp``."""
+    """Complete per-attention sparse runtime state consumed by FMHA/``AttentionOp``."""
 
     # Sparse index inputs shared by multiple algorithms.
     sparse_kv_indices: Optional[torch.Tensor] = None
@@ -57,3 +59,12 @@ class SparseRuntimeParams:
     threshold_scale_factor_prefill: float = 0.0
     # SkipSoftmax decode threshold; diffusion models leave it at zero.
     threshold_scale_factor_decode: float = 0.0
+    block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
+
+
+__all__ = [
+    "SparseBackendForwardArgs",
+    "SparseMetadataParams",
+    "SparseParams",
+    "SparseRuntimeParams",
+]

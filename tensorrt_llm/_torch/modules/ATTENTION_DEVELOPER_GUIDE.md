@@ -147,8 +147,10 @@ pass it through the registered `AttentionForwardArgs.sparse_backend_args`
 field. For example, DSA owns `DSABackendForwardArgs`, whose indexer
 intermediates are consumed by `DSATrtllmAttention.sparse_attn_predict`.
 Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices` and
-the backend-to-AttentionOp `SparseRuntimeParams`, live in
-`attention_backend/sparse/params.py`.
+the backend-to-FMHA/`AttentionOp` `SparseRuntimeParams`, live in
+`attention_backend/sparse/params.py`. The latter is carried by
+`AttentionForwardArgs.sparse_runtime_params` and nests optional general
+block-sparse inputs in `SparseRuntimeParams.block_sparse_inputs`.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
@@ -187,6 +189,27 @@ same user-facing config.
 
 Sparse registrations are defined in `attention_backend/sparse/registry.py`. Check
 that file for the current supported combinations, as they may change over time.
+
+Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
+Algorithms lower their live routing state to an algorithm-neutral
+`BlockSparseForwardInputs`, nested at
+`SparseRuntimeParams.block_sparse_inputs`: block geometry plus either canonical
+BSR routes or an exact packed bitmask. Optional K/V summaries enable proxy
+routes, and optional token-validity bits mask ragged KV tails. Plans contain
+only static format, proxy, geometry, and capacity choices; every run receives
+the live routes, summaries, validity bits, page tables, and sequence lengths.
+
+`PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
+whose attention layers execute serially may explicitly bind a model-scoped
+cache to reuse graph-stable route workspaces across compatible layers. The
+cache must not be shared by concurrent forwards; each independent model
+component must own separate state.
+
+The core library owns this general planning, validation, and execution
+contract. Algorithm integrations own the surrounding lifecycle: prediction and
+effective Q/K/V preparation before the core forward, plus any algorithm-specific
+post-processing afterward. They pass precomputed `SparseRuntimeParams` into the
+core instead of adding algorithm-specific FMHA libraries.
 
 ### 2.3 Backend contract
 
@@ -305,30 +328,34 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 Each `TrtllmAttention` owns a per-instance `FmhaManager`. The manager builds
-the ordered list of internal FMHA libraries, performs phase-aware selection,
-and caches request-dependent selections. `update_quant_config()` replaces the
-manager, rebuilding the library list and starting with an empty selection
-cache. `TrtllmAttention` prepares the complete per-forward state, passes itself
-to the manager for selection, and then executes the selected library.
+the ordered list of internal FMHA libraries from the registry, performs
+phase-aware selection, and caches request-dependent selections. These are not
+separate attention backends. Check `fmha/registry.py` for the current libraries,
+defaults, and canonical order.
 
-`TritonCustomMaskFmha` provides Triton context attention for custom masks,
-`CuteDslMlaFmha` integrates Blackwell CuTe DSL MLA decode kernels,
-`FlashInferSparseMlaFmha` integrates SM120/SM121 sparse MLA kernels for
-DeepSeek-V4 and DSA,
-`FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from FlashInfer into
-the `TRTLLM` backend, and `FallbackFmha` calls the regular `thop.attention`
-runtime path. These are not separate attention backends.
+`update_quant_config()` replaces the manager, rebuilding the library list and
+starting with an empty selection cache. `TrtllmAttention` prepares the complete
+per-forward state, passes itself to the manager for selection, and then executes
+the selected library.
 
-`TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`triton_custom_mask,cute_dsl_mla,msa_sparse_gqa,flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`;
-use `TLLM_FMHA_LIBS=fallback` or
-`TLLM_FMHA_LIBS=-triton_custom_mask,-cute_dsl_mla,-msa_sparse_gqa,-flashinfer_sparse_mla,-flashinfer_trtllm_gen`
-to force the fallback
-path. Each FMHA library exposes `is_available()` for module/static environment
-checks and `is_supported()` for per-forward request checks.
-For mixed non-MLA batches, the manager checks each active phase independently
-with `is_supported(..., phase=...)`; a phased library accepts only phases
-backed by its corresponding `run_*()` entry point.
+`TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
+it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
+defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
+block-sparse PrimTS remains enabled by default because a dense fallback cannot
+preserve its routing semantics. Delta entries update the
+default membership and follow canonical registry order, while an exact list
+preserves the user-specified order. Each FMHA library exposes `is_available()`
+for module/static environment checks and `is_supported()` for per-forward
+request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
+per-call lowered sparse runtime carrier. `None` means prediction has not run;
+an empty `SparseRuntimeParams()` means prediction ran and produced no sparse
+payload. The carrier holds both flat `AttentionOp` parameters and optional
+`BlockSparseForwardInputs` in its nested `block_sparse_inputs` field. The
+block-sparse implementation validates and consumes the latter, while every
+other library rejects it rather than silently dropping sparse routing semantics.
+For mixed non-MLA batches, the manager checks each active phase
+independently with `is_supported(..., phase=...)`; a phased library accepts only
+phases backed by its corresponding `run_*()` entry point.
 
 The `TrtllmAttention` constructor's optional `flashinfer_mla_backend` argument
 explicitly selects the MLA generation kernel inside
@@ -372,6 +399,16 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+- `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
+  vendored PrimTS contiguous and paged wrappers. Paged generation passes a
+  live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
+  does not stage page tables through CSR metadata.
+- `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
+  vendored PrimTS kernels. Before changing the managed source under
+  `attention_backend/prims_ts`, read the
+  [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
+  upstream-worthy changes in FlashInfer and update the vendor lock; keep only
+  TRT-LLM-specific adaptations in the persistent patch.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA

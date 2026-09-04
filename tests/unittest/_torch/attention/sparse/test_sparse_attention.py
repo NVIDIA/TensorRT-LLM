@@ -19,16 +19,19 @@ Unit tests for sparse attention with TrtllmAttention backend.
 
 import math
 from dataclasses import dataclass
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention_backend import block_sparse
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention_backend.sparse import hooks as sparse_hooks
+from tensorrt_llm._torch.attention_backend.sparse import params as sparse_params_module
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
@@ -37,7 +40,6 @@ from tensorrt_llm._torch.attention_backend.sparse.hooks import (
     MLASparseHooks,
     get_sparse_attention_hooks,
     get_sparse_mla_hooks,
-    prepare_sparse_runtime_params,
     register_attention_sparse_hooks,
     register_mla_sparse_hooks,
 )
@@ -178,31 +180,6 @@ class TestSparseAttention(TrtllmAttention):
         return self._sparse_attn_indices, self._sparse_attn_offsets
 
 
-def test_sparse_runtime_params() -> None:
-    attention = TestSparseAttention.__new__(TestSparseAttention)
-    attention.sparse_params = MockSparseParams()
-    attention._sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
-    attention._sparse_kv_offsets = torch.tensor([0, 1], dtype=torch.int32)
-    attention._sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
-    attention._sparse_attn_offsets = None
-    forward_args = AttentionForwardArgs(
-        sparse_runtime_params=SparseRuntimeParams(sparse_attn_kv_lens=torch.tensor([3]))
-    )
-
-    runtime_params = prepare_sparse_runtime_params(
-        attention, torch.empty(0), None, None, forward_args
-    )
-
-    assert runtime_params.sparse_kv_indices is attention._sparse_kv_indices
-    assert runtime_params.sparse_kv_offsets is attention._sparse_kv_offsets
-    assert runtime_params.sparse_attn_indices is attention._sparse_attn_indices
-    assert runtime_params.sparse_attn_offsets is None
-    assert runtime_params.sparse_attn_indices_block_size == 1
-    assert (
-        runtime_params.sparse_attn_kv_lens is forward_args.sparse_runtime_params.sparse_attn_kv_lens
-    )
-
-
 def test_sparse_attn_hook_registration() -> None:
     hook_module = ModuleType("sparse_attn_hook_registration")
     hook_module.sparse_params = MockSparseParams()
@@ -262,15 +239,407 @@ def test_mla_backend_only_forward() -> None:
     )
 
 
-def test_sparse_runtime_params_without_prediction() -> None:
+def test_sparse_prediction_without_sparse_params_has_empty_runtime() -> None:
     attention = TrtllmAttention.__new__(TrtllmAttention)
-    attention.sparse_params = MockSparseParams()
+    attention.sparse_params = None
 
-    runtime_params = prepare_sparse_runtime_params(
-        attention, torch.empty(0), None, None, AttentionForwardArgs()
+    prediction = attention.predict_sparse_attention(
+        torch.empty(0), None, None, None, AttentionForwardArgs()
     )
 
-    assert runtime_params == SparseRuntimeParams()
+    assert prediction == SparseRuntimeParams()
+
+
+def test_sparse_runtime_preparation_is_owned_by_aggregate_predictor() -> None:
+    assert not hasattr(sparse_hooks, "prepare_sparse_runtime_params")
+
+
+def _make_block_sparse_inputs() -> block_sparse.BlockSparseForwardInputs:
+    return block_sparse.BlockSparseForwardInputs(
+        q_block_size=64,
+        kv_block_size=64,
+        exact_block_bits=torch.zeros((1, 1), dtype=torch.int32),
+    )
+
+
+def test_attention_forward_args_owns_only_sparse_runtime_params() -> None:
+    fields = AttentionForwardArgs.__dataclass_fields__
+
+    assert "sparse_runtime_params" in fields
+    assert "block_sparse_inputs" not in fields
+    assert "sparse_attention_prediction" not in fields
+    assert fields["sparse_runtime_params"].default is None
+    assert "SparseAttentionPrediction" not in vars(sparse_params_module)
+    assert "sparse_attn_predict" in TrtllmAttention.__dict__
+    assert "_supports_skip_softmax_prediction" not in TrtllmAttention.__dict__
+    assert "_block_sparse_fmha_cache_state" not in TrtllmAttention.__dict__
+
+
+def test_skip_softmax_uses_an_algorithm_specific_trtllm_backend() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.registry import (
+        get_trtllm_sparse_attn_attention_backend,
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        backend as skip_softmax_backend,
+    )
+
+    SkipSoftmaxTrtllmAttention = skip_softmax_backend.SkipSoftmaxTrtllmAttention
+
+    assert (
+        get_trtllm_sparse_attn_attention_backend(SkipSoftmaxParams()) is SkipSoftmaxTrtllmAttention
+    )
+    assert SkipSoftmaxTrtllmAttention.__bases__ == (TrtllmAttention,)
+    assert "predict_sparse_attention" in SkipSoftmaxTrtllmAttention.__dict__
+    assert not hasattr(skip_softmax_backend, "SkipSoftmaxPredictionMixin")
+    assert not hasattr(skip_softmax_backend, "_SparseAttentionPredictor")
+
+
+@pytest.mark.parametrize("backend_name", ["FLASHINFER", "unknown"])
+def test_sparse_attention_backend_fallback_fails_fast_without_redispatch(
+    backend_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensorrt_llm._torch.attention_backend import utils as attention_backend_utils
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxParams
+
+    monkeypatch.setattr(attention_backend_utils, "IS_FLASHINFER_AVAILABLE", False)
+
+    with (
+        patch.object(
+            attention_backend_utils,
+            "get_trtllm_sparse_attn_attention_backend",
+        ) as trtllm_sparse_resolver,
+        pytest.raises(
+            ValueError,
+            match="cannot use unavailable or unknown attention backend",
+        ),
+    ):
+        attention_backend_utils.get_attention_backend(
+            backend_name, sparse_params=SkipSoftmaxParams()
+        )
+
+    trtllm_sparse_resolver.assert_not_called()
+
+
+@pytest.mark.parametrize("backend_name", ["FLASHINFER", "unknown"])
+def test_trtllm_fallback_without_sparse_params_remains_dense(
+    backend_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tensorrt_llm._torch.attention_backend import utils as attention_backend_utils
+
+    monkeypatch.setattr(attention_backend_utils, "IS_FLASHINFER_AVAILABLE", False)
+
+    assert attention_backend_utils.get_attention_backend(backend_name) is TrtllmAttention
+
+
+def test_skip_softmax_backend_preserves_existing_prediction_payload() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        SkipSoftmaxParams,
+        SkipSoftmaxScheduler,
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.skip_softmax.backend import (
+        SkipSoftmaxTrtllmAttention,
+    )
+
+    sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
+    block_sparse_inputs = object()
+    base_prediction = SparseRuntimeParams(
+        sparse_kv_indices=sparse_kv_indices,
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    attention = SkipSoftmaxTrtllmAttention.__new__(SkipSoftmaxTrtllmAttention)
+    attention.sparse_params = SkipSoftmaxParams(
+        scheduler=SkipSoftmaxScheduler.from_threshold_scale_factor(5000.0)
+    )
+
+    with patch.object(
+        TrtllmAttention,
+        "predict_sparse_attention",
+        return_value=base_prediction,
+    ) as parent_predict:
+        prediction = attention.predict_sparse_attention(
+            torch.empty(0),
+            None,
+            None,
+            object(),
+            AttentionForwardArgs(),
+        )
+
+    parent_predict.assert_called_once()
+    assert prediction.block_sparse_inputs is block_sparse_inputs
+    assert prediction.sparse_kv_indices is sparse_kv_indices
+    assert prediction.threshold_scale_factor_prefill == 5000.0
+
+
+class _StopAfterShapeValidation(Exception):
+    pass
+
+
+def _make_sparse_prediction_forward_backend() -> TrtllmAttention:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.sparse_params = None
+    attention.is_mla_enable = False
+    attention.num_heads = 1
+    attention.num_kv_heads = 1
+    attention.head_dim = 4
+    attention.get_local_layer_idx = Mock(return_value=1)
+    attention._ensure_rope_table_size = Mock(side_effect=_StopAfterShapeValidation)
+    return attention
+
+
+def _make_sparse_prediction_forward_metadata() -> TrtllmAttentionMetadata:
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    seq_lens = torch.tensor([2], dtype=torch.int32)
+    metadata._seq_lens = seq_lens
+    metadata._seq_lens_kv = seq_lens
+    metadata._seq_lens_cuda = None
+    metadata.kv_cache_manager = None
+    metadata._max_seq_len_storage = 4
+    metadata.use_paged_context_fmha = False
+    metadata.cu_q_seqlens = None
+    metadata.cu_kv_seqlens = None
+    metadata.enable_flash_mla = False
+    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.kv_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.kv_lens_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.prompt_lens_cuda_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.prompt_lens_cpu_runtime = torch.tensor([2], dtype=torch.int32)
+    metadata.host_request_types_runtime = torch.tensor([0], dtype=torch.int32)
+    return metadata
+
+
+def test_forward_materializes_dynamic_block_sparse_prediction_before_shape_validation() -> None:
+    attention = _make_sparse_prediction_forward_backend()
+    block_sparse_inputs = _make_block_sparse_inputs()
+    prediction = SparseRuntimeParams(
+        sparse_attn_kv_lens=torch.tensor([4]),
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    attention.predict_sparse_attention = Mock(return_value=prediction)
+    q = torch.empty((2, 4))
+    k = torch.empty((4, 4))
+    v = torch.empty((4, 4))
+    metadata = _make_sparse_prediction_forward_metadata()
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.context_only,
+    )
+
+    for _ in range(2):
+        with pytest.raises(_StopAfterShapeValidation):
+            attention.forward(q, k, v, metadata, forward_args)
+
+    assert attention.predict_sparse_attention.call_count == 2
+    attention.predict_sparse_attention.assert_called_with(q, k, v, metadata, forward_args)
+    assert attention._ensure_rope_table_size.call_count == 2
+    assert forward_args.sparse_runtime_params is None
+
+
+@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+def test_forward_reuses_precomputed_sparse_runtime_params(
+    has_block_sparse_inputs: bool,
+) -> None:
+    attention = _make_sparse_prediction_forward_backend()
+    attention.predict_sparse_attention = Mock()
+    block_sparse_inputs = _make_block_sparse_inputs() if has_block_sparse_inputs else None
+    prediction = SparseRuntimeParams(
+        sparse_attn_kv_lens=torch.tensor([2]),
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    q = torch.empty((2, 4))
+    num_kv_tokens = 4 if has_block_sparse_inputs else 2
+    k = torch.empty((num_kv_tokens, 4))
+    v = torch.empty((num_kv_tokens, 4))
+    metadata = _make_sparse_prediction_forward_metadata()
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_input_type=AttentionInputType.context_only,
+        sparse_runtime_params=prediction,
+    )
+
+    for _ in range(2):
+        with pytest.raises(_StopAfterShapeValidation):
+            attention.forward(q, k, v, metadata, forward_args)
+
+    attention.predict_sparse_attention.assert_not_called()
+    assert attention._ensure_rope_table_size.call_count == 2
+    assert forward_args.sparse_runtime_params is prediction
+
+
+def test_prepare_sparse_attention_prediction_runs_predictors_once() -> None:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.sparse_params = MockSparseParams()
+    sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
+    sparse_kv_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
+    sparse_attn_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    attention.sparse_kv_predict = Mock(return_value=(sparse_kv_indices, sparse_kv_offsets))
+    attention.sparse_attn_predict = Mock(return_value=(sparse_attn_indices, sparse_attn_offsets))
+    q = torch.empty((1, 4))
+    k = torch.empty((1, 4))
+    v = torch.empty((1, 4))
+    metadata = Mock()
+    forward_args = AttentionForwardArgs()
+
+    with patch.object(
+        attention,
+        "predict_sparse_attention",
+        wraps=attention.predict_sparse_attention,
+    ) as predict_sparse_attention:
+        prediction = sparse_hooks.prepare_sparse_attention_prediction(
+            attention, q, k, v, metadata, forward_args
+        )
+
+    assert isinstance(prediction, SparseRuntimeParams)
+    assert prediction.block_sparse_inputs is None
+    assert prediction.sparse_kv_indices is sparse_kv_indices
+    assert prediction.sparse_kv_offsets is sparse_kv_offsets
+    assert prediction.sparse_attn_indices is sparse_attn_indices
+    assert prediction.sparse_attn_offsets is sparse_attn_offsets
+    assert prediction.sparse_attn_indices_block_size == 1
+    assert prediction.sparse_attn_kv_lens is None
+    predict_sparse_attention.assert_called_once_with(q, k, v, metadata, forward_args)
+    attention.sparse_kv_predict.assert_called_once_with(q, k, metadata, forward_args)
+    attention.sparse_attn_predict.assert_called_once_with(q, k, metadata, forward_args)
+
+
+@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+def test_prepare_sparse_attention_prediction_reuses_precomputed_result(
+    has_block_sparse_inputs: bool,
+) -> None:
+    attention = TestSparseAttention.__new__(TestSparseAttention)
+    attention.predict_sparse_attention = Mock()
+    block_sparse_inputs = _make_block_sparse_inputs() if has_block_sparse_inputs else None
+    prediction = SparseRuntimeParams(
+        block_sparse_inputs=block_sparse_inputs,
+    )
+    forward_args = AttentionForwardArgs(sparse_runtime_params=prediction)
+
+    result = sparse_hooks.prepare_sparse_attention_prediction(
+        attention,
+        torch.empty((1, 4)),
+        None,
+        None,
+        Mock(),
+        forward_args,
+    )
+
+    assert result is prediction
+    attention.predict_sparse_attention.assert_not_called()
+
+
+def test_deepseek_v4_forward_sets_sparse_topk_for_precomputed_runtime() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
+    )
+
+    attention = DeepseekV4TrtllmAttention.__new__(DeepseekV4TrtllmAttention)
+    attention.compress_ratio = 2
+    attention.sparse_attention_config = SimpleNamespace(window_size=8)
+    runtime_params = SparseRuntimeParams(sparse_attn_indices=torch.tensor([3]))
+    forward_args = AttentionForwardArgs(sparse_runtime_params=runtime_params)
+    metadata = SimpleNamespace(
+        num_sparse_topk=0,
+        max_compressed_indices={2: 5},
+    )
+    expected_output = object()
+
+    def parent_forward(*args, **kwargs):
+        assert metadata.num_sparse_topk == 13
+        assert kwargs["forward_args"].sparse_runtime_params is runtime_params
+        return expected_output
+
+    with patch.object(TrtllmAttention, "forward", side_effect=parent_forward) as parent:
+        output = attention.forward(torch.empty(0), None, None, metadata, forward_args)
+
+    assert output is expected_output
+    parent.assert_called_once()
+
+
+def test_deepseek_v4_prediction_composes_runtime_without_metadata_side_effect() -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
+    )
+
+    attention = DeepseekV4TrtllmAttention.__new__(DeepseekV4TrtllmAttention)
+    attention.compress_ratio = 2
+    attention.sparse_attention_config = SimpleNamespace(window_size=8)
+    sparse_attn_indices = torch.tensor([3], dtype=torch.int32)
+    base_prediction = SparseRuntimeParams(sparse_attn_indices=sparse_attn_indices)
+    attention.sparse_params = MockSparseParams()
+    metadata = SimpleNamespace(
+        num_sparse_topk=7,
+        num_ctx_tokens=1,
+        num_tokens=3,
+        sparse_mla_topk_lens={2: torch.tensor([11, 12, 13], dtype=torch.int32)},
+        sparse_mla_base_ptrs={2: 1234},
+        max_compressed_indices={2: 5},
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with patch.object(
+        TrtllmAttention,
+        "predict_sparse_attention",
+        return_value=base_prediction,
+    ) as parent_predict:
+        prediction = attention.predict_sparse_attention(
+            torch.empty((2, 4)),
+            None,
+            None,
+            metadata,
+            forward_args,
+        )
+
+    parent_predict.assert_called_once()
+    assert prediction.sparse_attn_indices is sparse_attn_indices
+    torch.testing.assert_close(
+        prediction.sparse_attn_kv_lens,
+        torch.tensor([12, 13], dtype=torch.int32),
+    )
+    assert prediction.aux_kv_cache_pool_ptr == 1234
+    assert metadata.num_sparse_topk == 7
+
+
+@pytest.mark.parametrize(
+    "attention_input_type,scratch_attribute",
+    [
+        (AttentionInputType.context_only, "nvfp4_mla_context_fp8_scratch"),
+        (AttentionInputType.generation_only, "nvfp4_mla_fp8_scratch"),
+    ],
+)
+def test_dsa_prediction_attaches_nvfp4_scratch_pointer(
+    attention_input_type: AttentionInputType,
+    scratch_attribute: str,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.sparse.dsa.backend import DSATrtllmAttention
+
+    attention = DSATrtllmAttention.__new__(DSATrtllmAttention)
+    scratch = torch.empty(4)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(dtype=tensorrt_llm.bindings.DataType.NVFP4),
+        nvfp4_mla_context_fp8_scratch=None,
+        nvfp4_mla_fp8_scratch=None,
+    )
+    setattr(metadata, scratch_attribute, scratch)
+    base_prediction = SparseRuntimeParams(sparse_attn_indices=torch.tensor([3]))
+    forward_args = AttentionForwardArgs(attention_input_type=attention_input_type)
+
+    with patch.object(
+        TrtllmAttention,
+        "predict_sparse_attention",
+        return_value=base_prediction,
+    ) as parent_predict:
+        prediction = attention.predict_sparse_attention(
+            torch.empty(0),
+            None,
+            None,
+            metadata,
+            forward_args,
+        )
+
+    parent_predict.assert_called_once()
+    assert prediction.sparse_attn_indices is base_prediction.sparse_attn_indices
+    assert prediction.aux_kv_cache_pool_ptr == scratch.data_ptr()
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

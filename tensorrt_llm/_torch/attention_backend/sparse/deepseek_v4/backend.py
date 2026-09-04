@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..params import SparseRuntimeParams
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -131,11 +132,17 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if self.use_fp8_ds_mla:
                 self.compressor.enable_footer_scale_cache()
 
-    def _prepare_sparse_forward_args(
+    def predict_sparse_attention(
         self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-    ) -> None:
+    ) -> SparseRuntimeParams:
+        """Predict indices and attach DeepSeek-V4 runtime metadata."""
+
+        prediction = super().predict_sparse_attention(q, k, v, metadata, forward_args)
         attention_input_type = forward_args.attention_input_type
         if attention_input_type == AttentionInputType.context_only:
             start_idx = 0
@@ -147,19 +154,19 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             start_idx = 0
             end_idx = metadata.num_tokens
 
-        sparse_args = forward_args.sparse_runtime_params
-        sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
-            start_idx:end_idx
-        ]
-        if self.compress_ratio > 1:
-            sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
-        else:
-            sparse_args.aux_kv_cache_pool_ptr = None
-
-        metadata.num_sparse_topk = (
-            self.sparse_attention_config.window_size
-            + metadata.max_compressed_indices[self.compress_ratio]
+        runtime_params = replace(
+            prediction,
+            sparse_attn_kv_lens=metadata.sparse_mla_topk_lens[self.compress_ratio][
+                start_idx:end_idx
+            ],
+            aux_kv_cache_pool_ptr=(
+                metadata.sparse_mla_base_ptrs[self.compress_ratio]
+                if self.compress_ratio > 1
+                else None
+            ),
         )
+
+        return runtime_params
 
     def forward(
         self,
@@ -171,12 +178,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         **kwargs,
     ):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        metadata.num_sparse_topk = (
+            self.sparse_attention_config.window_size
+            + metadata.max_compressed_indices[self.compress_ratio]
+        )
         attn_sink = getattr(self, "attn_sink", None)
         if attn_sink is not None:
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
-        self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
     def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:

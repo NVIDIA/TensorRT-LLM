@@ -141,11 +141,24 @@ sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, fo
 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, forward_args)
 ```
 
-`hooks.py` writes these results to `SparseRuntimeParams`. SkipSoftmax writes
-its thresholds to the same runtime interface consumed by `AttentionOp`.
-`AttentionForwardArgs.sparse_backend_args` carries algorithm inputs from the
-module to the backend, while `sparse_runtime_params` carries lowered inputs
-from the backend to `AttentionOp`.
+`hooks.py` aggregates these results into one per-call
+`SparseRuntimeParams`. SkipSoftmax writes its thresholds to the same runtime
+carrier. `AttentionForwardArgs.sparse_backend_args` carries algorithm inputs
+from the module to the backend, while
+`AttentionForwardArgs.sparse_runtime_params` carries the complete lowered state
+from the backend through FMHA dispatch to `AttentionOp`.
+
+`SparseRuntimeParams.block_sparse_inputs` is the nested carrier for optional,
+algorithm-neutral `BlockSparseForwardInputs`. The selected general
+block-sparse FMHA validates and consumes that field; dense FMHA libraries reject
+it instead of silently ignoring its routes. A `None` `sparse_runtime_params`
+means prediction has not run yet, while an empty `SparseRuntimeParams()` means
+prediction ran and produced no sparse payload.
+
+The core contract owns this runtime transport and general block-sparse FMHA
+execution. Algorithm integrations own their prediction policy, effective Q/K/V
+preparation, and any post-processing around the normal core forward. They pass
+precomputed `SparseRuntimeParams` when prediction has already run.
 
 Different KV heads are allowed to emit different sparse index sets; Q
 heads that map to the same KV head share the KV head's sparse pattern.

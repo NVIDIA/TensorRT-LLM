@@ -23,7 +23,7 @@ import inspect
 import os
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import torch
 
@@ -121,14 +121,33 @@ _FMHA_CACHE_SEQ_LEN_Q_GRID: tuple[int, ...] = _make_fmha_cache_grid(
     _FMHA_CACHE_SEQ_LEN_Q_CANDIDATES
 )
 _FMHA_CACHE_SANITY_CHECK_ENV = "TRTLLM_FMHA_CACHE_SANITY_CHECK"
+_SparseIndexState = Literal["absent", "empty", "nonempty"]
+
+
+def _sparse_index_cache_state(indices: torch.Tensor | None) -> _SparseIndexState:
+    if indices is None:
+        return "absent"
+    return "empty" if indices.numel() == 0 else "nonempty"
 
 
 class _FmhaCacheKey(NamedTuple):
+    """Inputs that may vary between requests and change FMHA selection.
+
+    Values invariant for a model or layer within one LLM instance must be excluded.
+    """
+
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
     use_spec_decoding: bool
+    has_block_sparse_inputs: bool
+    block_sparse_format: str | None
+    block_sparse_use_proxy_routes: bool
+    block_sparse_has_kv_valid_bits: bool
+    sparse_kv_indices_state: _SparseIndexState
+    sparse_attn_indices_state: _SparseIndexState
+    has_sparse_topk: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
@@ -361,12 +380,37 @@ class FmhaManager:
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
 
+        sparse_runtime_params = forward_args.sparse_runtime_params
+        block_sparse_inputs = (
+            sparse_runtime_params.block_sparse_inputs if sparse_runtime_params is not None else None
+        )
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
             use_spec_decoding=metadata.use_spec_decoding,
+            has_block_sparse_inputs=block_sparse_inputs is not None,
+            block_sparse_format=(
+                block_sparse_inputs.sparse_format if block_sparse_inputs is not None else None
+            ),
+            block_sparse_use_proxy_routes=(
+                block_sparse_inputs.use_proxy_routes if block_sparse_inputs is not None else False
+            ),
+            block_sparse_has_kv_valid_bits=(
+                block_sparse_inputs is not None and block_sparse_inputs.kv_valid_bits is not None
+            ),
+            sparse_kv_indices_state=_sparse_index_cache_state(
+                sparse_runtime_params.sparse_kv_indices
+                if sparse_runtime_params is not None
+                else None
+            ),
+            sparse_attn_indices_state=_sparse_index_cache_state(
+                sparse_runtime_params.sparse_attn_indices
+                if sparse_runtime_params is not None
+                else None
+            ),
+            has_sparse_topk=int(getattr(metadata, "num_sparse_topk", 0)) > 0,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
         )

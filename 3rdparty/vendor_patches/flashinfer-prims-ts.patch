@@ -1,0 +1,27 @@
+diff --git a/block_sparse.py b/block_sparse.py
+index e13adfaeb8bd06b8f66047e10520c4cc64844da5..3ef893867f1406b07b2006412252dfed0c795275 100644
+--- a/block_sparse.py
++++ b/block_sparse.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/decode.py b/decode.py
+index 57e48fcd3ed81122151e2c31eb16a61476b279fe..70b522fe02a2beaa8458227afd92feee659ab1bb 100644
+--- a/decode.py
++++ b/decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+diff --git a/mla_decode.py b/mla_decode.py
+index 5e6f94442f62c705d3791b258a642d13c9868605..c0e76f0b3533b35093aceaf4c9ba34ebf52f006a 100644
+--- a/mla_decode.py
++++ b/mla_decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");

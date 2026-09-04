@@ -41,7 +41,7 @@ import re
 import textwrap
 import typing
 from dataclasses import fields
-from types import SimpleNamespace
+from types import SimpleNamespace, UnionType
 
 import pytest
 
@@ -381,7 +381,19 @@ def _dataclass_field_type(cls, name: str):
         return None
     if f is None:
         return None
-    return f.type if not isinstance(f.type, str) else None
+    if isinstance(f.type, str):
+        return None
+    return _unwrap_optional(f.type)
+
+
+def _unwrap_optional(py_type):
+    """Return the payload type for ``Optional[T]`` annotations."""
+    origin = typing.get_origin(py_type)
+    if origin in (typing.Union, UnionType):
+        args = [arg for arg in typing.get_args(py_type) if arg is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return py_type
 
 
 def _resolve_path(root_cls, path: tuple[str, ...]):
@@ -403,7 +415,7 @@ def _python_category(py_type) -> str:
     confidently (the type check is then skipped for that kwarg)."""
     # Unwrap Optional[X] / Union[X, None].
     origin = typing.get_origin(py_type)
-    if origin is typing.Union:
+    if origin in (typing.Union, UnionType):
         args = [a for a in typing.get_args(py_type) if a is not type(None)]
         if len(args) == 1:
             return _python_category(args[0])
@@ -557,7 +569,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
     for f in fields(cls):
         if f.name in excluded:
             continue
-        ftype = f.type if not isinstance(f.type, str) else None
+        ftype = _dataclass_field_type(cls, f.name)
         if ftype is not None and dataclasses.is_dataclass(ftype):
             sub = {p[1:] for p in chains if len(p) >= 2 and p[0] == f.name}
             assert sub, (
@@ -565,7 +577,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
                 f"declared but `{f.name}.<subfield>` is never read at the "
                 f"call site."
             )
-            _verify_consumed(ftype, sub)
+            _verify_consumed(ftype, sub, excluded=excluded)
         else:
             assert f.name in consumed, (
                 f"Field `{f.name}` on {cls.__name__} not consumed by the "
@@ -608,7 +620,7 @@ def _all_forward_args_field_names() -> set[str]:
     def _walk(cls) -> None:
         for f in fields(cls):
             seen.add(f.name)
-            ftype = f.type if not isinstance(f.type, str) else None
+            ftype = _dataclass_field_type(cls, f.name)
             if ftype is not None and dataclasses.is_dataclass(ftype):
                 _walk(ftype)
 

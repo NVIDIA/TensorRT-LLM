@@ -36,9 +36,9 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import (
+    from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import _cute_dsl_import_error
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import (
         VSAMetadataBuilder,
-        _cute_dsl_import_error,
         set_vsa_forward_context,
     )
     from tensorrt_llm._torch.visual_gen.config import (

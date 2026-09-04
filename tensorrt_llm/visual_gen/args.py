@@ -117,7 +117,7 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL / TRTLLM backends)."
         ),
     )
 
@@ -187,7 +187,7 @@ class AttentionConfig(StrictBaseModel):
         algo = self.sparse_attention_config.algorithm
         supported_backends = {
             "skip_softmax": ("TRTLLM", "CUTEDSL"),
-            "vsa": ("CUTEDSL",),
+            "vsa": ("CUTEDSL", "TRTLLM"),
         }.get(algo)
         if supported_backends is None:
             return self
@@ -202,21 +202,14 @@ class AttentionConfig(StrictBaseModel):
         return self
 
     @model_validator(mode="after")
-    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
-        # attention. SkipSoftmax is part of that dense path and can compose.
-        if (
-            self.backend == "CUTEDSL"
-            and self.quant_attention_config is not None
-            and self.sparse_attention_config is not None
-            and self.sparse_attention_config.algorithm == "vsa"
-        ):
-            raise ValueError(
-                "CUTEDSL backend: quant_attention_config and VSA "
-                "sparse_attention_config are mutually exclusive (the "
-                "CuTeDSLAttention dispatcher selects either the dense path "
-                "or the sparse VSA path, not both)."
-            )
+    def _validate_quant_sparse_mutex(self) -> "AttentionConfig":
+        if self.quant_attention_config is None or self.sparse_attention_config is None:
+            return self
+
+        if self.sparse_attention_config.algorithm == "vsa":
+            # VSA consumes the unquantized Q/K/V path, so accepting an attention
+            # quantization recipe would silently ignore user configuration.
+            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
         return self
 
 

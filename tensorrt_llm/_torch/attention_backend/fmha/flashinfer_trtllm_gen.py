@@ -678,6 +678,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> Tuple[bool, str]:
+        sparse_runtime_params = fwd.sparse_runtime_params
+        if (
+            sparse_runtime_params is not None
+            and sparse_runtime_params.block_sparse_inputs is not None
+        ):
+            return False, "block_sparse_inputs are not supported."
         is_mla_enable = attn.is_mla_enable
         if phase is None:
             has_context_phase = fwd.attention_input_type != AttentionInputType.generation_only
@@ -759,8 +765,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "sage attention."
         if meta.helix_position_offsets is not None:
             return False, "helix parallelism."
-        sparse_kv_indices = fwd.sparse_runtime_params.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse_runtime_params.sparse_attn_indices
+        sparse_kv_indices = (
+            sparse_runtime_params.sparse_kv_indices if sparse_runtime_params is not None else None
+        )
+        sparse_attn_indices = (
+            sparse_runtime_params.sparse_attn_indices if sparse_runtime_params is not None else None
+        )
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
@@ -1257,7 +1267,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         attention_chunk_size = get_attention_chunk_size(attn)
         output = fwd.output
         fp8_context_fmha = self._use_fp8_context_fmha(output, fwd.attention_input_type)
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.batch_size
         (
             q_processed,
             kv_pool,
@@ -1382,7 +1392,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if get_attention_chunk_size(attn) != 0:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
-        batch_beam = params.num_requests * meta.beam_width
+        batch_beam = params.batch_size
         if params.attention_input is None:
             raise RuntimeError("MLA generation requires attention_input.")
         kv_cache, block_tables, _kv_scale_pool = thop.build_trtllm_gen_kv_cache_metadata(
