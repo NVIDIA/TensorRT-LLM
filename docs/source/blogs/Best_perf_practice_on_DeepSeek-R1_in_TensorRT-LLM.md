@@ -211,7 +211,8 @@ cuda_graph_config:
   - 2
   - 1
 print_iter_log: true
-kv_cache_dtype: fp8
+kv_cache_config:
+  dtype: fp8
 enable_attention_dp: true
 EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
