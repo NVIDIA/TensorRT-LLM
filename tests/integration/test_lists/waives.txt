@@ -342,7 +342,6 @@ unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async S
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
 unittest/llmapi/test_llm.py::test_generate_with_detokenization_stop_words_streaming[/scratch.trt_llm_data/llm-models/gemma/gemma-3-1b-it] SKIP (https://nvbugs/6566772)
-unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2" SKIP (https://nvbugs/6428092)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp2[False-False-True] SKIP (https://nvbugs/6432826)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
