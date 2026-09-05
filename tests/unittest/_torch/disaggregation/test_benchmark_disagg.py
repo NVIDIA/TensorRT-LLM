@@ -30,7 +30,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import GenTransferStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
 

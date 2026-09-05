@@ -53,7 +53,7 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 _FLASHINFER_WORKSPACE_BYTES = 320 * 1024 * 1024
 _TRTLLM_GEN_TOKENS_PER_BLOCK = 32
@@ -936,7 +936,7 @@ def _build_gemma4_kv_cache_manager(
     sizes line up with what the model actually requests at runtime.
     """
     import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
     if quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache():

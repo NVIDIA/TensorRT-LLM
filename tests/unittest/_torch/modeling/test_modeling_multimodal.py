@@ -26,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig

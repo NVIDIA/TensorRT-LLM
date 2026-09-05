@@ -92,7 +92,7 @@ def _factory_model_engine(
 
 
 def _v2_manager(*, is_draft: bool):
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.enable_block_reuse = False
@@ -233,7 +233,9 @@ class TestResourceManagerAPI:
         ]
 
     def test_real_v2_target_receives_relocation_metadata(self):
-        from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
+        from tensorrt_llm._torch.pyexecutor.kv_cache import (
+            kv_cache_manager_v2 as kv_cache_v2_module,
+        )
 
         target = _v2_manager(is_draft=False)
         target.kv_cache_map = {}

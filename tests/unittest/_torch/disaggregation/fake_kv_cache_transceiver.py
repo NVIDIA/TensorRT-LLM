@@ -3,7 +3,7 @@
 
 from typing import Dict, List, Optional
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,

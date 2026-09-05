@@ -445,7 +445,9 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3
 
     def _make_manager(self, use_kda_replay=True):
-        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import PythonMambaCacheManager
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            PythonMambaCacheManager,
+        )
 
         L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M, self.NHEADS)
         committed = W - 1

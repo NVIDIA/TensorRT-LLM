@@ -29,6 +29,7 @@ l0_dgx_b300:
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/executor
+  - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/multi_gpu_modeling -k "deepseek"

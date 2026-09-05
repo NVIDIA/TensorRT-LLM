@@ -20,7 +20,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 

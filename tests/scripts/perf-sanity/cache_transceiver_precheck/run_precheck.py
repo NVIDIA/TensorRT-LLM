@@ -235,14 +235,14 @@ def load_internal_apis():
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
         create_kv_cache_transceiver,
         maybe_enable_fabric_memory_for_python_transceiver,
     )
+    from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
         LlmRequest,
         LlmRequestState,
