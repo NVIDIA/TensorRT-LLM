@@ -21,7 +21,7 @@ for at most 0.5 seconds during an instrumented shutdown boundary.
 
 Adapted from PR #11299 (usage lib POC), with:
 - GXT Event Protocol v1.6 envelope (NvTelemetry-compliant)
-- Architecture-class-only model sanitization
+- Public-architecture allowlisting with private-name hashing
 - DO_NOT_TRACK industry-standard env var support
 - First-launch console notification
 
@@ -43,6 +43,7 @@ CI/Test auto-detection:
 """
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -57,6 +58,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
 from tensorrt_llm.usage.llmapi_config import (
@@ -76,6 +78,8 @@ _HTTP_TIMEOUT = 2.0
 _MAX_HEARTBEATS = 1000
 _TERMINAL_FLUSH_TIMEOUT = 0.5
 _ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
+_ARCHITECTURE_HASH_DOMAIN = b"trtllm-architecture-class-v1\0"
+_ARCHITECTURE_HASH_PREFIX = "sha256:"
 _T = TypeVar("_T")
 
 
@@ -335,7 +339,7 @@ def _collect_gpu_info() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Model info extraction (sanitized -- architecture class name only)
+# Model info extraction (public architecture name or private deterministic hash)
 # ---------------------------------------------------------------------------
 
 
@@ -362,25 +366,53 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
     if pretrained_config is None:
         return None
     try:
-        # Case 1: HF PretrainedConfig — .architectures (plural list)
+        # Case 1: HF PretrainedConfig — .architectures (plural list). The
+        # first item is authoritative; later entries are intentionally ignored.
         architectures = getattr(pretrained_config, "architectures", None)
-        if architectures and isinstance(architectures, (list, tuple)) and len(architectures) > 0:
-            return str(architectures[0])
+        if isinstance(architectures, (list, tuple)) and architectures:
+            architecture = architectures[0]
+            if isinstance(architecture, str) and architecture.strip():
+                return architecture
+            return None
 
         # Case 2: TRT-LLM PretrainedConfig — .architecture (singular str)
         architecture = getattr(pretrained_config, "architecture", None)
-        if architecture and isinstance(architecture, str):
+        if isinstance(architecture, str) and architecture.strip():
             return architecture
 
         # Case 3: HF from_pretrained on engine dir — nested pretrained_config dict
         nested_config = getattr(pretrained_config, "pretrained_config", None)
         if isinstance(nested_config, dict) and "architecture" in nested_config:
-            return str(nested_config["architecture"])
+            architecture = nested_config["architecture"]
+            if isinstance(architecture, str) and architecture.strip():
+                return architecture
 
-        # Last resort: config class name (e.g. "LlamaConfig")
+        # Preserve the legacy fallback when no explicit architecture is present.
+        # The caller still applies the plaintext allowlist before reporting it.
         return type(pretrained_config).__name__
     except (AttributeError, TypeError, KeyError, IndexError):
         return None
+
+
+def _architecture_telemetry_fields(pretrained_config: Any) -> tuple[str, str]:
+    """Return mutually exclusive plaintext-name and deterministic-hash fields.
+
+    Exact, public allowlist matches are safe to report by name. Every other
+    non-empty string is hashed immediately and is never logged. Missing or
+    malformed values fail closed to the schema's empty-string sentinels.
+    """
+    architecture = _extract_architecture_class_name(pretrained_config)
+    if architecture is None:
+        return "", ""
+    if architecture in PUBLIC_HF_ARCHITECTURES:
+        return architecture, ""
+    try:
+        digest = hashlib.sha256(
+            _ARCHITECTURE_HASH_DOMAIN + architecture.encode("utf-8")
+        ).hexdigest()
+    except UnicodeEncodeError:
+        return "", ""
+    return "", f"{_ARCHITECTURE_HASH_PREFIX}{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +670,7 @@ def _background_reporter(
         # --- Collect initial data ---
         system_info = _collect_system_info()
         gpu_info = _collect_gpu_info()
-        arch_class_name = _extract_architecture_class_name(pretrained_config)
+        arch_class_name, arch_class_hash = _architecture_telemetry_fields(pretrained_config)
         trtllm_config = _extract_trtllm_config(llm_args)
         features_json = _collect_features(llm_args)
         try:
@@ -680,9 +712,8 @@ def _background_reporter(
             gpuMemoryMB=gpu_info.get("gpu_memory_mb") or 0,
             cudaVersion=_clamp_str(gpu_info.get("cuda_version") or "", _S),
             # Model
-            architectureClassName=_clamp_str(arch_class_name or "", _L),
-            # Reserved for TRTLLM-411. This change does not populate hashes.
-            architectureClassHash="",
+            architectureClassName=_clamp_str(arch_class_name, _L),
+            architectureClassHash=arch_class_hash,
             # Config
             backend=_clamp_str(trtllm_config.get("backend") or "", _S),
             tensorParallelSize=trtllm_config.get("tensor_parallel_size") or 1,
