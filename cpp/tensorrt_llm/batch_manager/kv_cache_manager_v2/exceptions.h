@@ -17,8 +17,10 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <cuda.h>
@@ -31,7 +33,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 template <typename F>
-void terminateOnException(char const* context, F&& func) noexcept
+void abortOnExcept(char const* context, F&& func) noexcept
 {
     try
     {
@@ -40,12 +42,29 @@ void terminateOnException(char const* context, F&& func) noexcept
     catch (std::exception const& error)
     {
         TLLM_LOG_ERROR("%s: %s", context, error.what());
-        std::terminate();
+        std::abort();
     }
     catch (...)
     {
         TLLM_LOG_ERROR("%s: unknown error", context);
-        std::terminate();
+        std::abort();
+    }
+}
+
+template <typename F>
+void logOnExcept(char const* context, F&& func) noexcept
+{
+    try
+    {
+        std::forward<F>(func)();
+    }
+    catch (std::exception const& error)
+    {
+        TLLM_LOG_ERROR("%s: %s", context, error.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("%s: unknown error", context);
     }
 }
 
@@ -184,3 +203,43 @@ inline void cuCheck(CUresult result)
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+
+// Runs a callable and, if it throws, logs the error prefixed with the enclosing function, then
+// aborts. Variadic so the callable may contain commas.
+#define KVCM2_ABORT_ON_EXCEPT(...)                                                                                     \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
+
+// Runs a callable and, if it throws, logs the error prefixed with the enclosing function and
+// returns normally. The remainder of the callable is skipped. Variadic so it may contain commas.
+#define KVCM2_LOG_ON_EXCEPT(...)                                                                                       \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::logOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
+
+// Check variants for noexcept contexts such as destructors: on failure they log the assertion
+// message, source location and backtrace captured by TLLM_CHECK, prefixed with the enclosing
+// function, then abort.
+#define KVCM2_CHECK_FATAL(cond)                                                                                        \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(__PRETTY_FUNCTION__, [&]() { TLLM_CHECK(cond); })
+
+#define KVCM2_CHECK_FATAL_WITH_INFO(cond, info, ...)                                                                   \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(                                                 \
+        __PRETTY_FUNCTION__, [&]() { TLLM_CHECK_WITH_INFO(cond, info, ##__VA_ARGS__); })
+
+// As above, but only evaluated when debug checks are enabled. The gDebug test comes first so
+// nothing is built when checks are off.
+#define KVCM2_CHECK_FATAL_DEBUG(cond)                                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (TLLM_UNLIKELY(::tensorrt_llm::batch_manager::kv_cache_manager_v2::gDebug))                                 \
+        {                                                                                                              \
+            KVCM2_CHECK_FATAL(cond);                                                                                   \
+        }                                                                                                              \
+    } while (0)
+
+#define KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(cond, info, ...)                                                             \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (TLLM_UNLIKELY(::tensorrt_llm::batch_manager::kv_cache_manager_v2::gDebug))                                 \
+        {                                                                                                              \
+            KVCM2_CHECK_FATAL_WITH_INFO(cond, info, ##__VA_ARGS__);                                                    \
+        }                                                                                                              \
+    } while (0)

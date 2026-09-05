@@ -147,7 +147,8 @@ PerLevelEvictionController::PerLevelEvictionController(
 
 PerLevelEvictionController::~PerLevelEvictionController()
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(mPolicies.begin(), mPolicies.end(), [](auto const& p) { return p.empty(); }),
+    KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
+        std::all_of(mPolicies.begin(), mPolicies.end(), [](auto const& p) { return p.empty(); }),
         "Eviction controller is not empty on destruction");
 }
 

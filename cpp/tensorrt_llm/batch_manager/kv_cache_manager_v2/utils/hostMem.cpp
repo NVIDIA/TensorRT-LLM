@@ -215,7 +215,7 @@ HostMem::HostMem(size_t size)
 
 HostMem::~HostMem()
 {
-    destroy();
+    KVCM2_LOG_ON_EXCEPT([this]() { destroy(); });
 }
 
 void HostMem::resize(size_t newSize)

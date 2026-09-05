@@ -129,14 +129,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
-    try
-    {
-        shutdown();
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_ERROR("%s", e.what());
-    }
+    KVCM2_LOG_ON_EXCEPT([this]() { shutdown(); });
 }
 
 void KvCacheManager::_checkNoLivingKvCaches(char const* api) const
