@@ -1,7 +1,11 @@
+import os
+import threading
+
 import pytest
 
 from tensorrt_llm.llmapi import LlmArgs
 from tensorrt_llm.llmapi.utils import (ApiStatusRegistry,
+                                       _set_affinity_all_threads,
                                        generate_api_docs_as_docstring)
 
 pytestmark = pytest.mark.cpu_only
@@ -36,6 +40,35 @@ def test_generate_api_docs_as_docstring():
     doc = generate_api_docs_as_docstring(LlmArgs)
     assert ":tag:`beta`" in doc, "the label is not generated"
     print(doc)
+
+
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="Linux only")
+def test_set_affinity_all_threads_binds_existing_threads():
+    all_cpus = sorted(os.sched_getaffinity(0))
+    if len(all_cpus) < 2:
+        pytest.skip("needs at least two CPUs")
+    ready = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def worker():
+        ready.set()
+        release.wait()
+        seen.append(sorted(os.sched_getaffinity(0)))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    ready.wait()
+    try:
+        subset = all_cpus[:1]
+        assert _set_affinity_all_threads(subset) >= 2
+        release.set()
+        thread.join()
+        assert seen == [subset]
+        assert sorted(os.sched_getaffinity(0)) == subset
+    finally:
+        release.set()
+        _set_affinity_all_threads(all_cpus)
 
 
 class DelayedAssert:

@@ -635,6 +635,25 @@ def get_numa_aware_cpu_affinity(device_id):
     return cpu_affinity
 
 
+def _set_affinity_all_threads(cpus: List[int]) -> int:
+    """Bind every thread of this process to `cpus`; returns the thread count.
+
+    sched_setaffinity(pid) only binds the main thread, so threads created
+    earlier (MPI, communication and I/O helpers) would keep their old mask.
+    """
+    if not os.path.isdir("/proc/self/task"):
+        psutil.Process().cpu_affinity(cpus)
+        return 1
+    nthreads = 0
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            os.sched_setaffinity(int(tid), cpus)
+            nthreads += 1
+        except OSError:
+            pass
+    return nthreads
+
+
 def configure_cpu_affinity(device_id: int) -> None:
     """Probe and configure the CPU affinity of the calling process based on NUMA topology.
 
@@ -642,8 +661,9 @@ def configure_cpu_affinity(device_id: int) -> None:
         device_id: The CUDA device ID to determine optimal CPU affinity.
 
     Note:
-        If the process already has constrained affinity, a warning is logged.
-        Configuration is handled as follows:
+        The affinity is applied to every thread of the process, not only the
+        main thread. If the process already has constrained affinity, a warning
+        is logged. Configuration is handled as follows:
             TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
                 -> Affinity is automatically configured if it is unconstrained,
                    and deleted if it is constrained externally by the user.
@@ -672,17 +692,19 @@ def configure_cpu_affinity(device_id: int) -> None:
             logger.warning(f"Worker process {pid} has constrained CPU affinity "
                            f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
                            f"Removing CPU affinity constraints.")
-            process.cpu_affinity(all_cpus)
+            _set_affinity_all_threads(all_cpus)
 
     # If affinity is unconstrained and the user hasn't explicitly
     # prohibited it or the user has explicitly requested it, choose the
     # optimal affinity based upon the NUMA topology
     if ((numa_aware_affinity is None and not constrained_affinity)
             or (numa_aware_affinity == "1")):
-        process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+        nthreads = _set_affinity_all_threads(
+            get_numa_aware_cpu_affinity(device_id))
         logger.info(
             f"Worker process {pid} CPU affinity set to "
-            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
+            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
+            f"({nthreads} threads).")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
