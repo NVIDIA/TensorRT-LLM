@@ -94,6 +94,7 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
+from .peft_cache_stats import append_peft_cache_iteration_stats
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import PPCommTag
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -896,6 +897,7 @@ class PyExecutor:
         self.stats = []
         self._latest_kv_iter_stats = None
         self._last_kv_iter_stats_fetch_iter = None
+        self._latest_peft_iter_stats = None
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
@@ -2081,6 +2083,19 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
+        # Drained every iteration rather than on _kv_iter_stats_interval: the
+        # counters clear on read and are emitted on the same iteration, so a
+        # wider interval would merge windows without saving anything. The C++
+        # recorders carry their own enableStats gate, set from the same
+        # predicate, so this is the reporting half of that switch.
+        peft_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
+        if peft_cache_manager is not None and self.enable_iter_perf_stats:
+            self._latest_peft_iter_stats = (
+                peft_cache_manager.impl.get_and_reset_iteration_stats())
+        else:
+            self._latest_peft_iter_stats = None
+
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
 
@@ -2333,7 +2348,8 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           peft_iter_stats: Optional[object] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2344,6 +2360,8 @@ class PyExecutor:
             stats: Iteration-level stats.
             req_stats: Optional per-request stats.
             kv_iter_stats: Optional KV iteration stats captured with ``stats``.
+            peft_iter_stats: Optional PEFT/LoRA cache iteration stats captured
+                with ``stats``. ``None`` when LoRA is not configured.
             attention_dp_rank: Optional ADP rank for fanned-out rank-local rows.
             host_step_time_ms: Per-loop CPU wall captured by profile_step
                 for the loop that built this batch. Surfaces as
@@ -2396,6 +2414,7 @@ class PyExecutor:
                     _json.loads(r.to_json_str()) for r in req_stats
                 ]
             append_kv_cache_iteration_stats(local_dict, kv_iter_stats)
+            append_peft_cache_iteration_stats(local_dict, peft_iter_stats)
             if host_step_time_ms is not None:
                 local_dict["hostStepTimeMS"] = host_step_time_ms
             if prev_device_step_time_ms is not None:
@@ -2420,6 +2439,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] peft_iter_stats: Optional[PeftCacheIterationStats]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -2427,7 +2447,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, peft_iter_stats))
 
     def _process_iter_stats(
         self,
@@ -2492,14 +2512,16 @@ class PyExecutor:
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                peft_iter_stats=self._latest_peft_iter_stats)
         else:
             self._append_iter_stats(
                 stats,
                 req_stats,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
-                gpu_forward_time_ms=gpu_forward_time_ms)
+                gpu_forward_time_ms=gpu_forward_time_ms,
+                peft_iter_stats=self._latest_peft_iter_stats)
 
     def _executor_loop_cleanup(self):
         # Wake any waiters in await_responses BEFORE potentially-blocking
@@ -5960,7 +5982,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        peft_iter_stats=record.peft_iter_stats)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]

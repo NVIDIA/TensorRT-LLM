@@ -280,7 +280,7 @@ class PyBasePeftCacheManager : public tb::BasePeftCacheManager
 public:
     ~PyBasePeftCacheManager() override = default;
 
-    NB_TRAMPOLINE(tb::BasePeftCacheManager, 8);
+    NB_TRAMPOLINE(tb::BasePeftCacheManager, 9);
 
     void addRequestPeft(tb::BasePeftCacheManager::LlmRequestPtr llmRequest, bool tryGpuCache = true) override
     {
@@ -321,6 +321,11 @@ public:
     bool enabled() const override
     {
         NB_OVERRIDE_PURE(enabled);
+    }
+
+    tb::PeftCacheIterationStats getAndResetIterationStats() override
+    {
+        NB_OVERRIDE_PURE(getAndResetIterationStats);
     }
 };
 } // namespace
@@ -720,6 +725,26 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
 {
+    nb::class_<tb::PeftCacheIterationStats>(m, "PeftCacheIterationStats")
+        .def(nb::init<>())
+        .def_rw("requests_paused", &tb::PeftCacheIterationStats::requestsPaused)
+        .def_rw("requests_resumed", &tb::PeftCacheIterationStats::requestsResumed)
+        .def_rw("requests_terminated", &tb::PeftCacheIterationStats::requestsTerminated)
+        .def_rw("tasks_released_device", &tb::PeftCacheIterationStats::tasksReleasedDevice)
+        .def_rw("tasks_released_host", &tb::PeftCacheIterationStats::tasksReleasedHost)
+        .def_rw("tasks_evicted_device", &tb::PeftCacheIterationStats::tasksEvictedDevice)
+        .def_rw("pages_evicted_device", &tb::PeftCacheIterationStats::pagesEvictedDevice)
+        .def_rw("tasks_evicted_host", &tb::PeftCacheIterationStats::tasksEvictedHost)
+        .def_rw("pages_evicted_host", &tb::PeftCacheIterationStats::pagesEvictedHost)
+        .def_rw("device_pages_total", &tb::PeftCacheIterationStats::devicePagesTotal)
+        .def_rw("device_pages_available", &tb::PeftCacheIterationStats::devicePagesAvailable)
+        .def_rw("host_pages_total", &tb::PeftCacheIterationStats::hostPagesTotal)
+        .def_rw("host_pages_available", &tb::PeftCacheIterationStats::hostPagesAvailable)
+        .def_rw("device_tasks_in_progress", &tb::PeftCacheIterationStats::deviceTasksInProgress)
+        .def_rw("device_tasks_done", &tb::PeftCacheIterationStats::deviceTasksDone)
+        .def_rw("active_tasks", &tb::PeftCacheIterationStats::activeTasks)
+        .def_rw("paused_tasks", &tb::PeftCacheIterationStats::pausedTasks);
+
     nb::class_<tb::BasePeftCacheManager, PyBasePeftCacheManager>(m, "BasePeftCacheManager")
         .def("add_request_peft", &tb::BasePeftCacheManager::addRequestPeft, nb::arg("request"),
             nb::arg("try_gpu_cache") = true, nb::call_guard<nb::gil_scoped_release>())
@@ -738,12 +763,14 @@ void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)
         .def_prop_ro("max_host_pages", &tb::BasePeftCacheManager::getMaxHostPages)
         .def("determine_num_pages", &tb::BasePeftCacheManager::determineNumPages, nb::arg("request"),
             nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("enabled", &tb::BasePeftCacheManager::enabled);
+        .def_prop_ro("enabled", &tb::BasePeftCacheManager::enabled)
+        .def("get_and_reset_iteration_stats", &tb::BasePeftCacheManager::getAndResetIterationStats,
+            nb::call_guard<nb::gil_scoped_release>());
 
     nb::class_<tb::PeftCacheManager, tb::BasePeftCacheManager>(m, "PeftCacheManager")
-        .def(nb::init<tb::PeftCacheManagerConfig, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
+        .def(nb::init<tb::PeftCacheManagerConfig, tr::ModelConfig, tr::WorldConfig, tr::BufferManager, bool>(),
             nb::arg("config"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("enable_stats") = false, nb::call_guard<nb::gil_scoped_release>())
         .def("is_task_cached", &tb::PeftCacheManager::isTaskCached, nb::arg("taskId"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("is_task_cached_device", &tb::PeftCacheManager::isTaskCachedDevice, nb::arg("taskId"),

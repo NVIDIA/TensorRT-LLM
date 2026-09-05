@@ -38,6 +38,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -267,8 +268,10 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
 }
 
 PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager)
-    : mModelConfig(modelConfig)
+    runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager, bool enableStats)
+    // Order matches member declaration order (mEnableStats precedes mModelConfig).
+    : mEnableStats(enableStats)
+    , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
     , mDevice{runtime::utils::initDevice(worldConfig)}
 {
@@ -285,8 +288,10 @@ PeftCacheManager::PeftCacheManager(PeftCacheManagerConfig const& config, runtime
     // first adapter selects the homogeneous LoRA dtype.
     auto [hostCacheConfig, deviceCacheConfig]
         = getPageManagerConfig(mConfig, modelConfig, worldConfig, modelConfig.getDataType(), mDeviceCacheByteBudget);
-    mHostLoraCache = std::make_unique<runtime::LoraCache>(hostCacheConfig, modelConfig, worldConfig, bufferManager);
-    mDeviceLoraCache = std::make_unique<runtime::LoraCache>(deviceCacheConfig, modelConfig, worldConfig, bufferManager);
+    mHostLoraCache
+        = std::make_unique<runtime::LoraCache>(hostCacheConfig, modelConfig, worldConfig, bufferManager, mEnableStats);
+    mDeviceLoraCache = std::make_unique<runtime::LoraCache>(
+        deviceCacheConfig, modelConfig, worldConfig, bufferManager, mEnableStats);
 
     mPutWorkerPool = std::make_shared<runtime::WorkerPool>(mConfig.numPutWorkers, mDevice);
     mEnsureWorkerPool = std::make_unique<runtime::WorkerPool>(config.numEnsureWorkers, mDevice);
@@ -611,7 +616,13 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
         mTaskIdToReqIds.at(taskId).insert(reqId);
         if (mTaskIdToPausedReqIds.count(taskId))
         {
-            mTaskIdToPausedReqIds.at(taskId).erase(reqId);
+            // Counting the erase rather than the call keeps this a true resume count:
+            // re-registering a request that was never paused erases nothing.
+            auto const wasPaused = mTaskIdToPausedReqIds.at(taskId).erase(reqId);
+            if (mEnableStats)
+            {
+                mIterRequestsResumed += wasPaused;
+            }
             if (mTaskIdToPausedReqIds.at(taskId).empty())
             {
                 mTaskIdToPausedReqIds.erase(taskId);
@@ -637,10 +648,18 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
             {
                 mTaskIdToPausedReqIds.try_emplace(taskId, std::unordered_set<uint64_t>{});
             }
-            mTaskIdToPausedReqIds.at(taskId).insert(reqId);
+            auto const newlyPaused = mTaskIdToPausedReqIds.at(taskId).insert(reqId).second;
+            if (mEnableStats && newlyPaused)
+            {
+                ++mIterRequestsPaused;
+            }
         }
         else
         {
+            if (mEnableStats)
+            {
+                ++mIterRequestsTerminated;
+            }
             if (pauseTakskIt != mTaskIdToPausedReqIds.end())
             {
                 pauseTakskIt->second.erase(reqId);
@@ -655,6 +674,10 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
         {
             // paused taskIds get removed from gpu cache but not host cache
             mDeviceLoraCache->markTaskDone(taskId);
+            if (mEnableStats)
+            {
+                ++mIterTasksReleasedDevice;
+            }
             if (!mTaskIdToPausedReqIds.count(taskId))
             {
                 {
@@ -664,6 +687,10 @@ void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool ter
                         "erase task " + std::to_string(taskId) + " future size=" + std::to_string(mPutFutures.size()));
                 }
                 mHostLoraCache->markTaskDone(taskId);
+                if (mEnableStats)
+                {
+                    ++mIterTasksReleasedHost;
+                }
             }
         }
     }
@@ -698,6 +725,31 @@ SizeType32 PeftCacheManager::getMaxDevicePages() const
 SizeType32 PeftCacheManager::getMaxHostPages() const
 {
     return mHostLoraCache->getNumPages();
+}
+
+PeftCacheIterationStats PeftCacheManager::getAndResetIterationStats()
+{
+    PeftCacheIterationStats stats;
+
+    stats.requestsPaused = std::exchange(mIterRequestsPaused, 0);
+    stats.requestsResumed = std::exchange(mIterRequestsResumed, 0);
+    stats.requestsTerminated = std::exchange(mIterRequestsTerminated, 0);
+    stats.tasksReleasedDevice = std::exchange(mIterTasksReleasedDevice, 0);
+    stats.tasksReleasedHost = std::exchange(mIterTasksReleasedHost, 0);
+
+    std::tie(stats.tasksEvictedDevice, stats.pagesEvictedDevice) = mDeviceLoraCache->getAndResetEvictionCounters();
+    std::tie(stats.tasksEvictedHost, stats.pagesEvictedHost) = mHostLoraCache->getAndResetEvictionCounters();
+
+    stats.devicePagesTotal = mDeviceLoraCache->getNumPages();
+    stats.devicePagesAvailable = mDeviceLoraCache->getNumAvailablePages();
+    stats.hostPagesTotal = mHostLoraCache->getNumPages();
+    stats.hostPagesAvailable = mHostLoraCache->getNumAvailablePages();
+    std::tie(stats.deviceTasksInProgress, stats.deviceTasksDone) = mDeviceLoraCache->getNumInProgressAndDoneTasks();
+
+    stats.activeTasks = static_cast<SizeType32>(mTaskIdToReqIds.size());
+    stats.pausedTasks = static_cast<SizeType32>(mTaskIdToPausedReqIds.size());
+
+    return stats;
 }
 
 SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRequest) const

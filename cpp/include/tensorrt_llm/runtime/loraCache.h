@@ -25,6 +25,8 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <atomic>
+#include <cstdint>
 #include <deque>
 #include <list>
 #include <map>
@@ -32,6 +34,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace tensorrt_llm::runtime
 {
@@ -182,9 +185,11 @@ public:
      * param[in] modelConfig: a ModelConfig
      * param[in] worldConfig: a WorldConfig
      * param[in] bufferManager: a BufferManager only used to allocate page blocks
+     * param[in] enableStats: record eviction counters. Off by default so the counters
+     * cost nothing for callers that never read them.
      */
     LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
-        WorldConfig const& worldConfig, BufferManager const& bufferManager);
+        WorldConfig const& worldConfig, BufferManager const& bufferManager, bool enableStats = false);
 
     /**
      * \brief Reinitialize this cache and another cache (e.g. a host/device pair) to store the
@@ -300,6 +305,23 @@ public:
      * \returns -- total number of pages allocated to cache (used or not)
      */
     [[nodiscard]] SizeType32 getNumPages() const;
+
+    /**
+     * \returns -- number of pages not currently claimed by a task
+     */
+    [[nodiscard]] SizeType32 getNumAvailablePages() const;
+
+    /**
+     * \returns -- number of tasks resident in the cache, split into those still
+     * held by a request and those marked done (evictable)
+     */
+    [[nodiscard]] std::pair<SizeType32, SizeType32> getNumInProgressAndDoneTasks() const;
+
+    /**
+     * \brief Read and clear the eviction counters accumulated since the last call.
+     * \returns -- {tasks evicted, pages reclaimed from those tasks}
+     */
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> getAndResetEvictionCounters();
 
     /**
      * \param[in] pageId: the page id
@@ -435,6 +457,12 @@ private:
     std::unordered_map<TaskIdType, TaskValuePtr> mCacheMap;
     std::list<TaskIdType> mInProgressTasks;
     std::list<TaskIdType> mDoneTasks;
+
+    // Eviction counters, drained per iteration by PeftCacheManager. Atomic because
+    // claimPagesWithEvict runs on the put/ensure worker pools as well as the main thread.
+    bool mEnableStats{false};
+    std::atomic<std::uint64_t> mNumTasksEvicted{0};
+    std::atomic<std::uint64_t> mNumPagesEvicted{0};
 
     std::vector<std::unique_ptr<BufferManager>> mDeviceBufferManagers;
     std::unique_ptr<BufferManager> mBufferManager;

@@ -32,6 +32,8 @@ from .._torch.peft.lora.manager import LoraManager
 from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
+from .._torch.pyexecutor.peft_cache_stats import \
+    append_peft_cache_iteration_stats
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
@@ -1081,6 +1083,7 @@ class BaseWorker(GenerationExecutor):
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        peft_iter_stats = stats[8] if len(stats) > 8 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -1096,6 +1099,7 @@ class BaseWorker(GenerationExecutor):
                     json.loads(req_stat.to_json_str()))
 
         append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
+        append_peft_cache_iteration_stats(stats_dict, peft_iter_stats)
 
         # Per-loop CPU wall captured by profile_step() — always a clean
         # single-loop measurement, matching the log line's `host_step_time`.

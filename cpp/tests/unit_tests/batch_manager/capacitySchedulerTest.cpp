@@ -107,6 +107,11 @@ public:
         return true;
     }
 
+    [[nodiscard]] PeftCacheIterationStats getAndResetIterationStats() override
+    {
+        return {};
+    }
+
 private:
     SizeType32 mNumPages;
     SizeType32 mMaxDevicePages;

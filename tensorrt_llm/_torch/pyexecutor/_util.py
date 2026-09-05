@@ -3242,6 +3242,9 @@ def create_py_executor_instance(
             execution_stream=execution_stream,
             lora_target_modules=target_modules,
             initial_data_type=initial_lora_data_type,
+            # Same predicate as the KV managers, so one /metrics row describes
+            # both caches over the same window.
+            enable_stats=self._enable_kv_cache_stats(),
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
