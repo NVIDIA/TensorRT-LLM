@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent_flow import (
@@ -15,6 +17,7 @@ from agent_flow import (
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 
+from . import concurrent_review as cr
 from .progress import (
     BUILD_STAGE,
     PLAN_STAGE,
@@ -85,6 +88,15 @@ def _make_agent(
     )
 
 
+@dataclass
+class _InFlightReview:
+    """A reviewer turn running on a worker thread against a frozen commit."""
+
+    iteration: int
+    snapshot: cr.ReviewSnapshot
+    future: Future
+
+
 class AgentTeamWorkflow:
     """Plan phase then build phase loop, both built on AgentLayer.
 
@@ -102,6 +114,8 @@ class AgentTeamWorkflow:
         build_human_review_enabled: bool = False,
         replan_on_qa: bool = False,
         trigger_replan_with_feedback: bool = False,
+        concurrent_review: bool = False,
+        review_snapshot_repo: str | Path | None = None,
         clean: bool = False,
         plan: str | Path | None = None,
         acceptance_criteria: str | Path | None = None,
@@ -136,6 +150,21 @@ class AgentTeamWorkflow:
         # the post-QA replan machinery, so it requires replan_on_qa (the
         # check below).
         self.trigger_replan_with_feedback = trigger_replan_with_feedback
+        # When True, the build phase pipelines coder and reviewer: the
+        # coder's checkout is frozen at a git ref after each coder turn,
+        # reviewer(i) runs on a worker thread against that frozen commit,
+        # and coder(i+1) starts immediately in a worktree branched from
+        # it. Off by default; the classic strictly-sequential build loop
+        # is untouched (see ``_run_build_loop``).
+        self.concurrent_review = concurrent_review
+        # Explicit override for the checkout to freeze. When None the repo
+        # is resolved from task.yaml (``review_snapshot_repo``, falling
+        # back to ``trtllm_repo_path``) once the task is materialized.
+        self.review_snapshot_repo_override = review_snapshot_repo
+        self._snapshot_repo: Path | None = None
+        # Per-iteration review report the Reviewer writes in concurrent
+        # mode instead of the shared status.md; see ``_review_status_path``.
+        self._review_executor: ThreadPoolExecutor | None = None
         # When set on a fresh run, the matching plan-phase output is
         # populated from this value. If *both* presets are provided the
         # plan phase is skipped entirely and the workflow starts at the
@@ -235,6 +264,7 @@ class AgentTeamWorkflow:
         progress_tools = build_progress_tools(
             self._progress_ctx,
             plan_drafter_replan_on_qa=self.replan_on_qa,
+            coder_review_notices=self.concurrent_review,
         )
 
         # Coder and Reviewer share status.md as a rolling scratchpad. The
@@ -242,6 +272,37 @@ class AgentTeamWorkflow:
         # needed because the file is overwritten each turn.
         self._status_ctx = StatusContext(path=self.status_path)
         status_tools = build_status_tools(self._status_ctx)
+
+        # Shared-file safety for concurrent mode. Coder and Reviewer run at
+        # the same time, so every file both roles write needs splitting:
+        #
+        # - ``status.md`` — both call ``update_status``, which *overwrites*
+        #   the file. The Reviewer gets its own StatusContext pointed at a
+        #   per-iteration ``status-review-<i>.md``; the Coder keeps
+        #   status.md, and the verdict notice tells it where the review
+        #   report is. ``read_status`` for the Reviewer still resolves to
+        #   its own file, which is what it just wrote.
+        # - ``progress.yaml`` — append-only but read-modify-written whole,
+        #   so two appends can race; ``progress._append`` now serializes on
+        #   a lock. The per-agent ``current_iteration`` stamp is also
+        #   shared mutable state, so the Reviewer gets its own
+        #   ProgressContext and the two roles stamp different iterations.
+        # - ``plan.md`` / ``acceptance-criteria.md`` / ``task.yaml`` are
+        #   read-only for both roles in the build phase; the ledger
+        #   (progress.yaml) is covered above.
+        #
+        # In sequential mode these contexts *are* the shared ones, so the
+        # wiring is byte-for-byte what it always was.
+        if self.concurrent_review:
+            self._reviewer_progress_ctx = ProgressContext(path=self.progress_path)
+            self._reviewer_status_ctx = StatusContext(path=self.status_path)
+            reviewer_progress_tools = build_progress_tools(self._reviewer_progress_ctx)["reviewer"]
+            reviewer_status_tools = build_status_tools(self._reviewer_status_ctx)["reviewer"]
+        else:
+            self._reviewer_progress_ctx = self._progress_ctx
+            self._reviewer_status_ctx = self._status_ctx
+            reviewer_progress_tools = progress_tools["reviewer"]
+            reviewer_status_tools = status_tools["reviewer"]
 
         # PlanDrafter has ``human_input_enabled=True`` unconditionally so
         # it can call the ``ask_human`` MCP tool during the human-review
@@ -281,7 +342,7 @@ class AgentTeamWorkflow:
         self.reviewer = _make_agent(
             "reviewer",
             self.prompts.reviewer,
-            progress_tools["reviewer"] + status_tools["reviewer"],
+            reviewer_progress_tools + reviewer_status_tools,
             required_tools=["append_reviewer_progress", "update_status"],
             backend_kind="codex",
             model=CODEX_DEFAULT_MODEL,
@@ -300,6 +361,12 @@ class AgentTeamWorkflow:
         )
         self._progress_tools = progress_tools
         self._status_tools = status_tools
+        # Kept separately because they close over the Reviewer's own
+        # contexts: rebuilding the Reviewer from ``_progress_tools`` /
+        # ``_status_tools`` would silently re-point it at the Coder's
+        # progress stamp and status.md (see ``_reset_reviewer``).
+        self._reviewer_progress_tools = reviewer_progress_tools
+        self._reviewer_status_tools = reviewer_status_tools
 
     def __enter__(self) -> "AgentTeamWorkflow":
         return self
@@ -308,6 +375,9 @@ class AgentTeamWorkflow:
         self.close()
 
     def close(self) -> None:
+        if self._review_executor is not None:
+            self._review_executor.shutdown(wait=True)
+            self._review_executor = None
         for layer in (self.plan_drafter, self.plan_reviewer, self.coder, self.reviewer, self.qa):
             layer.__exit__(None, None, None)
 
@@ -328,95 +398,11 @@ class AgentTeamWorkflow:
                 self._run_plan_phase(state, log)
 
             # ----- BUILD PHASE -----
-            for i in range(state.next_iteration_index, self.num_iterations):
-                iteration = i + 1
-                print_rule(
-                    f"[bold cyan]Iteration {iteration}/{self.num_iterations}[/bold cyan]",
-                    log,
-                )
-
-                # Each stage checkpoints before advancing, so a crash/Ctrl-C
-                # mid-iteration resumes at the same agent rather than
-                # rerunning earlier stages.
-                if state.stage == STAGE_CODER:
-                    if self._should_reset_coder(i):
-                        self._reset_coder()
-                    self._run_coder(iteration)
-                    state.stage = STAGE_REVIEWER
-                    self._checkpoint(state)
-
-                if state.stage == STAGE_REVIEWER:
-                    if self._should_reset_reviewer(i):
-                        self._reset_reviewer()
-                    self._run_reviewer(iteration)
-                    decision = self._latest_reviewer_decision()
-                    if decision != "APPROVE":
-                        # REJECT (or missing) → loop back to coder, skip QA.
-                        print_message(
-                            f"[bold yellow]↻ reviewer {decision or 'missing'} "
-                            f"— looping back to coder[/bold yellow]",
-                            log,
-                        )
-                        state.next_iteration_index = i + 1
-                        state.stage = STAGE_CODER
-                        self._checkpoint(state)
-                        continue
-                    state.stage = STAGE_QA
-                    self._checkpoint(state)
-
-                if state.stage == STAGE_QA:
-                    # QA is stateless, so its "reset every iteration" need
-                    # is satisfied by SessionConfig; no explicit reset call.
-                    self._run_qa(iteration)
-                    if self.replan_on_qa:
-                        # In replan mode the PlanDrafter — not QA — is the
-                        # terminator. Hand off to the replan sub-cycle and
-                        # let it decide DONE / loop / escalate.
-                        state.stage = STAGE_REPLAN
-                        self._checkpoint(state)
-                    else:
-                        decision = self._latest_qa_decision()
-                        score = self._latest_qa_score()
-                        state.next_iteration_index = i + 1
-                        score_ok = self.min_score <= 0 or (
-                            score is not None and score >= self.min_score
-                        )
-                        if decision == "APPROVE" and score_ok:
-                            state.done = True
-                            state.stage = STAGE_CODER
-                            self._checkpoint(state)
-                            print_message(
-                                f"[bold green]✔ QA APPROVE at iteration {iteration}[/bold green]",
-                                log,
-                            )
-                            break
-                        if decision == "APPROVE" and score is not None and score < self.min_score:
-                            print_message(
-                                f"[bold yellow]↻ qa APPROVE but score "
-                                f"{score:.2f} < {self.min_score:.2f} — "
-                                f"looping back to coder[/bold yellow]",
-                                log,
-                            )
-                        else:
-                            print_message(
-                                f"[bold yellow]↻ qa "
-                                f"{decision or 'missing'} — looping back "
-                                f"to coder[/bold yellow]",
-                                log,
-                            )
-                        state.stage = STAGE_CODER
-                        self._checkpoint(state)
-
-                if state.stage in _REPLAN_STAGES:
-                    # Sub-cycle: PlanDrafter(replan) [→ PlanReviewer
-                    # [→ Human]] → either DONE (break the build loop) or
-                    # back to STAGE_CODER for iteration i+1. Both classic
-                    # and replan modes share STAGE_QA entry, but only
-                    # replan_on_qa=True ever puts a STAGE_REPLAN_* value
-                    # on ``state.stage``.
-                    if self._run_replan_subcycle(state, log, i, iteration):
-                        break
-
+            # ----- BUILD PHASE -----
+            if self.concurrent_review:
+                self._run_build_loop_concurrent(state, log)
+            else:
+                self._run_build_loop(state, log)
             # Budget exhausted without an APPROVE: mark the run done so a
             # stale checkpoint doesn't auto-resume back into the loop.
             if not state.done:
@@ -430,6 +416,401 @@ class AgentTeamWorkflow:
                 log,
             )
             raise
+
+    def _run_build_loop(self, state: WorkflowState, log) -> None:
+        """Strictly sequential build phase: coder -> reviewer -> qa, per iteration."""
+        for i in range(state.next_iteration_index, self.num_iterations):
+            iteration = i + 1
+            print_rule(
+                f"[bold cyan]Iteration {iteration}/{self.num_iterations}[/bold cyan]",
+                log,
+            )
+
+            # Each stage checkpoints before advancing, so a crash/Ctrl-C
+            # mid-iteration resumes at the same agent rather than
+            # rerunning earlier stages.
+            if state.stage == STAGE_CODER:
+                if self._should_reset_coder(i):
+                    self._reset_coder()
+                self._run_coder(iteration)
+                state.stage = STAGE_REVIEWER
+                self._checkpoint(state)
+
+            if state.stage == STAGE_REVIEWER:
+                if self._should_reset_reviewer(i):
+                    self._reset_reviewer()
+                self._run_reviewer(iteration)
+                decision = self._latest_reviewer_decision()
+                if decision != "APPROVE":
+                    # REJECT (or missing) → loop back to coder, skip QA.
+                    print_message(
+                        f"[bold yellow]↻ reviewer {decision or 'missing'} "
+                        f"— looping back to coder[/bold yellow]",
+                        log,
+                    )
+                    state.next_iteration_index = i + 1
+                    state.stage = STAGE_CODER
+                    self._checkpoint(state)
+                    continue
+                state.stage = STAGE_QA
+                self._checkpoint(state)
+
+            if self._run_qa_stage(state, log, i, iteration):
+                break
+
+    def _run_qa_stage(self, state: WorkflowState, log, i: int, iteration: int) -> bool:
+        """Run the QA stage (and the replan sub-cycle when enabled).
+
+        Extracted verbatim from the build loop so the sequential and the
+        concurrent-review loops share one implementation. Returns True when
+        the build phase is finished (QA APPROVE above the score floor, or a
+        replan that declared DONE) and the caller must stop iterating.
+        """
+        if state.stage == STAGE_QA:
+            # QA is stateless, so its "reset every iteration" need
+            # is satisfied by SessionConfig; no explicit reset call.
+            self._run_qa(iteration)
+            if self.replan_on_qa:
+                # In replan mode the PlanDrafter — not QA — is the
+                # terminator. Hand off to the replan sub-cycle and
+                # let it decide DONE / loop / escalate.
+                state.stage = STAGE_REPLAN
+                self._checkpoint(state)
+            else:
+                decision = self._latest_qa_decision()
+                score = self._latest_qa_score()
+                state.next_iteration_index = i + 1
+                score_ok = self.min_score <= 0 or (score is not None and score >= self.min_score)
+                if decision == "APPROVE" and score_ok:
+                    state.done = True
+                    state.stage = STAGE_CODER
+                    self._checkpoint(state)
+                    print_message(
+                        f"[bold green]✔ QA APPROVE at iteration {iteration}[/bold green]",
+                        log,
+                    )
+                    return True
+                if decision == "APPROVE" and score is not None and score < self.min_score:
+                    print_message(
+                        f"[bold yellow]↻ qa APPROVE but score "
+                        f"{score:.2f} < {self.min_score:.2f} — "
+                        f"looping back to coder[/bold yellow]",
+                        log,
+                    )
+                else:
+                    print_message(
+                        f"[bold yellow]↻ qa "
+                        f"{decision or 'missing'} — looping back "
+                        f"to coder[/bold yellow]",
+                        log,
+                    )
+                state.stage = STAGE_CODER
+                self._checkpoint(state)
+
+        if state.stage in _REPLAN_STAGES:
+            # Sub-cycle: PlanDrafter(replan) [→ PlanReviewer
+            # [→ Human]] → either DONE (break the build loop) or
+            # back to STAGE_CODER for iteration i+1. Both classic
+            # and replan modes share STAGE_QA entry, but only
+            # replan_on_qa=True ever puts a STAGE_REPLAN_* value
+            # on ``state.stage``.
+            if self._run_replan_subcycle(state, log, i, iteration):
+                return True
+        return False
+
+    # --------------------------------------------------- concurrent review
+
+    def _run_build_loop_concurrent(self, state: WorkflowState, log) -> None:
+        """Build phase with reviewer(i) overlapped onto coder(i+1).
+
+        Pipeline depth is 1: at most one review is ever in flight. Per
+        iteration ``i`` (1-based ``iteration``):
+
+        1. Run coder(i). If a review of iteration i-1 is in flight, the
+           coder is told so and works in a worktree off the frozen commit;
+           the verdict lands mid-turn as a ``read_review_notices`` entry.
+        2. Join the in-flight review (it has usually finished long before).
+        3. Snapshot the checkout. On a dirty tree, a missing repo, or the
+           last allowed iteration, fall back to a *sequential* review of
+           iteration i and carry on as the classic loop would.
+        4. Otherwise, if the previous verdict was a REJECT, launch
+           reviewer(i) concurrently and go straight to coder(i+1).
+        5. If the previous verdict was an APPROVE, drain the pipeline: run
+           reviewer(i) sequentially on the fresh snapshot. Only if that
+           *fresh* pass also approves does the work reach QA — so coder
+           commits made while a review was running are never carried into
+           QA on the strength of a verdict that never saw them.
+        """
+        self._resume_in_flight_review(state, log)
+
+        in_flight: _InFlightReview | None = None
+        i = state.next_iteration_index
+        try:
+            while i < self.num_iterations:
+                iteration = i + 1
+                print_rule(
+                    f"[bold cyan]Iteration {iteration}/{self.num_iterations}[/bold cyan]",
+                    log,
+                )
+
+                if state.stage == STAGE_CODER:
+                    if self._should_reset_coder(i):
+                        self._reset_coder()
+                    self._run_coder(iteration, addendum=self._coder_addendum(in_flight))
+                    state.stage = STAGE_REVIEWER
+                    self._checkpoint(state)
+
+                if state.stage == STAGE_REVIEWER:
+                    prior = self._join_review(in_flight, log)
+                    in_flight = None
+                    state.review_in_flight_iteration = 0
+                    snapshot = self._take_snapshot(iteration, log)
+                    overlap = (
+                        snapshot is not None
+                        and prior != "APPROVE"
+                        and iteration < self.num_iterations
+                    )
+                    if overlap:
+                        assert snapshot is not None
+                        in_flight = self._launch_review(iteration, snapshot, log)
+                        state.review_in_flight_iteration = iteration
+                        state.review_snapshot_repo = str(snapshot.repo)
+                        state.review_snapshot_commit = snapshot.commit
+                        state.review_snapshot_ref = snapshot.ref
+                        state.next_iteration_index = i + 1
+                        state.stage = STAGE_CODER
+                        self._checkpoint(state)
+                        i += 1
+                        continue
+
+                    # Drain: review this iteration synchronously. Either the
+                    # snapshot failed (fall back to today's behavior) or the
+                    # previous review approved and we want a fresh verdict
+                    # that has actually seen the newest commits.
+                    if self._should_reset_reviewer(i):
+                        self._reset_reviewer()
+                    self._run_reviewer(iteration, snapshot=snapshot)
+                    decision = self._latest_reviewer_decision()
+                    if decision != "APPROVE":
+                        print_message(
+                            f"[bold yellow]↻ reviewer {decision or 'missing'} "
+                            f"— looping back to coder[/bold yellow]",
+                            log,
+                        )
+                        state.next_iteration_index = i + 1
+                        state.stage = STAGE_CODER
+                        self._checkpoint(state)
+                        i += 1
+                        continue
+                    state.stage = STAGE_QA
+                    self._checkpoint(state)
+
+                if self._run_qa_stage(state, log, i, iteration):
+                    break
+                i += 1
+        finally:
+            # Never leave a review thread running past the build phase: on
+            # an exception or a break we still want the verdict recorded.
+            if in_flight is not None:
+                self._join_review(in_flight, log)
+                state.review_in_flight_iteration = 0
+                self._checkpoint(state)
+
+    def _resume_in_flight_review(self, state: WorkflowState, log) -> None:
+        """Re-run a review that was in flight when the checkpoint was written.
+
+        The snapshot ref pins exactly what that review was looking at, so
+        the re-run is against the same tree the original saw — not
+        whatever the checkout has drifted to since. When the ref is gone
+        (repo moved, ref pruned) we log and skip: the iteration will get
+        reviewed again by the normal pipeline.
+        """
+        iteration = state.review_in_flight_iteration
+        if not iteration:
+            return
+        repo = Path(state.review_snapshot_repo) if state.review_snapshot_repo else None
+        ref = state.review_snapshot_ref or cr.review_ref(iteration)
+        if repo is None or not cr.snapshot_exists(repo, ref):
+            print_message(
+                f"[bold yellow]⚠ review of iteration {iteration} was in "
+                f"flight but its snapshot ref {ref} is gone — skipping the "
+                f"re-review; the pipeline will review the next snapshot"
+                f"[/bold yellow]",
+                log,
+            )
+            state.review_in_flight_iteration = 0
+            self._checkpoint(state)
+            return
+        snapshot = cr.ReviewSnapshot(
+            iteration=iteration,
+            repo=repo,
+            commit=state.review_snapshot_commit,
+            ref=ref,
+        )
+        print_message(
+            f"[bold cyan]↻ re-running the review of iteration {iteration} "
+            f"from snapshot {snapshot.short_commit}[/bold cyan]",
+            log,
+        )
+        self._run_reviewer(iteration, snapshot=snapshot)
+        self._post_verdict_notice(iteration)
+        state.review_in_flight_iteration = 0
+        self._checkpoint(state)
+
+    def _take_snapshot(self, iteration: int, log) -> cr.ReviewSnapshot | None:
+        """Freeze the coder's checkout, or return None to force sequential review.
+
+        A dirty working tree is the important case: the reviewer can only
+        read committed state, so freezing a dirty tree would review
+        something the coder never produced. We refuse, warn loudly, and
+        this iteration is reviewed sequentially — correct, just not
+        overlapped.
+        """
+        repo = self._resolve_snapshot_repo()
+        if repo is None:
+            print_message(
+                "[bold yellow]⚠ --concurrent-review is on but no snapshot "
+                "repo is configured (set `review_snapshot_repo` in task.yaml "
+                "or pass --review-snapshot-repo) — reviewing sequentially"
+                "[/bold yellow]",
+                log,
+            )
+            return None
+        checkout = self._review_checkout()
+        try:
+            snapshot = cr.snapshot_repo(repo, iteration, allow_dirty=checkout is not None)
+            if checkout is not None:
+                cr.checkout_snapshot(checkout, snapshot)
+        except cr.SnapshotError as exc:
+            print_message(
+                f"[bold yellow]⚠ cannot snapshot the checkout for iteration "
+                f"{iteration}: {exc} — falling back to a SEQUENTIAL review "
+                f"for this iteration (the coder stays idle until the verdict)"
+                f"[/bold yellow]",
+                log,
+            )
+            return None
+        where = f" -> reviewer checkout {checkout}" if checkout is not None else ""
+        print_message(
+            f"[bold cyan]⧉ snapshot for review of iteration {iteration}: "
+            f"{snapshot.short_commit} ({snapshot.ref}){where}[/bold cyan]",
+            log,
+        )
+        if snapshot.dirty:
+            print_message(
+                f"[bold yellow]⚠ {len(snapshot.dirty)} uncommitted entries in "
+                f"{repo} are not part of the snapshot (in-place mode reviews "
+                f"the commit only)[/bold yellow]",
+                log,
+            )
+        return snapshot
+
+    def _review_checkout(self) -> Path | None:
+        """The reviewer's own worktree (in-place mode), or None."""
+        raw = cr.read_task_mapping(self.task_path).get(cr.TASK_KEY_REVIEW_CHECKOUT)
+        return Path(str(raw)).expanduser() if raw else None
+
+    def _resolve_snapshot_repo(self) -> Path | None:
+        if self._snapshot_repo is None:
+            self._snapshot_repo = cr.resolve_snapshot_repo(
+                self.task_path, self.review_snapshot_repo_override
+            )
+        return self._snapshot_repo
+
+    def _review_status_path(self, iteration: int) -> Path:
+        """Per-iteration review report, so the Reviewer never shares status.md."""
+        return self.workspace / f"status-review-{iteration}.md"
+
+    def _launch_review(self, iteration: int, snapshot: cr.ReviewSnapshot, log) -> "_InFlightReview":
+        """Start reviewer(i) on a worker thread and return its handle.
+
+        Threads, not ``asyncio.gather``: a persistent ``AgentLayer`` pins
+        its backend client to the event loop of its own ``PortalRunner``
+        thread, so gathering ``aforward`` coroutines on a transient loop
+        would strand the session. Calling the two layers' synchronous
+        ``forward`` from two threads gives each its own loop, which is
+        exactly what the layer already expects.
+        """
+        if self._review_executor is None:
+            self._review_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="agent-flow-review"
+            )
+        if self._should_reset_reviewer(iteration - 1):
+            self._reset_reviewer()
+        print_message(
+            f"[bold cyan]⇉ reviewer {iteration} running concurrently with "
+            f"coder {iteration + 1}[/bold cyan]",
+            log,
+        )
+
+        def _run() -> str | None:
+            self._run_reviewer(iteration, snapshot=snapshot)
+            decision = self._latest_reviewer_decision()
+            # Post the verdict from *this* thread, while the coder's turn
+            # is still open: that is what makes the notice an injection
+            # rather than a between-iterations hand-off.
+            self._post_verdict_notice(iteration, decision)
+            return decision
+
+        return _InFlightReview(
+            iteration=iteration,
+            snapshot=snapshot,
+            future=self._review_executor.submit(_run),
+        )
+
+    def _post_verdict_notice(self, iteration: int, decision: str | None = None) -> None:
+        if decision is None:
+            decision = self._latest_reviewer_decision()
+        append_human_feedback(
+            self.progress_path,
+            summary=cr.verdict_notice(
+                iteration,
+                decision,
+                self._review_status_path(iteration),
+                in_place=self._review_checkout() is not None,
+            ),
+            iteration=iteration + 1,
+            stage=BUILD_STAGE,
+            source=cr.REVIEWER_NOTICE_SOURCE,
+        )
+
+    def _join_review(self, in_flight: "_InFlightReview | None", log) -> str | None:
+        """Wait for an overlapped review to finish and return its decision.
+
+        A failing review must not take the run down: the coder's work is
+        already committed, so we log the exception and treat the verdict as
+        missing, which the caller handles the same way as a REJECT.
+        """
+        if in_flight is None:
+            return None
+        try:
+            decision = in_flight.future.result()
+        except Exception as exc:  # noqa: BLE001 - reported, not swallowed silently
+            print_message(
+                f"[bold red]✗ concurrent review of iteration "
+                f"{in_flight.iteration} failed: {exc!r} — treating as no "
+                f"verdict[/bold red]",
+                log,
+            )
+            return None
+        print_message(
+            f"[bold cyan]⇇ concurrent review of iteration "
+            f"{in_flight.iteration} returned {decision or 'no verdict'}"
+            f"[/bold cyan]",
+            log,
+        )
+        return decision
+
+    def _coder_addendum(self, in_flight: "_InFlightReview | None") -> str:
+        if in_flight is None:
+            return ""
+        task_data = cr.read_task_mapping(self.task_path)
+        return cr.coder_addendum(
+            in_flight.snapshot,
+            worktrees_dir=task_data.get(cr.TASK_KEY_WORKTREES_DIR),
+            reservations=task_data.get(cr.TASK_KEY_WORKTREE_RESERVATIONS),
+            review_checkout=task_data.get(cr.TASK_KEY_REVIEW_CHECKOUT),
+        )
 
     def _run_plan_phase(self, state: WorkflowState, log) -> None:
         """Drive the plan phase to completion.
@@ -973,7 +1354,7 @@ class AgentTeamWorkflow:
         self.reviewer = _make_agent(
             "reviewer",
             self.prompts.reviewer,
-            self._progress_tools["reviewer"] + self._status_tools["reviewer"],
+            self._reviewer_progress_tools + self._reviewer_status_tools,
             required_tools=["append_reviewer_progress", "update_status"],
             backend_kind="codex",
             model=CODEX_DEFAULT_MODEL,
@@ -1297,7 +1678,14 @@ class AgentTeamWorkflow:
             "file (`plan.md` or `acceptance-criteria.md`) for each item."
         )
 
-    def _run_coder(self, iteration: int) -> None:
+    def _run_coder(self, iteration: int, *, addendum: str = "") -> None:
+        """Run one Coder turn.
+
+        ``addendum`` is appended verbatim to the user prompt. It is empty
+        except in concurrent-review mode, where it tells the Coder that a
+        review is running against a frozen snapshot and it must work in a
+        worktree until the verdict notice arrives.
+        """
         self._progress_ctx.current_iteration = iteration
         self.coder(
             f"Workspace: {self.workspace}\n"
@@ -1323,11 +1711,25 @@ class AgentTeamWorkflow:
             "(with a `summary` of what you built or changed) and "
             "`update_status` (overwriting status.md with a short, clean "
             "snapshot — current status, execution path, what's been tried, "
-            "what worked, what didn't, pointers for the next step)."
+            "what worked, what didn't, pointers for the next step)." + addendum
         )
 
-    def _run_reviewer(self, iteration: int) -> None:
-        self._progress_ctx.current_iteration = iteration
+    def _run_reviewer(self, iteration: int, *, snapshot: cr.ReviewSnapshot | None = None) -> None:
+        """Run one Reviewer turn.
+
+        When ``snapshot`` is set (concurrent-review mode) the Reviewer is
+        told the checkout is frozen at that commit, and its
+        ``update_status`` writes the per-iteration ``status-review-<i>.md``
+        instead of the status.md the Coder is concurrently overwriting.
+        """
+        # Under concurrent review the Coder and the Reviewer run at the
+        # same time, so only the reviewer's own contexts are stamped here;
+        # sequential mode keeps the old single-context behavior.
+        if snapshot is None:
+            self._progress_ctx.current_iteration = iteration
+        else:
+            self._reviewer_progress_ctx.current_iteration = iteration
+            self._reviewer_status_ctx.path = self._review_status_path(iteration)
         # Surface the replan-on-qa flag to the Reviewer so a prompt
         # extension can branch on it (e.g. the modeling-bringup
         # Stage/Goal protocol uses a different APPROVE gate in the two
@@ -1367,6 +1769,16 @@ class AgentTeamWorkflow:
             "(overwriting status.md to reflect the post-review state, "
             "what was actually tested, and what the Coder must address "
             "next on REJECT)."
+            + (
+                cr.reviewer_addendum(
+                    snapshot,
+                    review_checkout=(
+                        str(self._review_checkout()) if self._review_checkout() else None
+                    ),
+                )
+                if snapshot
+                else ""
+            )
         )
 
     def _run_qa(self, iteration: int) -> None:

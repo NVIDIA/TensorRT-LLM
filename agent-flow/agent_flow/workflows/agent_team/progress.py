@@ -65,6 +65,7 @@ ends the plan phase) — no regex over prose.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -77,11 +78,27 @@ from rich.syntax import Syntax
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
 
+from .concurrent_review import REVIEWER_NOTICE_SOURCE
+
 PLAN_STAGE = "plan_stage"
 BUILD_STAGE = "build_stage"
 HUMAN_FEEDBACK = "human_feedback"
 _STAGES = (PLAN_STAGE, BUILD_STAGE)
 _TOP_LEVEL_KEYS = (PLAN_STAGE, BUILD_STAGE, HUMAN_FEEDBACK)
+
+#: ``source`` value on ``human_feedback`` entries authored by the user via
+#: ``--feedback``. Entries written by the orchestrator on behalf of another
+#: agent (currently only the Reviewer, in concurrent-review mode) carry a
+#: different source so the reader can tell the two apart. Entries written
+#: before this field existed have no ``source`` key and are treated as human.
+SOURCE_HUMAN = "human"
+
+# progress.yaml is read-modify-written in full on every append. In
+# concurrent-review mode two agent turns overlap, so two appends can race
+# and one would silently lose the other's entry. All appends in this
+# process serialize on this lock; the file is only ever written by the
+# orchestrator process, so an in-process lock is sufficient.
+_APPEND_LOCK = threading.Lock()
 
 _STAGE_BY_AGENT = {
     "plan_drafter": PLAN_STAGE,
@@ -154,6 +171,7 @@ def append_human_feedback(
     summary: str,
     iteration: int,
     stage: str,
+    source: str = SOURCE_HUMAN,
 ) -> dict[str, Any]:
     """Append one ``human_feedback`` entry to ``progress.yaml`` and return it.
 
@@ -161,6 +179,12 @@ def append_human_feedback(
     user's mid-run guidance becomes visible to the build-phase agents on
     the next turn. Also emits a styled log panel so the user can see what
     landed.
+
+    ``source`` marks who authored the notice. The default ``"human"``
+    reproduces the historical entry shape byte-for-byte (no ``source``
+    key). Any other value — currently only ``"reviewer"``, used by
+    concurrent-review mode to hand a verdict to an already-running Coder —
+    is stamped onto the entry so readers can filter on it.
     """
     if stage not in _STAGES:
         raise ValueError(f"unknown stage: {stage!r}")
@@ -170,11 +194,20 @@ def append_human_feedback(
         "stage": stage,
         "summary": summary,
     }
-    data = read_progress(path)
-    data[HUMAN_FEEDBACK].append(entry)
-    write_progress(path, data)
+    if source != SOURCE_HUMAN:
+        entry["source"] = source
+    with _APPEND_LOCK:
+        data = read_progress(path)
+        data[HUMAN_FEEDBACK].append(entry)
+        write_progress(path, data)
     _log_human_feedback_write(entry)
     return entry
+
+
+def read_notices(path: Path, source: str) -> list[dict[str, Any]]:
+    """Return ``human_feedback`` entries whose ``source`` matches ``source``."""
+    entries = read_progress(path)[HUMAN_FEEDBACK]
+    return [e for e in entries if e.get("source", SOURCE_HUMAN) == source]
 
 
 def find_entries(
@@ -238,9 +271,10 @@ def latest_entry(path: Path, agent: str) -> dict[str, Any] | None:
 
 
 def _append(path: Path, agent: str, entry: dict[str, Any]) -> None:
-    data = read_progress(path)
-    data[_STAGE_BY_AGENT[agent]].append(entry)
-    write_progress(path, data)
+    with _APPEND_LOCK:
+        data = read_progress(path)
+        data[_STAGE_BY_AGENT[agent]].append(entry)
+        write_progress(path, data)
 
 
 def _now_iso() -> str:
@@ -306,6 +340,7 @@ def build_progress_tools(
     ctx: ProgressContext,
     *,
     plan_drafter_replan_on_qa: bool = False,
+    coder_review_notices: bool = False,
 ) -> dict[str, list[Any]]:
     """Build the per-agent tool lists for ``BackendConfig(tools=...)``.
 
@@ -659,7 +694,13 @@ def build_progress_tools(
             },
         )
         async def read_human_feedback(_args: dict[str, Any]) -> dict[str, Any]:
-            entries = read_progress(ctx.path)[HUMAN_FEEDBACK]
+            # Human-authored entries only. In concurrent-review mode the
+            # orchestrator also parks reviewer verdicts in this list, and
+            # those are a downstream agent's voice, not the user's — they
+            # are served by ``read_review_notices`` instead. With
+            # concurrent review off no such entry exists and this filter
+            # is a no-op.
+            entries = read_notices(ctx.path, SOURCE_HUMAN)
             if not entries:
                 text = "# No human_feedback entries yet.\n"
             else:
@@ -668,6 +709,39 @@ def build_progress_tools(
             return {"content": [{"type": "text", "text": text}]}
 
         return read_human_feedback
+
+    # ``read_review_notices`` is the Coder's inbox for verdicts that land
+    # *while its turn is running* (concurrent-review mode). It reads the
+    # same ``human_feedback`` list, filtered to ``source: reviewer``.
+    def _make_review_notices_tool(caller: str):
+        @tool(
+            "read_review_notices",
+            (
+                "Return every review notice the orchestrator has posted for "
+                "you, as YAML text. In concurrent-review mode the Reviewer "
+                "runs at the same time as you against a frozen snapshot of "
+                "the checkout, and its verdict arrives here mid-turn as a "
+                "`REVIEW VERDICT for iteration N: APPROVE|REJECT` entry. "
+                "Poll this at least once mid-turn and once before you end "
+                "your turn: until the verdict lands you must not touch the "
+                "snapshotted checkout."
+            ),
+            {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        )
+        async def read_review_notices(_args: dict[str, Any]) -> dict[str, Any]:
+            entries = read_notices(ctx.path, REVIEWER_NOTICE_SOURCE)
+            if not entries:
+                text = "# No review notices yet — the review is still running.\n"
+            else:
+                text = _yaml_dump(entries)
+            _log_human_feedback_read(caller, len(entries), text)
+            return {"content": [{"type": "text", "text": text}]}
+
+        return read_review_notices
 
     def _make_build_read_tool(caller: str):
         """Like ``_make_read_tool`` but reads from ``build_stage``.
@@ -743,6 +817,14 @@ def build_progress_tools(
         # needs the user's direct voice too — same rationale as QA below.
         plan_reviewer_tools.append(_make_human_feedback_tool("plan_reviewer"))
 
+    coder_tools = [
+        append_coder_progress,
+        _make_read_tool("coder"),
+        _make_human_feedback_tool("coder"),
+    ]
+    if coder_review_notices:
+        coder_tools.append(_make_review_notices_tool("coder"))
+
     # QA intentionally does not get `read_latest_progress`: its verdict
     # must be grounded in ``task.yaml`` and the actual code it builds, not
     # downstream artifacts (plan.md, progress.yaml) that could drift.
@@ -753,11 +835,7 @@ def build_progress_tools(
     return {
         "plan_drafter": plan_drafter_tools,
         "plan_reviewer": plan_reviewer_tools,
-        "coder": [
-            append_coder_progress,
-            _make_read_tool("coder"),
-            _make_human_feedback_tool("coder"),
-        ],
+        "coder": coder_tools,
         "reviewer": [
             append_reviewer_progress,
             _make_read_tool("reviewer"),

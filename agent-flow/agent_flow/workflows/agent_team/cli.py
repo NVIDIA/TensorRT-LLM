@@ -159,6 +159,33 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feedback is absent. Off by default.",
     )
     parser.set_defaults(trigger_replan_with_feedback=False)
+    parser.add_argument(
+        "--concurrent-review",
+        dest="concurrent_review",
+        action="store_true",
+        help="Overlap the Reviewer with the next Coder iteration instead "
+        "of running them strictly in sequence. At the end of coder(i) the "
+        "coder's checkout is frozen at a git ref "
+        "(`refs/agent-flow/review/iter-<i>`); reviewer(i) then runs against "
+        "that commit on a worker thread while coder(i+1) starts "
+        "immediately in a git worktree branched from it. The verdict is "
+        "delivered to the running coder as a `source: reviewer` notice in "
+        "progress.yaml, which it reads with `read_review_notices`. Requires "
+        "a snapshot repo (`review_snapshot_repo` in task.yaml, "
+        "`trtllm_repo_path` as a fallback, or --review-snapshot-repo); "
+        "iterations where the working tree is dirty fall back to a "
+        "sequential review. Off by default.",
+    )
+    parser.set_defaults(concurrent_review=False)
+    parser.add_argument(
+        "--review-snapshot-repo",
+        dest="review_snapshot_repo",
+        type=Path,
+        default=None,
+        help="Git checkout the Coder edits, frozen per iteration for "
+        "--concurrent-review. Overrides the task.yaml keys. Ignored "
+        "without --concurrent-review.",
+    )
     return parser.parse_args(argv)
 
 
@@ -175,6 +202,8 @@ def main(argv: list[str] | None = None, *, prompts: PromptBundle | None = None) 
         build_human_review_enabled=args.build_human_review_enabled,
         replan_on_qa=args.replan_on_qa,
         trigger_replan_with_feedback=args.trigger_replan_with_feedback,
+        concurrent_review=args.concurrent_review,
+        review_snapshot_repo=args.review_snapshot_repo,
         clean=args.clean,
         plan=args.plan,
         acceptance_criteria=args.acceptance_criteria,

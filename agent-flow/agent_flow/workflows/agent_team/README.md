@@ -58,6 +58,8 @@ agent-team --clean \
 | `--plan` | unset | Pre-supply `plan.md` (text or file path). Combined with `--acceptance-criteria` it skips the plan phase entirely; alone it still runs the plan phase so the PlanDrafter generates the missing `acceptance-criteria.md`. Ignored when resuming from a checkpoint — pass `--clean` to start fresh. |
 | `--acceptance-criteria` | unset | Pre-supply `acceptance-criteria.md` (text or file path). Mirrors `--plan`: combined with `--plan` skips the plan phase; alone runs the plan phase to generate `plan.md`. |
 | `--feedback` | unset | Append a human-feedback entry to `progress.yaml`'s `human_feedback` list before the next iteration runs. Value is either the literal feedback text or a path to a file containing it. Intended for resume scenarios: stop the workflow (Ctrl-C), re-run with `--feedback "..."`, and the build-phase agents (coder, reviewer, qa) pick it up via `read_human_feedback` on their next turn. Each invocation appends — prior entries are preserved. |
+| `--concurrent-review` | off | Overlap the Reviewer with the next Coder iteration instead of running them strictly in sequence. See [Concurrent review](#concurrent-review-opt-in-via---concurrent-review). |
+| `--review-snapshot-repo` | unset | The git checkout the Coder edits, frozen once per iteration for `--concurrent-review`. Overrides the `review_snapshot_repo` / `trtllm_repo_path` task keys. Ignored without `--concurrent-review`. |
 
 ## Workflow
 
@@ -137,6 +139,103 @@ With `--plan-human-review` on, a `DRAFT_READY` revision that the
 PlanReviewer APPROVEs runs through the same human-review sub-stage as
 the initial plan, before the next coder iteration starts.
 
+## Concurrent review (opt-in via `--concurrent-review`)
+
+Sequentially the build phase is `coder(i) -> reviewer(i) -> verdict ->
+coder(i+1)`. A reviewer that builds and runs the code can take hours, and
+the Coder — plus any machines it has reserved — is idle for all of it.
+With `--concurrent-review` the two overlap, at a pipeline depth of 1:
+
+1. At the end of `coder(i)` the orchestrator **snapshots** the Coder's
+   checkout: it records `HEAD` and creates the ref
+   `refs/agent-flow/review/iter-<i>` at that commit. The repo comes from
+   `--review-snapshot-repo`, else the task key `review_snapshot_repo`,
+   else `trtllm_repo_path`.
+2. `reviewer(i)` runs **on a worker thread** against that frozen commit.
+   Its prompt says the checkout is frozen at `<hash>`, that the Coder is
+   working elsewhere, and that it must not expect or request changes.
+3. `coder(i+1)` starts **immediately**, with an addendum: a review is in
+   progress against `<hash>`, so it must not touch the snapshotted
+   checkout. It works in a git worktree branched from the snapshot (under
+   the task's `worktrees_dir`, claiming a slot in `worktree_reservations`
+   if configured, otherwise `<repo>/../worktrees`), runs the code from
+   there, and folds its worktree commits back into the main checkout once
+   the verdict arrives.
+4. The verdict is delivered **into the running Coder turn** as a
+   `progress.yaml` notice with `source: reviewer`
+   (`REVIEW VERDICT for iteration i: APPROVE|REJECT, see <path>`). The
+   Coder polls it with the `read_review_notices` MCP tool, which is only
+   registered in this mode. `read_human_feedback` filters these out — they
+   are a downstream agent's voice, not the user's.
+
+### Verdict handling
+
+- **REJECT** — `coder(i+1)` keeps going; it already has the rejection as
+  input. When it ends, snapshot again, launch `reviewer(i+1)`, start
+  `coder(i+2)`.
+- **APPROVE** — `coder(i+1)` is **never killed**; it finishes its turn.
+  Then the pipeline drains: iteration `i+1` gets a *fresh* sequential
+  review on its own snapshot, and only if that pass also approves does
+  the work reach QA. So commits made while a review was running are never
+  carried into QA on the strength of a verdict that never saw them. The
+  cost is one extra review pass whenever an approval lands mid-pipeline;
+  the alternative — shipping unreviewed commits to QA — trades a real
+  correctness gap for that saving, which is not worth it.
+
+`--num-iterations` still caps total coder turns, and the last allowed
+iteration is always reviewed sequentially (there is no next coder turn to
+overlap with).
+
+### When it falls back to sequential
+
+For a given iteration the workflow logs a warning and reviews
+sequentially — correct, just not overlapped — when:
+
+- the working tree is **dirty**. The reviewer can only read committed
+  state, so freezing a dirty tree would have it review something the
+  Coder never produced. The workflow refuses to snapshot rather than
+  review a lie; commit (or stash) and the next iteration overlaps again.
+- no snapshot repo is configured, the path does not exist, or it is not a
+  git checkout.
+
+### Shared-file safety
+
+Two agent turns run at once, so every file both roles write is split:
+
+| File | Change in concurrent mode |
+| --- | --- |
+| `status.md` | Both roles' `update_status` *overwrites* this file. The Reviewer is repointed at a per-iteration `status-review-<i>.md`; the Coder keeps `status.md`. The verdict notice carries the path to the review report. |
+| `progress.yaml` | Append-only but read-modify-written whole, so two appends could lose one another. All appends now serialize on a process-wide lock. The Reviewer also gets its own `ProgressContext`, so the two roles stamp different iteration numbers. |
+| `plan.md`, `acceptance-criteria.md`, `task.yaml` | Read-only for both build-phase roles; unchanged. |
+
+### Resume, and switching a live run over
+
+The checkpoint records which review was in flight
+(`review_in_flight_iteration`) and the exact commit it was reading
+(`review_snapshot_repo` / `_commit` / `_ref`). On restart that review is
+**re-run from the snapshot ref**, so it sees the same tree the
+interrupted run did rather than whatever the checkout has drifted to. If
+the ref is gone, the workflow logs a warning and lets the pipeline review
+the next snapshot instead. These fields are purely additive, so an older
+checkpoint loads unchanged and the schema version stays at 5.
+
+To switch a **running sequential run** to concurrent mode:
+
+1. Wait for the end of a coder step (the checkpoint is written with
+   `stage: reviewer`), then stop the process with Ctrl-C. Stopping
+   mid-reviewer also works — that reviewer turn is simply re-run.
+2. Commit everything in the coder's checkout. A dirty tree is the one
+   thing that silently keeps you on the sequential path.
+3. Re-run the exact same command **without `--clean`**, adding
+   `--concurrent-review` (and `--review-snapshot-repo <path>` if the task
+   file does not name the repo).
+
+Resume-without-`--clean` is the default: `AgentTeamWorkflow.__init__`
+sets `self.resume = self.state_path.is_file()` and only wipes the managed
+files when `clean` is passed, so the restart picks up at the checkpointed
+stage and iteration. Nothing about the workspace files changes when the
+flag is turned on, so the switch is safe at any iteration boundary.
+
 ## Shared workspace files
 
 All agents communicate through files in the workspace — user prompts
@@ -149,6 +248,7 @@ only reference paths, never embed content.
 | `acceptance-criteria.md` | PlanDrafter | PlanReviewer, Coder, Reviewer, QA | Flat markdown checklist (`- [ ] ...`) of **outcome-bound** pass/fail bars distilled from `task.yaml` only — no leaked plan prescriptions. The build's APPROVE gate (Reviewer + QA). Co-approved with `plan.md` (PlanReviewer + human) and immutable post-approval — QA re-verifies every box at runtime. |
 | `progress.yaml` | every agent (append-only); orchestrator on `--feedback` | every agent (via `read_latest_progress`); build-phase agents also via `read_human_feedback` | Structured audit log split into top-level `plan_stage`, `build_stage`, and `human_feedback` lists. Stage entries carry `decision` / `weighted_score` so the orchestrator never has to regex-scrape agent prose. `human_feedback` entries hold user-authored notes injected via `--feedback`. |
 | `status.md` | Coder, Reviewer (overwrite each turn) | Coder, Reviewer | Short rolling scratchpad: current state, execution path, what was tried, what worked, what didn't, pointers for the next step. PlanDrafter / PlanReviewer / QA do not see it. |
+| `status-review-<i>.md` | Reviewer (`--concurrent-review` only) | Coder (via the verdict notice) | The Reviewer's per-iteration rolling snapshot. Exists only in concurrent-review mode, where the Reviewer must not share `status.md` with a Coder that is writing it at the same time. |
 | `.agent_team_state.json` | orchestrator | orchestrator (on resume) | Checkpoint of `stage` + iteration indices. Re-running the workflow against the workspace auto-resumes from it; pass `--clean` to wipe it. |
 
 ## MCP tools
@@ -229,6 +329,8 @@ documentation and the workflow diagram. The source lives in
   per-agent `append_*_progress` / `read_latest_progress` MCP tools.
 - `agent_flow/workflows/agent_team/status.py` — `status.md` rolling scratchpad and the
   `update_status` / `read_status` MCP tools.
+- `agent_flow/workflows/agent_team/concurrent_review.py` — git snapshotting and the
+  prompt addenda for `--concurrent-review`.
 - `agent_flow/workflows/agent_team/state.py` — checkpoint schema for resume (stage +
   iteration indices, persisted to `.agent_team_state.json`).
 

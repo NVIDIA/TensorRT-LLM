@@ -101,6 +101,18 @@ class WorkflowState:
     # the same feedback-triggered framing; cleared when the sub-cycle
     # hands back to the coder or terminates the workflow.
     feedback_replan: bool = False
+    # Concurrent-review bookkeeping (all zero/empty unless the workflow
+    # runs with ``--concurrent-review``). ``review_in_flight_iteration``
+    # is the 1-based iteration whose review was launched but whose
+    # verdict had not been recorded when the checkpoint was written; the
+    # snapshot fields pin the exact commit it was reviewing so a resume
+    # can re-run that review from the frozen tree instead of guessing.
+    # Purely additive with defaults, so a v4/v5 checkpoint written before
+    # these existed loads unchanged and SCHEMA_VERSION stays at 5.
+    review_in_flight_iteration: int = 0
+    review_snapshot_repo: str = ""
+    review_snapshot_commit: str = ""
+    review_snapshot_ref: str = ""
 
 
 def load_state(path: Path) -> WorkflowState:
@@ -126,6 +138,10 @@ def load_state(path: Path) -> WorkflowState:
         done=bool(data.get("done", False)),
         stage=stage,
         feedback_replan=bool(data.get("feedback_replan", False)),
+        review_in_flight_iteration=int(data.get("review_in_flight_iteration", 0)),
+        review_snapshot_repo=str(data.get("review_snapshot_repo", "")),
+        review_snapshot_commit=str(data.get("review_snapshot_commit", "")),
+        review_snapshot_ref=str(data.get("review_snapshot_ref", "")),
     )
 
 
