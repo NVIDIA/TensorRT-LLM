@@ -44,11 +44,14 @@ transforms:
         # "shared_expert_down_proj": "rowwise"
         # gating layer should be replicated as well
         # "gate": "gather"
+  compile_model:
+    # https://github.com/NVIDIA/TensorRT-LLM/issues/13858
+    piecewise_enabled: false
   multi_stream_moe:
     stage: compile
-    enabled: true
+    enabled: false # https://github.com/NVIDIA/TensorRT-LLM/issues/12954
   multi_stream_gemm:
     stage: compile
-    enabled: true
+    enabled: false # https://github.com/NVIDIA/TensorRT-LLM/issues/12954
   gather_logits_before_lm_head:
     enabled: true
