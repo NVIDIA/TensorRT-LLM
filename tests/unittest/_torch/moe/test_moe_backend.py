@@ -156,7 +156,7 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
         _select_explicit_fallback_tactic([])
 
 
-def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts():
+def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts() -> None:
     forward_impl = MagicMock(return_value=torch.empty(1))
     runner = CuteDslFusedMoENvfp4Runner(
         forward_impl=forward_impl,
@@ -179,7 +179,7 @@ def test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts():
     assert forward_impl.call_args.kwargs["use_count_native_expert_metadata"] is True
 
 
-def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens():
+def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens() -> None:
     common_kwargs = {
         "forward_impl": MagicMock(),
         "num_experts": 256,
@@ -197,11 +197,18 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     assert len(direct_config.constraint_specs) == 4
     assert direct_config.inputs_pre_hook is None
     assert direct_runner.unique_id()[-1] == "direct_expert_metadata"
+    direct_dynamic_spec = direct_config.dynamic_tensor_specs[0]
+    expert_capacity_rows = 3 * 257
+    assert direct_dynamic_spec.gen_tuning_buckets(expert_capacity_rows) == (384, 768)
+    assert direct_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 768
 
     legacy_runner = CuteDslFusedMoENvfp4Runner(**common_kwargs)
     legacy_config = legacy_runner.get_tuning_config()
     assert len(legacy_config.dynamic_tensor_specs) == 1
     assert legacy_config.inputs_pre_hook is not None
+    legacy_dynamic_spec = legacy_config.dynamic_tensor_specs[0]
+    assert legacy_dynamic_spec.gen_tuning_buckets(expert_capacity_rows)[-1] == 512
+    assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
 
 
 @pytest.mark.parametrize(
@@ -213,19 +220,16 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     ],
 )
 def test_cutedsl_deep_ep_direct_metadata_disable_env(
-    monkeypatch, disable_value: Optional[str], expected_disabled: bool
-):
+    monkeypatch: pytest.MonkeyPatch,
+    disable_value: Optional[str],
+    expected_disabled: bool,
+) -> None:
     env_name = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
     if disable_value is None:
         monkeypatch.delenv(env_name, raising=False)
     else:
         monkeypatch.setenv(env_name, disable_value)
 
-    def mock_base_init(self, **kwargs):
-        self.aux_stream_dict = {}
-        self.event_dict = {}
-
-    monkeypatch.setattr(CutlassFusedMoE, "__init__", mock_base_init)
     monkeypatch.setattr(torch.cuda, "Stream", MagicMock(return_value=object()))
     monkeypatch.setattr(torch.cuda, "Event", MagicMock(return_value=object()))
 
@@ -234,13 +238,16 @@ def test_cutedsl_deep_ep_direct_metadata_disable_env(
         "num_experts": 8,
         "hidden_size": 64,
         "intermediate_size": 128,
+        "model_config": ModelConfig(skip_create_weights_in_init=True),
     }
 
     backend = CuteDslFusedMoE(**constructor_kwargs)
     assert backend.disable_deep_ep_direct_metadata is expected_disabled
 
 
-def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch):
+def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     is_capturing = MagicMock(side_effect=AssertionError("CPU path queried CUDA capture state"))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", is_capturing)
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
@@ -311,7 +318,9 @@ def test_deep_ep_adapter_free_output_matches_schema_and_reuses_cache(monkeypatch
     assert comm.deep_ep_buffer is None
 
 
-def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(monkeypatch):
+def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", MagicMock(return_value=True))
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)
     comm._adapter_free_placeholder_cache = {}
@@ -343,7 +352,7 @@ def test_deep_ep_adapter_free_cache_miss_rejected_during_capture(monkeypatch):
 )
 def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
     disabled: bool, has_nvfp4: bool, supports_post_quant: bool, expected: bool
-):
+) -> None:
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = disabled
     backend.use_fused_finalize = True
@@ -356,12 +365,12 @@ def test_scheduler_selects_cutedsl_deep_ep_direct_metadata(
     assert backend.can_use_deep_ep_direct_metadata(supports_post_quant) is expected
 
 
-def test_other_backend_rejects_deep_ep_direct_metadata():
+def test_other_backend_rejects_deep_ep_direct_metadata() -> None:
     backend = CutlassFusedMoE.__new__(CutlassFusedMoE)
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
-def test_cutedsl_rejects_direct_metadata_without_fused_finalize():
+def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.disable_deep_ep_direct_metadata = False
     backend.use_fused_finalize = False
@@ -374,7 +383,7 @@ def test_cutedsl_rejects_direct_metadata_without_fused_finalize():
     assert backend.can_use_deep_ep_direct_metadata(True) is False
 
 
-def test_cutedsl_direct_metadata_request_fails_without_fused_finalize():
+def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
     backend.use_fused_finalize = False
     backend.hidden_size = 4
@@ -401,7 +410,9 @@ def test_cutedsl_direct_metadata_request_fails_without_fused_finalize():
 
 
 @pytest.mark.parametrize("disabled,expected", [(False, True), (True, False)])
-def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(disabled: bool, expected: bool):
+def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
+    disabled: bool, expected: bool
+) -> None:
     recv_expert_count = torch.tensor([3, 0, 5], dtype=torch.int32)
     expert_capacity = 8
     comm = DeepEPLowLatency.__new__(DeepEPLowLatency)

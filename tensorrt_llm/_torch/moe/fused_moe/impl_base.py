@@ -240,6 +240,11 @@ class MoEImplBase(
         self, x: "torch.Tensor | Fp4QuantizedTensor", **kwargs: object
     ) -> "tuple[torch.Tensor, torch.Tensor | None] | dict": ...
 
+    def can_use_deep_ep_direct_metadata(self, supports_post_quant_dispatch: bool) -> bool:
+        """Return whether this backend can consume DeepEP counts directly."""
+        del supports_post_quant_dispatch
+        return False
+
     # Narrower than ``MoE.run_moe``, which also takes a keyword-only
     # ``workspace``. Not a drift: the impl already allocates that scratch
     # itself, through ``get_workspaces`` below. What the scheduler still owns is

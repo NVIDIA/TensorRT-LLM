@@ -1230,8 +1230,10 @@ class CuteDslFusedMoE(MoEImplBase):
                     torch.ops.trtllm.moe_output_memset_inplace(
                         input=moe_output,
                         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=
+                        permuted_idx_to_expanded_idx,
                         num_non_exiting_tiles=num_non_exiting_tiles,
                         tile_tokens_dim=tile_size,
                         top_k=effective_top_k,

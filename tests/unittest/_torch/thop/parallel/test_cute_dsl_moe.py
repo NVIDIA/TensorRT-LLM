@@ -39,9 +39,9 @@ from tensorrt_llm._torch.locality_domain_utils import (
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
+    _expert_count_tile_plan,
     _LocalityDomainConcurrentTunableRunner,
     _runner_tactics_match_tile_size,
-    _expert_count_tile_plan,
     cute_dsl_nvfp4_grouped_gemm_ref,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import interleave_linear_and_gate
@@ -283,6 +283,7 @@ def test_moe_sort(num_tokens: int, top_k: int, ep_size: int, tile_size: int):
     get_sm_version() not in (100, 103),
     reason="This test is only supported on SM 100 and SM 103 GPUs",
 )
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
 @pytest.mark.parametrize("tile_size", [128, 256])
 def test_count_native_cutedsl_matches_legacy_sort_bitwise(tile_size: int):
     """Exercise count-native FC1/FC2 against the legacy sort path on the GPU."""
