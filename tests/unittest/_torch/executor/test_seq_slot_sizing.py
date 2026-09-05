@@ -2,32 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Seq-slot pool sizing.
 
-Two independent reasons the pool must exceed max_batch_size:
+Two independent reasons the pool must exceed max_batch_size, both selected
+from runtime topology rather than model architecture:
 
-Attention-DP overlap headroom. Under the overlap scheduler, requests
-finished in the previous iteration still hold their sequence slots when
-the next iteration's prepare_resources runs, while the V2 scheduler has
-already dropped them from its budget
-(no_schedule_after_state=GENERATION_TO_COMPLETE) and backfilled their
-seats. Transient slot demand is therefore 2 * max_batch_size, regardless
-of whether speculative decoding is enabled. This headroom is selected
-from runtime topology rather than model architecture.
+Attention-DP overlap headroom. Requests finished in the previous iteration
+still hold their sequence slots when the next iteration's prepare_resources
+runs, while the V2 scheduler has already dropped them from its budget
+(no_schedule_after_state=GENERATION_TO_COMPLETE) and backfilled their seats.
+Transient slot demand is therefore twice max_batch_size, whether or not
+speculative decoding is enabled.
 
-Disaggregated serving. The pool can never be smaller than the capacity
-the admission path enforces, which on a generation server is
-KVCacheManagerV2's IndexMapper. That is sized at 2 * max_num_sequences so
-a batch in KV transfer can overlap a batch that is generating, and the V2
-scheduler admits disagg_gen_init requests against it rather than against
-the seat pool. Sizing seats below it lets a request be admitted that
-cannot be seated once its transfer lands, which raises NoFreeSlotsError on
-the event-loop thread and deadlocks the job. Unlike the headroom above
-this does not depend on attention-DP, overlap, or PP.
+Disaggregated serving. On a generation server the admission bound is
+KVCacheManagerV2's IndexMapper rather than the seat pool, and it is sized at
+twice max_num_sequences. Unlike the headroom above, this holds regardless of
+attention-DP, overlap, or PP.
 
-compute_max_num_sequences is the single sizing implementation used both
-for the executor's SeqSlotManager pool (create_py_executor_instance) and
-for the sampler state (create_torch_sampler_args). Every other
-slot-indexed buffer -- spec-decode draft_probs, GuidedDecoder per-request
-state -- follows the same number, since py_seq_slot indexes all of them.
+compute_max_num_sequences is the single sizing implementation, used for the
+executor's SeqSlotManager pool and for the sampler state. Every other
+slot-indexed buffer follows the same number, since py_seq_slot indexes them
+all.
 """
 
 from unittest.mock import Mock
@@ -50,7 +43,7 @@ SIZING_CASES = [
     (1, False, True, 2),
     (1, False, False, 1),
     (1, True, True, 1),
-    # Existing PP sizing is preserved regardless of the headroom opt-in.
+    # PP sizing is independent of the headroom opt-in.
     (2, False, True, 2),
     (4, False, True, 4),
     (4, True, False, 4),
@@ -133,8 +126,7 @@ def test_is_disagg_enabled(cache_transceiver_config, expected):
 DISAGG_SIZING_CASES = [
     # Disagg gets the coefficient on topology alone, with no headroom opt-in.
     (1, False, 2),
-    # Disagg and overlap headroom both cover one extra set of in-flight
-    # sequences, so they overlap rather than compose into 4x.
+    # The two factors overlap rather than compose, so this stays 2x.
     (1, True, 2),
     # PP composes: the IndexMapper is likewise sized pp_size * 2.
     (2, False, 4),
@@ -159,8 +151,8 @@ def test_disagg_seats_cover_index_mapper_capacity(
 
     assert seats == max_batch_size * expected_factor
 
-    # The bound that actually matters: seats must cover every request the
-    # admission path can let through. Mirrors KVCacheManagerV2.__init__.
+    # Seats must cover every request admission can let through. Mirrors the
+    # expression in KVCacheManagerV2.__init__.
     index_mapper_capacity = max_batch_size * pp_size * 2
     assert seats >= index_mapper_capacity
 
@@ -182,7 +174,7 @@ def test_disagg_seats_do_not_depend_on_overlap_scheduler(disable_overlap):
 
 
 def test_aggregate_sizing_is_unchanged():
-    """Aggregated deployments keep their established pool size."""
+    """Aggregated deployments size the pool at one forward batch."""
     max_batch_size = 8
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
 
@@ -200,9 +192,8 @@ def test_sizing_matches_kv_manager_admission_bound(pp_size, is_disagg):
     """The two coefficients are computed independently; hold them in step.
 
     KVCacheManagerV2 derives its own admission bound from max_batch_size,
-    pp_size and is_disagg. A drift between that expression and
-    compute_max_num_sequences is the whole bug, so assert them against each
-    other rather than against a literal.
+    pp_size and is_disagg. Assert the two expressions against each other
+    rather than against a literal, so a drift in either one fails here.
     """
     max_batch_size = 8
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)

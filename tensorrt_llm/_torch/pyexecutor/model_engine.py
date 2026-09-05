@@ -360,10 +360,8 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Two independent reasons the pool must exceed one forward batch:
-        # disaggregation admits up to the IndexMapper bound, and attention-DP
-        # under overlap can backfill a batch before the previous batch's
-        # terminal slots are released. Both are known before the model loads.
+        # Both reasons the pool must exceed one forward batch are known from
+        # the runtime topology, before the model loads.
         from ._util import (compute_max_num_sequences, is_disagg_enabled,
                             should_enable_disagg_adp_overlap_headroom,
                             should_enable_dsv4_adp_dummy_fixes)
@@ -2685,10 +2683,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # Slot-indexed metadata buffers must span the whole SeqSlotManager pool,
-        # whatever sizes it: py_seq_slot ranges over [0, max_num_seq_slots), and
-        # that exceeds max_num_requests under PP, attention-DP overlap headroom,
-        # and disaggregated serving alike.
+        # Slot-indexed metadata buffers must span the whole pool, whatever
+        # sizes it.
         num_seq_slots = self.max_num_seq_slots
         if no_cache:
             return get_spec_metadata(

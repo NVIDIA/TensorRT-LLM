@@ -2401,23 +2401,19 @@ def compute_max_num_sequences(mapping: Mapping,
                               is_disagg: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    The pool must seat every request that can hold a slot at once, so it can
-    never be smaller than the capacity the admission path enforces. On a
-    disaggregated generation server that bound is ``KVCacheManagerV2``'s
-    ``IndexMapper``, which the V2 scheduler consults through
-    ``prepare_disagg_gen_init`` and which is deliberately sized at
-    ``2 * max_num_sequences`` so a batch in KV transfer can overlap a batch
-    that is generating. Sizing seats below that admits requests the pool
-    cannot seat: the KV transfer completes, ``add_slot`` finds the pool full
-    and raises, and because that happens on the executor's event-loop thread
-    the rank dies mid-collective and takes the job down with it. Mirroring the
-    coefficient here keeps the two in step.
+    The pool must seat every request the admission path can let through. On a
+    disaggregated generation server that bound is KVCacheManagerV2's
+    IndexMapper, sized at twice max_num_sequences so a batch in KV transfer
+    can overlap a batch that is generating. Seats below that bound let a
+    request be admitted that cannot be seated once its transfer lands, and
+    add_slot then raises on the executor's event-loop thread, killing the rank
+    mid-collective.
 
-    ``enable_overlap_headroom`` is a separate, narrower concern and stays
-    opt-in: disaggregated attention-DP needs a second non-PP slot set because
-    the V2 scheduler can backfill seats before the overlap scheduler releases
-    the previous iteration's terminal slots. Pipeline parallelism already
-    sizes the pool by ``pp_size``.
+    enable_overlap_headroom covers a different case. Disaggregated
+    attention-DP needs a second non-PP slot set because the V2 scheduler can
+    backfill seats before the overlap scheduler releases the previous
+    iteration's terminal slots. Pipeline parallelism already sizes the pool by
+    pp_size.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
@@ -2426,10 +2422,9 @@ def compute_max_num_sequences(mapping: Mapping,
                              and not disable_overlap_scheduler else 1)
     num_seats = max_batch_size * num_micro_batches
     if is_disagg:
-        # Keep in step with the IndexMapper coefficient in
-        # KVCacheManagerV2.__init__. max() rather than another multiplication:
-        # the disagg and overlap-headroom factors both cover one extra set of
-        # in-flight sequences, so they overlap rather than compose.
+        # max() rather than another multiplication: the disagg and
+        # overlap-headroom factors both cover one extra set of in-flight
+        # sequences, so they overlap rather than compose.
         num_seats = max(num_seats, max_batch_size * mapping.pp_size * 2)
     return num_seats
 
@@ -2455,13 +2450,9 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
                                             kv_cache_manager) -> None:
     """Fail at startup if the seat pool is smaller than what admission allows.
 
-    The KV cache manager is the component that decides whether a request may
-    enter the executor, and every request it admits eventually asks
-    ``SeqSlotManager`` for a seat. Should the pool be the smaller of the two,
-    the shortfall does not surface until the offending request arrives, at
-    which point ``add_slot`` raises on the event-loop thread, that rank stops
-    joining collectives, and its peers hang until the hang detector aborts the
-    job. Comparing the two bounds here converts that into a startup failure.
+    Otherwise the shortfall stays invisible until a request that cannot be
+    seated arrives, and it then surfaces as a hang rather than an error.
+    No-op for managers that publish no admission bound.
     """
     admission_bound = getattr(kv_cache_manager, "max_admissible_sequences",
                               None)

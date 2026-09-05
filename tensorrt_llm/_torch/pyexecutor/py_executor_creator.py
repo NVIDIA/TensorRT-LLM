@@ -800,9 +800,8 @@ def create_py_executor(
             if mapping.is_last_pp_rank():
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # GuidedDecoder indexes its per-request state by
-                    # py_seq_slot, so it must span the whole SeqSlotManager
-                    # pool rather than one forward batch.
+                    # Indexed by py_seq_slot, so it must span the whole pool
+                    # rather than one forward batch.
                     "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,

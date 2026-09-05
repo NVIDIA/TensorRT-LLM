@@ -607,12 +607,8 @@ class SpecMetadata:
         if not self.use_rejection_sampling:
             return
 
-        # Slot-indexed buffers span the full SeqSlotManager pool: py_seq_slot
-        # can range over [0, num_seq_slots), which exceeds max_num_requests
-        # under PP, DeepSeek-V4 overlap headroom, and disaggregated serving.
-        # Fall back to max_num_requests when the pool size is unknown (0).
-        # One extra scratch row at index ``slot_capacity``
-        # absorbs CUDA-graph dummy/padding requests (``py_seq_slot is None``).
+        # One extra scratch row past the pool absorbs CUDA-graph dummy and
+        # padding requests, whose py_seq_slot is None.
         slot_capacity = self.num_seq_slots or self.max_num_requests
         num_slot_rows = slot_capacity + 1
 
