@@ -258,6 +258,11 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise RuntimeError(
                 "RPC mode enabled but no rpc_addr provided to RayGPUWorker")
         self.init_rpc_worker(self.global_rank, rpc_addr, hmac_key)
+        # Postprocess parallelism: spawn the local PostprocWorker pool on the
+        # response-producing rank. Outputs re-enter _response_queue via the
+        # collector thread, so the RPC stream needs no protocol change.
+        if self.global_rank == 0 and self.postproc_config.enabled:
+            self.init_postproc_workers()
         self.start_rpc_server()
 
     def setup_engine(self):
@@ -325,6 +330,9 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if hasattr(self, 'shutdown_event'):
             self.shutdown_event.set()
+
+        if getattr(self, '_postproc_pool', None) is not None:
+            self.shutdown_postproc_workers()
 
         if hasattr(self, 'rpc_server') and self.rpc_server is not None:
             logger.info(f"[Rank {self.global_rank}] Shutting down RPC server")

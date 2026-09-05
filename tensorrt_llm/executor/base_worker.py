@@ -105,6 +105,11 @@ class BaseWorker(GenerationExecutor):
             postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor,
         )
+        # GenerationExecutor.__init__ rebuilds postproc_config from the two
+        # fields above, dropping the rest (e.g. post_processor_hook). Workers
+        # that spawn their own postproc pool (RpcWorkerMixin) need the full
+        # configuration, so keep the caller-provided one.
+        self.postproc_config = postproc_config
 
         # inputs
         self._engine = engine
@@ -257,9 +262,20 @@ class BaseWorker(GenerationExecutor):
         assert self.frontend_result_queues is None
         self.result_queue = queue
 
-    def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
-        assert self.result_queue is None
+    def set_postproc_queues(self,
+                            queues: list["IpcQueue"],
+                            *,
+                            coexist_with_result_queue: bool = False) -> None:
+        """ Set the IPC queues for feeding post-processing processes.
+
+        coexist_with_result_queue: the classic proxy gives each PostprocWorker
+        its own push lane to the frontend, so a result_queue must not exist
+        there. Under RPC/Ray orchestration the finished PostprocWorker.Output
+        records are collected back INTO the result queue (the single RPC
+        response stream), so both queues legitimately coexist.
+        """
+        if not coexist_with_result_queue:
+            assert self.result_queue is None
         assert self.frontend_result_queues is None
         self.postproc_queues = queues
 
@@ -1542,6 +1558,35 @@ def _get_logprobs(worker,
     return logprobs_result
 
 
+def _send_rsp_to_postproc(
+        worker, response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
+        postproc_batches: Optional[List[List["PostprocWorker.Input"]]]):
+    """Shard a raw response to the postproc workers (batched or direct put)."""
+    sampling_params, postproc_params, disaggregated_params = (
+        _get_params_for_first_rsp(worker, response.client_id))
+    inp = PostprocWorker.Input(
+        response,
+        # sampling_params is necessary for creating fake GenerationResult
+        # instances in the postproc processes. They are for incremental
+        # detokenize. They should be transmitted only once for each
+        # Request.
+        sampling_params=sampling_params,
+        postproc_params=postproc_params,
+        disaggregated_params=disaggregated_params,
+        streaming=worker._results.get(response.client_id, None)._streaming)
+
+    # Group the responses into buckets for the postprocessing steps.
+    # Bucketing is used instead of random dispatching because the
+    # incremental detokenization during postprocessing relies on the
+    # prior CompletionOutput of a given request.
+    pid = response.client_id % worker.postproc_config.num_postprocess_workers
+
+    if postproc_batches is None:
+        worker.postproc_queues[pid].put(inp)
+    else:
+        postproc_batches[pid].append(inp)
+
+
 def _send_rsp(
         worker,
         response: Union[tllm.Response, ResponseWrapper, ErrorResponse],
@@ -1549,7 +1594,21 @@ def _send_rsp(
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
-    if worker.frontend_result_queues is not None:
+    # Postprocess parallelism takes priority over the direct result routes:
+    # under RPC/Ray orchestration the worker holds a result_queue (the RPC
+    # response stream feed) AND postproc input queues at the same time, and
+    # raw responses must go to the postproc workers first — their finished
+    # Output records re-enter the result_queue via the collector thread
+    # (see RpcWorkerMixin.init_postproc_workers). ErrorResponse records are
+    # exempt when a direct route exists: PostprocWorker reads input.rsp.result,
+    # which they lack, so they ride the result queue instead (the proxy demux
+    # already terminates on them).
+    _error_with_direct_route = (isinstance(response, ErrorResponse)
+                                and (worker.frontend_result_queues is not None
+                                     or worker.result_queue is not None))
+    if postproc_batches is not None and not _error_with_direct_route:
+        _send_rsp_to_postproc(worker, response, postproc_batches)
+    elif worker.frontend_result_queues is not None:
         # Route to the origin frontend's result lane; None/out-of-range ids
         # fall back to lane 0 (see frontend_lane_index).
         if rsp_batch is not None:
@@ -1564,29 +1623,7 @@ def _send_rsp(
         else:
             worker.result_queue.put(response)
     else:
-        sampling_params, postproc_params, disaggregated_params = (
-            _get_params_for_first_rsp(worker, response.client_id))
-        inp = PostprocWorker.Input(
-            response,
-            # sampling_params is necessary for creating fake GenerationResult
-            # instances in the postproc processes. They are for incremental
-            # detokenize. They should be transmitted only once for each
-            # Request.
-            sampling_params=sampling_params,
-            postproc_params=postproc_params,
-            disaggregated_params=disaggregated_params,
-            streaming=worker._results.get(response.client_id, None)._streaming)
-
-        pid = response.client_id % worker.postproc_config.num_postprocess_workers
-
-        if not postproc_batches:
-            # Group the responses into buckets for the postprocessing steps.
-            # Bucketing is used instead of random dispatching because the
-            # incremental detokenization during postprocessing relies on the
-            # prior CompletionOutput of a given request.
-            worker.postproc_queues[pid].put(inp)
-        else:
-            postproc_batches[pid].append(inp)
+        _send_rsp_to_postproc(worker, response, None)
 
     # Eliminate the finished GenerationRequest instances timely, which may
     # take considerable memory.
