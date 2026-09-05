@@ -739,14 +739,14 @@ def _update_kv_cache_draft_token_location(
     scheduled_batch: ScheduledRequests,
     attn_metadata: "AttentionMetadata",
     kv_cache_dtype_byte_size: float,
-):
+    include_finished_requests: bool = False,
+) -> None:
     run_kv_cache_relocation = False
     for request in scheduled_batch.generation_requests:
-        if request.state != LlmRequestState.GENERATION_COMPLETE:
-            if (
-                request.py_num_accepted_draft_tokens > 0
-                and len(request.py_num_accepted_draft_tokens_indices) > 0
-            ):
+        if (
+            request.state != LlmRequestState.GENERATION_COMPLETE or include_finished_requests
+        ) and request.py_num_accepted_draft_tokens > 0:
+            if len(request.py_num_accepted_draft_tokens_indices) > 0:
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
         return
@@ -2882,16 +2882,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
-        """Beam-0 tokens for block reuse, in the form the active backend consumes.
+        """Return a zero-copy beam-0 token view for block reuse.
 
-        The C++ backend ingests a zero-copy int32 view (get_tokens_view) — no per-token
-        PyLong allocation. The pure-Python backend cannot consume a numpy array, so it gets
-        a plain list (get_tokens), preserving pre-optimization behavior. ``_cpp_introspection``
-        is None exactly when the Python backend is active.
+        The C++ backend consumes this view directly. The pure-Python backend materializes only
+        the selected chunk in ``_augment_tokens_for_block_reuse``.
         """
-        if _cpp_introspection is not None:
-            return req.get_tokens_view(DEFAULT_BEAM_INDEX)
-        return req.get_tokens(DEFAULT_BEAM_INDEX)
+        return req.get_tokens_view(DEFAULT_BEAM_INDEX)
 
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
@@ -2922,7 +2918,10 @@ class KVCacheManagerV2(BaseResourceManager):
             or req.multimodal_positions is None
             or req.multimodal_lengths is None
         ):
-            return tokens[chunk_start:chunk_end] if is_sliced else tokens
+            chunk = tokens[chunk_start:chunk_end] if is_sliced else tokens
+            if _cpp_introspection is None and hasattr(chunk, "tolist"):
+                return chunk.tolist()
+            return chunk
 
         # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
         # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
@@ -3698,8 +3697,47 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-        if request.context_remaining_length == 0:
+        keep_committing = self._can_commit_generation_blocks(request)
+        if request.context_remaining_length == 0 and not keep_committing:
             kv_cache.stop_committing()
+
+    def _can_commit_generation_blocks(self, request: LlmRequest) -> bool:
+        """Whether decode KV remains a valid reusable logical prefix."""
+        return (
+            self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and not self.kv_compression_manages_history
+            and not self.is_draft
+            and not request.is_dummy_request
+            and not request.is_context_only_request
+        )
+
+    def try_commit_generation_blocks(self, request: LlmRequest) -> None:
+        """Commit the stable KV prefix produced by generation forwards."""
+        should_commit = (
+            self._can_commit_generation_blocks(request)
+            and request.state != LlmRequestState.CONTEXT_INIT
+        )
+        if not should_commit:
+            return
+
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return
+
+        # The newest sampled token has no KV until the next forward pass.
+        stable_token_count = request.max_beam_num_tokens - 1
+        is_end = request.state == LlmRequestState.GENERATION_COMPLETE
+        if stable_token_count > kv_cache.num_committed_tokens:
+            tokens = self._augment_tokens_for_block_reuse(
+                self._reuse_token_source(request),
+                request,
+                start=kv_cache.num_committed_tokens,
+                end=stable_token_count,
+            )
+            kv_cache.commit(tokens, is_end=is_end)
+        elif is_end:
+            kv_cache.commit([], is_end=True)
 
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
@@ -4100,7 +4138,11 @@ class KVCacheManagerV2(BaseResourceManager):
     ):
         if not self.is_draft:
             _update_kv_cache_draft_token_location(
-                self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size
+                self,
+                scheduled_batch,
+                attn_metadata,
+                kv_cache_dtype_byte_size,
+                include_finished_requests=True,
             )
         # Context request KV cache updates are handled by
         # update_context_resources, called separately from the executor loop.
@@ -4143,6 +4185,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
+            self.try_commit_generation_blocks(req)
 
     def copy_batch_block_offsets(
         self,

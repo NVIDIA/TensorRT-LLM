@@ -3343,10 +3343,11 @@ class PyExecutor:
 
                 scheduled_requests = executed_batch.scheduled_requests
                 if self._is_kv_manager_v2:
-                    # Finalize V2 context KV before disagg transfer/response
-                    # handling can terminate the request.
+                    # Finalize V2 KV before transfer/response handling can
+                    # terminate the request.
                     self.kv_cache_manager.update_context_resources(
                         scheduled_requests)
+                    self._update_v2_generation_resources(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3364,8 +3365,10 @@ class PyExecutor:
                                                    'kv_cache_dtype_byte_size',
                                                    None)
                 self.resource_manager.update_resources(
-                    sample_state_scheduled_requests, attn_metadata,
-                    kv_cache_dtype_byte_size)
+                    sample_state_scheduled_requests,
+                    attn_metadata,
+                    kv_cache_dtype_byte_size,
+                    skip_kv_cache_manager=self._is_kv_manager_v2)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -4506,10 +4509,11 @@ class PyExecutor:
                             iteration_id=self.iter_counter)
 
                     if self._is_kv_manager_v2:
-                        # Finalize V2 context KV before disagg transfer/response
-                        # handling can terminate the request.
+                        # Finalize V2 KV before transfer/response handling can
+                        # terminate the request.
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
+                        self._update_v2_generation_resources(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -4526,8 +4530,10 @@ class PyExecutor:
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
                     self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
+                        scheduled_batch,
+                        attn_metadata,
+                        kv_cache_dtype_byte_size,
+                        skip_kv_cache_manager=self._is_kv_manager_v2)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -5535,19 +5541,33 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    def _update_v2_generation_resources(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        if not self._is_kv_manager_v2:
+            return
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
+        self.kv_cache_manager.update_resources(scheduled_requests,
+                                               attn_metadata,
+                                               kv_cache_dtype_byte_size)
+
     def _process_previous_batch(self):
         self._handle_canceled_requests()
+        scheduled_requests = self.previous_batch.scheduled_requests
+        self._update_v2_generation_resources(scheduled_requests)
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
         finished_requests = self._handle_responses(
             emit_first_iter=not self.enable_early_first_token_response)
-        scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
-        self.resource_manager.update_resources(scheduled_requests,
-                                               attn_metadata,
-                                               kv_cache_dtype_byte_size)
+        self.resource_manager.update_resources(
+            scheduled_requests,
+            attn_metadata,
+            kv_cache_dtype_byte_size,
+            skip_kv_cache_manager=self._is_kv_manager_v2)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 

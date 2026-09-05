@@ -244,7 +244,34 @@ class TestResourceManagerAPI:
         with patch.object(kv_cache_v2_module, "_update_kv_cache_draft_token_location") as relocate:
             manager.update_resources(batch, metadata, 2.0)
 
-        relocate.assert_called_once_with(target, batch, metadata, 2.0)
+        relocate.assert_called_once_with(
+            target, batch, metadata, 2.0, include_finished_requests=True
+        )
+
+    def test_update_can_skip_only_target_kv_cache_manager(self):
+        calls = []
+        metadata = MagicMock(name="attention_metadata")
+        draft = MagicMock(name="draft_kv_cache_manager")
+        target = MagicMock(name="target_kv_cache_manager")
+        compression = MagicMock(name="compression_manager")
+        draft.update_resources.side_effect = lambda *args: calls.append(("draft", args))
+        target.update_resources.side_effect = lambda *args: calls.append(("target", args))
+        compression.update_resources.side_effect = lambda *args: calls.append(("compression", args))
+        manager = ResourceManager(
+            {
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+                ResourceManagerType.KV_CACHE_MANAGER: target,
+                ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER: compression,
+            }
+        )
+        batch = _batch(generation=[_req(1)])
+
+        manager.update_resources(batch, metadata, 2.0, skip_kv_cache_manager=True)
+
+        assert calls == [
+            ("draft", (batch,)),
+            ("compression", (batch,)),
+        ]
 
     def test_prepare_fires_init_on_first_chunk_only(self, fake_kv_cache_manager):
         rec = []
