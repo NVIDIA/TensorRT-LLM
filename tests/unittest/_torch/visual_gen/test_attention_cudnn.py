@@ -193,3 +193,51 @@ def test_cudnn_backend_wires_validated_recipes():
     assert attention.recipe == "mxfp8"
     assert attention.preferred_layout == AttentionTensorLayout.NHD
     assert attention.support_lse() and not attention.support_fused_qkv()
+
+
+@pytest.mark.parametrize("num_kv_heads", [8, 2], ids=["mha", "gqa"])
+def test_cudnn_fp8_attention_with_fused_qkv(num_kv_heads):
+    """Packed Q/K/V are quantized through the shared-scale path; separate ones are not.
+
+    The shared scale shifts the output slightly, so the two paths are compared at the
+    suite's FP8 tolerance rather than for equality.
+    """
+    _require_cudnn("fp8")
+    device = torch.device("cuda")
+    batch, num_heads, seq_len, head_dim = 1, 8, 256, 64
+    q_dim, kv_dim = num_heads * head_dim, num_kv_heads * head_dim
+
+    # Q/K/V as views into one buffer, the way get_qkv splits under FUSE_QKV.
+    torch.manual_seed(0)
+    qkv = torch.randn(batch, seq_len, q_dim + 2 * kv_dim, device=device, dtype=torch.bfloat16)
+    q, k, v = (
+        x.view(batch, seq_len, -1, head_dim) for x in qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+    )
+
+    assert CuDNNAttention._is_fused_qkv(q, k, v)
+    fused_qkv = CuDNNAttention._as_fused_qkv(q, k, v)
+    assert fused_qkv.data_ptr() == qkv.data_ptr(), "fused view must alias, not copy"
+    torch.testing.assert_close(fused_qkv, qkv, atol=0.0, rtol=0.0)
+
+    # Cloning breaks the shared storage, so equal values take the per-tensor path.
+    separate = tuple(x.contiguous() for x in (q, k, v))
+    assert not CuDNNAttention._is_fused_qkv(*separate)
+
+    attention = CuDNNAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+        dtype=torch.bfloat16,
+        quant_attention_config=RECIPES["fp8"],
+    )
+    fused_out = attention.forward(q, k, v)
+    separate_out = attention.forward(*separate)
+    ref_out, _ = _reference(q, k, v, is_causal=False)
+
+    for what, a, b in (
+        ("fused vs reference", fused_out.float(), ref_out),
+        ("separate vs reference", separate_out.float(), ref_out),
+        ("fused vs separate", fused_out.float(), separate_out.float()),
+    ):
+        cosine = F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item()
+        assert cosine > MIN_COSINE["fp8"], f"{what}: cosine similarity {cosine} too low"
