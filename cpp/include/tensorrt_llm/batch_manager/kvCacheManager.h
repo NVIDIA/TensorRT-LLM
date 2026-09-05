@@ -1005,8 +1005,6 @@ public:
     //! whether a subsequent refreshBlocks()/syncTransfers() is necessary.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest, bool pinBlocks = false);
 
@@ -1561,15 +1559,6 @@ public:
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
 
-    //! \brief Calculate the proportional share each window size receives of the total memory pool
-    //! \details Example:       (uniqueWindowSizeToLayers={1024: [1], 4096: [0, 4, 5], 8192: [2, 3]})
-    //!          Would Return:  {1024: 0.0345, 4096: 0.4138, 8192: 0.5517} [sums to 1.0].
-    //!          See: TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare).
-    //! \return Map<windowSize, share> where share is a float between 0 and 1. Shares sum to 1.0.
-    static std::map<SizeType32, float> calculateWindowSizeToShare(
-        std::map<SizeType32, std::vector<SizeType32>> const& uniqueWindowSizeToLayers,
-        std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize);
-
     void allocatePools(bool useUvm);
 
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
@@ -1579,14 +1568,10 @@ public:
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
         bool isEnableBlockReuse);
 
-    void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
     //! \brief According to request's current position, copy data from the last full block to the next block (ignoring
     //! the placeholder block). It should be called after every context chunk is processed.
     //! \return true iff at least one async block transfer was actually issued.
     bool copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
@@ -1603,9 +1588,6 @@ public:
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
-        SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
     //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
@@ -1943,9 +1925,6 @@ public:
     //! \brief Update cache offsets for blocks initiated from sequence
     void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
 
-    //! \brief Update cache offsets for block at index
-    void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-
     //! \brief Add/detach block(s) to/from the sequence if needed
     //! \details When we need a new block, we add it. For sliding window
     //! attention (SWA), when a block goes out-of-window (OOW), we detach it
@@ -2211,13 +2190,6 @@ public:
     /// @return Map from window size to vector of layer indices that use that window size
     [[nodiscard]] static std::map<SizeType32, std::vector<SizeType32>> groupLayersByWindowSize(
         std::vector<SizeType32> const& maxAttentionWindowVec, SizeType32 numLayers);
-
-    /// @brief Calculate the free memory available for KV cache allocation.
-    /// @param bufferManager Buffer manager for memory operations
-    /// @param config KV cache configuration parameters
-    /// @return Tuple containing the {.freePrimaryMemBytes, .freeSecondaryMemBytes}
-    [[nodiscard]] static std::tuple<uint64_t, uint64_t> calculateFreeMemBytes(
-        runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config);
 
     /// @brief Calculate the maximum number of KV cache blocks that can be allocated based on available GPU memory.
     /// @details This function computes how many blocks each WindowBlockManager should receive based on the weighted
