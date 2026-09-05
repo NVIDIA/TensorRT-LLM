@@ -536,6 +536,27 @@ class ModelLoaderMetricNames(Enum):
     POST_LOAD_PROCESSING_SECONDS = "post_load_processing_seconds"
 
 
+def _checkpoint_startup_metadata(
+    checkpoint_loader: BaseCheckpointLoader,
+    load_format: LoadFormat | str,
+) -> dict[str, str]:
+    """Describe the concrete checkpoint source selected for this load."""
+    weight_loader = getattr(checkpoint_loader, "weight_loader", None)
+    source_kind = getattr(checkpoint_loader, "checkpoint_format", None)
+    load_format_name = getattr(load_format, "name", load_format)
+    return {
+        "checkpoint_loader_kind":
+        type(checkpoint_loader).__name__,
+        "checkpoint_weight_loader_kind":
+        (type(weight_loader).__name__
+         if weight_loader is not None else "unknown"),
+        "checkpoint_source_kind":
+        str(source_kind or "unknown"),
+        "load_format":
+        str(load_format_name).lower(),
+    }
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -644,11 +665,17 @@ class ModelLoader:
         self._gms_backend = None
         # Mostly weight loading and processing time metrics, updated when load() is called.
         self._metrics: dict[str, float] = {}
+        self._startup_metadata: dict[str, str] = {}
 
     @property
     def metrics(self) -> dict[str, float]:
         """Return weight loading and processing time metrics."""
         return self._metrics
+
+    @property
+    def startup_metadata(self) -> dict[str, str]:
+        """Return checkpoint-source metadata captured by the latest load."""
+        return self._startup_metadata
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -805,6 +832,8 @@ class ModelLoader:
         post_transform_config_identity = PostTransformConfigIdentity.from_model_config(
             config)
         load_format = self.llm_args.load_format
+        self._startup_metadata = _checkpoint_startup_metadata(
+            checkpoint_loader, load_format)
 
         with timing_metric(
                 ModelLoaderMetricNames.TOTAL_MODEL_LOADING_SECONDS.value,

@@ -2070,7 +2070,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'BUILD_URL',
                     'JOB_NAME',
                     'globalVars',
-                    'gitlabCommit'
+                    'gitlabCommit',
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
