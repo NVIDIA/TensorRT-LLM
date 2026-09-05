@@ -254,6 +254,34 @@ class FlashInferWrappers:
     decode_block_table_active_width: int = field(default=0, repr=False)
 
 
+# Field order of the plan-info vector returned by FlashInfer's FA2
+# batch-prefill plan (``PrefillPlanInfo::ToVector``,
+# include/flashinfer/attention/scheduler.cuh). The decode plan returns a
+# 10-entry vector with a different order, so the length identifies the layout.
+_FI_PREFILL_PLAN_INFO_LEN = 15
+_FI_PLAN_PADDED_BATCH_SIZE = 0
+_FI_PLAN_CTA_TILE_Q = 3
+_FI_PLAN_V_OFFSET = 10
+_FI_PLAN_S_OFFSET = 11
+_FI_PLAN_SPLIT_KV = 14
+_FI_SIZEOF_FLOAT = 4
+
+# The value a split-KV partial's log-sum-exp must hold for the merge to ignore
+# it. The merge runs ``st.merge(v, s, 1)`` from an initial state of m = -inf,
+# d = 1 (state.cuh), i.e. m = max(m, s), then d += exp2(s - m) and
+# o += v * exp2(s - m).
+#
+# Zero is not neutral: against a real partial with lse 3 it drags the merged
+# value from 5.0 to 4.44, and with lse -2 down to 1.0, because exp2(0 - m) is
+# comparable to the real weight. -inf is not neutral either, it is fatal: if
+# such an entry is merged while the state is still at its m = -inf init,
+# exp2(-inf - -inf) is NaN and the row is poisoned for good -- the very
+# failure this scratch handling exists to prevent. A large negative *finite*
+# value is neutral on both counts: m becomes finite immediately, exp2(s - m)
+# underflows to 0 against any real partial, and no NaN is reachable.
+_FI_NEUTRAL_LSE = -3.0e38
+
+
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
@@ -964,6 +992,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,
             )
+            # This buffer is run scratch: FlashInfer carves per-tile partial
+            # outputs and log-sum-exps out of it for split-KV attention and
+            # merges them afterwards. The merge can cover a tile the attention
+            # kernel did not write, so uninitialized contents reach the
+            # attention result. Zero it once so the first pass cannot read
+            # whatever the allocation happened to land on;
+            # _zero_planned_split_kv_scratch() below keeps later passes clean.
+            self.workspace_buffer.zero_()
 
         self.paged_kv_indptr_decode = torch.empty((self.max_num_requests + 1, ),
                                                   device='cuda',
@@ -1470,6 +1506,59 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # float workspace is run scratch.
                 wrappers.is_planned = False
                 self._plan_with_params(plan_params)
+
+    def zero_planned_split_kv_scratch(self, wrapper, num_qo_heads: int,
+                                      head_dim_vo: int) -> None:
+        """Reset the split-KV partials the wrapper's current plan will use.
+
+        With split-KV the attention kernel writes a partial output (``tmp_v``)
+        and a log-sum-exp (``tmp_s``) per scheduled tile into the shared float
+        workspace, and a merge pass combines them. A tile the merge covers
+        that this pass's attention kernel did not write returns whatever the
+        buffer already held -- an earlier, differently shaped plan's partials,
+        whose log-sum-exps can carry ``-inf`` for chunks with no keys in the
+        attention window. Merging those yields a non-finite attention row.
+        Non-finite outputs have been observed this way under CUDA graphs with
+        changing batch composition.
+
+        Zeroing the workspace once at allocation only covers the first pass,
+        so the reset has to happen per pass. Only this plan's extent is
+        touched: a few MB out of the 320 MB workspace.
+
+        Call this immediately before ``wrapper.run()``, not after the plan: a
+        CUDA graph is captured around the run and replayed without
+        re-planning, so a reset placed at plan time would execute once and
+        every replay would attend over whatever the previous replay left.
+        Placed here it is captured into the graph and re-runs on each replay.
+        Plan reuse (a wrapper kept planned across steps) is fine for the same
+        reason -- the extent is read from the wrapper's live plan info, and
+        everything it depends on is fixed for the life of a captured graph.
+        """
+        plan_info = getattr(wrapper, "_plan_info", None)
+        if plan_info is None or self.workspace_buffer is None:
+            return
+        plan_info = list(plan_info)
+        # The FA2 batch-prefill plan returns 15 entries; the batch-decode plan
+        # returns 10 in a different order, so the length picks out the layout.
+        if len(plan_info) != _FI_PREFILL_PLAN_INFO_LEN:
+            return
+        if not plan_info[_FI_PLAN_SPLIT_KV]:
+            # No split, no partials and no merge.
+            return
+        num_tiles = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
+                     plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
+        v_offset = plan_info[_FI_PLAN_V_OFFSET]
+        s_offset = plan_info[_FI_PLAN_S_OFFSET]
+        v_bytes = num_tiles * head_dim_vo * _FI_SIZEOF_FLOAT
+        s_bytes = num_tiles * _FI_SIZEOF_FLOAT
+        # workspace_buffer is uint8, so these are byte ranges. Both offsets are
+        # 16-byte aligned by FlashInfer's allocator, so the float view is safe.
+        # tmp_v is a partial output and contributes nothing once its weight is
+        # zero; tmp_s is that weight and needs the neutral sentinel instead
+        # (see _FI_NEUTRAL_LSE for why neither 0 nor -inf will do).
+        self.workspace_buffer[v_offset:v_offset + v_bytes].zero_()
+        self.workspace_buffer[s_offset:s_offset + s_bytes].view(
+            torch.float32).fill_(_FI_NEUTRAL_LSE)
 
     def prepare(self) -> None:
 
@@ -2490,6 +2579,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     attention_mask_data=attention_mask_data,
                 )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
+            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
+                                                   self.head_dim)
             if isinstance(wrapper,
                           flashinfer.BatchPrefillWithPagedKVCacheWrapper):
                 wrapper.run(
@@ -2553,12 +2644,16 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_prefill_wrapper(plan_params)
+            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
+                                                   self.head_dim)
             wrapper.run(q[:num_ctx_tokens],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
         def decode_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_decode_wrapper(plan_params)
+            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
+                                                   self.head_dim)
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
