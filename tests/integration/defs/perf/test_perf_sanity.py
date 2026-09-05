@@ -26,7 +26,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 import pytest
 import yaml
@@ -605,8 +605,8 @@ MINIMIZE_METRICS = [
     "d_mean_itl",
     "d_median_itl",
     "d_p99_itl",
-    # TPOT is "Time per Output Token (ms)": benchmark_serving computes it as
-    # (e2e_latency - ttft) / (output_len - 1), so it is a latency like its
+    # TPOT is "Time per Output Token (ms)" -- benchmark_serving computes it as
+    # (e2e_latency - ttft) / (output_len - 1) -- so it is a latency like its
     # ttft/itl/e2el siblings, not a rate (https://nvbugs/6706765).
     "d_mean_tpot",
     "d_median_tpot",
@@ -757,6 +757,95 @@ def publish_addr_file(path: str, host: str, port: int) -> None:
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+# Environment variables that identify THIS process as a rank of an already-running
+# MPI job, or that wire it to that job's daemon/PMIx server. A child that imports
+# tensorrt_llm is a fresh top-level process, but the import itself runs
+# MPI_Init_thread (tensorrt_llm/_utils.py does `from mpi4py import MPI` at module
+# scope), so inheriting any of these makes its mpi4py try to (re-)join the
+# launcher's job and abort on a NULL communicator. For the server that happens
+# before launch_server can bind its socket and publish --report_addr, leaving
+# wait_for_reported_addr with only an exit code to report; the benchmark client
+# dies the same way with an empty results log (https://nvbugs/6706765).
+#
+# Deliberately NARROWER than the library's own split_mpi_env(), which drops every
+# OMPI_* and SLURM_* var: some of those describe the *allocation* rather than this
+# process's place in it, and the child's own MPI_Comm_spawn sizes itself through
+# them (OMPI_MCA_rmaps_* / OMPI_MCA_hwloc_* placement policy; SLURM_NODELIST and
+# SLURM_TASKS_PER_NODE, which OMPI's Slurm resource allocator requires by name).
+# Dropping those too only moves the failure to "could not spawn processes", so
+# identity and session wire-up go while the allocation description stays.
+#
+# OMPI_MCA_ess=^singleton and OMPI_MCA_pmix=^s1,s2,cray,isolated look like inert
+# tuning but are NEGATED component lists forbidding exactly the standalone
+# components a fresh top-level process must select, so both have to go;
+# OMPI_MCA_ess* also carries the jobid/vpid this process was assigned.
+_MPI_IDENTITY_ENV_PREFIXES = (
+    "OMPI_COMM_WORLD_",
+    "OMPI_MCA_ess",
+    "OMPI_MCA_pmix",
+    "OMPI_MCA_orte_",
+    "OMPI_APP_CTX_",
+    "OMPI_NUM_APP_CTX",
+    "OMPI_UNIVERSE_SIZE",
+    "OMPI_FIRST_RANKS",
+    "OMPI_FILE_LOCATION",
+    "OMPI_ARGV",
+    "OMPI_COMMAND",
+    "PMIX_",
+    "PMI_",
+)
+
+# Slurm's per-rank identity and the srun step back-channel: their presence is
+# what makes OMPI conclude it was direct-launched by srun and demand the job's
+# PMI server. Spelled out by exact name rather than by a "SLURM_STEP" prefix,
+# because that prefix would also take SLURM_STEP_GPUS -- a GPU *allocation* fact,
+# not an identity, and so covered by the keep-rule above.
+_SLURM_IDENTITY_ENV_NAMES = frozenset(
+    {
+        "SLURM_PROCID",
+        "SLURM_LOCALID",
+        "SLURM_NODEID",
+        "SLURM_GTIDS",
+        "SLURM_TASK_PID",
+        "SLURM_STEPID",
+        "SLURM_STEP_ID",
+        "SLURM_STEP_NODELIST",
+        "SLURM_STEP_NUM_NODES",
+        "SLURM_STEP_NUM_TASKS",
+        "SLURM_STEP_TASKS_PER_NODE",
+        "SLURM_STEP_LAUNCHER_PORT",
+        "SLURM_SRUN_COMM_HOST",
+        "SLURM_SRUN_COMM_PORT",
+        "SLURM_LAUNCH_NODE_IPADDR",
+    }
+)
+
+
+def trtllm_child_env(env: Mapping[str, str]) -> Dict[str, str]:
+    """``env`` minus the MPI/PMIx/Slurm rank identity of whatever launched pytest.
+
+    Applied to every child this module ``Popen``s that imports ``tensorrt_llm``:
+    the servers AND the benchmark client, for the reason given above the two
+    constant lists. The library applies the same discipline before ``Popen``ing
+    its own children (``split_mpi_env`` in ``tensorrt_llm/commands/serve.py``, the
+    ``mpi_blacklist`` subshell in ``tensorrt_llm/llmapi/trtllm-llmapi-launch``),
+    so this is that policy at the harness's own launch sites, not a new one.
+
+    A no-op in CI, where pytest's environment is already clean by the time it
+    starts -- ``jenkins/scripts/slurm_run.sh`` unsets these families for
+    single-node stages and the disagg BENCHMARK / DISAGG_SERVER roles, and the
+    multi-node roles reach pytest through ``trtllm-llmapi-launch``. Closing the
+    hole here makes a lane reproduced by hand under ``mpirun``/``srun``, or any
+    future caller reaching pytest without one of those wrappers, behave the way CI
+    does instead of dying in the child's MPI_Init.
+    """
+    return {
+        k: v
+        for k, v in env.items()
+        if not k.startswith(_MPI_IDENTITY_ENV_PREFIXES) and k not in _SLURM_IDENTITY_ENV_NAMES
+    }
 
 
 def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) -> str:
@@ -1483,7 +1572,7 @@ class AggrTestCmds(NamedTuple):
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
-            server_env = copy.deepcopy(os.environ)
+            server_env = trtllm_child_env(os.environ)
             if server_idx < len(self.server_configs):
                 server_env.update(self.server_configs[server_idx].to_env())
             with open(server_file_path, "w") as server_ctx:
@@ -1520,7 +1609,7 @@ class AggrTestCmds(NamedTuple):
                     )
                     print_info(f"Starting client. cmd is {client_cmd_with_port}")
 
-                    client_env = copy.deepcopy(os.environ)
+                    client_env = trtllm_child_env(os.environ)
                     if client_config:
                         client_env.update(client_config.to_env())
                     output = _run_benchmark_with_log(
@@ -1965,7 +2054,7 @@ class DisaggTestCmds(NamedTuple):
                     self.test_output_dir,
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
-                worker_env = copy.deepcopy(os.environ)
+                worker_env = trtllm_child_env(os.environ)
                 if worker_cfg is not None:
                     worker_env.update(worker_cfg.to_env())
                 with open(server_file_path, "w") as server_ctx:
@@ -2004,7 +2093,7 @@ class DisaggTestCmds(NamedTuple):
                     self.test_output_dir,
                     f"trtllm-serve.{self.disagg_serving_type}.{server_idx}.log",
                 )
-                disagg_env = copy.deepcopy(os.environ)
+                disagg_env = trtllm_child_env(os.environ)
                 if configs_for_idx is not None:
                     _, _, disagg_cfg = configs_for_idx
                     disagg_env.update(to_env_dict(disagg_cfg.server_env_var))
@@ -2078,7 +2167,7 @@ class DisaggTestCmds(NamedTuple):
                                 self.test_output_dir, self.num_gen_servers
                             )
 
-                        bench_env = copy.deepcopy(os.environ)
+                        bench_env = trtllm_child_env(os.environ)
                         if client_config:
                             bench_env.update(client_config.to_env())
                         # Keep aiperf's artifacts (its own logs included) with

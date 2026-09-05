@@ -725,3 +725,94 @@ def test_a_tpot_baseline_tracks_the_steady_state_not_the_worst_day() -> None:
 
     assert baseline == pytest.approx(5.0, abs=0.2)
     assert as_maximize > baseline * 1.4
+
+
+# One rank identity as an MPI launcher actually exports it, measured under
+# `mpirun -np 1` inside the CI container image. Spelled out rather than read from
+# os.environ so the test says the same thing on a developer laptop.
+_LAUNCHER_IDENTITY = {
+    "OMPI_COMM_WORLD_RANK": "0",
+    "OMPI_COMM_WORLD_SIZE": "1",
+    "OMPI_COMM_WORLD_LOCAL_RANK": "0",
+    "OMPI_MCA_ess": "^singleton",
+    "OMPI_MCA_ess_base_jobid": "3826286593",
+    "OMPI_MCA_pmix": "^s1,s2,cray,isolated",
+    "OMPI_MCA_orte_hnp_uri": "3826286592.0;tcp://10.0.0.1:39633",
+    "OMPI_MCA_orte_local_daemon_uri": "3826286592.0;tcp://10.0.0.1:39633",
+    "OMPI_MCA_orte_precondition_transports": "0000000000000000-0000000000000000",
+    "OMPI_UNIVERSE_SIZE": "1",
+    "PMIX_RANK": "0",
+    "PMIX_NAMESPACE": "3826286593",
+    "PMIX_SERVER_URI21": "3826286592.0;tcp4://127.0.0.1:39633",
+    "SLURM_PROCID": "0",
+    "SLURM_LOCALID": "0",
+    "SLURM_STEPID": "33",
+    "SLURM_SRUN_COMM_HOST": "10.0.0.1",
+}
+
+# What the same environment says about the ALLOCATION rather than about this
+# process's place in it. The child runs its own MPI_Comm_spawn, and OMPI's Slurm
+# resource allocator reads SLURM_NODELIST / SLURM_TASKS_PER_NODE by name to size
+# it, so stripping these converts the bug into MPI_ERR_SPAWN instead of fixing it.
+_ALLOCATION_FACTS = {
+    "SLURM_NODELIST": "node-gpu-2",
+    "SLURM_TASKS_PER_NODE": "1",
+    "SLURM_NTASKS": "1",
+    "SLURM_NNODES": "1",
+    "SLURM_JOB_ID": "1871020",
+    "SLURM_JOB_NODELIST": "node-gpu-2",
+    "SLURM_STEP_GPUS": "0",
+    "SLURM_GPUS_ON_NODE": "1",
+    "OMPI_MCA_rmaps_base_oversubscribe": "1",
+    "OMPI_MCA_hwloc_base_binding_policy": "none",
+    "OMPI_MCA_plm_slurm_args": "--external-launcher",
+}
+
+
+def test_trtllm_child_env_drops_every_launcher_identity_variable() -> None:
+    """A child that imports tensorrt_llm must not inherit its launcher's identity.
+
+    tensorrt_llm/_utils.py does `from mpi4py import MPI` at module scope, so
+    MPI_Init_thread runs on import. With any of these present the child tries to
+    (re-)join the launcher's job and aborts on a NULL communicator -- the server
+    before launch_server can publish --report_addr (surfacing only as an exit
+    code), the benchmark client with an empty results log
+    (https://nvbugs/6706765).
+    """
+    cleaned = perf_sanity.trtllm_child_env({**_LAUNCHER_IDENTITY, **_ALLOCATION_FACTS})
+
+    assert not [k for k in _LAUNCHER_IDENTITY if k in cleaned]
+
+
+def test_trtllm_child_env_keeps_the_allocation_the_child_spawns_into() -> None:
+    """Stripping the allocation too would just move the failure, not remove it.
+
+    The child's own MPI_Comm_spawn sizes itself through OMPI's Slurm resource
+    allocator, which requires SLURM_NODELIST and SLURM_TASKS_PER_NODE by name and
+    FORCE-TERMINATEs without them. So this is the half of the environment that has
+    to survive, and it is asserted separately from the half that must not.
+    """
+    cleaned = perf_sanity.trtllm_child_env({**_LAUNCHER_IDENTITY, **_ALLOCATION_FACTS})
+
+    assert {k: cleaned.get(k) for k in _ALLOCATION_FACTS} == _ALLOCATION_FACTS
+    # Non-vacuity: the two halves are disjoint, so neither assertion above is
+    # trivially satisfied by the other's keys.
+    assert not set(_LAUNCHER_IDENTITY) & set(_ALLOCATION_FACTS)
+
+
+def test_trtllm_child_env_preserves_unrelated_variables() -> None:
+    """Everything the lane actually needs must ride through untouched.
+
+    The child is the real server: it needs the model cache, the venv, and any
+    per-config env the lane set. A prefix list that swept these would break the
+    run in a way no MPI assertion above would notice.
+    """
+    payload = {
+        "LLM_MODELS_ROOT": "/code/llm-models",
+        "PATH": "/usr/bin",
+        "VIRTUAL_ENV": "/code/venv",
+        "TRTLLM_MOE_BACKEND": "TRTLLM",
+        "CUDA_VISIBLE_DEVICES": "0",
+    }
+
+    assert perf_sanity.trtllm_child_env(dict(payload)) == payload
