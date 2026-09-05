@@ -251,6 +251,11 @@ class TritonPythonModel:
             self._response_thread = threading.Thread(target=self._response_loop)
             self._response_thread.start()
 
+            self.multimodal_enabled = bool(
+                triton_config.get("multimodal", False))
+            if self.multimodal_enabled:
+                self._init_multimodal()
+
             self.req_id_to_request_data = {}
             self.triton_user_id_to_req_ids = {}
             self.lock = threading.Lock()
@@ -479,13 +484,17 @@ class TritonPythonModel:
 
         # Unique request id used to identify each triton request
         triton_req_id = str(randint(0, sys.maxsize))
+        # Absence from `req_id_to_request_data` only means "cancelled" once the
+        # request has been added to it. Before that it just means preprocessing
+        # has not finished, and an error still has to be reported to the client.
+        request_registered = False
 
         try:
             from tensorrt_llm import SamplingParams
 
             # TODO: [JIRA-4496] Implement when request contains batched prompts
             (prompt, sampling_params, streaming, output_config,
-             lora_request) = self._convert_request(request)
+             lora_request) = await self._convert_request(request)
             if streaming and not self.decoupled:
                 raise pb_utils.TritonModelException(
                     "Streaming is only supported in decoupled mode.")
@@ -508,6 +517,7 @@ class TritonPythonModel:
                     # TODO: [JIRA-4496] Add all batched request ids to the set
                     self.triton_user_id_to_req_ids[triton_user_id].add(
                         triton_req_id)
+                request_registered = True
 
             async for request_output in response_iterator:
                 # Send each response if streaming.
@@ -560,7 +570,7 @@ class TritonPythonModel:
             # already sent a COMPLETE_FINAL on this response_sender; they
             # remove the entry from req_id_to_request_data as the signal.
             with self.lock:
-                was_cancelled = (triton_req_id
+                was_cancelled = (request_registered and triton_req_id
                                  not in self.req_id_to_request_data)
             if not was_cancelled:
                 error = pb_utils.TritonError(f"Error generating request: {e}")
@@ -582,7 +592,45 @@ class TritonPythonModel:
                 if triton_user_id is not None and triton_user_id != "" and triton_user_id in self.triton_user_id_to_req_ids:
                     del self.triton_user_id_to_req_ids[triton_user_id]
 
-    def _convert_request(self, request):
+    def _init_multimodal(self):
+        """Resolve the tokenizer, HF processor and model type once."""
+        from transformers import AutoProcessor
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import \
+            load_pretrained_config
+
+        self._mm_tokenizer = self._llm_engine.tokenizer
+        hf_model_dir = self._llm_engine._hf_model_dir or getattr(
+            getattr(self._mm_tokenizer, "tokenizer", None), "name_or_path",
+            None)
+        if hf_model_dir is None:
+            raise pb_utils.TritonModelException(
+                "triton_config.multimodal is enabled but the checkpoint directory "
+                "could not be resolved from the engine.")
+        hf_model_dir = str(hf_model_dir)
+        trust_remote_code = self._llm_engine.args.trust_remote_code
+        try:
+            self._mm_processor = AutoProcessor.from_pretrained(
+                hf_model_dir, trust_remote_code=trust_remote_code)
+            model_config = load_pretrained_config(
+                hf_model_dir,
+                trust_remote_code=trust_remote_code,
+                checkpoint_format=getattr(self._llm_engine.args,
+                                          "checkpoint_format", None))
+        except Exception as e:
+            raise pb_utils.TritonModelException(
+                f"triton_config.multimodal is enabled but the HF processor/config "
+                f"for '{hf_model_dir}' could not be loaded: {e}")
+
+        # Composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
+        # attribute to `text_config`, so prefer the class attribute.
+        self._mm_model_type = getattr(type(model_config),
+                                      "model_type", None) or getattr(
+                                          model_config, "model_type", "")
+        self.logger.log_info("[trtllm] multimodal input enabled for model_type "
+                             f"'{self._mm_model_type}'")
+
+    async def _convert_request(self, request):
         """Helper function to convert the request into a prompt for LLM.generate_async
 
         Args:
@@ -593,6 +641,8 @@ class TritonPythonModel:
 
         Notes:
             - The current implementation only supports text_input being a 1D tensor(a single prompt).
+            - With `image_url`, prompt becomes a multimodal PromptInputs dict.
+              `image_url` is only read when `triton_config.multimodal` is set.
         """
         text_input = get_input_tensor_by_name(request, 'text_input')
         if text_input is None:
@@ -607,6 +657,26 @@ class TritonPythonModel:
 
         if isinstance(prompt, bytes):
             prompt = prompt.decode("utf-8")
+
+        # Only read `image_url` when the operator opts in, so a deployment
+        # already declaring that input keeps its behavior after an upgrade.
+        if self.multimodal_enabled:
+            image_url = get_input_tensor_by_name(request, 'image_url')
+            if image_url is not None and image_url.size > 0:
+                from tensorrt_llm.inputs import async_build_multimodal_prompt
+
+                prompt = await async_build_multimodal_prompt(
+                    model_type=self._mm_model_type,
+                    tokenizer=self._mm_tokenizer,
+                    processor=self._mm_processor,
+                    prompt=prompt,
+                    media=[
+                        url.decode("utf-8")
+                        if isinstance(url, bytes) else str(url)
+                        for url in image_url.reshape(-1)
+                    ],
+                    modality="image",
+                )
 
         sampling_params = get_sampling_params_from_request(request)
         output_config = get_output_config_from_request(request)

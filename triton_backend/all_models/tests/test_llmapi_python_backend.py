@@ -1,4 +1,4 @@
-# Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -24,7 +24,10 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import asyncio
+import json
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, Union
 from unittest.mock import MagicMock, patch
@@ -42,7 +45,7 @@ from helpers import (convert_request_input_to_dict,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 # Use PYTHONPATH=../llmapi/tensorrt_llm/1/
-from model import *
+from model import TritonPythonModel
 
 
 @dataclass
@@ -361,3 +364,154 @@ def test_get_parameter():
     # Special cases
     assert get_parameter(model_config, "empty_param") is None
     assert get_parameter(model_config, "env_var_param") is None
+
+
+def _make_multimodal_model(enabled: bool):
+    """A bare model with just the multimodal state `_convert_request` reads."""
+    model = TritonPythonModel.__new__(TritonPythonModel)
+    model.multimodal_enabled = enabled
+    model._mm_tokenizer = "tokenizer"
+    model._mm_processor = "processor"
+    model._mm_model_type = "qwen2_5_vl"
+    return model
+
+
+def test_convert_request_ignores_image_url_when_multimodal_disabled():
+    # A deployment that already declares an `image_url` input for another
+    # purpose must be unaffected until it opts in via triton_config.multimodal.
+    model = _make_multimodal_model(enabled=False)
+    request = make_mock_triton_request({
+        **inputs(),
+        "image_url": [b"https://example.com/a.jpg"],
+    })
+
+    prompt, _, _, _, _ = asyncio.run(model._convert_request(request))
+
+    assert prompt == "Tell me a story."
+
+
+def test_convert_request_delegates_to_shared_inputs_helper():
+    # The backend must not build the multimodal prompt itself: placeholder
+    # handling depends on the model's ContentFormat, which the shared helper in
+    # tensorrt_llm.inputs owns. Assert we hand it the right arguments.
+    model = _make_multimodal_model(enabled=True)
+    captured = {}
+
+    async def fake_helper(**kwargs):
+        captured.update(kwargs)
+        return {
+            "prompt": "rendered",
+            "multi_modal_data": {
+                "image": ["decoded"]
+            }
+        }
+
+    inputs_mod = MagicMock()
+    inputs_mod.async_build_multimodal_prompt = fake_helper
+    request = make_mock_triton_request({
+        **inputs(),
+        "image_url": [b"https://example.com/a.jpg", b"/tmp/b.png"],
+    })
+
+    with patch.dict(sys.modules, {
+            "tensorrt_llm": MagicMock(),
+            "tensorrt_llm.inputs": inputs_mod,
+    }):
+        prompt, _, _, _, _ = asyncio.run(model._convert_request(request))
+
+    assert prompt["multi_modal_data"] == {"image": ["decoded"]}
+    assert captured["model_type"] == "qwen2_5_vl"
+    assert captured["tokenizer"] == "tokenizer"
+    assert captured["processor"] == "processor"
+    assert captured["modality"] == "image"
+    assert captured["prompt"] == "Tell me a story."
+    # Bytes tensors are decoded, order preserved.
+    assert captured["media"] == ["https://example.com/a.jpg", "/tmp/b.png"]
+
+
+def _bare_model_for_execute():
+    """A model with only the state `_execute_single_request` touches."""
+    model = TritonPythonModel.__new__(TritonPythonModel)
+    model.logger = MagicMock()
+    model.lock = threading.Lock()
+    model.req_id_to_request_data = {}
+    model.triton_user_id_to_req_ids = {}
+    model._ongoing_request_count = 0
+    model.decoupled = False
+    model.output_dtype = np.object_
+    return model
+
+
+class _RecordingSender:
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, response, flags=None):
+        self.sent.append((response, flags))
+
+
+def test_execute_single_request_reports_preprocessing_failure():
+    # A bad image URL fails inside _convert_request, before the request is
+    # registered in req_id_to_request_data. The error must still reach the
+    # client with COMPLETE_FINAL, otherwise it waits forever.
+    model = _bare_model_for_execute()
+    sender = _RecordingSender()
+    request = make_mock_triton_request({"text_input": ["describe this"]})
+    request.get_response_sender = lambda: sender
+    request.request_id = lambda: "triton-user-1"
+
+    async def failing_convert(_request):
+        raise RuntimeError(
+            "Cannot connect to host example.invalid:443 [Name or service not known]"
+        )
+
+    model._convert_request = failing_convert
+
+    with patch.dict(sys.modules, {"tensorrt_llm": MagicMock()}):
+        with pytest.raises(RuntimeError):
+            asyncio.run(model._execute_single_request(request))
+
+    pb_utils = sys.modules["triton_python_backend_utils"]
+    assert len(sender.sent) == 1, "client must receive exactly one response"
+    response, flags = sender.sent[0]
+    assert flags == pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
+    assert response.has_error()
+    assert "example.invalid" in response.error.message
+
+
+def test_execute_single_request_skips_response_when_cancelled():
+    # Once the request IS registered, an empty map means the cancellation loop
+    # already sent COMPLETE_FINAL and removed the entry, so the error handler
+    # must stay silent rather than send a second final response.
+    model = _bare_model_for_execute()
+    sender = _RecordingSender()
+    request = make_mock_triton_request({"text_input": ["describe this"]})
+    request.get_response_sender = lambda: sender
+    request.request_id = lambda: "triton-user-2"
+
+    async def convert(_request):
+        return ("a prompt", {}, False, {}, None)
+
+    class CancellingIterator:
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            # Stand in for cancellation_loop: it sends COMPLETE_FINAL and drops
+            # the entry while generation is in flight.
+            with model.lock:
+                model.req_id_to_request_data.clear()
+            raise RuntimeError("request aborted")
+
+    engine = MagicMock()
+    engine.generate_async.return_value = CancellingIterator()
+    model._convert_request = convert
+    model._llm_engine = engine
+
+    with patch.dict(sys.modules, {"tensorrt_llm": MagicMock()}):
+        with pytest.raises(RuntimeError):
+            asyncio.run(model._execute_single_request(request))
+
+    assert sender.sent == [], "must not double-send after cancellation"
