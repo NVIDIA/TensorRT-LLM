@@ -13,6 +13,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
     HfConfigLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
@@ -79,6 +81,31 @@ class HfCheckpointLoader(BaseCheckpointLoader):
 
     def get_default_config_loader(self) -> HfConfigLoader:
         return HfConfigLoader()
+
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Inspect metadata only for the exact built-in eager HF loader path."""
+        if (type(self) is not HfCheckpointLoader
+                or type(self.weight_loader) is not HfWeightLoader):
+            return None
+        return self.weight_loader.build_checkpoint_catalog(
+            checkpoint_dir,
+            use_consolidated=kwargs.get("use_consolidated", False),
+        )
+
+    def activate_weight_session(
+            self,
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: BaseWeightMapper | None = None) -> None:
+        """Start deferred read-ahead only on the built-in HF path."""
+        if (type(self) is HfCheckpointLoader
+                and type(self.weight_loader) is HfWeightLoader):
+            self.weight_loader.activate_weight_session(
+                readiness_error, weight_mapper=weight_mapper)
+            return
+        super().activate_weight_session(readiness_error,
+                                        weight_mapper=weight_mapper)
 
     @property
     def weight_loader(self) -> BaseWeightLoader:
