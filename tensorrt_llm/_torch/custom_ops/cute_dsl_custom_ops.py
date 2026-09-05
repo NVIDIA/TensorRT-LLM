@@ -157,6 +157,47 @@ class GroupedGemmInputsHelper:
     def get_max_num_permuted_tokens(self, num_tokens: int) -> int:
         return self.get_max_num_tiles(num_tokens) * self.tile_size
 
+    def get_expert_capacity_num_permuted_tokens(self,
+                                                expert_capacity: int) -> int:
+        """Return padded rows for a fixed-capacity expert layout."""
+        if expert_capacity <= 0:
+            raise ValueError("Expert capacity must be positive")
+        return (self.num_local_experts *
+                ceil_div(expert_capacity, self.tile_size) * self.tile_size)
+
+    def _expert_capacity_from_rows(self, num_rows: int) -> int:
+        if num_rows <= 0 or num_rows % self.num_local_experts != 0:
+            raise ValueError(
+                "Expert-major rows must be positive and divisible by the "
+                "number of local experts")
+        return num_rows // self.num_local_experts
+
+    def gen_expert_capacity_tuning_buckets(self,
+                                           num_rows: int) -> Tuple[int, ...]:
+        """Generate bounded expert-major row profiles for count-native tuning."""
+        capacity = max(self.tile_size,
+                       self._expert_capacity_from_rows(num_rows))
+        capacities = get_last_power_of_2_num_tokens_buckets(capacity)
+        return tuple(self.num_local_experts * value for value in capacities
+                     if value >= self.tile_size)
+
+    def map_to_expert_capacity_tuning_bucket(self, num_rows: int) -> int:
+        """Map an expert-major layout to a stable power-of-two capacity bucket."""
+        capacity = max(self.tile_size,
+                       self._expert_capacity_from_rows(num_rows))
+        return (self.num_local_experts * last_positive_power_of_2(capacity))
+
+    def infer_shape_input0_rows(self, input_shapes: List[torch.Size]) -> int:
+        return input_shapes[0][0]
+
+    def infer_shape_input5_rows(self, input_shapes: List[torch.Size]) -> int:
+        return input_shapes[5][0]
+
+    def infer_shape_padded_rows_from_input5(
+            self, input_shapes: List[torch.Size]) -> int:
+        capacity = self._expert_capacity_from_rows(input_shapes[5][0])
+        return self.get_expert_capacity_num_permuted_tokens(capacity)
+
     def infer_num_tokens(self, max_num_permuted_tokens: int) -> int:
         """Infer the maximum possible number of tokens given the max_num_permuted_tokens.
         """
@@ -2641,7 +2682,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      local_expert_offset: int,
                      tile_size: int,
                      output_dtype: torch.dtype,
-                     scaling_vector_size: int = 16):
+                     scaling_vector_size: int = 16,
+                     use_expert_counts: bool = False):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -2652,6 +2694,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert output_dtype == torch.bfloat16
             self.output_dtype = output_dtype
             self.scaling_vector_size = scaling_vector_size
+            self.use_expert_counts = use_expert_counts
+            if self.use_expert_counts:
+                if self.top_k != 1:
+                    raise ValueError("Expert-count scheduling requires top_k=1")
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2672,6 +2718,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.tile_size,
                 self.output_dtype,
                 self.scaling_vector_size,
+                self.use_expert_counts,
             )
 
         def get_valid_tactics(
@@ -2729,6 +2776,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                  self.num_local_experts,
                                                  self.local_expert_offset,
                                                  self.tile_size)
+                if self.use_expert_counts:
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            5, 0, helper.gen_expert_capacity_tuning_buckets,
+                            helper.map_to_expert_capacity_tuning_bucket), ),
+                        constraint_specs=(ConstraintSpec(
+                            0, 0, helper.infer_shape_padded_rows_from_input5),
+                                          ConstraintSpec(
+                                              2, 0, fp4_scale_infer_shape),
+                                          ConstraintSpec(
+                                              10, 0,
+                                              helper.infer_shape_input5_rows)),
+                        use_cold_l2_cache=True)
+                    return self.__class__.tuning_config_cache[key]
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, helper.gen_tuning_buckets,
@@ -2776,16 +2837,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert c.dim() == 2
             num_tokens = c.size(0)
             assert c.size(1) == n
+            expert_capacity = 0
+            if self.use_expert_counts:
+                if num_tokens % self.num_local_experts != 0:
+                    raise ValueError(
+                        "Expert-major output rows must be divisible by the "
+                        "number of local experts")
+                expert_capacity = num_tokens // self.num_local_experts
 
             num_tiles = m // self.tile_size
-            assert tile_idx_to_group_idx.dtype == torch.int32
-            assert tile_idx_to_group_idx.size() == (num_tiles, )
-            assert tile_idx_to_mn_limit.dtype == torch.int32
-            assert tile_idx_to_mn_limit.size() == (num_tiles, )
-            assert permuted_idx_to_expanded_idx.dtype == torch.int32
-            assert permuted_idx_to_expanded_idx.size() == (m, )
-            assert num_non_exiting_tiles.dtype == torch.int32
-            assert num_non_exiting_tiles.numel() == 1
+            if self.use_expert_counts:
+                for metadata in (tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                                 permuted_idx_to_expanded_idx,
+                                 num_non_exiting_tiles):
+                    if (metadata.dtype != torch.int32
+                            or metadata.size() != (self.num_local_experts, )):
+                        raise ValueError(
+                            "Expert-count metadata must be int32 with one "
+                            "entry per local expert")
+            else:
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
             assert token_final_scales.dtype == torch.float32
             assert token_final_scales.dim() == 2
             assert token_final_scales.size() == (num_tokens, self.top_k)
@@ -2841,13 +2919,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 0] == self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
-                         cluster_shape_mn, raster_along_m)
+                         cluster_shape_mn, raster_along_m,
+                         self.use_expert_counts, self.num_local_experts)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                     raster_along_m=raster_along_m,
+                    use_expert_counts=self.use_expert_counts,
+                    num_local_experts=self.num_local_experts,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -2872,6 +2953,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     l,
                     num_tokens,
                     self.top_k,
+                    expert_capacity,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -2904,6 +2986,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 l,
                 num_tokens,
                 self.top_k,
+                expert_capacity,
             ]
             compiled_gemm(*exec_args, stream=stream)
             return c
@@ -2931,12 +3014,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tile_size: int,
         output_dtype: torch.dtype,
         scaling_vector_size: int = 16,
+        expert_counts: Optional[torch.Tensor] = None,
+        expert_capacity: int = 0,
     ) -> None:
         tuner = AutoTuner.get()
+        if expert_counts is None and expert_capacity != 0:
+            raise ValueError(
+                "expert_capacity must be zero when expert_counts is absent")
+        if expert_counts is not None:
+            if expert_capacity <= 0:
+                raise ValueError(
+                    "expert_capacity must be positive when expert_counts is provided"
+                )
+            if output.size(0) != num_local_experts * expert_capacity:
+                raise ValueError("Expert-major output rows must equal "
+                                 "num_local_experts * expert_capacity")
 
         runner = Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
-            num_experts, top_k, num_local_experts, local_expert_offset,
-            tile_size, output_dtype, scaling_vector_size)
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            tile_size,
+            output_dtype,
+            scaling_vector_size,
+            use_expert_counts=expert_counts is not None)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -2952,6 +3054,48 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs,
         )
         runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell")
+    def _(
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output: torch.Tensor,
+        tile_idx_to_group_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        tile_size: int,
+        output_dtype: torch.dtype,
+        scaling_vector_size: int = 16,
+        expert_counts: Optional[torch.Tensor] = None,
+        expert_capacity: int = 0,
+    ) -> None:
+        num_tokens = token_final_scales.size(0)
+        n = weight.size(1)
+        if output.shape != (num_tokens, n):
+            raise ValueError(
+                "CuTeDSL grouped GEMM finalize output shape must be "
+                f"{(num_tokens, n)}, got {tuple(output.shape)}")
+        if output.dtype != output_dtype:
+            raise ValueError(
+                "CuTeDSL grouped GEMM finalize output dtype must match "
+                f"output_dtype={output_dtype}, got {output.dtype}")
+        if expert_counts is None and expert_capacity != 0:
+            raise ValueError(
+                "expert_capacity must be zero when expert_counts is absent")
+        if expert_counts is not None and expert_capacity <= 0:
+            raise ValueError(
+                "expert_capacity must be positive when expert_counts is provided"
+            )
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_blackwell",
@@ -3370,7 +3514,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      scaling_vector_size: int = 16,
                      activation_type: ActivationType = ActivationType.Swiglu,
-                     swiglu_limit_scalar: float = float("inf")):
+                     swiglu_limit_scalar: float = float("inf"),
+                     use_expert_counts: bool = False):
             """Initialize the runner.
 
             Args:
@@ -3392,6 +3537,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.tile_size = tile_size
             self.scaling_vector_size = scaling_vector_size
             self.swiglu_limit_scalar = swiglu_limit_scalar
+            self.use_expert_counts = use_expert_counts
+            if self.use_expert_counts:
+                if self.top_k != 1:
+                    raise ValueError("Expert-count scheduling requires top_k=1")
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3413,6 +3562,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.scaling_vector_size,
                 self.activation_type,
                 self.swiglu_limit_scalar,
+                self.use_expert_counts,
             )
 
         def get_valid_tactics(
@@ -3424,9 +3574,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Tuning uses layout: a, b, a_sf, b_sf, alpha, ...
             a = inputs[0]
             b = inputs[1]
-            permuted_idx_to_expanded_idx = inputs[7]
-            # m is the permuted size from permuted_idx_to_expanded_idx, not from a
-            m = permuted_idx_to_expanded_idx.size(0)
+            if self.use_expert_counts:
+                helper = GroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                )
+                if a.size(0) % self.num_local_experts != 0:
+                    raise ValueError(
+                        "Expert-major input rows must be divisible by the "
+                        "number of local experts")
+                expert_capacity = a.size(0) // self.num_local_experts
+                m = helper.get_expert_capacity_num_permuted_tokens(
+                    expert_capacity)
+            else:
+                # m is the permuted size from permuted_idx_to_expanded_idx, not from a.
+                m = inputs[7].size(0)
             k = a.size(1) * 2
             l, n = b.size(0), b.size(1)  # noqa: E741
 
@@ -3463,11 +3628,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def get_tuning_config(self) -> TuningConfig:
             key = self.unique_id()
             if key not in self.__class__.tuning_config_cache:
-                helper = GatherGroupedGemmInputsHelper(self.num_experts,
-                                                       self.top_k,
-                                                       self.num_local_experts,
-                                                       self.local_expert_offset,
-                                                       self.tile_size)
+                helper = GroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                )
+                if self.use_expert_counts:
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            0, 0, helper.gen_expert_capacity_tuning_buckets,
+                            helper.map_to_expert_capacity_tuning_bucket), ),
+                        constraint_specs=(ConstraintSpec(
+                            2, 0, helper.infer_shape_input0_rows), ),
+                        use_cold_l2_cache=True)
+                    return self.__class__.tuning_config_cache[key]
+                helper = GatherGroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                )
                 # Tuning uses layout:
                 # a, b, a_sf, b_sf, alpha, tile_idx, tile_mn_limit, permuted_idx, ...
                 self.__class__.tuning_config_cache[key] = TuningConfig(
@@ -3523,10 +3706,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert alpha.dtype == torch.float32
             assert alpha.dim() == 1
 
-            # a.size(0) is orig_m (original input size before gather)
-            # permuted_idx_to_expanded_idx.size(0) is m (permuted size after gather)
+            # a.size(0) is orig_m (original input size before gather).
             orig_m, k = a.size(0), a.size(1) * 2
-            m = permuted_idx_to_expanded_idx.size(0)
+            expert_capacity = 0
+            if self.use_expert_counts:
+                helper = GroupedGemmInputsHelper(
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                )
+                if orig_m % self.num_local_experts != 0:
+                    raise ValueError(
+                        "Expert-major input rows must be divisible by the "
+                        "number of local experts")
+                expert_capacity = orig_m // self.num_local_experts
+                m = helper.get_expert_capacity_num_permuted_tokens(
+                    expert_capacity)
+            else:
+                m = permuted_idx_to_expanded_idx.size(0)
             l, n = b.size(0), b.size(1)  # noqa: E741
             scale_k = k // self.scaling_vector_size
             interm_size = n // 2 if self.is_gated else n
@@ -3542,14 +3741,24 @@ if IS_CUTLASS_DSL_AVAILABLE:
             assert a_sf.size(1) == scale_k
 
             num_tiles = m // self.tile_size
-            assert tile_idx_to_group_idx.dtype == torch.int32
-            assert tile_idx_to_group_idx.size() == (num_tiles, )
-            assert tile_idx_to_mn_limit.dtype == torch.int32
-            assert tile_idx_to_mn_limit.size() == (num_tiles, )
-            assert permuted_idx_to_expanded_idx.dtype == torch.int32
-            assert permuted_idx_to_expanded_idx.size() == (m, )
-            assert num_non_exiting_tiles.dtype == torch.int32
-            assert num_non_exiting_tiles.numel() == 1
+            if self.use_expert_counts:
+                for metadata in (tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                                 permuted_idx_to_expanded_idx,
+                                 num_non_exiting_tiles):
+                    if (metadata.dtype != torch.int32
+                            or metadata.size() != (self.num_local_experts, )):
+                        raise ValueError(
+                            "Expert-count metadata must be int32 with one "
+                            "entry per local expert")
+            else:
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
             assert global_sf.dtype == torch.float32
             assert global_sf.numel() == 1
 
@@ -3615,7 +3824,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, self.top_k,
                          mma_tiler_mn, cluster_shape_mn, raster_along_m,
-                         self.activation_type, self.swiglu_limit_scalar)
+                         self.activation_type, self.swiglu_limit_scalar,
+                         self.use_expert_counts, self.num_local_experts)
 
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
@@ -3627,6 +3837,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     activation_type=self.activation_type,
                     swiglu_limit=self.swiglu_limit_scalar,
+                    use_expert_counts=self.use_expert_counts,
+                    num_local_experts=self.num_local_experts,
                 )
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
@@ -3650,6 +3862,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     n,
                     k,
                     l,
+                    expert_capacity,
                 ]
 
                 compiled_gemm = cute.compile(
@@ -3683,6 +3896,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 n,
                 k,
                 l,
+                expert_capacity,
             ]
 
             compiled_gemm(*exec_args, stream=stream)
@@ -3712,6 +3926,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        expert_counts: Optional[torch.Tensor] = None,
+        expert_capacity: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """CuteDSL-based NVFP4 gather grouped GEMM with activation fusion.
 
@@ -3722,6 +3938,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         tuner = AutoTuner.get()
         swiglu_limit_scalar = _canonicalize_swiglu_limit_scalar(
             swiglu_limit_scalar)
+        if expert_counts is None and expert_capacity != 0:
+            raise ValueError(
+                "expert_capacity must be zero when expert_counts is absent")
+        if expert_counts is not None:
+            if expert_capacity <= 0:
+                raise ValueError(
+                    "expert_capacity must be positive when expert_counts is provided"
+                )
+            if input.size(0) != num_local_experts * expert_capacity:
+                raise ValueError("Expert-major input rows must equal "
+                                 "num_local_experts * expert_capacity")
 
         runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
             num_experts,
@@ -3731,7 +3958,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             scaling_vector_size,
             activation_type=ActivationType(activation_type),
-            swiglu_limit_scalar=swiglu_limit_scalar)
+            swiglu_limit_scalar=swiglu_limit_scalar,
+            use_expert_counts=expert_counts is not None)
         inputs = [
             input, weight, input_scale, weight_scale, alpha,
             tile_idx_to_group_idx, tile_idx_to_mn_limit,
@@ -3768,8 +3996,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         activation_type: int = int(ActivationType.Swiglu),
         swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+        expert_counts: Optional[torch.Tensor] = None,
+        expert_capacity: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = permuted_idx_to_expanded_idx.size(0)
+        if expert_counts is not None:
+            helper = GroupedGemmInputsHelper(num_experts, top_k,
+                                             num_local_experts,
+                                             local_expert_offset, tile_size)
+            m = helper.get_expert_capacity_num_permuted_tokens(expert_capacity)
+        else:
+            m = permuted_idx_to_expanded_idx.size(0)
         n = weight.size(1)
         is_gated = is_gated_activation(ActivationType(activation_type))
         interm_size = n // 2 if is_gated else n

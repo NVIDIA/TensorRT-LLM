@@ -19,6 +19,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <cuda_fp4.h>
+#include <limits>
 
 namespace btg = batchedGemm::trtllm::gen;
 
@@ -342,6 +343,59 @@ void moe_output_memset_inplace(torch::Tensor const& input, torch::Tensor const& 
 #undef DISPATCH_MOE_OUTPUT_MEMSET
 }
 
+void moe_output_memset_from_expert_counts_inplace(torch::Tensor const& input, torch::Tensor const& expert_counts,
+    int64_t const expert_capacity, int64_t const ep_size, bool const enable_alltoall = false)
+{
+    TORCH_CHECK(input.dim() == 2, "input must be 2D.");
+    TORCH_CHECK(expert_counts.dim() == 1, "expert_counts must be 1D.");
+    TORCH_CHECK(expert_counts.scalar_type() == torch::kInt32, "expert_counts must be int32.");
+    TORCH_CHECK(expert_capacity > 0 && expert_capacity <= std::numeric_limits<int32_t>::max(),
+        "expert_capacity must be a positive int32 value.");
+    TORCH_CHECK(
+        expert_counts.size(0) <= std::numeric_limits<int32_t>::max(), "The number of local experts must fit in int32.");
+    TORCH_CHECK(input.size(0) == expert_counts.size(0) * expert_capacity,
+        "input rows must equal expert_counts.size(0) * expert_capacity.");
+    TORCH_CHECK(input.size(0) <= std::numeric_limits<int32_t>::max(), "input rows must fit in int32.");
+    TORCH_CHECK(input.size(1) <= std::numeric_limits<int32_t>::max(), "hidden size must fit in int32.");
+
+    auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    int32_t const numLocalExperts = static_cast<int32_t>(expert_counts.size(0));
+    int32_t const expertCapacity = static_cast<int32_t>(expert_capacity);
+    int32_t const hiddenSize = static_cast<int32_t>(input.size(1));
+
+#define DISPATCH_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(InputType)                                                       \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (!enable_alltoall || ep_size <= 1)                                                                          \
+        {                                                                                                              \
+            cudaMemsetAsync(input.data_ptr(), 0, sizeof(InputType) * input.numel(), stream);                           \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            tensorrt_llm::kernels::cute_dsl::moeOutputMemsetFromExpertCounts(                                          \
+                reinterpret_cast<InputType*>(input.data_ptr()), expert_counts.data_ptr<int32_t>(), numLocalExperts,    \
+                expertCapacity, hiddenSize, stream);                                                                   \
+        }                                                                                                              \
+    } while (0)
+
+    if (input.scalar_type() == torch::kFloat16)
+    {
+        DISPATCH_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(half);
+    }
+#ifdef ENABLE_BF16
+    else if (input.scalar_type() == torch::kBFloat16)
+    {
+        DISPATCH_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS(__nv_bfloat16);
+    }
+#endif
+    else
+    {
+        TORCH_CHECK(false, "Unsupported input dtype: ", input.scalar_type());
+    }
+
+#undef DISPATCH_MOE_OUTPUT_MEMSET_FROM_EXPERT_COUNTS
+}
+
 // Activation
 
 torch::Tensor moe_swiglu(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
@@ -520,6 +574,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k, int "
         "ep_size, bool enable_alltoall = False) -> ()");
     m.def(
+        "moe_output_memset_from_expert_counts_inplace(Tensor(a!) input, Tensor expert_counts, int expert_capacity, "
+        "int ep_size, bool enable_alltoall = False) -> ()");
+    m.def(
         "moe_swiglu(Tensor input, Tensor tile_idx_to_mn_limit, Tensor num_non_exiting_tiles, "
         "int tile_tokens_dim) -> Tensor");
     m.def(
@@ -538,6 +595,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_unpermute_inplace", &tensorrt_llm::torch_ext::moe_unpermute_inplace);
     m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);
     m.impl("moe_output_memset_inplace", &tensorrt_llm::torch_ext::moe_output_memset_inplace);
+    m.impl("moe_output_memset_from_expert_counts_inplace",
+        &tensorrt_llm::torch_ext::moe_output_memset_from_expert_counts_inplace);
     m.impl("moe_swiglu", &tensorrt_llm::torch_ext::moe_swiglu);
     m.impl("moe_swiglu_nvfp4_quantize", &tensorrt_llm::torch_ext::moe_swiglu_nvfp4_quantize);
     m.impl("moe_gelu", &tensorrt_llm::torch_ext::moe_gelu);

@@ -58,6 +58,9 @@ class MoEStaticCapability:
     # flag in their own constructor keep doing so; that check guards direct
     # construction, which never reaches the factory.
     supports_apply_router_weight_on_input: bool = False
+    # Whether the backend can consume DeepEP's expert-major receive counts
+    # directly, without materializing token-major adapter metadata.
+    supports_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -500,6 +503,11 @@ class MoECommPlan:
     # made; TRTLLM-14972 makes ``combine()`` read it from here and drops the
     # attribute.
     payload_in_workspace: bool
+    # DeepEP Low-Latency expert-major layout metadata. These stay unset for
+    # every other communication strategy.
+    recv_expert_count: Optional[torch.Tensor] = None
+    deep_ep_expert_capacity: Optional[int] = None
+    use_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)

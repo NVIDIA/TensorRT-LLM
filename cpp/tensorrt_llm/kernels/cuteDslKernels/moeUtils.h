@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,10 @@ void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit, int3
     int32_t const* permuted_idx_to_expanded_idx, int32_t const* num_non_exiting_tiles,
     int32_t const max_num_permuted_tokens, int32_t const hidden_size, int32_t const top_k, int32_t const tile_size,
     cudaStream_t stream);
+
+template <typename InputType>
+void moeOutputMemsetFromExpertCounts(InputType* input, int32_t const* expertCounts, int32_t numLocalExperts,
+    int32_t expertCapacity, int32_t hiddenSize, cudaStream_t stream);
 
 template <typename InputType, typename OutputType, typename SFType>
 void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
