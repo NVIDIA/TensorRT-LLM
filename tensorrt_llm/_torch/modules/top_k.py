@@ -20,18 +20,10 @@ class TopKImplementation(str, Enum):
     TORCH = "torch"
     CUDA_RADIX = "cuda_radix"
     CUTE_DSL_RADIX = "cute_dsl_radix"
-    CUDA_GVR = "cuda_gvr"
     CUTE_DSL_GVR = "cute_dsl_gvr"
-    CUTE_DSL_GVR_V2 = "cute_dsl_gvr_v2"
 
 
 _GVR_IMPLEMENTATIONS = {
-    TopKImplementation.CUDA_GVR,
-    TopKImplementation.CUTE_DSL_GVR,
-    TopKImplementation.CUTE_DSL_GVR_V2,
-}
-_TEMPORAL_GVR_IMPLEMENTATIONS = {
-    TopKImplementation.CUDA_GVR,
     TopKImplementation.CUTE_DSL_GVR,
 }
 _MAX_RADIX_BLOCKS_PER_ROW = 10
@@ -55,6 +47,7 @@ class TopK(nn.Module):
         prefill_implementation: TopKImplementation | None = None,
         decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
+        gvr_self_sampling: bool = True,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -65,10 +58,12 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
-        # emission-assisted GVR (opt-in via prepare_gvr_emission): the
-        # module owns the closed-loop emission state; the caller passes
-        # the returned kwargs to the scoring op, and the consume side is
-        # injected into the GVR Top-K call while the step stays armed
+        # Second-level GVR dispatch for CUTE_DSL_GVR: True selects the
+        # hint-free self-sampling engine, False the temporal-hint engine.
+        self.gvr_self_sampling = gvr_self_sampling
+        # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
+        # owns the closed-loop emission state; only reachable on the temporal
+        # (gvr_self_sampling=False) V1 path.
         self._gvr_emission_state = None
         self._gvr_emission_route = None
         self._gvr_emission_armed = False
@@ -76,7 +71,10 @@ class TopK(nn.Module):
     @property
     def needs_gvr_prior(self) -> bool:
         """Return whether decode consumes previous-step Top-K indices."""
-        return self.decode_implementation in _TEMPORAL_GVR_IMPLEMENTATIONS
+        return (
+            self.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+            and not self.gvr_self_sampling
+        )
 
     def forward(
         self,
@@ -105,10 +103,11 @@ class TopK(nn.Module):
             next_n: Number of decode rows per request.
             max_seq_len: Maximum decode score width used for GVR kernel tuning.
             gvr_ext_kwargs: GVR-only keyword arguments. ``gvr_prior_indices``
-                is required by the temporal CUDA and CuTe DSL GVR paths. It is
+                is required by the temporal GVR path (``CUTE_DSL_GVR`` with
+                ``gvr_self_sampling=False``). It is
                 caller-owned int32 previous selection with shape
-                ``[num_requests, top_k]`` on ``scores.device``. GVR V2 does
-                not consume this state.
+                ``[num_requests, top_k]`` on ``scores.device``. The
+                self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
 
@@ -227,8 +226,6 @@ class TopK(nn.Module):
             output_indices,
             next_n,
             self.top_k,
-            pre_idx=None,
-            heuristic_scratch=None,
             compress_ratio=self.compress_ratio,
             radix_aux_indices=radix_indices,
             radix_aux_logits=radix_values,
@@ -292,7 +289,7 @@ class TopK(nn.Module):
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR_V2:
+        if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
             if (
                 # engine hardware-format gate (falls through otherwise):
@@ -319,7 +316,7 @@ class TopK(nn.Module):
                     f"next_n={next_n}, hint-free).",
                     key="selfsampling_topk_engaged",
                 )
-                # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
+                # Self-sampling GVR varlen engine:
                 # one launch for the batch; per-row n from device kv_lens,
                 # capture-stable tuning from the max-seq-len engine constant
                 # (no host reads — CUDA-graph safe). The module receives
@@ -336,7 +333,7 @@ class TopK(nn.Module):
                 )
                 return output_indices
             logger.warning_once(
-                "TRTLLM_GVR_SELF_SAMPLING=1 but the decode scores do not "
+                "self-sampling GVR is selected but the decode scores do not "
                 "satisfy the engine's hardware-format gate "
                 f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
                 "falling back to the CUDA insertion/radix Top-K path.",
@@ -349,8 +346,6 @@ class TopK(nn.Module):
                 output_indices,
                 next_n,
                 self.top_k,
-                pre_idx=None,
-                heuristic_scratch=None,
                 compress_ratio=self.compress_ratio,
                 radix_aux_indices=radix_indices,
                 radix_aux_logits=radix_values,
@@ -358,52 +353,32 @@ class TopK(nn.Module):
             return output_indices
 
         assert gvr_prior_indices is not None
-        if self.decode_implementation == TopKImplementation.CUDA_GVR:
-            workspace = self._get_workspace(
-                scores,
-                (scores.shape[0], self.top_k),
-                scores.dtype,
-                "top_k_cuda_gvr_workspace",
+        assert max_seq_len is not None
+        # V1 temporal (DSL). Emission-assisted candidates (opt-in) are only
+        # armed on this hint-first path; the self-sampling V2 path above never
+        # arms them.
+        emission_kwargs: dict = {}
+        if self._gvr_emission_armed:
+            state = self._gvr_emission_state
+            num_rows = scores.shape[0]
+            emission_kwargs = state.topk_ext_kwargs(
+                self._gvr_emission_route,
+                num_rows,
+                state.block_max[:num_rows] if state.block_max is not None else None,
             )
-            radix_indices, radix_values = self._get_radix_workspace(scores)
-            torch.ops.trtllm.indexer_topk_decode(
-                scores,
-                sequence_lengths,
-                output_indices,
-                next_n,
-                self.top_k,
-                pre_idx=gvr_prior_indices,
-                heuristic_scratch=workspace,
-                compress_ratio=self.compress_ratio,
-                radix_aux_indices=radix_indices,
-                radix_aux_logits=radix_values,
-            )
-        elif self.decode_implementation == TopKImplementation.CUTE_DSL_GVR:
-            assert max_seq_len is not None
-            emission_kwargs: dict = {}
-            if self._gvr_emission_armed:
-                state = self._gvr_emission_state
-                num_rows = scores.shape[0]
-                emission_kwargs = state.topk_ext_kwargs(
-                    self._gvr_emission_route,
-                    num_rows,
-                    state.block_max[:num_rows] if state.block_max is not None else None,
-                )
-                self._gvr_emission_armed = False
-            torch.ops.trtllm.cute_dsl_gvr_topk_decode(
-                scores,
-                gvr_prior_indices,
-                sequence_lengths,
-                output_indices,
-                self.top_k,
-                next_n=next_n,
-                compress_ratio=self.compress_ratio,
-                max_seq_len=max_seq_len,
-                order_row=gvr_row_order,
-                **emission_kwargs,
-            )
-        else:
-            raise AssertionError(f"Unexpected GVR implementation: {self.decode_implementation}")
+            self._gvr_emission_armed = False
+        torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+            scores,
+            gvr_prior_indices,
+            sequence_lengths,
+            output_indices,
+            self.top_k,
+            next_n=next_n,
+            compress_ratio=self.compress_ratio,
+            max_seq_len=max_seq_len,
+            order_row=gvr_row_order,
+            **emission_kwargs,
+        )
         return output_indices
 
     def prepare_gvr_emission(
