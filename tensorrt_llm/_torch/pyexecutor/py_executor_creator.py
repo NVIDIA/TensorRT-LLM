@@ -38,7 +38,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    compute_max_num_sequences, create_py_executor_instance,
+                    instantiate_sampler, is_disagg_enabled, is_mla,
                     validate_feature_combination)
 from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
@@ -701,8 +702,14 @@ def create_py_executor(
     sparse_attention_config = model_engine.sparse_attention_config
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
-                                max_batch_size * getattr(mapping, "pp_size", 1))
+    # Engines that are not PyTorchModelEngine do not size the pool themselves;
+    # fall back to the same sizing function so the two never disagree.
+    max_num_seq_slots = getattr(
+        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
+            mapping,
+            max_batch_size,
+            llm_args.disable_overlap_scheduler,
+            is_disagg=is_disagg_enabled(cache_transceiver_config))
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -791,14 +798,11 @@ def create_py_executor(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
-                guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_dsv4_overlap_headroom", False) else
-                                        max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The scoped DeepSeek-V4 path follows the expanded slot
-                    # pool. Other configurations retain max_batch_size.
-                    "max_num_sequences": guided_decoder_slots,
+                    # Indexed by py_seq_slot, so it must span the whole pool
+                    # rather than one forward batch.
+                    "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -924,8 +928,7 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        is_disagg = (cache_transceiver_config is not None
-                     and cache_transceiver_config.backend is not None)
+        is_disagg = is_disagg_enabled(cache_transceiver_config)
         is_hybrid = is_hybrid_linear(
             model_engine.model.model_config.pretrained_config)
 
