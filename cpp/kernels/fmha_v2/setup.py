@@ -2170,6 +2170,28 @@ def get_effective_sm_and_name(kspec):
     return sm, sm_name
 
 
+# Head sizes of the vision encoders TRT-LLM serves: Gemma3 VL (72), Clip/SigLip (80)
+# and Pixtral VL (Mistral-Large-3's encoder is hidden 1664 / 16 heads -> 104).
+#
+# Two gates must both admit a head size, and they live in different functions, so a
+# size listed in only one yields a kernel that exists but can never be selected.
+# Driving both from this single list is what stops them drifting apart:
+#   * enumerate_kernels() decides whether the kernel is generated at all. sm100 is
+#     absent from its general clause, so a head size missing here gets no kernel and
+#     FmhaDispatcher drops to unfused MHA, whose quadratic qk_buf/qk_buf_float terms
+#     in AttentionOp::getWorkspaceSizeForContext size the workspace in TiB.
+#   * selected_mask_types() decides which mask variants that kernel is compiled for.
+#     A ViT attends over a padded batch with no causal structure, i.e.
+#     AttentionMaskType::PADDING, and the lookup in fused_multihead_attention_v2.cpp
+#     is an exact hash match with no fallback, so without that variant it fails with
+#     "FMHA kernels are not found with these parameters".
+VISION_ENCODER_HEAD_SIZES = [72, 80, 104]
+
+# packed_qkv + padding mask is needed by the encoder models (32 / 64 / 128) and by
+# every vision encoder above.
+PACKED_QKV_PADDING_MASK_HEAD_SIZES = [32, 64, 128] + VISION_ENCODER_HEAD_SIZES
+
+
 def selected_mask_types(kspec):
     # by default, we generate all combinations.
     # '1' means true, '0' means false.
@@ -2197,10 +2219,9 @@ def selected_mask_types(kspec):
             sliding_or_chunked_causal_mask = '0'
             bidirectional_sliding_window_mask = '0'
             custom_mask = '0'
-        # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
+        # encoder models and vision encoders need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
-            # NOTE: 72/80 are added for vision transformer
-            if kspec.head_size not in [32, 64, 72, 80, 128]:
+            if kspec.head_size not in PACKED_QKV_PADDING_MASK_HEAD_SIZES:
                 padding_mask = '0'
         # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
@@ -6884,36 +6905,17 @@ def enumerate_kernels():
         ]
     # yapf: disable
     specs_names = [(kspec, *encode_name(kspec)) for kspec in specs_expanded
-                  # Volta is deprecated in TRT-LLM.
-                  if  (kspec.sm            in [80, 86, 89, 90, 120]
+                  # Volta is deprecated in TRT-LLM. sm100 is not covered generally;
+                  # it is served only for the vision encoder head sizes.
+                  if  (((kspec.sm          in [80, 86, 89, 90, 120] and kspec.head_size <= 256)
+                    or  (kspec.sm          == 100 and kspec.head_size in VISION_ENCODER_HEAD_SIZES))
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     <= 256
                   and kspec.head_size_v   == 0
                   and kspec.sage_block_sizes is None
                   and kspec.version       == 2
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
-                  # Clip/SigLip support.
-                  or  (kspec.sm           == 100
-                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     == 80
-                  and kspec.head_size_v   == 0
-                  and kspec.sage_block_sizes is None
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
-                  # Gemma3 VL support.
-                  or  (kspec.sm           == 100
-                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
-                  and kspec.head_size     == 72
-                  and kspec.head_size_v   == 0
-                  and kspec.sage_block_sizes is None
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == True
-                  and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
                   # Deepseek MLA (generation 576/512 paged)
                   or (kspec.sm            in [90, 100, 120]
                   and kspec.dtype         in ['bf16', 'e4m3_fp32']
