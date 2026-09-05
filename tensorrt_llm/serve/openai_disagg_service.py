@@ -13,8 +13,13 @@
 # limitations under the License.
 
 import asyncio
+import base64
+import json
 import os
+import traceback
 from typing import Callable, Optional
+
+import numpy as np
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
@@ -66,6 +71,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self._warm_ctx_enabled = config.warm_ctx_from_gen
+        self._warm_tasks: set = set()
 
         match self._config.schedule_style:
             case "generation_first":
@@ -110,6 +117,158 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
+    @staticmethod
+    def _align_to_blocks(token_ids: list, block_size: int) -> list:
+        """Drop the ragged tail so every requested block is a whole one.
+
+        Small example:
+        # With block_size 4 and 10 ids, the last 2 ids form no whole block:
+        #     in  [A B C D E F G H I J]   ->  out [A B C D E F G H]
+        # The kv cache stores whole blocks only, so asking for I and J guarantees a miss.
+        """
+        if block_size <= 0:
+            return list(token_ids)
+        whole = (len(token_ids) // block_size) * block_size
+        return list(token_ids[:whole])
+
+    def _warm_block_size(self) -> Optional[int]:
+        """Tokens per KV block, or None when the context router does not track it."""
+        size = getattr(self._ctx_router, "_tokens_per_block", None)
+        if size is None:
+            logger.error("tokens_per_block must be set for warm_ctx.")
+            return None
+        return int(size)
+
+    @staticmethod
+    def _gen_token_ids_of(response: UCompletionResponse) -> list:
+        """Generated token ids from a non-streaming response, or [] when absent."""
+        return list(getattr(response.choices[0], "token_ids", None) or [])
+
+    @staticmethod
+    def _gen_token_ids_of_sse(body: str) -> list:
+        """Generated token ids collected from the streaming chunks.
+
+        The generation worker emits them per chunk only when the orchestrator sets
+        return_gen_token_ids on the request.
+        """
+        ids = []
+        for line in body.split("\n"):
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:") :].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                choice = json.loads(payload)["choices"][0]
+            except (ValueError, KeyError, IndexError):
+                continue
+            chunk_ids = choice.get("token_ids")
+            if chunk_ids:
+                ids.extend(chunk_ids)
+        return ids
+
+    @staticmethod
+    def _prompt_token_ids_of(gen_req: UCompletionRequest) -> list:
+        """The exact ids the generation worker holds for the prompt."""
+        ids = getattr(gen_req, "prompt_token_ids", None)
+        if ids:
+            return list(ids)
+        packed = getattr(gen_req, "prompt_token_ids_b64", None)
+        if packed:
+            return np.frombuffer(base64.b64decode(packed), dtype=np.int32).tolist()
+        prompt = getattr(gen_req, "prompt", None)
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
+            return list(prompt)
+        return []
+
+    def _spawn_warm_task(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._warm_tasks.add(task)
+        task.add_done_callback(self._warm_tasks.discard)
+
+    async def _warm_ctx(
+        self,
+        ctx_server: Optional[str],
+        gen_server: Optional[str],
+        gen_req: UCompletionRequest,
+        disagg_request_id: Optional[int],
+        gen_token_ids: list,
+    ) -> None:
+        """Pull the finished turn's KV from the generation worker."""
+        try:
+            if not ctx_server or not gen_server or not gen_token_ids:
+                return
+
+            prompt_token_ids = self._prompt_token_ids_of(gen_req)
+            if not prompt_token_ids:
+                return
+
+            block_size = self._warm_block_size()
+            if block_size is None:
+                return
+            full_token_ids = self._align_to_blocks(
+                prompt_token_ids + list(gen_token_ids), block_size
+            )
+            if not full_token_ids:
+                return
+
+            state = await self._gen_client.get_data_transceiver_state(gen_server)
+            if state is None:
+                return
+
+            warm_req = CompletionRequest(
+                model=gen_req.model,
+                prompt=full_token_ids,
+                max_tokens=1,
+                stream=False,
+                disaggregated_params=DisaggregatedParams(
+                    request_type="generation_only",
+                    encoded_opaque_state=state,
+                    disagg_request_id=disagg_request_id,
+                    first_gen_tokens=[0],
+                    transfer_only=True,
+                ),
+            )
+            await self._ctx_client.send_request(warm_req, server=ctx_server)
+            logger.info(
+                f"Warmed ctx {ctx_server} from gen {gen_server}: "
+                f"{len(full_token_ids)} of "
+                f"{len(prompt_token_ids)}+{len(gen_token_ids)} tokens "
+                f"(block={block_size})"
+            )
+        except Exception:
+            self._gen_client.forget_data_transceiver_state(gen_server)
+            logger.error(f"Failed to warm ctx: {traceback.format_exc()}")
+
+    async def _warming_stream(
+        self,
+        gen_response: UCompletionResponseOrGenerator,
+        ctx_server: Optional[str],
+        gen_server: Optional[str],
+        gen_req: UCompletionRequest,
+        disagg_request_id: Optional[int],
+    ):
+        """Relay a streaming response, then warm the context worker once it drains."""
+        seen = []
+        try:
+            async for chunk in gen_response:
+                seen.append(chunk)
+                yield chunk
+        finally:
+            body = b"".join(c for c in seen if isinstance(c, bytes)).decode(
+                "utf-8", errors="ignore"
+            )
+            self._spawn_warm_task(
+                self._warm_ctx(
+                    ctx_server,
+                    gen_server,
+                    gen_req,
+                    disagg_request_id,
+                    self._gen_token_ids_of_sse(body),
+                )
+            )
+
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
@@ -153,6 +312,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+                if self._warm_ctx_enabled and gen_req.disaggregated_params is not None:
+                    # warm_ctx requires the request to address the generation worker's blocks by
+                    # exact token content since the blocks on the generation worker are keyed by token content.
+                    gen_req.disaggregated_params.return_gen_token_ids = True
             except Exception:
                 if gen_server:
                     await self._gen_router.finish_request(
@@ -173,6 +336,21 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_reservation_id = disagg_request_id
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
+            )
+            if not self._warm_ctx_enabled:
+                return gen_response
+            if request.stream:
+                return self._warming_stream(
+                    gen_response, ctx_server, gen_server, gen_req, disagg_request_id
+                )
+            self._spawn_warm_task(
+                self._warm_ctx(
+                    ctx_server,
+                    gen_server,
+                    gen_req,
+                    disagg_request_id,
+                    self._gen_token_ids_of(gen_response),
+                )
             )
             return gen_response
         else:
@@ -332,6 +510,13 @@ class OpenAIDisaggregatedService(OpenAIService):
         )
         if hasattr(self._coordinator, "set_clients"):
             self._coordinator.set_clients(self._ctx_client, self._gen_client)
+        if self._warm_ctx_enabled and not self._ctx_router.keeps_conversation_affinity():
+            logger.warning(
+                "warm_ctx_from_gen needs a kv_cache_aware or conversation router that keeps conversation affinity. "
+                f"Got {type(self._ctx_router).__name__}. "
+                "Disabling warm_ctx_from_gen."
+            )
+            self._warm_ctx_enabled = False
         await self._coordinator.start()
 
     async def teardown(self) -> None:

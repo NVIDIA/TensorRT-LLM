@@ -152,6 +152,11 @@ class DisaggServerConfig():
     # the orchestrator relays a string instead of materializing the token-id list
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
     gen_tokids_ctxbytes: bool = False
+    # After a turn finishes, ask the context worker to pull that conversation's KV from the
+    # generation worker that produced it. The next turn then reuses the reply tokens instead
+    # of prefilling them again. Needs a kv_cache_aware or conversation router that keeps
+    # conversation affinity and block reuse on both sides.
+    warm_ctx_from_gen: bool = False
     # Number of uvicorn disagg-server worker processes to fork on the public port.
     # >1 means a fleet of delegating servers behind one coordinator. Replaces the
     # WEB_CONCURRENCY env var (explicit config over implicit env).
@@ -253,6 +258,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        allow_request_chat_template: bool = False,
                        gen_strip_message_history: bool = False,
                        gen_tokids_ctxbytes: bool = False,
+                       warm_ctx_from_gen: bool = False,
                        num_workers: int = 1,
                        disagg_coordinator_url: Optional[str] = None,
                        server_keep_alive_timeout: int = 10,
@@ -324,6 +330,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
+    config.warm_ctx_from_gen = warm_ctx_from_gen
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
     config.server_keep_alive_timeout = validate_config_non_negative_int(

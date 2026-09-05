@@ -139,6 +139,7 @@ async def run_worker(kv_cache_config,
     intercomm.send(intercomm.Get_rank(), dest=0, tag=MPI_READY)
 
     last_cached_tokens = 0
+    last_prompt_token_ids = []
     print(f"Waiting for requests")
     while True:
         try:
@@ -154,6 +155,9 @@ async def run_worker(kv_cache_config,
                 continue
             if requests == "GET_LAST_CACHED_TOKENS":
                 intercomm.send(last_cached_tokens, dest=0, tag=MPI_RESULT)
+                continue
+            if requests == "GET_LAST_PROMPT_TOKEN_IDS":
+                intercomm.send(last_prompt_token_ids, dest=0, tag=MPI_RESULT)
                 continue
 
             request_metas = []
@@ -226,6 +230,8 @@ async def run_worker(kv_cache_config,
                             result = await future
                             last_cached_tokens = getattr(
                                 result, 'cached_tokens', 0)
+                            last_prompt_token_ids = list(
+                                getattr(result, 'prompt_token_ids', None) or [])
                             print(
                                 f"Worker {rank}: got result {i}, "
                                 f"cached_tokens={last_cached_tokens}, sending",
@@ -1108,6 +1114,161 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                 f"Expected at most 1 cached token for unrelated prompt, got {cached2}"
             assert cached2 < cached1, \
                 "Unrelated prompt should have fewer cached tokens than transferred prompt"
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+            raise
+        finally:
+            print("Sending termination request", flush=True)
+            mpi_send_termination_request(intercomm)
+
+            print("Waiting for all workers to terminate. ", flush=True)
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False])
+def test_warm_ctx_from_gen(model, generation_overlap):
+    """Warm a context worker with a generation worker's KV, then confirm the reuse hit.
+
+    Worker 0 is the generation worker, and worker 1 is the context worker.
+
+    Flow:
+    1. Worker 0 generates a reply, so it holds KV for the prompt AND the reply.
+    2. Worker 1 receives a generation_only request carrying worker 0's transceiver state.
+       Worker 1 pulls the whole conversation and commits it to its own reuse tree.
+    3. Worker 1 prefills the next turn, which is prompt + reply + new user text.
+    4. cached_tokens on worker 1 must cover the reply, not the prompt alone.
+    """
+    worker_pytorch_configs = []
+
+    # Worker 0: generation worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=True,
+             cuda_graph_config=CudaGraphConfig()))
+
+    # Worker 1: context worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=not generation_overlap,
+             cuda_graph_config=CudaGraphConfig()))
+
+    tokens_per_block = 32
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      tokens_per_block=tokens_per_block) for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = mpi_publish_name()
+
+    turn1 = "What is the capital of Germany?"
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                futures.append(executor.submit(worker_entry_point, *worker_arg))
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise
+
+        intercomm = None
+        try:
+            print("Launched all the workers.", flush=True)
+            intercomm = mpi_initialize_intercomm(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+
+            # 1. Worker 0 generates a reply and its reuse tree now holds prompt and reply.
+            print("Turn 1 on worker 0 (gen role)", flush=True)
+            requests = [(turn1, SamplingParams(max_tokens=32,
+                                               ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 0, intercomm)
+            assert len(responses) == 1
+            generated_ids = list(responses[0][0].token_ids)
+            assert len(generated_ids) > 0
+
+            # Get worker 0's own token ids.
+            intercomm.send("GET_LAST_PROMPT_TOKEN_IDS", dest=0, tag=MPI_REQUEST)
+            prompt_ids = intercomm.recv(source=0, tag=MPI_RESULT)
+            assert len(prompt_ids) > 0
+            raw_ids = list(prompt_ids) + generated_ids
+            whole = (len(raw_ids) // tokens_per_block) * tokens_per_block
+            full_ids = raw_ids[:whole]
+            assert len(full_ids) > len(prompt_ids), (
+                f"{len(raw_ids)} tokens align down to {len(full_ids)}, which does "
+                f"not reach past the {len(prompt_ids)}-token prompt")
+            print(
+                f"Worker 0 holds {len(prompt_ids)} prompt + "
+                f"{len(generated_ids)} generated tokens; "
+                f"aligned to {len(full_ids)} for transfer",
+                flush=True)
+
+            # 2. Read worker 0's transceiver state
+            intercomm.send("GET_STATE", dest=0, tag=MPI_REQUEST)
+            state = intercomm.recv(source=0, tag=MPI_RESULT)
+            assert isinstance(state, bytes) and len(state) > 0
+
+            # 3. The warming request: Worker 1 pulls turn 1's KV from worker 0
+            print("Warming worker 1 (ctx role) from worker 0", flush=True)
+            warm_params = DisaggregatedParams(
+                request_type="generation_only",
+                opaque_state=state,
+                first_gen_tokens=[0],
+                disagg_request_id=4242,
+                transfer_only=True,
+            )
+            requests = [(full_ids, SamplingParams(max_tokens=1,
+                                                  ignore_eos=True), warm_params)
+                        ]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+            assert not isinstance(responses[0], str), (
+                f"warm request errored instead of transferring KV: {responses[0]}"
+            )
+            warm_tokens = responses[0][0].token_ids or []
+            assert len(warm_tokens) <= 1, (
+                f"transfer_only request produced {len(warm_tokens)} tokens. Instead no decode steps should be run."
+            )
+
+            # 4. Next turn on worker 1: turn 1 plus a new user message, as token ids so the
+            #    prefix stays byte-identical to what worker 0 served.
+            print("Turn 2 on worker 1, expecting a reuse hit", flush=True)
+            turn2_ids = full_ids + [450, 7483, 338, 29973]
+            requests = [(turn2_ids, SamplingParams(max_tokens=4,
+                                                   ignore_eos=True), None)]
+            responses = send_requests_to_worker(requests, 1, intercomm)
+            assert len(responses) == 1
+
+            intercomm.send("GET_LAST_CACHED_TOKENS", dest=1, tag=MPI_REQUEST)
+            warmed_cached = intercomm.recv(source=1, tag=MPI_RESULT)
+            print(
+                f"Worker 1 cached_tokens after warming: {warmed_cached} "
+                f"(prompt alone would be <= {len(prompt_ids)})",
+                flush=True)
+
+            # The hit must reach past the prompt into the reply.
+            assert warmed_cached > len(prompt_ids), (
+                f"cached_tokens={warmed_cached} does not exceed the "
+                f"{len(prompt_ids)}-token prompt, so the reply KV did not transfer"
+            )
 
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
