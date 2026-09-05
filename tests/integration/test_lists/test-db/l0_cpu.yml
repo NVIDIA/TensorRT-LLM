@@ -112,6 +112,7 @@ l0_cpu:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_llm_quant.py
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/llmapi/test_llm_utils.py
