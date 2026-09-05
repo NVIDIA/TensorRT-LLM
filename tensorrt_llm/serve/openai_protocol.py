@@ -968,13 +968,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high", "max", "none"]] = Field(
+        "low", "medium", "high", "none", "minimal", "xhigh", "max"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
-                "The level of reasoning effort to use. Controls how much "
-                "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
-                "'none' for models with Kimi-style thinking control."),
+                "Constrains effort on reasoning for reasoning models. "
+                "Supported values are none, minimal, low, medium, high, xhigh "
+                "and max. Not every model accepts every level; the value is "
+                "passed to the chat template unchanged, so a model that does "
+                "not support a level rejects it. Note that 'max' is specific "
+                "to the DeepSeek V4 series and is not part of the standard "
+                "OpenAI API specification."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose

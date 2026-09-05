@@ -199,6 +199,33 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
+def _chat_template_kwargs_with_effort(request) -> dict:
+    """Surface `reasoning_effort` to the chat template.
+
+    Templates that gate reasoning on this field cannot otherwise see it: only
+    `chat_template_kwargs` reaches the renderer, so the top-level OpenAI field
+    is silently ignored. vLLM forwards it the same way, and the value is passed
+    through unmapped - a template that does not accept a level rejects it
+    itself, rather than us guessing a substitute and quietly changing how much
+    the model reasons.
+
+    Forwarded only when the caller actually sent it. The field defaults to LOW
+    for the harmony path, so injecting the default would hand every request a
+    level its template may not accept. `model_fields_set` is what separates a
+    caller-sent value from that default; it stands in for vLLM's `None`
+    default, which its merge drops for the same reason.
+
+    A sent value overrides `chat_template_kwargs`, matching vLLM's merge order.
+    """
+    kwargs = dict(request.chat_template_kwargs or {})
+    if "reasoning_effort" in request.model_fields_set:
+        effort = request.reasoning_effort
+        effort = getattr(effort, "value", effort)
+        if effort is not None:
+            kwargs["reasoning_effort"] = effort
+    return kwargs
+
+
 def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
 
@@ -2152,7 +2179,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template_kwargs=_chat_template_kwargs_with_effort(
+                        request),
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
