@@ -9,11 +9,12 @@ run, based on what the PR changed. New rules are added in Python only.
 
 | Tier | Where | Basis |
 |---|---|---|
-| **1. Rules** | `rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
-| **2. Coverage** | `coverage_selection/`, `coverage_tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is core Python present in the touch DB. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `coverage_selection/SELECTION.md`. |
+| **1. Rules** | `cbts/rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
+| **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is core Python present in the touch DB. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
 
-The touch DB is produced by the post-merge collection under `coverage_utils/`;
-see `coverage_utils/COLLECTION.md` for what it does and does not record.
+The touch DB is produced by the post-merge collection under
+`cbts/coverage/collection/`; see `cbts/coverage/collection/COLLECTION.md`
+for what it does and does not record.
 
 ## Consumption layers
 
@@ -30,7 +31,7 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `main.py::RULE_CLASSES`:
+Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
@@ -44,7 +45,7 @@ Nine rules, registered in `main.py::RULE_CLASSES`:
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) |
 | `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
 
-See `rules/README.md` for per-rule logic.
+See `cbts/rules/README.md` for per-rule logic.
 
 ## Scopes
 
@@ -62,7 +63,7 @@ See `rules/README.md` for per-rule logic.
 | `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry, docs-only edits). Layer 2 still applies. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
-`_combine_scopes` (main.py): rules with `scope="noop"` give way to any
+`_combine_scopes` (`cbts/command/main.py`): rules with `scope="noop"` give way to any
 actionable rule that also fired. Identical actionable scopes pass through;
 testsonly-family mixes combine to `testsonly`; anything else returns
 `None`.
@@ -74,36 +75,48 @@ unclaimed files in `pr.changed_files` → fallback.
 ## File map
 
 ```
-jenkins/scripts/cbts/
+jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH for `import cbts.*`
 ├── README.md              this file
-├── main.py                CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
-├── blocks.py              YAML index + path/waive lookup + filtered tmp test-db generation + per-stage count
-├── rules/
-│   ├── README.md          per-rule logic
-│   ├── base.py            Rule ABC + PRInputs + RuleResult
-│   ├── _helpers.py        diff iteration + lookup-into-block_filters + stages_by_yaml_stem
-│   ├── waives_rule.py
-│   ├── tests_def_rule.py
-│   ├── test_list_rule.py
-│   ├── auto_deploy_rule.py
-│   ├── visual_gen_rule.py
-│   ├── spec_dec_rule.py
-│   ├── agent_flow_rule.py
-│   ├── openengine_rule.py
-│   └── out_of_scope_rule.py
-├── coverage_tier.py       Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
-├── coverage_selection/
-│   ├── SELECTION.md       how a decision is made: qualname concepts, decline gates, narrowing
-│   ├── selector.py        CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
-│   ├── qualname_map.py    changed lines → co_qualname, plus the import-time and closure classifications
-│   ├── touch_db.py        read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
-│   └── artifact.py        resolve and merge the x86/SBSA post-merge touch DBs
-├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
-└── tools/
-    ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
-    ├── coverage_audit.py  report a touch DB's format, scale, untrusted rate and HEAD coverage gap
-    ├── coverage_explain.py  explain one commit's decision case by case (delegates to CoverageSelector)
-    └── report_cbts_decision.py  post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
+├── cbts/                  the importable package
+│   ├── __init__.py
+│   ├── blocks.py          YAML index + path/waive lookup + filtered tmp test-db generation + per-stage count
+│   ├── rules/
+│   │   ├── README.md      per-rule logic
+│   │   ├── base.py        Rule ABC + PRInputs + RuleResult
+│   │   ├── _helpers.py    diff iteration + lookup-into-block_filters + stages_by_yaml_stem
+│   │   ├── waives.py
+│   │   ├── tests_def.py
+│   │   ├── test_list.py
+│   │   ├── auto_deploy.py
+│   │   ├── visual_gen.py
+│   │   ├── spec_dec.py
+│   │   ├── agent_flow.py
+│   │   ├── openengine.py
+│   │   └── out_of_scope.py
+│   ├── coverage/
+│   │   ├── tier.py        Tier 2 entry: applies the selector to the test-db YAMLs, classifies every candidate entry
+│   │   ├── selection/
+│   │   │   ├── SELECTION.md  how a decision is made: qualname concepts, decline gates, narrowing
+│   │   │   ├── selector.py   CoverageSelector.decide(): changed lines → qualnames → impacted / skippable per stage family
+│   │   │   ├── qualname_map.py  changed lines → co_qualname, plus the import-time and closure classifications
+│   │   │   └── touch_db.py   read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
+│   │   └── collection/    post-merge collection that produces the touch DB (see its README / COLLECTION.md)
+│   └── command/           unified CLI, `python -m cbts.command ...`
+│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
+│       ├── dryrun.py       `dryrun` — replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
+│       ├── report_decision.py  `report-decision` — post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
+│       └── coverage/
+│           ├── pilot.py        `coverage pilot` — resolve the PR author for the coverage pilot policy
+│           ├── selection/
+│           │   ├── artifact.py `coverage selection artifact` — resolve and merge the x86/SBSA post-merge touch DBs
+│           │   ├── audit.py    `coverage selection audit` — report a touch DB's format, scale, untrusted rate and HEAD coverage gap
+│           │   └── explain.py  `coverage selection explain` — explain one commit's decision case by case (delegates to CoverageSelector)
+│           └── collection/
+│               ├── pystart_report.py    `coverage collection pystart-report` — union leaf coverage DBs into the touch DB / report
+│               └── compact_touch_db.py  `coverage collection compact-touch-db` — one-shot compact-schema sizing spike (dev only)
+└── cbts_injectors/        bare-importable guest hooks (NOT part of the `cbts` package)
+    ├── sitecustomize.py   loaded automatically by Python's `site` machinery in every instrumented subprocess
+    └── cbts_plugin.py     pytest plugin, loaded via `-p cbts_plugin`
 ```
 
 ## Lookup algorithms
@@ -179,11 +192,12 @@ Jenkins console diagnostics.
 
 ## How it's invoked (CI)
 
-`getCbtsResult` calls `main.py` twice on the L0_MergeRequest agent:
+`getCbtsResult` calls `cbts.command main` twice on the L0_MergeRequest agent
+(via `PYTHONPATH=jenkins/scripts/cbts python3 -m cbts.command main ...`):
 
-1. `main.py --list-needed-diffs` → file patterns whose diffs Groovy must fetch
+1. `main --list-needed-diffs` → file patterns whose diffs Groovy must fetch
    (Ant-style globs).
-2. `main.py cbts_input.json` → decision JSON on stdout. When any block was
+2. `main cbts_input.json` → decision JSON on stdout. When any block was
    narrowed, writes `${LLM_ROOT}/cbts_test_db/` with the affected YAMLs and
    only their affected blocks (kept entries preserve `TIMEOUT (n)`,
    `ISOLATION`, `-k`, `-m` verbatim).
@@ -260,11 +274,11 @@ and reuse normally.
 
 ## Adding a new rule
 
-1. **Create `rules/my_rule.py`** subclassing `Rule`:
+1. **Create `cbts/rules/my_rule.py`** subclassing `Rule`:
 
    ```python
    from typing import Optional
-   from blocks import YAMLIndex, Stage
+   from cbts.blocks import YAMLIndex, Stage
    from .base import PRInputs, Rule, RuleResult
 
    class MyRule(Rule):
@@ -295,13 +309,13 @@ and reuse normally.
            )
    ```
 
-2. Register in `main.py::RULE_CLASSES` (and adjust `build_rules()` if the
-   constructor signature differs).
+2. Register in `cbts/command/main.py::RULE_CLASSES` (and adjust
+   `build_rules()` if the constructor signature differs).
 
 3. No Groovy edits needed.
 
 4. If the new scope name should combine with existing testsonly-family
-   scopes, add it to `_TESTSONLY_FAMILY` in `main.py`.
+   scopes, add it to `_TESTSONLY_FAMILY` in `cbts/command/main.py`.
 
 `Selector` unions `affected_stages` and `block_filters`; scopes are
 combined via `_combine_scopes`.
@@ -312,7 +326,7 @@ CBTS defers to the existing filter chain when:
 
 - PostMerge job / `alternativeTRT` set
 - `changed_files` is empty
-- `main.py` throws or stdout is unparsable
+- `cbts.command main` throws or stdout is unparsable
 - Python returns `scope: null`
 - A file in `pr.changed_files` is unhandled by every rule (e.g. a `.py`
   file outside any YAML namespace)
@@ -323,7 +337,7 @@ CBTS defers to the existing filter chain when:
 - Tier 2 declines: a residual file is not core Python, is absent from the
   touch DB, has an import-executed change (module / class body, signature or
   decorator line), has no usable patch, has unparsable source, or has a closure
-  change with no wider row set (see `coverage_selection/SELECTION.md` §3-4)
+  change with no wider row set (see `cbts/coverage/selection/SELECTION.md` §3-4)
 - No touch DB artifact could be resolved — Tier 2 never runs
 - The resolved DB sits more than `--coverage-max-drift` commits from the PR's
   base commit, on either side, or an unmeasurable distance from it — Tier 2
