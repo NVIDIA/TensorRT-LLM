@@ -1525,7 +1525,10 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host, port)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

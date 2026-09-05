@@ -296,11 +296,12 @@ Outcomes:
 ## OpenEngineRule
 
 Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
-entries under `unittest/grpc/openengine/`. The focused test is registered in `l0_cpu.yml`, so it
-resolves to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
-unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so an OpenEngine change never needs a GPU shard and the
-test still runs on every baseline and fallback pipeline. Those are also the only stages that install
-`requirements-openengine.txt`; that install is guarded on the stage name in `jenkins/L0_Test.groovy`
+entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
+they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
+unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
+pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_l40s.yml`,
+adding `L40S-PyTorch-*`: an OpenEngine change does pull one GPU shard. Those are also the only stages
+that install `requirements-openengine.txt`; that install is guarded on the stage name in `jenkins/L0_Test.groovy`
 and deliberately not on CBTS scope, because `scopes` is a union across fired rules and a mixed
 selection would otherwise carry the OpenEngine pins into every shard it runs. If no OpenEngine test
 entry is registered, the rule returns `scope=None` and falls back to the baseline rather than
