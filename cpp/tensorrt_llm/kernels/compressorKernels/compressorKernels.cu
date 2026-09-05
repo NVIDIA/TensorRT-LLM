@@ -297,7 +297,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
     int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks,
-    int out_elem_bytes)
+    int out_elem_bytes, int32_t const* __restrict__ new_tokens_per_seq = nullptr)
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
@@ -337,7 +337,16 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     int const eff_tid = head_blk * NTHRD_INNER + tid;
 
     int const kv_len = kv_lens[batch_idx];
-    int const sp = kv_len - NEXT_N;
+    // How many tokens this request appended this step. Uniform batches append
+    // NEXT_N each, which is what the template bound encodes. Under DSpark's
+    // ragged verification each request appends its own window instead, so the
+    // count is read per request and NEXT_N degrades to a compile-time *upper*
+    // bound -- which is all the loops below need it to be, because both are
+    // already guarded (Phase 1 by token_idx < kv_len, Phase 3 by
+    // num_compressions). Keeping NEXT_N as the bound is what preserves the
+    // full unroll on the uniform path.
+    int const nn = (new_tokens_per_seq != nullptr) ? new_tokens_per_seq[batch_idx] : NEXT_N;
+    int const sp = kv_len - nn;
     int const in_off = cu_seq_lens[batch_idx];
     int const out_off = cu_kv_comp[batch_idx];
     int64_t const page_sd = static_cast<int64_t>(page_size) * STATE_DIM;
@@ -413,7 +422,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     // ================================================================
     // Phase 2: Count how many complete compression windows finished.
     // ================================================================
-    int last_token_idx = sp + NEXT_N - 1;
+    int last_token_idx = sp + nn - 1;
     int num_compressions = (last_token_idx + 1) / COMPRESS_RATIO - sp / COMPRESS_RATIO;
 
     // ================================================================
@@ -635,19 +644,24 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 
 // Per-axis fan-outs (used to keep the master list compact).
 #define FOREACH_DECODE_NN_1_4(F, HD, KV, ST, CR, NRW)                                                                  \
-    F(HD, KV, ST, CR, 1, NRW) F(HD, KV, ST, CR, 2, NRW) F(HD, KV, ST, CR, 3, NRW) F(HD, KV, ST, CR, 4, NRW)
+    F(HD, KV, ST, CR, 1, NRW)                                                                                          \
+    F(HD, KV, ST, CR, 2, NRW) F(HD, KV, ST, CR, 3, NRW) F(HD, KV, ST, CR, 4, NRW)
 #define FOREACH_DECODE_NN_5_8(F, HD, KV, ST, CR, NRW)                                                                  \
-    F(HD, KV, ST, CR, 5, NRW) F(HD, KV, ST, CR, 6, NRW) F(HD, KV, ST, CR, 7, NRW) F(HD, KV, ST, CR, 8, NRW)
+    F(HD, KV, ST, CR, 5, NRW)                                                                                          \
+    F(HD, KV, ST, CR, 6, NRW) F(HD, KV, ST, CR, 7, NRW) F(HD, KV, ST, CR, 8, NRW)
 #define FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW)                                                                       \
     FOREACH_DECODE_NN_1_4(F, HD, 2, 2, CR, NRW)                                                                        \
     FOREACH_DECODE_NN_1_4(F, HD, 2, 4, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_1_4(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_1_4(F, HD, 4, 4, CR, NRW)
+    FOREACH_DECODE_NN_1_4(F, HD, 4, 2, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_1_4(F, HD, 4, 4, CR, NRW)
 #define FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)                                                                       \
     FOREACH_DECODE_NN_5_8(F, HD, 2, 2, CR, NRW)                                                                        \
     FOREACH_DECODE_NN_5_8(F, HD, 2, 4, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_5_8(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_5_8(F, HD, 4, 4, CR, NRW)
+    FOREACH_DECODE_NN_5_8(F, HD, 4, 2, CR, NRW)                                                                        \
+    FOREACH_DECODE_NN_5_8(F, HD, 4, 4, CR, NRW)
 #define FOREACH_DECODE_DTYPE_1_8(F, HD, CR, NRW)                                                                       \
-    FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW) FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)
+    FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW)                                                                           \
+    FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)
 
 // Master list. Order does not matter; the dispatcher walks linearly.
 // clang-format off
@@ -663,7 +677,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 // Generate explicit template instantiations.
 #define INST_DECODE(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                  \
     template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const*, float const*, void*, \
-        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
+        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int,   \
+        int32_t const*);
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
@@ -680,7 +695,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
     int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
     int compress_ratio, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
-    cudaStream_t stream)
+    int32_t const* new_tokens_per_seq, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(
         compress_ratio == 4 || compress_ratio == 128, "pagedKvCompressLaunch only supports compress_ratio 4 or 128");
@@ -731,14 +746,15 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     {                                                                                                                  \
         pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, \
             paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
-            page_size, max_blocks, out_elem_bytes);                                                                    \
+            page_size, max_blocks, out_elem_bytes, new_tokens_per_seq);                                                \
         return;                                                                                                        \
     }
     FOREACH_DECODE_CONFIG(TRY_LAUNCH)
 #undef TRY_LAUNCH
 
     TLLM_THROW(
-        "pagedKvCompressLaunch: no matching instantiation for HD=%d, kv_eb=%d, state_eb=%d, CR=%d, NN=%d, NRW=%d",
+        "pagedKvCompressLaunch: no matching instantiation for HD=%d, "
+        "kv_eb=%d, state_eb=%d, CR=%d, NN=%d, NRW=%d",
         head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, next_n, num_red_warps);
 }
 
@@ -1079,8 +1095,10 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
         //   prev-segment (first head_dim,  kv_col=0)    from window (abs_idx-1)
         //   curr-segment (second head_dim, kv_col=HD)   from window abs_idx
         if (abs_idx > 0)
-            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0, false); // prev window, first half
-        reduce_window(win_start, HEAD_DIM, HEAD_DIM, false);            // curr window, second half
+            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0,
+                false); // prev window, first half
+        reduce_window(win_start, HEAD_DIM, HEAD_DIM,
+            false);     // curr window, second half
     }
     else
     {
@@ -1175,7 +1193,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 
 #define INST_PREFILL_DTYPES(HD, CR, NRW)                                                                               \
     INST_PREFILL(HD, 2, 2, CR, NRW)                                                                                    \
-    INST_PREFILL(HD, 2, 4, CR, NRW) INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
+    INST_PREFILL(HD, 2, 4, CR, NRW)                                                                                    \
+    INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
 
 INST_PREFILL_DTYPES(128, 4, 1)
 INST_PREFILL_DTYPES(128, 128, 4)
@@ -1209,7 +1228,8 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
         compress_ratio == 4 || compress_ratio == 128, "prefillReductionLaunch only supports compress_ratio 4 or 128");
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
-        "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
+        "prefillReductionLaunch only supports bf16/fp32 "
+        "kv_score and paged state");
     int const elem_bytes_for_vec = max(kv_score_elem_bytes, state_elem_bytes);
     int const vec = prefillVec(head_dim, elem_bytes_for_vec);
     int const nthrd_base = head_dim / vec;

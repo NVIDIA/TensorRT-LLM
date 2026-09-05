@@ -4121,9 +4121,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Dynamic-tree draft managers reserve K * max_draft_len slots,
                 # which can exceed the tree's runtime draft width. Reclaim that
                 # reserve slack together with rejected draft tokens; otherwise
-                # it accumulates in the draft KV cache after every generation
-                # step. Target managers do not allocate this reserve slack.
+                # it accumulates in the draft KV cache after every generation step.
                 rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
+            elif getattr(req, "py_verify_len", None) is not None:
+                # Target preparation reserves the full drafted block, while
+                # ragged verification can score only a prefix. Reclaim the
+                # unverified suffix in addition to rejections within the window.
+                runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
+                reserved_draft_len = max(get_draft_token_length(req), self._kv_reserve_draft_tokens)
+                rewind_len += max(reserved_draft_len - runtime_draft_len, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)

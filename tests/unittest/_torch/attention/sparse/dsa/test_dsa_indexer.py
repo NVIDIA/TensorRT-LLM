@@ -223,6 +223,7 @@ def test_kv_lens_row_reorder_threshold():
             num_generations=num_generations,
             num_sms=num_sms,
             max_draft_tokens=next_n - 1,
+            gen_token_stride=next_n,
             num_contexts=0,
             num_seqs=num_generations,
             kv_lens_cuda=kv_lens_cuda,
@@ -348,6 +349,8 @@ def test_shared_topk_lifecycle(monkeypatch):
     )
     metadata._create_kv_lens_2d_buffer = Mock()
     metadata.create_expanded_buffers = Mock()
+    metadata._ragged_num_rows = 0
+    metadata._attn_num_rows = 0
 
     with patch(
         "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.prefer_pinned",

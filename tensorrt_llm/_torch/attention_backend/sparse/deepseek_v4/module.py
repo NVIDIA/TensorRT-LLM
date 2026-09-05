@@ -458,10 +458,11 @@ def _fused_q_rope_specs(
     """(cos_sin, specs) for the fused Q RoPE, one spec per phase in the batch.
 
     Each spec is `(rows, cache_lens, seq_len, cu_q_seqlens)` where `rows` is the
-    row range of the batch it covers. Context rows take positions from a ragged
-    token cumsum, generation rows from a uniform query length, so one launch
-    cannot serve both -- a mixed batch yields two specs and the caller issues one
-    launch per spec over disjoint row ranges of the same output buffers.
+    row range of the batch it covers. Context and ragged-generation rows take
+    positions from separate request-major token cumsums; uniform generation
+    retains the scalar query length. A mixed batch yields two specs and the
+    caller issues one launch per spec over disjoint row ranges of the same
+    output buffers.
 
     Returns `(None, [])` when the batch does not qualify.
     """
@@ -489,16 +490,34 @@ def _fused_q_rope_specs(
 
     if num_generations > 0:
         num_gen_tokens = num_tokens - num_ctx_tokens
-        if num_gen_tokens <= 0 or num_gen_tokens % num_generations != 0:
+        if num_gen_tokens <= 0:
             return None, []
-        specs.append(
-            (
-                slice(num_ctx_tokens, num_tokens),
-                cache_lens[num_contexts:],
-                num_gen_tokens // num_generations,
-                None,
+        if bool(getattr(attn_metadata, "is_ragged_verify", False)):
+            prep_gen = getattr(attn_metadata, "mla_prepare_fused_q_gen_cu_seqlens", None)
+            if prep_gen is None:
+                return None, []
+            cu_q_seqlens = prep_gen()
+            if cu_q_seqlens is None:
+                return None, []
+            specs.append(
+                (
+                    slice(num_ctx_tokens, num_tokens),
+                    cache_lens[num_contexts : num_contexts + num_generations],
+                    0,
+                    cu_q_seqlens,
+                )
             )
-        )
+        else:
+            if num_gen_tokens % num_generations != 0:
+                return None, []
+            specs.append(
+                (
+                    slice(num_ctx_tokens, num_tokens),
+                    cache_lens[num_contexts:],
+                    num_gen_tokens // num_generations,
+                    None,
+                )
+            )
 
     if not specs:
         return None, []

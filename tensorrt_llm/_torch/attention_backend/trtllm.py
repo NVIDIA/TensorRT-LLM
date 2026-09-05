@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
 import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
+    from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._torch.attention_backend.fmha.interface import (
     MlaBackendPolicy, _CuteDslMlaStagingKey)
@@ -697,6 +699,69 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
         """Restore backend state modified for draft-forward execution."""
         return None
+
+    def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
+        """The token-major generation presentation, or None.
+
+        None on every backend but DSA, and on every uniform DSA batch. See
+        ``DSAtrtllmAttentionMetadata.token_major_gen_view``.
+        """
+        return None
+
+    @contextlib.contextmanager
+    def presented_token_major(
+            self, view: Optional["TokenMajorGenView"]) -> Iterator[None]:
+        """Temporarily present the generation half as one row per query token.
+
+        The MLA rope and sparse-MLA generation ops learn their sequence count
+        from ``host_context_lengths.size(0)`` and then require the query tokens
+        to divide evenly across it. A ragged batch does not divide. Swapping in
+        per-token views for the duration of those two calls makes the division
+        trivial (seq_len == 1) and satisfies their asserts rather than weakening
+        them.
+
+        Scoped deliberately: ``num_seqs`` is read as a *request* count almost
+        everywhere else -- spec workers sizing acceptance rectangles, the
+        KV-length correction under the overlap scheduler, the indexer's own
+        metadata -- so the token-major rows must never outlive these two calls.
+        """
+        if view is None:
+            yield
+            return
+        saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
+                 self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
+                 self.max_num_requests, self.prompt_lens_cuda_runtime,
+                 self.host_request_types_runtime)
+        try:
+            self.kv_lens_cuda_runtime = view.sequence_length
+            self.kv_lens_runtime = view.host_past_key_value_lengths
+            self.prompt_lens_cpu_runtime = view.host_context_lengths
+            self.kv_cache_block_offsets = view.kv_cache_block_offsets
+            # The op reserves its multi-CTA-KV counter as
+            # `num_heads * max_num_requests` and sizes its generation workspace
+            # from the same number. Under this presentation the batch dimension
+            # the kernels see is the ROW count, which is larger. Passing the
+            # static ceiling grows the reservation to cover it while keeping the
+            # op's (beam_width, max_num_requests, window) cache key constant.
+            # This is only a capacity input -- the op's own mMaxNumRequests is a
+            # JIT-warmup hint, and the per-step request count comes from the
+            # batch, not from here.
+            #
+            # The attention workspace is sized from the same number, so it
+            # grows with the row ceiling; that memory would otherwise hold
+            # KV cache.
+            self.max_num_requests = view.max_num_rows
+            # Every runtime view has to agree on batch_size with
+            # kv_lens_cuda_runtime, and the op reads request_types over all of
+            # num_seqs -- both are the row count here, not the request count.
+            self.prompt_lens_cuda_runtime = view.prompt_lens_cuda
+            self.host_request_types_runtime = view.host_request_types
+            yield
+        finally:
+            (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
+             self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
+             self.max_num_requests, self.prompt_lens_cuda_runtime,
+             self.host_request_types_runtime) = saved
 
     def prepare(self) -> None:
         super().prepare()
@@ -2107,12 +2172,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
-        fmha = self._fmha_manager.select(self, q, k, v, metadata, forward_args)
+        # On a ragged generation step the attention op is handed
+        # one row per query token so its `num_tokens % num_seqs == 0` check
+        # passes with seq_len == 1. Keep the presentation scoped around both
+        # current-main's library selection and dispatch: support checks read the
+        # same runtime metadata as the selected FMHA implementation.
+        token_major_view = (metadata.token_major_gen_view()
+                            if forward_args.attention_input_type
+                            == AttentionInputType.generation_only else None)
+        with metadata.presented_token_major(token_major_view):
+            fmha = self._fmha_manager.select(self, q, k, v, metadata,
+                                             forward_args)
 
-        if fmha is None:
-            raise RuntimeError(
-                "No TRT-LLM attention FMHA library supports this request.")
-        fmha.forward(q, k, v, metadata, forward_args)
+            if fmha is None:
+                raise RuntimeError(
+                    "No TRT-LLM attention FMHA library supports this request.")
+            fmha.forward(q, k, v, metadata, forward_args)
 
         if self.print_skip_softmax_stat:
             total_blocks, skipped_blocks = self.skip_softmax_stat
@@ -2382,6 +2457,47 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
+        # Same presentation as the attention dispatch above: the
+        # rope kernel derives batch_idx = tok / seq_len and the KV write offset
+        # from a single scalar seq_len, which only describes a batch where every
+        # request contributes the same number of tokens.
+        with self.presented_token_major_for(metadata):
+            self._mla_rope_generation_impl(
+                metadata, fused_q, q_pe, latent_cache, cu_q_seqlens,
+                cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params,
+                kv_norm_weight, kv_norm_eps, precomputed_cu_seqlens,
+                precomputed_fmha_scheduler, kv_only, kv_done_elsewhere,
+                quant_scale_qkv)
+
+    @contextlib.contextmanager
+    def presented_token_major_for(
+            self, metadata: TrtllmAttentionMetadata) -> Iterator[None]:
+        with metadata.presented_token_major(metadata.token_major_gen_view()):
+            yield
+
+    def _mla_rope_generation_impl(
+        self,
+        metadata: TrtllmAttentionMetadata,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
+        latent_cache: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        fmha_scheduler_counter: torch.Tensor,
+        mla_bmm1_scale: Optional[torch.Tensor],
+        mla_bmm2_scale: Optional[torch.Tensor],
+        quant_q_buffer: torch.Tensor,
+        out_scale: Optional[torch.Tensor],
+        helix_tensor_params: List[Optional[torch.Tensor]],
+        kv_norm_weight: Optional[torch.Tensor],
+        kv_norm_eps: float,
+        precomputed_cu_seqlens: bool,
+        precomputed_fmha_scheduler: bool,
+        kv_only: bool,
+        kv_done_elsewhere: bool,
+        quant_scale_qkv: Optional[torch.Tensor],
+    ) -> None:
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
