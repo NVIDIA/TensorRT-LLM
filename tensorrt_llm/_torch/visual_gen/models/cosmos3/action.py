@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -395,6 +396,16 @@ ACTION_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
 
 
 def pil_to_rgb(value: Any) -> PIL.Image.Image:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            image = PIL.Image.open(BytesIO(bytes(value)))
+            image.load()
+            return image.convert("RGB")
+        except OSError as exc:
+            raise ValueError(
+                f"Cosmos3 action image reference could not be decoded; it may be "
+                f"truncated, corrupt, or in an unsupported format: {exc}"
+            ) from exc
     if isinstance(value, (str, Path)):
         # load_image, not PIL.Image.open: the bundled action prompts carry
         # https:// frame references, and it also handles file:// and data: URIs.
@@ -404,7 +415,8 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
     if isinstance(value, PIL.Image.Image):
         return value.convert("RGB")
     raise TypeError(
-        f"Cosmos3 action preprocessing expected PIL image or image path, got {type(value)!r}."
+        f"Cosmos3 action preprocessing expected image bytes, PIL image, or image path, "
+        f"got {type(value)!r}."
     )
 
 
@@ -440,10 +452,11 @@ def action_reference_size(
     Video references are encoded bytes, so their size comes from the container
     header rather than a decode; images are measured directly.
     """
-    source = video if action_mode == ACTION_MODE_INVERSE_DYNAMICS else (image or video)
+    source_is_video = action_mode == ACTION_MODE_INVERSE_DYNAMICS or image is None
+    source = video if source_is_video else image
     if source is None:
         raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image or video input.")
-    if isinstance(source, bytes):
+    if source_is_video and isinstance(source, bytes):
         from tensorrt_llm.media.decoding import video_stream_info
 
         info = video_stream_info(source)
