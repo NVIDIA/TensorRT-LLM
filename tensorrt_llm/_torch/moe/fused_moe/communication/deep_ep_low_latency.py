@@ -127,7 +127,8 @@ class DeepEPLowLatency(Communication):
         ):
             logger.warning_once(
                 f"Ignoring {_NVFP4_FUSED_OUTPUT_SCALE_ENV} for a layer without "
-                "low-precision NVFP4 combine"
+                "low-precision NVFP4 combine",
+                key=_NVFP4_FUSED_OUTPUT_SCALE_ENV,
             )
             self._fuse_nvfp4_output_scale = False
 
