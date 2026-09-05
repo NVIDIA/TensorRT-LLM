@@ -2706,6 +2706,9 @@ class PyExecutor:
                 if scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
+                if self.kv_cache_transceiver:
+                    self._retire_transfer_only_requests(scheduled_batch)
+
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if self._pp_rebalance_drain_iters is not None:
                     # Draining for a KV pool rebalance: stop feeding the ring
@@ -4420,6 +4423,9 @@ class PyExecutor:
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
 
+                if self.kv_cache_transceiver:
+                    self._retire_transfer_only_requests(scheduled_batch)
+
                 can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
@@ -5229,6 +5235,9 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
+                if self.kv_cache_transceiver:
+                    self._retire_transfer_only_requests(scheduled_batch)
+
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
 
@@ -7310,17 +7319,32 @@ class PyExecutor:
             else:
                 self._terminate_request(request)
 
+    @nvtx_range("_retire_transfer_only_requests")
+    def _retire_transfer_only_requests(self, scheduled_batch):
+        transfer_only_requests = [
+            req for req in scheduled_batch.generation_requests
+            if req.is_disagg_generation_transmission_complete
+            and self._is_transfer_only_request(req)
+        ]
+        if len(transfer_only_requests) == 0:
+            return
+        for req in transfer_only_requests:
+            req.context_current_position = req.prompt_len
+            if self.kv_cache_transceiver is not None:
+                self.kv_cache_transceiver.commit_blocks_for_reuse(req)
+        self._finish_transfer_only_requests(transfer_only_requests)
+        done = {id(req) for req in transfer_only_requests}
+        scheduled_batch.generation_requests = [
+            req for req in scheduled_batch.generation_requests
+            if id(req) not in done
+        ]
+
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
-        cache_trans_complete_requests = []
-        transfer_only_requests = []
-        for req in scheduled_batch.generation_requests:
-            if not req.is_disagg_generation_transmission_complete:
-                continue
-            if self._is_transfer_only_request(req):
-                transfer_only_requests.append(req)
-            else:
-                cache_trans_complete_requests.append(req)
+        cache_trans_complete_requests = [
+            req for req in scheduled_batch.generation_requests
+            if req.is_disagg_generation_transmission_complete
+        ]
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests_last_chunk = cache_trans_complete_requests
@@ -7349,11 +7373,6 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
-                if self._is_transfer_only_request(req):
-                    req.context_current_position = req.prompt_len
-                    if self.kv_cache_transceiver is not None:
-                        self.kv_cache_transceiver.commit_blocks_for_reuse(req)
-                    continue
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 if self.kv_cache_transceiver is not None:
@@ -7381,14 +7400,6 @@ class PyExecutor:
                     req.add_new_token(first_gen_tokens[beam], beam)
 
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
-
-        if len(transfer_only_requests) > 0:
-            self._finish_transfer_only_requests(transfer_only_requests)
-            done = {id(req) for req in transfer_only_requests}
-            scheduled_batch.generation_requests = [
-                req for req in scheduled_batch.generation_requests
-                if id(req) not in done
-            ]
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
