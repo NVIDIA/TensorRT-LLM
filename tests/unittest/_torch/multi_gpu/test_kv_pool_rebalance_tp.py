@@ -100,6 +100,7 @@ def _make_executor(
     exe.enable_attention_dp = enable_attention_dp
     exe.enable_kv_pool_rebalance = True
     exe.kv_cache_transceiver = None
+    exe.kv_connector_manager = None
     exe.is_warmup = False
     exe.is_shutdown = False
     exe.drafter = None

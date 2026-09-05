@@ -697,9 +697,9 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
+            # The KV connector is supported on V2 via the pool layout
+            # registration path, so it no longer forces a fallback to V1.
             incompat: List[str] = []
-            if self._kv_connector_manager is not None:
-                incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -726,8 +726,8 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "and disable the KV connector.")
+                        "provide a compatible fallback. Disable the listed "
+                        "features to run hybrid linear models.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.

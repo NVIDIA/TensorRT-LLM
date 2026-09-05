@@ -305,7 +305,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._prioritize_first_token_gen:
             requests_list.sort(
                 key=lambda req: (
-                    0 if (req.is_generation_only_request() and req.py_decoding_iter == 0) else 1
+                    0 if (req.is_generation_only_request and req.py_decoding_iter == 0) else 1
                 )
             )
 
@@ -472,14 +472,28 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and not recompute_paused
                 and not inflight_request_ids
             ):
+                # A connector rejects every tier below GPU at bring-up
+                # (`PyExecutor._reject_non_gpu_cache_tiers`), so offering those
+                # two settings there is advice the user cannot act on.
+                if getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:
+                    remedy = (
+                        "A KV connector is attached, which requires a GPU-only cache, "
+                        "so no secondary tier can be configured. Increase "
+                        "kv_cache_config.max_tokens or kv_cache_config."
+                        "free_gpu_memory_fraction, or lower max_num_tokens to hand "
+                        "memory back to the KV pool."
+                    )
+                else:
+                    remedy = (
+                        "Configure kv_cache_config.host_cache_size or "
+                        "kv_cache_config.disk_cache_size, or increase "
+                        "kv_cache_config.max_tokens."
+                    )
                 raise RuntimeError(
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
                     f"request(s) active but none could be scheduled or "
                     f"evicted or recompute-paused. KV cache pool is likely exhausted with no "
-                    f"secondary cache tier for suspend/resume offload. "
-                    f"Configure kv_cache_config.host_cache_size or "
-                    f"kv_cache_config.disk_cache_size, or increase "
-                    f"kv_cache_config.max_tokens."
+                    f"secondary cache tier for suspend/resume offload. {remedy}"
                 )
 
         return (
@@ -549,6 +563,18 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+
+        Deliberately connector-blind: the connector is asked later, in
+        ``KVCacheManagerV2.prepare_resources``, so the budget here assumes it
+        serves nothing. That is safe because honouring an offer only ever
+        removes tokens from the forward pass, and it costs only that a served
+        prefix frees no budget for another request in the same iteration.
+
+        ``should_add_sequence`` must not gate scheduling either: it stays false
+        from the moment an asynchronous load completes until
+        ``request_finished``, so a request gated on it would be skipped forever
+        and never run the prefill the load was for. A loading request is kept
+        out of the batch by its ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
         """
         if self.chunking_enabled:
             return self._try_schedule_context_chunked(req, budget)
