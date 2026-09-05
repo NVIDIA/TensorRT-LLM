@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-sampling GVR top-K decode kernels (CuTe DSL, SM100/103 and SM107).
+"""Self-sampling GVR top-K kernels (CuTe DSL, SM100/103 and SM107).
 
 SM107/Rubin is enabled only when the installed CuTe DSL exposes its Rubin
 helpers. This is source support, not an R200 performance-tuning claim.

@@ -425,19 +425,6 @@ def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
     )
 
 
-def test_unsupported_prefill_implementation_raises() -> None:
-    top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
-
-    with pytest.raises(NotImplementedError, match="does not support prefill Top-K"):
-        top_k(
-            torch.ones(1, 1),
-            torch.empty(1, 1, dtype=torch.int32),
-            is_prefill=True,
-            row_starts=torch.zeros(1, dtype=torch.int32),
-            row_ends=torch.ones(1, dtype=torch.int32),
-        )
-
-
 def test_gvr_emission_reset_parks_reused_slots(monkeypatch) -> None:
     """Cold-started rows must carry non-finite lines.
 

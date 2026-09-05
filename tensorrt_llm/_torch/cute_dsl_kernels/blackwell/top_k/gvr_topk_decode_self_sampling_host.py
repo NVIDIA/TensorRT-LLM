@@ -51,6 +51,7 @@ import math
 import operator
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -599,6 +600,8 @@ def route_streaming(
     k: int,
     force_main: bool = False,
     num_sms: int = DEFAULT_NUM_SMS,
+    *,
+    force_r_one: bool = False,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -606,18 +609,22 @@ def route_streaming(
     skipped even when the envelope n would normally land on them.  Where
     route() itself lands on main/clus this is IDENTICAL to route().
     force_main additionally skips the clus rounding, so the raw
-    min(r1, r2) R matches the CUDA else-branch exactly."""
+    min(r1, r2) R matches the CUDA else-branch exactly. ``num_sms`` defaults
+    to the B200 route constant; the prefill-only caller supplies its active
+    full-device or locality-domain SM count. ``force_r_one`` is reserved for
+    prefill, whose correctness contract is one CTA per row."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
     if num_sms < 1:
         raise RuntimeError(f"route_streaming requires num_sms >= 1, got {num_sms}")
     R = 1
-    if b <= 32:
-        r1 = max(num_sms // b, 1)
-        r2 = max(((n >> 2) + 1023) // 1024, 1)
-        R = max(min(r1, r2), 1)
-    elif b <= min(num_sms // 2, MAX_SPLIT_ROWS) and (n >> 2) >= 16384 and k <= 1024:
-        R = 2
+    if not force_r_one:
+        if b <= 32:
+            r1 = max(num_sms // b, 1)
+            r2 = max(((n >> 2) + 1023) // 1024, 1)
+            R = max(min(r1, r2), 1)
+        elif b <= min(num_sms // 2, MAX_SPLIT_ROWS) and (n >> 2) >= 16384 and k <= 1024:
+            R = 2
     useclus = False
     if not force_main and 2 <= R <= 8 and k <= 1024:
         p2 = 1
@@ -802,21 +809,48 @@ def _available_num_sms(device: torch.device | int) -> int:
     """Return SMs available to launches in the current execution domain."""
     return _execution_domain(device)[0]
 
+
 # ---- prefill launcher cache ------------------------------------------------
-# Prefill routes always force R==1 (single CTA per row): route_streaming gives
-# R>1 only for b<=74, so the representative row counts below (first row of each
-# route band) pin R=1 and reduce the engine set to <=6 per k. The launcher
-# compiled function depends only on the row TIER, k and the envelope bucket
-# (which selects U on the tier-0 1024-thread arm; tiers 1/2 fix U), never on
-# the exact row count (arbitrary q-tile / q-split remainders) or npad (a
-# runtime scalar), so the cache stays bounded over a long-running server.
+# Prefill explicitly forces R==1 (single CTA per row). The compiled function
+# depends only on the active-compute topology, row tier, k and the envelope
+# bucket (which selects U on the tier-0 1024-thread arm; tiers 1/2 fix U),
+# never on the exact row count (arbitrary q-tile / q-split remainders) or npad
+# (a runtime scalar), so the cache stays bounded over a long-running server.
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
-_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
 
 
-def _prefill_tier(rows: int) -> int:
-    return 0 if rows <= 148 else 1 if rows <= 296 else 2
+@dataclass(frozen=True)
+class _PrefillTopology:
+    """Active compute topology used by the prefill launch policy."""
+
+    locality_domain_id: int | None
+    active_num_sms: int
+    total_num_sms: int
+
+
+def _prefill_topology(device: torch.device | int) -> _PrefillTopology:
+    """Read the caller's active full-device or locality-domain topology.
+
+    A locality-domain context controls execution placement and has a smaller
+    SM partition. It does not imply that an arbitrary input allocation is
+    memory-local; allocation provenance remains the caller's responsibility.
+    """
+    device_index = _device_ordinal(device)
+    active_num_sms, locality_domain_id = _execution_domain(device_index)
+    _, total_num_sms = _DEVICE_COMPUTE_INFO[device_index]
+    return _PrefillTopology(locality_domain_id, active_num_sms, total_num_sms)
+
+
+def _prefill_tier_rows(topology: _PrefillTopology) -> tuple[int, int, int]:
+    """Return one representative row count for each active-SM wave tier."""
+    num_sms = topology.active_num_sms
+    return (num_sms // 2 + 1, num_sms + 1, 2 * num_sms + 1)
+
+
+def _prefill_tier(rows: int, topology: _PrefillTopology) -> int:
+    num_sms = topology.active_num_sms
+    return 0 if rows <= num_sms else 1 if rows <= 2 * num_sms else 2
 
 
 def _prefill_bucket(n_env: int) -> int:
@@ -825,25 +859,33 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
-def _prefill_cache_key(tier: int, k: int, n_bucket: int):
+def _prefill_cache_key(topology: _PrefillTopology, tier: int, k: int, n_bucket: int) -> tuple:
     # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
     # to one key so warmup covers them with a single launch.
-    return (tier, k, n_bucket if tier == 0 else 0)
+    return (topology, tier, k, n_bucket if tier == 0 else 0)
 
 
-def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+def _prefill_launcher(topology: _PrefillTopology, tier: int, k: int, n_bucket: int) -> tuple:
     """Capture-time prefill plan + compiled launcher (main family, R=1).
 
     Mirrors ``_varlen_launcher``'s main branch but with r_const=1, split=False
     (so tsh_en=0) and the prefill compile flag. SCAP_/CMP_/aim are envelope
     upper bounds; npad is filled per call in ``run_prefill``."""
-    key = _prefill_cache_key(tier, k, n_bucket)
+    key = _prefill_cache_key(topology, tier, k, n_bucket)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
-    b_route = _PREFILL_TIER_ROWS[tier]
+    b_route = _prefill_tier_rows(topology)[tier]
     n_route = max(n_bucket, k + 1)
-    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    plan = route_streaming(
+        b_route,
+        n_route,
+        n_route,
+        k,
+        force_main=True,
+        num_sms=topology.active_num_sms,
+        force_r_one=True,
+    )
     if plan["kernel"] != "main":
         raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
     rt = plan["rt"]
@@ -1765,6 +1807,13 @@ def run_prefill(
     under capture). Launches in ``<=65535``-row slabs so ``gridDim.y`` never
     overflows.
 
+    Execution locality: launches stay on the caller's current CUDA stream.
+    When called inside ``LocalityDomainRuntime.partition_context``, the row
+    tiers use that partition's actual SM count. This only localizes compute;
+    ``logits`` is memory-local only when its producer/allocation is local.
+    An explicit ``workspace`` follows the same zero-initialization and
+    per-in-flight ownership contract as ``run_varlen``.
+
     KNOWN LIMITATION: rows containing NaN inside the window are out of
     contract (as for the radix reference — both order NaN implementation-
     specifically). DeepGEMM prefill logits are finite in-window. Trusted
@@ -1828,27 +1877,29 @@ def run_prefill(
         if logits.untyped_storage().size() // 4 < need:
             raise RuntimeError("logits view storage too small to widen to its row stride")
         lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
-    if workspace is not None:
-        validate_run_ws(workspace, logits)
-        ws = kernel_view(workspace)
-    else:
-        ws = _ws_hot.get(d)
-        if ws is None:
-            ws = default_workspace(logits)
     n_env = _index(max_row_len) if max_row_len is not None else logits.shape[1]
     n_env = min(max(n_env, 1), npad)
     n_bucket = _prefill_bucket(n_env)
+    topology = _prefill_topology(d)
+    launchers = []
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
+        tier = _prefill_tier(r1 - r0, topology)
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(topology, tier, k, n_bucket))
         if lc is None:
             if _is_capturing():
                 raise RuntimeError(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket)
+            lc = _prefill_launcher(topology, tier, k, n_bucket)
+        launchers.append((r0, r1, lc))
+
+    # Preflight every topology-specific launcher before consulting the
+    # default workspace. A graph-capture cache miss therefore fails before
+    # this entry can create a CUDA allocation.
+    ws = _workspace_for_varlen_launch(logits, workspace, topology.locality_domain_id)
+    for r0, r1, lc in launchers:
         _, fn, (scap, cmp_), tail = lc
         # ABI parity with the varlen main call: pre_idx slot = row_ends,
         # kv_lens slot = row_starts. The n / SMP / TGT / Q / SS2 / TGT2 launch
@@ -2029,22 +2080,25 @@ _PREFILL_WARMUP_LOCK = threading.Lock()
 def warmup_prefill(
     top_k: int,
     max_cols: int,
-    num_rows_list: Sequence[int] = (1, 149, 297),
+    num_rows_list: Sequence[int] | None = None,
     row_stride: int | None = None,
 ) -> None:
     """TESTING/INIT ONLY — compile the prefill engine set before serving.
 
     Six engines per k at most: the tier-0 (1024-thread) arm walks the pow2
     envelope buckets (U = 1/2/4/8), tiers 1/2 fix U so one launch each. One
-    tiny real launch per distinct ``(tier, k, bucket)`` cache key; ``ks=0``,
-    ``ke=n_env`` (all long rows). ``max_cols`` is the compressed max column
-    count (``get_indexer_max_seq_len``); the bucket caps at 32768 (U=8 above),
-    so envelopes past it share one key. The done-key gates only the GPU
-    launches — the ``_PREFILL_CACHE`` population is idempotent.
+    tiny real launch per distinct ``(topology, tier, k, bucket)`` cache key;
+    ``ks=0``, ``ke=n_env`` (all long rows). ``max_cols`` is the compressed max
+    column count (``get_indexer_max_seq_len``); the bucket caps at 32768 (U=8
+    above), so envelopes past it share one key. The done-key gates only the
+    GPU launches — the ``_PREFILL_CACHE`` population is idempotent.
     """
     dev = torch.cuda.current_device()
+    topology = _prefill_topology(dev)
     k = int(top_k)
     max_cols = int(max_cols)
+    if num_rows_list is None:
+        num_rows_list = (1, topology.active_num_sms + 1, 2 * topology.active_num_sms + 1)
     lo = _prefill_bucket(k + 1)
     hi = _prefill_bucket(max_cols)
     buckets = []
@@ -2056,16 +2110,23 @@ def warmup_prefill(
         buckets = [hi]
     keys = {}  # cache_key -> (tier, bucket) representative for the launch
     for rows in num_rows_list:
-        tier = _prefill_tier(int(rows))
+        tier = _prefill_tier(int(rows), topology)
         bset = buckets if tier == 0 else buckets[:1]
         for bk in bset:
-            keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk))
-    done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
+            keys.setdefault(_prefill_cache_key(topology, tier, k, bk), (tier, bk))
+    done_key = (
+        dev,
+        topology,
+        k,
+        max_cols,
+        tuple(sorted(int(r) for r in num_rows_list)),
+        row_stride,
+    )
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
     for tier, bk in keys.values():
-        rows = _PREFILL_TIER_ROWS[tier]
+        rows = _prefill_tier_rows(topology)[tier]
         stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
         if stride < bk or stride % 4:
             stride = (max(stride, bk) + 256 + 255) // 256 * 256

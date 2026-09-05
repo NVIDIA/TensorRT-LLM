@@ -176,6 +176,49 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     assert metadata.needs_gvr_prior == (not use_self_sampling)
 
 
+def test_metadata_sm107_temporal_gvr_does_not_allocate_prior() -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=False,
+    )
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_RUBIN_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=107,
+        ),
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+
+    assert not metadata.use_self_sampling_topk
+    assert not metadata.needs_gvr_prior
+
+
 @pytest.mark.parametrize(
     "kwargs,expected",
     [
@@ -186,6 +229,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
         (dict(is_cute_dsl_available=False), False),
         (dict(sm_version=107), False),
         (dict(sm_version=107, is_cute_dsl_rubin_available=True), True),
+        (dict(sm_version=100, is_cute_dsl_rubin_available=False), True),
         (dict(sm_version=120), False),
         (dict(index_topk=256), False),
         (dict(compress_ratio=2), False),
@@ -205,15 +249,30 @@ def test_use_self_sampling_gvr(kwargs, expected):
     assert use_self_sampling_gvr(**base) is expected
 
 
-def test_sm107_gvr_admission_is_self_sampling_only():
-    """Temporal GVR remains restricted to its validated SM100/103 path."""
-    common = dict(
-        is_cute_dsl_available=True,
-        is_cute_dsl_rubin_available=True,
-        sm_version=107,
+@pytest.mark.parametrize(
+    "sm_version,rubin_dsl,use_self_sampling,expected",
+    [
+        (100, False, False, True),
+        (100, False, True, True),
+        (103, False, False, True),
+        (107, False, True, False),
+        (107, True, True, True),
+        (107, True, False, False),
+        (120, True, True, False),
+    ],
+)
+def test_gvr_hardware_gate_is_algorithm_specific(
+    sm_version, rubin_dsl, use_self_sampling, expected
+):
+    assert (
+        is_gvr_cute_dsl_supported(
+            is_cute_dsl_available=True,
+            is_cute_dsl_rubin_available=rubin_dsl,
+            sm_version=sm_version,
+            use_self_sampling_topk=use_self_sampling,
+        )
+        is expected
     )
-    assert is_gvr_cute_dsl_supported(**common, use_self_sampling_topk=True)
-    assert not is_gvr_cute_dsl_supported(**common, use_self_sampling_topk=False)
 
 
 @pytest.mark.parametrize("use_self_sampling_topk", [True, False])
@@ -311,16 +370,18 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
 
 
 @pytest.mark.parametrize(
-    "use_self_sampling,sm_version,msl_c,should_warmup",
+    "use_self_sampling,sm_version,rubin_dsl,msl_c,should_warmup",
     [
-        (True, 100, 65536, True),
-        (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
-        (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
-        (True, 90, 65536, False),  # non-datacenter Blackwell
+        (True, 100, False, 65536, True),
+        (True, 100, False, 30001, True),  # odd msl_c must not skip the prefill leg
+        (False, 100, False, 65536, False),  # temporal-hint layers: no prefill engine
+        (True, 107, False, 65536, False),  # Rubin needs its CuTe DSL helpers
+        (True, 107, True, 65536, True),
+        (True, 90, False, 65536, False),
     ],
 )
 def test_metadata_warmup_selfsampling_prefill_leg(
-    use_self_sampling, sm_version, msl_c, should_warmup
+    use_self_sampling, sm_version, rubin_dsl, msl_c, should_warmup
 ):
     """The self-sampling warmup drives BOTH the decode (varlen) and the prefill
     engines; the prefill leg sits before the DeepGEMM decode-stride guard so an
@@ -342,6 +403,10 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         patch(
             "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
             True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_RUBIN_AVAILABLE",
+            rubin_dsl,
         ),
         patch(
             "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
@@ -689,7 +754,7 @@ def test_indexer_two_level_gvr_dispatch(
 
 
 @skip_pre_hopper
-def test_indexer_sm107_temporal_gvr_falls_back_to_radix():
+def test_indexer_sm107_temporal_gvr_falls_back_to_radix() -> None:
     """SM107 support is V2-only; requesting temporal V1 must not select GVR."""
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
@@ -717,6 +782,7 @@ def test_indexer_sm107_temporal_gvr_falls_back_to_radix():
 
     assert indexer.top_k.decode_implementation == TopKImplementation.CUDA_RADIX
     assert not indexer.top_k.gvr_self_sampling
+    assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert not indexer.top_k.needs_gvr_prior
 
 

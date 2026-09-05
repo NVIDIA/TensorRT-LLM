@@ -747,8 +747,9 @@ class Indexer(nn.Module):
         else:
             if self._enable_heuristic_topk:
                 logger.warning_once(
-                    "enable_heuristic_topk=True but the DSL GVR engine is "
-                    f"unavailable (cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                    "enable_heuristic_topk=True but the selected DSL GVR "
+                    f"engine ({'self-sampling V2' if self._use_self_sampling_topk else 'temporal V1'}) "
+                    f"is unavailable (cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
                     f"cutlass_dsl_rubin={IS_CUTLASS_DSL_RUBIN_AVAILABLE}, "
                     f"sm={get_sm_version()}); using the exact radix decode "
                     "top-K instead.",

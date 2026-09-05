@@ -187,7 +187,10 @@ class TopK(nn.Module):
                 )
                 # ks/ke are already in compressed column units; run_prefill
                 # writes the local (column - ks) frame with -1 pad and no host
-                # reads (envelope from scores.shape[1]).
+                # reads (envelope from scores.shape[1]). The runner preserves
+                # the current stream and, on Rubin, reads an enclosing
+                # locality-domain context for launch topology only. This call
+                # does not allocate or claim locality for ``scores``.
                 selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
                 return output_indices
             else:

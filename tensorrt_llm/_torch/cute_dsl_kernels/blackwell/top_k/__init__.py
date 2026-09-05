@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CuTE DSL Top-K kernels for Blackwell architecture."""
+"""CuTE DSL Top-K kernels for Blackwell and compatible Rubin paths."""
 
 from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
