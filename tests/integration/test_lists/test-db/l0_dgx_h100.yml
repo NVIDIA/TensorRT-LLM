@@ -342,3 +342,19 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-cpp_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-python_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-cpp_mamba_cache]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+      auto_trigger: others
+      orchestrator: mpi
+  tests:
+  - unittest/_torch/multi_gpu -m "post_merge" TIMEOUT (90)
