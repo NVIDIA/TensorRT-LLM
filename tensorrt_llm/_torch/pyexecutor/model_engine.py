@@ -3936,12 +3936,25 @@ class PyTorchModelEngine(ModelEngine):
         return None
 
     def _get_all_rank_num_tokens_and_spec_counts(
-        self, attn_metadata: AttentionMetadata, spec_counts: Tuple[int, ...]
+            self, attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
+            total_num_tokens: int, num_seqs: int, num_gens: int
     ) -> Tuple[Optional[List[int]], Optional[List[List[int]]]]:
         """Exchange the attention and speculative per-rank counts in a single
-        collective instead of one collective each."""
+        collective instead of one collective each.
+
+        The spec token count is derived here via
+        ``SpecMetadata.dp_num_tokens_hint`` because this collective runs
+        *before* ``spec_metadata.prepare()`` rewrites ``num_tokens`` into the
+        same shape (the attention count it shares the collective with is
+        consumed earlier, by padding selection). ``num_gens`` must count every
+        generation request, CUDA-graph dummies included, to match the
+        ``num_generations`` that ``prepare()`` will use.
+        """
         if not self.enable_attention_dp:
             return None, None
+        spec_counts = (spec_metadata.dp_num_tokens_hint(total_num_tokens,
+                                                        num_gens), num_seqs,
+                       num_gens)
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
             # two exchanges separate.
@@ -4734,9 +4747,8 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 (attn_metadata.all_rank_num_tokens, spec_all_rank_counts
                  ) = self._get_all_rank_num_tokens_and_spec_counts(
-                     attn_metadata,
-                     (total_num_tokens, len(spec_metadata.seq_lens),
-                      attn_metadata.num_generations))
+                     attn_metadata, spec_metadata, total_num_tokens,
+                     len(spec_metadata.seq_lens), attn_metadata.num_generations)
             else:
                 attn_metadata.all_rank_num_tokens = \
                     self._get_all_rank_num_tokens(attn_metadata)
@@ -6416,10 +6428,13 @@ class PyTorchModelEngine(ModelEngine):
 
         spec_all_rank_counts = None
         if spec_metadata is not None and self.enable_attention_dp:
+            # Pass scheduled_requests.num_generation_requests, not the
+            # dummy-free num_generation_requests local above; see the helper.
             (attn_all_rank_num_tokens, spec_all_rank_counts
              ) = self._get_all_rank_num_tokens_and_spec_counts(
-                 attn_metadata, (total_num_tokens, len(sequence_lengths),
-                                 len(scheduled_requests.generation_requests)))
+                 attn_metadata, spec_metadata, total_num_tokens,
+                 len(sequence_lengths),
+                 scheduled_requests.num_generation_requests)
         else:
             attn_all_rank_num_tokens = self._get_all_rank_num_tokens(
                 attn_metadata)

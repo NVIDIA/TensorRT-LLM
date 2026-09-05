@@ -1036,6 +1036,17 @@ class SpecMetadata:
         self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
         self.draft_probs[slots, :draft_len, 0] = 1.0
 
+    def dp_num_tokens_hint(self, num_tokens: int, num_generations: int) -> int:
+        """Return the attention-DP token-count hint for ``num_tokens``.
+
+        ``prepare()`` rewrites ``num_tokens`` into this shape, and the
+        attention-DP allgather in ``model_engine`` needs the same value before
+        ``prepare()`` runs. Subclasses that rewrite the count override this so
+        both callers derive it from one place and cannot drift apart. The base
+        metadata keeps the count as-is.
+        """
+        return num_tokens
+
     def prepare(self):
         """
         Hook to be called before the forward step of the model.
