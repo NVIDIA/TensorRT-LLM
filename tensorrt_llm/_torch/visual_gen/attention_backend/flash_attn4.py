@@ -30,7 +30,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 _flash_attn_fwd_import_error = None
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
-except (ImportError, OSError) as e:
+except (ImportError, OSError, AttributeError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
 

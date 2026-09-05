@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Weight loader for diffusion models."""
 
 import json
@@ -28,7 +43,10 @@ class WeightLoader(BaseWeightLoader):
         # Returns: {"transformer": {...}, "transformer_2": {...}}
     """
 
-    def __init__(self, components: Union[str, List[str]] = PipelineComponent.TRANSFORMER):
+    def __init__(
+        self,
+        components: Union[str, List[str]] = PipelineComponent.TRANSFORMER,
+    ) -> None:
         """
         Args:
             components: Component(s) to load weights for. Can be:
@@ -46,7 +64,7 @@ class WeightLoader(BaseWeightLoader):
         self,
         checkpoint_dir: str,
         mapping: Mapping,
-        **kwargs,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Load weights from checkpoint directory.
@@ -62,9 +80,11 @@ class WeightLoader(BaseWeightLoader):
         """
         checkpoint_path = Path(checkpoint_dir)
 
-        # Check if this is a pipeline (has model_index.json)
-        model_index = checkpoint_path / "model_index.json"
-        is_pipeline = model_index.exists()
+        # Standard and modular Diffusers manifests use the same component
+        # subdirectory layout for weight-bearing models.
+        is_pipeline = (checkpoint_path / "model_index.json").exists() or (
+            checkpoint_path / "modular_model_index.json"
+        ).exists()
 
         # Load weights for each component
         all_weights = {}
@@ -80,7 +100,7 @@ class WeightLoader(BaseWeightLoader):
                 if len(self.components) > 1:
                     raise ValueError(
                         f"Multiple components specified but {checkpoint_dir} is not a pipeline "
-                        "(no model_index.json found)"
+                        "(no model_index.json or modular_model_index.json found)"
                     )
                 weight_dir = checkpoint_path
 
@@ -131,7 +151,7 @@ class WeightLoader(BaseWeightLoader):
 
         return component_weights
 
-    def _find_weight_files(self, weight_dir) -> List[str]:
+    def _find_weight_files(self, weight_dir: Union[str, Path]) -> List[str]:
         """Find safetensors or bin weight files.
 
         Handles:
