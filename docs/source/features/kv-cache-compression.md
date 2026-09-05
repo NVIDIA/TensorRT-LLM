@@ -6,14 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 # KV Cache Compression
 
 - [Overview](#overview)
-- [Compression Methods](#compression-methods)
-  - [Cold-Page Quantization](#cold-page-quantization)
-  - [TriAttention](#triattention)
 - [When Compression Runs](#when-compression-runs)
   - [Iteration-Driven Methods](#iteration-driven-methods)
   - [Storage-Bound Methods](#storage-bound-methods)
+- [Compression Methods](#compression-methods)
+  - [Cold-Page Quantization](#cold-page-quantization)
+  - [TriAttention](#triattention)
 - [Support](#support)
-- [Verification](#verification)
 - [Further Reading](#further-reading)
 
 ## Overview
@@ -25,23 +24,31 @@ serving system must evict and later reconstruct useful context. At scale, this
 creates substantial redundant work, increases request latency, and limits the
 scale and efficiency of KV-cache reuse.
 
-KV cache compression is a family of techniques for reducing the resources
-required to retain and reuse KV state. A method may select or evict less useful
-KV tokens, compact the retained state, encode KV values at lower precision or
-in another compact representation, or apply compression while KV data is
-transferred or stored. Depending on the method and workload, these techniques
-can reduce Attention work, cache footprint, data movement, and recomputation
-while increasing effective cache capacity. Lossy methods may trade some output
-quality for those savings, so their accuracy and quality impact must be
-evaluated for the target workload.
+Existing KV cache compression methods use a range of techniques. Token eviction
+removes selected KV entries, quantization represents KV values at lower
+precision, and other methods use compact encodings or transformations to reduce
+the retained representation. Depending on the method and workload, these
+techniques can reduce Attention work, cache footprint, data movement, and
+recomputation while increasing effective cache capacity. Lossy methods may
+trade some output quality for those savings, so their accuracy and quality
+impact must be evaluated for the target workload.
 
-At a high level, a compression method observes the current KV state at an
-appropriate cache-lifecycle boundary, applies a method-specific transformation,
-and makes the resulting state available to the existing inference path.
-TensorRT-LLM provides these integration points outside the Attention kernel so
-compression policies do not require model-specific or compression-specific
-branches in Attention. For example, an iteration-driven implementation can
-transform retained KV state after a prefill or generation step, while a
+As an LLM serving system, TensorRT-LLM KV cache compression supports both
+method-level techniques, such as eviction and quantization, and system-level
+co-design across storage, transfer, and execution. Compression can be
+co-designed with the KV-cache storage hierarchy, data-transfer path, and
+inference lifecycle to optimize storage capacity, data movement, and
+computation together. This includes storage-aware compressed layouts,
+compression placed on transfer paths, and fused or co-optimized compression and
+transfer operations.
+
+TensorRT-LLM organizes its integration points along this lifecycle dimension. A
+compression method observes the current KV state at an appropriate boundary,
+applies a method-specific transformation, and makes the resulting state
+available to the existing inference path. These integration points sit outside
+the Attention kernel, so compression policies do not require model-specific or
+compression-specific branches in Attention. An iteration-driven implementation
+can transform retained KV state after a prefill or generation step, while a
 storage-bound implementation can encode Pages as they move to Host or Disk and
 decode them when they return.
 
@@ -79,10 +86,52 @@ selects a compression method. A concrete compression method must understand the
 cache layout it transforms; it can preserve unsupported or non-Attention state
 losslessly, or reject a layout that it cannot handle.
 
-Currently, only one KV cache compression method can be enabled for each LLM
-instance.
+## When Compression Runs
+
+Compression methods use one or both integration models. Iteration-driven
+methods run from PyExecutor's request and iteration lifecycle. Storage-bound
+methods run only when KVCM migrates a Page across a hot/cold representation
+boundary. A method implements only the integration models and stages it needs.
+
+### Iteration-Driven Methods
+
+PyExecutor dispatches semantic lifecycle hooks through
+`KVCacheCompressionManager`. TriAttention uses the generation-end hook to run
+periodic, budget-triggered token eviction.
+
+| Trigger | Manager method | Purpose |
+| --- | --- | --- |
+| A request enters its first prefill chunk | `on_request_init()` | Initialize request-local compression state |
+| A request finishes its final prefill chunk | `on_context_step_end()` | Run optional context-bound compression |
+| Before each scheduled forward iteration | `on_generation_step_begin()` | Inspect or prepare the generation cohort when required |
+| After each scheduled forward iteration and the native KVCM update | `on_generation_step_end()` | Process the generation cohort, such as periodic TriAttention eviction |
+| A request finishes or aborts | `on_request_finish()` | Release request-local compression state |
+
+### Storage-Bound Methods
+
+KVCM calls a storage-bound codec provider only when migration changes the Page
+representation. NVFP4 cold-page quantization implements these two batched
+operations and does not register for per-iteration callbacks.
+
+At the native storage boundary, KVCM invokes `IKvCacheColdPageCodec::encode()`
+or `IKvCacheColdPageCodec::decode()`. A codec backed by a Python compression
+provider delegates those operations to the provider hooks shown below.
+
+| Trigger | Native codec method | Python provider hook | Purpose |
+| --- | --- | --- | --- |
+| A hot Page moves to a cold tier | `encode()` | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
+| A cold Page returns to the GPU | `decode()` | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
+
+KVCM still decides when Pages migrate and owns their Slots, streams, completion
+ordering, rollback, and mapping publication. For method signatures and
+ownership rules, see the
+[KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md).
 
 ## Compression Methods
+
+TensorRT-LLM currently supports compression methods through both lifecycle
+integration models. Only one KV cache compression method can be enabled for
+each LLM instance.
 
 | Method | When it runs | What it changes | Primary benefit |
 | --- | --- | --- | --- |
@@ -179,47 +228,6 @@ llm = LLM(
 For calibration, configuration parameters, and current requirements, see the
 [detailed TriAttention example](source:examples/kv_cache_compression/triattention.md).
 
-## When Compression Runs
-
-Compression methods use one of two execution models. Iteration-driven methods
-run from PyExecutor's request and iteration lifecycle. Storage-bound methods
-run only when KVCM migrates a Page across a hot/cold representation boundary.
-A method implements only the execution model and stages it needs.
-
-### Iteration-Driven Methods
-
-PyExecutor dispatches semantic lifecycle hooks through
-`KVCacheCompressionManager`. TriAttention uses the generation-end hook to run
-periodic, budget-triggered token eviction.
-
-| Trigger | Manager method | Purpose |
-| --- | --- | --- |
-| A request enters its first prefill chunk | `on_request_init()` | Initialize request-local compression state |
-| A request finishes its final prefill chunk | `on_context_step_end()` | Run optional context-bound compression |
-| Before each scheduled forward iteration | `on_generation_step_begin()` | Inspect or prepare the generation cohort when required |
-| After each scheduled forward iteration and the native KVCM update | `on_generation_step_end()` | Process the generation cohort, such as periodic TriAttention eviction |
-| A request finishes or aborts | `on_request_finish()` | Release request-local compression state |
-
-### Storage-Bound Methods
-
-KVCM calls a storage-bound codec provider only when migration changes the Page
-representation. NVFP4 cold-page quantization implements these two batched
-operations and does not register for per-iteration callbacks.
-
-At the native storage boundary, KVCM invokes `IKvCacheColdPageCodec::encode()`
-or `IKvCacheColdPageCodec::decode()`. A codec backed by a Python compression
-provider delegates those operations to the provider hooks shown below.
-
-| Trigger | Native codec method | Python provider hook | Purpose |
-| --- | --- | --- | --- |
-| A hot Page moves to a cold tier | `encode()` | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
-| A cold Page returns to the GPU | `decode()` | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
-
-KVCM still decides when Pages migrate and owns their Slots, streams, completion
-ordering, rollback, and mapping publication. For method signatures and
-ownership rules, see the
-[KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md).
-
 ## Support
 
 The two methods share the compression framework but support different cache
@@ -228,6 +236,7 @@ structures. Platform and method requirements are noted below.[^support-requireme
 | Cache structure | NVFP4 cold-page quantization | TriAttention |
 | --- | --- | --- |
 | MHA Attention KV | Supported | Not supported |
+| MQA Attention KV | Supported | Not supported |
 | GQA Attention KV | Supported | Restricted; see the TriAttention example |
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
@@ -256,15 +265,6 @@ TriAttention has been tested with Qwen3-8B. These are tested-model lists, not
 exhaustive support lists. Other models that use a supported KV-cache structure
 are expected to work; consult the method example for method-specific
 restrictions.
-
-## Verification
-
-Configuring a compression method does not by itself prove that compression ran.
-Cold-page quantization is exercised only when the workload creates real
-GPU-to-cold and cold-to-GPU Page migration. Verify that a Host or Disk cache is
-enabled and that the workload produces offload and reuse. For a hybrid model,
-seeing Attention KV compressed while GDN, SSM, or Conv state remains lossless is
-expected behavior.
 
 ## Further Reading
 
