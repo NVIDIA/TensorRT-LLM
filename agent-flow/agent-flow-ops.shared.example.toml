@@ -1,0 +1,59 @@
+# agent-flow ops: SHARED machine config. Copy to ~/.config/agent-flow/ops.toml
+# (or point $AGENT_FLOW_OPS_SHARED at it). Everything here is shared by every
+# project on this machine: one allocation table, one worktree slot table, one
+# container definition. Per-project values (project root, workspace, roles,
+# notice channels) belong in the project overlay — see
+# agent-flow-ops.example.toml — which is layered on top of this file.
+
+[projects]
+# Directory holding the project directories (`ops.project list` / `new`).
+root = "/path/to/projects"
+
+[allocations]
+# Shared machine allocations, one holder at a time. The key is what you claim.
+[allocations.dev1]
+job_id = "000001"
+job_name = "my-dev-alloc"        # preferred over job_id: survives a requeue
+description = "4-GPU development allocation"
+aliases = ["dev"]                # old names, so a rename migrates the table
+
+[allocations.dev2]
+job_id = "000002"
+job_name = "my-second-alloc"
+description = "second lane, so one long run does not block short probes"
+
+[worktrees]
+# Pre-created, reusable git worktree slots (creating one takes minutes on a
+# network filesystem, so they are claimed and reused, never added per task).
+dir = "/path/to/worktrees"
+slots = ["wt-1", "wt-2", "wt-3"]
+
+[container]
+name = "my-container"            # container name inside the allocation
+image = "/path/to/image.sqsh"    # passed alongside the name: a preempted
+                                 # allocation comes back with no containers
+mounts = ["/path/to/workspace-root:/path/to/workspace-root:rw"]
+repo = "/path/to/main-checkout"  # checkout whose code the commands import
+default_allocation = "dev1"
+# Shell lines run verbatim after the [container.env] exports, before `cd $REPO`
+# and the command. Use these for anything positional: PATH edits, per-rank
+# scratch dirs, mkdir calls.
+env_prologue = [
+  "export PATH=$REPO/.venv/bin:$PATH",
+  "export PYTHONPATH=$REPO${PYTHONPATH:+:$PYTHONPATH}",
+  "export TRITON_CACHE_DIR=/tmp/triton-rank${SLURM_PROCID:-0}",
+  "mkdir -p $TRITON_CACHE_DIR",
+]
+
+[container.env]
+# Plain exports, emitted before the prologue below.
+PYTHONUNBUFFERED = "1"
+HF_HOME = "/path/to/caches/huggingface"
+# Offline flags: a repo id that is really a local path must fail locally, never
+# in a request to a remote hub. An offline-mode error means a fetch was
+# attempted and must be reported, not worked around by unsetting these.
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+
+[dispatch]
+spool_dir = "dispatch"           # relative to the project root

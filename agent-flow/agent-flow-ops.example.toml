@@ -1,0 +1,72 @@
+# agent-flow ops: PER-PROJECT overlay. Copy to <project>/agent-flow-ops.toml,
+# or point $AGENT_FLOW_OPS_PROJECT at the project directory. The shared machine
+# config (allocations, worktree slots, container) is layered underneath — see
+# agent-flow-ops.shared.example.toml. A single file holding both halves also
+# works.
+#
+# Nothing has a built-in default: a tool that finds no config refuses to run
+# rather than guess a project directory.
+
+[project]
+# Everything one project owns: logs, workspace, notices, ledger.
+name = "my-project"
+root = "/path/to/projects/my-project"
+workspace = "workspace"          # relative to root, or absolute
+log_dir = "logs"                 # relative to root, or absolute
+# archive_root = "/path/to/projects/archive"  # frozen copies of finished projects
+
+[roles]
+# Roles that can be addressed by a notice. Defaults to the keys of
+# [roles.checkouts] when omitted.
+names = ["coder", "reviewer"]
+
+[roles.checkouts]
+# role -> the checkout that role works from. Used to infer which role is
+# running a process from its cwd (longest match wins), replacing hard-coded
+# path fragments. A role with no checkout simply cannot be inferred; set
+# AGENT_NOTICE_ROLE or pass --role instead.
+coder = "/path/to/main-checkout"
+reviewer = "/path/to/worktrees/wt-2"
+
+[notices]
+# command_cache = "test_command.md"   # workspace file every role reads before
+#                                     # running a command (mid-turn channel)
+# live_notes = "LIVE-NOTES.md"        # appended file a PostToolUse hook injects
+# ack_command = "python -m agent_flow.ops.ack_notice"
+
+[mailboxes]
+# Addressable participants beyond the roles above. Roles are registered
+# automatically; anything registered at runtime lands in <root>/MAILBOXES.json.
+# default_delivery = ["command_cache", "live_notes"]
+# default_due_minutes = 0      # 0: messages never become overdue on their own
+# human = "oncall"             # where `mailbox nag` escalates at the top rung
+# tool_result_file = ".pending-messages.md"
+
+# [mailboxes.oncall]
+# kind = "human"               # agent | human | service
+# description = "the human on call"
+# delivery = []                # humans read the queue, not the agent channels
+
+# [mailboxes.watchdog]
+# kind = "service"
+# delivery = ["live_notes"]
+
+[dashboard]
+# The narrator model is optional: without the CLI binary the dashboard prints
+# "(narration unavailable)" and keeps working.
+# narrator_command = "claude"
+# narrator_model = "claude-haiku-4-5-20251001"
+refresh_seconds = 20
+
+[archive]
+# What `agent_flow.ops.archive` copies out of a project, and the two size
+# thresholds. Defaults shown; every key is optional.
+# trees = ["workspace", "logs", "notes", "restart"]
+# files = ["task.yaml", "AGENT-NOTICES.jsonl", "HANDOFF.md", "MEMENTO.md"]
+# globs = ["run-*.log", "*.jsonl"]
+# handoff_dir = "handoff"          # only handoff_suffixes are copied from it
+# handoff_suffixes = [".md", ".txt"]
+# evidence_dir = "evidence"
+# evidence_max_bytes = 2097152     # larger evidence is listed, not copied
+# git_max_bytes = 5242880          # larger archived files are .gitignore'd
+# commit = true                    # commit the archive repo after freezing
