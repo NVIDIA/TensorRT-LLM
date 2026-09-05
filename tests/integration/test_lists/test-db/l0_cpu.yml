@@ -93,6 +93,10 @@ l0_cpu:
   - unittest/grpc/openengine/test_openengine.py
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
+  - unittest/llmapi/apps/test_anthropic_adapter.py
+  - unittest/llmapi/apps/test_anthropic_batches.py
+  - unittest/llmapi/apps/test_anthropic_gateway.py
+  - unittest/llmapi/apps/test_anthropic_routes.py
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
