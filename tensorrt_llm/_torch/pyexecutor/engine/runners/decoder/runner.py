@@ -100,6 +100,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...metadata import build_attention_metadata
 from ...model_call import ModelCaller
+from ...multimodal import MultimodalItemScheduler
 from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
@@ -266,6 +267,7 @@ class DecoderRunner(ScheduledModelRunner):
         iter_states: dict[str, Any],
         metrics: dict[str, float],
         kv_cache_manager_key: ResourceManagerType,
+        mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self.model = model
         self.input_processor = input_processor
@@ -280,6 +282,7 @@ class DecoderRunner(ScheduledModelRunner):
         self.iter_states = iter_states
         self._metrics = metrics
         self.kv_cache_manager_key = kv_cache_manager_key
+        self._mm_item_scheduler = mm_item_scheduler
 
         self._config = config
 
@@ -3165,6 +3168,12 @@ class DecoderRunner(ScheduledModelRunner):
     def _new_extra_inputs(self) -> "ExtraInputsCollector":
         return _NO_EXTRA_INPUTS
 
+    def _build_multimodal_data_for_llm(self, request: LlmRequest) -> dict[str, Any] | None:
+        """Attach cached item outputs when item scheduling owns the request."""
+        if self._mm_item_scheduler is None:
+            return request.py_multimodal_data
+        return self._mm_item_scheduler.build_multimodal_data_for_llm(request)
+
     def _prepare_tp_inputs(
         self,
         scheduled_requests: ScheduledRequests,
@@ -3328,7 +3337,7 @@ class DecoderRunner(ScheduledModelRunner):
                 multimodal_input=_build_request_multimodal_input(
                     request, self._config.mm_encoder_cache_enabled
                 ),
-                multimodal_data=request.py_multimodal_data,
+                multimodal_data=self._build_multimodal_data_for_llm(request),
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx,
