@@ -1756,14 +1756,27 @@ class OpenAIServer(_VideoRoutesMixin):
             pass
         return JSONResponse(content=events)
 
+    def _record_server_first_token_time(self,
+                                        raw_request: Optional[Request]) -> None:
+        """Stamp the first-token time in the reference clock domain, once.
+
+        The value is only ever read back by ``build_request_metrics_record``,
+        which runs under ``_collect_perf_metrics``, so sampling the clock on
+        the default path would be work nobody consumes.
+        """
+        if not self._collect_perf_metrics or raw_request is None:
+            return
+        if not getattr(raw_request.state, "server_first_token_time", None):
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
         if self._collect_perf_metrics:
-            if raw_request and not getattr(raw_request.state,
-                                           "server_first_token_time", None):
-                raw_request.state.server_first_token_time = (
-                    self._adjusted_steady_clock.now())
+            # Fallback for the non-streaming paths, which never reach the
+            # streaming stamp site.
+            self._record_server_first_token_time(raw_request)
             record = build_request_metrics_record(
                 res, raw_request, adjusted_clock=self._adjusted_steady_clock)
             if record is not None and raw_request is not None:
@@ -1873,8 +1886,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
+                self._record_server_first_token_time(raw_request)
                 pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
                         first_response, args)
@@ -2503,8 +2515,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
             first_response = await anext(generator)
-            raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-            )
+            self._record_server_first_token_time(raw_request)
             yield first_response
             async for output in generator:
                 yield output
@@ -2636,8 +2647,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
-                raw_request.state.server_first_token_time = (
-                    self._adjusted_steady_clock.now())
+                self._record_server_first_token_time(raw_request)
                 pp_results = (first_response.outputs[0]._postprocess_result if
                               self.postproc_worker_enabled else post_processor(
                                   first_response, args))
