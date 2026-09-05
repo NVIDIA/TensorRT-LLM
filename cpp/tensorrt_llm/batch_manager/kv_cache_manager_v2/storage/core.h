@@ -49,7 +49,12 @@ struct Slot
     CachedCudaEvent readyEvent = CachedCudaEvent::makeNull();
 
     Slot() = default;
-    ~Slot() = default;
+
+    ~Slot()
+    {
+        KVCM2_CHECK_FATAL_DEBUG_WITH_INFO(
+            !hasValidSlot(), "Slot %d destroyed without being released", toSizeT(mSlotId.value()));
+    }
 
     // A slot id has exactly one owner: transferring a Slot empties the source, so it cannot be
     // released twice. Copying is not available for the same reason.

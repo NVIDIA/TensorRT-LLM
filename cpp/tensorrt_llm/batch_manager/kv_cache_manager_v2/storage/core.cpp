@@ -61,6 +61,18 @@ SlotAllocator::~SlotAllocator()
         KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
             "SlotAllocator destroyed with some slots not recycled");
     }
+
+    // Recycled and overflow slots still carry their ids; the allocator owns them, so clear them
+    // here rather than letting ~Slot report each one. A slot that escaped the allocator is not in
+    // the recycle lists and is still reported.
+    for (auto& slot : mRecycledSlots)
+    {
+        slot.resetSlot();
+    }
+    for (auto& slot : mOverflowSlots)
+    {
+        slot.resetSlot();
+    }
 }
 
 SlotCount SlotAllocator::numFreeSlots() const noexcept
@@ -134,6 +146,9 @@ void SlotAllocator::release(Slot slot)
     SlotId const slotId = slot.slotId();
     if (slotId >= numSlots() || !mOccupiedMask.get(toSizeT(slotId)))
     {
+        // The id is not one this allocator has outstanding, so drop it rather than let the
+        // rejected slot look like an unreleased one.
+        slot.resetSlot();
         throw LogicError("SlotAllocator::release: slot is not occupied");
     }
     mOccupiedMask.clear(toSizeT(slotId));

@@ -146,10 +146,11 @@ private:
     static std::string makeMessage(CUresult result)
     {
         char const* errStr = nullptr;
-        cuGetErrorString(result, &errStr);
-        std::string msg = "CUDA driver error: ";
-        msg += errStr ? errStr : "<unknown>";
-        return msg;
+        if (cuGetErrorString(result, &errStr) != CUDA_SUCCESS || errStr == nullptr)
+        {
+            errStr = "<Failed to get error string with cuGetErrorString>";
+        }
+        return "CUDA driver error: " + std::to_string(static_cast<int>(result)) + " (" + errStr + ")";
     }
 };
 

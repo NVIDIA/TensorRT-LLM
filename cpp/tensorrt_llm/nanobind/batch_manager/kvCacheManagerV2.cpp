@@ -1705,16 +1705,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
             {
-                if (!beamSearchIndices.is_none())
-                {
-                    PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
-                    throw nb::python_error();
-                }
-                // Note: an empty token list with is_end=True must still stop committing,
-                // so we do not early-return on empty; commit() handles it.
+                // An empty token list with is_end=True must still stop committing, so we do not
+                // early-return on empty; commit() handles it. beam_search_indices is only
+                // rejected when there are tokens, matching the reference ordering.
                 withTokens(acceptedInputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
+                        if (view.size() != 0 && !beamSearchIndices.is_none())
+                        {
+                            PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
+                            throw nb::python_error();
+                        }
                         // commit() sources knownNoDigest from the KvCache's text_only flag. Guard
                         // that claim against the actual tokens: a text_only sequence committing a
                         // digest would silently corrupt the block-key hash.
