@@ -23,7 +23,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -471,7 +471,9 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
+        # Owned by the listener thread only: _respond_with_kv / _send_failed_result_to_receiver.
+        # Every other thread (workers, app threads) must use _get_or_connect_thread_dealer.
+        self._dealers = {}
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
@@ -731,7 +733,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -761,7 +763,7 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1365,7 +1367,11 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
+                # Called from app threads and the listener thread: use the per-thread dealer, never
+                # the listener-owned self._dealers. Every caller is a long-lived thread (executor loop
+                # via TxSession.__init__/cancel_request, or the Sender listener), so the per-thread
+                # DEALER cache is not created and abandoned by short-lived threads.
+                self._get_or_connect_thread_dealer(peer_ri.self_endpoint).send(
                     [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
                 )
             except Exception as e:
@@ -2892,7 +2898,13 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
+def _create_nixl_agent(
+    name: str,
+    rank: int,
+    world_size: int,
+    agent_buffer_size_mb: int = 0,
+    agent_bounce_params: Optional[Dict[str, str]] = None,
+) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
@@ -2903,6 +2915,8 @@ def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAge
         num_threads=num_threads,
         rank=rank,
         world_size=world_size,
+        agent_buffer_size_mb=agent_buffer_size_mb,
+        agent_bounce_params=agent_bounce_params,
         **kwargs,
     )
 
@@ -2933,6 +2947,15 @@ class TransferWorkerConfig:
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
+    # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
+    # fast path. Derived upstream from CacheTransceiverConfig: it equals
+    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
+    # case `bounce` above is off) and 0 otherwise.
+    agent_buffer_size_mb: int = 0
+    # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
+    # trailing _BYTES, lowercased); dict > env > default. Ignored when
+    # agent_buffer_size_mb == 0.
+    agent_bounce_params: Optional[Dict[str, str]] = None
 
 
 class TransferWorker:
@@ -3003,7 +3026,22 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
+            agent_buffer_size_mb=self._config.agent_buffer_size_mb,
+            agent_bounce_params=self._config.agent_bounce_params,
         )
+        # The pure-Python agent has no bounce_enabled attribute and already warns on its own.
+        if (
+            self._config.agent_buffer_size_mb > 0
+            and hasattr(self._agent, "bounce_enabled")
+            and not self._agent.bounce_enabled
+        ):
+            logger.warning(
+                f"TransferWorker: the C++ transfer-agent bounce was requested "
+                f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
+                f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
+                f"{self._agent.name} (not built or init failed); standard per-descriptor NIXL "
+                "transfers are in use."
+            )
         self._registered_mem: list = []
         try:
             self._register_kv_cache()
@@ -3103,6 +3141,14 @@ class TransferWorker:
         # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)
         if agent is not None:
+            try:
+                if getattr(agent, "bounce_enabled", False):
+                    logger.info(
+                        f"TransferWorker.shutdown: agent {agent.name} bounce_submit_count="
+                        f"{agent.bounce_submit_count} bounce_reject_count={agent.bounce_reject_count}"
+                    )
+            except Exception as e:  # observability only; never skip deregister/shutdown below
+                logger.debug(f"TransferWorker.shutdown: bounce counters unavailable: {e}")
             registered = getattr(self, "_registered_mem", [])
             while registered:
                 desc = registered.pop(0)

@@ -132,10 +132,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 tx_timeout_s=sender_wait_slice_s,
                 tx_overall_timeout_s=transfer_timeout_s,
                 rx_timeout_s=transfer_timeout_s,
-                # Size 0 turns bounce off; the per-transfer size gates are internal (tuned via
-                # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
-                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
+                # routes it to exactly one implementation: the Python bounce below (per-region,
+                # size 0 = off; the per-transfer size gates are internal, tuned via env:
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
+                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
+                # transfer-agent staging buffer (bounce v2, one buffer shared by send and recv).
+                bounce=bounce_config_from_size(
+                    0
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else cache_transceiver_config.kv_cache_bounce_size_mb
+                ),
+                agent_buffer_size_mb=(
+                    cache_transceiver_config.kv_cache_bounce_size_mb
+                    if cache_transceiver_config.agent_bounce_buffer_enable
+                    else 0
+                ),
+                agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
         logger.info(
@@ -1273,9 +1286,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # Bounce buffers stage a whole request, not individual chunks.
-        if cfg.kv_cache_bounce_size_mb != 0:
-            blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
+        # The Python bounce reserves a receiver region for the whole request, not per chunk.
+        # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
+        # independently below the Python layer, so a pipelined chunk is just another request.
+        if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
+            blockers.append(
+                f"the Python bounce buffer (kv_cache_bounce_size_mb="
+                f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
+            )
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
             blockers.append("a Mamba/hybrid cache manager")
         # Policies other than all_reusable defer the whole prompt's commit to the final

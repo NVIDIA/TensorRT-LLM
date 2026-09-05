@@ -111,6 +111,8 @@ l0_h100:
   # DSA indexer-K side cache (V1, REPLICATED).
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_dsa_indexer
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
+  # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/disaggregated/test_cache_transceiver_precheck_e2e.py
@@ -292,6 +294,7 @@ l0_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[common-90]
+  - cpp/test_unit_tests.py::test_unit_tests[executor_bounce-90]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-90]
   - cpp/test_unit_tests.py::test_unit_tests[thop-90]
 - condition:
