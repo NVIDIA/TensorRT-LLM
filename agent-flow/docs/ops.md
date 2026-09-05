@@ -125,6 +125,38 @@ a finished run reviewable months later, on a machine with none of the original
 infrastructure, which is the point — a run whose evidence only renders on the
 cluster that produced it is not evidence.
 
+## Freezing a finished run
+
+```
+python -m agent_flow.ops.archive freeze <name> [--source DIR] [--dest DIR]
+python -m agent_flow.ops.archive list
+```
+
+`freeze` copies the readable half of a project into
+`<dest>/run-<date>-<name>/`: the workspace, logs, notes, the text files at the
+project root, the text documents under `handoff/`, and every evidence file
+under `evidence_max_bytes`. Larger evidence is *listed* in
+`EVIDENCE-MANIFEST.json` with its size, mtime, and original path rather than
+copied — the bulk a long run leaves behind (source trees, checkpoints, profiler
+output) is not what makes it reviewable. `MANIFEST.json` records the archived
+run's scoreboard, taken from the ledger in the archive itself, plus the repo
+HEAD and branch when `--repo` names a checkout.
+
+Two properties matter more than the copying:
+
+* **Idempotent.** Re-freezing the same name refreshes the folder in place:
+  unchanged files are skipped, and the README index row between the
+  `<!-- index -->` markers is amended, never duplicated.
+* **Nothing oversized enters git.** Any archived file over `git_max_bytes`
+  (5 MB by default) gets its own `.gitignore` entry and a row in
+  `MANIFEST.json["oversize"]`. A large file removed from git history costs far
+  more than one never committed.
+
+Symlinks are never followed, in either direction — a link inside the project
+can point at a filesystem the archive must not absorb, so links are counted and
+skipped. Override any of the copy lists or thresholds under `[archive]` in the
+config.
+
 ## Scaffolding a new project
 
 ```

@@ -40,3 +40,16 @@ reviewer = "/path/to/worktrees/wt-2"
 # narrator_command = "claude"
 # narrator_model = "claude-haiku-4-5-20251001"
 refresh_seconds = 20
+
+[archive]
+# What `agent_flow.ops.archive` copies out of a project, and the two size
+# thresholds. Defaults shown; every key is optional.
+# trees = ["workspace", "logs", "notes", "restart"]
+# files = ["task.yaml", "AGENT-NOTICES.jsonl", "HANDOFF.md", "MEMENTO.md"]
+# globs = ["run-*.log", "*.jsonl"]
+# handoff_dir = "handoff"          # only handoff_suffixes are copied from it
+# handoff_suffixes = [".md", ".txt"]
+# evidence_dir = "evidence"
+# evidence_max_bytes = 2097152     # larger evidence is listed, not copied
+# git_max_bytes = 5242880          # larger archived files are .gitignore'd
+# commit = true                    # commit the archive repo after freezing
