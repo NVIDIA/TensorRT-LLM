@@ -1128,6 +1128,27 @@ class LmEvalEvaluator(Evaluator):
         llm.shutdown()
 
 
+def _parse_stop_strings(ctx, param, value):
+    """Parse the ``--stop_strings`` CLI value into a list of strings.
+
+    The value must be a JSON list whose members are all strings, e.g.
+    ``'["</s>", "<|im_end|>"]'``. Anything else (a JSON string, object, or a
+    list with a non-string member) is rejected so the evaluator never stops on
+    individual characters.
+    """
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise click.BadParameter(f"must be valid JSON: {e}")
+    if not isinstance(parsed, list) or not all(
+            isinstance(s, str) for s in parsed):
+        raise click.BadParameter("must be a JSON list of strings, e.g. "
+                                 '\'["</s>", "<|im_end|>"]\'')
+    return parsed
+
+
 class GSM8K(LmEvalEvaluator):
 
     def __init__(self, **kwargs):
@@ -1203,7 +1224,7 @@ class GSM8K(LmEvalEvaluator):
         "--stop_strings",
         type=str,
         default=None,
-        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        callback=_parse_stop_strings,
         help='Replace the task yaml\'s stop strings, as a JSON list, e.g. '
         '\'["</s>", "<|im_end|>"]\'. GSM8K\'s yaml stops on "Question:", a '
         'few-shot delimiter; in a chat-templated 0-shot run a model that '
