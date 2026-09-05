@@ -79,6 +79,14 @@ DIRECT_DEP_LICENSES = {
         "Apache-2.0",
         "https://github.com/flashinfer-ai/flashinfer",
     ),
+    # The wheel ships python/CuTeDSL, which is carved out of CUTLASS's BSD-3-Clause
+    # terms and licensed under the NVIDIA EULA instead.
+    "nvidia-cutlass-dsl": (
+        "NVIDIA CUTLASS DSL",
+        "NVIDIA Software License Agreement",
+        "https://docs.nvidia.com/cutlass/media/docs/pythonDSL/license.html",
+    ),
+    "apache-tvm-ffi": ("Apache TVM FFI", "Apache-2.0", "https://github.com/apache/tvm-ffi"),
     "safetensors": ("safetensors", "Apache-2.0", "https://github.com/huggingface/safetensors"),
     "accelerate": ("Accelerate", "Apache-2.0", "https://github.com/huggingface/accelerate"),
     "huggingface-hub": (
