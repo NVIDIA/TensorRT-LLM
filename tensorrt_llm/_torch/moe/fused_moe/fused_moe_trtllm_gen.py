@@ -15,7 +15,7 @@
 
 import os
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional, Union
+from typing import Dict, FrozenSet, List, Optional, Union
 
 import torch
 from torch import nn
@@ -187,6 +187,18 @@ class TRTLLMGenFusedMoE(MoEImplBase):
                 and quant_config.layer_quant_mode.has_fp8_block_scales()):
             return replace(support, limit=ActivationParamShape.UNIFORM_SCALAR)
         return support
+
+    @classmethod
+    def situ_supported_quant_algos(cls) -> FrozenSet[QuantAlgo]:
+        """The quant algos this backend has a fused SiTu FC1 cubin for.
+
+        Public because a model that hands SiTu to this backend has to decide,
+        before construction, whether the handoff can work at all -- and the
+        only alternative to asking is restating the set. Restating it is what
+        broke once already: ``modeling_kimi_linear`` carried its own copy,
+        the NVFP4 cubins landed here, and the copy stayed at MXFP4-only.
+        """
+        return frozenset(cls._SITU_SUPPORTED_QUANT_ALGOS)
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:

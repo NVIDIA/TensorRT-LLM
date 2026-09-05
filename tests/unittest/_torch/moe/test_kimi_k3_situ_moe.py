@@ -611,6 +611,57 @@ def test_kimi_k3_moe_auto_backend_defaults_to_trtllm(architecture):
 
 
 # ---------------------------------------------------------------------------
+# The K3 model layer and TRTLLMGenFusedMoE both have to know which routed-expert
+# formats trtllm-gen has a fused SiTu FC1 cubin for. They disagreed once: the
+# model's copy was written when MXFP4 was the only drop (#17865) and #17940 then
+# shipped the NVFP4 cubins and updated only the backend, so for a week an NVFP4
+# K3 checkpoint raised at construction on a path that the kernels supported.
+#
+# It survived because every other SiTu test calls ``create_moe`` directly and so
+# never reaches the model-layer guard -- the kernel path was green throughout.
+# These two tests enter through the guard instead.
+# ---------------------------------------------------------------------------
+
+
+def test_kimi_k3_trtllm_situ_admits_every_backend_supported_quant():
+    """The model must not narrow what the backend says it can serve.
+
+    Asserting agreement rather than a literal set is the point: a new fused
+    SiTu cubin family should require no edit here, and removing one should
+    fail loudly rather than leave a stale allow-list behind.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import TRTLLMGenFusedMoE
+
+    supported = TRTLLMGenFusedMoE.situ_supported_quant_algos()
+    assert QuantAlgo.NVFP4 in supported, (
+        "trtllm-gen has shipped group-16 Bmm_E2m1_E2m1E2m1_..._siTuGlu_* cubins "
+        "since #17940; if this fails the backend regressed, not the model."
+    )
+    for algo in supported:
+        KimiK3MoERuntime._check_trtllm_situ_quant("TRTLLM", algo)
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.W4A16_MXFP4, None])
+def test_kimi_k3_trtllm_situ_rejects_quant_without_fused_cubin(quant_algo):
+    """...and must still reject the formats that have no fused SiTu cubin.
+
+    ``resolve_moe_backend`` sends every K3 architecture to TRTLLM, including
+    the generic FP8_BLOCK_SCALES fallback, so this rejection is reachable
+    without anyone asking for TRTLLM by name. It has to name the fix.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import TRTLLMGenFusedMoE
+
+    assert quant_algo not in TRTLLMGenFusedMoE.situ_supported_quant_algos()
+    with pytest.raises(ValueError, match="fused SiTu cubins exist only for"):
+        KimiK3MoERuntime._check_trtllm_situ_quant("TRTLLM", quant_algo)
+
+    # Any other backend owns its own SiTu translation and is not this guard's
+    # business -- gating it here is how CUTLASS would get blocked by a
+    # trtllm-gen cubin inventory.
+    KimiK3MoERuntime._check_trtllm_situ_quant("CUTLASS", quant_algo)
+
+
+# ---------------------------------------------------------------------------
 # MoE tensor-parallel shard parity (ConfigurableMoE / TRTLLM-Gen, GPU).
 #
 # Production K3 TP8 geometry per rank: ALL experts, intermediate 3072/8=384,
