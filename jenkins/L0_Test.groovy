@@ -422,7 +422,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         // touching on-disk results*.xml files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
         def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz --exclude='${stageName}/timeout_data*.jsonl' ${transformOpt} ${stageName}/"
         trtllm_utils.uploadArtifacts(
             "results-${stageName}${postTag}.tar.gz",
             "${UPLOAD_PATH}/test-results/"
@@ -517,10 +517,10 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
         isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${isolateTestCmdLine.join(" ")}
-            """
+            runPytestWithLog(stageName, isolateTestCmdLine, i,
+                "${WORKSPACE}/${stageName}/unfinished_test.txt",
+                "${WORKSPACE}/${stageName}/timeout_data.jsonl",
+                llmSrc)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2514,6 +2514,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def sshStatCmd = Utils.sshUserCmd(remote, "\"srun --overlap ${srunAccountArg}--quiet --jobid='${slurmJobId}' --ntasks=1 stat -c %Y '${remoteWorkspaceTrk}/results.xml' || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
                 def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
+                def hasTimeoutDataCmd = Utils.sshUserCmd(
+                    remote,
+                    "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type f -name 'timeout_data_step*_rank*.jsonl' -print -quit | grep -q .\"")
+                def scpTimeoutDataCmd = scpFromRemoteCmd(
+                    remote,
+                    "${remoteWorkspaceTrk}/timeout_data_step*_rank*.jsonl",
+                    "${stageName}/")
                 def sshRefreshCacheCmd = Utils.sshUserCmd(remote, "\"ls '${remoteWorkspaceTrk}/' > /dev/null 2>&1; ls -la '${remoteWorkspaceTrk}/results.xml' > /dev/null 2>&1 || true\"")
                 def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
                 def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
@@ -2570,6 +2577,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             [ \$_attempt -lt 3 ] && sleep 10
                         done
                         [ "\$_unfinished_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished not available, skipping"
+                        rm -f '${WORKSPACE}/${stageName}'/timeout_data_step*_rank*.jsonl || true
+                        if ${hasTimeoutDataCmd}; then
+                            _timeout_data_ok=0
+                            for _attempt in 1 2 3; do
+                                ${scpTimeoutDataCmd} && { _timeout_data_ok=1; break; }
+                                echo "[PROGRESS-UPLOAD] ${stageName}: scp timeout data failed (attempt \$_attempt/3)"
+                                [ \$_attempt -lt 3 ] && sleep 10
+                            done
+                            [ "\$_timeout_data_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: timeout data not available, classification may fall back to terminated_unexpectedly"
+                        fi
                         SCP_PERF_TMPL='${scpPerfTemplate}'
                         while IFS= read -r perf_folder; do
                             [ -z "\$perf_folder" ] && continue
@@ -2662,6 +2679,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // failure classifies as UserFailure -> not suppressed -> reported.
             boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
                 retryContextAllowsRetry(null, retryContext, caughtStageError, false)
+            if (stageIsInterrupted) {
+                echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                sh "find '${WORKSPACE}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -delete || true"
+            } else {
+                // The final progress snapshot already contains the same XML. Run
+                // once more here to make classification/cleanup authoritative
+                // before the progress tar is promoted or direct-uploaded.
+                generateTimeoutTestResultXml(pipeline, stageName)
+            }
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
             deleteProgressArtifact(stageName, postTag)
         } finally {
@@ -3419,9 +3445,15 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else if (!fileExists("${stageName}/results-timeout.xml")) {
+                } else {
                     // Generate timeout test result xml if there are terminated unexpectedly tests
-                    generateTimeoutTestResultXml(pipeline, stageName)
+                    def hasPendingTimeoutData = sh(
+                        script: "find '${WORKSPACE}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -print -quit | grep -q .",
+                        returnStatus: true,
+                    ) == 0
+                    if (hasPendingTimeoutData || !fileExists("${stageName}/results-timeout.xml")) {
+                        generateTimeoutTestResultXml(pipeline, stageName)
+                    }
                 }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
@@ -3457,7 +3489,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // results.xml, or the superseded-file rename above can all leave the
             // last uploaded snapshot stale.
             def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz --exclude='${stageName}/timeout_data*.jsonl' ${transformOpt} ${stageName}/"
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
@@ -4003,6 +4035,70 @@ def launchTestListCheck(pipeline)
     })
 }
 
+// Run one pytest command through timeout log capture. Optional progress-upload
+// settings keep the existing watcher in the same Jenkins shell step.
+def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDataFile,
+                     llmSrc, Map progressUpload=[:], boolean resetOutputDir=false) {
+    def outDir = "${WORKSPACE}/${stageName}"
+    // writeFile runs as the Jenkins agent user, whereas the stage directory is
+    // created by the test container and can be root-owned. Keep the temporary
+    // command file in the Jenkins-writable workspace root.
+    def cmdFile = Utils.createTempLocation(pipeline, "./pytest_cmd_${invIdx}.sh")
+    def logFile = Utils.createTempLocation(pipeline, "./pytest_output_${invIdx}.log")
+    def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
+
+    writeFile file: cmdFile, text: "#!/usr/bin/env bash\nset -ex\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
+    try {
+        if (resetOutputDir) {
+            sh "rm -rf '${outDir}/'"
+        }
+        sh "mkdir -p '${outDir}'"
+        if (progressUpload.isEmpty()) {
+            sh "bash '${wrapperScript}' '${logFile}' '${timeoutDataFile}' '${unfinishedFile}' -- bash '${cmdFile}'"
+        } else {
+            def finalSnapshot = progressUpload.finalSnapshotRequiresXml ? """
+                if [ -f '${progressUpload.xmlPath}' ]; then
+                    LABEL='${progressUpload.finalLabel}' FINAL_SNAPSHOT=1 \\
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                fi
+            """ : """
+                LABEL='${progressUpload.finalLabel}' FINAL_SNAPSHOT=1 \\
+                bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+            """
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                sh """
+                    set +e
+                    export STAGE_NAME='${stageName}'
+                    export PROGRESS_TAR='${progressUpload.tar}'
+                    export PROGRESS_URL='${progressUpload.url}'
+                    export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
+                    export POST_TAG='${progressUpload.postTag}'
+                    PROGRESS_DONE_FILE='${progressUpload.doneFile}' \\
+                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                    LABEL_PREFIX='${progressUpload.labelPrefix}' \\
+                    XML_PATH='${progressUpload.xmlPath}' \\
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
+                    WATCHER_PID=\$!
+
+                    bash '${wrapperScript}' '${logFile}' '${timeoutDataFile}' \\
+                        '${unfinishedFile}' -- bash '${cmdFile}'
+                    rc=\$?
+
+                    touch '${progressUpload.doneFile}'
+                    wait \$WATCHER_PID 2>/dev/null || true
+                    ${finalSnapshot}
+                    exit \$rc
+                """
+            }
+        }
+    } finally {
+        sh "rm -f '${cmdFile}' '${logFile}' || true"
+    }
+}
+
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
         script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
@@ -4010,7 +4106,23 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
+    def unfinishedTestFiles = sh(
+        script: "find '${curPath}/${stageName}' -type f -name 'unfinished_test.txt' -print | sort",
+        returnStdout: true,
+    ).trim().split("\\n").findAll { it }
+    // Preserve the historical no-op behavior when pytest never created an
+    // unfinished list (for example, if the stage failed before pytest setup).
+    if (unfinishedTestFiles.isEmpty()) {
+        unfinishedTestFiles = ["unfinished_test.txt"]
+    }
+    def unfinishedTestArgs = unfinishedTestFiles.collect { "--test-file-path '${it}'" }.join(" ")
+    def timeoutDataFiles = sh(
+        script: "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -print | sort",
+        returnStdout: true,
+    ).trim().split("\\n").findAll { it }
+    def timeoutDataArgs = timeoutDataFiles.collect { "--timeout-data-file '${it}'" }.join(" ")
+    sh """python3 ${scriptPath} --stage-name '${stageName}' ${unfinishedTestArgs} --output-file '${outputFilePath}' ${timeoutDataArgs}"""
+    sh "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -delete || true"
     if (fileExists(outputFilePath)) {
         return true
     }
@@ -4429,39 +4541,20 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
         def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
         sh "rm -f ${rerunDoneFile}"
         try {
-            withCredentials([usernamePassword(
-                    credentialsId: 'urm-artifactory-creds',
-                    usernameVariable: 'ART_USER',
-                    passwordVariable: 'ART_PASS')]) {
-                sh """
-                    set +e
-                    export STAGE_NAME='${stageName}'
-                    export PROGRESS_TAR='${rerunProgressTar}'
-                    export PROGRESS_URL='${rerunProgressUrl}'
-                    export POST_TAG='${postTag}'
-                    # ---- background watcher for rerun${times} ----
-                    PROGRESS_DONE_FILE='${rerunDoneFile}' \\
-                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
-                    LABEL_PREFIX='rerun${times} checkpoint' \\
-                    XML_PATH='${xmlFile}' \\
-                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
-                    WATCHER_PID=\$!
-
-                    # ---- foreground rerun ----
-                    cd ${llmSrc}/tests/integration/defs && \\
-                    ${newTestCmdLine.join(" ")}
-                    rc=\$?
-
-                    touch '${rerunDoneFile}'
-                    wait \$WATCHER_PID 2>/dev/null || true
-
-                    # ---- immediate final snapshot of rerun${times} ----
-                    LABEL='rerun${times} final snapshot' FINAL_SNAPSHOT=1 \\
-                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
-
-                    exit \$rc
-                """
-            }
+            runPytestWithLog(stageName, newTestCmdLine, times,
+                "${rerunDir}/unfinished_test.txt",
+                "${WORKSPACE}/${stageName}/timeout_data.jsonl",
+                llmSrc,
+                [
+                    doneFile: rerunDoneFile,
+                    tar: rerunProgressTar,
+                    url: rerunProgressUrl,
+                    postTag: postTag,
+                    labelPrefix: "rerun${times} checkpoint",
+                    finalLabel: "rerun${times} final snapshot",
+                    xmlPath: xmlFile,
+                    finalSnapshotRequiresXml: false,
+                ])
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5198,6 +5291,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
+                // Clear any stale timeout_data.jsonl from a previous run of this stage.
+                // rm -rf below (regular path) would remove it too, but isolated-only or
+                // rerun-only stages skip rm -rf and could inherit a stale file.
+                sh "rm -f '${WORKSPACE}/${stageName}/timeout_data.jsonl' || true"
+                def timeoutDataFile = "${WORKSPACE}/${stageName}/timeout_data.jsonl"
+                def unfinishedFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 try {
                     // Sentinel that the watcher polls to know pytest has exited
                     // (success or failure). Lives outside ${stageName}/ so the
@@ -5214,43 +5313,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             // step (not a Groovy parallel branch) so Blue Ocean
                             // renders the stage as a single box rather than a
                             // nested parallel split.
-                            withCredentials([usernamePassword(
-                                    credentialsId: 'urm-artifactory-creds',
-                                    usernameVariable: 'ART_USER',
-                                    passwordVariable: 'ART_PASS')]) {
-                                sh """
-                                    set +e
-                                    export STAGE_NAME='${stageName}'
-                                    export PROGRESS_TAR='${progressTar}'
-                                    export PROGRESS_URL='${progressUrl}'
-                                    export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
-                                    export POST_TAG='${postTag}'
-                                    # ---- background watcher ----
-                                    PROGRESS_DONE_FILE='${pytestDoneFile}' \\
-                                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
-                                    LABEL_PREFIX='checkpoint' \\
-                                    XML_PATH='${WORKSPACE}/${stageName}/results.xml' \\
-                                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
-                                    WATCHER_PID=\$!
-
-                                    # ---- foreground pytest ----
-                                    rm -rf '${stageName}/'
-                                    cd '${llmSrc}/tests/integration/defs'
-                                    ${pytestCommand.join(" ")}
-                                    rc=\$?
-
-                                    touch '${pytestDoneFile}'
-                                    wait \$WATCHER_PID 2>/dev/null || true
-
-                                    # ---- immediate final snapshot of run 1 ----
-                                    if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                                        LABEL='run1 final snapshot' FINAL_SNAPSHOT=1 \\
-                                        bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
-                                    fi
-
-                                    exit \$rc
-                                """
-                            }
+                            runPytestWithLog(stageName, pytestCommand, 0,
+                                unfinishedFile, timeoutDataFile, llmSrc,
+                                [
+                                    doneFile: pytestDoneFile,
+                                    tar: progressTar,
+                                    url: progressUrl,
+                                    postTag: postTag,
+                                    labelPrefix: "checkpoint",
+                                    finalLabel: "run1 final snapshot",
+                                    xmlPath: "${WORKSPACE}/${stageName}/results.xml",
+                                    finalSnapshotRequiresXml: true,
+                                ],
+                                true)
                         } else {
                             echo "No regular tests to run for stage ${stageName}"
                             noRegularTests = true
@@ -5275,12 +5350,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
-                            // Rerun passed but the first run had a timeout: mark this
-                            // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                            // not just the enclosing parent stage.
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests terminated unexpectedly, please check the test report."
+                        } else {
+                            // A normal assertion failure leaves an empty file; only
+                            // a hard interruption leaves one or more nodeids.
+                            def hasUnfinished = fileExists(unfinishedFile) &&
+                                readFile(unfinishedFile).readLines().any { it.trim() }
+                            if (hasUnfinished) {
+                                // Defer XML generation until isolated tests complete,
+                                // so all timeout snippets are collected first.
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    error "Some tests terminated unexpectedly, please check the test report."
+                                }
                             }
                         }
                     }
@@ -5331,7 +5411,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+        if (generateTimeoutTestResultXml(pipeline, stageName) || fileExists("${stageName}/results-timeout.xml")) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
