@@ -427,6 +427,13 @@ class DenseGemmW4A16CuteM1Kernel:
         self._compile_cache: dict = {}
         self._explicit_stream_cache: dict[tuple[int, int, int], bool] = {}
 
+    @staticmethod
+    def _expected_blockscale_shape(n: int, k: int) -> tuple[int, int]:
+        """Return the padded row-major E4M3 block-scale matrix shape."""
+        sf_rows = ((n + 127) // 128) * 128
+        sf_cols = (((k // _SF_VEC_SIZE) + 3) // 4) * 4
+        return sf_rows, sf_cols
+
     @classmethod
     def _validate_warps(cls, warps: int) -> int:
         warps = int(warps)
@@ -484,8 +491,7 @@ class DenseGemmW4A16CuteM1Kernel:
                 tile_n=warps,
                 threads=threads,
             )
-            sf_rows = ((n + 127) // 128) * 128
-            sf_cols = (((k // _SF_VEC_SIZE) + 3) // 4) * 4
+            sf_rows, sf_cols = self._expected_blockscale_shape(n, k)
             fake_args = (
                 cute.runtime.make_fake_tensor(BFloat16, (k,), stride=(1,), assumed_align=16),
                 cute.runtime.make_fake_tensor(
@@ -540,6 +546,22 @@ class DenseGemmW4A16CuteM1Kernel:
             )
         if not self.is_supported(1, k, n):
             raise NotImplementedError(f"M=1 CuTe GEMV supports K % 32 == 0; got K={k}, N={n}")
+
+        expected_scale_shape = self._expected_blockscale_shape(n, k)
+        if tuple(w_blockscale_linear_u8.shape) != expected_scale_shape:
+            raise ValueError(
+                "w_blockscale_linear_u8 must have padded linear scale "
+                f"shape {expected_scale_shape}; got {tuple(w_blockscale_linear_u8.shape)}"
+            )
+        if w_blockscale_linear_u8.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise TypeError(
+                "w_blockscale_linear_u8 dtype must be uint8 or float8_e4m3fn; "
+                f"got {w_blockscale_linear_u8.dtype}"
+            )
+        if w_blockscale_linear_u8.device != x.device:
+            raise ValueError("w_blockscale_linear_u8 must be on the same device as x")
+        if not w_blockscale_linear_u8.is_contiguous():
+            raise ValueError("w_blockscale_linear_u8 must be contiguous")
 
         if out is None:
             out = torch.empty(1, n, dtype=torch.bfloat16, device=x.device)
@@ -620,7 +642,11 @@ def _get_kernel() -> DenseGemmW4A16CuteM1Kernel:
 class W4A16NVFP4CuteM1Runner(TunableRunner):
     """AutoTuner runner for the one-output-per-warp CuTe M=1 kernel."""
 
-    tuning_config = TuningConfig(use_cold_l2_cache=True, use_cuda_graph=False)
+    tuning_config = TuningConfig(
+        use_cold_l2_cache=True,
+        use_cuda_graph=False,
+        exclude_from_cache=True,
+    )
 
     def unique_id(self):
         # The v2 key prevents reuse of cache entries for removed topologies.

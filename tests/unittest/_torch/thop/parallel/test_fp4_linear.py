@@ -21,6 +21,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.w4a16_nvfp4_m1 import \
+    DenseGemmW4A16CuteM1Kernel
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.utils import model_extra_attrs
@@ -829,6 +831,27 @@ def test_w4a16_nvfp4_linear_cute_m1(dtype, mnk):
 
     torch.cuda.synchronize()
     torch.testing.assert_close(output, ref_output, atol=0.5, rtol=2e-2)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12),
+                    reason="cutlass-dsl 4.1.0 requires Python 3.12+")
+@pytest.mark.skipif(
+    get_sm_version() != 121,
+    reason="CuTe W4A16 M=1 production dispatch is enabled only on SM121",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE,
+                    reason="cutlass-dsl is not available")
+@pytest.mark.parametrize("scale_shape", [(1, 4), (128, 3)])
+def test_w4a16_nvfp4_cute_m1_rejects_malformed_scale_layout(scale_shape):
+    """Reject unpadded scale rows and incorrect scale column counts."""
+    kernel = DenseGemmW4A16CuteM1Kernel()
+    x = torch.zeros((1, 32), dtype=torch.bfloat16, device="cuda")
+    weight = torch.zeros((1, 16), dtype=torch.uint8, device="cuda")
+    scale = torch.zeros(scale_shape, dtype=torch.uint8, device="cuda")
+    alpha = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(ValueError, match="must have padded linear scale shape"):
+        kernel(x, weight, scale, alpha)
 
 
 @pytest.mark.skipif(

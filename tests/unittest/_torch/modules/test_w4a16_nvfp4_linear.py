@@ -389,6 +389,93 @@ def test_w4a16_nvfp4_linear_uses_marlin_op_after_weight_transform():
     assert output.shape == (1, 3)
 
 
+def _run_marlin_transform_for_cute_test(weight_scale_2, preserve_for_cute):
+    """Run the Marlin transform with its CUDA operators replaced by shape stubs."""
+    method = MarlinNVFP4LinearMethod()
+    original_weight = torch.nn.Parameter(
+        torch.zeros((3, 16), dtype=torch.uint8), requires_grad=False
+    )
+    module = SimpleNamespace(
+        weight=original_weight,
+        weight_scale=torch.nn.Parameter(
+            torch.zeros((128, 4), dtype=torch.uint8), requires_grad=False
+        ),
+        weight_scale_2=torch.nn.Parameter(weight_scale_2, requires_grad=False),
+        _w4a16_cute_weight=torch.empty(0, dtype=torch.uint8),
+        _w4a16_cute_weight_scale=torch.empty(0, dtype=torch.uint8),
+        _w4a16_cute_alpha=torch.empty(0, dtype=torch.float32),
+        in_features=32,
+        out_features=3,
+        scaling_vector_size=16,
+    )
+    scale_unswizzled = torch.zeros((128, 4), dtype=torch.uint8)
+
+    with (
+        patch.object(
+            method,
+            "_is_cute_m1_weight_shape_eligible",
+            return_value=preserve_for_cute,
+        ),
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=121),
+        patch(
+            "torch.ops.trtllm.block_scale_interleave_reverse",
+            return_value=scale_unswizzled,
+            create=True,
+        ),
+        patch(
+            "torch.ops.trtllm.gptq_marlin_repack",
+            return_value=torch.zeros((8, 128), dtype=torch.int32),
+            create=True,
+        ),
+        patch(
+            "tensorrt_llm.quantization.utils.marlin_utils.marlin_permute_scales",
+            side_effect=lambda scale, *args, **kwargs: scale,
+        ),
+        patch(
+            "tensorrt_llm.quantization.utils.marlin_utils.nvfp4_marlin_process_scales",
+            side_effect=lambda scale: scale,
+        ),
+        patch(
+            "tensorrt_llm.quantization.utils.marlin_utils.nvfp4_marlin_process_global_scale",
+            side_effect=lambda scale: scale,
+        ),
+    ):
+        method.transform_weights(module)
+
+    return module, original_weight, scale_unswizzled
+
+
+def test_w4a16_nvfp4_transform_does_not_retain_cute_weights_when_ineligible():
+    """Ineligible Marlin layers must not retain a second weight representation."""
+    module, _, _ = _run_marlin_transform_for_cute_test(
+        torch.tensor([1.0], dtype=torch.float32), preserve_for_cute=False
+    )
+
+    assert module._w4a16_cute_weight.numel() == 0
+    assert module._w4a16_cute_weight_scale.numel() == 0
+    assert module._w4a16_cute_alpha.numel() == 0
+
+
+@pytest.mark.parametrize(
+    "weight_scale_2",
+    [
+        torch.empty(0, dtype=torch.float32),
+        torch.tensor([0.0], dtype=torch.float32),
+        torch.tensor([float("nan")], dtype=torch.float32),
+    ],
+)
+def test_w4a16_nvfp4_transform_sanitizes_cute_alpha(weight_scale_2):
+    """CuTe and Marlin must use the same fallback for a degenerate scale."""
+    module, original_weight, scale_unswizzled = _run_marlin_transform_for_cute_test(
+        weight_scale_2, preserve_for_cute=True
+    )
+
+    assert module._w4a16_cute_weight.data_ptr() == original_weight.data_ptr()
+    assert module._w4a16_cute_weight_scale.data_ptr() == scale_unswizzled.data_ptr()
+    torch.testing.assert_close(module._w4a16_cute_alpha, torch.ones(1, dtype=torch.float32))
+    torch.testing.assert_close(module.weight_global_scale, torch.ones(1, dtype=torch.bfloat16))
+
+
 def test_w4a16_nvfp4_linear_uses_marlin_for_m_greater_than_one():
     method = MarlinNVFP4LinearMethod()
     input_tensor = torch.ones((2, 32), dtype=torch.bfloat16)
@@ -436,6 +523,7 @@ def test_w4a16_nvfp4_linear_uses_cute_m1_with_original_weight_layout():
     cute_weight = torch.empty((64, 32), dtype=torch.uint8)
     cute_weight_scale = torch.empty((128, 4), dtype=torch.uint8)
     weight_scale_2 = torch.tensor([0.5], dtype=torch.float32)
+    cute_alpha = torch.tensor([0.5], dtype=torch.float32)
     module = SimpleNamespace(
         weight=torch.empty((16, 128), dtype=torch.int32),
         weight_scale=torch.empty((4, 128), dtype=torch.float8_e4m3fn),
@@ -443,6 +531,7 @@ def test_w4a16_nvfp4_linear_uses_cute_m1_with_original_weight_layout():
         weight_global_scale=torch.tensor([0.5], dtype=torch.bfloat16),
         _w4a16_cute_weight=cute_weight,
         _w4a16_cute_weight_scale=cute_weight_scale,
+        _w4a16_cute_alpha=cute_alpha,
         dtype=torch.bfloat16,
         in_features=4096,
         out_features=2688,
@@ -481,7 +570,7 @@ def test_w4a16_nvfp4_linear_uses_cute_m1_with_original_weight_layout():
     assert captured["input"] is input_tensor
     assert captured["weight"] is cute_weight
     assert captured["weight_scale"] is cute_weight_scale
-    assert captured["global_scale"] is weight_scale_2
+    assert captured["global_scale"] is cute_alpha
     assert captured["out"] is None
     torch.testing.assert_close(output, torch.ones_like(output))
 
