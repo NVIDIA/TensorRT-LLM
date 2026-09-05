@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from diffusers import MiniMaxH3Scheduler
 
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     MINIMAX_H3_AUDIO_TAG,
@@ -37,7 +38,6 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     video_latent_num_frames,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.scheduler import MiniMaxH3Scheduler
 
 
 @pytest.mark.parametrize(

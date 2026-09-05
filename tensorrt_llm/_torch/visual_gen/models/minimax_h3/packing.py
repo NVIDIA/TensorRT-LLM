@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 try:
     from PIL import Image
@@ -397,50 +398,6 @@ def build_row_timesteps(
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
-def _randn_tensor(
-    shape: tuple[int, ...],
-    generator: torch.Generator | list[torch.Generator] | None,
-    device: torch.device | None,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    target_device = device or torch.device("cpu")
-    generator_device = None
-    if generator is not None:
-        first_generator = generator[0] if isinstance(generator, list) else generator
-        generator_device = first_generator.device
-    random_device = target_device
-    if generator_device is not None and generator_device.type != target_device.type:
-        if generator_device.type != "cpu":
-            raise ValueError(
-                f"Cannot generate a {target_device} tensor from a "
-                f"{generator_device.type} generator."
-            )
-        random_device = torch.device("cpu")
-
-    if isinstance(generator, list):
-        if len(generator) != shape[0]:
-            raise ValueError(
-                "A generator list must have one entry per batch element; "
-                f"got {len(generator)} for batch size {shape[0]}."
-            )
-        samples = [
-            torch.randn(
-                (1, *shape[1:]),
-                generator=batch_generator,
-                device=random_device,
-                dtype=dtype,
-            )
-            for batch_generator in generator
-        ]
-        return torch.cat(samples).to(target_device)
-    return torch.randn(
-        shape,
-        generator=generator,
-        device=random_device,
-        dtype=dtype,
-    ).to(target_device)
-
-
 def keyframe_condition_noise(
     condition_latent_shapes: tuple[tuple[int, int, int], ...],
     patch_size: tuple[int, int, int],
@@ -452,7 +409,7 @@ def keyframe_condition_noise(
     """Draw and patchify keyframe conditioning noise in packed order."""
     rows = []
     for num_latent_frames, latent_height, latent_width in condition_latent_shapes:
-        noise = _randn_tensor(
+        noise = randn_tensor(
             (1, latent_channels, num_latent_frames, latent_height, latent_width),
             generator=generator,
             device=device,

@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers import MiniMaxH3Scheduler
 from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.config import discover_pipeline_components
@@ -30,7 +31,6 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     resolve_canvas_size,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.scheduler import MiniMaxH3Scheduler
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
@@ -75,6 +75,9 @@ class _FakeMiniMaxH3Transformer:
 class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
     def __init__(self) -> None:
         torch.nn.Module.__init__(self)
+        # BasePipeline.__init__ is bypassed here, so set the backing attribute
+        # that BasePipeline.device reads.
+        self._device = torch.device("cpu")
         self.transformer = _FakeMiniMaxH3Transformer()
         self.vae = SimpleNamespace(
             config=SimpleNamespace(latent_channels=2),

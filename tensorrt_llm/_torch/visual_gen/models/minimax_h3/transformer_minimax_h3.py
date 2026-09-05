@@ -28,6 +28,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
@@ -39,8 +40,6 @@ from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.quantization.mode import QuantAlgo
-
-from .modeling_utils import MiniMaxH3TimestepEmbedding, MiniMaxH3Timesteps
 
 MINIMAX_H3_MODALITY_NUM = 3
 MINIMAX_H3_VIDEO_TAG = 0
@@ -404,6 +403,13 @@ class MiniMaxH3TransformerBlock(nn.Module):
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
+# Only the vanilla and FA4 attention backends honour ``key_padding_mask``.  The
+# TRTLLM and CUTEDSL backends accept it through ``**kwargs`` and silently drop
+# it, which would corrupt results rather than fail, so padded packed sequences
+# have to be rejected up front.
+_KEY_PADDING_MASK_BACKENDS = frozenset({"VANILLA", "FA4"})
+
+
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     """MiniMax-H3's dense single-stream joint audio-video transformer.
 
@@ -419,6 +425,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "MiniMax-H3 initial support is TP=1 only. AdaLN tensor-parallel "
                 "sharding requires a model-specific gather contract."
             )
+        self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
+        self._supports_key_padding_mask = self._attn_backend in _KEY_PADDING_MASK_BACKENDS
         quant_algo = model_config.quant_config.quant_algo
         if quant_algo is not None and not (
             quant_algo == QuantAlgo.FP8 and model_config.dynamic_weight_quant
@@ -490,12 +498,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self.audio_proj_in = Linear(audio_in_channels, hidden_size, bias=True, **fp32_linear_kwargs)
         self.context_embedder = Linear(text_dim, hidden_size, bias=True, **bf16_linear_kwargs)
 
-        self.time_proj = MiniMaxH3Timesteps(
+        self.time_proj = Timesteps(
             num_channels=freq_dim,
             flip_sin_to_cos=True,
             downscale_freq_shift=0,
         )
-        self.time_embedder = MiniMaxH3TimestepEmbedding(
+        self.time_embedder = TimestepEmbedding(
             in_channels=freq_dim,
             time_embed_dim=time_embed_hidden_dim,
             out_dim=time_embed_dim,
@@ -647,6 +655,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
         key_padding_mask = None
         if bool((token_tags < 0).any()):
+            if not self._supports_key_padding_mask:
+                raise NotImplementedError(
+                    "Padded packed sequences (negative token_tags) need an attention "
+                    "backend that honours key_padding_mask; the "
+                    f"{self._attn_backend} backend ignores it. Use VANILLA or FA4."
+                )
             key_padding_mask = (
                 (token_tags >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
             )

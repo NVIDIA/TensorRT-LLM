@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+from diffusers import AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
@@ -32,9 +34,6 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, 
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
-from .autoencoder_kl_minimax_h3 import AutoencoderKLMiniMaxH3
-from .autoencoder_kl_minimax_h3_audio import AutoencoderKLMiniMaxH3Audio
-from .modeling_utils import MiniMaxH3DiagonalGaussianDistribution, minimax_h3_randn_tensor
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -60,7 +59,6 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
-from .scheduler import MiniMaxH3Scheduler
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 
@@ -248,9 +246,9 @@ class MiniMaxH3Pipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()
         if self.scheduler is not None:
-            self.scheduler.register_to_config(shift=self.VIDEO_SCHEDULER_SHIFT)
+            self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
         if self.audio_scheduler is not None:
-            self.audio_scheduler.register_to_config(shift=self.AUDIO_SCHEDULER_SHIFT)
+            self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
 
     def _load_request_keyframes(
         self,
@@ -477,8 +475,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             pixels = torch.from_numpy(np.array(image)).to(self.device)
             pixels = pixels.permute(2, 0, 1)[None, :, None]
             pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
-            moments = self.vae._encode_clip(pixels)
-            posterior = MiniMaxH3DiagonalGaussianDistribution(moments)
+            posterior = self.vae.encode(pixels).latent_dist
             encode_generator = torch.Generator().manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
             latents = posterior.sample(generator=encode_generator)
             latents = latents.to(torch.float16).float().cpu()
@@ -512,7 +509,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         generator: torch.Generator,
         condition_latents: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        latents = minimax_h3_randn_tensor(
+        latents = randn_tensor(
             (
                 1,
                 self.vae.config.latent_channels,
@@ -531,7 +528,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         if condition_latents is not None:
             video_rows = torch.cat((condition_latents, video_rows))
 
-        audio_rows = minimax_h3_randn_tensor(
+        audio_rows = randn_tensor(
             (
                 num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS,
                 self.audio_vae.config.latent_channels,

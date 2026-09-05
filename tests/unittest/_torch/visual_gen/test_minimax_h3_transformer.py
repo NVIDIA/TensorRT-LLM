@@ -39,6 +39,15 @@ except ImportError:
     HFMiniMaxH3Transformer3DModel = None
 
 
+# The transformer's forward pass runs TRT-LLM modules that dispatch to CUDA-only
+# kernels (notably RMSNorm -> flashinfer_rmsnorm), so any test that actually calls
+# forward has to run on a GPU.
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="MiniMax-H3 forward uses CUDA-only TRT-LLM kernels",
+)
+
+
 _TINY_CONFIG: dict[str, object] = {
     "num_attention_heads": 2,
     "attention_head_dim": 8,
@@ -106,11 +115,13 @@ def _initialize_weights(module: nn.Module, scale: float = 0.02) -> None:
             if "norm" in name and name.endswith("weight"):
                 parameter.fill_(1.0)
             else:
+                # Draw on CPU so the values stay identical regardless of the
+                # device the model lives on, then copy onto the parameter.
                 parameter.copy_(
                     torch.randn(
                         parameter.shape,
                         dtype=parameter.dtype,
-                        device=parameter.device,
+                        device="cpu",
                         generator=generator,
                     )
                     * scale
@@ -184,6 +195,7 @@ def test_post_load_preserves_dynamic_fp8_projection_weights() -> None:
     assert model.audio_proj_out.weight.dtype == torch.float8_e4m3fn
 
 
+@requires_cuda
 def test_transformer_keeps_dynamic_fp8_linear_inputs_high_precision() -> None:
     class _RecordingFP8Linear(nn.Module):
         def __init__(self, out_features: int, output_dtype: torch.dtype) -> None:
@@ -205,7 +217,7 @@ def test_transformer_keeps_dynamic_fp8_linear_inputs_high_precision() -> None:
                 device=hidden_states.device,
             )
 
-    model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_fp8_model_config())
+    model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_fp8_model_config()).to("cuda")
     spies = {
         "context_embedder": _RecordingFP8Linear(12, torch.bfloat16),
         "proj_in": _RecordingFP8Linear(12, torch.float32),
@@ -221,7 +233,7 @@ def test_transformer_keeps_dynamic_fp8_linear_inputs_high_precision() -> None:
     model.proj_out = spies["proj_out"]
     model.audio_proj_out = spies["audio_proj_out"]
 
-    model(**_model_inputs())
+    model(**_model_inputs("cuda"))
 
     assert all(
         input_dtype != torch.float8_e4m3fn
@@ -248,18 +260,18 @@ def _initialize_diffusers_golden_weights(module: nn.Module) -> None:
             offset += parameter.numel()
 
 
-def _diffusers_golden_inputs() -> dict[str, torch.Tensor]:
+def _diffusers_golden_inputs(device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
     return {
-        "hidden_states": torch.tensor([[[-0.75, -0.25], [0.25, 0.75]]]),
-        "audio_hidden_states": torch.tensor([[[-0.5, 0.125, 0.875]]]),
-        "encoder_hidden_states": torch.tensor([[[0.1, -0.2, 0.3, -0.4, 0.5]]]),
-        "timestep": torch.tensor([0.0, 0.75]),
-        "timestep_indices": torch.tensor([0, 1, 1, 0]),
-        "token_tags": torch.tensor([1, 0, 2, 0]),
-        "position_ids": torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]]),
-        "video_indices": torch.tensor([1, 3]),
-        "audio_indices": torch.tensor([2]),
-        "text_indices": torch.tensor([0]),
+        "hidden_states": torch.tensor([[[-0.75, -0.25], [0.25, 0.75]]], device=device),
+        "audio_hidden_states": torch.tensor([[[-0.5, 0.125, 0.875]]], device=device),
+        "encoder_hidden_states": torch.tensor([[[0.1, -0.2, 0.3, -0.4, 0.5]]], device=device),
+        "timestep": torch.tensor([0.0, 0.75], device=device),
+        "timestep_indices": torch.tensor([0, 1, 1, 0], device=device),
+        "token_tags": torch.tensor([1, 0, 2, 0], device=device),
+        "position_ids": torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]], device=device),
+        "video_indices": torch.tensor([1, 3], device=device),
+        "audio_indices": torch.tensor([2], device=device),
+        "text_indices": torch.tensor([0], device=device),
     }
 
 
@@ -379,7 +391,9 @@ def _reference_timestep_embedding(
     timestep: torch.Tensor,
 ) -> torch.Tensor:
     half_dim = model.config.freq_dim // 2
-    exponent = -torch.log(torch.tensor(10000.0)) * torch.arange(half_dim, dtype=torch.float32)
+    exponent = -torch.log(torch.tensor(10000.0, device=timestep.device)) * torch.arange(
+        half_dim, dtype=torch.float32, device=timestep.device
+    )
     frequencies = torch.exp(exponent / half_dim)
     sinusoidal = timestep[:, None].to(torch.float32) * frequencies[None, :]
     sinusoidal = torch.cat((sinusoidal.cos(), sinusoidal.sin()), dim=-1)
@@ -577,8 +591,9 @@ def test_transformer_blocks_flatten_tokens_for_trt_gated_mlp() -> None:
     )
 
 
+@requires_cuda
 def test_forward_builds_timestep_modality_adaln_indices() -> None:
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
     _initialize_weights(model)
 
     class _CaptureBlock(nn.Module):
@@ -601,16 +616,19 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
 
     capture_block = _CaptureBlock()
     model.transformer_blocks = nn.ModuleList([capture_block])
-    model(**_model_inputs())
+    model(**_model_inputs("cuda"))
 
     # row = timestep_index * 3 + modality_tag
-    torch.testing.assert_close(capture_block.adaln_indices, torch.tensor([1, 3, 5, 0]))
+    torch.testing.assert_close(
+        capture_block.adaln_indices, torch.tensor([1, 3, 5, 0], device="cuda")
+    )
 
 
+@requires_cuda
 def test_static_context_is_numerically_identical_to_uncached_path() -> None:
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
     _initialize_weights(model)
-    inputs = _model_inputs()
+    inputs = _model_inputs("cuda")
 
     uncached = model(**inputs)
     static_context = model.prepare_static_context(
@@ -628,6 +646,7 @@ def test_static_context_is_numerically_identical_to_uncached_path() -> None:
     torch.testing.assert_close(cached.audio_sample, uncached.audio_sample, rtol=0, atol=0)
 
 
+@requires_cuda
 def test_tiny_nonzero_layer_transformer_matches_cpu_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,9 +660,11 @@ def test_tiny_nonzero_layer_transformer_matches_cpu_reference(
         _cpu_swiglu,
     )
     torch.manual_seed(11)
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1, num_refiner_layers=1))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(num_layers=1, num_refiner_layers=1)
+    ).to("cuda")
     _initialize_weights(model, scale=0.1)
-    inputs = _model_inputs()
+    inputs = _model_inputs("cuda")
 
     expected_video, expected_audio = _reference_one_layer_forward(model, inputs)
     actual = model(**inputs)
@@ -657,6 +678,7 @@ def test_tiny_nonzero_layer_transformer_matches_cpu_reference(
     )
 
 
+@requires_cuda
 def test_transformer_block_is_fullgraph_compile_safe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -669,13 +691,15 @@ def test_transformer_block_is_fullgraph_compile_safe(
         "tensorrt_llm._torch.modules.gated_mlp.swiglu",
         _cpu_swiglu,
     )
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1))
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1)).to("cuda")
     _initialize_weights(model, scale=0.1)
     block = model.transformer_blocks[0].eval()
-    hidden_states = torch.randn(1, 4, 12, dtype=torch.bfloat16)
-    temb = torch.randn(2, 6, dtype=torch.bfloat16)
-    adaln_indices = torch.tensor([0, 1, 2, 3])
-    rotary_emb = model.rope(torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]]))
+    hidden_states = torch.randn(1, 4, 12, dtype=torch.bfloat16, device="cuda")
+    temb = torch.randn(2, 6, dtype=torch.bfloat16, device="cuda")
+    adaln_indices = torch.tensor([0, 1, 2, 3], device="cuda")
+    rotary_emb = model.rope(
+        torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]], device="cuda")
+    )
 
     try:
         expected = block(hidden_states, temb, adaln_indices, rotary_emb)
@@ -685,6 +709,36 @@ def test_transformer_block_is_fullgraph_compile_safe(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize(
+    ("backend", "supported"),
+    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
+)
+def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
+    config = _make_model_config()
+    config.attention = AttentionConfig(backend=backend)
+    model = h3.MiniMaxH3Transformer3DModel(config)
+
+    assert model._supports_key_padding_mask is supported
+
+
+@requires_cuda
+def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
+    """TRTLLM/CUTEDSL swallow key_padding_mask via **kwargs, so fail loudly instead."""
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    # A negative tag marks a padded row, which is what builds the mask.
+    inputs["token_tags"] = torch.tensor([1, 0, 2, -1], device="cuda")
+
+    # The VANILLA model honours the mask, so it runs.
+    model(**inputs)
+
+    model._supports_key_padding_mask = False
+    model._attn_backend = "TRTLLM"
+    with pytest.raises(NotImplementedError, match="key_padding_mask"):
+        model(**inputs)
 
 
 def test_released_checkpoint_mixed_dtype_contract() -> None:
@@ -857,6 +911,7 @@ def _copy_golden_parameters_to_hf(
                 reference_parameters[name].copy_(parameter)
 
 
+@requires_cuda
 def test_tiny_transformer_matches_pinned_diffusers_golden(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -871,12 +926,16 @@ def test_tiny_transformer_matches_pinned_diffusers_golden(
         "tensorrt_llm._torch.modules.gated_mlp.swiglu",
         _cpu_swiglu,
     )
-    model = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=1, num_refiner_layers=1))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(num_layers=1, num_refiner_layers=1)
+    ).to("cuda")
     _initialize_diffusers_golden_weights(model)
 
-    actual = model(**_diffusers_golden_inputs())
-    expected_video = torch.tensor([[[-0.1232801974, -0.1542745978], [-0.0780100822, 0.0215485524]]])
-    expected_audio = torch.tensor([[[0.1819977611, 0.1006751955, -0.1606836915]]])
+    actual = model(**_diffusers_golden_inputs("cuda"))
+    expected_video = torch.tensor(
+        [[[-0.1232801974, -0.1542745978], [-0.0780100822, 0.0215485524]]], device="cuda"
+    )
+    expected_audio = torch.tensor([[[0.1819977611, 0.1006751955, -0.1606836915]]], device="cuda")
 
     torch.testing.assert_close(actual.sample, expected_video, rtol=2e-2, atol=2e-3)
     torch.testing.assert_close(
