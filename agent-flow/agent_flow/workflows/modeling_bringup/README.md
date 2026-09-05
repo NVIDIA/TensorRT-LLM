@@ -207,6 +207,16 @@ what injects the Slurm/container prompt block into the agents. See
 
 All flags from the generic `agent-team` CLI are accepted as-is. See the
 [`agent_team` README](../agent_team/README.md#useful-flags) for their semantics.
+`--concurrent-review` overlaps the Reviewer with the next Coder iteration: it
+freezes `trtllm_repo_path` at a git ref after each Coder turn (or
+`review_snapshot_repo` / `--review-snapshot-repo` when the checkout the Coder
+edits is not the TensorRT-LLM one), so from then on **the Coder must do its
+work in a git worktree branched from that snapshot** and fold the commits back
+once the verdict notice arrives — the main checkout has to stay still while the
+Reviewer builds and runs it. Add optional `worktrees_dir` /
+`worktree_reservations` keys to name where those worktrees live. An
+uncommitted working tree at the end of a Coder turn falls back to a sequential
+review for that iteration.
 The workflow source lives in `agent_flow/workflows/modeling_bringup/`; import
 the bundle programmatically with
 `from agent_flow.workflows.modeling_bringup import MODELING_BRINGUP_PROMPTS`.
