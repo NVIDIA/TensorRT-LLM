@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -70,7 +71,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ResponseUsage,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
-                                                UCompletionResponse)
+                                                UCompletionResponse,
+                                                to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -103,6 +105,45 @@ CUSTOM_TOOL_INPUT_ARG = "input"
 def _responses_debug_log(msg):
     if ENABLE_RESPONSES_DEBUG_MSG:
         logger.info(msg)
+
+
+def _responses_debug_enabled() -> bool:
+    """Whether the caller should bother building a debug message.
+
+    ``_responses_debug_log`` drops the message, but its argument is evaluated
+    first. Callers whose argument costs real work - decoding a whole prompt,
+    for instance - must check this before constructing it.
+    """
+    return ENABLE_RESPONSES_DEBUG_MSG
+
+
+def _is_context_only(request: ResponsesRequest) -> bool:
+    """Whether this request is the context half of a disaggregated split.
+
+    Such a request comes from the orchestrator rather than a client, and its
+    response is consumed by the orchestrator alone.
+    """
+    params = getattr(request, "disaggregated_params", None)
+    return params is not None and params.request_type == "context_only"
+
+
+def _relayed_prompt_token_ids(request: ResponsesRequest) -> Optional[list[int]]:
+    """The already-tokenized prompt the orchestrator relayed, if any.
+
+    Returns None for an ordinary client request, which carries neither field
+    and must be rendered and tokenized here.
+    """
+    if request.prompt_token_ids is not None:
+        return request.prompt_token_ids
+    if not request.prompt_token_ids_b64:
+        return None
+    # int32 little-endian buffer, matching what the context worker encodes.
+    import numpy as np
+    decoded = np.frombuffer(base64.b64decode(request.prompt_token_ids_b64),
+                            dtype=np.int32).tolist()
+    # Cache it so a later reader does not decode a second time.
+    request.prompt_token_ids = decoded
+    return decoded
 
 
 _harmony_encoding = None
@@ -666,8 +707,16 @@ def finish_reason_mapping(finish_reason: str) -> str:
             return 'failed'
         case 'cancelled':
             return 'cancelled'
+        case 'not_finished':
+            # Reached on the context worker in disaggregated serving: it is
+            # capped at one token and hands the request off, so the engine
+            # reports that generation has not finished. "incomplete" is the
+            # closest public status, and the orchestrator does not read it -
+            # it reads the unmapped value off ResponsesResponse.finish_reason.
+            return 'incomplete'
 
-    raise RuntimeError("Should never reach here!")
+    raise RuntimeError(
+        f"Unhandled finish reason {finish_reason!r} in finish_reason_mapping")
 
 
 def _item_text(item: dict) -> str:
@@ -1177,7 +1226,16 @@ async def request_preprocess(
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
-    if use_harmony:
+    # In disaggregated serving the context worker has already rendered the chat
+    # template and tokenized; the orchestrator relays the result so the
+    # generation worker does not repeat that work on a prompt it is being
+    # handed verbatim. Rendering again would also be wrong, not just wasteful:
+    # a template that samples anything per-render could produce a prompt the
+    # context worker never prefilled, and the KV cache would not match.
+    pretokenized = _relayed_prompt_token_ids(request)
+    if pretokenized is not None:
+        input_tokens = pretokenized
+    elif use_harmony:
         input_tokens = await _create_input_tokens_harmony(
             request=request,
             prev_response=prev_response,
@@ -1198,9 +1256,13 @@ async def request_preprocess(
             processor=processor,
         )
 
-    _responses_debug_log("======= Complete Inputs to model =======")
-    _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
-    _responses_debug_log("========================================")
+    if _responses_debug_enabled():
+        # Guarded rather than passed straight to _responses_debug_log: decoding
+        # is a real tokenizer call on every request, and the argument would be
+        # evaluated whether or not debug logging is on.
+        _responses_debug_log("======= Complete Inputs to model =======")
+        _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
+        _responses_debug_log("========================================")
     add_thinking_budget_logits_processor(
         sampling_params,
         reasoning_parser=reasoning_parser,
@@ -1585,15 +1647,28 @@ def _create_response(
             request.tools,
             chat_template_kwargs=reasoning_chat_template_kwargs(request))
 
+    finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
         request=request,
         sampling_params=sampling_params,
         model_name=model_name,
         created_time=response_creation_time,
         output=output_content,
-        status=finish_reason_mapping(final_res.outputs[0].finish_reason),
+        status=finish_reason_mapping(finish_reason),
         usage=_create_usage(final_res, num_prompt_tokens),
     )
+    # Disaggregated serving. A context-only response is read by the
+    # orchestrator, never by a client: it carries the KV-cache handle, the
+    # first generated token and the tokenized prompt so a generation worker can
+    # pick the request up. Everything else - an aggregated server, or the
+    # generation response that does reach the client - leaves these unset.
+    # ctx_info_endpoint in particular names an internal address, and
+    # prompt_token_ids would add the whole prompt back to every reply.
+    if _is_context_only(request):
+        response.finish_reason = finish_reason
+        response.disaggregated_params = to_disaggregated_params(
+            final_res.outputs[0].disaggregated_params)
+        response.prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
 
     _responses_debug_log("========== Response ===========")
     _responses_debug_log(response)
@@ -2742,6 +2817,41 @@ class ResponseHooks(ABC):
 
 async def done_generator() -> AsyncGenerator[bytes, None]:
     yield "data: [DONE]\n\n".encode('utf-8')
+
+
+def _sse_event(event: StreamingResponsesResponse) -> bytes:
+    return (f"event: {event.type}\n"
+            f"data: {event.model_dump_json(indent=None)}\n\n").encode("utf-8")
+
+
+async def responses_done_generator(
+        response: ResponsesResponse) -> AsyncGenerator[bytes, None]:
+    """Stream an already-complete ResponsesResponse as a well-formed SSE run.
+
+    Used when a request finishes without ever reaching a generation worker.
+    The Responses protocol has no ``[DONE]`` sentinel - a client watches for
+    ``response.completed`` - so emitting the completions-style terminator here
+    would leave a streaming client waiting for an event that never arrives.
+    """
+    payload = response.model_dump()
+    yield _sse_event(
+        ResponseCreatedEvent(
+            type="response.created",
+            response=payload,
+            sequence_number=0,
+        ))
+    yield _sse_event(
+        ResponseInProgressEvent(
+            type="response.in_progress",
+            response=payload,
+            sequence_number=1,
+        ))
+    yield _sse_event(
+        ResponseCompletedEvent(
+            type="response.completed",
+            response=payload,
+            sequence_number=2,
+        ))
 
 
 UCompletionResponseOrGenerator = Union[UCompletionResponse,

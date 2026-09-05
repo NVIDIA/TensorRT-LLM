@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import json
 import signal
 import socket
 import traceback
@@ -44,8 +45,9 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, CompletionRequest, ResponsesRequest,
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -61,6 +63,27 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+def _worker_error_detail(exception: "aiohttp.ClientResponseError") -> str:
+    """The worker's own error message, unwrapped from the HTTP envelope.
+
+    A worker reports a rejection as an OpenAI-style error body. aiohttp folds
+    that into a ``message`` that reads
+    ``Bad Request: {"object":"error","message":"...","type":...}``. Handing the
+    whole envelope to the client buries the sentence that says what to change,
+    so pull the inner message back out when it is there.
+    """
+    raw = exception.message or ""
+    start = raw.find("{")
+    if start != -1:
+        try:
+            body = json.loads(raw[start:])
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("message"):
+            return str(body["message"])
+    return raw or f"Worker returned HTTP {exception.status}"
+
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -265,6 +288,7 @@ class OpenAIDisaggServer:
         # so /health and /cluster_info hook straight to self._coordinator.
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -364,6 +388,21 @@ class OpenAIDisaggServer:
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
             raise exception
+        elif (isinstance(exception, aiohttp.ClientResponseError)
+              and 400 <= exception.status < 500):
+            # A worker rejected the request itself - an unsupported tool, a bad
+            # parameter. That verdict is about the client's request and would
+            # be identical on any worker, so relaying it as a 500 both blames
+            # the server for the client's input and throws away the one thing
+            # that makes a 4xx useful: the reason. Clients retry a 500, which
+            # cannot succeed, and Codex spends its retry budget before
+            # reporting a generic failure.
+            self._perf_metrics_collector.http_exceptions.inc()
+            logger.error(
+                f"Worker rejected the request with {exception.status}: {exception.message}"
+            )
+            raise HTTPException(status_code=exception.status,
+                                detail=_worker_error_detail(exception))
         else:
             self._perf_metrics_collector.internal_errors.inc()
             logger.error("Internal server error: ", traceback.format_exc())

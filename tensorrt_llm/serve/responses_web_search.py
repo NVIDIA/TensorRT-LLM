@@ -86,6 +86,43 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
     return None
 
 
+def _external_access_flag(tools: Optional[Sequence[Any]]) -> Any:
+    """The tool's ``external_web_access`` as it survived request validation.
+
+    Returns the sentinel string "absent" when the field is not there at all,
+    which is a different situation from an explicit True: a client that never
+    set it may simply be using an older tool shape. Reported in the rejection
+    message because it is the field the decision turns on, and it is otherwise
+    invisible to whoever has to act on the error.
+    """
+    for tool in tools or []:
+        if not is_web_search_tool(tool):
+            continue
+        if isinstance(tool, dict):
+            return tool.get("external_web_access", "absent")
+        return getattr(tool, "external_web_access", "absent")
+    return "absent"
+
+
+def _wants_external_search(tools: Optional[Sequence[Any]]) -> bool:
+    """Whether the client is actually asking for live external searches.
+
+    The tool carries ``external_web_access``. A client that sets it to False is
+    declaring up front that it does not want the server reaching the open web,
+    so there is no live result for the server to fail to deliver and nothing
+    the client could be misled about. Absent or True means the ordinary
+    "search the web for me" request.
+    """
+    for tool in tools or []:
+        if not is_web_search_tool(tool):
+            continue
+        external = getattr(tool, "external_web_access", None)
+        if external is None and isinstance(tool, dict):
+            external = tool.get("external_web_access")
+        return external is not False
+    return False
+
+
 def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]:
     """Why this request's web_search tool cannot be honoured, or None.
 
@@ -96,7 +133,22 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
     the model never searched. Rejecting is recoverable (drop the tool and
     retry); a silently unsearched answer is not.
     """
-    if web_search_tool_spec(tools) is None:
+    spec = web_search_tool_spec(tools)
+    if spec is None:
+        return None
+    # Name the tool that triggered this. A bare "'web_search' cannot be
+    # honoured" leaves the operator guessing which of the client's tools it
+    # means and what shape it arrived in, and the tool is one a client often
+    # attaches implicitly rather than on purpose.
+    seen = f" (tool type {spec.type!r}, external_web_access={_external_access_flag(tools)!r})"
+    if not _wants_external_search(tools):
+        # The client attached the tool with external access explicitly off, so
+        # it is not waiting on live results and cannot be misled by their
+        # absence. Codex sends exactly this - {"type": "web_search",
+        # "external_web_access": false} - when its model catalog says the model
+        # has no search tool; refusing that costs the client the whole server
+        # over a search it never asked for. A client that leaves the flag on is
+        # asking for live search and still gets a loud failure below.
         return None
     if load_web_search_config().enabled:
         # A provider is configured, so the operator does expect live search,
@@ -104,9 +156,9 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
         # the pieces live here and in web_search.py without a driver.
         return (
             "a provider is configured but the per-request search loop is "
-            "not wired into this endpoint yet"
+            f"not wired into this endpoint yet{seen}"
         )
-    return "no web search provider is configured on this server"
+    return f"no web search provider is configured on this server{seen}"
 
 
 def server_executes_web_search(tools: Optional[Sequence[Any]]) -> bool:

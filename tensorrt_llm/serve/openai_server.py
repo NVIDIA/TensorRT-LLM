@@ -2905,10 +2905,21 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.stream else responses_api_post_processor,
                 postproc_args=postproc_args,
             )
+            # Disaggregated serving. The signature check has to happen before
+            # the params reach the engine: encoded_opaque_state and
+            # ctx_info_endpoint name a peer this worker will pull KV cache
+            # from, so an unsigned request could redirect that fetch.
+            self._validate_internal_disagg_request(request, raw_request)
+            disaggregated_params = to_llm_disaggregated_params(
+                request.disaggregated_params)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             promise = self.generator.generate_async(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
@@ -2931,6 +2942,19 @@ class OpenAIServer(_VideoRoutesMixin):
                                          media_type="text/event-stream")
             else:
                 response = await create_response(promise, postproc_params)
+                # Context-only: hand the tokenized prompt back as a base64
+                # int32 buffer when the orchestrator asked for one, so it
+                # relays a single string rather than materializing the int
+                # list on its event loop. Encoding runs here, on one of N
+                # context workers, instead of on the single orchestrator.
+                if (request.disaggregated_params is not None and
+                        request.disaggregated_params.return_prompt_token_ids_b64
+                        and response.prompt_token_ids is not None):
+                    import numpy as np
+                    response.prompt_token_ids_b64 = base64.b64encode(
+                        np.asarray(response.prompt_token_ids,
+                                   dtype=np.int32).tobytes()).decode("ascii")
+                    response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
