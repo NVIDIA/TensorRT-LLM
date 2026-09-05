@@ -219,6 +219,41 @@ class TestFlashInferAttention(unittest.TestCase):
                 flashinfer_backend="trtllm-gen",
             )
 
+    def test_cuda_graph_metadata_owns_a_private_plan_cache(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=4,
+            max_num_tokens=16,
+        )
+        plan_params = PlanParams(
+            num_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            attention_mask_type=AttentionMaskType.causal,
+        )
+        eager_wrappers = FlashInferWrappers(is_planned=True)
+        metadata._plan_params_to_wrappers[plan_params] = eager_wrappers
+
+        graph_metadata = metadata.create_cuda_graph_metadata(2)
+
+        # Wrappers belong to a metadata instance, and the runner builds one metadata per captured
+        # batch size. That partitioning keeps ordinary single-token graph wrappers isolated even
+        # though their PlanParams reuse the same zero generation count.
+        self.assertTrue(graph_metadata.is_cuda_graph)
+        self.assertIsNot(graph_metadata._plan_params_to_wrappers,
+                         metadata._plan_params_to_wrappers)
+        self.assertEqual(graph_metadata._plan_params_to_wrappers, {})
+        self.assertIs(metadata._plan_params_to_wrappers[plan_params],
+                      eager_wrappers)
+
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
