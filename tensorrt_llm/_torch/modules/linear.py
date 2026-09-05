@@ -532,15 +532,16 @@ class LinearMethodBase(ABC):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method for unquantized (BF16 / FP16 / FP32) weights.
 
-    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103)
-    ----------------------------------------------------------
+    BF16 GEMM dispatch (priority order, Blackwell SM100/SM103 and SM107)
+    -------------------------------------------------------------------
     1. **low-m GEMM** (``TRTLLM_LOW_M_GEMM_BACKEND=auto``, M ≤ 32)
        CuTe-DSL low-m GEMM kernel for small-M decode batches on Blackwell.
        Orthogonal to ``use_cute_dsl_bf16_gemm`` — must be enabled
        independently via the env var.
 
     2. **persistent GEMM** (``Linear(use_cute_dsl_bf16_gemm=True)``)
-       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel.
+       ``trtllm::cute_dsl_bf16_gemm_blackwell`` persistent CuTe-DSL kernel;
+       ``trtllm::cute_dsl_bf16_gemm_rubin`` on SM107.
 
     3. **cublas_mm** (``Linear(use_custom_cublas_mm=True)``)
        ``trtllm::cublas_mm``; use when TP AllReduce fuse via NCCL
@@ -586,7 +587,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             output = apply_low_m_gemm(module, input, module.weight, bias)
             if output is not None:
                 return output
-        # CuTe DSL BF16 GEMM path for Blackwell
+        # CuTe DSL BF16 GEMM path for Blackwell / SM107
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
             # input: [*, K], weight: [N, K], output: [*, N]
@@ -597,7 +598,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                                  n,
                                  dtype=torch.bfloat16,
                                  device=input.device)
-            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+            bf16_gemm_op = (torch.ops.trtllm.cute_dsl_bf16_gemm_rubin
+                            if get_sm_version() == 107 else
+                            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
+            bf16_gemm_op(
                 input_2d.contiguous(),
                 module.weight,
                 output,

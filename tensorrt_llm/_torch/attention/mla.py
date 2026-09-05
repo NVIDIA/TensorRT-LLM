@@ -1402,9 +1402,14 @@ class MLA(nn.Module):
         )
 
     def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
-        """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
+        """BMM with optional CuTe DSL bf16 acceleration on Blackwell/SM107."""
         if self.use_cute_dsl_bf16_bmm and is_sm_100f():
-            torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(a, b_no_transpose, output)
+            bf16_bmm_op = (
+                torch.ops.trtllm.cute_dsl_bf16_bmm_rubin
+                if get_sm_version() == 107
+                else torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell
+            )
+            bf16_bmm_op(a, b_no_transpose, output)
         else:
             torch.ops.trtllm.bmm_out(a, b_transposed, output)
 
