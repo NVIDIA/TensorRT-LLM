@@ -173,6 +173,7 @@ class FallbackFmha(Fmha):
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
             sage_attn_qk_int8=forward_args.sage_attn_qk_int8,
+            sage_attn_smooth_k=forward_args.sage_attn_smooth_k,
             is_fused_qkv=forward_args.is_fused_qkv,
             update_kv_cache=forward_args.update_kv_cache,
             cross_kv=forward_args.cross_kv,

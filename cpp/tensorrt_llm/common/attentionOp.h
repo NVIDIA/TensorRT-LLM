@@ -430,6 +430,22 @@ public:
         return useSparseMLA() || (mUseSparseAttention && mUseTllmGen && mUseTllmGenSparseAttention);
     }
 
+    [[nodiscard]] bool sageAttnRequested() const
+    {
+        return mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0;
+    }
+
+    [[nodiscard]] bool useSageAttn() const
+    {
+        return sageAttnRequested() && mFP8ContextFMHA && !mIsMLAEnabled && !useKVCache();
+    }
+
+    [[nodiscard]] bool useHopperSageAttn() const
+    {
+        return useSageAttn() && mSM == kernels::kSM_90 && mSageAttnQkInt8 && mSageAttnNumEltsPerBlkQ == 2
+            && mSageAttnNumEltsPerBlkK == 16 && mSageAttnNumEltsPerBlkV == 1;
+    }
+
     [[nodiscard]] int smVersion() const
     {
         return mSM;
@@ -561,12 +577,12 @@ public:
     float mSkipSoftmaxThresholdScaleFactorDecode = 0;
     // Skip correction when the row-max increase is within this base-2 threshold.
     float mSkipCorrectionThreshold = 0;
-    // Optional SageAttention block sizes.
-    // Currently, these are only consumed by the TllmGen backend path.
+    // Optional SageAttention block sizes, in tokens per scale for q/k and channels per scale for v.
     int mSageAttnNumEltsPerBlkQ = 0;
     int mSageAttnNumEltsPerBlkK = 0;
     int mSageAttnNumEltsPerBlkV = 0;
     bool mSageAttnQkInt8 = false;
+    bool mSageAttnSmoothK = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -592,7 +608,7 @@ public:
             mSkipAttn, mFuseFp4Quant, mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores,
             mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSkipCorrectionThreshold, mSageAttnNumEltsPerBlkQ,
-            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8, mSageAttnSmoothK);
     };
 
 private:

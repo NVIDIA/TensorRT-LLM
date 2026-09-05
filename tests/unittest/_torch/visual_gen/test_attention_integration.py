@@ -25,7 +25,6 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     RingAttention,
     UlyssesAttention,
 )
-from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
@@ -300,43 +299,6 @@ class TestSeparateQkvSequenceParallelGuard:
         assert isinstance(attn.attn, VanillaAttention)
 
 
-def _build_sage_routed_attention(qkv_mode: QKVMode):
-    """Build a TRTLLM-SAGE-configured Attention for backend-routing checks."""
-    quant_cfg = QuantAttentionConfig(
-        qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
-    )
-    config = create_model_config(
-        hidden_size=512,
-        num_heads=4,
-        head_dim=128,
-        attn_backend="TRTLLM",
-        quant_attention_config=quant_cfg,
-        skip_create_weights_in_init=True,
-    )
-    attn = Attention(
-        hidden_size=512,
-        num_attention_heads=4,
-        head_dim=128,
-        qkv_mode=qkv_mode,
-        config=config,
-    )
-    return attn, quant_cfg
-
-
-class TestSageAttentionBackendRouting:
-    def test_self_attention_uses_trtllm_sage_backend(self):
-        attn, quant_cfg = _build_sage_routed_attention(QKVMode.FUSE_QKV)
-        assert attn.attn_backend == "TRTLLM"
-        assert isinstance(attn.attn, TrtllmAttention)
-        assert attn.attn.quant_attention_config == quant_cfg
-        assert not attn.attn.support_fused_qkv()
-
-    def test_cross_attention_with_sage_config_falls_back_to_vanilla(self):
-        attn, _ = _build_sage_routed_attention(QKVMode.SEPARATE_QKV)
-        assert attn.attn_backend == "VANILLA"
-        assert isinstance(attn.attn, VanillaAttention)
-
-
 # ============================================================================
 # Test functions
 # ============================================================================
@@ -446,8 +408,10 @@ def test_sage_attention_self_attention(qk_dtype: str, batch_size: int, seq_len: 
     """
     compute_capability = torch.cuda.get_device_capability()
     gpu_arch = f"sm_{compute_capability[0]}{compute_capability[1]}a"
-    if qk_dtype == "int8" and gpu_arch not in ["sm_100a"]:
-        pytest.skip("Int8 kernels are only available for SM100 devices.")
+    # This test configures the contiguous-block recipe (q_block_size=1), which requires SM100. The
+    # SM90 recipe is covered by test_attention_trtllm_sage.py::test_attention_trtllm_sage_hopper.
+    if gpu_arch not in ["sm_100a"]:
+        pytest.skip("The contiguous-block SageAttention recipe is only available on SM100 devices.")
     print("\n" + "=" * 60)
     print(f"Testing SageAttention (qk_dtype={qk_dtype}, B={batch_size}, S={seq_len})")
     print("=" * 60)

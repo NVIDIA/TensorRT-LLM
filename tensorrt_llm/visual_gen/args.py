@@ -86,6 +86,14 @@ class QuantAttentionConfig(StrictBaseModel):
             "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
         ),
     )
+    smooth_k: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Subtract the per-channel K mean before quantizing K, which narrows the range the "
+            "quantized type has to cover. SageAttention only."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -123,14 +131,24 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
+        # SAGE supports different recipes for different architectures.
         SAGE_RECIPES = {
-            ("int8", "fp8", (1, 1, 1)),
-            ("int8", "fp8", (1, 4, 1)),
-            ("int8", "fp8", (1, 16, 1)),
-            ("fp8", "fp8", (1, 1, 1)),
-            ("fp8", "fp8", (1, 4, 1)),
+            90: {
+                ("int8", "fp8", (2, 16, 1)),
+            },
+            100: {
+                ("int8", "fp8", (1, 1, 1)),
+                ("int8", "fp8", (1, 4, 1)),
+                ("int8", "fp8", (1, 16, 1)),
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
+            103: {
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+            },
         }
+        # Other recipes verify the hardware at corresponding backend implementations.
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
@@ -149,20 +167,18 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe in SAGE_RECIPES:
-                # int8 Q/K SAGE has a compiled cubin only on SM100.
-                if q_config.qk_dtype == "int8" and get_sm_version() != 100:
-                    raise ValueError(
-                        f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
-                        f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
-                    )
-            else:
+            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes "
-                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
-                    f"{sorted(SAGE_RECIPES)}."
+                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
+                    f"{sorted(recipes)}."
                 )
+        elif q_config.smooth_k:
+            raise ValueError(
+                f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
+                f"backend='{self.backend}'."
+            )
         elif self.backend == "CUTEDSL":
             if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(

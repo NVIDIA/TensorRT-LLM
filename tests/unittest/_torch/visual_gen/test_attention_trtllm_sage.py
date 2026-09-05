@@ -60,7 +60,9 @@ def _test_attention_trtllm_sage(
     amp_mul_v: Optional[float] = None,
     skip_softmax: bool = False,
     sage_attn_qk_int8: bool = False,
+    sage_attn_num_elts_per_blk_q: int = 1,
     sage_attn_num_elts_per_blk_k: Optional[int] = None,
+    sage_attn_smooth_k: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tuple[torch.Tensor, torch.Tensor, float, float, float]:
     torch.manual_seed(1234)
@@ -121,15 +123,17 @@ def _test_attention_trtllm_sage(
         "attention_mask": mask_type,
     }
 
-    # SageAttention separate-QKV requires these block sizes.
+    # Which block sizes are legal depends on the GPU: SM100 scales contiguous token blocks, SM90
+    # only accepts (q, k, v) = (2, 16, 1).
     if sage_attn_num_elts_per_blk_k is None:
         sage_attn_num_elts_per_blk_k = 16 if sage_attn_qk_int8 else 1
     attn_kwargs.update(
         {
-            "sage_attn_num_elts_per_blk_q": 1,
+            "sage_attn_num_elts_per_blk_q": sage_attn_num_elts_per_blk_q,
             "sage_attn_num_elts_per_blk_k": sage_attn_num_elts_per_blk_k,
             "sage_attn_num_elts_per_blk_v": 1,
             "sage_attn_qk_int8": sage_attn_qk_int8,
+            "sage_attn_smooth_k": sage_attn_smooth_k,
         }
     )
 
@@ -170,8 +174,9 @@ def _test_attention_trtllm_sage(
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("gqa_groups", [1, 2, 4])
 @pytest.mark.parametrize("num_heads", [4, 12, 16])
-@pytest.mark.parametrize("seq_len", [128, 256, 1024, 8192])
+@pytest.mark.parametrize("seq_len", [128, 256, 1000, 8192])
 @pytest.mark.parametrize("skip_softmax", [False, True])
+@pytest.mark.parametrize("sage_attn_smooth_k", [False, True])
 @pytest.mark.parametrize(
     "out_dtype,sage_attn_qk_int8,sage_attn_num_elts_per_blk_k,atol,rtol",
     [
@@ -189,6 +194,7 @@ def test_attention_trtllm_sage(
     out_dtype: torch.dtype,
     skip_softmax: bool,
     sage_attn_qk_int8: bool,
+    sage_attn_smooth_k: bool,
     sage_attn_num_elts_per_blk_k: int,
     atol: float,
     rtol: float,
@@ -205,6 +211,7 @@ def test_attention_trtllm_sage(
         amp_mul=3.2,
         skip_softmax=skip_softmax,
         sage_attn_qk_int8=sage_attn_qk_int8,
+        sage_attn_smooth_k=sage_attn_smooth_k,
         sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
         out_dtype=out_dtype,
     )
@@ -221,3 +228,52 @@ def test_attention_trtllm_sage(
 
     assert cos_sim > 0.990, f"Cosine similarity {cos_sim:.6f} below threshold"
     torch.testing.assert_close(out_tllm, out_native, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TRTLLM attention.")
+@pytest.mark.skipif(
+    _cuda_cc()[0] != 9, reason="Hopper SageAttention test requires CUDA major version 9."
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("gqa_groups", [1, 2])
+@pytest.mark.parametrize("num_heads", [4, 16])
+@pytest.mark.parametrize("seq_len", [128, 256, 1000, 8192])
+@pytest.mark.parametrize("sage_attn_smooth_k", [False, True])
+def test_attention_trtllm_sage_hopper(
+    seq_len: int,
+    num_heads: int,
+    gqa_groups: int,
+    batch_size: int,
+    sage_attn_smooth_k: bool,
+):
+    """SageAttention on SM90.
+
+    That kernel accepts one configuration: (q, k, v) = (2, 16, 1) with INT8 Q/K and head_dim 128.
+    """
+    out_tllm, out_native, max_abs, mean_abs, cos_sim = _test_attention_trtllm_sage(
+        num_heads=num_heads,
+        num_kv_heads=num_heads // gqa_groups,
+        head_dim=128,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        amp_mul=3.2,
+        skip_softmax=False,
+        sage_attn_qk_int8=True,
+        sage_attn_smooth_k=sage_attn_smooth_k,
+        sage_attn_num_elts_per_blk_q=2,
+        sage_attn_num_elts_per_blk_k=16,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert out_tllm.shape == out_native.shape, "Shape mismatch"
+    assert torch.isfinite(out_native).all(), "Inf / NaN detected in Torch SDPA"
+    assert torch.isfinite(out_tllm).all(), "Inf / NaN detected in TRTLLM attention"
+
+    print("\nResults:")
+    print(f"  Output shape: {out_tllm.shape}")
+    print(f"  Max absolute difference: {max_abs:.6f}")
+    print(f"  Mean absolute difference: {mean_abs:.6f}")
+    print(f"  Cosine similarity: {cos_sim:.6f}")
+
+    assert cos_sim > 0.990, f"Cosine similarity {cos_sim:.6f} below threshold"
+    torch.testing.assert_close(out_tllm, out_native, atol=5e-1, rtol=5e-1)

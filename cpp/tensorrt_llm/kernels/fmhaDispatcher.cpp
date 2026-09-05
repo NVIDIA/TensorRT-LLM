@@ -68,6 +68,14 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     }
     else
     {
+        // SageAttention sets different QK/V datatypes. Unlike trtllmGen, the fmha_v2 kernelMetaInfo
+        // carries one input datatype. Collapse pair to the composite type where it's registered.
+        if (mFixedParams.dataType == DATA_TYPE_INT8 && mFixedParams.dataTypeKv == DATA_TYPE_KV_INT8_E4M3)
+        {
+            mFixedParams.dataType = DATA_TYPE_KV_INT8_E4M3;
+            fixedParams.dataType = DATA_TYPE_KV_INT8_E4M3;
+        }
+
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
             "KV cache data type %s is not the same as input data type %s.",
             data_type_to_string(mFixedParams.dataTypeKv).c_str(), data_type_to_string(mFixedParams.dataType).c_str());
@@ -152,6 +160,26 @@ bool FmhaDispatcher::isSupported()
     }
     else
     {
+        if (mFixedParams.sageBlockSizeQ > 0 || mFixedParams.sageBlockSizeK > 0 || mFixedParams.sageBlockSizeV > 0)
+        {
+            // This backend implements SageAttention on SM90 only, with one kernel, for block
+            // sizes (2, 16, 1) and separate Q/K/V.
+            int const sm = tensorrt_llm::common::getSMVersion();
+            if (sm != kSM_90)
+            {
+                TLLM_LOG_WARNING("fmha_v2 implements SageAttention on SM90 only, got sm_%d.", sm);
+                return false;
+            }
+            if (mFixedParams.sageBlockSizeQ != 2 || mFixedParams.sageBlockSizeK != 16
+                || mFixedParams.sageBlockSizeV != 1)
+            {
+                TLLM_LOG_WARNING(
+                    "SageAttention on SM90 supports exactly one block-size combination, (q, k, v) = (2, 16, 1), "
+                    "got (%d, %d, %d).",
+                    mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, mFixedParams.sageBlockSizeV);
+                return false;
+            }
+        }
         foundKernels = mFMHARunner->isFmhaSupported();
     }
     if (!foundKernels)

@@ -958,6 +958,7 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
 
     is_fused_qkv: bool = False
     update_kv_cache: bool = True

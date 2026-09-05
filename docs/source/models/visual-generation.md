@@ -216,7 +216,9 @@ By default, `strict=True` raises when adapter tensors cannot be matched, have un
 In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
 
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
-- **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
+- **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3). Supported recipes are validated at runtime, and which ones exist depends on the GPU:
+  - Blackwell (`sm_100a` / `sm_103a`) scales runs of contiguous tokens, so the block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints).
+  - Hopper (`sm_90a`) scales the tokens each thread owns, so `(q, k, v) = (2, 16, 1)` with `qk_dtype='int8'` is the only supported recipe, and `head_dim` must be 128.
 
 
 Python API for SageAttention:

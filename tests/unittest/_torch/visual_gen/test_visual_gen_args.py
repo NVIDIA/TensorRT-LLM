@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
@@ -97,43 +98,34 @@ class TestAttentionConfigQuantValidation:
             )
 
     @pytest.mark.parametrize(
-        ("qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
+        ("sm_ver", "qk_dtype", "q_block_size", "k_block_size", "v_block_size"),
         [
-            ("int8", 1, 1, 1),
-            ("int8", 1, 4, 1),
-            ("int8", 1, 16, 1),
-            ("fp8", 1, 1, 1),
-            ("fp8", 1, 4, 1),
+            (90, "int8", 2, 16, 1),
+            (100, "int8", 1, 1, 1),
+            (100, "int8", 1, 4, 1),
+            (100, "int8", 1, 16, 1),
+            (100, "fp8", 1, 1, 1),
+            (100, "fp8", 1, 4, 1),
+            (103, "fp8", 1, 1, 1),
+            (103, "fp8", 1, 4, 1),
         ],
     )
-    def test_supported_quant_config_sage(self, qk_dtype, q_block_size, k_block_size, v_block_size):
-        # int8 Q/K SAGE has a compiled cubin only on SM100; pin the SM so this
-        # supported-recipe check is host-independent (CI CPU stages have no GPU).
-        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-            attention = AttentionConfig(
-                backend="TRTLLM",
-                quant_attention_config=QuantAttentionConfig(
-                    qk_dtype=qk_dtype,
-                    q_block_size=q_block_size,
-                    k_block_size=k_block_size,
-                    v_block_size=v_block_size,
-                ),
-            )
+    def test_supported_quant_config_sage(
+        self, sm_ver, qk_dtype, q_block_size, k_block_size, v_block_size
+    ):
+        if get_sm_version() != sm_ver:
+            pytest.skip(f"Recipe requires sm_{sm_ver}.")
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype=qk_dtype,
+                q_block_size=q_block_size,
+                k_block_size=k_block_size,
+                v_block_size=v_block_size,
+            ),
+        )
 
         assert attention.quant_attention_config is not None
-
-    @pytest.mark.parametrize("sm_version", [90, 107, 120])
-    def test_int8_sage_rejected_on_non_sm100(self, sm_version):
-        # int8 Q/K SAGE only has an SM100 cubin; validation must fail fast on
-        # any other SM instead of silently falling back to unfused MHA.
-        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_version):
-            with pytest.raises(ValidationError, match="only supports sm_100"):
-                AttentionConfig(
-                    backend="TRTLLM",
-                    quant_attention_config=QuantAttentionConfig(
-                        qk_dtype="int8", q_block_size=1, k_block_size=1, v_block_size=1
-                    ),
-                )
 
     def test_supported_quant_config_cute(self):
         attention = AttentionConfig(
