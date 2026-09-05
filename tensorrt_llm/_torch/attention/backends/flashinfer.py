@@ -44,6 +44,7 @@ from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
+                        log_attention_failure_context,
                         merge_attention_forward_args)
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
@@ -2697,16 +2698,24 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        self.forward_impl(
-            q=q,
-            k=k,
-            v=v,
-            metadata=metadata,
-            attention_mask_type=attention_mask_type,
-            attention_mask_data=attention_mask_data,
-            attention_window_size=attention_window_size,
-            output=output,
-            latent_cache=latent_cache,
-            attention_input_type=forward_args.attention_input_type,
-        )
+        try:
+            self.forward_impl(
+                q=q,
+                k=k,
+                v=v,
+                metadata=metadata,
+                attention_mask_type=attention_mask_type,
+                attention_mask_data=attention_mask_data,
+                attention_window_size=attention_window_size,
+                output=output,
+                latent_cache=latent_cache,
+                attention_input_type=forward_args.attention_input_type,
+            )
+        except RuntimeError as exc:
+            # Report the TRTLLM-convention (exclusive) window, not the
+            # decremented FlashInfer one, so both backends log the same number.
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
         return output
