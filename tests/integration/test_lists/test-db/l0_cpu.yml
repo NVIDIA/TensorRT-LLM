@@ -37,6 +37,7 @@ l0_cpu:
   # tests/unittest/conftest.py drops every file without a pytest.mark.cpu_only when the stage
   # runs -m cpu_only, so this entry contributes only the 3 marked files under attention/.
   - unittest/_torch/attention
+  - unittest/_torch/custom_ops/test_fast_custom_op.py
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
   - unittest/_torch/executor

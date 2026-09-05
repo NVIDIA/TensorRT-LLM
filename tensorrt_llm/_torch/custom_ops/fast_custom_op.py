@@ -30,17 +30,46 @@ Caveats (inherited from using the low-level API):
 * ``mutates_args`` must be a concrete tuple; ``"unknown"`` auto-functionalization
   is not supported.
 * ``device_types`` defaults to ``"CUDA"``. Pass a different string or a tuple
-  of strings to register on other backends.
+  of strings to register on other backends, or ``None`` to register a single
+  backend-agnostic kernel (``CompositeExplicitAutograd``), which is what
+  ``@torch.library.custom_op`` does when ``device_types`` is omitted.
+* **The per-call aliasing/mutation validation that ``@custom_op`` performs is
+  gone.** ``@custom_op`` raises at runtime if an op returns a tensor that
+  aliases an input without declaring it; the low-level API does not check, so
+  the same bug silently corrupts the aliased input instead. Set
+  ``TLLM_VALIDATE_CUSTOM_OPS=1`` to make every ``fast_custom_op`` fall back to
+  ``@torch.library.custom_op`` and restore those checks — CI runs at least one
+  stage with the flag set so the checks still guard every op.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Tuple, Union
+import os
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 import torch
 from torch.library import Library, infer_schema, register_fake
 
 _LIBS: dict[tuple[str, str], Library] = {}
+
+# When set, `fast_custom_op` degrades to `@torch.library.custom_op` so the
+# schema/aliasing validation it performs on every call is back in force. Meant
+# for CI and for bisecting a suspected miscompare down to this decorator; it
+# reintroduces the per-call dispatcher tax, so never set it in production.
+VALIDATE_CUSTOM_OPS: bool = os.getenv("TLLM_VALIDATE_CUSTOM_OPS", "0") == "1"
+
+
+def _dispatch_key_for_device(device_type: str) -> str:
+    """Map a device type ("cuda") to a dispatch key ("CUDA").
+
+    ``Library.impl`` only accepts dispatch keys, while ``custom_op`` accepts
+    device types. Both spellings are common in the tree, so accept either.
+    """
+    try:
+        return torch._C._dispatch_key_for_device(device_type)
+    except (AttributeError, RuntimeError):
+        # Already a dispatch key ("CUDA", "CompositeExplicitAutograd", ...).
+        return device_type
 
 
 def _get_library(namespace: str, kind: str = "FRAGMENT") -> Library:
@@ -56,7 +85,7 @@ def fast_custom_op(
     qualname: str,
     *,
     mutates_args: Union[Iterable[str], str] = (),
-    device_types: Union[str, Tuple[str, ...]] = "CUDA",
+    device_types: Optional[Union[str, Tuple[str, ...]]] = "CUDA",
 ) -> Callable[[Callable], "FastCustomOp"]:
     """Register a Python function as a fast custom torch op.
 
@@ -65,6 +94,14 @@ def fast_custom_op(
       mutates_args: names of arguments that are mutated in-place; empty tuple
         means the op is pure.
       device_types: backend(s) to register the impl on (default ``"CUDA"``).
+        ``None`` registers one backend-agnostic kernel, matching what
+        ``@torch.library.custom_op`` does when ``device_types`` is omitted —
+        use it when porting such an op so its set of supported devices does
+        not silently narrow.
+
+    With ``TLLM_VALIDATE_CUSTOM_OPS=1`` this returns a plain
+    ``@torch.library.custom_op`` instead, restoring the per-call schema and
+    aliasing validation at the cost of the dispatcher tax.
     """
     if "::" not in qualname:
         raise ValueError(f"qualname must be '<ns>::<name>', got {qualname!r}")
@@ -74,7 +111,21 @@ def fast_custom_op(
         raise TypeError("mutates_args must be an iterable of names or 'unknown'")
     mutates_args_tuple = mutates_args if isinstance(mutates_args, str) else tuple(mutates_args)
 
-    dev_types = (device_types,) if isinstance(device_types, str) else tuple(device_types)
+    if VALIDATE_CUSTOM_OPS:
+        return torch.library.custom_op(
+            qualname, mutates_args=mutates_args_tuple, device_types=device_types
+        )
+
+    if device_types is None:
+        # `custom_op` registers a device-agnostic kernel when device_types is
+        # omitted; CompositeExplicitAutograd is the low-level equivalent.
+        dev_types: Tuple[str, ...] = ("CompositeExplicitAutograd",)
+    else:
+        names = (device_types,) if isinstance(device_types, str) else tuple(device_types)
+        # `Library.impl` wants a dispatch key ("CUDA"), while `custom_op` takes
+        # a device type ("cuda"). Normalize the same way `custom_op` does so
+        # both spellings work and porting an op cannot break on the casing.
+        dev_types = tuple(_dispatch_key_for_device(name) for name in names)
 
     def decorator(fn: Callable) -> "FastCustomOp":
         schema = infer_schema(fn, op_name=op_name, mutates_args=mutates_args_tuple)
