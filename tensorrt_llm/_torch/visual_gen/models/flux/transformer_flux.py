@@ -17,8 +17,7 @@ Forward Pass Flow:
 5. norm_out + proj_out -> noise prediction
 """
 
-import os
-from typing import Any, Dict, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -251,26 +250,6 @@ def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
     return F.gelu(x, approximate="tanh")
 
 
-_FUSED_MLP_GELU_ENV = "TRTLLM_FLUX_FUSED_MLP_GELU"
-
-
-def _fused_mlp_gelu_enabled(block_type: Literal["single", "dual"]) -> bool:
-    """Return whether fused GEMM+GELU is requested for a FLUX block type."""
-    raw_value = os.environ.get(_FUSED_MLP_GELU_ENV, "0")
-    value = raw_value.strip().lower()
-    if value in {"1", "full"}:
-        return True
-    if value == "0":
-        return False
-    if value in {"single", "dual"}:
-        return value == block_type
-    raise ValueError(
-        f"{_FUSED_MLP_GELU_ENV} must be one of "
-        "['0', '1', 'single', 'dual', 'full'], "
-        f"got {raw_value!r}"
-    )
-
-
 class FluxTransformerBlock(nn.Module):
     """Dual-stream transformer block for FLUX.
 
@@ -346,12 +325,11 @@ class FluxTransformerBlock(nn.Module):
 
         # FFN layers (shared TRT-LLM MLP module)
         # HF key remapping (net.0.proj.* → up_proj.*, net.2.* → down_proj.*) in load_weights()
-        mlp_activation = gelu_tanh if _fused_mlp_gelu_enabled("dual") else _gelu_tanh_eager
         self.ff = MLP(
             hidden_size=dim,
             intermediate_size=int(dim * 4.0),
             bias=True,
-            activation=mlp_activation,
+            activation=gelu_tanh,
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
@@ -361,7 +339,7 @@ class FluxTransformerBlock(nn.Module):
             hidden_size=dim,
             intermediate_size=int(dim * 4.0),
             bias=True,
-            activation=mlp_activation,
+            activation=gelu_tanh,
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
@@ -493,7 +471,6 @@ class FluxSingleTransformerBlock(nn.Module):
             reduce_output=False,
         )
         self.act_mlp = _gelu_tanh_eager
-        self._fused_mlp_gelu_requested = _fused_mlp_gelu_enabled("single")
         self._use_fused_mlp_gelu = False
         self._share_nvfp4_quantize = False
 
@@ -528,8 +505,7 @@ class FluxSingleTransformerBlock(nn.Module):
     def configure_fused_mlp_gelu(self) -> bool:
         """Enable the fused NVFP4 MLP projection and GELU path after loading."""
         self._use_fused_mlp_gelu = bool(
-            self._fused_mlp_gelu_requested
-            and is_nvfp4_gemm_gelu_fusion_eligible(self.proj_mlp)
+            is_nvfp4_gemm_gelu_fusion_eligible(self.proj_mlp)
             and hasattr(getattr(self.proj_mlp, "quant_method", None), "_input_prepare")
         )
         return self._use_fused_mlp_gelu
