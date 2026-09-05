@@ -23,10 +23,9 @@ from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
                                  maybe_pin_memory, nvtx_range, prefer_pinned,
-                                 release_gc, torch_dtype_to_str, trace_func)
+                                 release_gc, trace_func)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
-from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
@@ -86,6 +85,8 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
+from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
+                          make_lora_model_config)
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
@@ -97,8 +98,7 @@ from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
 from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+                               ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
 from .sampler.ops.flashinfer import warmup_sampling_module
 from .scheduler import ScheduledRequests
@@ -1041,6 +1041,12 @@ class PyTorchModelEngine(ModelEngine):
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
+        # Every LoRA parameter decision lives in engine/lora.py. The builder
+        # holds no model and no manager: `enable_spec_decode` and
+        # `runtime_draft_len` are rewritten during capture, so they -- and the
+        # manager the two `_util.py` hooks below install -- are passed per call.
+        self._lora = LoraParamBuilder(spec_config=self.spec_config,
+                                      attn_backend=self.attn_backend)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1082,38 +1088,25 @@ class PyTorchModelEngine(ModelEngine):
                               lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str],
                               swap_gate_up_proj_lora_b_weight: bool = True):
-        self.lora_model_config = LoraModelConfig(
-            lora_target_modules=lora_target_modules,
-            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
-            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+        # Called by `_util.py` after the engine exists. Both LoRA handles stay
+        # engine state: warmup, capture and the enc-dec fast path read them.
+        self.lora_model_config = make_lora_model_config(
+            self.model, lora_target_modules, trtllm_modules_to_hf_modules,
+            swap_gate_up_proj_lora_b_weight)
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
-        # Get model configuration
         if self.cuda_graph_runner.enabled:
-            max_lora_size = lora_config.max_loras or 8  # Default fallback
-            max_batch_size = self.batch_size  # Use engine's max batch size
-
             # For spec decode, each generation request contributes
             # max_draft_len + 1 tokens per forward pass.
             max_tokens_per_seq = (self.original_max_draft_len +
                                   1) if self.is_spec_decode else 1
-            self.cuda_graph_lora_manager = CudaGraphLoraManager(
-                max_lora_size=max_lora_size,
-                max_batch_size=max_batch_size,
-                max_lora_rank=lora_config.max_lora_rank,
-                model=self.model,
-                lora_model_config=self.lora_model_config,
-                overlap_lora_and_base=lora_config.overlap_lora_and_base,
-                device='cuda',
-                max_tokens_per_seq=max_tokens_per_seq)
-
-            logger.info(
-                f"Initialized CUDA Graph LoRA manager, "
-                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
-            )
+            self.cuda_graph_lora_manager = make_cuda_graph_lora_manager(
+                self.model,
+                lora_config,
+                self.lora_model_config,
+                self.batch_size,  # Use engine's max batch size
+                max_tokens_per_seq)
 
     def _use_lora_cuda_graph(self,
                              scheduled_requests: ScheduledRequests) -> bool:
@@ -4722,8 +4715,12 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         # Get LoRA parameters
-        lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+        lora_params = self._lora.build(
+            scheduled_requests,
+            attn_metadata,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len)
 
         # Handle padding for piecewise CUDA graphs
         attn_metadata.padded_num_tokens = None
@@ -6407,11 +6404,14 @@ class PyTorchModelEngine(ModelEngine):
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
-        lora_params = self._get_lora_params_from_requests(
+        lora_params = self._lora.build(
             scheduled_requests,
             attn_metadata,
-            peft_cache_manager,
-            maybe_graph,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len,
+            peft_cache_manager=peft_cache_manager,
+            maybe_graph=maybe_graph,
             use_lora_graph=use_lora_graph)
 
         spec_all_rank_counts = None
@@ -6710,8 +6710,12 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
 
-        lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+        lora_params = self._lora.build(
+            scheduled_requests,
+            attn_metadata,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len)
 
         inputs = {
             'attn_metadata': attn_metadata,
@@ -6770,170 +6774,6 @@ class PyTorchModelEngine(ModelEngine):
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None
-
-    def _get_lora_params_from_requests(
-            self,
-            scheduled_requests: ScheduledRequests,
-            attn_metadata: AttentionMetadata,
-            peft_cache_manager: Optional[PeftCacheManager] = None,
-            maybe_graph: bool = False,
-            use_lora_graph: bool = False):
-        '''
-        Get LoRA parameters from scheduled requests.
-
-        Uses CUDA Graph compatible mode in decode only batch, otherwise falls back to eager mode.
-
-        Returns:
-            Dictionary containing LoRA parameters, or None if no LoRA requests
-        '''
-        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
-
-        if use_cuda_graph_mode:
-            if not use_lora_graph:
-                self.cuda_graph_lora_manager.prepare_base_only_batch(
-                    peft_cache_manager)
-                return None
-            # For spec decode verification (non-extend_ctx), each sequence has
-            # runtime_draft_len + 1 tokens in the forward pass.
-            tokens_per_seq = 1
-            if (self.enable_spec_decode and self.runtime_draft_len > 0
-                    and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend)):
-                tokens_per_seq = self.runtime_draft_len + 1
-            return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_cache_manager,
-                tokens_per_seq)
-        else:
-            if self.cuda_graph_lora_manager is not None:
-                self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
-                    peft_cache_manager)
-            peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
-            ) if peft_cache_manager is not None else None
-            lora_params = peft_table and self._get_eager_lora_params_from_requests(
-                scheduled_requests, attn_metadata, peft_table)
-            if lora_params:
-                lora_params["data_type"] = peft_cache_manager.data_type
-            return lora_params
-
-    def _get_eager_lora_params_from_requests(
-            self, scheduled_requests: ScheduledRequests,
-            attn_metadata: AttentionMetadata,
-            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
-        '''
-        Eager mode LoRA parameter preparation logic.
-
-        lora_params: dict
-        {
-            layer_id: dict
-            {
-                module_id: dict
-                {
-                    adapter_size: torch tensor: int
-                    weight_pointers: torch tensor: int64
-                }
-            }
-        }
-        '''
-        lora_params = {}
-        tmp_lora_params = {}
-
-        request_list = scheduled_requests.all_requests()
-
-        # trace all requests to get the union set of the lora params
-        for request in request_list:
-            if request.lora_task_id is None:
-                continue
-
-            layer_module_configs = peft_table[request.lora_task_id]
-
-            for module in layer_module_configs:
-                module_id = module.module_id
-                layer_id = module.layer_id
-
-                if layer_id not in lora_params:
-                    lora_params[layer_id] = {}
-                if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {
-                        'adapter_size': [],
-                        'weight_pointers': [],
-                    }
-
-                scaling_vec_pointer = module.scaling_vec_pointer
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
-                tmp_lora_params[(request.py_request_id, layer_id,
-                                 module_id)] = {
-                                     'adapter_size': [module.adapter_size],
-                                     'weight_pointers': [
-                                         module.weights_in_pointer,
-                                         module.weights_out_pointer,
-                                         scaling_vec_pointer
-                                     ],
-                                 }
-
-        for request in request_list:
-            # Need to set default values for this case
-            if request.lora_task_id is None:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_lora_params = lora_params[layer_id][module_id]
-                        current_lora_params['adapter_size'].append(0)
-                        current_lora_params['weight_pointers'] += [0, 0, 0]
-
-            else:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_tmp_lora_params = tmp_lora_params.get(
-                            (request.py_request_id, layer_id, module_id), None)
-                        current_lora_params = lora_params[layer_id][module_id]
-                        if current_tmp_lora_params is None:
-                            current_lora_params['adapter_size'].append(0)
-                            current_lora_params['weight_pointers'] += [0, 0, 0]
-                        else:
-                            current_lora_params[
-                                'adapter_size'] += current_tmp_lora_params[
-                                    'adapter_size']
-                            current_lora_params[
-                                'weight_pointers'] += current_tmp_lora_params[
-                                    'weight_pointers']
-
-        for layer_id in lora_params:
-            for module_id in lora_params[layer_id]:
-                current_lora_params = lora_params[layer_id][module_id]
-                current_lora_params['adapter_size'] = torch.IntTensor(
-                    current_lora_params['adapter_size'])
-                current_lora_params['weight_pointers'] = torch.LongTensor(
-                    current_lora_params['weight_pointers'])
-
-        if lora_params:
-            host_request_types = attn_metadata.host_request_types
-            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
-            num_seqs = attn_metadata.num_seqs
-            num_contexts = attn_metadata.num_contexts
-            num_generations = attn_metadata.num_generations
-
-            # During spec decode verification (non-extend_ctx mode), each
-            # generation request processes (runtime_draft_len + 1) tokens at
-            # once. The LoRA op's C++ kernel only advances 1 token per
-            # kGENERATION request, so we re-label generation requests as
-            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
-            # count so the kernel correctly expands LoRA weights for all tokens.
-            if (self.enable_spec_decode and self.runtime_draft_len > 0
-                    and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend) and num_generations > 0):
-                tokens_per_req = self.runtime_draft_len + 1
-                host_request_types = host_request_types.clone()
-                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
-                prompt_lens_cpu = prompt_lens_cpu.clone()
-                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
-
-            lora_params['host_request_types'] = host_request_types
-            lora_params['prompt_lens_cpu'] = prompt_lens_cpu
-            lora_params['num_seqs'] = num_seqs
-
-        return lora_params
 
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
