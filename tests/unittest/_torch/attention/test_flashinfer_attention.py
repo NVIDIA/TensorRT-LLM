@@ -1205,3 +1205,71 @@ class TestFlashInferAttention(unittest.TestCase):
 
         graph.replay()
         torch.testing.assert_close(result_actual, result_ref, atol=1e-2, rtol=0)
+
+
+class TestSplitKVScratchReset(unittest.TestCase):
+    """CPU-only checks for FlashInferAttentionMetadata.zero_planned_split_kv_scratch.
+
+    The method only reads the wrapper's plan info and writes into the
+    workspace buffer, so it can be exercised with a stub metadata object and a
+    host tensor -- no GPU, no planned FlashInfer wrapper.
+    """
+
+    NUM_QO_HEADS = 2
+    HEAD_DIM = 8
+    PADDED_BATCH_SIZE = 3
+    CTA_TILE_Q = 4
+    V_OFFSET = 4096
+    S_OFFSET = 65536
+    FILL = 0xAB
+
+    def _plan_info(self, split_kv: bool = True) -> List[int]:
+        plan_info = [0] * flashinfer_backend._FI_PREFILL_PLAN_INFO_LEN
+        plan_info[flashinfer_backend.
+                  _FI_PLAN_PADDED_BATCH_SIZE] = self.PADDED_BATCH_SIZE
+        plan_info[flashinfer_backend._FI_PLAN_CTA_TILE_Q] = self.CTA_TILE_Q
+        plan_info[flashinfer_backend._FI_PLAN_V_OFFSET] = self.V_OFFSET
+        plan_info[flashinfer_backend._FI_PLAN_S_OFFSET] = self.S_OFFSET
+        plan_info[flashinfer_backend._FI_PLAN_SPLIT_KV] = int(split_kv)
+        return plan_info
+
+    def _reset(self, workspace: torch.Tensor, wrapper) -> None:
+        # Unbound call: the method needs nothing from the metadata but the
+        # workspace buffer, and constructing one requires a GPU.
+        FlashInferAttentionMetadata.zero_planned_split_kv_scratch(
+            SimpleNamespace(workspace_buffer=workspace), wrapper,
+            self.NUM_QO_HEADS, self.HEAD_DIM)
+
+    def test_resets_exactly_the_planned_extent(self):
+        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
+        self._reset(workspace, SimpleNamespace(_plan_info=self._plan_info()))
+
+        num_tiles = self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS
+        v_bytes = num_tiles * self.HEAD_DIM * flashinfer_backend._FI_SIZEOF_FLOAT
+        s_bytes = num_tiles * flashinfer_backend._FI_SIZEOF_FLOAT
+
+        # tmp_v is zeroed; tmp_s holds the neutral log-sum-exp, which must be
+        # finite so the merge cannot produce NaN from -inf minus -inf.
+        self.assertTrue(workspace[self.V_OFFSET:self.V_OFFSET +
+                                  v_bytes].eq(0).all())
+        lse = workspace[self.S_OFFSET:self.S_OFFSET + s_bytes].view(
+            torch.float32)
+        self.assertTrue(torch.isfinite(lse).all())
+        self.assertTrue(lse.eq(flashinfer_backend._FI_NEUTRAL_LSE).all())
+
+        # Nothing outside the two ranges is touched.
+        for boundary in (self.V_OFFSET - 1, self.V_OFFSET + v_bytes,
+                         self.S_OFFSET - 1, self.S_OFFSET + s_bytes):
+            self.assertEqual(int(workspace[boundary]), self.FILL)
+
+    def test_no_op_without_a_split_kv_prefill_plan(self):
+        untouched = torch.full((1 << 16, ), self.FILL, dtype=torch.uint8)
+        for wrapper in (
+                SimpleNamespace(_plan_info=self._plan_info(split_kv=False)),
+                # A batch-decode plan returns 10 entries in a different order.
+                SimpleNamespace(_plan_info=[0] * 10),
+                SimpleNamespace(_plan_info=None),
+                SimpleNamespace(),
+        ):
+            self._reset(untouched, wrapper)
+            self.assertTrue(untouched.eq(self.FILL).all())
