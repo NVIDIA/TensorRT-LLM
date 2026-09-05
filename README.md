@@ -325,8 +325,9 @@ deployment, and not linked to users. The data we collect includes:
 - Feature summary flags (LoRA, speculative decoding, prefix caching, CUDA graphs, chunked context, data parallelism)
 - Disaggregated serving metadata (role and deployment ID)
 - Process-local LLM lifecycle counts (initialization attempts, successful and active instances, peak concurrency, and initialization failures)
+- VisualGen pipeline identity, capability, parallelism, feature settings, and process-local lifecycle counts
 - Bounded terminal status for instrumented processes (known exit code or signal, termination category, lifecycle phase, component, and reporting source)
-- Selected LLM API configuration values: parallelism, dtype, KV cache, scheduler, CUDA graph, and compile settings
+- Selected LLM and VisualGen configuration values: parallelism, dtype, caching, attention, CUDA graph, and compile settings
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
 Telemetry is automatically disabled in CI and test environments.
@@ -337,7 +338,7 @@ To disable telemetry data collection, use any of the following methods:
 
 - **Environment variable**: Set `TRTLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1`, or `TELEMETRY_DISABLED=true`
 - **File-based**: Create the file `~/.config/trtllm/do_not_track`
-- **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
+- **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`, or pass `VisualGenArgs(telemetry_config=TelemetryConfig(disabled=True))` to `VisualGen()`
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
 
 CLI terminal telemetry may report that an argument or YAML configuration was

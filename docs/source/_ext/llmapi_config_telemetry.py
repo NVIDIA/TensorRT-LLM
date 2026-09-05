@@ -33,7 +33,7 @@ for the user-facing collection and opt-out overview, and the
 [telemetry schema reference](source:tensorrt_llm/usage/schemas/README.md)
 for the wire schema.
 
-**No PII or free-form fields are captured.** LLM API configuration capture is
+**No PII or free-form fields are captured.** Runtime configuration capture is
 *type-driven*: fields whose type is categorical (`Literal`/`Enum`/`bool`) or
 numeric (`int`/`float`), plus safe collections of those, are captured
 automatically. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are never captured
@@ -44,7 +44,7 @@ below; the runtime can capture nothing absent from this list.
 If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
 `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
 
-## LLM API Configuration Fields
+## Runtime Configuration Fields
 
 A field can still be absent from a specific payload when its parent config is
 unset or when the safety sanitizer rejects the runtime value.
@@ -76,16 +76,22 @@ def _table(rows: list[dict]) -> str:
 def generate_telemetry_reference(repo_root: Path | str, output_path: Path | str) -> None:
     repo_root = Path(repo_root)
     golden = json.loads((repo_root / _GOLDEN_REL).read_text())
-    rows = golden.get("TorchLlmArgs", [])
-    content = [
-        _REFERENCE_PREAMBLE,
-        "### `TorchLlmArgs`",
-        "",
-        f"{len(rows)} captured fields.",
-        "",
-        _table(rows),
-        "",
-    ]
+    preferred = ("TorchLlmArgs", "VisualGenArgs")
+    model_names = [name for name in preferred if name in golden]
+    model_names.extend(sorted(set(golden) - set(model_names)))
+    content = [_REFERENCE_PREAMBLE]
+    for model_name in model_names:
+        rows = golden[model_name]
+        content.extend(
+            [
+                f"### `{model_name}`",
+                "",
+                f"{len(rows)} captured fields.",
+                "",
+                _table(rows),
+                "",
+            ]
+        )
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(content))

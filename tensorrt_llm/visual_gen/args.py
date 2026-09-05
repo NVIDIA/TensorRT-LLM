@@ -30,6 +30,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.usage.config import TelemetryConfig
 
 from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
 
@@ -658,6 +659,13 @@ class VisualGenArgs(StrictBaseModel):
             "(e.g., 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'). "
             "Hub models are downloaded and cached automatically."
         ),
+    )
+
+    telemetry_config: TelemetryConfig = Field(
+        default_factory=TelemetryConfig,
+        telemetry=False,
+        status="prototype",
+        description="Configure anonymous usage telemetry for this VisualGen process.",
     )
 
     revision: Optional[str] = Field(

@@ -723,6 +723,7 @@ class TestPipelineMetadataBridging:
                 "status": "READY",
                 "default_generation_params": pipeline_cls.default_generation_params.fget(mock_self),
                 "extra_param_specs": pipeline_cls.extra_param_specs.fget(mock_self),
+                "telemetry_metadata": {"modality": "video"},
             },
         )
 
@@ -731,6 +732,58 @@ class TestPipelineMetadataBridging:
         import pickle
 
         return pickle.loads(pickle.dumps(response))
+
+    @pytest.mark.parametrize(
+        ("external_launch", "environment", "expected"),
+        [
+            (None, {}, ("local_spawn", 1)),
+            ((0, 0, 8, "localhost", 1234), {"GROUP_WORLD_SIZE": "2"}, ("torchrun", 2)),
+            (
+                (0, 0, 8, "localhost", 1234),
+                {"SLURM_PROCID": "0", "SLURM_NNODES": "4"},
+                ("slurm", 4),
+            ),
+        ],
+    )
+    def test_launch_metadata_is_bounded(self, monkeypatch, external_launch, environment, expected):
+        from tensorrt_llm._torch.visual_gen.executor import _visual_gen_launch_metadata
+
+        for name in ("SLURM_PROCID", "SLURM_NNODES", "GROUP_WORLD_SIZE", "LOCAL_WORLD_SIZE"):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in environment.items():
+            monkeypatch.setenv(name, value)
+
+        assert _visual_gen_launch_metadata(external_launch) == expected
+
+    def test_pipeline_telemetry_metadata_is_fail_silent(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import (
+            PIPELINE_REGISTRY,
+            AutoPipeline,
+            _PipelineEntry,
+        )
+
+        class _SlottedPipeline:
+            __slots__ = ()
+
+            @classmethod
+            def resolve_variant(cls, _config):
+                return cls
+
+            def __init__(self, _config):
+                pass
+
+        monkeypatch.setitem(
+            PIPELINE_REGISTRY,
+            "SlottedPipeline",
+            _PipelineEntry(pipeline_cls=_SlottedPipeline, telemetry_safe=True),
+        )
+        monkeypatch.setattr(
+            AutoPipeline,
+            "_detect_from_checkpoint",
+            lambda _checkpoint_dir: "SlottedPipeline",
+        )
+
+        assert isinstance(AutoPipeline.from_config(object(), "/model"), _SlottedPipeline)
 
     def test_ready_payload_pickle_roundtrip(self):
         """The READY dict survives pickle (the ZMQ transport layer)."""
@@ -805,7 +858,10 @@ class TestPipelineMetadataBridging:
         assert restored.output["default_generation_params"]["height"] == 1024
 
     def test_client_extracts_metadata_from_ready(self):
-        """DiffusionRemoteClient stores metadata when processing a READY response."""
+        """The real READY wait path stores pipeline and telemetry metadata."""
+        import asyncio
+        from types import SimpleNamespace
+
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
         from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
         from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
@@ -816,20 +872,94 @@ class TestPipelineMetadataBridging:
         ltx2_defaults = LTX2Pipeline.default_generation_params.fget(None)
         ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
 
-        # Simulate what _wait_ready_async does: extract from the response payload
-        client = MagicMock(spec=DiffusionRemoteClient)
-        client.default_generation_params = {}
-        client.extra_param_specs = {}
+        async def wait_ready():
+            client = SimpleNamespace(
+                lock=asyncio.Lock(),
+                completed_responses={-1: restored},
+                default_generation_params={},
+                extra_param_specs={},
+                supports_image_edit=False,
+                ref_slot_specs={},
+                telemetry_metadata={},
+                worker_processes=[],
+                _ext_worker_thread=None,
+                response_event=asyncio.Event(),
+            )
+            await DiffusionRemoteClient._wait_ready_async(client)
+            return client
 
-        payload = restored.output
-        if isinstance(payload, dict):
-            client.default_generation_params = payload.get("default_generation_params", {})
-            client.extra_param_specs = payload.get("extra_param_specs", {})
+        client = asyncio.run(wait_ready())
 
         assert client.default_generation_params == ltx2_defaults
         assert set(client.extra_param_specs.keys()) == set(ltx2_specs.keys())
         for spec in client.extra_param_specs.values():
             assert isinstance(spec, ExtraParamSchema)
+        assert client.telemetry_metadata == {"modality": "video"}
+
+    def test_worker_telemetry_metadata_allowlists_identity_and_components(self, monkeypatch):
+        """READY metadata never forwards an unknown model or component name."""
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen import executor
+
+        class _Pipeline:
+            transformer_components = ("transformer", "private_component")
+
+            def __init__(self):
+                self._telemetry_pipeline_class_name = "PublicPipeline"
+                self.pipeline_config = SimpleNamespace(
+                    quant_config=SimpleNamespace(quant_algo=SimpleNamespace(name="NVFP4")),
+                    dynamic_weight_quant=True,
+                    get_quant_config=lambda component: SimpleNamespace(
+                        quant_algo=(
+                            SimpleNamespace(name="NVFP4") if component == "transformer" else None
+                        )
+                    ),
+                )
+
+        registry = {
+            "PublicPipeline": SimpleNamespace(
+                pipeline_cls=_Pipeline,
+                hf_ids=["nvidia/public-model"],
+                modality="image",
+                telemetry_safe=True,
+            )
+        }
+        monkeypatch.setattr(executor, "PIPELINE_REGISTRY", registry)
+
+        public = executor._visual_gen_telemetry_metadata(
+            _Pipeline(), SimpleNamespace(model="nvidia/public-model")
+        )
+        private = executor._visual_gen_telemetry_metadata(
+            _Pipeline(), SimpleNamespace(model="/private/customer/model")
+        )
+
+        assert public["model_id"] == "nvidia/public-model"
+        assert public["pipeline_class_name"] == "PublicPipeline"
+        assert public["resolved_pipeline_class"] == "_Pipeline"
+        assert public["modality"] == "image"
+        assert public["quantization_algo"] == "NVFP4"
+        assert public["quantized_components"] == ["transformer"]
+        assert private["model_id"] == "other"
+
+        class _PrivatePipeline(_Pipeline):
+            def __init__(self):
+                super().__init__()
+                self._telemetry_pipeline_class_name = "CustomerPipeline"
+
+        registry["CustomerPipeline"] = SimpleNamespace(
+            pipeline_cls=_PrivatePipeline,
+            hf_ids=["customer/private-model"],
+            modality="image",
+            telemetry_safe=False,
+        )
+        private_pipeline = executor._visual_gen_telemetry_metadata(
+            _PrivatePipeline(), SimpleNamespace(model="customer/private-model")
+        )
+        assert private_pipeline["model_id"] == "other"
+        assert private_pipeline["pipeline_class_name"] == "unknown"
+        assert private_pipeline["resolved_pipeline_class"] == "unknown"
+        assert private_pipeline["modality"] == "unknown"
 
 
 # =============================================================================

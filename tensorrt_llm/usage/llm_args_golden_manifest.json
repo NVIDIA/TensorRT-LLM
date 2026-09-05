@@ -2183,6 +2183,7 @@
       "allowed_values": [
         "unknown",
         "llm_class",
+        "visual_gen_class",
         "cli_serve",
         "cli_bench",
         "cli_eval",
@@ -2293,6 +2294,507 @@
       "converter": "",
       "kind": "value",
       "path": "use_fine_grained_sync"
+    }
+  ],
+  "VisualGenArgs": [
+    {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM",
+        "FA4",
+        "CUTEDSL"
+      ],
+      "annotation": "Literal['VANILLA', 'TRTLLM', 'FA4', 'CUTEDSL']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_config.backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.quant_attention_config.k_block_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.quant_attention_config.q_block_size"
+    },
+    {
+      "allowed_values": [
+        "bf16",
+        "int8",
+        "fp8",
+        "mxfp8",
+        "nvfp4"
+      ],
+      "annotation": "Literal['bf16', 'int8', 'fp8', 'mxfp8', 'nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_config.quant_attention_config.qk_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.quant_attention_config.v_block_size"
+    },
+    {
+      "allowed_values": [
+        "fp8"
+      ],
+      "annotation": "Literal['fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_config.quant_attention_config.v_dtype"
+    },
+    {
+      "allowed_values": [
+        "skip_softmax",
+        "vsa"
+      ],
+      "annotation": "Literal['skip_softmax']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_config.sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.sparse_attention_config.disabled_until_timestep"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.sparse_attention_config.target_sparsity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.sparse_attention_config.threshold_scale_factor"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_config.sparse_attention_config.vsa_sparsity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.Bn_compute_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.Fn_compute_blocks"
+    },
+    {
+      "allowed_values": [
+        "cache_dit",
+        "teacache"
+      ],
+      "annotation": "Literal['cache_dit']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_config.cache_backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.coefficients"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.coefficients_2"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.enable_separate_cfg"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.enable_taylorseer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.force_refresh_step_hint"
+    },
+    {
+      "allowed_values": [
+        "once",
+        "repeat"
+      ],
+      "annotation": "Literal['once', 'repeat']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_config.force_refresh_step_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.max_cached_steps"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.max_continuous_cached_steps"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.max_warmup_steps"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.residual_diff_threshold"
+    },
+    {
+      "allowed_values": [
+        "dynamic",
+        "static"
+      ],
+      "annotation": "Literal['dynamic', 'static']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "cache_config.scm_steps_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.taylorseer_order"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.teacache_thresh"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_config.use_ret_steps"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "compilation_config.num_frames"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Tuple[int, int]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "compilation_config.resolutions"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "compilation_config.skip_warmup"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cpu_offload_config.enable"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cpu_offload_config.pin_memory"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cuda_graph_config.enable"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_layerwise_nvtx_marker"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.async_ulysses"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Tuple[Annotated[int, FieldInfo(annotation=NoneType, required=True, metadata=[Ge(ge=1)])], Annotated[int, FieldInfo(annotation=NoneType, required=True, metadata=[Ge(ge=1)])]]",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.attn2d_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.cfg_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.parallel_vae_size"
+    },
+    {
+      "allowed_values": [
+        "width",
+        "height"
+      ],
+      "annotation": "Literal['width', 'height']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "parallel_config.parallel_vae_split_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.ring_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.tp_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "parallel_config.ulysses_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.clamp_val"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.group_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.has_zero_point"
+    },
+    {
+      "allowed_values": [
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+        "W8A16_GPTQ",
+        "W4A16_GPTQ",
+        "W8A8_SQ_PER_CHANNEL",
+        "W8A8_SQ_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN",
+        "W4A8_QSERVE_PER_GROUP",
+        "W4A8_QSERVE_PER_CHANNEL",
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "INT8",
+        "MIXED_PRECISION",
+        "NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "W4A16_MXFP4",
+        "MXFP8",
+        "W4A16_NVFP4",
+        "NVFP4_AWQ",
+        "NVFP4_ARC",
+        "NO_QUANT"
+      ],
+      "annotation": "Optional[tensorrt_llm.quantization.mode.QuantAlgo]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "quant_config.kv_cache_quant_algo"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.mamba_ssm_philox_rounds"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.pre_quant_scale"
+    },
+    {
+      "allowed_values": [
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+        "W8A16_GPTQ",
+        "W4A16_GPTQ",
+        "W8A8_SQ_PER_CHANNEL",
+        "W8A8_SQ_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN",
+        "W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN",
+        "W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN",
+        "W4A8_QSERVE_PER_GROUP",
+        "W4A8_QSERVE_PER_CHANNEL",
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "INT8",
+        "MIXED_PRECISION",
+        "NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "W4A16_MXFP4",
+        "MXFP8",
+        "W4A16_NVFP4",
+        "NVFP4_AWQ",
+        "NVFP4_ARC",
+        "NO_QUANT"
+      ],
+      "annotation": "Optional[tensorrt_llm.quantization.mode.QuantAlgo]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "quant_config.quant_algo"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.smoothquant_val"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "quant_config.use_meta_recipe"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "runtime_lora_config.fuse_qkv"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "runtime_lora_config.scale"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "runtime_lora_config.strict"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_autotune"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "torch_compile_config.enable_fullgraph"
     }
   ]
 }

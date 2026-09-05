@@ -18,6 +18,7 @@ import zmq
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
@@ -36,6 +37,116 @@ WORKER_TIMEOUT = 2.0
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
+_TELEMETRY_TRANSFORMER_COMPONENTS = frozenset(("transformer", "transformer_2"))
+
+
+def _visual_gen_launch_metadata(
+    external_launch: Optional[Tuple[int, int, int, str, int]],
+) -> Tuple[str, int]:
+    """Return a bounded launch mode and best-known deployment node count."""
+    if external_launch is None:
+        return "local_spawn", 1
+
+    if "SLURM_PROCID" in os.environ:
+        launch_mode = "slurm"
+        node_count_value = os.environ.get("SLURM_NNODES")
+    else:
+        launch_mode = "torchrun"
+        node_count_value = os.environ.get("GROUP_WORLD_SIZE")
+
+    try:
+        node_count = int(node_count_value) if node_count_value is not None else 0
+    except ValueError:
+        node_count = 0
+    if node_count <= 0:
+        try:
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+            world_size = external_launch[2]
+            node_count = (world_size + local_world_size - 1) // local_world_size
+        except (TypeError, ValueError, ZeroDivisionError):
+            node_count = 0
+    return launch_mode, max(node_count, 0)
+
+
+def _quant_algo_name(quant_config: Any) -> str:
+    """Return a bounded enum label from a resolved component config."""
+    quant_algo = getattr(quant_config, "quant_algo", None)
+    if quant_algo is None:
+        return ""
+    name = getattr(quant_algo, "name", None)
+    return name if isinstance(name, str) else ""
+
+
+def _visual_gen_telemetry_metadata(pipeline: Any, args: VisualGenArgs) -> Dict[str, Any]:
+    """Build bounded READY metadata from the successfully loaded pipeline."""
+    defaults: Dict[str, Any] = {
+        "model_id": "other",
+        "pipeline_class_name": "unknown",
+        "resolved_pipeline_class": "unknown",
+        "modality": "unknown",
+        "quantization_algo": "",
+        "dynamic_weight_quant": False,
+        "quantized_components": [],
+    }
+    try:
+        pipeline_class_name = getattr(pipeline, "_telemetry_pipeline_class_name", "unknown")
+        entry = PIPELINE_REGISTRY.get(pipeline_class_name)
+        if entry is None or not entry.telemetry_safe:
+            pipeline_class_name = "unknown"
+            entry = None
+
+        resolved_entry = next(
+            (
+                candidate
+                for candidate in PIPELINE_REGISTRY.values()
+                if candidate.telemetry_safe and type(pipeline) is candidate.pipeline_cls
+            ),
+            None,
+        )
+        resolved_pipeline_class = (
+            type(pipeline).__name__ if resolved_entry is not None else "unknown"
+        )
+
+        model_id = "other"
+        if any(
+            candidate.telemetry_safe and args.model in candidate.hf_ids
+            for candidate in PIPELINE_REGISTRY.values()
+        ):
+            model_id = args.model
+
+        pipeline_config = pipeline.pipeline_config
+        quantized_components = []
+        quantization_algos = []
+        for component in pipeline.transformer_components:
+            if component not in _TELEMETRY_TRANSFORMER_COMPONENTS:
+                continue
+            component_quant = pipeline_config.get_quant_config(component)
+            quantization_algo = _quant_algo_name(component_quant)
+            if quantization_algo:
+                quantized_components.append(component)
+                if quantization_algo not in quantization_algos:
+                    quantization_algos.append(quantization_algo)
+
+        if len(quantization_algos) == 1:
+            quantization_algo = quantization_algos[0]
+        elif quantization_algos:
+            quantization_algo = "mixed"
+        else:
+            quantization_algo = ""
+
+        defaults.update(
+            model_id=model_id,
+            pipeline_class_name=pipeline_class_name,
+            resolved_pipeline_class=resolved_pipeline_class,
+            modality=entry.modality if entry is not None else "unknown",
+            quantization_algo=quantization_algo,
+            dynamic_weight_quant=bool(pipeline_config.dynamic_weight_quant),
+            quantized_components=quantized_components,
+        )
+    except Exception:
+        # Telemetry metadata is optional and must never disrupt worker startup.
+        pass
+    return defaults
 
 
 class _IterationStatsTracker:
@@ -441,6 +552,9 @@ class DiffusionExecutor:
                         "extra_param_specs": self.pipeline.extra_param_specs,
                         "supports_image_edit": self.pipeline.supports_image_edit,
                         "ref_slot_specs": self.pipeline.ref_slot_specs,
+                        "telemetry_metadata": _visual_gen_telemetry_metadata(
+                            self.pipeline, self.visual_gen_args
+                        ),
                     },
                 )
             )
@@ -756,6 +870,7 @@ class DiffusionRemoteClient:
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
+        self.launch_mode, self.node_count = _visual_gen_launch_metadata(ext)
 
         if ext is None:
             # Single-node: coordinator spawns all workers locally
@@ -824,6 +939,7 @@ class DiffusionRemoteClient:
         self.extra_param_specs: Dict = {}
         self.supports_image_edit: bool = False
         self.ref_slot_specs: Dict = {}
+        self.telemetry_metadata: Dict[str, Any] = {}
 
         # --- Launch workers ---
         self.worker_processes = []
@@ -1182,6 +1298,9 @@ class DiffusionRemoteClient:
                         self.extra_param_specs = payload.get("extra_param_specs", {})
                         self.supports_image_edit = bool(payload.get("supports_image_edit", False))
                         self.ref_slot_specs = payload.get("ref_slot_specs", {})
+                        telemetry_metadata = payload.get("telemetry_metadata")
+                        if isinstance(telemetry_metadata, dict):
+                            self.telemetry_metadata = telemetry_metadata
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return

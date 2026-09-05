@@ -216,6 +216,18 @@ class TestPipelineRegistryUnique:
         ids = VisualGen.supported_models()
         assert len(ids) == len(set(ids)), f"VisualGen.supported_models() returned duplicates: {ids}"
 
+    def test_registered_pipelines_declare_safe_telemetry_metadata(self):
+        """Built-in pipeline metadata is explicitly allowlisted and bounded."""
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
+
+        allowed = {"image", "video", "video_audio", "layered_image", "mixed"}
+        missing = {
+            name: entry.modality
+            for name, entry in PIPELINE_REGISTRY.items()
+            if entry.modality not in allowed or not entry.telemetry_safe
+        }
+        assert not missing, f"Pipeline telemetry metadata is not allowlisted: {missing}"
+
 
 class TestVisualGenArgsCacheBackend:
     def test_cache_dit_nested_config(self):

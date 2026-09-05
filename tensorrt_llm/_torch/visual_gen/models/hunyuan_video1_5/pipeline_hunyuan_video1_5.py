@@ -143,6 +143,8 @@ def retrieve_timesteps(
         "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v_distilled",
     ],
     doc="Tencent HunyuanVideo 1.5 family (text-to-video).",
+    modality="video",
+    telemetry_safe=True,
 )
 class HunyuanVideo15Pipeline(BasePipeline):
     def __init__(self, pipeline_config: DiffusionPipelineConfig):
