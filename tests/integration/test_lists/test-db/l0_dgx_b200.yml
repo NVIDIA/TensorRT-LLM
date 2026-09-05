@@ -16,6 +16,7 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
+  - unittest/_torch/moe/test_deep_ep_bf16_fp4_dispatch.py::test_deep_ep_fused_transport_paths_match_numeric_references
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   # ------------- Disaggregated Serving: Pipelined KV Transfer (multi-GPU) ---------------
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[use_kv_cache_manager_v2=False-enable_block_reuse=True]
