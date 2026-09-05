@@ -219,8 +219,8 @@ class GvrEmissionState:
             self.cand_cur[:nc].zero_()
 
     def indexer_emit_kwargs(self, emit_tier: str, num_rows: int) -> dict:
-        """kwargs for CuteDSLFP4PagedMQALogitsRunner.forward covering the
-        planned emission tier (caller merges into its call)."""
+        """kwargs for the paged-MQA scoring runners (FP4 / FP8) covering
+        the planned emission tier (caller merges into its call)."""
         kw: dict = {}
         if emit_tier in ("counts", "list"):
             kw["seed_thr"] = self.seed_row[:num_rows]
