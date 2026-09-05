@@ -64,7 +64,10 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.18
+# Capped below 0.6.17: its W4A16 MoE ultra-wide-FC2 override picks an fc2 tile
+# (tile_k=32) that its own force_tile_config re-validation rejects, aborting
+# CUDA-graph warmup on SM120/121 (nvbugs/6721561). Still broken in 0.6.18.post1.
+flashinfer-python==0.6.16.post4
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
