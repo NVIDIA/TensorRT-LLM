@@ -35,16 +35,22 @@ node's `kv_cache_config.host_cache_size`.
 
 import contextlib
 import time
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from tensorrt_llm.logger import logger
 
-from .config import DEFAULT_METADATA_SERVER
-from .master import local_address
+from .config import DEFAULT_METADATA_SERVER, parse_size
+from .master import (
+    local_address,
+    master_timeout,
+    resolve_master_address,
+    wait_for_master,
+)
 
 __all__ = [
     "DEFAULT_DONOR_LOCAL_BUFFER_SIZE",
     "donate_segment",
+    "maybe_donate_segment",
 ]
 
 #: A donor never transfers, but `setup` rejects a zero-sized transfer buffer.
@@ -130,3 +136,38 @@ def donate_segment(
             f"mooncake-store: withdrew the {donated} lent from {host}; the "
             "master will report blocks that lived there as lost"
         )
+
+
+@contextlib.contextmanager
+def maybe_donate_segment(donation: Any) -> Iterator[Optional[str]]:
+    """Lend memory for this process's lifetime if the config asked to.
+
+    Args:
+        donation: A `MooncakeDonationConfig`, or `None` to do nothing, so
+            callers need no condition of their own.
+
+    Yields the host the segment is registered under, or `None`.
+    """
+    if donation is None:
+        yield None
+        return
+
+    # Bringup blocks here on a master that may belong to a different job, so
+    # name the address before waiting on it.
+    logger.info(
+        "mooncake-store: mooncake_donation is set, so this server lends host "
+        f"memory to the pool at {donation.master_server_address} without using "
+        "it; resolving the master now"
+    )
+    master_address = resolve_master_address(donation.master_server_address, master_timeout())
+    # Checked before setup so an absent master is reported as such, rather than
+    # as the status code setup returns for every kind of failure.
+    wait_for_master(master_address)
+    with donate_segment(
+        master_server_address=master_address,
+        segment_size=parse_size(donation.segment_size),
+        protocol=donation.protocol,
+        device_name=donation.device_name,
+        metadata_server=donation.metadata_server,
+    ) as host:
+        yield host

@@ -4007,6 +4007,8 @@ class PyExecutor:
             self._defer_connector_load_cancellations()
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
+                if self._resume_preempted_request(req):
+                    continue
                 self._release_transfer(req)
             for req in self.kv_connector_manager.take_finished_load_terminations(
             ):
@@ -4034,6 +4036,26 @@ class PyExecutor:
                 if req_id != cancel_id
             ]
         self._terminate_request(request)
+
+    def _resume_preempted_request(self, request: LlmRequest) -> bool:
+        """Complete a preemption whose connector saves have now retired.
+
+        The scheduler preempts a request by handing it to the connector the
+        same way a finished request is handed over, so its pages stay put until
+        every rank reports the in-flight saves done. Both kinds come back
+        through `get_finished`, and only the KV cache manager knows which is
+        which.
+
+        Returns True when *request* was preempted rather than finished, in
+        which case its pages are now released and it is back in context state
+        awaiting a re-prefill.
+        """
+        if not self._is_kv_manager_v2:
+            return False
+        if not self.kv_cache_manager.try_complete_preemption(request):
+            return False
+        request.pause(self.max_input_len)
+        return True
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:

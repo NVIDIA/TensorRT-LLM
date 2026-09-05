@@ -1456,7 +1456,19 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
 
-            self.kv_cache_manager.preempt_request(victim)
+            if not self.kv_cache_manager.preempt_request(victim):
+                # A connector is still reading these pages, so they are not
+                # free yet and the victim keeps its cache and its state. The
+                # executor finishes the release once the saves retire; see
+                # PyExecutor._resume_preempted_request. Stopping here leaves
+                # one victim draining at a time, so the next pass finds those
+                # pages instead of giving up a second request's cache for
+                # nothing.
+                logger.debug(
+                    f"[V2Scheduler] Preemption of request {victim.py_request_id} "
+                    "deferred until its connector saves retire"
+                )
+                return False
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "
                 f"(state={victim.state.name})"
@@ -1538,7 +1550,14 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # A connector load in flight releases its pages when it lands, so a
         # pass that reclaims nothing while one is outstanding is not a stall.
-        if any(self._has_pending_connector_load(r) for r in active_requests):
+        # A preemption waiting on the connector's saves to retire is the same
+        # case from the other direction: those pages are already given up and
+        # arrive once the saves land, but the victim keeps its state until
+        # then, so nothing above can see them.
+        if (
+            any(self._has_pending_connector_load(r) for r in active_requests)
+            or self.kv_cache_manager.has_pending_preemption()
+        ):
             self._stalled_schedules = 0
             return
 

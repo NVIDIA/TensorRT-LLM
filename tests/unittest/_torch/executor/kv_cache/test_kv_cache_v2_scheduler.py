@@ -223,6 +223,8 @@ def make_kv_cache_manager(
     # The default here has a cache tier below GPU, which leaves preemption off.
     mgr.has_cache_tier_below_gpu = has_cache_tier_below_gpu
     mgr.preempt_request.side_effect = lambda req: True
+    # A bare Mock would answer truthily and suppress every stall check.
+    mgr.has_pending_preemption.return_value = False
     return mgr
 
 

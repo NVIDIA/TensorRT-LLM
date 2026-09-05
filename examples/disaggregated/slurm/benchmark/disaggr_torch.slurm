@@ -138,6 +138,26 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
+# The Mooncake store bindings, when a worker config asks for the connector.
+# Images built from this repo bake them in (docker/common/install_mooncake.sh),
+# so this only confirms they are there: a job that discovers the gap later
+# fails once per rank, deep in engine startup.
+mooncake_enabled=false
+if grep -qs "mooncake-store" "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; then
+    mooncake_enabled=true
+    # Both halves of the wheel are checked because they fail at different
+    # times: the connector needs mooncake.store in every context rank, and
+    # 'trtllm-serve mooncake_master' needs the binary on PATH.
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N 1 -n 1 \
+        bash -c 'python3 -c "import mooncake.store" && command -v mooncake_master' \
+        &> ${full_logdir}/2_check_mooncake.log; then
+        cleanup_on_failure "A worker config requests the mooncake-store connector, but this image has neither the mooncake.store bindings nor the mooncake_master binary. Build the image from this repo so that docker/common/install_mooncake.sh runs. Check ${full_logdir}/2_check_mooncake.log for details"
+    fi
+    echo "Mooncake store bindings found in the image"
+fi
+
 # Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
@@ -153,6 +173,20 @@ replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_co
 client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"
+
+# The pool is described in the worker configs and provisioned by trtllm-serve
+# during its own bringup: the context server starts the master, renders the
+# client config and publishes the master's address, and the generation servers
+# read that address to lend the pool their memory. Nothing here starts, waits
+# for or configures any of it.
+#
+# The one value a config written before submission cannot know is this job's log
+# directory, which the master's address is published into, so a __LOG_DIR__
+# placeholder in either worker config is filled in here.
+if [ "${mooncake_enabled}" = "true" ]; then
+    sed -i "s|__LOG_DIR__|${full_logdir}|g" \
+        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"
+fi
 
 # Per-worker hostfile / gpu_map files for srun --distribution=arbitrary.
 # submit.py emits *_base.txt with <nodeN_placeholder>; rewrite them here.
@@ -176,6 +210,20 @@ cat ${start_server_cmds_file} | while read cmd; do
 done
 echo "Server is ready!"
 
+# A connector that failed to open its store handle does not stop the worker from
+# serving, it just never hits, so surface the startup lines here rather than
+# leaving them to be discovered after the benchmark. The registration line
+# carries the bytes/page figure the pool sizing depends on.
+if [ "${mooncake_enabled}" = "true" ]; then
+    echo "Mooncake store startup lines from the context workers:"
+    if ! grep -h "mooncake-store" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null; then
+        echo "  WARNING: no mooncake-store lines found. The connector may not have" \
+             "loaded; check ${full_logdir}/3_output_CTX_*.log and" \
+             "${full_logdir}/mooncake_master.log. The benchmark will still run," \
+             "but without the store."
+    fi
+fi
+
 # Start client commands
 echo "Starting client commands from ${client_cmds_file}..."
 while read -r cmd <&3; do
@@ -185,6 +233,78 @@ while read -r cmd <&3; do
         cleanup_on_failure "Command failed: ${cmd}."
     fi
 done 3< "${client_cmds_file}"
+
+# Collect the store's traffic into one file. The per-event lines live at DEBUG
+# in the worker logs (module _torch), so this is only populated when a config
+# asks for that verbosity. The counts are what show the store did work rather
+# than merely started.
+if [ "${mooncake_enabled}" = "true" ]; then
+    mooncake_summary="${full_logdir}/9_mooncake_summary.log"
+    {
+        # The address file is retracted when the master stops, so fall back to
+        # the context server's log, which still names the master the run used.
+        echo "master: $(tr -d '[:space:]' < "${full_logdir}/master.addr" 2>/dev/null \
+            || grep -hoE "master at [0-9.]+:[0-9]+" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
+               | head -n 1 | awk '{print $3}' || echo unknown)"
+        echo
+        echo "== startup =="
+        grep -h "mooncake-store.*\(ready\|registered layout\)" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null || echo "(none)"
+        echo
+        echo "== event counts =="
+        for pattern in "matched" "loaded" "failed to load" "failed to save" \
+                       "lookup failed" "could not reserve connector prefix"; do
+            count=$(grep -h "mooncake-store.*${pattern}" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null | wc -l || true)
+            echo "${pattern}: ${count}"
+        done
+        echo
+        # Where the blocks physically went. The master names a segment for
+        # every allocation and a segment is one client process's donated
+        # memory, so grouping by segment host shows how much of the pool lives
+        # on a decode node rather than on the prefill node that computed it.
+        # Without a donor this section shows only the prefill node.
+        echo "== block placement by segment host =="
+        echo "(lending hosts: $(grep -hoE "GiB of [0-9.]+ is now part of the pool" \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null \
+            | awk '{print $3}' | sort -u | paste -sd, - || echo none))"
+        grep -o "allocation_succeeded size=[0-9]* segment=[0-9.]*:[0-9]*" \
+            "${full_logdir}/mooncake_master.log" 2>/dev/null \
+            | awk '{
+                    sub(/size=/, "", $2); sub(/segment=/, "", $3);
+                    split($3, parts, ":"); host = parts[1]; port = parts[2];
+                    allocs[host]++; bytes[host] += $2;
+                    if (!((host, port) in seen)) {
+                        seen[host, port] = 1;
+                        segs[host] = segs[host] " " port;
+                    }
+                    total_allocs++; total_bytes += $2;
+                }
+                END {
+                    if (total_allocs == 0) { print "(no allocations)"; exit }
+                    for (h in allocs) {
+                        printf "%-16s pages=%-7d %8.2f GiB  %5.1f%% of pool contents  segments:%s\n",
+                            h, allocs[h], bytes[h] / 1073741824,
+                            100 * bytes[h] / total_bytes, segs[h];
+                    }
+                    printf "%-16s pages=%-7d %8.2f GiB\n", "TOTAL", total_allocs, total_bytes / 1073741824;
+                }' || echo "(could not parse master log)"
+        echo
+        # Lending memory happens inside the generation servers, so their own
+        # logs are where a segment that never mounted shows up.
+        echo "== lent segments =="
+        grep -h "mooncake-store: .*\(lending memory\|part of the pool\|withdrew\)" \
+            "${full_logdir}"/3_output_GEN_*.log 2>/dev/null || echo "(none)"
+        echo
+        echo "== pool bringup (context server) =="
+        grep -h "mooncake-store:" "${full_logdir}"/3_output_CTX_*.log 2>/dev/null \
+            | head -n 30 || echo "(none)"
+        echo
+        # The master's own glog output, not anything TensorRT-LLM writes.
+        echo "== master =="
+        tail -n 50 "${full_logdir}/mooncake_master.log" 2>/dev/null || echo "(no master log)"
+    } > "${mooncake_summary}" 2>&1
+    echo "Mooncake store summary written to ${mooncake_summary}"
+    cat "${mooncake_summary}"
+fi
 
 echo "Job completed successfully, total runtime: $SECONDS seconds"
 

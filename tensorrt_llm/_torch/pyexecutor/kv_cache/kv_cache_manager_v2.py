@@ -1433,6 +1433,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
             # to spill to, which a connector run never uses, so drop it here; an
             # explicitly configured host_cache_size is rejected at bring-up.
+            #
+            # That leaves the scheduler without a tier to spill to, where
+            # suspension frees nothing, so pages are reclaimed by preemption
+            # instead. See KVCacheManagerV2.preempt_request.
             host_quota = 0
             logger.info(
                 "KV cache manager v2 host tier disabled: a KV connector is attached "
@@ -1747,6 +1751,12 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
+        # Requests whose pages a connector is still reading from, so the
+        # release half of `preempt_request` has to wait.
+        self._pending_preemption: Dict[int, LlmRequest] = {}
+        # Requests whose pages a connector is still reading from, so the
+        # release half of `preempt_request` has to wait.
+        self._pending_preemption: Dict[int, LlmRequest] = {}
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
@@ -3790,6 +3800,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """True when a suspended page has somewhere to be evicted to."""
         return len(self.impl.cache_tier_list) > 1
 
+    def has_pending_preemption(self) -> bool:
+        """True while a deferred preemption is still waiting on a connector."""
+        return bool(self._pending_preemption)
+
     def preempt_request(self, req: LlmRequest) -> bool:
         """Give up *req*'s KV cache so its pages can be reclaimed.
 
@@ -3801,17 +3815,55 @@ class KVCacheManagerV2(BaseResourceManager):
         space.
 
         The request is reset to context state by the caller and re-prefills
-        whatever it can no longer match.
+        whatever it can no longer match. With a connector attached, blocks it
+        already wrote to the store come back through the ordinary prefix load,
+        and recompute is the fallback when the store no longer has them.
 
         Returns whether the pages were released. Callers must check: pages
         still being read out of, such as by a connector save in flight, are
-        not released until that completes.
+        not released until that completes. Freeing them now would let a later
+        request overwrite the bytes mid-transfer and publish them under a valid
+        hash, so callers must not count on the pages until
+        :meth:`try_complete_preemption` has run for this request.
         """
+        if self.kv_connector_manager is None or self.is_draft:
+            self._release_preempted(req)
+            return True
+
+        by_layer_group = self.get_page_indices_by_layer_group(req)
+        cache_block_ids = by_layer_group[0] if len(by_layer_group) == 1 else []
+        # The same handshake the finish path uses: the request lands in
+        # DISAGG_CONTEXT_TRANS_IN_PROGRESS, out of the schedulable range, and
+        # its `_KVCache` keeps holding the pages until every rank reports the
+        # save retired through `get_finished`.
+        if self.kv_connector_manager.request_finished(req, cache_block_ids, by_layer_group):
+            self._pending_preemption[req.py_request_id] = req
+            return False
+
+        self._release_preempted(req)
+        return True
+
+    def try_complete_preemption(self, req: LlmRequest) -> bool:
+        """Release pages for a request whose deferred preemption just cleared.
+
+        Returns False when *req* was not awaiting preemption, which is how the
+        caller tells a preempted request apart from an ordinary finished one in
+        the connector's `get_finished` output.
+        """
+        if self._pending_preemption.pop(req.py_request_id, None) is None:
+            return False
         self._release_preempted(req)
         return True
 
     def _release_preempted(self, req: LlmRequest) -> None:
         self.free_resources(req)
+        # Ask the connector again on re-admission rather than reusing the
+        # memoised offer, since the store now has more of this prefix than it
+        # did when the request was first admitted.
+        req.py_connector_prefix_start = None
+        req.py_connector_prefix_end = None
+        req.py_connector_load_async = False
+        req.py_connector_delivered = False
         req.py_num_connector_matched_tokens = 0
 
     # ---- prepare_resources ----
@@ -5219,6 +5271,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        # A request awaiting preemption can still be cancelled or fail while
+        # its saves drain. Dropping the entry here keeps a dead request from
+        # blocking every later preemption through has_pending_preemption.
+        self._pending_preemption.pop(request.py_request_id, None)
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
             if self.kv_connector_manager.has_pending_load(request):

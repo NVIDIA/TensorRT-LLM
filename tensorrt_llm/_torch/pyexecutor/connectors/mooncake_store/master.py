@@ -43,12 +43,14 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from tensorrt_llm.logger import logger
 
+from ..registry import uses_connector
 from .config import CLIENT_CONFIG_NAME, CONFIG_PATH_ENV, DEFAULT_METADATA_SERVER, RUN_DIR_ENV
 
 __all__ = [
     "PoolSpec",
     "local_address",
     "master_timeout",
+    "maybe_provision_pool",
     "provision_pool",
     "resolve_master_address",
     "running_master",
@@ -607,3 +609,31 @@ def _check_exactly_one_master(pool: PoolSpec) -> None:
             "address a master elsewhere published, set master_server_address "
             "to file://<path>."
         )
+
+
+@contextlib.contextmanager
+def maybe_provision_pool(kv_connector_config: Any) -> Iterator[None]:
+    """Provision the pool if this deployment asked the server to.
+
+    A no-op for every other connector, and for a `mooncake-store` config that
+    left `mooncake_store` unset, since such a deployment is told about its pool
+    through `MOONCAKE_CONFIG_PATH` instead.
+
+    Args:
+        kv_connector_config: A `KvCacheConnectorConfig`, or `None` to do
+            nothing, so callers need no condition of their own.
+    """
+    if not uses_connector(kv_connector_config, "mooncake-store"):
+        yield
+        return
+
+    pool = kv_connector_config.mooncake_store
+    if pool is None:
+        yield
+        return
+
+    # `MooncakeStoreConfig` is the user-facing spelling of the same settings,
+    # so the two are matched by field name. `model_key` is left out of it
+    # deliberately; see `MooncakeStoreConnectorConfig.resolve_model_key`.
+    with provision_pool(PoolSpec.from_json({}, **pool.model_dump())):
+        yield
