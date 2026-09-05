@@ -51,7 +51,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
     GenTransferStatus,
     KvCacheTransceiver,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -329,8 +329,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             window_size = lg.sliding_window_size
 
             if window_size is not None:
+                draft_len = get_draft_token_length(req) if is_gen_only else 0
                 allocated_blocks = (
-                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
+                    req.prompt_len
+                    + draft_len
+                    + self._kv_cache_manager.num_extra_kv_tokens
+                    + tpb
+                    - 1
                 ) // tpb
                 beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
                     block_ids,
