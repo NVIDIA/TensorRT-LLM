@@ -76,6 +76,7 @@ from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
+from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -947,6 +948,9 @@ class PyExecutor:
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
         self._fill_admit_cap: int = 0
+        # Optional GPU keepalive for the fill gate (TRTLLM_GPU_KEEPALIVE=1).
+        # Allocates nothing here; its device side is set up at its first tick.
+        self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -2510,6 +2514,11 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+
+        # The loop may exit while the benchmark fill gate is still closed.
+        keepalive = getattr(self, "_gpu_keepalive", None)
+        if keepalive is not None:
+            keepalive.close()
 
         for i in range(self.num_micro_batches):
             try:
@@ -4126,7 +4135,9 @@ class PyExecutor:
         A short sleep (0.1s) yields the CPU between retries that made no
         transfer progress while keeping the polling interval short enough to
         avoid KV transfer backpressure on the CTX server. Retries that complete
-        a transfer do not sleep.
+        a transfer do not sleep. With ``TRTLLM_GPU_KEEPALIVE=1`` every closed
+        retry also queues a short GPU keepalive chunk, so the GPU does not read
+        idle for the whole wait; the chunks are drained when the gate opens.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -4142,13 +4153,19 @@ class PyExecutor:
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch, transfer_made_progress)
             transfer_made_progress = self._benchmark_transfer_progress_global
+            keepalive = getattr(self, "_gpu_keepalive", None)
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
                 self._benchmark_completed_gen_transfer_ids.clear()
-            elif not transfer_made_progress:
-                time.sleep(0.1)
+                if keepalive is not None:
+                    keepalive.drain()
+            else:
+                if keepalive is not None:
+                    keepalive.tick()
+                if not transfer_made_progress:
+                    time.sleep(0.1)
             if not can_forward:
                 self._fail_if_fill_gate_stalled(transfer_made_progress)
                 return can_forward, True
