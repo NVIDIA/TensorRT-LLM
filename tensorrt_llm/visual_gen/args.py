@@ -45,7 +45,7 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / CUTEDSL / CUDNN backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
@@ -61,10 +61,13 @@ class QuantAttentionConfig(StrictBaseModel):
             "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
         ),
     )
-    v_dtype: Literal["fp8"] = Field(
+    v_dtype: Literal["fp8", "mxfp8"] = Field(
         "fp8",
         status="prototype",
-        description="V quantization dtype. The current kernels always load V in FP8 (e4m3).",
+        description=(
+            "V quantization format. fp8 is the 8-bit floating-point element format; mxfp8 is "
+            "the block-scaled format."
+        ),
     )
     q_block_size: int = Field(
         0,
@@ -98,16 +101,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL", "CUDNN"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL, CUDNN",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / CUTEDSL / CUDNN backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -130,6 +133,11 @@ class AttentionConfig(StrictBaseModel):
             ("int8", "fp8", (1, 16, 1)),
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
+        }
+        # cuDNN fused SDPA quantizes both GEMMs with the same element format.
+        CUDNN_RECIPES = {
+            ("fp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "mxfp8", (0, 0, 0)),
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
@@ -171,9 +179,18 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(CUTEDSL_RECIPES)}."
                 )
+        elif self.backend == "CUDNN":
+            if recipe not in CUDNN_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='CUDNN'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUDNN_RECIPES)}. Omit quant_attention_config to run "
+                    f"unquantized attention."
+                )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL', 'CUDNN'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )
