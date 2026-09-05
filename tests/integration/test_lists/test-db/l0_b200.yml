@@ -273,6 +273,7 @@ l0_b200:
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
+  - unittest/_torch/cute_dsl_kernels/test_nvfp4_conv3d.py
   - unittest/_torch/visual_gen/test_media_decode.py
   - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
@@ -288,6 +289,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
   - unittest/_torch/visual_gen/test_model_loader.py
+  - unittest/_torch/visual_gen/test_fp4_conv_autotuner.py
   - unittest/_torch/visual_gen/test_flux_transformer.py
   - unittest/_torch/visual_gen/test_flux_attention.py
   - unittest/_torch/visual_gen/test_flux_pipeline.py
@@ -303,6 +305,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
   - unittest/_torch/visual_gen/test_wan_dup_up3d.py
   - unittest/_torch/visual_gen/test_wan_vae.py
+  - unittest/_torch/visual_gen/test_wan_vae_fp4.py
   - unittest/_torch/visual_gen/test_wan_vae_halo.py
   - unittest/_torch/visual_gen/test_fastwan_dmd_math.py
   - unittest/_torch/visual_gen/test_fastwan_pipeline.py
