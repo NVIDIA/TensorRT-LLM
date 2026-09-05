@@ -1558,6 +1558,18 @@ def pytest_addoption(parser):
         "Only used with --periodic-junit.",
     )
     parser.addoption(
+        "--periodic-unfinished-test-path",
+        action="store",
+        default=None,
+        help=
+        "Override the unfinished_test.txt location (default: alongside "
+        "--periodic-junit-xmlpath). Use this to make a rerun attempt that writes "
+        "its results XML elsewhere still share the original attempt's "
+        "unfinished_test.txt, so a crash during the rerun itself is recorded in "
+        "the same place the caller checks for unresolved crashes. Only used "
+        "with --periodic-save-unfinished-test.",
+    )
+    parser.addoption(
         "--periodic-hang-traceback",
         action="store_true",
         default=False,
@@ -1698,6 +1710,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_unfinished_test_path = config.getoption(
+            "--periodic-unfinished-test-path", default=None)
         periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
                                                    default=False)
 
@@ -1717,6 +1731,7 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
         )
 

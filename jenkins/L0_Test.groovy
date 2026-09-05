@@ -492,11 +492,12 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
+def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
     def rerunFailed = false
+    def hasUnrerunFailure = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -532,6 +533,38 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
                 }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
+            } else {
+                // unfinished_test.txt is shared across the whole stage, so match
+                // by this test's own name instead of just checking file presence.
+                // isolateTestName may still carry a " TIMEOUT (N)" / " ISOLATION"
+                // suffix (processShardTestList only strips the ISOLATION token,
+                // not a chained TIMEOUT one), but unfinished_test.txt stores the
+                // bare pytest nodeid, so strip it the same way test_rerun.py does.
+                def bareTestName = isolateTestName.split(/ TIMEOUT | ISOLATION/)[0]
+                def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                // conftest.py rewrites item._nodeid to "${test_prefix}/${nodeid}"
+                // (--test-prefix=${stageName}), so that's the line periodic_junit.py
+                // actually writes here — match the full prefixed form, not just the name.
+                def isTestUnfinished = fileExists(unfinishedTestFile) &&
+                    sh(script: "grep -Fxq -- '${stageName}/${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                if (isTestUnfinished) {
+                    // Record this crash as a JUnit <testcase> like the regular-test
+                    // path does. hasUnrerunFailure stays untouched here: it drives
+                    // the duration/no-signature message below, which doesn't apply.
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
+                    }
+                } else if (fileExists("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                    // Same duration/no-signature gap as the regular-test path: this
+                    // finished but failed, and was never actually rerun, so
+                    // results_isolated_${i}.xml still carries the original
+                    // <failure> with nothing here to flag it.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                    }
+                    hasUnrerunFailure = true
+                }
             }
         } finally {
             // Clean up the temporary test file
@@ -545,8 +578,13 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
             error "One or more isolated tests failed after rerun attempts"
         }
     }
+    if (hasUnrerunFailure) {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
+        }
+    }
 
-    return rerunFailed  // Return the updated value
+    return [rerunFailed: rerunFailed, hasUnrerunFailure: hasUnrerunFailure]
 }
 
 def getInfraDryRunPytestTargets(testListPath) {
@@ -1644,6 +1682,9 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
+        // flag unchanged, so every attempt shares one unfinished_test.txt.
+        "--periodic-unfinished-test-path=${outputPath}/unfinished_test.txt",
         "--periodic-hang-traceback",
     ]
 
@@ -4364,8 +4405,12 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 // Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        echo "There is no ${resultFileName} file, skip the rerun step"
-        return true
+        // No results were ever flushed (e.g. the process was killed before any
+        // test finished reporting). test_rerun.py treats a missing xml as "no
+        // tests ran" and falls back to unfinished_test.txt / the original test
+        // list to classify each test, so keep going instead of assuming a
+        // rerun already failed.
+        echo "There is no ${resultFileName} file; falling back to unfinished/not-run classification for ${testType}"
     }
 
     // Create rerun directory structure to avoid conflicts
@@ -4531,6 +4576,7 @@ def generateRerunReport(stageName, llmSrc) {
     // Collect all original and rerun result files
     def allInputFiles = []
 
+    // ---- Regular test results ----
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
@@ -4539,7 +4585,18 @@ def generateRerunReport(stageName, llmSrc) {
             rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
         }
     }
+    // Add regular rerun results
+    if (hasRegularReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+                rerunResultFiles.add(rerunFile)
+            }
+        }
+    }
 
+    // ---- Isolated test results ----
     // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
@@ -4548,26 +4605,15 @@ def generateRerunReport(stageName, llmSrc) {
                 allInputFiles.add(file.trim())
             }
         }
-        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
-        isolatedTestsWithReruns.each { isolatedTest ->
-            if (fileExists(isolatedTest.originalResult)) {
-                rerunResultFiles.add(isolatedTest.originalResult)
-                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-            }
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    rerunResultFiles.add(rerunFile)
-                }
-            }
-        }
     }
-
-    // Add regular rerun results
-    if (hasRegularReruns) {
+    // Add isolated rerun results
+    isolatedTestsWithReruns.each { isolatedTest ->
+        if (fileExists(isolatedTest.originalResult)) {
+            rerunResultFiles.add(isolatedTest.originalResult)
+            echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+        }
         for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
                 rerunResultFiles.add(rerunFile)
@@ -5079,6 +5125,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
+        def hasUnrerunFailure = false
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -5270,18 +5317,33 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (Exception e) {
                         def isRerunFailed = rerunFailedTests(
                             stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
+                        // Unconditional: a test can crash again during the rerun itself
+                        // (isRerunFailed=true), and unfinished_test.txt is the only
+                        // record of that crash. junit()'s "results*.xml" glob picks up
+                        // results-timeout.xml directly, so this is what surfaces it.
+                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
                         if (isRerunFailed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                        } else if (hadUnfinishedTests) {
                             // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
+                        } else if (fileExists("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                            // Failures that finished (not a timeout) but were never
+                            // rerun because duration > 10 min and no known failure
+                            // signature matched: results.xml still carries their
+                            // original <failure>, but neither branch above fires for
+                            // them, so without this the stage silently reports green.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                            }
+                            hasUnrerunFailure = true
                         }
                     }
 
@@ -5289,8 +5351,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     if (preprocessedLists.isolateCount > 0) {
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(
-                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag) || rerunFailed
+                            def isolatedResult = runIsolatedTests(
+                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag)
+                            rerunFailed = isolatedResult.rerunFailed || rerunFailed
+                            hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -5333,6 +5397,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
+        }
+
+        if (hasUnrerunFailure) {
+            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
 
         if (perfMode) {
