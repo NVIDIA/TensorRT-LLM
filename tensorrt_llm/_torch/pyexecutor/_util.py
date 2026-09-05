@@ -955,7 +955,7 @@ class KvCacheCreator:
         return [MultimodalParams(multimodal_data=mm_data)]
 
     def _encode_dummy_inputs(self) -> Optional[torch.Tensor]:
-        """Run the full-budget MM encoder and retain request-owned output storage."""
+        """Run the full-budget MM encoder and retain equivalent store output."""
         if not self._dummy_encoder_inputs:
             return None
 
@@ -975,7 +975,7 @@ class KvCacheCreator:
                     )
                 output = self._model_engine.model.encode_multimodal_inputs(
                     encoder_inputs)
-                # Runtime item state owns detached copies rather than views of
+                # The runtime store owns detached copies rather than views of
                 # an encoder batch. Reproduce that allocation boundary here.
                 return output.detach().clone()
         finally:
@@ -984,20 +984,11 @@ class KvCacheCreator:
     def _get_multimodal_encoder_memory_reserve(self,
                                                profiled_output_bytes: int = 0
                                                ) -> int:
-        """Return output and cache capacity absent from the measured peak."""
-        output_budget = getattr(self._model_engine,
-                                "mm_encoder_output_budget_bytes", None)
-        unprofiled_output_bytes = max(0, (output_budget or 0) -
-                                      profiled_output_bytes)
-
-        model = self._model_engine.model
-        cache_bytes = 0
-        if (isinstance(model, MultimodalModelMixin)
-                and model.encoder_cache_active
-                and model.model_config.multimodal_config is not None):
-            cache_bytes = (
-                model.model_config.multimodal_config.encoder_cache_max_bytes)
-        return unprofiled_output_bytes + cache_bytes
+        """Return unified encoder-store capacity absent from the measured peak."""
+        encoder_cache = self._model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            return 0
+        return max(0, encoder_cache.max_bytes - profiled_output_bytes)
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -1221,7 +1212,7 @@ class KvCacheCreator:
 
         if py_executor is not None and not self._skip_est:
             # Run the MM encoder at its independent token budget, then keep the
-            # resulting request-owned embeddings resident while the text-only
+            # equivalent cache-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
             if encoder_profile_output is not None:
@@ -3384,7 +3375,8 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if getattr(model_engine, "mm_encoder_item_scheduling_enabled", False):
+    if (getattr(model_engine, "mm_encoder_item_scheduling_enabled", False)
+            and model_engine.mapping.is_first_pp_rank()):
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
         multimodal_config = llm_args.multimodal_config
@@ -3397,13 +3389,19 @@ def create_py_executor_instance(
             logger.info("Eager multimodal encoder scheduling is enabled for "
                         "capacity-rejected active requests.")
             scheduler_cls = MultimodalEagerEncoderScheduler
+        encoder_cache = model_engine.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM encoder item scheduling requires its unified output cache")
         scheduler = scheduler_cls(
             scheduler,
             max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
-            output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
+            encoder_cache=encoder_cache,
+            get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
+            retain_cache_entries=model_engine.model.encoder_cache_active,
         )
 
     config = model_engine.model.model_config.pretrained_config
