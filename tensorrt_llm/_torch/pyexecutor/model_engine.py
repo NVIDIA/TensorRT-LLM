@@ -46,11 +46,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..attention_backend.interface import (AttentionMetadata,
-                                           AttentionRuntimeFeatures)
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
-from ..attention_backend.utils import get_attention_backend
-from ..attention_backend.vanilla import VanillaAttentionMetadata
+from ..attention.backends.interface import (AttentionMetadata,
+                                            AttentionRuntimeFeatures)
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.utils import get_attention_backend
+from ..attention.backends.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
@@ -1566,7 +1566,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+            from tensorrt_llm._torch.attention.backends.sparse.dsa import (
                 _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
         except ImportError:
             return
@@ -1638,7 +1638,7 @@ class PyTorchModelEngine(ModelEngine):
         No-op on non-DSA models. See nvbugs/6482566.
         """
         try:
-            from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+            from ..attention.backends.sparse.deepseek_v4.deepseek_v4 import \
                 DeepseekV4Indexer
         except ImportError:
             return
@@ -1691,7 +1691,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from ..attention_backend.sparse.dsa import \
+            from ..attention.backends.sparse.dsa import \
                 DSAtrtllmAttentionMetadata
         except ImportError:
             return
@@ -2951,10 +2951,6 @@ class PyTorchModelEngine(ModelEngine):
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
 
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
         # those allocations can be reused during stable inference.
@@ -3928,15 +3924,15 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(
-                    self.dist.tp_cp_allgather(num_tokens, small_payload=True))
-            return list(self.dist.tp_allgather(num_tokens, small_payload=True))
+                return self.dist.tp_cp_allgather_int64([num_tokens
+                                                        ])[:, 0].tolist()
+            return self.dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(
-                self.dist.tp_allgather(num_ctx_requests, small_payload=True))
+            return self.dist.tp_allgather_int64([num_ctx_requests])[:,
+                                                                    0].tolist()
         return None
 
     def _get_all_rank_num_tokens_and_spec_counts(
@@ -3949,16 +3945,14 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
             # two exchanges separate.
-            gathered = self.dist.tp_cp_allgather(list(spec_counts),
-                                                 small_payload=True)
+            gathered = self.dist.tp_cp_allgather_int64(list(spec_counts))
             return (self._get_all_rank_num_tokens(attn_metadata),
-                    [list(col) for col in zip(*gathered)])
+                    gathered.T.tolist())
         num_tokens = attn_metadata.num_tokens
         if self.mapping.has_cp_helix():
             num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts],
-                                             small_payload=True)
-        cols = [list(col) for col in zip(*gathered)]
+        gathered = self.dist.tp_cp_allgather_int64([num_tokens, *spec_counts])
+        cols = gathered.T.tolist()
         return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
@@ -3981,8 +3975,8 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
-        spec_metadata.group_all_greedy_sample = all(all_flags)
+        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
         # key reads the flag next -- the stored override only takes effect on
@@ -4045,10 +4039,9 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_prefill_cuda_graph = (has_ctx_requests
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
-                all_ranks_can_run_prefill_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_prefill_cuda_graph,
-                                           small_payload=True))
-                if all(all_ranks_can_run_prefill_cuda_graph):
+                # Inputs are rank-uniform, so the flag already agrees on
+                # every rank.
+                if can_run_prefill_cuda_graph:
                     padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
                     logger.debug(
@@ -4190,6 +4183,20 @@ class PyTorchModelEngine(ModelEngine):
         model = getattr(self.model, "_orig_mod", self.model)
         top_level_model = getattr(model, "model", model)
         return getattr(top_level_model, "_orig_mod", top_level_model)
+
+    @functools.cached_property
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
+        top_level_model = self._get_top_level_model()
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
 
     def _get_position_id_offset(self) -> int:
         offset = getattr(self._get_top_level_model(), "position_id_offset", 0)
@@ -6746,10 +6753,10 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                all_rank_num_tokens = self.dist.tp_cp_allgather_int64([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths), spec_metadata.num_generations
-                ])
+                ]).tolist()
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -6758,8 +6765,8 @@ class PyTorchModelEngine(ModelEngine):
                     [item[2] for item in all_rank_num_tokens],
                     [item[3] for item in all_rank_num_tokens])
             else:
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    attn_metadata.num_tokens)
+                all_rank_num_tokens = self.dist.tp_cp_allgather_int64(
+                    [attn_metadata.num_tokens])[:, 0].tolist()
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None
@@ -7484,7 +7491,10 @@ class PyTorchModelEngine(ModelEngine):
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
                 and not self.llm_args.mm_encoder_only
-                and self.mapping.cp_size == 1):
+                # PLE owns recurrent n-gram and convolution state. Promoting a
+                # fresh final-context row would skip its cache-slot reset.
+                and not self._model_uses_ple_recurrent_state and
+                self.mapping.cp_size == 1):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(
                     scheduled_requests,

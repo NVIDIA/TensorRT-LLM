@@ -95,6 +95,14 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
+  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
+  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
+  # is what picks them up:
+  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
+  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
+  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
+  #               rebind mpi4py's serializer at import time, which applies process-wide on
+  #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
@@ -141,15 +149,12 @@ l0_b200:
   - unittest/_torch/modeling/test_kimi_k3_fp8_weight_read_gates.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
-  - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
-  - unittest/_torch/modules/fused_ops/test_fused_qk_norm_rope_gate.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
   - unittest/_torch/modules/test_fp4_num_tokens_slice.py
@@ -157,7 +162,6 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
-  - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules

@@ -19,7 +19,6 @@ from functools import partial
 from pathlib import Path
 
 import click
-import yaml
 from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
@@ -184,18 +183,6 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
-@optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT LLM engine.")
-@optgroup.option(
-    "--medusa_choices",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
-    default=None,
-    required=False,
-    help="Path to a YAML file that defines the Medusa tree.",
-)
 @optgroup.group("Reporting Options",
                 help="Options for reporting benchmark results.",
                 cls=OptionGroup)
@@ -239,8 +226,6 @@ def latency_command(
             "the deadline can be applied and the full dataset would run. Pass "
             "--concurrency N.")
 
-    # Speculative Decode Options
-    medusa_choices = params.get("medusa_choices")
     custom_tokenizer: str = params.get("custom_tokenizer", None)
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
@@ -316,12 +301,6 @@ def latency_command(
 
     exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
     exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
-
-    # Decoding Options
-    if medusa_choices is not None:
-        with open(medusa_choices, "r") as medusa_yml:
-            exec_settings["decoding_config"]["medusa_choices"] = \
-                yaml.load(medusa_yml, Loader=yaml.SafeLoader)
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)

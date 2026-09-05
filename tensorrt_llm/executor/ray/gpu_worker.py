@@ -30,7 +30,6 @@ from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 
 from ... import TorchLlmArgs
-from ...bindings import executor as tllm
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
@@ -228,7 +227,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         self,
         device_id: int,
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -243,7 +241,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         super().__init__(
             engine=engine,
-            executor_config=executor_config,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -345,7 +342,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             self.engine.shutdown()
             self.engine = None
 
-            assert self._executor_config is None, "An empty executor_config is expected in shutdown when LLM arguments are defined."
             if (self.llm_args.backend == "pytorch"
                     and hasattr(self, "checkpoint_loader")
                     and self.checkpoint_loader is not None):

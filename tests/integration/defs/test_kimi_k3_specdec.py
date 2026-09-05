@@ -3,11 +3,13 @@
 """Kimi K3 SA (suffix automaton) spec-dec integration test (truncated model).
 
 Runs the kimi_k3_sa_harness (same directory) on the first 4 layers (KDA +
-the first MLA layer) with SA spec dec and logits-parity checking: baseline
-and spec logprobs must agree along the shared output prefix (hard failure
-on drift — the state-bug signature), while non-tie divergences only warn
-(benign reduction-order rounding flips argmax on truncated-model noise
-logits; see the harness docstring).
+the first MLA layer) with SA spec dec and logits-parity checking.
+Spec dec does not support returning logprobs, so the comparison is
+one-sided (harness docstring, KIMI_K3_SPEC_PARITY): each trajectory's first
+divergence from the baseline must be a near-tie in the BASELINE
+distribution. A single non-tie only warns (benign reduction-order rounding
+flips argmax on truncated-model noise logits), but non-ties dominating in
+aggregate hard-fails.
 
 Requirements: 4 GPUs and the Kimi K3 checkpoint (env KIMI_K3_CKPT or
 <LLM_MODELS_ROOT>/Kimi-K3). Fails — deliberately does not skip — when the
