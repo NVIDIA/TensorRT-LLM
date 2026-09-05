@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Union
@@ -448,6 +449,25 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         return (hasattr(_core, "trtllm_bf16_moe")
                 and hasattr(_core, "trtllm_bf16_routed_moe"))
 
+    @staticmethod
+    def _flashinfer_supports_valid_dims() -> bool:
+        """Whether the installed FlashInfer honours unpadded ("valid") MoE dimensions.
+
+        FlashInfer gained ``valid_hidden_size`` / ``valid_intermediate_size`` in
+        flashinfer-ai/flashinfer#2482, which lets the trtllm-gen kernels clamp to the
+        unpadded extents instead of contracting over the padding. Probe the signature
+        rather than a version string so this keeps working across releases.
+        """
+        try:
+            from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+        except (ImportError, ModuleNotFoundError):
+            return False
+        try:
+            params = inspect.signature(trtllm_fp4_block_scale_moe).parameters
+        except (TypeError, ValueError):
+            return False
+        return "valid_hidden_size" in params and "valid_intermediate_size" in params
+
     def _is_unquantized_path(self) -> bool:
         return self.quant_config is None or not self.quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True)
@@ -498,15 +518,23 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if mode.has_w4a8_nvfp4_fp8() or mode.has_w4a8_mxfp4_fp8():
             return False
 
-        # These quant modes require alignment and no bias
+        # These quant modes historically required alignment and no bias. Both
+        # restrictions were FlashInfer limitations rather than kernel ones:
+        #   * bias was restored in flashinfer-ai/flashinfer#3416;
+        #   * unpadded hidden/intermediate sizes are handled by the valid-dims
+        #     support added in flashinfer-ai/flashinfer#2482, which this backend
+        #     now forwards (see FlashinferOpBackend.run_fp4_block_scale_moe).
+        # #3416 predates #2482, so a FlashInfer exposing valid dims necessarily
+        # carries the bias fix; one probe therefore gates both.
         if mode.has_nvfp4() or mode.has_w4a16_mxfp4(
         ) or mode.has_w4a8_mxfp4_mxfp8():
-            if self.bias:
-                return False
-            if self.intermediate_size_per_partition % quant_method.weight_alignment != 0:
-                return False
-            if self.hidden_size % quant_method.input_hidden_alignment != 0:
-                return False
+            if not self._flashinfer_supports_valid_dims():
+                if self.bias:
+                    return False
+                if self.intermediate_size_per_partition % quant_method.weight_alignment != 0:
+                    return False
+                if self.hidden_size % quant_method.input_hidden_alignment != 0:
+                    return False
 
         return True
 
