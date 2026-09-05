@@ -1,0 +1,22 @@
+# Basic disaggregated multi-node tier.
+#
+# The smallest shape each model runs in: one ctx worker, one gen worker, one
+# concurrent request, one round. It answers "does this model still come up and
+# serve on this GPU", not "how fast is it".
+#
+# Intended for a DAILY run. The full list (llm_perf_multinode.txt) is weekly.
+# Measured on GB200-LYRIS / GB300-LYRIS: 1028 s and 2731 s respectively for the
+# whole tier, against roughly four hours for the full list on GB200 alone.
+#
+# Every id here also appears in llm_perf_multinode.txt, which stays the single
+# place a case is added. Keep the two in step.
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_basic_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_basic_glm-5-fp4_8k1k_con1_ctx1_dep4_gen1_dep8_eplb256_mtp1_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_basic_gpt-oss-120b-fp4_8k1k_con1_ctx1_tp1_gen1_dep2_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_basic_kimi-k25-thinking-fp4_1k1k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_basic_qwen3-235b-fp4_8k1k_con1_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_basic_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_basic_deepseek-v4-pro-fp4_8k1k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_basic_glm-5-fp4_1k1k_con1_ctx1_dep2_gen1_tep4_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_basic_kimi-k25-thinking-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]
+perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_basic_kimi-k3-fp4_8k1k_con1_ctx1_tep16_gen1_tep16_eplb0_mtp0_ccb-NIXL]
