@@ -301,7 +301,10 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
     // Add scratch slot needs UNCONDITIONALLY (mirrors Python: delta loop is outside _never_resumed).
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[lc]);
+    {
+        TLLM_CHECK_DEBUG(scratchDeltaCounts[lc] >= 0);
+        numSlotsNeeded[lc] += scratchDeltaCounts[lc];
+    }
 
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
@@ -1297,7 +1300,6 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     mCapacity = newCap;
     mHistoryLength = newHist;
     _refreshGenerationAllocReady();
-    _evictOutOfWindowBlocks(newHist);
     TLLM_CHECK_DEBUG(_checkSanity());
     return true;
 }
@@ -1853,7 +1855,9 @@ PlannedDropHandle::PlannedDropHandle(KvCacheManager& manager, std::vector<Commit
     refs.reserve(unique.size());
     for (auto* page : unique)
     {
-        refs.emplace_back(dynamicPointerCast<CommittedPage>(page->sharedFromThis()));
+        auto ref = dynamicPointerCast<CommittedPage>(page->sharedFromThis());
+        TLLM_CHECK_WITH_INFO(ref, "Planned drop target is not a CommittedPage");
+        refs.emplace_back(std::move(ref));
         page->plannedDropCount += 1;
     }
     mPageRefs = std::move(refs);

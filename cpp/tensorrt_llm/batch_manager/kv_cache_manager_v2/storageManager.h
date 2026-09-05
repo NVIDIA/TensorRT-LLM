@@ -190,8 +190,7 @@ public:
     // ---- Migration ---------------------------------------------------------
 
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(
-        std::vector<BatchedLockTarget> const& targets, KvCache& kvCache, MigrationRecorder const& migrationRecorder);
+    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, MigrationRecorder const& migrationRecorder);
 
     // Best-effort migration of grouped pages to a destination cache level.
     void prefetch(
@@ -403,7 +402,6 @@ private:
     // Codec-selected PageIndexPair memory location for each lifecycle.
     TypedVec<LifeCycleId, PageIndexLocation> mPageIndexLocations;
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
-    StorageConfig mStorageConfig;
 
     // slot-to-page-index scale factors: [lcId][poolIdx]
     TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> mSlotToPageIndices;

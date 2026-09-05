@@ -295,7 +295,6 @@ UniqPageLock::~UniqPageLock()
             holder->uniqLock.reset();
 
             // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
-            auto holderCopy = std::move(holder);
             holder = nullptr;
 
             // If the page is not droppable (still held by someone else) and evictable,
@@ -453,7 +452,7 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         { kvCache._recordDroppedPages(pages, cacheLevel); };
         storeMgr->prepareFreeSlots(kHotLevel, requirements, migrationRecorder, dropRecorder);
         // Migrate non-GPU pages.
-        storeMgr->batchedMigrateToGpu(targets, kvCache, migrationRecorder);
+        storeMgr->batchedMigrateToGpu(targets, migrationRecorder);
     }
     catch (...)
     {

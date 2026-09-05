@@ -417,6 +417,7 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
     }
     catch (std::exception const& e)
     {
+        TLLM_LOG_WARNING("Failed to resize cache level %d to %zu: %s", level.value(), quota, e.what());
         return false;
     }
 }
