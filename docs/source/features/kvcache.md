@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # KV Cache System
 
 The KV cache stores previously computed key-value pairs for reuse during generation in order to avoid redundant calculations. The TensorRT LLM KV cache system also supports reuse across requests and uses a suite of tools like offloading and prioritized eviction to increase reuse. It supports variable attention window sizes and Multi-Head Attention (MHA) optimization techniques such as MQA and GQA.
@@ -199,6 +204,17 @@ prompt = TextPrompt(
 ### Enable Offloading to Host Memory
 
 Before a block is evicted from GPU memory, it can optionally be offloaded to host (CPU) memory. The block remains reusable until it is evicted from host memory. When an offloaded block is reused, it is first copied back into GPU memory. Offloading is controlled with property ```host_cache_size``` which specifies how much host memory (in bytes) should be allocated for offloading. The default is 0.
+
+Host offloading is a reuse and preemption mechanism, not a way to extend the
+active context length beyond what the GPU KV cache can hold for a request that
+is currently running. KV cache blocks for requests being processed must be
+resident in GPU memory before the model can attend to them. Host memory can keep
+evicted or paused blocks available for later onboarding, which avoids
+recomputation when those blocks are reused, but it does not let one active
+request attend directly to KV blocks that remain only in CPU memory. To support
+a longer active context, increase the GPU KV cache budget, reduce other memory
+pressure, use a smaller model or KV cache dtype, use an attention-window feature
+when applicable, or run on GPUs with more available memory.
 
 When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
 
