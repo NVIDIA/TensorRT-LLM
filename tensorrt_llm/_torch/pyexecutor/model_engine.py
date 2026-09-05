@@ -451,11 +451,13 @@ class PyTorchModelEngine(ModelEngine):
             enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
         )
         self.dist = dist
+        self.llm_args = llm_args
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
             RouteCapture.create(rank=self.dist.rank,
-                                model_engine=self)  # R3 router-replay
-        self.llm_args = llm_args
+                                model_engine=self,
+                                enabled=llm_args.enable_return_routed_experts
+                                )  # R3 router-replay
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
