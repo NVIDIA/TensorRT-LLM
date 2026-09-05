@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <random>
@@ -111,6 +113,74 @@ TEST_F(TllmBuffersTest, PinnedAllocator)
     EXPECT_EQ(counters.getPinnedDiff(), -size);
     EXPECT_EQ(allocator.getMemoryType(), MemoryType::kPINNED);
     EXPECT_THROW(allocator.deallocate(ptr, size), std::runtime_error);
+}
+
+TEST_F(TllmBuffersTest, HostRegisterChunked)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+
+    // A range page-locked chunk by chunk must behave exactly like one page-locked in a single call: every chunk,
+    // including a partial trailing one, is reported as host memory and the whole range is usable as the source of an
+    // async copy across chunk boundaries.
+    auto constexpr chunkSize = std::size_t{1} << 20; // 1 MB
+    auto constexpr size = 4 * chunkSize + PinnedAllocator::kHostPageSize;
+
+    auto* const host = static_cast<std::uint8_t*>(std::aligned_alloc(PinnedAllocator::kHostPageSize, size));
+    ASSERT_NE(host, nullptr);
+    for (std::size_t i = 0; i < size; ++i)
+    {
+        host[i] = static_cast<std::uint8_t>(i);
+    }
+
+    hostRegisterChunked(host, size, chunkSize);
+
+    for (std::size_t offset = 0; offset < size; offset += chunkSize)
+    {
+        cudaPointerAttributes attributes{};
+        TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, host + offset));
+        EXPECT_EQ(attributes.type, cudaMemoryTypeHost) << "chunk at offset " << offset << " was not page-locked";
+    }
+
+    auto device = BufferManager::gpuSync(size, tensorrt_llm::DataType::kUINT8);
+    std::vector<std::uint8_t> roundTrip(size, 0);
+    TLLM_CUDA_CHECK(::cudaMemcpyAsync(device->data(), host, size, cudaMemcpyHostToDevice, mStream->get()));
+    TLLM_CUDA_CHECK(::cudaMemcpyAsync(roundTrip.data(), device->data(), size, cudaMemcpyDeviceToHost, mStream->get()));
+    mStream->synchronize();
+    EXPECT_TRUE(std::equal(roundTrip.begin(), roundTrip.end(), host));
+
+    hostUnregisterChunked(host, size, chunkSize);
+
+    cudaPointerAttributes attributes{};
+    TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, host));
+    EXPECT_EQ(attributes.type, cudaMemoryTypeUnregistered);
+
+    std::free(host);
+}
+
+TEST_F(TllmBuffersTest, PinnedAllocatorChunkPinnedAllocation)
+{
+    if (mDeviceCount == 0)
+    {
+        GTEST_SKIP() << noDeviceSkipReason;
+    }
+
+    // The chunk-pinned path that PinnedAllocator takes for allocations larger than the chunk size. The requested
+    // size is deliberately neither chunk- nor page-aligned, so the tail is rounded up to a whole page.
+    auto constexpr chunkSize = std::size_t{1} << 20; // 1 MB
+    auto constexpr size = 2 * chunkSize + 1234;
+
+    auto* const ptr = PinnedAllocator::allocateChunkPinned(size, chunkSize);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr) % PinnedAllocator::kHostPageSize, std::uintptr_t{0});
+
+    cudaPointerAttributes attributes{};
+    TLLM_CUDA_CHECK(::cudaPointerGetAttributes(&attributes, static_cast<std::uint8_t*>(ptr) + size - 1));
+    EXPECT_EQ(attributes.type, cudaMemoryTypeHost);
+
+    EXPECT_NO_THROW(PinnedAllocator::deallocateChunkPinned(ptr, size, chunkSize));
 }
 
 TEST_F(TllmBuffersTest, HostAllocator)
