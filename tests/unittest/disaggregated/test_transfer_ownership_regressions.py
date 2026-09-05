@@ -641,6 +641,11 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     )
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
+    assert session.close() is False
+
+    session.process_aux_agent_result(peer_rank=2, status=AgentResult.FAILED)
+    assert session.close() is False
+    session.process_aux_agent_result(peer_rank=3, status=AgentResult.SUCCESS)
     assert session.close() is True
 
 
@@ -2165,7 +2170,11 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     def send_after_rooting(_slice: KVSlice) -> None:
         assert sender._send_reqs[rid] is send_req
 
-    send_session = SimpleNamespace(send=send_after_rooting, set_exception=Mock())
+    send_session = SimpleNamespace(
+        send=send_after_rooting,
+        set_exception=Mock(),
+        has_failed=Mock(return_value=False),
+    )
     sender._get_or_create_send_session = Mock(return_value=send_session)
     sender._create_kv_slice = Mock(return_value=kv_slice)
     sender._finalize_send = Mock()
