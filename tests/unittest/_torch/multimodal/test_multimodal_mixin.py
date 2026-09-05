@@ -105,6 +105,7 @@ class CountingEncoderMultimodalModel(DummyMultimodalModel):
             multimodal_config=MultimodalConfig(encoder_cache_max_bytes=encoder_cache_max_bytes)
         )
         self.encode_calls = 0
+        self._initialize_multimodal_encoder_cache(encoder_cache_max_bytes)
 
     def encode_multimodal_inputs(self, multimodal_params, **encoder_kwargs) -> torch.Tensor:
         self.encode_calls += 1
@@ -294,15 +295,42 @@ def test_encoder_cache_requires_model_opt_in():
     assert not model.encoder_cache_active
 
 
-def test_encoder_cache_creation_logs_embedding_row_capacity():
+def test_explicit_cache_initialization_creates_cache_without_persistent_reuse():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    cache = model._initialize_multimodal_encoder_cache(1024)
+
+    assert cache is not None
+    assert cache.max_bytes == 1024
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_explicit_cache_capacity_can_exceed_persistent_reuse_capacity():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
         torch.tensor([7]),
-        encoder_cache_max_bytes=4096,
+    )
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=1024)
     )
 
+    cache = model._initialize_multimodal_encoder_cache(2048)
+
+    assert cache is not None
+    assert cache.max_bytes == 2048
+    assert model._multimodal_encoder_cache is cache
+
+
+def test_encoder_cache_creation_logs_embedding_row_capacity():
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        CountingEncoderMultimodalModel(
+            make_embedding(hidden_size=4),
+            torch.tensor([7]),
+            encoder_cache_max_bytes=4096,
+        )
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
@@ -319,7 +347,7 @@ def test_encoder_cache_creation_logs_byte_capacity_without_embedding_metadata():
     )
 
     with patch("tensorrt_llm._torch.models.modeling_multimodal_mixin.logger.info") as info:
-        model._get_multimodal_encoder_cache()
+        model._initialize_multimodal_encoder_cache(4096)
 
     messages = [" ".join(map(str, call.args)) for call in info.call_args_list]
     assert any(
