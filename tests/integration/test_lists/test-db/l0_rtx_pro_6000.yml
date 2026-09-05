@@ -15,6 +15,8 @@ l0_rtx_pro_6000:
   tests:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  # NCCL-EP v0.2 owns LL shared-memory sizing; cover the factory regression on SM120.
+  - unittest/_torch/moe/test_communication_factory.py
   - unittest/_torch/modeling/test_modeling_deepseekv4.py::test_deepseek_v4_sanity[fp8-ds-mla]
   - unittest/_torch/attention/sparse/test_flashinfer_utils.py
   # - unittest/_torch/modeling -k "modeling_qwen3" # https://nvbugs/5234573

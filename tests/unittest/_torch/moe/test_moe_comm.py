@@ -79,7 +79,10 @@ from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer
 )
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import is_nccl_ep_installed
+from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
+    is_nccl_ep_installed,
+    nccl_ep_supports_version,
+)
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -140,7 +143,7 @@ class CommTestConfig:
     top_k: int
     hidden_size: int
     all_num_tokens: List[int]
-    quant_mode: str = "none"  # "none" | "fp8" | "nvfp4" | "w4afp8"
+    quant_mode: str = "none"  # "none" | "ds_fp8" | "fp8" | "nvfp4" | "w4afp8"
     use_low_precision_combine: bool = False
 
     def __str__(self) -> str:
@@ -542,7 +545,8 @@ def create_comm_object(
     # NOT a constructor parameter -- do not pass it.
     qc = (
         _make_mock_quant_config(config.quant_mode)
-        if config.quant_mode != "none" and comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL)
+        if config.quant_mode != "none"
+        and comm_type in (COMM_DEEP_EP, COMM_DEEP_EP_LL, COMM_NCCL_EP)
         else None
     )
 
@@ -619,6 +623,8 @@ def create_comm_object(
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=max_num_tokens,
             top_k=config.top_k,
+            quant_config=qc,
+            use_low_precision_combine=config.use_low_precision_combine,
         )
 
     else:
@@ -631,6 +637,18 @@ _WORKER_COMM = None
 
 def _comm_reuse_key(config: CommTestConfig) -> Tuple:
     """Return the constructor-affecting key used for worker-side comm reuse."""
+    if config.comm_type == COMM_NCCL_EP:
+        return (
+            config.comm_type,
+            config.ep_size,
+            config.num_experts,
+            config.hidden_size,
+            config.top_k,
+            config.quant_mode,
+            max(config.all_num_tokens),
+            config.use_low_precision_combine,
+        )
+
     if config.comm_type == COMM_ALLGATHER_RS:
         return (config.comm_type, config.ep_size)
 
@@ -815,7 +833,17 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
 
     if comm_type == COMM_NCCL_EP:
-        if config.quant_mode != "none":
+        if config.quant_mode == "nvfp4" and config.hidden_size % 256 != 0:
+            return "NcclEP nvfp4 requires hidden_size divisible by 256"
+        if config.quant_mode in ("fp8", "nvfp4"):
+            if not nccl_ep_supports_version("0.2"):
+                return f"NcclEP {config.quant_mode} requires libnccl_ep >= 0.2"
+        elif config.quant_mode == "ds_fp8":
+            if config.hidden_size % 512 != 0:
+                return "NcclEP ds_fp8 requires hidden_size divisible by 512"
+            if not nccl_ep_supports_version("0.2"):
+                return "NcclEP ds_fp8 requires libnccl_ep >= 0.2"
+        elif config.quant_mode != "none":
             return f"NcclEP does not support quant_mode={config.quant_mode}"
         if config.top_k > NCCL_EP_MAX_TOP_K:
             return f"NcclEP MAX_TOP_K={NCCL_EP_MAX_TOP_K}, got top_k={config.top_k}"
@@ -888,6 +916,7 @@ def _make_mock_quant_config(quant_mode: str) -> MagicMock:
     """
     mock = MagicMock()
     mock.layer_quant_mode.has_fp8_qdq.return_value = quant_mode == "fp8"
+    mock.layer_quant_mode.has_fp8_block_scales.return_value = quant_mode == "ds_fp8"
     mock.layer_quant_mode.has_nvfp4.return_value = quant_mode == "nvfp4"
     mock.quant_mode.is_int4_weight_only_per_group.return_value = quant_mode == "w4afp8"
     return mock
@@ -912,7 +941,12 @@ def _generate_postquant_data(
     torch.manual_seed(seed + rank)
     bf16_hs = torch.randn(num_tokens, H, dtype=torch.bfloat16, device="cuda")
 
-    if config.quant_mode == "fp8":
+    if config.quant_mode == "ds_fp8":
+        hs = bf16_hs
+        sf = None
+        global_scale = None
+
+    elif config.quant_mode == "fp8":
         hs = bf16_hs.to(torch.float8_e4m3fn)
         sf = None
         global_scale = None
@@ -1110,7 +1144,7 @@ def _prepare_moe_output_for_combine_reference(
     if config.comm_type == COMM_NVLINK_ONE_SIDED:
         return moe_output.to(torch.float8_e4m3fn).to(torch.bfloat16)
 
-    if config.comm_type == COMM_NVLINK_TWO_SIDED:
+    if config.comm_type in (COMM_NVLINK_TWO_SIDED, COMM_NCCL_EP):
         return _simulate_nvfp4_round_trip(moe_output)
 
     return None
@@ -1205,26 +1239,142 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         raise
 
 
+def _make_nccl_ep_internal_fp8_hidden_states(rank: int, config: CommTestConfig) -> torch.Tensor:
+    """Create DS-FP8 inputs with a distinct exact scale per 128-element block."""
+    num_tokens = config.all_num_tokens[rank]
+    num_blocks = config.hidden_size // 128
+    token_ids = torch.arange(num_tokens, dtype=torch.float32, device="cuda").view(-1, 1)
+    block_ids = torch.arange(num_blocks, dtype=torch.float32, device="cuda").view(1, -1)
+    # Every amax is BF16-exact and differs across ranks, tokens, and scale
+    # blocks. The four factors map exactly to E4M3 values 0, 112, 224, 448.
+    amax = 512.0 + rank * 1536.0 + token_ids * 128.0 + block_ids * 32.0
+    factors = (torch.arange(128, dtype=torch.int64, device="cuda") % 4).to(torch.float32)
+    factors = torch.where(factors == 3, 1.0, factors * 0.25).view(1, 1, -1)
+    return (amax.unsqueeze(-1) * factors).reshape(num_tokens, config.hidden_size).to(torch.bfloat16)
+
+
+def _worker_nccl_ep_internal_fp8_dispatch(config: CommTestConfig) -> dict:
+    """Exercise NCCL-EP's LL DeepSeek FP8 dispatch contract on one rank."""
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(
+        rank=rank,
+        tp_size=config.ep_size,
+        moe_ep_size=config.ep_size,
+        world_size=config.ep_size,
+    )
+    comm = _get_worker_comm(mapping, config)
+    num_tokens = config.all_num_tokens[rank]
+    experts_per_rank = config.num_experts // config.ep_size
+    target_rank = (rank + 1) % config.ep_size
+    worker_inputs = WorkerInputs(
+        hs=_make_nccl_ep_internal_fp8_hidden_states(rank, config),
+        hidden_states_sf=None,
+        global_scale=None,
+        slots=torch.full(
+            (num_tokens, 1),
+            target_rank * experts_per_rank,
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        scales=torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda"),
+        dispatch_kwargs={},
+    )
+    dispatch_outputs = _run_worker_dispatch(comm, worker_inputs, config)
+    sender_rank = (rank - 1) % config.ep_size
+    recv_hs = dispatch_outputs.recv_hs.view(
+        config.ep_size,
+        max(config.all_num_tokens),
+        config.hidden_size // 128,
+        128,
+    )
+    recv_sf = dispatch_outputs.recv_sf.view(
+        config.ep_size,
+        max(config.all_num_tokens),
+        config.hidden_size // 128,
+        1,
+    )
+    dequantized = (recv_hs.float() * recv_sf.float()).flatten(2)
+    expected = _make_nccl_ep_internal_fp8_hidden_states(sender_rank, config)
+    expected_rows = dequantized[sender_rank, :num_tokens]
+    payload_error = (expected_rows - expected.float()).abs()
+    valid_rows = (
+        (dispatch_outputs.recv_slots >= 0)
+        .any(dim=1)
+        .view(config.ep_size, max(config.all_num_tokens))
+    )
+    return {
+        "rank": rank,
+        "internal_quantization": comm.uses_internal_dispatch_quantization(),
+        "tokens_dtype": dispatch_outputs.recv_hs.dtype,
+        "scales_dtype": dispatch_outputs.recv_sf.dtype,
+        "tokens_shape": tuple(dispatch_outputs.recv_hs.shape),
+        "scales_shape": tuple(dispatch_outputs.recv_sf.shape),
+        "has_routed_token": bool(torch.any(dispatch_outputs.recv_slots >= 0).item()),
+        "valid_rows_per_sender": valid_rows.sum(dim=1).cpu().tolist(),
+        "payload_matches": bool(
+            torch.allclose(expected_rows, expected.float(), rtol=1e-3, atol=1e-3)
+        ),
+        "payload_max_abs_error": float(payload_error.max().item()),
+    }
+
+
+def _run_nccl_ep_internal_fp8_dispatch_test(mpi_pool_executor) -> None:
+    """Verify the NCCL-EP v0.2 internal FP8 dispatch interface on all ranks."""
+    config = CommTestConfig(
+        comm_type=COMM_NCCL_EP,
+        ep_size=mpi_pool_executor.num_workers,
+        num_experts=FIXED_NUM_EXPERTS,
+        top_k=1,
+        hidden_size=DEFAULT_HIDDEN_SIZE,
+        all_num_tokens=[16] * mpi_pool_executor.num_workers,
+        quant_mode="ds_fp8",
+    )
+    skip_reason = _get_skip_reason(config)
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    results = list(
+        mpi_pool_executor.map(
+            _worker_nccl_ep_internal_fp8_dispatch,
+            *zip(*[(config,)] * config.ep_size),
+        )
+    )
+    assert len(results) == config.ep_size
+    for result in results:
+        assert result["internal_quantization"]
+        assert result["tokens_dtype"] == torch.float8_e4m3fn
+        assert result["scales_dtype"] == torch.float32
+        assert result["tokens_shape"] == (
+            config.ep_size * max(config.all_num_tokens),
+            config.hidden_size,
+        )
+        assert result["scales_shape"] == (
+            config.ep_size * max(config.all_num_tokens),
+            config.hidden_size // 128,
+        )
+        assert result["has_routed_token"]
+        expected_valid_rows = [0] * config.ep_size
+        sender_rank = (result["rank"] - 1) % config.ep_size
+        expected_valid_rows[sender_rank] = config.all_num_tokens[sender_rank]
+        assert result["valid_rows_per_sender"] == expected_valid_rows
+        assert result["payload_matches"], result["payload_max_abs_error"]
+
+
 def _nccl_ep_replay_slots(
     *,
     target_rank: int,
     num_tokens: int,
     experts_per_rank: int,
 ) -> torch.Tensor:
-    """Route every local token to one EP rank, using distinct local experts."""
+    """Route every local token to one EP rank using distinct local experts."""
     local_experts = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
     local_experts %= experts_per_rank
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
 def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
-    """Capture LL dispatch, change routing, and verify the replay sees the change.
-
-    ``NcclEP.dispatch`` converts the stable input routing tensor to the dtype
-    expected by nccl-ep inside the graph. The captured handle therefore must
-    consume the updated device buffer on each replay, rather than reusing the
-    routes present while the graph was captured.
-    """
+    """Capture LL dispatch, change routing, and verify replay sees the change."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
     comm = None
@@ -1241,7 +1391,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         all_rank_num_tokens = config.all_num_tokens
 
         # A rank-tagged payload makes a routing change visible without relying
-        # on private nccl-ep state: local routing receives rank + 1, while the
+        # on private NCCL-EP state: local routing receives rank + 1, while the
         # second replay must receive the peer rank tag.
         hidden_states = torch.full(
             (num_tokens, config.hidden_size),
@@ -1263,7 +1413,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         )
 
         # Initialize the context and handle eagerly. Capture is intentionally
-        # rejected before this point, so this mirrors production graph setup.
+        # rejected before this point, matching production graph setup.
         comm.dispatch(
             hidden_states,
             None,
@@ -1923,8 +2073,12 @@ def _build_combine_reference(
             if target_mask.any():
                 ref.index_add_(0, source_info[target_mask, 1], moe_out[target_mask].float())
 
-    elif config.use_low_precision_combine and config.comm_type == COMM_NVLINK_TWO_SIDED:
-        # Path 1b: NVLinkTwoSided NVFP4 simulation + float32 accumulation.
+    elif config.use_low_precision_combine and config.comm_type in (
+        COMM_NVLINK_TWO_SIDED,
+        COMM_NCCL_EP,
+    ):
+        # Path 1b: NVLinkTwoSided and NCCL-EP both follow the DeepEP-LL
+        # NVFP4 pack/dequantize contract, then accumulate in float32.
         # fusedMoeCommKernels.cu quantize_nvfp4_sharedmem uses two-level
         # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
         # with E2M1 quantization. After NVLink transfer,
@@ -2041,6 +2195,7 @@ def verify_combine_results(
 
 POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
     "fp8": [
+        COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
         COMM_NVLINK_TWO_SIDED_FLASHINFER,
@@ -2048,6 +2203,7 @@ POSTQUANT_COMM_MAP: Dict[str, List[str]] = {
         COMM_ALLGATHER_RS,
     ],
     "nvfp4": [
+        COMM_NCCL_EP,
         COMM_NVLINK_ONE_SIDED,
         COMM_NVLINK_TWO_SIDED,
         COMM_NVLINK_TWO_SIDED_FLASHINFER,
@@ -2080,6 +2236,9 @@ def _supports_low_precision_combine(config: CommTestConfig) -> bool:
         if config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES_EXTENSION:
             return False
         return config.quant_mode in ("fp8", "nvfp4", "w4afp8")
+
+    if config.comm_type == COMM_NCCL_EP:
+        return config.quant_mode == "nvfp4" and config.hidden_size % 512 == 0
 
     return False
 
@@ -2954,6 +3113,52 @@ class TestMoEComm:
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "mpi_pool_executor,group",
+        [
+            pytest.param(
+                2,
+                CommTestGroup(
+                    configs=[
+                        CommTestConfig(
+                            comm_type=COMM_NCCL_EP,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=2,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[16, 16],
+                        )
+                    ]
+                ),
+                id="NcclEP_capability_e2e",
+            ),
+        ],
+        indirect=["mpi_pool_executor"],
+    )
+    def test_nccl_ep_capability_e2e(self, mpi_pool_executor, group: CommTestGroup):
+        """Exercise the public NCCL-EP v0.2 capability path end-to-end."""
+        if not nccl_ep_supports_version("0.2"):
+            pytest.skip("NCCL-EP capability API requires libnccl_ep >= 0.2")
+
+        from nccl.ep import ExpertIdKind, LayoutInfo
+
+        layout_info = LayoutInfo(recv_topk_idx_kind=ExpertIdKind.GLOBAL)
+        assert int(layout_info._lowpp.recv_topk_idx_kind) == int(ExpertIdKind.GLOBAL)
+        _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    def test_nccl_ep_internal_fp8_dispatch(self, mpi_pool_executor):
+        """NCCL-EP v0.2 internally quantizes BF16 LL dispatch payloads."""
+        _run_nccl_ep_internal_fp8_dispatch_test(mpi_pool_executor)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
+        """Verify LL CUDA graph replay reads routing written after capture."""
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,group",
         _make_boundary_test_params(),
         indirect=["mpi_pool_executor"],
     )
@@ -2980,18 +3185,6 @@ class TestMoEComm:
     def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, group: CommTestGroup):
         """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
         _run_full_test_group(mpi_pool_executor, group)
-
-    @pytest.mark.threadleak(enabled=False)
-    @pytest.mark.skip(
-        reason=(
-            "Temporarily waived pending NCCL-EP CUDA-graph replay fix: "
-            "https://nvbugspro.nvidia.com/bug/6523820"
-        )
-    )
-    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
-        """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)

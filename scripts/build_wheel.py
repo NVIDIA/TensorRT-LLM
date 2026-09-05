@@ -23,6 +23,7 @@ import sysconfig
 import tempfile
 import time
 import warnings
+import zipfile
 from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
 from functools import partial
@@ -768,6 +769,21 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
             copy(src, staging_dir / name)
 
 
+def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
+    """Stage NCCL-EP namespace packages from the intermediate wheel."""
+    package_root = staging_dir / "3rdparty" / "nccl_extensions"
+    nccl_root = package_root / "nccl"
+    if nccl_root.exists():
+        rmtree(nccl_root)
+    package_root.mkdir(parents=True, exist_ok=True)
+
+    prefixes = ("nccl/_extensions/", "nccl/ep/")
+    with zipfile.ZipFile(wheel) as archive:
+        for member in archive.infolist():
+            if member.filename.startswith(prefixes):
+                archive.extract(member, package_root)
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -982,15 +998,17 @@ def main(*,
     if cpp_only:
         build_pyt = "OFF"
         build_deep_ep = "OFF"
+        build_nccl_extensions = "OFF"
         build_deep_gemm = "OFF"
         build_flash_mla = "OFF"
     else:
         targets.extend([
             "th_common", "bindings", "deep_ep", "deep_gemm", "pg_utils",
-            "flash_mla"
+            "flash_mla", "nccl_extensions_wheel"
         ])
         build_pyt = "ON"
         build_deep_ep = "ON"
+        build_nccl_extensions = "ON"
         build_deep_gemm = "ON"
         build_flash_mla = "ON"
 
@@ -1038,7 +1056,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_NCCL_EXTENSIONS="{build_nccl_extensions}" -DBUILD_DEEP_GEMM="{build_deep_gemm}" -DBUILD_FLASH_MLA="{build_flash_mla}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -1060,6 +1078,17 @@ def main(*,
         print(cmake_build_command)
         build_run(cmake_build_command)
 
+    nccl_extensions_wheel = None
+    if not cpp_only:
+        nccl_extensions_wheels = sorted(
+            (build_dir / "tensorrt_llm" / "nccl_extensions" /
+             "dist").glob("nccl_extensions*.whl"))
+        if len(nccl_extensions_wheels) != 1:
+            raise RuntimeError(
+                "Expected exactly one source-built nccl-extensions wheel, found "
+                f"{len(nccl_extensions_wheels)}")
+        nccl_extensions_wheel = nccl_extensions_wheels[0]
+
     if cpp_only:
         assert not install, "Installing is not supported for cpp_only builds"
         return
@@ -1074,6 +1103,8 @@ def main(*,
 
     pkg_dir = wheel_project_dir / "tensorrt_llm"
     assert pkg_dir.is_dir(), f"{pkg_dir} is not a directory"
+    assert nccl_extensions_wheel is not None
+    stage_nccl_extensions_package(nccl_extensions_wheel, wheel_project_dir)
     lib_dir = pkg_dir / "libs"
     include_dir = pkg_dir / "include"
     if lib_dir.exists():

@@ -390,8 +390,16 @@ def mpi_pool_executor(request):
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
-        # make the number of workers visible to tests
-        setattr(executor, "num_workers", num_workers)
+        # mpi4py exposes this as a read-only property in current releases.
+        # Fall back to the requested value for older releases, but reject a
+        # not-yet-populated or mismatched property before a test can submit
+        # zero tasks and pass vacuously.
+        actual_num_workers = getattr(executor, "num_workers", num_workers)
+        if actual_num_workers != num_workers or actual_num_workers <= 0:
+            raise RuntimeError(
+                "MPIPoolExecutor worker count must be positive and match the "
+                f"requested pool size: requested={num_workers}, "
+                f"reported={actual_num_workers}")
         yield executor
 
 
