@@ -217,6 +217,15 @@ def inplace_info():
         "fp8_block_scaling_bmm_out": {
             1: "out"
         },
+        "cute_dsl_fp8_bmm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_nvfp4_gemm_inplace_rubin": {
+            1: "output_tensor"
+        },
+        "cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin": {
+            1: "output_tensor"
+        },
         "gate_forward": {
             1: "out_weights",
             2: "out_indices"
