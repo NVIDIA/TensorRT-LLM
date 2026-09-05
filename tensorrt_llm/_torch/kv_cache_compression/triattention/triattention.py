@@ -37,7 +37,7 @@ from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...modules.top_k import TopK, TopKImplementation
-from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, _check_page_table_is_gpu_addressable
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
 from ...utils import next_positive_power_of_2
@@ -98,6 +98,8 @@ def _allocate_block_offset_snapshot(
     block_offsets_host = torch.empty(
         snapshot_shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
+    if not manager.uses_device_page_table:
+        _check_page_table_is_gpu_addressable(host_rows=block_offsets_host)
     block_offsets_device = torch.empty(snapshot_shape, dtype=torch.int32, device=anchor_pool.device)
     return block_offsets_host, block_offsets_device
 
@@ -620,20 +622,28 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         device_block_offsets: torch.Tensor,
     ) -> None:
         """Snapshot host block offsets before their asynchronous device copy."""
-        manager.index_mapper.gather_k_block_offsets(
-            manager.host_kv_cache_block_offsets,
-            host_block_offsets,
-            request_ids,
-            host_block_offsets.shape[-1],
-        )
-        copy_batch_block_offsets_to_device(
-            host_block_offsets,
-            device_block_offsets,
-            self._identity_copy_indices_host[: len(request_ids)],
-            manager.index_scales,
-            manager.kv_offset,
-            torch.cuda.current_stream(device_block_offsets.device).cuda_stream,
-        )
+        if manager.uses_device_page_table:
+            manager.materialize_block_offsets_snapshot(
+                device_block_offsets,
+                request_ids,
+                host_staging=host_block_offsets,
+                stream=torch.cuda.current_stream(device_block_offsets.device),
+            )
+        else:
+            manager.index_mapper.gather_k_block_offsets(
+                manager.host_kv_cache_block_offsets,
+                host_block_offsets,
+                request_ids,
+                host_block_offsets.shape[-1],
+            )
+            copy_batch_block_offsets_to_device(
+                host_block_offsets,
+                device_block_offsets,
+                self._identity_copy_indices_host[: len(request_ids)],
+                manager.index_scales,
+                manager.kv_offset,
+                torch.cuda.current_stream(device_block_offsets.device).cuda_stream,
+            )
 
     def _select_kept_ordinals(self, request_count: int) -> None:
         """Select top-k tokens and settle score ties into kept-ordinal rows."""

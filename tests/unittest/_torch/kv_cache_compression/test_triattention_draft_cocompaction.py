@@ -230,6 +230,7 @@ def test_block_offset_snapshot_width_is_aligned_and_capped():
         num_pools=1,
         tokens_per_block=32,
         max_blocks_per_seq=4,
+        uses_device_page_table=False,
     )
     host, device_table = _allocate_block_offset_snapshot(
         manager,
