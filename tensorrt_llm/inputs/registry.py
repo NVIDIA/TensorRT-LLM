@@ -43,6 +43,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
+from .prefix_token_cache import create_prefix_token_cache
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -165,6 +166,8 @@ class DefaultInputProcessor(InputProcessor):
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
+        # Opt-in via TLLM_PREFIX_TOKEN_CACHE=1; None when disabled.
+        self._prefix_token_cache = create_prefix_token_cache(tokenizer)
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -172,6 +175,13 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
+        # Only when the tokenizer would be called exactly as the cache calls it.
+        if (self._prefix_token_cache is not None
+                and not sampling_params.add_special_tokens
+                and sampling_params.truncate_prompt_tokens is None):
+            with nvtx_range_debug("tokenize prompt (prefix cache)"):
+                return self._prefix_token_cache.encode(self.tokenizer,
+                                                       inputs["prompt"]), None
         kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
