@@ -1400,6 +1400,9 @@ private:
         case 103: return tg::CudaArch::Sm103a;
 #ifdef TLLM_RUBIN_FEATURES
         case 107: return tg::CudaArch::Sm107a;
+#else
+        // Sm107a is compiled out; the family arch keeps NVRTC output loadable on SM107.
+        case 107: return tg::CudaArch::Sm100f;
 #endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return tg::CudaArch::Sm100a;
         }
