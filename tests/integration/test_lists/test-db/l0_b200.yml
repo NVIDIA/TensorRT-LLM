@@ -324,6 +324,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example
@@ -359,7 +360,6 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_mtp_non_greedy_cuda_graph_matches_eager
 - condition:
     ranges:
