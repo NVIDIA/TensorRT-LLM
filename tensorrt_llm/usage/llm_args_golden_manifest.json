@@ -798,7 +798,8 @@
       "allowed_values": [
         "lmcache",
         "lmcache-mp",
-        "kvbm"
+        "kvbm",
+        "mooncake-store"
       ],
       "annotation": "Optional[str]",
       "converter": "allowlist",
@@ -1407,6 +1408,13 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.fuse_qkv_index_projection"
     },
     {
       "allowed_values": [

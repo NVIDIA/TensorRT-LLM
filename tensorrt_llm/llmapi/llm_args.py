@@ -1945,6 +1945,166 @@ class DecodingBaseConfig(StrictBaseModel):
         return 0
 
 
+class MooncakeStoreConfig(StrictBaseModel):
+    """The Mooncake store pool the `mooncake-store` connector should join.
+
+    Describes the pool: which master owns it, how workers reach it, and how
+    much memory each contributes. A worker's own relationship to the pool, such
+    as its read/write role and key namespace, stays in the
+    `TRTLLM_MOONCAKE_STORE_*` environment variables, since that is per process
+    while this is per deployment.
+
+    Setting this makes `trtllm-serve` render the Mooncake client config and
+    export `MOONCAKE_CONFIG_PATH` itself. An inherited `MOONCAKE_CONFIG_PATH`
+    still wins, so an externally managed pool stays reachable.
+    """
+    master_server_address: Optional[str] = Field(
+        None,
+        description="Address of an already-running mooncake_master, as "
+        "host:port or file://<path> naming a file that holds one. The file is "
+        "how to reach a master whose host a scheduler chose, since "
+        "'trtllm-serve mooncake_master --address_file' publishes it there "
+        "once it answers. Mutually exclusive with launch_master.")
+    launch_master: bool = Field(
+        False,
+        telemetry=False,
+        description="Start a mooncake_master in this server's process group "
+        "and use it. The pool then dies with the server, so this is only "
+        "correct for a single engine: several engines sharing a pool, or a "
+        "pool that must outlive a restart, need master_server_address.")
+    master_address_file: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where a master started by launch_master should publish "
+        "its host:port, for donors and other servers to read back as "
+        "file://<path>. One is always written to the run directory; set this "
+        "to put a second copy somewhere the rest of the deployment already "
+        "names, such as a shared filesystem. Removed when the master stops.")
+    master_port: int = Field(
+        50051,
+        telemetry=False,
+        description="RPC port for a master started by launch_master.")
+    master_metrics_port: int = Field(
+        9004,
+        telemetry=False,
+        description="Prometheus port for a master started by launch_master.")
+    master_eviction_ratio: float = Field(
+        0.05,
+        telemetry=False,
+        description="Fraction of the pool a master started by launch_master "
+        "frees per eviction pass.")
+    metadata_server: str = Field(
+        "P2PHANDSHAKE",
+        description="Mooncake metadata service. P2PHANDSHAKE keeps a separate "
+        "metadata process out of the deployment.")
+    protocol: str = Field(
+        "rdma",
+        description="Transport for page traffic: 'rdma' or 'tcp'. "
+        "TCP is for bring-up only; it invalidates performance conclusions.")
+    device_name: str = Field(
+        "",
+        description="RDMA device to transfer over, from ibv_devinfo. Empty "
+        "with protocol 'tcp'.")
+    global_segment_size: Union[int, str] = Field(
+        "16GiB",
+        description="Host memory each worker process contributes to the pool. "
+        "Pool capacity is this times the number of processes that open a "
+        "store handle, so a prefill-only connector gives a prefill-only pool.")
+    local_buffer_size: Union[int, str] = Field(
+        "1GiB",
+        description="Per-process Mooncake transfer buffer, not pool capacity.")
+    transfer_batch_size: int = Field(64,
+                                     telemetry=False,
+                                     description="Page keys per store call.")
+    cache_prefix: Optional[str] = Field(
+        None,
+        description="Key namespace for the pool. Bump it after any change to "
+        "page layout or contents. Defaults to 'trtllm'.")
+    stage_through_host: bool = Field(
+        False,
+        telemetry=False,
+        description="Copy pages through a pinned host buffer instead of "
+        "registering the KV pools with Mooncake. Needed where the HCA cannot "
+        "pin GPU pages (no GPUDirect RDMA); costs a copy each way.")
+    staging_buffer_bytes: Optional[Union[int, str]] = Field(
+        None,
+        telemetry=False,
+        description="Size of the buffer stage_through_host copies through, "
+        "per process. Pages move transfer_batch_size at a time, and a buffer "
+        "that cannot hold that many reduces the batch instead of failing, so "
+        "undersizing it costs throughput quietly. Defaults to the connector's "
+        "own 512MiB.")
+
+    @model_validator(mode="after")
+    def _require_exactly_one_master(self) -> "MooncakeStoreConfig":
+        if self.launch_master and self.master_server_address:
+            raise ValueError(
+                "mooncake_store: set either launch_master or "
+                "master_server_address, not both. launch_master starts a "
+                "master here; master_server_address joins an existing pool.")
+        if not self.launch_master and not self.master_server_address:
+            raise ValueError(
+                "mooncake_store: needs a master. Set master_server_address to "
+                "join an existing pool, or launch_master: true to start one "
+                "for this server alone.")
+        if self.master_address_file and not self.launch_master:
+            raise ValueError(
+                "mooncake_store: master_address_file publishes the address of "
+                "a master this server starts, so it needs launch_master: "
+                "true. To read an address a master elsewhere published, set "
+                "master_server_address: file://<path>.")
+        return self
+
+
+class MooncakeDonationConfig(StrictBaseModel):
+    """Host memory this server lends to a Mooncake pool it does not use.
+
+    Pool capacity comes only from processes that open a store handle, which in
+    a disaggregated deployment is the context servers alone. Setting this on
+    the generation servers puts their memory into the same pool, so prefill
+    writes blocks that land on decode-side DRAM while the generation engine
+    stays free of any connector and keeps its cache transceiver for the
+    handoff.
+
+    Capacity is kept separate from `kv_connector_config` because attaching a
+    connector would also start this server reading and writing the store.
+
+    The memory is charged to this process, so size it together with
+    `kv_cache_config.host_cache_size`.
+
+    Fields opt out of telemetry because they describe one site's pool rather
+    than which features are in use.
+    """
+    master_server_address: str = Field(
+        ...,
+        telemetry=False,
+        description="Master of the pool to lend memory to, as host:port or "
+        "file://<path> naming a file that holds one. The file is what a "
+        "context server's launch_master publishes, so the generation servers "
+        "can name a path instead of a host chosen by a scheduler, and they "
+        "wait for the master rather than having to start after it.")
+    segment_size: Union[int, str] = Field(
+        "32GiB",
+        telemetry=False,
+        description="Host memory this server contributes. Charged once per "
+        "server process, not per rank, so a node running several servers "
+        "contributes this much for each of them.")
+    protocol: str = Field(
+        "rdma",
+        telemetry=False,
+        description="Transport the pool's traffic reaches this memory over: "
+        "'rdma' or 'tcp'. Must match the pool's.")
+    device_name: str = Field(
+        "",
+        telemetry=False,
+        description="RDMA device to serve the segment over, from ibv_devinfo. "
+        "Empty with protocol 'tcp'.")
+    metadata_server: str = Field(
+        "P2PHANDSHAKE",
+        telemetry=False,
+        description="Mooncake metadata service. Must match the pool's.")
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -1959,7 +2119,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
         "auto-populated from the preset registry.",
-        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm',
+                                             'mooncake-store'))
     connector_module: Optional[str] = Field(
         None,
         description=
@@ -1974,11 +2135,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    mooncake_store: Optional[MooncakeStoreConfig] = Field(
+        None,
+        description="Pool topology for the 'mooncake-store' connector. When "
+        "set, trtllm-serve provisions the pool during bringup instead of "
+        "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
-        from tensorrt_llm._torch.pyexecutor.connectors.registry import \
-            CONNECTOR_REGISTRY
+        from tensorrt_llm._torch.pyexecutor.connectors.registry import (
+            CONNECTOR_REGISTRY, uses_connector)
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
@@ -1996,6 +2162,12 @@ class KvCacheConnectorConfig(StrictBaseModel):
             raise ValueError("connector_scheduler_class is required")
         if self.connector_worker_class is None:
             raise ValueError("connector_worker_class is required")
+        if self.mooncake_store is not None and not uses_connector(
+                self, "mooncake-store"):
+            raise ValueError(
+                "mooncake_store describes a Mooncake pool, but this config "
+                f"resolves to connector_module={self.connector_module!r}. "
+                "Set connector: mooncake-store, or drop mooncake_store.")
         return self
 
 
@@ -5216,6 +5388,17 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
+    )
+
+    mooncake_donation: Optional[MooncakeDonationConfig] = Field(
+        default=None,
+        description="Host memory to lend to a Mooncake pool this server does "
+        "not otherwise use. Separate from kv_connector_config because it adds "
+        "capacity without attaching a connector, which is what lets a "
+        "generation server hold pages for a pool only prefill reads and "
+        "writes. Honored by trtllm-serve, which holds the segment for the "
+        "server's lifetime.",
         status="prototype",
     )
 

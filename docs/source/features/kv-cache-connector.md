@@ -29,7 +29,7 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`build_connector_meta(self, scheduler_output: SchedulerOutput) -> object`**
   * **Description**: The core orchestration method. Called during the scheduling phase. It examines the current requests and decides which blocks need to be loaded from or saved to the external store.
-  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full -- the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
+  * **Arguments**: `scheduler_output` contains information about new requests, blocks allocated, current request states, and the cumulative `RequestData.block_hashes` chain. `block_hashes` is read directly from each KV cache block's stored hash, which the KV cache manager commits as soon as a block becomes full, so the value matches the hash that KV cache events will subsequently emit for the same block. The chain only covers beam 0; the executor rejects `kv_connector_config` at startup when `max_beam_width > 1`, so connectors may assume beam-width-1 inputs.
   * **Returns**: An arbitrary metadata object (picklable) that describes the tasks for the workers. This object is broadcasted to all workers.
 
 * **`get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> tuple[int, bool]`**
@@ -47,14 +47,14 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`cancel_load(self, request: LlmRequest, start: int, end: int)`**
   * **Description**: Optional, with a no-op default. Tells the connector that the runtime will not consume KV it offered from `get_num_new_matched_tokens` for prompt tokens `[start, end)`, so any ownership taken for that range can be released. Offsets are absolute prompt positions, on the same scale as `num_computed_tokens`.
-  * **When it fires**: only on `KVCacheManagerV2`, which asks during a speculative scheduling pass and resolves the answer later. Two things can happen in between, and both are reported here: the runtime may fail to allocate pages to cover the offer, in which case the request falls back to computing the prefix locally; or the request may be cancelled, time out or fail before it ever reaches a batch, in which case the whole offer is released. A third case -- the local cache overtaking part of the offer because another request committed the same prefix -- is handled by the same callback but cannot arise today, since a request's local match is fixed when its cache is created and only its own completed forward passes extend it.
+  * **When it fires**: only on `KVCacheManagerV2`, which asks during a speculative scheduling pass and resolves the answer later. Two things can happen in between, and both are reported here: the runtime may fail to allocate pages to cover the offer, in which case the request falls back to computing the prefix locally; or the request may be cancelled, time out or fail before it ever reaches a batch, in which case the whole offer is released. A third case, the local cache overtaking part of the offer because another request committed the same prefix, is handled by the same callback but cannot arise today, since a request's local match is fixed when its cache is created and only its own completed forward passes extend it.
   * **Caveat**: best-effort. For a synchronous load nothing has been transferred yet, so cancelling is exact. For `is_async=True` the transfer necessarily started inside `get_num_new_matched_tokens`, so it may already be in flight.
 
 ##### Serving a prefix on `KVCacheManagerV2`
 
-V1 answers `get_num_new_matched_tokens` from C++ while the block manager holds its radix-tree mutex, so the local match and the query are atomic and the answer is consumed immediately. V2 has no such mutex, and its scheduling pass is speculative -- a prepared request can still be dropped at the token budget, at resize, at multimodal alignment or at cross attention, and retried in a later iteration.
+V1 answers `get_num_new_matched_tokens` from C++ while the block manager holds its radix-tree mutex, so the local match and the query are atomic and the answer is consumed immediately. V2 has no such mutex, and its scheduling pass is speculative: a prepared request can still be dropped at the token budget, at resize, at multimodal alignment or at cross attention, and retried in a later iteration.
 
-The contract for connectors is unchanged, and in particular `get_num_new_matched_tokens` is still called **exactly once per request** on both managers -- a request that is asked and then deferred is not asked again when it comes back. What differs is that on V2 the runtime may resolve the answer in a later iteration than the one it asked in, and may by then be unable to honour part or all of it. That is what `cancel_load` reports.
+`get_num_new_matched_tokens` is still called **exactly once per request** on both managers, so a request that is asked and then deferred is not asked again when it comes back. What differs is that on V2 the runtime may resolve the answer in a later iteration than the one it asked in, and may by then be unable to honour part or all of it. That is what `cancel_load` reports.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
@@ -63,6 +63,11 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`register_kv_caches(self, kv_cache_tensor: torch.Tensor)`**
   * **Description**: Called at initialization. Provides the worker with the GPU KV cache tensors.
   * **Arguments**: `kv_cache_tensor` is the underlying storage tensor for the KV cache.
+
+* **`register_kv_cache_layout(self, layout: KvCacheLayout)`**
+  * **Description**: Called at initialization **instead of** `register_kv_caches` when the KV cache manager is `KVCacheManagerV2`, whose memory cannot be expressed as one tensor: there is one slot address space per pool and one page-index space per layer group. The default implementation raises, so a connector that does not implement it can only run on V1.
+  * **Arguments**: `layout` describes the byte ranges that repeat per page slot. Each `KvCacheLayerGroupLayout` carries a tuple of `KvCacheRegion`s, and the bytes for page slot `i` of a region live at `region.base + region.stride * i` for `region.size` bytes, or equivalently at `region.as_tensor()[i]`. Page indices arriving in `RequestData.new_block_ids_by_layer_group` are scoped to a layer group and index that group's regions.
+  * **Why regions rather than a tensor**: because the ranges are described rather than implied, the same structure covers MLA (a pool simply has no `value` buffer), sliding-window and hybrid models (one layer group per window size), and non-uniform slots such as MiniMax-M3's index-K buffer sitting beside K/V, without any of them being a special case.
 
 * **`start_load_kv(self, stream: torch.cuda.Stream)`**
   * **Description**: Initiates the loading of KV blocks from the external source into the GPU memory.
@@ -80,6 +85,185 @@ These methods run on all workers (GPU processes) and interact with the actual GP
 * **`get_finished(self, finished_gen_req_ids, started_loading_req_ids) -> tuple[list[int], list[int]]`**
   * **Description**: Polled by the runtime to check the status of asynchronous operations.
   * **Returns**: Two lists of request IDs: those that have finished saving, and those that have finished loading.
+
+## Built-in Connectors
+
+Named presets can be selected without naming a module or class:
+
+```python
+from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
+
+kv_connector_config = KvCacheConnectorConfig(connector="mooncake-store")
+```
+
+The available presets are `lmcache`, `lmcache-mp`, `kvbm` and `mooncake-store`. The first three are external packages; `mooncake-store` ships with TensorRT-LLM and is described below.
+
+### Mooncake distributed store (`mooncake-store`)
+
+Publishes KV pages into a [Mooncake](https://github.com/kvcache-ai/Mooncake) store, a shared CPU memory pool addressed by content, so a prefix computed by one engine can be replayed by another. Regular block reuse cannot do this, because it never leaves the instance that computed the prefix.
+
+This is a **different component** from the Mooncake transfer engine that the C++ cache transceiver uses for disaggregated prefill/decode handoff. That moves KV point to point between two known peers; this publishes pages into a pool that any peer can read. The two compose: a context server can write pages into the store and still hand off to a generation server over NIXL.
+
+#### Requirements
+
+* `KVCacheManagerV2` (`kv_cache_config.use_kv_cache_manager_v2: true`), since that is the manager that can describe its pools through `register_kv_cache_layout`.
+* The Mooncake Python bindings: `pip install mooncake-transfer-engine`. These are installed in the release container; the source build of the C++ transfer engine does not provide them.
+* A reachable Mooncake master (and metadata server, unless using `P2PHANDSHAKE`). See the [Mooncake documentation](https://kvcache-ai.github.io/Mooncake/). `trtllm-serve` can start one for a single engine; see below.
+* GPU-only KV cache tiers: set `kv_cache_config.host_cache_size: 0` and `disk_cache_size: 0`. A page evicted to another tier has its GPU slot reassigned, which would invalidate the addresses registered with the store.
+
+#### Configuration
+
+Describe the pool in `kv_connector_config.mooncake_store` and `trtllm-serve` provisions it during bringup: it resolves the master, renders the client config, and exports `MOONCAKE_CONFIG_PATH` before the ranks that open store handles are spawned.
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: 10.0.0.1:50051   # a master with its own lifetime
+    protocol: rdma
+    device_name: mlx5_0
+    global_segment_size: 32GiB
+    local_buffer_size: 1GiB
+```
+
+Replacing `master_server_address` with `launch_master: true` makes the server start a `mooncake_master` itself and use it, so a single-instance deployment needs nothing prepared outside `trtllm-serve`. **That master lives and dies with the server**, which makes it wrong for anything else: several engines that should share one pool would each get their own, and a pool meant to survive a restart cannot be owned by the thing restarting.
+
+A master started this way still publishes its address, to `master.addr` in the run directory and to `master_address_file` if one is named. That is how other processes, the donors below above all, find a pool this server owns, and how a finished run's logs say which master it used:
+
+```yaml
+mooncake_store:
+  launch_master: true
+  master_address_file: /shared/master.addr
+```
+
+The two cases above, several engines or surviving a restart, run the master as its own command instead:
+
+```bash
+trtllm-serve mooncake_master --rpc_port 50051 --address_file /shared/master.addr
+```
+
+The pool then lasts as long as that command, independently of any engine. `--address_file` receives `host:port` once the master accepts connections, and `master_server_address` accepts `file://<path>` as well as a literal address:
+
+```yaml
+kv_connector_config:
+  connector: mooncake-store
+  mooncake_store:
+    master_server_address: file:///shared/master.addr
+```
+
+This is what makes a master reachable without anyone writing its address down. Under a scheduler its host is not known when the configs are written; publishing it to a file the configs already name closes that gap, and a server reading the file waits for it, so the master and the engines can be started in any order. The file is removed when the master stops, so a stale address is never dialed.
+
+`TRTLLM_MOONCAKE_MASTER_BINARY` overrides the binary a launched master runs, and `TRTLLM_MOONCAKE_MASTER_TIMEOUT` (default 60s) sets how long startup waits for any master to accept connections or publish its address. Without that wait, a master that is not there yet fails inside every rank after the model has loaded. Set `TRTLLM_MOONCAKE_RUN_DIR` to keep the generated client config and the master's log, which are otherwise in a temporary directory removed at shutdown.
+
+#### Servers whose ranks the launcher starts
+
+Provisioning happens in the server process and reaches the ranks that open store handles by exporting `MOONCAKE_CONFIG_PATH` for them to inherit. That holds when the LLM constructor spawns them. It does not when the launcher starts one task per rank, as `trtllm-llmapi-launch` under a scheduler does, because those ranks were already running.
+
+Naming a shared run directory covers that case: the rendered config is read back from `$TRTLLM_MOONCAKE_RUN_DIR/mooncake.json` by any rank that inherited no path, so every rank of a multi-GPU server joins the pool its own leader provisioned. The directory has to be one they all see, which under a scheduler means the job's own, and it is where the master's log and published address already go:
+
+```bash
+export TRTLLM_MOONCAKE_RUN_DIR=/shared/run/$SLURM_JOB_ID
+srun trtllm-llmapi-launch trtllm-serve "$model" --config ctx.yaml
+```
+
+Without it, a rank that inherited nothing fails during bringup naming `MOONCAKE_CONFIG_PATH`, rather than serving without a store.
+
+#### Reading bringup in the log
+
+Everything the pool is assembled from is logged under the `mooncake-store:` prefix before the model loads, because a pool that came up wrong is otherwise visible only as a low hit rate hours later. In order: the run directory, the master's command line and pid, the address it published and where, the rendered client config in full, and the capacity each rank will contribute. A server lending memory logs the master it resolved, the segment in both GiB and bytes, and the transport, so that a size string parsed wrong is caught before the pool starts evicting far too eagerly.
+
+Both waits report progress every five seconds, since waiting for a master in another job is normal and indistinguishable from a hang if it is silent. A master that dies during startup has the tail of its own log quoted in the failure, which is where the reason, a port in use or a bad flag, actually is.
+
+#### Pool capacity
+
+Capacity comes only from processes that open a store handle, and `global_segment_size` is what each contributes, so the pool is that value times the number of such processes. In a disaggregated deployment the connector belongs on the context servers only, which makes every byte of the pool prefill-node memory: prefill's DRAM caching prefill's GPUs, largely duplicating what `kv_cache_config.host_cache_size` already does.
+
+To give the pool memory from nodes whose engines run no connector, ask those servers to lend it:
+
+```yaml
+# generation server: no connector, memory only
+mooncake_donation:
+  master_server_address: file:///shared/master.addr
+  segment_size: 320GiB
+  protocol: rdma
+  device_name: mlx5_1
+```
+
+`trtllm-serve` then holds that segment for as long as the server runs, so a generation node holds pages prefill wrote while its own engine stays connector-free and keeps its cache transceiver for the prefill-to-decode handoff. The server is ready only once the segment is mounted, which makes its readiness the signal that the pool has this capacity.
+
+Lending memory is deliberately outside `kv_connector_config`, and not a `TRTLLM_MOONCAKE_STORE_ROLE` either. Both of those attach a connector, and a connector reads or writes: `producer`, `consumer` and `both` all describe traffic, and none of them means "contribute memory only". Expressing capacity there would therefore start this server using the store. Capacity and traffic are separate, and configured separately.
+
+Size is charged **per server process, not per rank**, unlike `global_segment_size`. Two servers on one node lend twice this. The memory is charged to the process and competes with everything else on the node, `kv_cache_config.host_cache_size` above all, so size the two together.
+
+A node that runs no server at all can still lend, as its own command:
+
+```bash
+trtllm-serve mooncake_donor --master_server_address file:///shared/master.addr \
+    --segment_size 160GiB --protocol rdma --device_name mlx5_0
+```
+
+Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, using the same schema as the vLLM Mooncake store connector so one deployment can point both engines at the same pool:
+
+```json
+{
+  "metadata_server": "http://127.0.0.1:8080/metadata",
+  "master_server_address": "127.0.0.1:50051",
+  "protocol": "rdma",
+  "device_name": "mlx5_0",
+  "global_segment_size": "32GiB",
+  "local_buffer_size": "1GiB"
+}
+```
+
+Only `master_server_address` is required. `metadata_server` may be left out, in which case it is `P2PHANDSHAKE`, Mooncake's peer-to-peer handshake, which is also what `mooncake_store` and `mooncake_donation` default to; the example above names a metadata service instead.
+
+An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool, as the SLURM benchmark harness does, keeps working unchanged.
+
+Three further settings are TensorRT-LLM's rather than Mooncake's, and stay in the environment because they are per process rather than per pool:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TRTLLM_MOONCAKE_STORE_ROLE` | `both` | `producer` writes only, `consumer` reads only, `both` does both. |
+| `TRTLLM_MOONCAKE_STORE_PREFIX` | `trtllm` | Leading component of every key, for isolating deployments that share a pool. |
+| `TRTLLM_MOONCAKE_STORE_MODEL_KEY` | model directory basename | Identity keys are namespaced by. Two engines share cache only when they agree on it, so the default is the basename rather than the full path, since the same checkpoint is routinely mounted elsewhere on another host, which is exactly what sharing is for. |
+
+In a disaggregated deployment, run context servers as `both` and leave generation servers unconfigured. Generated tokens are rarely a reused prefix, so writing them costs bandwidth for no hit rate.
+
+#### Partial block reuse is forced off
+
+`kv_cache_config.enable_partial_reuse` is set to `false` when this connector is configured, with a warning, whether or not it was requested explicitly. It defaults to `true`, so most deployments will see that warning.
+
+The store is addressed by whole blocks. The connector is handed the device match as `num_computed_tokens` and offers only blocks beyond it, but it can resume only from a block boundary, so when the device match ends mid-block it declines the lookup and the store is not consulted at all. Partial reuse is precisely what puts the match off a boundary, so it trades part of one block of device reuse for every stored block of the remaining prefix. Measured on MiniMax-M3, leaving it enabled declined 97.2% of lookups and left actual prompt cache read at 35% against a 96% ceiling; forcing it off raised that to 94% and roughly doubled throughput.
+
+#### How it keys pages
+
+`KVCacheManagerV2` reports `RequestData.block_hashes` empty, so the connector derives block identity itself: a blake2b chain where each block's hash covers its own tokens *and* every token before it, seeded by the request's `cache_salt`. A key is `<prefix>/<model>/w<world size>r<rank>/lg<layer group>/t<tokens per block>b<bytes per page>/<block hash>`. The namespace pins down everything that would make the stored bytes mean something different, so a mismatched shard count, layer group or page geometry reads as a cache miss rather than as garbage.
+
+The value for one key is the concatenation of that layer group's regions for one page slot, handed to Mooncake's multi-buffer batch APIs as a list of `(address, size)` pairs.
+
+#### Transfer behavior
+
+* **Loads are synchronous**, performed in `start_load_kv` before the forward pass. A failed load raises: the runtime has already counted those tokens as computed, so a partial load is a wrong answer rather than a slow one.
+* **Saves are asynchronous**, handed to a background thread behind a CUDA event recorded on the forward stream. The pages are only complete once the pass that wrote them retires, and blocking the executor loop on an RDMA write is the cost the store exists to avoid. The leader reports such requests as saving asynchronously, so their pages stay pinned until `get_finished` confirms the writes landed. A dropped save is logged rather than raised, since it only costs a future cache miss.
+* Pages the store already holds are skipped, so several ranks or instances converging on the same prefix write it once.
+
+#### Unsupported configurations
+
+These are rejected at startup, before any request is admitted:
+
+| Configuration | Reason |
+|---|---|
+| Context parallelism | A rank holds a slice of the sequence rather than whole blocks of it, so one key would name different bytes on different ranks. |
+| Sliding-window attention / VSWA | A page's validity depends on where the window sits, which is a property of the request that read it rather than of the tokens it holds. |
+| MiniMax-M3 with `sparse_disable_index_value: false` | The index-V cache is a plain tensor outside the paged pools, so a replayed prefix would pair stored index-K with stale index-V. Disaggregated serving applies the same restriction. |
+| Pipeline parallelism | Untested rather than unsound. Use tensor parallelism. |
+| `KVCacheManagerV1` | Identity here is a per-layer-group hash chain; V1 supplies real block hashes over a single flat block space. |
+
+Beam search, attention data parallelism, non-GPU cache tiers and Mamba caches are rejected for all connectors by the executor.
+
+#### Example
+
+`examples/llm-api/configs/trtllm_mooncake_store_connector_extra.yaml` is a starting point for `trtllm-serve`.
 
 ## Example Implementation
 

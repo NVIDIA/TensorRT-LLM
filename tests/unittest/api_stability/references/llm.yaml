@@ -243,6 +243,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig]
         default: null
         status: prototype
+      mooncake_donation:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.MooncakeDonationConfig]
+        default: null
+        status: prototype
       enable_lm_head_tp_in_adp:
         annotation: bool
         default: False
