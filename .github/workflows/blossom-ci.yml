@@ -482,6 +482,59 @@ jobs:
           CI_SERVER: ${{ secrets.CI_SERVER }}
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  Trigger-failure-report:
+    name: Report trigger failure
+    needs: [Authorization, Vulnerability-scan, Job-trigger]
+    if: |
+        always() &&
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        (needs.Authorization.result == 'failure' ||
+        needs.Vulnerability-scan.result == 'failure' ||
+        needs.Job-trigger.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Mark the trigger failure
+        env:
+          AUTHORIZATION_RESULT: ${{ needs.Authorization.result }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          VULNERABILITY_SCAN_RESULT: ${{ needs.Vulnerability-scan.result }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${AUTHORIZATION_RESULT}" == "failure" ]]; then
+            failed_stage="Authorization"
+          elif [[ "${VULNERABILITY_SCAN_RESULT}" == "failure" ]]; then
+            failed_stage="Vulnerability scan"
+          else
+            failed_stage="Start CI job"
+          fi
+
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${ISSUE_NUMBER}" --jq '.head.sha')"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          description="Blossom-CI trigger failed in ${failed_stage}"
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${head_sha}" \
+            -f state='failure' \
+            -f context='blossom-ci' \
+            -f description="${description}" \
+            -f target_url="${run_url}"
+
+          body="$(printf '%s\n\n%s\n\n%s' \
+            "❌ **Blossom-CI trigger failed during ${failed_stage}.**" \
+            "The trigger workflow did not complete, so this does not indicate a test failure." \
+            "[View the trigger logs](${run_url}) and retry after the infrastructure recovers.")"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="${body}"
+
   Upload-Log:
     name: Upload log
     runs-on: blossom
