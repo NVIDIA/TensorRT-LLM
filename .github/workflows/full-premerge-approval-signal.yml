@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Full Pre-Merge Approval Signal
+run-name: >-
+  ${{ (github.event.action == 'dismissed' ||
+       (github.event.action == 'submitted' && github.event.review.state == 'approved'))
+      && format('Full pre-merge approval candidate for PR #{0}', github.event.pull_request.number)
+      || format('Ignored review for PR #{0}', github.event.pull_request.number) }}
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  evaluate-full-approval:
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event.action == 'dismissed' ||
+       (github.event.action == 'submitted' && github.event.review.state == 'approved'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate full approval
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          SIGNAL_PATH: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
+        with:
+          retries: 2
+          script: |
+            const { mkdir, writeFile } = require('node:fs/promises');
+            const { dirname } = require('node:path');
+
+            const pullNumber = Number(context.payload.pull_request?.number);
+            if (!Number.isSafeInteger(pullNumber) || pullNumber <= 0) {
+              core.warning('The review event does not contain a valid pull request number.');
+              return;
+            }
+
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    reviewDecision
+                    state
+                  }
+                }
+              }
+            `;
+            const sleep = (milliseconds) =>
+              new Promise((resolve) => setTimeout(resolve, milliseconds));
+            const reportOutstandingReviews = async (reviewDecision) => {
+              let detail;
+              try {
+                const response = await github.request(
+                  'GET /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers',
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pullNumber,
+                  }
+                );
+                const requests = [
+                  ...response.data.users.map((user) => `user \`${user.login}\``),
+                  ...response.data.teams.map(
+                    (team) => `team \`${context.repo.owner}/${team.slug}\``
+                  ),
+                ];
+                detail = requests.length > 0
+                  ? `Outstanding review requests: ${requests.join(', ')}.`
+                  : 'No specific outstanding user or team review request is currently visible.';
+              } catch (error) {
+                core.warning(`Could not read outstanding review requests: ${error.message}`);
+                detail = 'Outstanding review requests could not be read.';
+              }
+
+              const summary =
+                `PR #${pullNumber} is not fully approved (reviewDecision: ` +
+                `\`${reviewDecision || 'NOT_AVAILABLE'}\`).\n\n${detail}\n\n` +
+                'GitHub reviewDecision remains authoritative; branch protection, rulesets, ' +
+                'CODEOWNERS, or a blocking review may impose additional requirements.';
+              core.notice(summary.replaceAll('\n', ' '));
+              try {
+                await core.summary
+                  .addHeading('Full pre-merge approval is still required')
+                  .addRaw(summary)
+                  .write();
+              } catch (error) {
+                core.warning(`Could not write the approval summary: ${error.message}`);
+              }
+            };
+
+            try {
+              let reviewDecision;
+              for (let attempt = 1; attempt <= 3; attempt += 1) {
+                const result = await github.graphql(query, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  number: pullNumber,
+                });
+                const pullRequest = result.repository?.pullRequest;
+                if (!pullRequest || pullRequest.state !== 'OPEN') {
+                  console.log(`PR #${pullNumber} is not open; no signal will be published.`);
+                  return;
+                }
+                reviewDecision = pullRequest.reviewDecision;
+                if (pullRequest.reviewDecision === 'APPROVED') {
+                  await mkdir(dirname(process.env.SIGNAL_PATH), { recursive: true });
+                  await writeFile(process.env.SIGNAL_PATH, `${pullNumber}\n`, 'utf8');
+                  console.log(`PR #${pullNumber} is fully approved; publishing a signal.`);
+                  return;
+                }
+                if (attempt < 3) {
+                  await sleep(attempt * 2000);
+                }
+              }
+              await reportOutstandingReviews(reviewDecision);
+            } catch (error) {
+              core.warning(`Could not evaluate full approval for PR #${pullNumber}: ${error.message}`);
+            }
+
+      - name: Upload full approval signal
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-premerge-approval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 1
