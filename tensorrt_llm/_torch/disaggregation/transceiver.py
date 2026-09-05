@@ -800,11 +800,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
         tpb = self._kv_cache_manager.tokens_per_block
 
-        # Include any reused prefix in the first transferred chunk.
+        # Include a reused prefix in the first regular chunk only when it was
+        # not already transferred before the context forward.
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
+        extends_to_prefix = is_first_chunk and not req.py_kv_prefix_sent
         is_last_chunk = req.context_remaining_length == 0
         # Defer partial blocks except at the prompt's final chunk.
-        chunk_start = 0 if is_first_chunk else chunk_start_pos // tpb
+        chunk_start = 0 if extends_to_prefix else chunk_start_pos // tpb
         chunk_end = (chunk_end_pos + tpb - 1) // tpb if is_last_chunk else chunk_end_pos // tpb
 
         # The final chunk is sent even when it contains no complete block.

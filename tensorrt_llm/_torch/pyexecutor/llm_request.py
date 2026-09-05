@@ -993,6 +993,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_timed_out = False
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
+        # Set when the reuse-hit prefix blocks were transferred before the
+        # first context forward, so the first prefill chunk must not send them
+        # a second time.
+        self.py_kv_prefix_sent = False
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
