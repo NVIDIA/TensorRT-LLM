@@ -1014,8 +1014,8 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
-    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
-        """V1 truncates packed beam cache indices to the requested blocks."""
+    def test_batch_cache_indices_honor_requested_blocks_for_beam0(self):
+        """V1 returns and truncates only beam 0's cache indices."""
         kv_cache_manager = KVCacheManager(
             kv_cache_config=KvCacheConfig(max_tokens=256,
                                           enable_block_reuse=False),
@@ -1036,11 +1036,10 @@ class TestResourceManager(unittest.TestCase):
                                                 max_beam_width=2)
 
             full_indices = kv_cache_manager.get_batch_cache_indices(
-                [request_id], beam_width=2)
+                [request_id])
             requested_blocks = 4
             truncated_indices = kv_cache_manager.get_batch_cache_indices(
                 [request_id],
-                beam_width=2,
                 num_blocks_per_seq=[requested_blocks],
             )
 

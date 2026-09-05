@@ -892,7 +892,6 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         aux_buffer=worker._aux_buffer,
         timeout_s=0.25,
         prompt_len=128,
-        beam_width=1,
         overall_timeout_s=60.0,
     )
 

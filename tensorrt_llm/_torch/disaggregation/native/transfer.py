@@ -440,14 +440,12 @@ class KVSendTask(SendTaskBase):
         params: DisaggregatedParams,
         slice_id: int,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
     ):
         super().__init__(params)
         self.slice_id = slice_id
         self.transferred_count = 0
         self._slice = kv_slice
         self._prompt_len = prompt_len
-        self._beam_width = beam_width
 
 
 class Sender(SenderBase):
@@ -937,18 +935,10 @@ class Sender(SenderBase):
         )
 
     @staticmethod
-    def _beam0_block_count(block_ids: np.ndarray, total_blocks: int, beam_width: int) -> int:
-        """Return the number of beam-0 blocks in a packed 1-D beam layout."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids.size
-        return max(0, block_ids.size - (beam_width - 1))
-
-    @staticmethod
     def _trim_receiver_window_head(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
         peer_window_size: Optional[int],
-        beam_width: int,
     ) -> np.ndarray:
         """Drop the receiver's extra leading blocks for a windowed layer group.
 
@@ -964,7 +954,7 @@ class Sender(SenderBase):
         block_diff = dst_block_ids.size - src_block_ids.size
         if block_diff <= 0:
             return dst_block_ids
-        if peer_window_size is None or beam_width > 1:
+        if peer_window_size is None:
             raise ValueError(
                 f"src/dst block count mismatch: {src_block_ids.size} vs "
                 f"{dst_block_ids.size} (dst must not exceed src)"
@@ -1063,20 +1053,17 @@ class Sender(SenderBase):
                     src_block_ids,
                     dst_block_ids,
                     peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
-                    beam_width=task._beam_width,
                 )
-                src_beam0 = Sender._beam0_block_count(src_block_ids, total_blocks, task._beam_width)
-                dst_beam0 = Sender._beam0_block_count(dst_block_ids, total_blocks, task._beam_width)
-                assert src_beam0 <= total_blocks, (
-                    f"src beam-0 block list ({src_beam0}) exceeds total slice "
+                assert src_block_ids.size <= total_blocks, (
+                    f"src block list ({src_block_ids.size}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                assert dst_beam0 <= total_blocks, (
-                    f"dst beam-0 block list ({dst_beam0}) exceeds total slice "
+                assert dst_block_ids.size <= total_blocks, (
+                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                src_start = (total_blocks - src_beam0) * tpb
-                dst_start = (total_blocks - dst_beam0) * tpb
+                src_start = (total_blocks - src_block_ids.size) * tpb
+                dst_start = (total_blocks - dst_block_ids.size) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
@@ -1425,13 +1412,9 @@ class TxSession(TxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
         overall_timeout_s: Optional[float] = None,
     ):
-        super().__init__(
-            sender,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
+        super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
@@ -1503,7 +1486,6 @@ class TxSession(TxSessionBase):
                 params,
                 slice_id,
                 prompt_len=self._base_args.prompt_len,
-                beam_width=self._base_args.beam_width,
             )
             task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
@@ -2341,12 +2323,8 @@ class RxSession(RxSessionBase):
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
-        beam_width: int = 1,
     ):
-        super().__init__(
-            receiver,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
+        super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
@@ -2966,7 +2944,6 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
-            beam_width=request.py_beam_width,
             overall_timeout_s=self._config.tx_overall_timeout_s,
         )
 
@@ -2980,7 +2957,6 @@ class TransferWorker:
             aux_buffer=self._aux_buffer,
             timeout_s=self._config.rx_timeout_s,
             prompt_len=request.prompt_len,
-            beam_width=request.py_beam_width,
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

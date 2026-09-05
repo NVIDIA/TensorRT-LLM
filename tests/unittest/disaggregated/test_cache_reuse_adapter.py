@@ -21,13 +21,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
-from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
-    CacheReuseAdapter,
-    _CacheReuseAdapterV1,
-)
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import CacheReuseAdapter
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -105,159 +101,6 @@ class TestAlignKvBlocks:
 
 
 # ---------------------------------------------------------------------------
-# Packed 1-D beam block layout.
-# ---------------------------------------------------------------------------
-
-
-class TestPackedBeamBlockLayout:
-    """Verify beam search block IDs stay 1-D with only final tail blocks appended."""
-
-    def test_v1_adapter_uses_request_py_beam_width(self):
-        class _FakeMgr:
-            enable_block_reuse = True
-            tokens_per_block = 32
-
-            def __init__(self):
-                self.beam_width = None
-                self.pool_indices_window = None
-
-            def get_batch_cache_indices(self, request_ids, layer_idx=None, beam_width=1):
-                self.beam_width = beam_width
-                return [[10, 11, 12, 13]]
-
-            def get_memory_pool_block_indices(self, block_ids, window_size):
-                # Identity translation: nothing offloaded, block_id == pool slot.
-                self.pool_indices_window = window_size
-                return block_ids
-
-        req = _FakeReq(prompt_len=7)
-        req.py_request_id = 1
-        req.py_beam_width = 4
-        req.sampling_config = _FakeSamplingConfig(beam_width=1)
-        mgr = _FakeMgr()
-
-        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg(window=512))
-
-        assert mgr.beam_width == 4
-        assert mgr.pool_indices_window == 512
-        np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
-
-    def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
-        packed = KVCacheManager._pack_beam_cache_indices([[10], [10], [10], [10]])
-
-        assert packed == [10]
-
-    def test_pack_beam_cache_indices_appends_final_unshared_blocks(self):
-        packed = KVCacheManager._pack_beam_cache_indices(
-            [
-                [10, 11, 12],
-                [10, 11, 13],
-                [10, 11, 14],
-                [10, 11, 15],
-            ]
-        )
-
-        assert packed == [10, 11, 12, 13, 14, 15]
-
-    def test_pack_beam_cache_indices_skips_shared_final_blocks(self):
-        packed = KVCacheManager._pack_beam_cache_indices(
-            [
-                [10, 11, 12],
-                [10, 11, 12],
-                [10, 11, 13],
-            ]
-        )
-
-        assert packed == [10, 11, 12, 13]
-
-    def test_beam0_block_count_for_full_packed_prompt(self):
-        block_ids = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
-
-        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=4) == 3
-
-    def test_beam0_block_count_after_cached_prefix_skip(self):
-        block_ids = np.array([12, 13, 14, 15], dtype=np.int64)
-
-        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=4) == 1
-
-    def test_beam0_block_count_for_single_beam_unchanged(self):
-        block_ids = np.array([10, 11, 12], dtype=np.int64)
-
-        assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=1) == 3
-
-    def test_align_packed_single_block_prompt_keeps_all_beam_blocks(self):
-        src_block_ids = np.array([10, 10, 10, 10], dtype=np.int64)
-        dst_block_ids = np.array([20, 21, 22, 23], dtype=np.int64)
-        total_blocks = 1
-        tpb = 32
-        src_start = (total_blocks - Sender._beam0_block_count(src_block_ids, total_blocks, 4)) * tpb
-        dst_start = (total_blocks - Sender._beam0_block_count(dst_block_ids, total_blocks, 4)) * tpb
-
-        src, dst = Sender._align_kv_blocks(
-            src_block_ids,
-            dst_block_ids,
-            src_token_start=src_start,
-            dst_token_start=dst_start,
-            tokens_per_block=tpb,
-        )
-
-        np.testing.assert_array_equal(src, [10, 10, 10, 10])
-        np.testing.assert_array_equal(dst, [20, 21, 22, 23])
-
-    def test_trim_single_block_prompt_preserves_packed_beam_tails(self):
-        block_ids = np.array([10, 11, 12, 13], dtype=np.int64)
-
-        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
-            block_ids,
-            beam_width=4,
-            total_blocks=1,
-            expected_valid=1,
-            cache_skip=0,
-        )
-
-        np.testing.assert_array_equal(trimmed, [10, 11, 12, 13])
-
-    def test_trim_long_prompt_preserves_valid_beam0_and_tails(self):
-        block_ids = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
-
-        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
-            block_ids,
-            beam_width=4,
-            total_blocks=3,
-            expected_valid=3,
-            cache_skip=0,
-        )
-
-        np.testing.assert_array_equal(trimmed, [10, 11, 12, 13, 14, 15])
-
-    def test_trim_swa_prefix_preserves_packed_beam_tails(self):
-        block_ids = np.array([10, 11, 12, 13, 14, 15, 16], dtype=np.int64)
-
-        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
-            block_ids,
-            beam_width=4,
-            total_blocks=4,
-            expected_valid=2,
-            cache_skip=0,
-        )
-
-        np.testing.assert_array_equal(trimmed, [12, 13, 14, 15, 16])
-
-    def test_cache_skip_drops_tail_blocks_when_beam0_fully_cached(self):
-        block_ids = np.array([10, 11, 12, 13], dtype=np.int64)
-
-        trimmed = KvCacheTransceiverV2._trim_packed_beam_block_ids(
-            block_ids,
-            beam_width=4,
-            total_blocks=1,
-            expected_valid=1,
-            cache_skip=1,
-        )
-
-        assert trimmed.size == 0
-
-
-# ---------------------------------------------------------------------------
 # Windowed layer group where only the generation side runs speculative decoding.
 # ---------------------------------------------------------------------------
 
@@ -277,7 +120,7 @@ class TestTrimReceiverWindowHead:
         dst_block_ids = np.array([20, 21], dtype=np.int64)
 
         trimmed = Sender._trim_receiver_window_head(
-            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW
         )
 
         np.testing.assert_array_equal(trimmed, [21])
@@ -292,10 +135,10 @@ class TestTrimReceiverWindowHead:
         tpb = 128
 
         dst_block_ids = Sender._trim_receiver_window_head(
-            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW
         )
-        src_start = (total_blocks - Sender._beam0_block_count(src_block_ids, total_blocks, 1)) * tpb
-        dst_start = (total_blocks - Sender._beam0_block_count(dst_block_ids, total_blocks, 1)) * tpb
+        src_start = (total_blocks - src_block_ids.size) * tpb
+        dst_start = (total_blocks - dst_block_ids.size) * tpb
 
         src, dst = Sender._align_kv_blocks(
             src_block_ids,
@@ -313,7 +156,7 @@ class TestTrimReceiverWindowHead:
         dst_block_ids = np.array([20, 21], dtype=np.int64)
 
         trimmed = Sender._trim_receiver_window_head(
-            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW
         )
 
         np.testing.assert_array_equal(trimmed, [20, 21])
@@ -324,7 +167,7 @@ class TestTrimReceiverWindowHead:
         dst_block_ids = np.array([20], dtype=np.int64)
 
         trimmed = Sender._trim_receiver_window_head(
-            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW
         )
 
         np.testing.assert_array_equal(trimmed, [20])
@@ -334,18 +177,7 @@ class TestTrimReceiverWindowHead:
         dst_block_ids = np.array([20, 21], dtype=np.int64)
 
         with pytest.raises(ValueError, match="block count mismatch"):
-            Sender._trim_receiver_window_head(
-                src_block_ids, dst_block_ids, peer_window_size=None, beam_width=1
-            )
-
-    def test_multi_beam_still_raises(self):
-        src_block_ids = np.array([10], dtype=np.int64)
-        dst_block_ids = np.array([20, 21], dtype=np.int64)
-
-        with pytest.raises(ValueError, match="block count mismatch"):
-            Sender._trim_receiver_window_head(
-                src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=4
-            )
+            Sender._trim_receiver_window_head(src_block_ids, dst_block_ids, peer_window_size=None)
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +195,6 @@ def _build_transceiver_for_kv_slice(
     sliding_window_size=None,
     cached_tokens: int = 0,
     is_generation_only: bool = False,
-    beam_width: int = 1,
 ):
     """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
 
@@ -400,7 +231,7 @@ def _build_transceiver_for_kv_slice(
     req = SimpleNamespace(
         prompt_len=prompt_len,
         py_request_id=0,
-        py_beam_width=beam_width,
+        py_beam_width=1,
         is_generation_only_request=lambda: is_generation_only,
     )
     return transceiver, req
@@ -466,22 +297,6 @@ class TestCreateKvSliceBlockSpan:
             np.array([102, 103], dtype=np.int64),
         )
 
-    def test_swa_allocation_cap_preserves_packed_beam_tails(self):
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=0,
-            prompt_len=32,
-            block_ids=[100, 101, 102, 103, 104, 200, 201, 202],
-            sliding_window_size=16,
-            beam_width=4,
-        )
-
-        kv_slice = transceiver._create_kv_slice(req)
-
-        np.testing.assert_array_equal(
-            kv_slice.block_ids_per_layer_groups[0],
-            np.array([102, 103, 200, 201, 202], dtype=np.int64),
-        )
-
     @pytest.mark.parametrize(
         "block_ids",
         (
@@ -505,18 +320,6 @@ class TestCreateKvSliceBlockSpan:
             kv_slice.block_ids_per_layer_groups[0],
             np.array([102, 103], dtype=np.int64),
         )
-
-    def test_swa_speculative_tail_requires_single_beam(self):
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=2,
-            prompt_len=32,
-            block_ids=[100, 101, 102, 103, 104],
-            sliding_window_size=16,
-            beam_width=4,
-        )
-
-        with pytest.raises(ValueError, match="speculative scratch blocks require beam_width == 1"):
-            transceiver._create_kv_slice(req)
 
     @pytest.mark.parametrize("prompt_len", (1150, 1151))
     def test_dspark_disagg_boundary_keeps_only_initialized_swa(self, prompt_len):
@@ -584,11 +387,6 @@ class _StubAdapter(CacheReuseAdapter):
 class _FakeReq:
     def __init__(self, prompt_len: int):
         self.prompt_len = prompt_len
-
-
-class _FakeSamplingConfig:
-    def __init__(self, beam_width: int):
-        self.beam_width = beam_width
 
 
 def _lg(window=None):
