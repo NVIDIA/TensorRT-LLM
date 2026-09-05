@@ -182,6 +182,52 @@ def _capture_tllm_logs():
         yield records
 
 
+def _make_mxfp8_engine(method, **overrides):
+    """Engine stand-in carrying just the attributes _run_autotuner_warmup reads.
+
+    Defaults describe a single-rank engine with CUDA graphs on, torch.compile
+    off, and a runnable warmup batch. Tests override only what they vary.
+    """
+    fields = dict(
+        llm_args=SimpleNamespace(enable_autotuner=True),
+        cuda_graph_runner=SimpleNamespace(enabled=True),
+        _torch_compile_enabled=False,
+        model=SimpleNamespace(
+            modules=lambda: [
+                SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
+                SimpleNamespace(quant_method=method),
+            ]
+        ),
+        kv_cache_manager_key="kv_cache",
+        max_num_tokens=16,
+        batch_size=16,
+        max_seq_len=2,
+        original_max_draft_len=0,
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=object(),
+        is_draft_model=False,
+        guided_decoder=None,
+        max_total_draft_tokens=0,
+        no_cuda_graph=lambda: contextlib.nullcontext(),
+        _create_warmup_request=Mock(return_value=object()),
+        _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+        _should_run_warmup_batch=Mock(return_value=True),
+        _release_megamoe_profiling_scratch=Mock(),
+        forward=Mock(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _make_mxfp8_resource_manager(num_available_tokens=16):
+    kv_cache_manager = SimpleNamespace(
+        get_num_available_tokens=lambda **kwargs: num_available_tokens
+    )
+    return SimpleNamespace(
+        get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+    )
+
+
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
@@ -306,16 +352,7 @@ class TestWarmupCleanup(unittest.TestCase):
             method = MXFP8LinearMethod()
             self.assertEqual(method.backend, "trtllm")
 
-            engine = SimpleNamespace(
-                llm_args=SimpleNamespace(enable_autotuner=False),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
-                model=SimpleNamespace(
-                    modules=lambda: [
-                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
-                        SimpleNamespace(quant_method=method),
-                    ]
-                ),
-            )
+            engine = _make_mxfp8_engine(method, llm_args=SimpleNamespace(enable_autotuner=False))
             PyTorchModelEngine._run_autotuner_warmup(engine, Mock())
 
         self.assertEqual(calls, [])
@@ -367,43 +404,11 @@ class TestWarmupCleanup(unittest.TestCase):
             method = MXFP8LinearMethod()
             self.assertFalse(method.needs_native_autotune)
 
-            engine = SimpleNamespace(
-                llm_args=SimpleNamespace(enable_autotuner=True),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
-                model=SimpleNamespace(
-                    modules=lambda: [
-                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
-                        SimpleNamespace(quant_method=method),
-                    ]
-                ),
-                kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
-                dist=object(),
-                is_draft_model=False,
-                guided_decoder=None,
-                max_total_draft_tokens=0,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                        contextlib.nullcontext(object()),
-                    ]
-                ),
-                _should_run_warmup_batch=Mock(return_value=True),
-                _release_megamoe_profiling_scratch=Mock(),
+            engine = _make_mxfp8_engine(
+                method,
                 forward=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
-            resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
-            )
+            resource_manager = _make_mxfp8_resource_manager()
 
             with (
                 patch(
@@ -480,43 +485,8 @@ class TestWarmupCleanup(unittest.TestCase):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
             method = MXFP8LinearMethod()
-            engine = SimpleNamespace(
-                llm_args=SimpleNamespace(enable_autotuner=True),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
-                model=SimpleNamespace(
-                    modules=lambda: [
-                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
-                        SimpleNamespace(quant_method=method),
-                    ]
-                ),
-                kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
-                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
-                dist=object(),
-                is_draft_model=False,
-                guided_decoder=None,
-                max_total_draft_tokens=0,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(
-                    side_effect=[
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                        contextlib.nullcontext(None),
-                    ]
-                ),
-                _should_run_warmup_batch=Mock(return_value=False),
-                _release_megamoe_profiling_scratch=Mock(),
-                forward=Mock(),
-            )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
-            resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
-            )
+            engine = _make_mxfp8_engine(method, _should_run_warmup_batch=Mock(return_value=False))
+            resource_manager = _make_mxfp8_resource_manager()
 
             with (
                 patch(
@@ -550,6 +520,77 @@ class TestWarmupCleanup(unittest.TestCase):
         sync_tactics.assert_not_called()
         engine.forward.assert_not_called()
 
+    def test_flashinfer_mxfp8_not_armed_under_torch_compile(self):
+        """https://nvbugs/6714109: torch.compile keeps automatic FlashInfer off.
+
+        mm_mxfp8 cannot run inside a compiled region, so arming the auto
+        backend there would only latch _flashinfer_autotuned after a pass that
+        tuned nothing.
+        """
+        calls = []
+
+        @contextlib.contextmanager
+        def trtllm_autotune(**kwargs):
+            calls.append("autotune_enter")
+            yield
+            calls.append("autotune_exit")
+
+        @contextlib.contextmanager
+        def flashinfer_autotune():
+            calls.append("flashinfer_autotune_enter")
+            yield
+            calls.append("flashinfer_autotune_exit")
+
+        flashinfer_module = ModuleType("flashinfer")
+        flashinfer_module.mm_mxfp8 = Mock()
+        flashinfer_module.autotune = Mock(side_effect=flashinfer_autotune)
+
+        tuner = SimpleNamespace(
+            setup_distributed_state=Mock(),
+            profiling_cache={},
+            print_profiling_cache=Mock(),
+            cache_pp_recv=Mock(),
+            cache_pp_send=Mock(),
+            clean_pp_flag=Mock(),
+        )
+
+        with (
+            patch.dict(sys.modules, {"flashinfer": flashinfer_module}),
+            patch(
+                "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
+                return_value=True,
+            ),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
+            os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
+            method = MXFP8LinearMethod()
+            engine = _make_mxfp8_engine(method, _torch_compile_enabled=True)
+            resource_manager = _make_mxfp8_resource_manager()
+
+            with (
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get",
+                    return_value=tuner,
+                ),
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
+                    side_effect=trtllm_autotune,
+                ),
+                patch.object(MXFP8GemmRunner, "sync_all_tactic_caches"),
+                patch("torch.cuda.synchronize"),
+                patch("torch.cuda.empty_cache"),
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
+            ):
+                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+
+        # Only the native pass runs; the FlashInfer tuning pass is never entered.
+        self.assertEqual(calls, ["autotune_enter", "autotune_exit"])
+        self.assertEqual(method.backend, "trtllm")
+        self.assertFalse(method._flashinfer_autotuned)
+        flashinfer_module.autotune.assert_not_called()
+        self.assertTrue(method._native_autotuned)
+
     def test_flashinfer_mxfp8_rank_mismatch_falls_back_before_warmup(self):
         """TP and PP ranks agree on fallback before the tuning forward."""
         flashinfer_module = ModuleType("flashinfer")
@@ -578,36 +619,12 @@ class TestWarmupCleanup(unittest.TestCase):
         ):
             os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
             method = MXFP8LinearMethod()
-            engine = SimpleNamespace(
-                llm_args=SimpleNamespace(enable_autotuner=True),
-                cuda_graph_runner=SimpleNamespace(enabled=True),
-                model=SimpleNamespace(
-                    modules=lambda: [
-                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
-                        SimpleNamespace(quant_method=method),
-                    ]
-                ),
-                kv_cache_manager_key="kv_cache",
-                max_num_tokens=16,
-                batch_size=16,
-                max_seq_len=2,
-                original_max_draft_len=0,
+            engine = _make_mxfp8_engine(
+                method,
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
-                is_draft_model=False,
-                guided_decoder=None,
-                max_total_draft_tokens=0,
-                no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
-                _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
-                _should_run_warmup_batch=Mock(return_value=True),
-                _release_megamoe_profiling_scratch=Mock(),
-                forward=Mock(),
             )
-            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
-            resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
-            )
+            resource_manager = _make_mxfp8_resource_manager()
 
             with (
                 patch(
