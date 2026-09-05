@@ -1602,7 +1602,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
     def test_prims_ts_bfloat16(self, mocker):
-        if not is_sm_100f(get_sm_version()):
+        if get_sm_version() not in (100, 103):
             pytest.skip("PrimTS requires SM100 or SM103")
 
         calls = _count_prims_ts_phase_calls(mocker)
@@ -4930,7 +4930,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     def test_prims_ts_bfloat16(self, mocker):
-        if not is_sm_100f(get_sm_version()):
+        if get_sm_version() not in (100, 103):
             pytest.skip("PrimTS requires SM100 or SM103")
 
         calls = _count_prims_ts_phase_calls(mocker)

@@ -34,9 +34,9 @@ from .context import (
 )
 from .mla_decode import (
     BatchMLADecodePagedTSWrapper,
-    batch_decode_mla_with_paged_kv_cache,
-    get_prims_ts_batch_decode_mla_workspace_size,
-    prims_ts_batch_decode_with_kv_cache_mla,
+    batch_mla_decode_with_paged_kv_cache,
+    get_prims_ts_batch_mla_decode_workspace_size,
+    prims_ts_batch_mla_decode_with_kv_cache,
 )
 
 __all__ = [
@@ -53,7 +53,7 @@ __all__ = [
     "get_prims_ts_batch_decode_workspace_size",
     "prims_ts_batch_decode_with_kv_cache",
     "BatchMLADecodePagedTSWrapper",
-    "batch_decode_mla_with_paged_kv_cache",
-    "get_prims_ts_batch_decode_mla_workspace_size",
-    "prims_ts_batch_decode_with_kv_cache_mla",
+    "batch_mla_decode_with_paged_kv_cache",
+    "get_prims_ts_batch_mla_decode_workspace_size",
+    "prims_ts_batch_mla_decode_with_kv_cache",
 ]

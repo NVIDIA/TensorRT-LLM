@@ -606,6 +606,7 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
         (103, "4.7.0", "13.3", True),
         (100, "4.7.0", "13.4", True),
         (100, "4.7.0", "13.2", False),
+        (107, "4.7.0", "13.3", False),
         (120, "4.7.0", "13.3", False),
         (100, "4.6.2", "13.3", False),
     ],
@@ -1413,7 +1414,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     )
     monkeypatch.setattr(
         prims_ts_package,
-        "get_prims_ts_batch_decode_mla_workspace_size",
+        "get_prims_ts_batch_mla_decode_workspace_size",
         Mock(return_value=64),
     )
     monkeypatch.setattr(
@@ -1651,7 +1652,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     )
     monkeypatch.setattr(
         prims_ts_package,
-        "get_prims_ts_batch_decode_mla_workspace_size",
+        "get_prims_ts_batch_mla_decode_workspace_size",
         Mock(return_value=96),
     )
     monkeypatch.setattr(
@@ -1757,7 +1758,7 @@ def test_mla_prepare_workspace_sizes_caller_owned_workspace(
     workspace_size = Mock(return_value=48)
     monkeypatch.setattr(
         prims_ts_package,
-        "get_prims_ts_batch_decode_mla_workspace_size",
+        "get_prims_ts_batch_mla_decode_workspace_size",
         workspace_size,
     )
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
@@ -1804,7 +1805,7 @@ def test_mla_prepare_workspace_preserves_cached_wrappers_with_stable_allocation(
     workspace_size = Mock(return_value=48)
     monkeypatch.setattr(
         prims_ts_package,
-        "get_prims_ts_batch_decode_mla_workspace_size",
+        "get_prims_ts_batch_mla_decode_workspace_size",
         workspace_size,
     )
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
@@ -1846,7 +1847,7 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     required_bytes = iter((32, 64))
     monkeypatch.setattr(
         prims_ts_package,
-        "get_prims_ts_batch_decode_mla_workspace_size",
+        "get_prims_ts_batch_mla_decode_workspace_size",
         lambda *args, **kwargs: next(required_bytes),
     )
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)

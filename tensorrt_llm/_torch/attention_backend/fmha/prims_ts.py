@@ -693,10 +693,10 @@ class PrimsTSFmha(PhasedFmha):
 
         if self.attn.is_mla_enable:
             from tensorrt_llm._torch.attention_backend.prims_ts import (
-                get_prims_ts_batch_decode_mla_workspace_size,
+                get_prims_ts_batch_mla_decode_workspace_size,
             )
 
-            required_bytes = get_prims_ts_batch_decode_mla_workspace_size(
+            required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
                 int(self.attn.kv_lora_rank),

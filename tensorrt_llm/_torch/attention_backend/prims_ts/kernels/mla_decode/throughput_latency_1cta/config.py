@@ -31,29 +31,15 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
-from ..helpers.query import (
-    groups_tokens_heads_q_capacity,
-    groups_tokens_heads_q_group_count,
-)
+from ..helpers.query import FlatQueryTileLayout
 
 
 # 1CTA profiles are specialized for these Q/head tiles.  Tile sizes 8/16 use
 # the swaps-MMA-AB schedule; tile sizes 32/64 are supported for explicit or
 # keeps-MMA-AB profiles.
 SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
-
-# Automatic profile search without a groups_tokens_heads_q tile target considers only
-# the low-Q swaps-MMA-AB variants. groups_tokens_heads_q selection may supply a
-# q32 or q64 target before profile resolution.
-AUTO_SWAPS_TILE_SIZE_Q = (8, 16)
-
-# The swaps-MMA-AB generation heuristic partitions K in 256-token chunks.  TS
-# measurements place the q16/q64 crossover below the reference 1024-token
-# boundary: q64 wins once projected q16 work exceeds 768 KV tokens per CTA.
-SWAPS_MMA_AB_KV_STEP_TOKENS = 256
-SWAPS_MMA_AB_MAX_SEQ_LEN_PER_CTA_KV = 768
 
 # SM100A exposes 227 KiB of dynamic SMEM.  Keep a small TS metadata reservation
 # when deciding whether the automatic cluster-reduction scratch can fit.
@@ -109,9 +95,6 @@ class MlaConfig:
     seq_len_kv: int = 4096
     logical_num_heads_q: int = 16
     logical_seq_len_q: int = 4
-    # Public spelling retained from the existing groups_tokens_heads API;
-    # kernel code uses the semantic ``groups_tokens_heads_q_ratio`` property.
-    groups_tokens_heads_ratio: int = 1
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
@@ -129,7 +112,7 @@ class MlaConfig:
     use_bf16_output: int = 1
     use_fp8_output: int = 0
 
-    # Mainloop tile shape for groups_tokens_heads_q decode.  Each loop step consumes two
+    # Mainloop tile shape for flat query-row decode. Each loop step consumes two
     # 128-token KV tiles: K for the current score update and V for the delayed
     # PV update.
     tile_size_q: int = 16
@@ -209,12 +192,6 @@ class MlaConfig:
     use_attention_sinks: int = 0
     use_sliding_window_causal: int = 0
     attention_window_size: int = 0
-
-    @property
-    def groups_tokens_heads_q_ratio(self) -> int:
-        """Return logical Q positions grouped into one effective row."""
-
-        return self.groups_tokens_heads_ratio
 
     @property
     def softmax0_num_warps(self) -> int:
@@ -449,40 +426,34 @@ class MlaProfile:
 
 
 @dataclass(frozen=True)
-class GroupsTokensHeadsLaunchShape:
-    """Logical and effective groups_tokens_heads_q launch dimensions."""
+class FlatQueryLaunchShape:
+    """Logical query geometry and its normalized physical flat-row launch."""
 
-    enabled: bool
-    ratio: int
     logical_num_heads_q: int
     logical_seq_len_q: int
     num_heads_q: int
     seq_len_q: int
-    tile_size_q: int | None
+    tile_size_q: int
 
     @classmethod
     def for_tile(
         cls,
         logical_num_heads_q: int,
         logical_seq_len_q: int,
-        tile_size_q: int | None,
-    ) -> "GroupsTokensHeadsLaunchShape":
-        """Build effective dimensions from an optional selected Q tile."""
+        tile_size_q: int,
+    ) -> "FlatQueryLaunchShape":
+        """Build consecutive physical M-row tiles for one logical query."""
 
-        if logical_num_heads_q <= 0:
-            raise ValueError("logical_num_heads_q must be positive")
-        ratio = (
-            groups_tokens_heads_q_capacity(logical_num_heads_q, tile_size_q)
-            if tile_size_q is not None
-            else 1
+        layout = FlatQueryTileLayout.for_tile(
+            logical_num_heads_q,
+            logical_seq_len_q,
+            tile_size_q,
         )
         return cls(
-            enabled=ratio > 1,
-            ratio=ratio,
             logical_num_heads_q=logical_num_heads_q,
             logical_seq_len_q=logical_seq_len_q,
-            num_heads_q=logical_num_heads_q * ratio,
-            seq_len_q=groups_tokens_heads_q_group_count(logical_seq_len_q, ratio),
+            num_heads_q=layout.tile_size_q,
+            seq_len_q=layout.num_tiles,
             tile_size_q=tile_size_q,
         )
 
@@ -509,123 +480,6 @@ def tile_size_q_from_profile_name(profile: str | None) -> int | None:
     return None
 
 
-def resolve_groups_tokens_heads_q_tile_hint(
-    explicit_tile_size_q: int | None,
-    profile: str | None,
-) -> int | None:
-    """Resolve explicit tile precedence without treating zero as absent."""
-
-    if explicit_tile_size_q is not None:
-        return validate_tile_size_q(explicit_tile_size_q)
-    return tile_size_q_from_profile_name(profile)
-
-
-def should_auto_group_tokens_heads_q(num_heads_q: int, seq_len_q: int) -> bool:
-    """Return whether a no-hint 1CTA launch should group tokens and Q heads."""
-
-    if num_heads_q <= 0:
-        raise ValueError("num_heads_q must be positive")
-    if seq_len_q <= 0:
-        raise ValueError("seq_len_q must be positive")
-    return seq_len_q > 1 or num_heads_q < min(SUPPORTED_TILE_SIZE_Q)
-
-
-def tile_size_q_for_tokens_heads(num_tokens_heads_q: int) -> int:
-    """Return the groups_tokens_heads_q tile target from tokens times heads."""
-
-    if num_tokens_heads_q <= 0:
-        raise ValueError("num_tokens_heads_q must be positive")
-    if num_tokens_heads_q <= 8:
-        return 8
-    if num_tokens_heads_q <= 16:
-        return 16
-    if num_tokens_heads_q <= 32:
-        return 32
-    return 64
-
-
-def compute_mla_groups_tokens_heads_ratio_for_tile(
-    num_heads_q: int,
-    seq_len_q: int,
-    tile_size_q: int,
-) -> int:
-    """Return the groups_tokens_heads_q ratio for a selected Q tile."""
-
-    if seq_len_q <= 0:
-        raise ValueError("seq_len_q must be positive")
-    return groups_tokens_heads_q_capacity(num_heads_q, tile_size_q)
-
-
-def resolve_groups_tokens_heads_q_launch_shape(
-    *,
-    num_heads_q: int,
-    seq_len_q: int,
-    groups_tokens_heads: bool,
-    tile_size_q: int | None,
-    auto_groups_tokens_heads: bool = False,
-) -> GroupsTokensHeadsLaunchShape:
-    """Resolve logical and effective groups_tokens_heads_q dimensions."""
-
-    target_tile_size_q = tile_size_q
-    grouping_selected = (
-        groups_tokens_heads or auto_groups_tokens_heads or tile_size_q is not None
-    )
-    if grouping_selected and target_tile_size_q is None:
-        target_tile_size_q = tile_size_q_for_tokens_heads(num_heads_q * seq_len_q)
-
-    return GroupsTokensHeadsLaunchShape.for_tile(
-        num_heads_q,
-        seq_len_q,
-        target_tile_size_q if grouping_selected else None,
-    )
-
-
-def resolve_throughput_latency_groups_tokens_heads_q_shape(
-    *,
-    num_heads_q: int,
-    seq_len_q: int,
-    explicit_tile_size_q: int | None,
-    profile: str | None,
-    groups_tokens_heads: bool = False,
-    auto_groups_tokens_heads: bool = True,
-) -> GroupsTokensHeadsLaunchShape:
-    """Apply 1CTA tile precedence and automatic groups_tokens_heads_q policy once."""
-
-    tile_size_q = resolve_groups_tokens_heads_q_tile_hint(explicit_tile_size_q, profile)
-    return resolve_groups_tokens_heads_q_launch_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        groups_tokens_heads=groups_tokens_heads,
-        tile_size_q=tile_size_q,
-        auto_groups_tokens_heads=(
-            auto_groups_tokens_heads
-            and should_auto_group_tokens_heads_q(num_heads_q, seq_len_q)
-        ),
-    )
-
-
-def resolve_groups_tokens_heads_launch_shape(
-    *,
-    num_heads_q: int,
-    seq_len_q: int,
-    groups_tokens_heads: bool,
-    tile_size_q: int | None,
-    auto_groups_tokens_heads: bool = False,
-    m_tile: int = 128,
-) -> GroupsTokensHeadsLaunchShape:
-    """Resolve the public groups_tokens_heads launch shape."""
-
-    del m_tile
-    shape = resolve_groups_tokens_heads_q_launch_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        groups_tokens_heads=groups_tokens_heads,
-        tile_size_q=tile_size_q,
-        auto_groups_tokens_heads=auto_groups_tokens_heads,
-    )
-    return shape
-
-
 def validate_max_active_clusters(max_active_clusters: int) -> int:
     """Return the explicit hardware active-cluster capacity."""
 
@@ -637,174 +491,53 @@ def validate_max_active_clusters(max_active_clusters: int) -> int:
 
 
 def tile_size_q_for_heads(num_heads_q: int) -> int:
-    """Choose the automatic 1CTA Q tile from the effective grouped head count."""
+    """Choose the automatic 1CTA Q tile from the physical row extent."""
 
-    # H8 gets a q8 tile, H16/H32 use the q16 swaps-MMA-AB schedule, and wider
-    # effective head tiles use the q64 keeps-MMA-AB schedule.
-    if num_heads_q <= 8:
-        return 8
-    if num_heads_q <= 32:
-        return 16
-    return 64
-
-
-def use_swaps_mma_ab_mla_gen_kernel(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    multi_processor_count: int,
-) -> bool:
-    """Return whether MLA generation should use swaps-MMA-AB.
-
-    Estimate the number of KV CTAs using a 256-token KV step, then use
-    swaps-MMA-AB while its projected per-CTA KV work stays within the
-    TS-measured crossover and the q16 head split fits within one SM wave.
-    """
-
-    num_ctas = batch_size * seq_len_q * ceil(num_heads_q / 16)
-    if num_ctas <= 0:
-        return False
-
-    max_num_ctas_per_seq_kv = ceil(seq_len_kv / SWAPS_MMA_AB_KV_STEP_TOKENS)
-    num_ctas_per_seq_kv = min(
-        max_num_ctas_per_seq_kv,
-        max(1, multi_processor_count // num_ctas),
-    )
-    seq_len_per_cta_kv = ceil(seq_len_kv / num_ctas_per_seq_kv)
-    return (
-        seq_len_per_cta_kv <= SWAPS_MMA_AB_MAX_SEQ_LEN_PER_CTA_KV
-        and num_ctas <= multi_processor_count
+    return auto_tile_size_q_for_mla_gen(
+        num_heads_q=num_heads_q,
+        seq_len_q=1,
     )
 
 
 def auto_tile_size_q_for_mla_gen(
     *,
-    batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
-    seq_len_kv: int,
-    multi_processor_count: int,
 ) -> int:
-    """Select the default 1CTA MLA generation Q tile.
+    """Choose the smallest native M tile covering the flat query rows.
 
-    When the normal family choice is q16, prefer a full q32 tile if it is the
-    smallest tile that collapses the q16 work from multiple CTA waves to one
-    without leaving capacity for a split-KV replica.  This occupancy transition
-    refines swaps-MMA-AB only; it must not replace a q64 keeps-MMA-AB choice.
+    Shapes wider than the largest 1CTA tile use repeated M64 tiles. The choice
+    depends only on query geometry, so one compiled topology is reusable across
+    runtime batch extents and K/V lengths.
     """
 
-    if num_heads_q <= 32:
-        base_tile_size_q = 8 if num_heads_q <= 8 else 16
-    elif use_swaps_mma_ab_mla_gen_kernel(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=multi_processor_count,
-    ):
-        base_tile_size_q = 16
-    else:
-        base_tile_size_q = 64
-
-    q16_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 16)
-    q32_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 32)
-    full_q32 = num_heads_q >= 32 and num_heads_q % 32 == 0
-    if (
-        base_tile_size_q == 16
-        and full_q32
-        and q16_work > multi_processor_count
-        and q32_work <= multi_processor_count
-        and multi_processor_count // q32_work == 1
-    ):
-        return 32
-    return base_tile_size_q
+    total_q_rows = num_heads_q * seq_len_q
+    for tile_size_q in SUPPORTED_TILE_SIZE_Q:
+        if total_q_rows <= tile_size_q:
+            return tile_size_q
+    return SUPPORTED_TILE_SIZE_Q[-1]
 
 
-def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
+def resolve_auto_flat_query_launch_shape(
     *,
-    batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    max_active_clusters: int,
-) -> GroupsTokensHeadsLaunchShape:
-    """Resolve the automatic grouped-Q shape used by the public MLA planner.
+) -> FlatQueryLaunchShape:
+    """Resolve the public 1CTA profile tile and flat-row launch extent.
 
-    The grouped FP8 q32 swaps-MMA-AB schedule is still a useful explicit
-    benchmark target, but grouping every query token into one q32 CTA removes
-    too much launch parallelism for a short-K launch whose per-token grid still
-    fits in one resident wave.  In that regime, retain the established
-    MLA-generation tile heuristic so the planner uses the smaller per-token
-    tile.  Long-K launches, multi-wave per-token grids, keeps-MMA-AB q64
-    grouping, and BF16 grouped schedules retain their existing choices.
+    Equivalent H/Q factorizations resolve to the same physical profile when
+    their runtime work is otherwise identical.
     """
-
-    launch_shape = resolve_throughput_latency_groups_tokens_heads_q_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        explicit_tile_size_q=None,
-        profile=None,
-        auto_groups_tokens_heads=True,
-    )
-    if not (
-        qkv_dtype == "e4m3"
-        and launch_shape.tile_size_q == 32
-        and launch_shape.ratio > 1
-    ):
-        return launch_shape
 
     tile_size_q = auto_tile_size_q_for_mla_gen(
-        batch_size=batch_size,
         num_heads_q=num_heads_q,
         seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=max_active_clusters,
     )
-    per_token_work = q_tile_work_count(
-        batch_size,
+    return FlatQueryLaunchShape.for_tile(
         num_heads_q,
         seq_len_q,
         tile_size_q,
     )
-    steady_steps = ceil(seq_len_kv / (MlaConfig.tile_size_kv * MlaConfig.num_insts_kv))
-    if per_token_work > max_active_clusters or steady_steps > 8:
-        return launch_shape
-    return resolve_throughput_latency_groups_tokens_heads_q_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        explicit_tile_size_q=tile_size_q,
-        profile=None,
-        auto_groups_tokens_heads=True,
-    )
-
-
-def min_heuristic_tile_size_q(num_heads_q: int) -> int:
-    """Return the smallest Q tile considered after split-KV is exhausted."""
-
-    if num_heads_q <= 8:
-        return 8
-    return 16
-
-
-def smaller_tile_size_q_candidates(
-    num_heads_q: int, tile_size_q: int
-) -> tuple[int, ...]:
-    """Return smaller Q tiles considered after split-KV in heuristic order."""
-
-    min_tile_size_q = min_heuristic_tile_size_q(num_heads_q)
-    candidates = []
-    # Keep tile_size_q=32 available for explicit benchmarking, but do not
-    # select it automatically until the swaps-MMA-AB q32 profile is tuned.
-    for candidate in reversed(AUTO_SWAPS_TILE_SIZE_Q):
-        if candidate >= tile_size_q or candidate < min_tile_size_q:
-            continue
-        if num_heads_q > candidate and num_heads_q % candidate != 0:
-            continue
-        candidates.append(candidate)
-    return tuple(candidates)
 
 
 def profile_name(
@@ -823,33 +556,34 @@ def q_tile_work_count(
     """Return CTA work count before KV or V-head-dim decomposition."""
 
     tile_size_q = tile_size_q or tile_size_q_for_heads(num_heads_q)
-    return batch_size * seq_len_q * ceil(num_heads_q / tile_size_q)
+    return batch_size * ceil(num_heads_q * seq_len_q / tile_size_q)
 
 
-def automatic_split_kv_step_tokens(
-    *, qkv_dtype: str, tile_size_q: int, base_work: int
+def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
+    """Return one steady-state K step for the selected task graph."""
+
+    num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
+    return MlaConfig.tile_size_kv * num_kv_insts
+
+
+def select_auto_split_kv(
+    *,
+    seq_len_kv: int,
+    tile_size_q: int,
+    base_work: int,
+    target_work: int,
 ) -> int:
-    """Return the target KV-token cadence limiting automatic split count.
+    """Choose the smallest split count preserving the target K-step depth."""
 
-    The base steady-state step consumes two 128-token KV tiles.  FP8 q8 keeps
-    two such steps per split, while FP8 q16 uses four once the Q grid already
-    exposes more than four CTAs. Those FP8 factors come from local measurements
-    rather than imported constants. For non-divisible K, the final balanced split
-    can own less than the target. BF16 q8 uses the common one-step cadence;
-    the tiny q16 grid keeps its existing two-step cadence.
-    """
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    if qkv_dtype == "e4m3":
-        if tile_size_q <= 8 or (tile_size_q == 16 and base_work <= 4):
-            return steady_step_tokens * 2
-        if tile_size_q == 16:
-            return steady_step_tokens * 4
-        return steady_step_tokens
-
-    if tile_size_q == 16 and base_work == 2:
-        return steady_step_tokens * 2
-    return steady_step_tokens
+    split_kv_step_tokens = automatic_split_kv_step_tokens(tile_size_q)
+    max_split_kv = max(1, ceil(seq_len_kv / split_kv_step_tokens))
+    split_kv = min(
+        max_split_kv,
+        max(1, target_work // base_work),
+        MAX_MLA_SPLITS_KV,
+    )
+    local_k_steps = ceil(max_split_kv / split_kv)
+    return ceil(max_split_kv / local_k_steps)
 
 
 def is_power_of_two(value: int) -> bool:
@@ -949,6 +683,9 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         use_clc_dynamic_persistent_scheduler = 0
 
     return {
+        # Keeps-MMA-AB has one QK/PV pipe.  Raising this value would change the
+        # KV work partition without adding the second stream used by the swaps
+        # schedule, and would therefore skip every other KV tile.
         "num_insts_kv": 1,
         "kv_stages": kv_stages,
         "q_stages": q_stages,
@@ -1292,7 +1029,10 @@ def keeps_mma_ab_profiles(
     )
     base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 64)
     if base_work > max_active_clusters:
-        return clc, nonpersistent, split
+        # The Keeps-MMA-AB task graph supports one persistent work tile. A
+        # persistent launch would therefore omit the grid suffix once work
+        # exceeds the resident wave, so multi-wave shapes use the direct grid.
+        return nonpersistent, split
     return nonpersistent, clc, split
 
 
@@ -1430,10 +1170,8 @@ def auto_split_profile(
     latent_dim: int,
     max_active_clusters: int,
     tile_size_q: int | None = None,
-    allow_tile_size_q_adjustment: bool = False,
-    qkv_dtype: str = "bf16",
 ) -> MlaProfile | None:
-    """Choose split-KV, then smaller Q tiles, then V head-dim splitting."""
+    """Choose split-KV followed by V head-dimension decomposition."""
 
     max_active_clusters = validate_max_active_clusters(max_active_clusters)
     original_tile_size_q = tile_size_q or tile_size_q_for_heads(num_heads_q)
@@ -1442,42 +1180,20 @@ def auto_split_profile(
     if base_work <= 0 or base_work >= target_work:
         return None
 
-    # Limit split count with the measured target cadence for this TS schedule.
-    split_kv_step_tokens = automatic_split_kv_step_tokens(
-        qkv_dtype=qkv_dtype,
+    split_kv = select_auto_split_kv(
+        seq_len_kv=seq_len_kv,
         tile_size_q=original_tile_size_q,
         base_work=base_work,
+        target_work=target_work,
     )
-    max_split_kv = max(1, ceil(seq_len_kv / split_kv_step_tokens))
-    split_kv = min(max_split_kv, max(1, target_work // base_work))
     work_after_kv = base_work * split_kv
-    selected_tile_size_q = original_tile_size_q
-
-    if allow_tile_size_q_adjustment and work_after_kv < target_work:
-        for candidate_tile_size_q in smaller_tile_size_q_candidates(
-            num_heads_q, selected_tile_size_q
-        ):
-            candidate_work = (
-                q_tile_work_count(
-                    batch_size, num_heads_q, seq_len_q, candidate_tile_size_q
-                )
-                * split_kv
-            )
-            selected_tile_size_q = candidate_tile_size_q
-            work_after_kv = candidate_work
-            if work_after_kv >= target_work:
-                break
 
     head_dim_split = head_dim_split_for_work(
         work_after_kv=work_after_kv,
         target_work=target_work,
         latent_dim=latent_dim,
     )
-    if (
-        split_kv == 1
-        and head_dim_split == 1
-        and selected_tile_size_q == original_tile_size_q
-    ):
+    if split_kv == 1 and head_dim_split == 1:
         return None
 
     suffix = "baseline"
@@ -1488,7 +1204,7 @@ def auto_split_profile(
     if split_kv > 1 and head_dim_split > 1:
         suffix = f"{suffix}_hdim{latent_dim // head_dim_split}"
     return MlaProfile(
-        name=profile_name(suffix, num_heads_q, selected_tile_size_q),
+        name=profile_name(suffix, num_heads_q, original_tile_size_q),
         num_ctas_per_seq_kv=split_kv,
         num_ctas_per_head_dim=head_dim_split,
         use_persistent_scheduler=0,
@@ -1496,113 +1212,10 @@ def auto_split_profile(
         use_multi_ctas_kv=int_flag(split_kv > 1),
         use_cluster_reduction=int_flag(split_kv > 1),
         kernel_variant=(
-            "keeps_mma_ab" if selected_tile_size_q >= 64 else "swaps_mma_ab"
+            "keeps_mma_ab" if original_tile_size_q >= 64 else "swaps_mma_ab"
         ),
-        tile_size_q=selected_tile_size_q,
+        tile_size_q=original_tile_size_q,
     )
-
-
-def wave_fill_split_kv(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    latent_dim: int,
-    max_active_clusters: int,
-    tile_size_q: int,
-) -> int:
-    """Choose a joint split-KV/V decomposition for a family-switch probe.
-
-    The probe may use every legal one-step KV split, then derives V sharding
-    with ``head_dim_split_for_work``.  It maximizes resident CTA work without
-    exceeding one 1CTA wave; equal-work candidates prefer fewer KV splits to
-    reduce reduction overhead.  This path is internal to automatic family
-    selection and does not alter explicit split requests.
-    """
-
-    max_active_clusters = validate_max_active_clusters(max_active_clusters)
-    base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, tile_size_q)
-    if base_work <= 0:
-        raise ValueError("base work must be positive")
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    max_split_kv = min(
-        max(1, ceil(seq_len_kv / steady_step_tokens)),
-        max(1, max_active_clusters // base_work),
-    )
-    best_split = 1
-    best_score = (-1, 0)
-    for split_kv in range(1, max_split_kv + 1):
-        work_after_kv = base_work * split_kv
-        head_dim_split = head_dim_split_for_work(
-            work_after_kv=work_after_kv,
-            target_work=max_active_clusters,
-            latent_dim=latent_dim,
-        )
-        total_work = work_after_kv * head_dim_split
-        if total_work > max_active_clusters:
-            continue
-        score = (total_work, -split_kv)
-        if score > best_score:
-            best_split = split_kv
-            best_score = score
-    return best_split
-
-
-def fp8_q16_extended_family_probe_split_kv(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    max_active_clusters: int,
-) -> int | None:
-    """Return the bounded split count for an extended FP8 Q16 family probe.
-
-    The ordinary family probe is intentionally conservative and remains
-    unchanged.  This extended probe is considered only by the public planner
-    after a 2CTA launch fits in one resident cluster wave.  A Q16 Swaps CTA
-    consumes two KV128 instructions per steady-state step.  Give the candidate
-    enough splits to keep its local K span at no more than two such steps while
-    keeping the complete Q/K grid in one 1CTA wave.  If hardware capacity
-    cannot satisfy both constraints, return ``None`` instead of selecting a
-    K-rereading Q16 family with a long local mainloop.
-
-    V-head-dimension sharding is deliberately not part of this decision.  The
-    existing ``head_dim_split_for_work`` policy derives it after split-KV has
-    been fixed, preserving the launch-policy order of Q tile, K split, then V
-    decomposition.
-    """
-
-    max_active_clusters = validate_max_active_clusters(max_active_clusters)
-    if seq_len_kv <= 0:
-        raise ValueError("seq_len_kv must be positive")
-
-    tile_size_q = 16
-    base_work = q_tile_work_count(
-        batch_size,
-        num_heads_q,
-        seq_len_q,
-        tile_size_q,
-    )
-    if base_work <= 0:
-        raise ValueError("base work must be positive")
-    max_wave_splits = max_active_clusters // base_work
-    if max_wave_splits <= 0:
-        return None
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    max_local_steps = 2
-    target_split_kv = max(
-        1,
-        ceil(seq_len_kv / (max_local_steps * steady_step_tokens)),
-    )
-    split_kv = min(target_split_kv, max_wave_splits)
-    local_steps = ceil(seq_len_kv / (split_kv * steady_step_tokens))
-    if local_steps > max_local_steps:
-        return None
-    return split_kv
 
 
 def is_throughput_latency_mla_supported_shape(
@@ -1660,13 +1273,9 @@ def enumerate_throughput_latency_mla_profiles(
     ):
         return ()
 
-    target_work = max_active_clusters
     selected_tile_size_q = tile_size_q or auto_tile_size_q_for_mla_gen(
-        batch_size=batch_size,
         num_heads_q=num_heads_q,
         seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=target_work,
     )
     if explicit_split_kv is not None and explicit_split_kv > 0:
         if explicit_split_kv > 1 and explicit_persistent is True:
@@ -1734,8 +1343,6 @@ def enumerate_throughput_latency_mla_profiles(
         latent_dim=latent_dim,
         max_active_clusters=max_active_clusters,
         tile_size_q=selected_tile_size_q,
-        allow_tile_size_q_adjustment=False,
-        qkv_dtype=qkv_dtype,
     )
     if split_profile is not None:
         profiles.append(split_profile)
@@ -1837,24 +1444,12 @@ def make_throughput_latency_mla_config(
     reduction_mode: str | None = None,
     logical_num_heads_q: int | None = None,
     logical_seq_len_q: int | None = None,
-    groups_tokens_heads_ratio: int = 1,
     tile_size_q: int | None = None,
     explicit_split_kv: int | None = None,
     explicit_persistent: bool | None = None,
-    groups_tokens_heads_q_ratio: int | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
-
-    if groups_tokens_heads_q_ratio is None:
-        groups_tokens_heads_q_ratio = groups_tokens_heads_ratio
-    elif (
-        groups_tokens_heads_ratio != 1
-        and groups_tokens_heads_ratio != groups_tokens_heads_q_ratio
-    ):
-        raise ValueError(
-            "groups_tokens_heads_q_ratio conflicts with groups_tokens_heads_ratio"
-        )
 
     mask_type = normalize_mask_type(mask_type)
 
@@ -1880,19 +1475,6 @@ def make_throughput_latency_mla_config(
         raise ValueError("logical_seq_len_q must be positive")
     if seq_len_kv <= 0:
         raise ValueError("seq_len_kv must be positive")
-    if groups_tokens_heads_q_ratio <= 0:
-        raise ValueError("groups_tokens_heads_q_ratio must be positive")
-    if num_heads_q != logical_num_heads_q * groups_tokens_heads_q_ratio:
-        raise ValueError(
-            "effective num_heads_q must equal logical_num_heads_q * groups_tokens_heads_q_ratio"
-        )
-    if seq_len_q != groups_tokens_heads_q_group_count(
-        logical_seq_len_q, groups_tokens_heads_q_ratio
-    ):
-        raise ValueError(
-            "effective seq_len_q must equal ceil(logical_seq_len_q / "
-            "groups_tokens_heads_q_ratio)"
-        )
     if latent_dim <= 0:
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
@@ -1949,6 +1531,19 @@ def make_throughput_latency_mla_config(
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
+    flat_layout = FlatQueryTileLayout.for_tile(
+        logical_num_heads_q,
+        logical_seq_len_q,
+        tile_size_q,
+    )
+    if num_heads_q != flat_layout.tile_size_q or seq_len_q != flat_layout.num_tiles:
+        raise ValueError(
+            "physical 1CTA launch shape must match the flat query-row layout: "
+            f"got num_heads_q={num_heads_q}, seq_len_q={seq_len_q}; expected "
+            f"num_heads_q={flat_layout.tile_size_q}, "
+            f"seq_len_q={flat_layout.num_tiles} for logical "
+            f"H={logical_num_heads_q}, SQ={logical_seq_len_q}"
+        )
     if selected_profile.kernel_variant == "keeps_mma_ab" and num_heads_q < tile_size_q:
         raise ValueError(
             "keeps_mma_ab profiles require an effective Q tile of at least "
@@ -1981,14 +1576,12 @@ def make_throughput_latency_mla_config(
         head_dim_per_cta_v=head_dim_per_cta_v,
         reduction_mode=reduction_mode,
     )
-    if use_cluster_reduction == 1 and (
-        num_heads_q < tile_size_q or num_heads_q % tile_size_q != 0
-    ):
+    if use_cluster_reduction == 1 and flat_layout.tail_rows != tile_size_q:
         if reduction_mode == "cluster":
             raise ValueError(
                 "cluster reduction requires every launched Q tile to contain a full "
                 "tile_size_q rows: "
-                f"num_heads_q={num_heads_q}, tile_size_q={tile_size_q}"
+                f"tail_rows={flat_layout.tail_rows}, tile_size_q={tile_size_q}"
             )
         use_cluster_reduction = 0
     num_ctas_per_seq_q = max(1, seq_len_q)
@@ -2000,7 +1593,6 @@ def make_throughput_latency_mla_config(
         seq_len_kv=seq_len_kv,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
-        groups_tokens_heads_ratio=groups_tokens_heads_q_ratio,
         mask_type=mask_type,
         head_dim_qk=head_dim_qk,
         head_dim_v=latent_dim,

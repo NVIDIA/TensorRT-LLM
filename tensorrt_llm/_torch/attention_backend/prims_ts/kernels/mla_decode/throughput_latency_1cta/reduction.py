@@ -28,7 +28,7 @@ from ..helpers.ops import (
     vector_from_scalars,
 )
 from ..helpers.query import (
-    groups_tokens_heads_q_row_state,
+    flat_query_row_state,
     public_query_flat_row,
     split_o_element_offset,
 )
@@ -246,10 +246,10 @@ def run_gmem_reduction_kernel(
     neutral partials, so the reducer retains configured, compile-time split
     geometry without consuming stale workspace from an earlier graph replay.
 
-    The grid and workspace remain in effective groups_tokens_heads_q
-    coordinates. Every reducer variant maps those coordinates to
-    fixed or compact-ragged public storage; padded tail rows may synchronize
-    and consume workspace slots but never publish O or LSE.
+    The grid and workspace remain in physical flat-query tile coordinates.
+    Every reducer variant maps those coordinates to fixed or compact-ragged
+    public storage; inactive tail rows may synchronize and consume workspace
+    slots but never publish O or LSE.
     """
     # Pair with the dense kernel PDL signal before reading partials.
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -291,10 +291,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 head_idx,
                 cta_idx_q,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -427,10 +427,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 global_head_idx,
                 q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -518,10 +518,10 @@ def run_gmem_reduction_kernel(
             _,
             _,
             valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             global_head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -603,10 +603,10 @@ def run_gmem_reduction_kernel(
                 _,
                 _,
                 valid_output_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 head_idx,
                 row_q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,
@@ -680,10 +680,10 @@ def run_gmem_reduction_kernel(
             _,
             _,
             valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -742,7 +742,7 @@ def run_gmem_reduction_kernel(
             )
         return
 
-    # Scalar fallback: one reducer coordinate owns one grouped row and one
+    # Scalar fallback: one reducer coordinate owns one flat query row and one
     # head-dimension band, then publishes only after logical-row validation.
     reduction_dim_tiles = ceil_div(cfg.head_dim_v, GMEM_REDUCTION_SCALAR_DIM_TILE)
     head_idx = head_dim_tile_idx // Int32(reduction_dim_tiles)
@@ -753,10 +753,10 @@ def run_gmem_reduction_kernel(
         _,
         _,
         valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,

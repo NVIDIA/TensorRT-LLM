@@ -20,7 +20,6 @@ from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
 from .config import (
-    REDUCTION_ROWS_PER_CTA,
     REDUCTION_THREADS_PER_ROW,
     REDUCTION_VALUES_PER_THREAD,
     REDUCTION_VECTOR_BYTES,
@@ -34,7 +33,7 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
     vector_from_scalars,
 )
-from ..helpers.query import groups_tokens_heads_q_row_state, query_batch_bounds
+from ..helpers.query import flat_query_row_state, query_batch_bounds
 from .work_partition import (
     runtime_row_prefix_active_split_count,
     runtime_split_kv_cap,
@@ -54,15 +53,19 @@ def run_reduction_kernel(
     block_split_kvs,
     cfg,
     max_splits: cutlass.Constexpr[int],
+    rows_per_cta: cutlass.Constexpr[int],
 ):
-    """Combine eight grouped-coordinate split rows per 512-thread CTA.
+    """Combine consecutive logical split rows in one reference-reducer CTA.
 
     Each 64-thread row group owns one D512 output row.  Its first warp computes
     FP32 LSE rescale factors, both warps consume one contiguous 16-byte BF16
-    fragment per thread, and the final accumulation remains FP32.  Padded rows
-    still participate in CTA synchronization but never publish public output.
+    fragment per thread, and the final accumulation remains FP32.  The launch
+    is flattened over logical query rows, then each row is decomposed back into
+    its physical M128 workspace tile and row.  Only the last CTA can contain
+    inactive row groups; those groups still synchronize but never access the
+    workspace or publish public output.
     """
-    effective_head_group_idx, seq_q_idx, batch_idx = cute.arch.block_idx()
+    reduction_group_idx, _, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     row_in_cta = tidx // Int32(REDUCTION_THREADS_PER_ROW)
     row_thread_idx = tidx - row_in_cta * Int32(REDUCTION_THREADS_PER_ROW)
@@ -71,33 +74,45 @@ def run_reduction_kernel(
     )
     lane_idx = row_thread_idx % Int32(cfg.threads_per_warp)
 
-    effective_num_heads_q = Int32(kernel.num_heads * kernel.groups_tokens_heads_q_ratio)
-    effective_head_idx = (
-        effective_head_group_idx * Int32(REDUCTION_ROWS_PER_CTA) + row_in_cta
+    physical_tile_rows = Int32(cfg.mma_qk_tiler[0])
+    logical_query_rows = Int32(kernel.num_heads * kernel.seq_len_q)
+    local_flat_query_row = reduction_group_idx * Int32(rows_per_cta) + row_in_cta
+    row_is_valid = local_flat_query_row < logical_query_rows
+    # Clamp the final CTA's inactive row groups before decomposing the physical
+    # workspace coordinate.  ``rows_per_cta`` divides M128, so every CTA
+    # containing valid rows belongs to exactly one producer query tile.
+    safe_local_flat_query_row = cute.math.min(
+        local_flat_query_row, logical_query_rows - Int32(1)
     )
-    head_is_valid = effective_head_idx < effective_num_heads_q
-    # The row helper performs control-flow and storage-coordinate arithmetic.
-    # Clamp a tail CTA's padding rows before calling it, then predicate every
-    # public/workspace access with ``head_is_valid``.
-    safe_effective_head_idx = cute.math.min(
-        effective_head_idx, effective_num_heads_q - Int32(1)
-    )
-    (
-        storage_flat_query_row,
-        _,
-        logical_q_idx,
-        _,
-        mapped_query_is_valid,
-    ) = groups_tokens_heads_q_row_state(
-        safe_effective_head_idx,
-        seq_q_idx,
-        kernel.groups_tokens_heads_q_ratio,
-        kernel.num_heads,
-        kernel.seq_len_q,
-        cu_seqlens_q,
-        batch_idx,
-    )
-    query_is_valid = head_is_valid and mapped_query_is_valid
+    if cutlass.const_expr(kernel.num_heads * kernel.seq_len_q <= cfg.mma_qk_tiler[0]):
+        query_tile_idx = Int32(0)
+        row_in_tile = safe_local_flat_query_row
+    else:
+        query_tile_idx = safe_local_flat_query_row // physical_tile_rows
+        row_in_tile = safe_local_flat_query_row - query_tile_idx * physical_tile_rows
+    if cutlass.const_expr(cu_seqlens_q is None):
+        # Fixed Q storage is already flat in the producer's logical row order;
+        # bypass packed-offset clamping on this latency-sensitive reducer path.
+        storage_flat_query_row = safe_local_flat_query_row
+        logical_q_idx = storage_flat_query_row // Int32(kernel.num_heads)
+        mapped_query_is_valid = True
+    else:
+        (
+            storage_flat_query_row,
+            _,
+            logical_q_idx,
+            _,
+            mapped_query_is_valid,
+        ) = flat_query_row_state(
+            row_in_tile,
+            query_tile_idx,
+            cfg.mma_qk_tiler[0],
+            kernel.num_heads,
+            kernel.seq_len_q,
+            cu_seqlens_q,
+            batch_idx,
+        )
+    query_is_valid = row_is_valid and mapped_query_is_valid
     public_flat_query_row = storage_flat_query_row
     if cutlass.const_expr(cu_seqlens_q is None):
         public_flat_query_row = public_flat_query_row + batch_idx * Int32(
@@ -119,8 +134,8 @@ def run_reduction_kernel(
         )
     # Producer splits are sized from the group's largest K domain, while each
     # logical row consumes only the prefix containing its visible K tiles.
-    group_k = cache_seqs[batch_idx]
-    row_k = group_k
+    tile_k = cache_seqs[batch_idx]
+    row_k = tile_k
     if cutlass.const_expr(
         cfg.mask_type == MaskType.CAUSAL.value and kernel.seq_len_q > 1
     ):
@@ -129,19 +144,19 @@ def run_reduction_kernel(
             batch_idx,
             kernel.seq_len_q,
         )
-        _, _, group_last_logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-            Int32(kernel.num_heads * kernel.groups_tokens_heads_q_ratio - 1),
-            seq_q_idx,
-            kernel.groups_tokens_heads_q_ratio,
+        _, _, tile_last_logical_q_idx, _, _ = flat_query_row_state(
+            Int32(cfg.mma_qk_tiler[0] - 1),
+            query_tile_idx,
+            cfg.mma_qk_tiler[0],
             kernel.num_heads,
             kernel.seq_len_q,
             cu_seqlens_q,
             batch_idx,
         )
-        group_k = mask_visible_k_length(
+        tile_k = mask_visible_k_length(
             cfg.mask_type,
-            group_k,
-            group_last_logical_q_idx,
+            tile_k,
+            tile_last_logical_q_idx,
             logical_seq_len_q,
         )
         row_k = mask_visible_k_length(
@@ -150,25 +165,25 @@ def run_reduction_kernel(
             logical_q_idx,
             logical_seq_len_q,
         )
-    group_k_tile_total = (group_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
+    tile_k_tile_total = (tile_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     row_k_tile_total = (row_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     # A causal row consumes the prefix of configured-span ranges intersecting
     # its visible K tiles. This must stay identical to the producer geometry.
     local_split_kv = runtime_row_prefix_active_split_count(
         row_k_tile_total,
-        group_k_tile_total,
+        tile_k_tile_total,
         split_kv_cap,
     )
 
     smem_lse_scale = cutlass.Array(
         kernel.lse_dtype,
-        REDUCTION_ROWS_PER_CTA * max_splits,
+        rows_per_cta * max_splits,
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
     row_scale_offset = row_in_cta * Int32(max_splits)
 
-    acc_lse_tile = acc_lse[safe_effective_head_idx, None, seq_q_idx, batch_idx]
+    acc_lse_tile = acc_lse[row_in_tile, None, query_tile_idx, batch_idx]
     if row_warp_idx == 0:
         # The first warp for each row owns its log-sum-exp merge.  It publishes
         # one rescale factor per active split for the row's second warp too.
@@ -211,7 +226,7 @@ def run_reduction_kernel(
                     else kernel.lse_dtype(0.0)
                 )
 
-    # Eight independent writer warps publish scales before any row consumes
+    # Independent writer warps publish scales before any row consumes
     # them.  Invalid/padded rows participate so this remains a full CTA barrier.
     prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
 
@@ -234,14 +249,14 @@ def run_reduction_kernel(
         partial_elem_offset_base = (
             Int64(batch_idx)
             * Int64(cute.size(acc_output.shape[3]))
-            * Int64(effective_num_heads_q)
+            * Int64(physical_tile_rows)
             * Int64(split_kv)
             * Int64(cfg.latent_dim)
-            + Int64(seq_q_idx)
-            * Int64(effective_num_heads_q)
+            + Int64(query_tile_idx)
+            * Int64(physical_tile_rows)
             * Int64(split_kv)
             * Int64(cfg.latent_dim)
-            + Int64(safe_effective_head_idx) * Int64(split_kv) * Int64(cfg.latent_dim)
+            + Int64(row_in_tile) * Int64(split_kv) * Int64(cfg.latent_dim)
             + Int64(element_idx)
         )
         partial_output_ptr = acc_output_ptr + partial_elem_offset_base

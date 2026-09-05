@@ -14,24 +14,19 @@
 
 """Configuration for the throughput 2CTA MLA decode TS kernel.
 
-The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 is the public
-throughput path; dtype traits are explicit so FP8 bring-up can share the same
-configuration structure once its 2CTA V/PV layout is complete.
+The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 and FP8 inputs share
+the same explicit configuration structure and output-reduction contract.
 """
 
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
 # Softmax converts natural-scale scores to exp2 with log2(e).
 LOG2_E = 1.4426950408889634074
-
-# Split-KV reduction allocates one LSE slot per possible split.  Match the
-# standalone reducer's qualified workspace and launch capacity.
-MAX_SPLITS = 128
 
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
@@ -66,7 +61,7 @@ def ceil_div(a: int, b: int) -> int:
 def compute_split_kv(
     *,
     batch_size: int,
-    seq_len_q: int,
+    num_q_tiles: int,
     seq_len_kv: int,
     mma_qk_tiler_mn: Tuple[int, int] = (128, 128),
     max_active_blocks: int,
@@ -80,8 +75,8 @@ def compute_split_kv(
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if seq_len_q <= 0:
-        raise ValueError(f"seq_len_q must be positive, got {seq_len_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
     if seq_len_kv <= 0:
         raise ValueError(f"seq_len_kv must be positive, got {seq_len_kv}")
     if max_active_blocks <= 0:
@@ -92,30 +87,32 @@ def compute_split_kv(
         )
 
     max_splits = ceil_div(seq_len_kv, mma_qk_tiler_mn[1])
-    blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
+    blocks_per_batch = max(1, max_active_blocks // batch_size // (num_q_tiles * 2))
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    # The 2CTA reduction workspace supports more split slots, but the automatic
-    # scheduler caps launch-time splits at 32 to avoid excessive reduction work.
-    return min(split_wave_aware, 32)
+    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
 
 
 def compute_workspace_size(
     *,
-    num_heads: int,
-    seq_len_q: int,
+    tile_size_q: int,
+    num_q_tiles: int,
     latent_dim: int,
     batch_size: int,
     split_kv: int,
     partial_o_dtype,
     lse_dtype,
 ) -> int:
-    """Return mixed-dtype MLA split-KV workspace size in bytes."""
+    """Return the physical flat-tile split-KV workspace size in bytes."""
 
     if split_kv == 1:
         return 0
-    partial_rows = batch_size * num_heads * seq_len_q * split_kv
+    if tile_size_q <= 0:
+        raise ValueError(f"tile_size_q must be positive, got {tile_size_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
+    partial_rows = batch_size * tile_size_q * num_q_tiles * split_kv
     return partial_rows * (
         latent_dim * partial_o_dtype.width // 8 + lse_dtype.width // 8
     )

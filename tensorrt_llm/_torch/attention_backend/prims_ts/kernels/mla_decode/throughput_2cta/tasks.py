@@ -205,7 +205,11 @@ class MlaTask(Task):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
             self._run_pre_work_loop_entries(work_tile, context)
-            self._run_one_mla_work_tile(work_tile, context)
+            # Runtime K/Q metadata can make a statically launched split empty.
+            # Keep the CTA on the ordinary initialized-pipeline path, but skip
+            # its captured HEAD/LOOP/TAIL data work when the domain is zero.
+            if work_tile.k_tile_count > cutlass.Int32(0):
+                self._run_one_mla_work_tile(work_tile, context)
             self._run_post_work_loop_entries(work_tile, context)
             self._drain_mla_work_tile_tails()
             return

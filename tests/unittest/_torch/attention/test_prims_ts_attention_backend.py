@@ -418,8 +418,6 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     )
     v_cache = torch.randn_like(k_cache)
     qo_indptr = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
-    paged_kv_indptr = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
-    paged_kv_indices = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
     trt_block_tables = torch.tensor(
         [[[0, 1], [2, 3]], [[2, 3], [0, 1]]],
         device=device,
@@ -450,7 +448,8 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
     assert len(compile_records) == 3
     assert [
-        (args[2], args[3], policy["scheduler"]) for args, policy, _compiled in compile_records
+        (args[0].max_seq_len_q, args[0].max_kv_len, policy["scheduler"])
+        for args, policy, _compiled in compile_records
     ] == [
         (96, 96, "clc_dynamic_persistent"),
         (128, 128, "nonpersistent"),
@@ -484,7 +483,6 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     query.copy_(query.flip(0).clone())
     qo_indptr.copy_(torch.tensor([0, 2, 5], device=device, dtype=torch.int32))
     seq_lens.copy_(torch.tensor([64, 33], device=device, dtype=torch.int32))
-    paged_kv_indices.copy_(torch.tensor([2, 3, 0, 1], device=device, dtype=torch.int32))
     block_tables.copy_(torch.tensor([[2, 3], [0, 1]], device=device, dtype=torch.int32))
 
     reference = batch_prefill_with_paged_kv_cache(
@@ -492,9 +490,8 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
         k_cache,
         v_cache,
         qo_indptr,
-        paged_kv_indptr,
-        paged_kv_indices,
-        torch.tensor([32, 1], device=device, dtype=torch.int32),
+        block_tables,
+        seq_lens,
         page_size=page_size,
         mask_type="causal",
         out_dtype=dtype,
@@ -651,8 +648,8 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
     from tensorrt_llm._torch.attention_backend.prims_ts import (
         BatchMLADecodePagedTSWrapper,
-        get_prims_ts_batch_decode_mla_workspace_size,
-        prims_ts_batch_decode_with_kv_cache_mla,
+        get_prims_ts_batch_mla_decode_workspace_size,
+        prims_ts_batch_mla_decode_with_kv_cache,
     )
 
     batch_size = 2
@@ -696,7 +693,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
         device=device,
         dtype=dtype,
     )
-    workspace_bytes = get_prims_ts_batch_decode_mla_workspace_size(
+    workspace_bytes = get_prims_ts_batch_mla_decode_workspace_size(
         batch_size,
         num_heads,
         kv_lora_rank,
@@ -774,7 +771,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
     block_tables.copy_(block_tables.flip(0).clone())
     seq_lens.copy_(seq_lens.flip(0).clone())
     reference_workspace = torch.empty_like(external_workspace)
-    reference = prims_ts_batch_decode_with_kv_cache_mla(
+    reference = prims_ts_batch_mla_decode_with_kv_cache(
         query,
         kv_cache,
         reference_workspace,
