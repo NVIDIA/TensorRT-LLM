@@ -17,7 +17,9 @@ import time
 import uuid
 from importlib.util import find_spec
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
+from types import FrameType
+from typing import (TYPE_CHECKING, Any, Dict, NamedTuple, NoReturn, Optional,
+                    Sequence, Set)
 
 import click
 import torch
@@ -67,6 +69,19 @@ if TYPE_CHECKING:
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
+
+
+class _VisualGenStartupTermination(BaseException):
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _terminate_visual_gen_startup(signum: int,
+                                  frame: Optional[FrameType]) -> NoReturn:
+    del frame
+    raise _VisualGenStartupTermination(signum)
 
 
 def _report_observed_child_failure(return_code: int, component: str,
@@ -905,23 +920,36 @@ def launch_visual_gen_server(
 
         logger.info(f"Initializing VisualGen ({model})")
 
-        visual_gen_model = VisualGen(model=model, args=visual_gen_args)
+        previous_sigterm_handler = signal.signal(signal.SIGTERM,
+                                                 _terminate_visual_gen_startup)
+        visual_gen_model = None
+        try:
+            visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
-        n_workers = visual_gen_model.args.parallel_config.n_workers
-        logger.info(f"World size: {n_workers}")
-        logger.info(
-            f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
-        logger.info(
-            f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
-        )
+            n_workers = visual_gen_model.args.parallel_config.n_workers
+            logger.info(f"World size: {n_workers}")
+            logger.info(
+                f"CFG size: {visual_gen_model.args.parallel_config.cfg_size}")
+            logger.info("Ulysses size: "
+                        f"{visual_gen_model.args.parallel_config.ulysses_size}")
 
-        server = OpenAIServer(generator=visual_gen_model,
-                              model=model,
-                              server_role=ServerRole.VISUAL_GEN,
-                              metadata_server_cfg=metadata_server_cfg,
-                              tool_parser=None)
-        _apply_fastapi_middlewares(server.app, middleware)
-        uvloop.run(server(host, port, sockets=[s]))
+            server = OpenAIServer(generator=visual_gen_model,
+                                  model=model,
+                                  server_role=ServerRole.VISUAL_GEN,
+                                  metadata_server_cfg=metadata_server_cfg,
+                                  tool_parser=None)
+            _apply_fastapi_middlewares(server.app, middleware)
+            uvloop.run(server(host, port, sockets=[s]))
+        except _VisualGenStartupTermination as e:
+            if visual_gen_model is not None:
+                visual_gen_model.shutdown()
+            raise SystemExit(128 + e.signum) from None
+        finally:
+            signal.signal(
+                signal.SIGTERM,
+                signal.SIG_DFL if previous_sigterm_handler is None else
+                previous_sigterm_handler,
+            )
 
 
 @click.command("serve")

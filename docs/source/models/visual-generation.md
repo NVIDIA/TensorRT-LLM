@@ -378,6 +378,12 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
 
+For multi-node execution, VisualGen relies on the external launcher to terminate
+the remaining ranks when any rank exits. `torchrun` provides this behavior. With
+SLURM, launch the VisualGen rank group with `srun --kill-on-bad-exit=1`; without
+this option, surviving ranks can continue running and retain GPU memory after a
+peer or the coordinator exits.
+
 ## Developer Guide
 
 ### Architecture Overview
