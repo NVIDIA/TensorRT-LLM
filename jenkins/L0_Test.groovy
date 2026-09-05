@@ -6852,9 +6852,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             echo "###### Extra PyTorch CUDA 13.2 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            // TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once
-                            // public torch>=2.13.0 and a matching public triton are released.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            // Keep in sync with requirements.txt's torch/triton pins and
+                            // install_pytorch.sh: torchvision==0.29.0 is the release that
+                            // requires torch==2.14.0.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu130 torchvision==0.29.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
