@@ -65,7 +65,7 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import \
+    from tensorrt_llm._torch.attention.backends.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
@@ -2576,10 +2576,10 @@ class KVCacheManager(BaseResourceManager):
             # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
             # AttentionMetadata.create_cross_metadata() sets
             # cross_md.kv_cache_manager = cross_kv_cache_manager
-            # (attention_backend/interface.py), and then
+            # (attention/backends/interface.py), and then
             # TrtllmAttentionMetadata.prepare() calls
             # self.kv_cache_manager.copy_batch_block_offsets(...)
-            # (attention_backend/trtllm.py), which dispatches here on the
+            # (attention/backends/trtllm.py), which dispatches here on the
             # cross manager.
             num_gen_requests = len(request_ids) - num_context
             expected_num_seqs = num_context + num_gen_requests * beam_width

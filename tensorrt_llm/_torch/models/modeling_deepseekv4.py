@@ -52,8 +52,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends.sparse.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from ..attention.mla import MLA
 from ..distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -70,7 +71,6 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (

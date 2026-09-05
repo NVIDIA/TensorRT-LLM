@@ -6,16 +6,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.attention_backend.sparse.hooks import get_sparse_attention_hooks
-from tensorrt_llm._torch.attention_backend.sparse.qsa import (
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.sparse.hooks import get_sparse_attention_hooks
+from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSAAttentionMetadata,
     QSAMambaHybridCacheManagerV2,
     QSASparseMetadataParams,
     QSASparseParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.qsa.module import QSASparseHooks
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.module import QSASparseHooks
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams

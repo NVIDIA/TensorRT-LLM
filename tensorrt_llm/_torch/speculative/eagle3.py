@@ -12,8 +12,8 @@ from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -937,8 +937,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                    is_dsa_cache_manager)
+        from ..attention.backends.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                     is_dsa_cache_manager)
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts

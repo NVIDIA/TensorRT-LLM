@@ -24,7 +24,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_fwd_import_error = None

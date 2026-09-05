@@ -17,9 +17,9 @@ from typing import Callable
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams, PhasedFmha
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 
 
 class FakeAttention:

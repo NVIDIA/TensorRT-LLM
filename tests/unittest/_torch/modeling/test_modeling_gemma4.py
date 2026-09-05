@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 import torch
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
 
-from tensorrt_llm._torch.attention_backend import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1164,7 +1164,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1361,7 +1361,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         # Run context-phase comparison with tighter tolerance
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         hf_cache = DynamicCache()
@@ -1467,7 +1467,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1547,7 +1547,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1695,7 +1695,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         indices per pool so that each layer uses the correct indices during
         append_paged_kv_cache and attention plan/run.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         # E4B-like: sliding head_dim=64, full head_dim=128, kv_heads=2 both
@@ -1785,7 +1785,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         returned by get_paged_kv_indices_for_layer are within each pool's
         buffer size.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -1846,7 +1846,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         sliding layer, verifying the shared buffer has the right pool's
         indices at each step.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2056,7 +2056,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         data.  After swap pool0→pool1→pool0, the restored pool0 indices
         must match the original values, not pool1's values.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2132,7 +2132,7 @@ class TestGemma4HFComparison(unittest.TestCase):
     )
     def test_vswa_evicted_page_indices_are_sanitized(self) -> None:
         """FlashInfer metadata replaces evicted SWA page markers."""
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2208,7 +2208,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         a BS=1 baseline where B never existed.
         """
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -2633,7 +2633,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
 
     def test_attn_backend_dispatches_to_trtllm(self):
         """Verify the Gemma4 default dispatches to TrtllmAttention."""
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         backend_cls = get_attention_backend(defaults["attn_backend"])
@@ -3096,7 +3096,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         """
         import random
 
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3272,7 +3272,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         several decode iterations (e.g., stale plan data, growing kv_lens,
         VSWA swap with changing page counts).
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3443,7 +3443,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         Uses E2B real-dims config (hd=256/512, GQA=8) with multi-step
         decode to verify _block_tables update works for high-GQA models.
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3615,7 +3615,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         expect_split_kv: bool = False,
     ) -> None:
         """Helper: CUDA graph decode test with real head_dim configs."""
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3859,7 +3859,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         across multiple graph replays with changing kv_lens.  Uses
         31B-like config with trtllm-gen for all layers.
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )

@@ -14,7 +14,14 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
-  # ------------- PyTorch tests ---------------
+  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
+  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
+  # is what picks them up:
+  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
+  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
+  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
+  #               rebind mpi4py's serializer at import time, which applies process-wide on
+  #               every stage that collects them, including where the tests themselves skip.
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
@@ -23,13 +30,11 @@ l0_h100:
   - unittest/others/test_lora_manager.py
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
-  - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   - unittest/_torch/modules/test_w4a16_nvfp4_linear.py
