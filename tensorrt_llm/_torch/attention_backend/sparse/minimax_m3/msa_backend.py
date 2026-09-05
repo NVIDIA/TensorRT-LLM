@@ -33,7 +33,6 @@ import torch
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._utils import maybe_pin_memory
-from tensorrt_llm.bindings import DataType
 
 from .common import (
     MiniMaxM3SparseConfig,
@@ -376,6 +375,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_max_kv_len_all = 0
         self._msa_total_k = 0
         self._msa_total_k_rows = 0
+        self._msa_context_prefix_bounds = (0, 0, 0, 0)
         self._create_msa_buffers()
 
     @property
@@ -529,10 +529,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if buffers is None:
             return False
         return buffers[:, 0].dtype == torch.float8_e4m3fn
-
-    def _msa_main_kv_is_nvfp4(self) -> bool:
-        """Whether the main paged K/V cache uses packed NVFP4 storage."""
-        return getattr(self.kv_cache_manager, "dtype", None) == DataType.NVFP4
 
     def _create_msa_buffers(self) -> None:
         """Allocate the CUDA-graph-stable MSA device buffers.
@@ -1336,10 +1332,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         The page table and per-new-token cache slots are derived via the
         build_paged_kv_slot_mapping helper, then copied into the persistent
         buffers. The transient builder tensors are discarded.
-
-        Two of those buffers exist only for fmha_sm100 and are skipped when
-        _resolve_decode_kernels left it with nothing to run this step; see
-        _msa_runs_no_fmha.
         """
         self._msa_fields_ready = False
         # Drop any prewritten marker a failed prior step left unconsumed, so
@@ -1452,6 +1444,25 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             .sum()
             .item()
         )
+        # The same four bounds over the context prefix alone, which is what an
+        # NVFP4 sparse layer's CSR kernel covers once the ported decode kernels
+        # take the generation suffix. Sizing that call from the whole batch
+        # would let a long generation row inflate its worklist.
+        context_rows = min(int(self.num_contexts or 0), batch_size)
+        if context_rows > 0:
+            prefix_kv = kv_lens_cpu[:context_rows].to(torch.int64)
+            self._msa_context_prefix_bounds = (
+                int(qo_lens_cpu[:context_rows].max().item()),
+                int(prefix_kv.max().item()),
+                int(prefix_kv.sum().item()),
+                int(
+                    torch.div(prefix_kv + page_size - 1, page_size, rounding_mode="floor")
+                    .sum()
+                    .item()
+                ),
+            )
+        else:
+            self._msa_context_prefix_bounds = (0, 0, 0, 0)
         # Sub-page expansion for the trtllm-gen dense layers, staged once here
         # instead of once per layer. It runs outside capture and writes a
         # graph-stable buffer, so a replay reads what this step staged, exactly
