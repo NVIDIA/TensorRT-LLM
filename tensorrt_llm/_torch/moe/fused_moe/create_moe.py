@@ -12,6 +12,7 @@ from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .configurable_moe import ConfigurableMoE
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
@@ -178,8 +179,11 @@ def create_moe_backend(
             layer_idx=layer_idx,
             activation=activation,
         )
-    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE):
-        # The narrower CuteDsl argument set: these kernels take no expert bias.
+    elif moe_cls in (CuteDslFusedMoE, CuteDslB12xFusedMoE, CuteDslFc12FusedMoE):
+        # Both are constructed through the narrower CuteDsl argument set (no
+        # bias / swiglu_alpha-beta-limit). CuteDslB12xFusedMoE now delegates to
+        # CutlassFusedMoE.__init__, which does accept those four, so widening
+        # this branch would need the allow-lists above to admit b12x first.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
