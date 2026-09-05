@@ -517,6 +517,7 @@ class Cosmos3CausalAttention(Attention):
             num_key_value_heads=num_key_value_heads,
             head_dim=head_dim,
             qkv_mode=QKVMode.SEPARATE_QKV,
+            separate_qkv_is_self_attention=True,
             qk_norm=False,
             qk_norm_mode="per_head",
             bias=False,
