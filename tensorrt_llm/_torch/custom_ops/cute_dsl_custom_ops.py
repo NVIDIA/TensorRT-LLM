@@ -488,6 +488,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
+        # Every tactic triggers its own cute.compile() JIT, and that compile
+        # dominates autotune wall time (measured on B200: ~2.2s compile vs
+        # ~0.2ms execution per tactic), so opt into multiprocess tactic
+        # profiling to overlap the compiles across worker processes.
+        tactic_compile_dominates = True
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 0, get_last_power_of_2_num_tokens_buckets,
