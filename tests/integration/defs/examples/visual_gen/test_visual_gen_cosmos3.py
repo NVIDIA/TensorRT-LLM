@@ -623,7 +623,10 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    image=image_path,
+                    # forward() takes an encoded reference, not a path: the serve
+                    # path resolves MediaRef to bytes on the coordinator, so
+                    # direct callers read the file themselves.
+                    image=image_path.read_bytes(),
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES,
@@ -663,7 +666,7 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
     regression against a past TRT-LLM run. Full provenance:
     ``golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json``.
     """
-    image_path = str(tmp_path / "cosmos3_i2v_4step_conditioning.png")
+    image_path = tmp_path / "cosmos3_i2v_4step_conditioning.png"
     _write_cosmos3_i2v_conditioning_image(image_path)
     generated_path = tmp_path / "cosmos3_i2v_4step_generated.mp4"
     golden_path = _golden_media_path(
@@ -872,10 +875,13 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         tmp_path, "cosmos3_edge_i2v_lpips_golden_video.mp4", "Cosmos3-Edge I2V LPIPS golden video"
     )
     image_path = tmp_path / "cosmos3_edge_i2v_conditioning.png"
-    _write_cosmos3_edge_conditioning_image(str(image_path))
+    _write_cosmos3_edge_conditioning_image(image_path)
     result = _run_cosmos3_edge_lpips_pipeline(
         prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
-        image=str(image_path),
+        # forward() takes an encoded reference, not a path: the serve path
+        # resolves MediaRef to bytes on the coordinator, so direct callers
+        # read the file themselves.
+        image=image_path.read_bytes(),
         height=480,
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
