@@ -705,10 +705,16 @@ def _parse_server_timing_header(headers: Any) -> dict[str, float]:
 
 
 def _get_server_timing_metric(
-    timings: dict[str, float], name: str, *, require_positive: bool
-) -> float:
-    """Return a required Server-Timing metric, in seconds."""
+    timings: dict[str, float], name: str, *, require_positive: bool, required: bool = True
+) -> Optional[float]:
+    """Return a Server-Timing metric, in seconds.
+
+    An optional metric that is absent returns ``None``; one that is present is
+    validated either way, so a bad value is never mistaken for an absent one.
+    """
     if name not in timings:
+        if not required:
+            return None
         raise ValueError(f"Missing VisualGen Server-Timing metric: {name}")
     timing = timings[name]
     if not math.isfinite(timing) or timing < 0 or (require_positive and timing <= 0):
@@ -730,7 +736,9 @@ def _record_server_timings(headers: Any, record: VisualGenRequestRecord) -> None
     record.server_denoise = _get_server_timing_metric(
         timings, VISUAL_GEN_DENOISE_TIMING, require_positive=False
     )
-    record.server_e2e = timings.get(VISUAL_GEN_TOTAL_TIMING)
+    record.server_e2e = _get_server_timing_metric(
+        timings, VISUAL_GEN_TOTAL_TIMING, require_positive=True, required=False
+    )
 
 
 async def _dispatch_image(
@@ -1015,7 +1023,7 @@ def _output_rate(
     return key, count / duration if duration > 0 else 0.0
 
 
-def _record_json(record: VisualGenRequestRecord, backend: str) -> dict[str, Any]:
+def _record_json(record: VisualGenRequestRecord) -> dict[str, Any]:
     data: dict[str, Any] = {
         "index": record.index,
         "success": record.success,
@@ -1078,7 +1086,7 @@ def build_visual_gen_result(
             name: _stats(_samples(records, name), selected_percentiles)
             for name in SERVER_TIMING_FIELDS
         }
-        result["requests"] = [_record_json(record, backend) for record in records]
+        result["requests"] = [_record_json(record) for record in records]
     return result
 
 

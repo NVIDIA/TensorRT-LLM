@@ -42,6 +42,7 @@ from .visual_gen_perf_utils import (
     build_visual_gen_db_entry,
     get_visual_gen_match_keys,
     get_visual_gen_num_gpus_from_server_config,
+    latency_series,
 )
 
 DEFAULT_TIMEOUT = 5400
@@ -506,7 +507,12 @@ class VisualGenPerfSanityTestConfig:
 
         size = client_config.get("size")
         if size is not None:
-            width, _, height = str(size).partition("x")
+            width, sep, height = str(size).partition("x")
+            if not (sep and width.isdigit() and height.isdigit()):
+                raise ValueError(
+                    f"client_configs entry in {self.config_file} has size={size!r}; "
+                    "the document carries width and height, so it must be WxH."
+                )
             params["width"], params["height"] = int(width), int(height)
 
         extra_body = client_config.get("extra_body")
@@ -518,7 +524,8 @@ class VisualGenPerfSanityTestConfig:
             for key in ("image_reference", "video_reference"):
                 if key in extra:
                     per_request[key] = extra.pop(key)
-            params.update(extra)
+            if extra:
+                params["extra_params"] = {**params.get("extra_params", {}), **extra}
 
         prompt_file = client_config.get("prompt_file")
         if prompt_file is not None:
@@ -527,7 +534,7 @@ class VisualGenPerfSanityTestConfig:
                 prompt_file_path = Path(get_llm_root()) / prompt_file_path
             prompts = [
                 _prompt_from_line(line)
-                for line in prompt_file_path.read_text().splitlines()
+                for line in prompt_file_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
         else:
@@ -592,8 +599,9 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
+        latency = latency_series(str(client_config["backend"]))
         series = {
-            "e2e_latency": result_data["e2e_latency"],
+            latency: result_data[latency],
             "server_gen": result_data["timings"]["server_gen"],
         }
         for name, stats in series.items():

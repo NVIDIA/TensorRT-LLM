@@ -261,6 +261,9 @@ def test_online_benchmark(
     assert "completed" in data
     assert data["completed"] >= 1
     assert data["e2e_latency"]["mean"] > 0
+    # The video route stamps gen_latency at the postprocessing transition, so it
+    # ends before the encode and the /content fetch that e2e_latency includes.
+    assert 0 < data["gen_latency"]["mean"] < data["e2e_latency"]["mean"]
 
 
 # ===========================================================================
@@ -325,3 +328,4 @@ def test_offline_benchmark(tmp_path):
     assert "completed" in data
     assert data["completed"] >= 1
     assert data["mean_latency"] > 0
+    assert data["mean_generation"] > 0

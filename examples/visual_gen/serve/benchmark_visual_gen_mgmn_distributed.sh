@@ -198,8 +198,10 @@ mkdir -p "${RESULT_DIR}"
     echo "  frame_rate: ${FPS}"
   fi
   echo "requests:"
+  # YAML single-quoted: only ' needs escaping, by doubling, so a prompt carrying
+  # quotes or backslashes stays the prompt the run measured.
   for _ in $(seq 1 "${NUM_PROMPTS}"); do
-    echo "  - prompt: \"${PROMPT}\""
+    echo "  - prompt: '${PROMPT//\'/\'\'}'"
   done
 } > "${WORKLOAD_FILE}"
 
