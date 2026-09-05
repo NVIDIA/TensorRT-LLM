@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 
-from agent_flow.ops import notices
+from agent_flow.ops import mailbox, notices
 from agent_flow.ops.config import add_config_argument, config_from_args
 from agent_flow.ops.notify_agent import cache_path, strip_block
 
@@ -36,12 +36,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="post the promised follow-up for --id (that notice was acked with --later)",
     )
-    ap.add_argument("--role", help="who is acking (default: inferred from the cwd)")
+    ap.add_argument(
+        "--role", "--as", dest="role", help="mailbox that is acking (default: inferred)"
+    )
     a = ap.parse_args(argv)
     cfg = config_from_args(a)
-    notices.configure(cfg)
+    mailbox.configure(cfg)
 
-    role = a.role or notices.infer_role()
     text = " ".join(a.text) or "(no detail given)"
     if a.followup:
         if not a.nid:
@@ -49,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         notices.followup(text, a.nid)
         print(f"follow-up posted for {a.nid}: {text}")
         return 0
-    ids = notices.ack(text, a.nid, followup=a.later, role=role)
+    ids, name, source = mailbox.ack(text, a.nid, as_=a.role, later=a.later)
     if ids and ids[0].startswith("r"):
         print(f"no pending notice matched; recorded as report {ids[0]}: {text}")
         return 0
@@ -57,7 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     if not notices.pending() and cache.exists():
         cache.write_text(strip_block(cache.read_text()))
     suffix = " (follow-up due)" if a.later else ""
-    print(f"acknowledged {', '.join(ids)} as {role}{suffix}: {text}")
+    origin = "" if source == "explicit" else f" (mailbox from {source})"
+    print(f"acknowledged {', '.join(ids)} as {name}{suffix}{origin}: {text}")
     return 0
 
 

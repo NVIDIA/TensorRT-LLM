@@ -34,6 +34,23 @@ reviewer = "/path/to/worktrees/wt-2"
 # live_notes = "LIVE-NOTES.md"        # appended file a PostToolUse hook injects
 # ack_command = "python -m agent_flow.ops.ack_notice"
 
+[mailboxes]
+# Addressable participants beyond the roles above. Roles are registered
+# automatically; anything registered at runtime lands in <root>/MAILBOXES.json.
+# default_delivery = ["command_cache", "live_notes"]
+# default_due_minutes = 0      # 0: messages never become overdue on their own
+# human = "oncall"             # where `mailbox nag` escalates at the top rung
+# tool_result_file = ".pending-messages.md"
+
+# [mailboxes.oncall]
+# kind = "human"               # agent | human | service
+# description = "the human on call"
+# delivery = []                # humans read the queue, not the agent channels
+
+# [mailboxes.watchdog]
+# kind = "service"
+# delivery = ["live_notes"]
+
 [dashboard]
 # The narrator model is optional: without the CLI binary the dashboard prints
 # "(narration unavailable)" and keeps working.

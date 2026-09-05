@@ -52,6 +52,17 @@ def configure(cfg: OpsConfig, queue: Path | None = None) -> None:
     _ACK_CMD = str(cfg.get("notices", "ack_command", default=_ACK_CMD))
 
 
+def set_roles(names) -> None:
+    """Widen the addressable name set (see :mod:`agent_flow.ops.mailbox`).
+
+    Roles are the built-in mailboxes; a run that registers extra mailboxes
+    must have them recognised here too, or ``addressees()`` would silently
+    drop a name and the notice would read as addressed to everyone.
+    """
+    global _ROLES
+    _ROLES = tuple(dict.fromkeys(str(n) for n in names)) or _ROLES
+
+
 def set_queue(path) -> None:
     """Repoint the queue only (archive replay, a second run directory)."""
     global _QUEUE

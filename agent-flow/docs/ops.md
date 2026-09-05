@@ -98,6 +98,49 @@ with notices, acks, follow-ups and reports.
 * Who acked is recorded, not guessed: `--role`, else the cwd matched against
   the config's role-to-checkout mapping.
 
+## Mailboxes
+
+A notice addressed to a *role* is too narrow once more than two participants
+exist. A **mailbox** is a name any participant can register; the workflow roles
+are mailboxes that happen to be declared in `[roles]`, and the queue file, the
+record types and the id space are the same, so old records keep working.
+
+```
+python -m agent_flow.ops.mailbox register oncall --kind human
+python -m agent_flow.ops.mailbox send --to coder,reviewer --key j17 "switch to X"
+python -m agent_flow.ops.mailbox recv --as coder
+python -m agent_flow.ops.mailbox ack  --as coder --id n7 "switched"
+python -m agent_flow.ops.mailbox fsck
+python -m agent_flow.ops.mailbox nag
+```
+
+`notify_agent` and `ack_notice` are thin wrappers over this layer and keep
+their flags.
+
+* **Delivery is best-effort, the queue is the record.** A mailbox names
+  delivery hooks — `command_cache` (prepend to the file every role reads before
+  running a command), `live_notes` (append to the file a PostToolUse hook
+  injects), `tool_result` (write a file the harness injects into the next tool
+  result, optional by design). A hook that fails is reported and never changes
+  whether the message is pending. Hooks that write one project-wide file run
+  once per message, not once per addressee.
+* **Sends are idempotent under `--key`.** A caller that cannot tell whether its
+  first send landed retries with the same key and gets the original record
+  back.
+* **Acks are recorded by mailbox name**, with `ack_source` saying whether the
+  name was explicit, from `$AGENT_NOTICE_ROLE`, or inferred from the cwd. The
+  inference is a fallback only: a wrong guess silently settles someone else's
+  message, so it is worth being able to see afterwards.
+* **`fsck`** reports acks for a message that does not exist, acks stamped
+  before the message they answer, and messages addressed to nobody or to an
+  unregistered name. Exit 1 when anything is found.
+* **`nag`** escalates one step per round over what is overdue — a message past
+  `--due` (or `[mailboxes].default_due_minutes`) with an addressee that has not
+  acked, or a promised follow-up that never arrived: re-deliver, then mark it
+  OVERDUE for the dashboard, then post to the human mailbox.
+* **`status()`** returns pending, blocking, overdue and awaiting-follow-up in
+  one call, which is what the dashboard reads.
+
 ## Reservation etiquette
 
 Allocations and worktree slots use the same table (JSON under `flock`, rendered

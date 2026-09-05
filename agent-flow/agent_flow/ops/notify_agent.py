@@ -22,11 +22,10 @@ inject into the output of a wrapped command.
 from __future__ import annotations
 
 import argparse
-import datetime
 import re
 import sys
 
-from agent_flow.ops import notices
+from agent_flow.ops import mailbox, notices
 from agent_flow.ops.config import OpsConfig, add_config_argument, config_from_args
 
 BEGIN, END = "<!-- human-notice -->", "<!-- /human-notice -->"
@@ -61,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("message", nargs="?")
     ap.add_argument("--clear", action="store_true", help="remove the mirrored block")
     ap.add_argument("--to", default="all", help="addressees: a role, a comma list, or 'all'")
+    ap.add_argument("--key", default=None, help="client dedupe key; a retry sends once")
+    ap.add_argument("--due", type=float, default=None, help="minutes until it counts as overdue")
     ap.add_argument(
         "--block",
         action="store_true",
@@ -69,9 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     a = ap.parse_args(argv)
     cfg = config_from_args(a)
-    notices.configure(cfg)
+    mailbox.configure(cfg)
     cache = cache_path(cfg)
-    live = live_notes_path(cfg)
 
     if a.clear or not a.message:
         if cache.exists():
@@ -79,42 +79,28 @@ def main(argv: list[str] | None = None) -> int:
         print("cleared the mirrored block (queue history is append-only)")
         return 0
 
-    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M %Z").strip()
     try:
-        to_list = notices.parse_to(a.to)
+        to_list = mailbox.resolve_to(a.to)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    who = addressee_banner(to_list, notices.roles())
-    ack_cmd = notices.ack_command()
-    body = (
-        f"{BEGIN}\n> **HUMAN NOTICE ({stamp}) — {who}** — newer than your prompt and "
-        f"overrides it where they conflict. Act on it now rather than finishing your "
-        f"current approach first. When done, acknowledge with:\n>\n"
-        f'> `{ack_cmd} --role <role> "<one line: what you did about it>"`\n>\n'
-        + "\n".join(f"> {ln}" for ln in a.message.splitlines())
-        + f"\n{END}\n"
+    # A human notice is always mirrored into both mid-turn channels, whatever
+    # the addressee mailboxes normally ask for: that is what this CLI is for.
+    rec, duplicate, report = mailbox.send(
+        a.message,
+        to=to_list,
+        blocking=a.block,
+        key=a.key or "",
+        due_minutes=a.due,
+        title=f"HUMAN NOTICE — {addressee_banner(to_list, notices.roles())}",
+        hooks=("command_cache", "live_notes"),
     )
-    rec = notices.add(a.message, blocking=a.block, to=to_list)
+    if duplicate:
+        print(f"already sent as {rec['id']} (dedupe key {a.key}); nothing delivered again")
+        return 0
     delivered = [f"{notices.queue_path()} ({rec['id']}{', BLOCKING' if a.block else ''})"]
-    if cache.exists():
-        cache.write_text(body + "\n" + strip_block(cache.read_text()))
-        delivered.append(str(cache))
-    # Live notes are append-only history, so an ack does not remove the entry.
-    if live.exists():
-        with live.open("a") as fh:
-            fh.write(
-                f"\n## {stamp} — human notice ({who})"
-                + (
-                    " (BLOCKING: wrapped commands refuse to run until acknowledged)"
-                    if a.block
-                    else ""
-                )
-                + "\n"
-                + a.message.strip()
-                + f'\n\nAcknowledge with: `{ack_cmd} "<what you did>"`\n'
-            )
-        delivered.append(str(live))
+    delivered += [f"{d['detail']} [{d['to']}/{d['hook']}]" for d in report if d["ok"]]
+    delivered += [f"FAILED {d['to']}/{d['hook']}: {d['detail']}" for d in report if not d["ok"]]
     print("notice delivered to:\n  " + "\n  ".join(delivered))
     return 0
 
