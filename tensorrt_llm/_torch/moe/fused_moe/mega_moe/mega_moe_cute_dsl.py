@@ -359,7 +359,7 @@ class MegaMoECuteDsl(MoEImplBase):
     # The elementwise function and its constants are codegen-time literals, so
     # only a uniform per-layer value is representable.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.SiTu}),
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.SiTu}),
         alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
@@ -391,10 +391,13 @@ class MegaMoECuteDsl(MoEImplBase):
                 f"MegaMoECuteDsl supports activations in "
                 f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {p.dtype_act}.",
             )
-        if p.swiglu_gptoss_style:
+        if p.swiglu_gptoss_style and not (
+            p.activation_type == ActivationType.SwigluBias and p.bias is False
+        ):
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
-                "MegaMoECuteDsl does not support swiglu_gptoss_style.",
+                "MegaMoECuteDsl supports MiniMax-style SwigluBias without "
+                "expert bias, but not the GPT-OSS expert-bias package.",
             )
         if p.quant_algo != QuantAlgo.NVFP4:
             return _reject(
@@ -1441,8 +1444,14 @@ class MegaMoECuteDsl(MoEImplBase):
                 # The kernel clamps the post-fc1_alpha gate/up, so the model
                 # value goes in as-is -- no trtllm-gen-style div_(fc31_alpha).
                 gate_up_clamp=self.act_clamp,
-                act_alpha=self.act_alpha,
-                act_beta=self.act_beta,
+                swiglu_alpha=(
+                    self.act_alpha if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                swiglu_beta=(
+                    self.act_beta if self.activation_type is ActivationType.SwigluBias else None
+                ),
+                act_alpha=(self.act_alpha if self.activation_type is ActivationType.SiTu else None),
+                act_beta=(self.act_beta if self.activation_type is ActivationType.SiTu else None),
                 # Keep the deterministic standalone TopkReduce until form-B
                 # has dedicated GPU correctness and performance coverage.
                 in_kernel_fc2_reduce=False,

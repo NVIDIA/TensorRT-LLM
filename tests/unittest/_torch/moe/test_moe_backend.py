@@ -54,6 +54,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -78,6 +79,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEStaticCapability,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
+    MoEDep,
     collect_moe_environment,
     override_moe_environment,
 )
@@ -1018,7 +1020,10 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
-def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+def _make_megamoe_cutedsl_for_ctor_test(
+    *,
+    activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
+) -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
@@ -1032,7 +1037,83 @@ def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
         dtype=torch.bfloat16,
         model_config=model_config,
         init_load_balancer=False,
+        activation=activation,
     )
+
+
+def test_megamoe_cutedsl_accepts_minimax_m3_problem() -> None:
+    verdict = MegaMoECuteDsl.can_implement(
+        MoEProblem(
+            quant=QuantAlgo.NVFP4.value,
+            dtype_act=torch.bfloat16,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=8,
+            top_k=2,
+            swiglu_gptoss_style=True,
+            bias=False,
+            activation=ActivationType.SwigluBias.name,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=8,
+            env=MoEEnvironment(
+                sm=100,
+                available_deps=(MoEDep.MEGAMOE_CUTEDSL_RUNTIME, MoEDep.MEGAMOE_CUTEDSL_OP),
+            ),
+        ),
+    )
+
+    assert verdict.eligible, verdict.detail
+
+
+def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        activation=SwigluBiasActivation(
+            gate_sigmoid_scale=torch.full((8,), 1.702),
+            linear_offset=torch.ones(8),
+            clamp=torch.full((8,), 7.0),
+        )
+    )
+
+    assert moe.act_alpha == pytest.approx(1.702)
+    assert moe.act_beta == pytest.approx(1.0)
+    assert moe.act_clamp == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize(
+    ("parameter_name", "register_name"),
+    [
+        ("gate_sigmoid_scale", "alpha"),
+        ("linear_offset", "beta"),
+        ("clamp", "clamp"),
+    ],
+)
+def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(
+    parameter_name: str, register_name: str
+) -> None:
+    parameters = {
+        "gate_sigmoid_scale": torch.full((8,), 1.702),
+        "linear_offset": torch.ones(8),
+        "clamp": torch.full((8,), 7.0),
+    }
+    parameters[parameter_name][-1] += 1.0
+
+    with pytest.raises(ValueError, match=rf"uniform .*activation {register_name}"):
+        _make_megamoe_cutedsl_for_ctor_test(
+            activation=SwigluBiasActivation(**parameters),
+        )
+
+
+def test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+
+    assert moe.act_alpha is None
+    assert moe.act_beta is None
+    assert moe.act_clamp is None
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(

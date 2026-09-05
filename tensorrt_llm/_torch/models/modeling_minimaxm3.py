@@ -63,6 +63,7 @@ from ..modules.linear import (
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..moe.fused_moe.interface import MoESchedulerKind
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
@@ -79,6 +80,12 @@ from .modeling_utils import (
 # Limit backends to memory-efficient and math; cuDNN SDPA fails for this layout,
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+
+def _moe_routed_output_is_global(experts: nn.Module) -> bool:
+    """Return whether the selected MoE backend performs fused communication."""
+    backend = getattr(experts, "backend", experts)
+    return getattr(backend, "scheduler_kind", None) == MoESchedulerKind.FUSED_COMM
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +470,7 @@ class MiniMaxM3MoE(nn.Module):
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,
         )
+        self.routed_output_is_global = _moe_routed_output_is_global(self.experts)
         # Shared expert: dense MLP fused into MoE output. Constructed
         # with ``is_shared_expert=True`` so ``reduce_output=False``
         # (the external AllReduce below performs the combined
@@ -521,7 +529,8 @@ class MiniMaxM3MoE(nn.Module):
             return self.shared_experts(hidden_states)
 
         if self.shared_experts is None:
-            result = _compute_routed_output()
+            routed_output = _compute_routed_output()
+            result = routed_output
         else:
             routed_output, shared_output = maybe_execute_in_parallel(
                 _compute_routed_output,
@@ -531,11 +540,18 @@ class MiniMaxM3MoE(nn.Module):
                 self.aux_stream,
                 disable_on_compile=True,
             )
-            # In-place add into ``shared_output`` to avoid allocating a
-            # temporary (matches DeepSeekV3 / GLM convention).
+            if self.routed_output_is_global and self.allreduce is not None:
+                # Fused-communication backends have already combined the routed
+                # branch across ranks. Reduce only the still-local shared branch.
+                shared_output = self.allreduce(
+                    shared_output, all_reduce_params=final_all_reduce_params
+                )
+                return shared_output.add_(routed_output)
+            # In-place add into ``shared_output`` to avoid allocating a temporary
+            # (matches DeepSeekV3 / GLM convention).
             result = shared_output.add_(routed_output)
 
-        if self.allreduce is not None:
+        if self.allreduce is not None and not self.routed_output_is_global:
             result = self.allreduce(result, all_reduce_params=final_all_reduce_params)
         return result
 
@@ -1727,6 +1743,11 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
         self.pre_feed_forward_fusion = self.enable_fusion
         self.post_feed_forward_fusion = self.enable_fusion
+        if self.block_sparse_moe is not None and self.block_sparse_moe.routed_output_is_global:
+            # A fused-communication MoE has no routed AllReduce left to fold into
+            # the next layer's boundary norm. Its local shared branch is reduced
+            # inside MiniMaxM3MoE.forward instead.
+            self.post_feed_forward_fusion = False
 
         self.allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
