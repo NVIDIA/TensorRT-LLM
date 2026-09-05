@@ -1,13 +1,15 @@
 from operator import getitem
 
 import torch
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, KeywordArg,
                                              Match, MultiOutputPattern,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
+from . import _make_pattern_example_inputs
+
 aten = torch.ops.aten
-from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
 
 def register_add_norm(custom_pass: PatternMatcherPass):
@@ -63,7 +65,7 @@ def register_add_norm(custom_pass: PatternMatcherPass):
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=add_norm_pattern,
@@ -137,7 +139,7 @@ def register_add_norm_quant(custom_pass: PatternMatcherPass):
     register_replacement(
         empty_pattern,
         target_pattern,
-        [],
+        _make_pattern_example_inputs(empty_pattern),
         fwd_only,
         custom_pass,
         search_fn_pattern=add_norm_quant_pattern,

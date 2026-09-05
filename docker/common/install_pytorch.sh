@@ -12,8 +12,10 @@ fi
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-TORCH_VERSION="2.12.0"
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
+# Keep in sync with requirements.txt's torch/triton pins: torch==2.14.0 requires
+# triton~=3.8.0, which is what NGC 26.08 ships.
+TORCH_VERSION="2.14.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {

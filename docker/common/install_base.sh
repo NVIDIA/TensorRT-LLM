@@ -114,6 +114,17 @@ init_ubuntu() {
   # the apt packages leaves pip3 functional.
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
+
+  # PRRTE cannot derive its install dirs on its own: the HPC-X Open MPI 5 in the
+  # NGC PyTorch base image is relocated away from the prefix it was built with,
+  # so prte_info resolves to /build-result/hpcx-*, a build-machine path absent
+  # from the container, and `prte --version` cannot find its help files. Open
+  # MPI itself is fine -- the base image already exports OPAL_PREFIX and puts
+  # /usr/local/mpi/bin on PATH. Only the DLFW base images carry /opt/hpcx.
+  if [ -d /opt/hpcx/ompi5 ]; then
+    echo 'export PRTE_PREFIX=/opt/hpcx/ompi5' >> "${ENV}"
+  fi
+
   # Remove previous TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
     apt-get remove --purge -y libnvinfer*

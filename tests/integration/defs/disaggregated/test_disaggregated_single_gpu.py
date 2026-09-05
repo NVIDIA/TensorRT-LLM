@@ -2,7 +2,10 @@ import asyncio
 import os
 import pickle
 import platform
+import secrets
 import sys
+from contextlib import contextmanager
+from multiprocessing.connection import Client, Listener, wait
 
 import cloudpickle
 import pytest
@@ -55,40 +58,118 @@ MODEL_PATHS = {
 }
 
 
-def mpi_publish_name():
-    port_name = None
+class WorkerComm:
+    """Tagged local control channel for the single-node MPI workers.
+
+    The workers still use ``MPI.COMM_WORLD`` for TensorRT-LLM, but the test
+    control path cannot depend on MPI's external publish/lookup service because
+    CI intentionally removes its Slurm and PMIx environment before pytest.
+    """
+
+    def __init__(self, connections, rank=None):
+        self._connections = connections
+        self._rank = rank
+        self._pending = []
+        self._sources = {
+            connection: source
+            for source, connection in connections.items()
+        }
+
+    @classmethod
+    def connect(cls, address, authkey, rank):
+        connection = Client(address, family="AF_INET", authkey=authkey)
+        connection.send_bytes(cloudpickle.dumps(rank))
+        return cls({0: connection}, rank=rank)
+
+    @classmethod
+    def accept(cls, listener, num_workers):
+        connections = {}
+        for _ in range(num_workers):
+            connection = listener.accept()
+            rank = cloudpickle.loads(connection.recv_bytes())
+            if not isinstance(rank, int) or not 0 <= rank < num_workers:
+                connection.close()
+                raise RuntimeError(f"Invalid worker rank: {rank}")
+            if rank in connections:
+                connection.close()
+                raise RuntimeError(f"Duplicate worker rank: {rank}")
+            connections[rank] = connection
+        return cls(connections)
+
+    @staticmethod
+    def _matches(message_source, message_tag, source, tag):
+        source_matches = source == MPI.ANY_SOURCE or message_source == source
+        tag_matches = tag == MPI.ANY_TAG or message_tag == tag
+        return source_matches and tag_matches
+
+    def send(self, obj, dest, tag):
+        message = cloudpickle.dumps((tag, obj))
+        self._connections[dest].send_bytes(message)
+
+    def recv(self, source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG):
+        for index, (message_source, message_tag,
+                    obj) in enumerate(self._pending):
+            if self._matches(message_source, message_tag, source, tag):
+                self._pending.pop(index)
+                return obj
+
+        if source == MPI.ANY_SOURCE:
+            connections = list(self._connections.values())
+        else:
+            connections = [self._connections[source]]
+
+        while True:
+            for connection in wait(connections):
+                message_source = self._sources[connection]
+                message_tag, obj = cloudpickle.loads(connection.recv_bytes())
+                if self._matches(message_source, message_tag, source, tag):
+                    return obj
+                self._pending.append((message_source, message_tag, obj))
+
+    def Get_rank(self):
+        return self._rank
+
+    def close(self):
+        for connection in self._connections.values():
+            connection.close()
+        self._connections.clear()
+        self._sources.clear()
+        self._pending.clear()
+
+
+class WorkerCommServer:
+
+    def __init__(self):
+        self.authkey = secrets.token_bytes(32)
+        self._listener = Listener(("127.0.0.1", 0),
+                                  family="AF_INET",
+                                  authkey=self.authkey)
+        self.address = self._listener.address
+
+    def accept(self, num_workers=2):
+        return WorkerComm.accept(self._listener, num_workers)
+
+    def close(self):
+        self._listener.close()
+
+
+@contextmanager
+def worker_comm_server():
+    server = WorkerCommServer()
     try:
-        port_name = MPI.Open_port()
-        MPI.Publish_name('my_port', port_name)
-    except MPI.Exception as e:
-        print(f"Error publishing port name: {e}")
-        raise e
-    except Exception as e:
-        print(f"Unexpected error publishing port name: {e}")
-        raise e
-
-    return port_name
-
-
-def mpi_initialize_intercomm(port_name):
-    intercomm = None
-    try:
-        intercomm = MPI.COMM_SELF.Accept(port_name)
-    except MPI.Exception as e:
-        print(f"Error accepting intercomm: {e}", flush=True)
-        raise
-    except Exception as e:
-        print(f"Unexpected error accepting intercomm: {e}", flush=True)
-        raise
-    return intercomm
+        yield server
+    finally:
+        server.close()
 
 
 def mpi_send_termination_request(intercomm):
     if intercomm is not None:
-        # Send termination requests
-        intercomm.send(None, dest=0, tag=MPI_REQUEST)
-        intercomm.send(None, dest=1, tag=MPI_REQUEST)
-        print("Sent termination requests to the workers.")
+        try:
+            intercomm.send(None, dest=0, tag=MPI_REQUEST)
+            intercomm.send(None, dest=1, tag=MPI_REQUEST)
+            print("Sent termination requests to the workers.")
+        finally:
+            intercomm.close()
 
 
 def model_path(model_name):
@@ -104,18 +185,16 @@ async def run_worker(kv_cache_config,
                      pytorch_config,
                      model_name,
                      rank,
+                     worker_address,
+                     worker_authkey,
                      support_cancel=False):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     try:
-        port_name = MPI.Lookup_name('my_port')
-        intercomm = MPI.COMM_WORLD.Connect(port_name)
-    except MPI.Exception as e:
-        print(f"Error publishing port name: {e}")
-        raise e
+        intercomm = WorkerComm.connect(worker_address, worker_authkey, rank)
     except Exception as e:
-        print(f"Unexpected error publishing port name: {e}")
-        raise e
+        print(f"Error connecting worker control channel: {e}")
+        raise
 
     session = MPI.COMM_WORLD.Split(color=rank, key=0)
     set_mpi_comm(session)
@@ -241,6 +320,8 @@ async def run_worker(kv_cache_config,
             print(f"Unexpected error: {e}", flush=True)
             raise e
 
+    intercomm.close()
+
 
 def send_requests_to_worker(requests, worker_rank, intercomm):
     print(f"Sending {len(requests)} requests to worker {worker_rank}")
@@ -258,6 +339,8 @@ def worker_entry_point(kv_cache_config,
                        pytorch_config,
                        model_name,
                        rank,
+                       worker_address,
+                       worker_authkey,
                        support_cancel=False):
     return asyncio.run(
         run_worker(kv_cache_config,
@@ -265,6 +348,8 @@ def worker_entry_point(kv_cache_config,
                    pytorch_config,
                    model_name,
                    rank,
+                   worker_address,
+                   worker_authkey,
                    support_cancel=support_cancel))
 
 
@@ -294,17 +379,17 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -313,7 +398,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
         intercomm = None
         try:
             print("Launched all the workers.", flush=True)
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -442,19 +527,19 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
     prompt = "European Union is a political and economic union of 27 countries. The European Union is headquartered in Brussels, Belgium. The first president of the European Union was Jean-Claude Juncker. The current president is Ursula von der Leyen. The European Union is a major economic and political entity."
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -463,7 +548,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         intercomm = None
         try:
             print("Launched all the workers.")
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -552,22 +637,22 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
     prompt = "What is the capital of Germany?"
     mpi_info = MPI.Info.Create()
     mpi_info.Set("oversubscribe", "true")
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                             "OMPI_MCA_rmaps_base_oversubscribe": "1"
-                         },
-                         mpi_info=mpi_info) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y",
+                "OMPI_MCA_rmaps_base_oversubscribe": "1"
+            },
+            mpi_info=mpi_info) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -576,7 +661,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
         intercomm = None
         try:
             print("Launched all the workers.")
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -645,19 +730,20 @@ def test_disaggregated_logprobs(model, generation_overlap):
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
     max_tokens = 10
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -665,7 +751,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
 
         intercomm = None
         try:
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
 
@@ -751,29 +837,29 @@ def test_disaggregated_cancel_gen_requests(model):
     ]
     model_names = [model_path(model) for _ in range(2)]
 
-    port_name = mpi_publish_name()
-
     prompt = "What is the capital of Germany?"
     num_requests = 16
     num_cancel = 8
     max_tokens = 50
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y",
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y",
+            }) as executor:
         futures = []
         try:
             futures.append(
                 executor.submit(worker_entry_point, kv_cache_configs[0],
                                 cache_transceiver_configs[0],
-                                worker_pytorch_configs[0], model_names[0], 0))
+                                worker_pytorch_configs[0], model_names[0], 0,
+                                server.address, server.authkey))
             futures.append(
                 executor.submit(worker_entry_point, kv_cache_configs[1],
                                 cache_transceiver_configs[1],
                                 worker_pytorch_configs[1], model_names[1], 1,
-                                True))
+                                server.address, server.authkey, True))
         except Exception as e:
             print(f"Error submitting workers: {e}")
             raise e
@@ -781,7 +867,7 @@ def test_disaggregated_cancel_gen_requests(model):
         intercomm = None
         try:
             print("Launched all workers.", flush=True)
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -859,20 +945,20 @@ def test_disaggregated_logits(model, generation_overlap):
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
     prompt = "What is the capital of Germany?"
     max_tokens = 10
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": get_ucx_tls(),
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": get_ucx_tls(),
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -881,7 +967,7 @@ def test_disaggregated_logits(model, generation_overlap):
         intercomm = None
         try:
             print("Launched all the workers.", flush=True)
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -1009,19 +1095,19 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": "^ib,gdr_copy",
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": "^ib,gdr_copy",
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -1030,7 +1116,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
         intercomm = None
         try:
             print("Launched all the workers.", flush=True)
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
@@ -1169,19 +1255,19 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
         zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
             model_names, ranks))
 
-    port_name = mpi_publish_name()
-
     prompt = "What is the capital of Germany?"
 
-    with MPIPoolExecutor(max_workers=2,
-                         env={
-                             "UCX_TLS": "^ib,gdr_copy",
-                             "UCX_MM_ERROR_HANDLING": "y"
-                         }) as executor:
+    with worker_comm_server() as server, MPIPoolExecutor(
+            max_workers=2,
+            env={
+                "UCX_TLS": "^ib,gdr_copy",
+                "UCX_MM_ERROR_HANDLING": "y"
+            }) as executor:
         futures = []
         try:
             for worker_arg in worker_args:
-                future = executor.submit(worker_entry_point, *worker_arg)
+                future = executor.submit(worker_entry_point, *worker_arg,
+                                         server.address, server.authkey)
                 futures.append(future)
         except Exception as e:
             print(f"Error in worker {worker_arg}: {e}")
@@ -1190,7 +1276,7 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
         intercomm = None
         try:
             print("Launched all the workers.", flush=True)
-            intercomm = mpi_initialize_intercomm(port_name)
+            intercomm = server.accept()
 
             for _ in range(2):
                 intercomm.recv(tag=MPI_READY)
