@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Structural tests for the MiniMax-M3 MSA sparse attention backend.
+"""MiniMax-M3 integration tests for its MSA sparse attention backend.
 
-These validate backend selection, decode scratch-buffer sizing, and the paged
-HND view contract passed to the packaged MSA kernel. Numerical parity against
-the Triton reference is covered by the SM100 integration accuracy test.
+These validate MiniMax-M3 backend selection, indexer/cache integration, decode
+scratch-buffer sizing, and the paged HND contract passed to the packaged MSA
+kernel. Generic block-sparse MQA/GQA numerical coverage lives in the parent
+``test_sparse_mqa_gqa.py`` module.
 """
 
 import sys
@@ -25,7 +26,7 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
-def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
+def test_msa_package_availability_installs_cutlass_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
@@ -33,6 +34,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
     cute = ModuleType("cutlass.cute")
     cute.core = SimpleNamespace()
     cute.ThrMma = object()
+    cute.ThrCopy = object()
     cute.make_rmem_tensor = object()
     cutlass = ModuleType("cutlass")
     cutlass.cute = cute
@@ -44,6 +46,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
     try:
         assert msa_package_available()
         assert cute.core.ThrMma is cute.ThrMma
+        assert cute.core.ThrCopy is cute.ThrCopy
         assert cute.make_fragment is cute.make_rmem_tensor
     finally:
         msa_package_available.cache_clear()
