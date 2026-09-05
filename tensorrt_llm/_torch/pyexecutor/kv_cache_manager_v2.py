@@ -1331,6 +1331,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
+        # Lazily built map of layer-group id -> sliding window size, restricted
+        # to groups that are actually windowed. Only used by the debug-level
+        # window-crossing log below.
+        self._windowed_layer_group_sizes: Optional[Dict[int, int]] = None
+
         # Tracks the draft length allocated by try_allocate_generation per
         # request.  Used by extend_capacity_for_tokens to compute the exact
         # padding delta instead of blindly extending, which would cause
@@ -1735,6 +1740,61 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_event_layer_group_ids(self) -> List[int]:
         return [int(layer_group_id) for layer_group_id in range(len(self.impl.layer_grouping))]
+
+    def _get_windowed_layer_group_sizes(self) -> Dict[int, int]:
+        """Layer-group id -> window size, for groups whose window is smaller than max_seq_len.
+
+        Groups whose window equals max_seq_len are not windowed and are skipped.
+        """
+        if self._windowed_layer_group_sizes is None:
+            self._windowed_layer_group_sizes = {
+                group_id: window_size
+                for group_id, window_size in self._get_event_window_sizes_by_layer_group().items()
+                if window_size < self.max_seq_len
+            }
+        return self._windowed_layer_group_sizes
+
+    def _describe_page_indices(self, kv_cache: _KVCache, layer_group_id: int) -> str:
+        """Block ids backing a layer group, abbreviated to a count and a range."""
+        try:
+            indices = list(kv_cache.get_base_page_indices(layer_group_id))
+        except Exception as exc:  # pragma: no cover - diagnostics must never break a run
+            return f"<unavailable: {exc}>"
+        if not indices:
+            return "num_blocks=0"
+        return f"num_blocks={len(indices)}, block_range=[{min(indices)}, {max(indices)}]"
+
+    def _log_window_crossing(
+        self,
+        req: LlmRequest,
+        kv_cache: _KVCache,
+        pre_capacity: int,
+        new_capacity: int,
+        phase: str,
+    ) -> None:
+        """Log once per sequence per windowed pool when KV capacity crosses the window.
+
+        The crossing (capacity <= window before, > window after) is where a
+        windowed pool starts recycling blocks, so it is the first suspect when
+        an attention kernel fails at a sequence length near the window.
+        Capacity grows monotonically within a request, so the condition below
+        fires at most once per request per pool without extra bookkeeping.
+
+        Debug level only, and the guard runs before any of the strings or the
+        page-index scan are built, so a default run does no additional work.
+        """
+        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+            return
+        for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
+            if not (pre_capacity <= window_size < new_capacity):
+                continue
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
+                f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "
+                f"capacity {pre_capacity} -> {new_capacity} tokens, "
+                f"tokens_per_block={self.tokens_per_block}, "
+                f"{self._describe_page_indices(kv_cache, layer_group_id)}"
+            )
 
     def _get_event_window_sizes_by_layer_group(self) -> Dict[int, int]:
         # Assumes every layer in a group shares the same sliding_window_size,
@@ -2508,8 +2568,11 @@ class KVCacheManagerV2(BaseResourceManager):
         is_helix_req = self._has_cp_helix and not req.is_dummy_request
         if is_helix_req:
             self._set_helix_rank_fields(req)
-        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+        pre_capacity = kv_cache.capacity
+        new_capacity = self._required_gen_capacity(req, pre_capacity)
+        if not kv_cache.resize(new_capacity):
             return False
+        self._log_window_crossing(req, kv_cache, pre_capacity, new_capacity, "generation")
         if is_helix_req:
             # Commit only on success so a same-pass retry recomputes the
             # same step instead of skipping one.
@@ -2708,9 +2771,16 @@ class KVCacheManagerV2(BaseResourceManager):
 
         success = kv_cache.resize(capacity)
         if not success:
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} failed to resize KV cache "
+                f"from {pre_cap} to {capacity} tokens on the context path "
+                f"(context_current_position={req.context_current_position}, "
+                f"num_tokens={num_tokens})"
+            )
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        self._log_window_crossing(req, kv_cache, pre_cap, capacity, "context")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
@@ -2743,6 +2813,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
