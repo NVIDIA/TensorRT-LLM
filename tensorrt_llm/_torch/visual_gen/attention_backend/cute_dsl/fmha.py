@@ -611,15 +611,21 @@ def _quantize_blockscaled_one(
     if qk_sf_vec == 16:
         # NVFP4: per-16-element block, E4M3 SFs in swizzled layout; per-tensor global scale folded
         # into the returned `scale` (caller multiplies it into scale_softmax via sm_scale).
-        amax = x_2d.float().abs().amax().clamp(min=1e-6)
-        global_sf = (_FP8_E4M3_MAX * _FP4_E2M1_MAX) / amax
+        #
+        # Use TRTLLM's fused kernel to reduce on the last dimension, then run a subsequent reduction
+        # to obtain the scalar SF for nvfp4_quantize. S_pad % 128 == 0 is leveraged to expand the
+        # last dimension for fused kernel reductions, while 8192 is the largest dimension compatible
+        # with the same routine.
+        x_reduction_shape = x_2d.reshape(-1, min(8 * num_heads * head_dim, 8192))
+        reduced_rows = torch.ops.trtllm.calculate_nvfp4_global_scale(x_reduction_shape, None)
+        global_sf = reduced_rows.amin().clamp(max=(_FP8_E4M3_MAX * _FP4_E2M1_MAX) / 1e-6)
         global_sf_t = global_sf.to(torch.float32).reshape(1)
         x_q_2d, x_sf = torch.ops.trtllm.fp4_quantize(x_2d, global_sf_t, 16, False)
         # x_q_2d shape: (M, D/2) uint8 — natural packed layout (2 FP4 / byte).
         head_dim_packed = head_dim // 2
         x_q = x_q_2d.view(batch_size, num_heads, s_pad, head_dim_packed)
         x_q = x_q[:, :, :seq_len, :].transpose(1, 2).contiguous()  # (B, S, H, D/2)
-        return x_q, x_sf, amax / (_FP8_E4M3_MAX * _FP4_E2M1_MAX)
+        return x_q, x_sf, global_sf.reciprocal()
 
     raise ValueError(f"Unsupported qk_sf_vec={qk_sf_vec}; expected 0, 16, or 32.")
 
