@@ -15,11 +15,13 @@
 
 """Task-scheduled contiguous and paged context attention.
 
-The public surface intentionally exposes attention semantics, not scheduler
-choices. Reusable contiguous and paged plans compile from static capacities;
-packed request lengths and metadata remain per-run inputs. Both wrappers select
-scheduling from static topology while consuming the current request extents at
-launch. Paged plans conservatively treat all request lengths as variable.
+The public surface intentionally exposes attention semantics and optional
+compile-time metadata contracts, not scheduler choices. Reusable contiguous
+and paged plans compile from static capacities; packed request lengths and
+metadata remain per-run inputs. Both wrappers select scheduling from static
+topology while consuming the current request extents at launch. Paged plans
+conservatively treat all request lengths as variable unless the caller opts
+into an exact-uniform or zero-causal-offset contract.
 Single-instance dense paged plans use a static persistent launch when their
 logical CTA grid exceeds one resident wave; smaller grids launch one CTA per
 tile. Causal and paired persistent paged plans use CLC. The private policy is
@@ -1239,6 +1241,10 @@ def _resolve_paged_geometry(
             )
     max_seq_len_q = max(q_lengths)
     max_kv_len = max(k_lengths)
+    uniform_packed_lengths = all(
+        length == max_seq_len_q for length in q_lengths
+    ) and all(length == max_kv_len for length in k_lengths)
+    has_q_offset = _derive_has_q_offset(q_lengths, k_lengths, mask_type)
 
     geometry = _resolve_paged_plan_geometry(
         device=device,
@@ -1254,6 +1260,8 @@ def _resolve_paged_geometry(
         mask_type=mask_type,
         window_left=window_left,
         output_dtype=output_dtype,
+        uniform_packed_lengths=uniform_packed_lengths,
+        has_q_offset=has_q_offset,
     )
     _validate_paged_runtime_inputs(q, k_cache, v_cache, geometry)
     _validate_paged_runtime_metadata(
@@ -1328,11 +1336,17 @@ def _resolve_paged_plan_geometry(
     mask_type: str,
     window_left: int,
     output_dtype: torch.dtype,
+    uniform_packed_lengths: bool = False,
+    has_q_offset: bool = True,
 ) -> _PagedContextPlanGeometry:
     """Validate explicit static bounds for a reusable paged specialization."""
 
     _validate_paged_dtype_pair(q_dtype, kv_dtype, output_dtype)
     _validate_mask(mask_type)
+    if not isinstance(uniform_packed_lengths, bool):
+        raise TypeError("uniform_packed_lengths must be a bool")
+    if not isinstance(has_q_offset, bool):
+        raise TypeError("has_q_offset must be a bool")
     if mask_type == "variable_window":
         raise NotImplementedError(
             "mask_type='variable_window' is not supported for paged context"
@@ -1359,6 +1373,11 @@ def _resolve_paged_plan_geometry(
             f"even Hq/Hkv ratio greater than one; got {head_ratio}"
         )
 
+    # A causal Q offset is not part of dense attention semantics. Canonicalize
+    # it out of the compile identity even when the conservative public default
+    # was used, so dense callers keep one cache entry and the leaner kernel.
+    has_q_offset = mask_type == "causal" and has_q_offset
+
     return _PagedContextPlanGeometry(
         device=device,
         device_index=device_index,
@@ -1375,9 +1394,12 @@ def _resolve_paged_plan_geometry(
         mask_type=mask_type,
         window_left=window_left,
         head_paired=head_paired,
-        uniform_packed_lengths=False,
-        has_q_offset=mask_type == "causal",
-        packed_dense_k_mask=mask_type == "dense",
+        uniform_packed_lengths=uniform_packed_lengths,
+        has_q_offset=has_q_offset,
+        packed_dense_k_mask=(
+            mask_type == "dense"
+            and (not uniform_packed_lengths or max_kv_len % _CONTEXT_KV_TILE_N != 0)
+        ),
     )
 
 
@@ -1860,6 +1882,8 @@ def _get_compiled_paged_context(
         ("pairing", "head" if head_paired else "query"),
         ("kv_layout", "paged_hnd"),
         ("page_size", page_size),
+        ("uniform_packed_lengths", uniform_packed_lengths),
+        ("has_q_offset", has_q_offset),
         ("causal_single_kv_tile", False),
         ("packed_dense_k_mask", packed_dense_k_mask),
     )
@@ -2099,16 +2123,37 @@ def _validate_paged_runtime_metadata(
                 f"batch {batch_idx} has {q_length}, maximum is "
                 f"{geometry.max_seq_len_q}"
             )
+        if geometry.uniform_packed_lengths and q_length != geometry.max_seq_len_q:
+            raise ValueError(
+                "uniform_packed_lengths=True requires every qo_indptr delta "
+                f"to equal max_seq_len_q={geometry.max_seq_len_q}; batch "
+                f"{batch_idx} has {q_length}"
+            )
         if kv_length <= 0 or kv_length > geometry.max_kv_len:
             raise ValueError(
                 "seq_lens_kv entries must be positive and not exceed "
                 f"max_kv_len={geometry.max_kv_len}; batch {batch_idx} has "
                 f"{kv_length}"
             )
+        if geometry.uniform_packed_lengths and kv_length != geometry.max_kv_len:
+            raise ValueError(
+                "uniform_packed_lengths=True requires every seq_lens_kv entry "
+                f"to equal max_kv_len={geometry.max_kv_len}; batch "
+                f"{batch_idx} has {kv_length}"
+            )
         required_pages = (kv_length + geometry.page_size - 1) // geometry.page_size
         if geometry.mask_type == "causal" and q_length > kv_length:
             raise ValueError(
                 "bottom-right causal context requires Sq <= Sk for each "
+                f"request; got batch {batch_idx}: Sq={q_length}, Sk={kv_length}"
+            )
+        if (
+            geometry.mask_type == "causal"
+            and not geometry.has_q_offset
+            and q_length != kv_length
+        ):
+            raise ValueError(
+                "has_q_offset=False requires Sq == Sk for every causal "
                 f"request; got batch {batch_idx}: Sq={q_length}, Sk={kv_length}"
             )
         for row_offset, page_idx in enumerate(block_table_row[:required_pages]):
@@ -2514,10 +2559,13 @@ class BatchPrefillPagedTSWrapper:
 
     Plan-time scalar defaults are stored as one-element device tensors.
     ``run`` may replace either scale tensor without changing the compiled
-    specialization. Validation reads request metadata back to the host and may
-    synchronize. With caller-owned output, ``validate=False`` performs no
-    allocation, metadata readback, or synchronization and is suitable for
-    CUDA graph capture when the caller already enforces the full contract.
+    specialization. Plans default to a conservative dynamic-length contract;
+    callers may instead promise exact-uniform packed lengths or no causal Q
+    offset to compile one narrower specialization. Validation reads request
+    metadata back to the host, checks those promises, and may synchronize. With
+    caller-owned output, ``validate=False`` performs no allocation, metadata
+    readback, or synchronization and is suitable for CUDA graph capture only
+    when the caller already enforces the selected contract.
     Replanning invalidates captured graphs; prior launches and replays must
     finish before ``plan`` is called again. Keep the wrapper and all captured
     runtime tensors alive until every graph using the current plan is destroyed.
@@ -2558,18 +2606,29 @@ class BatchPrefillPagedTSWrapper:
         window_left: int = -1,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
+        uniform_packed_lengths: bool = False,
+        has_q_offset: bool = True,
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        Sequence lengths and page indices are deliberately absent. The plan
-        conservatively supports dynamic positive lengths bounded by
-        ``max_seq_len_q`` and ``max_kv_len``. ``batch_size`` is exact. Runtime
-        page-table rows must expose at least ``ceil(max_kv_len / page_size)``
-        columns, including any inactive padding columns. Calling ``plan``
-        again replaces plan-owned tensors and invalidates CUDA graphs captured
-        from the previous plan. Complete every prior launch and replay before
-        replanning. Planning allocates and compiles; complete it before CUDA
-        Graph capture.
+        Sequence lengths and page indices are deliberately absent. By default,
+        the plan supports dynamic positive lengths bounded by
+        ``max_seq_len_q`` and ``max_kv_len``. ``uniform_packed_lengths=True``
+        instead promises that every runtime Q length equals ``max_seq_len_q``
+        and every runtime K/V length equals ``max_kv_len``.
+        ``has_q_offset=False`` promises that every causal request has
+        ``Sq == Sk``. Dense attention ignores and canonicalizes the latter
+        flag. The selected contract compiles exactly one specialization and is
+        checked by ``run(validate=True)``. ``validate=False`` skips the checks,
+        so violating either promise can produce incorrect results or invalid
+        memory accesses.
+
+        ``batch_size`` is exact. Runtime page-table rows must expose at least
+        ``ceil(max_kv_len / page_size)`` columns, including inactive padding
+        columns. Calling ``plan`` again replaces plan-owned tensors and
+        invalidates CUDA graphs captured from the previous plan. Complete every
+        prior launch and replay before replanning. Planning allocates and
+        compiles; complete it before CUDA Graph capture.
 
         Parameters
         ----------
@@ -2604,6 +2663,14 @@ class BatchPrefillPagedTSWrapper:
             Softmax scale; defaults to the inverse square root of head size.
         output_scale : float
             Scale applied to the attention output.
+        uniform_packed_lengths : bool
+            Whether every run has Q lengths exactly ``max_seq_len_q`` and K/V
+            lengths exactly ``max_kv_len``. Defaults to ``False``.
+        has_q_offset : bool
+            Whether causal runs may have a nonzero bottom-right Q offset
+            ``Sk - Sq``. Setting this to ``False`` promises ``Sq == Sk`` for
+            every request. Dense attention ignores this flag. Defaults to
+            ``True``.
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
@@ -2621,6 +2688,8 @@ class BatchPrefillPagedTSWrapper:
             mask_type=mask_type,
             window_left=window_left,
             output_dtype=resolved_out_dtype,
+            uniform_packed_lengths=uniform_packed_lengths,
+            has_q_offset=has_q_offset,
         )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2683,10 +2752,17 @@ class BatchPrefillPagedTSWrapper:
           separate, isomorphic K and V pools. Padding entries beyond the
           logical K/V length are not dereferenced.
 
+        When ``plan`` selected ``uniform_packed_lengths=True``, every Q delta
+        must equal ``max_seq_len_q`` and every K/V length must equal
+        ``max_kv_len``. For a causal plan with ``has_q_offset=False``, every
+        request must additionally satisfy ``Sq[b] == Sk[b]``.
+
         With ``validate=True``, the host reads these values and may synchronize.
         Metadata may change only between completed launches or graph replays;
         CUDA graph capture additionally requires stable tensor shapes, strides,
-        and addresses plus ``validate=False``.
+        and addresses plus ``validate=False``. That mode does not verify the
+        plan-time metadata promises; the caller is responsible for preserving
+        them across every replay.
 
         Parameters
         ----------
@@ -3008,6 +3084,8 @@ def batch_prefill_with_paged_kv_cache(
         window_left=window_left,
         sm_scale=sm_scale,
         output_scale=output_scale,
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+        has_q_offset=geometry.has_q_offset,
     )
     return wrapper.run(
         q,

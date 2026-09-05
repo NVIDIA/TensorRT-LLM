@@ -460,6 +460,24 @@ class FmhaConfig:
         return self.use_paged_kv and self.single_qkv_instance
 
     @property
+    def needs_paged_v_tail_clear(self) -> bool:
+        """Whether paged V tiles can contain request-invalid rows.
+
+        Only exact-full causal grids omit the clear.  Requiring complete Q
+        work tiles also excludes a padded final query-paired domain.
+        """
+        if not self.use_paged_kv:
+            return False
+        q_work_tile_m = self.q_tile_m * self.work_tile_q_seq_tiles
+        return not (
+            self.has_uniform_varlen
+            and self.is_causal
+            and not self.has_q_offset
+            and self.uniform_seq_len_k % self.kv_tile_n == 0
+            and self.uniform_seq_len_q % q_work_tile_m == 0
+        )
+
+    @property
     def page_table_window_candidate_entries(self) -> int:
         """Return the widest page-ID window admitted by static topology.
 
@@ -973,11 +991,14 @@ class GmemQKVResource(MemoryResource):
             if cutlass.const_expr(self.cfg.use_paged_kv):
                 # Paged K/V is addressed through a block table rather than a
                 # packed token buffer, so it has no cumulative token offset.
-                from .helpers_paged import _load_runtime_seq_len_kv
+                if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                    seqlen_k = Int32(self.cfg.uniform_seq_len_k)
+                else:
+                    from .helpers_paged import _load_runtime_seq_len_kv
 
-                seqlen_k = _load_runtime_seq_len_kv(
-                    self.seqlens_kv, self.max_seq_len_kv, batch_coord
-                )
+                    seqlen_k = _load_runtime_seq_len_kv(
+                        self.seqlens_kv, self.max_seq_len_kv, batch_coord
+                    )
             elif cutlass.const_expr(self.cfg.has_uniform_varlen):
                 seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                 cuseqlen_k = batch_coord * seqlen_k
@@ -993,14 +1014,18 @@ class GmemQKVResource(MemoryResource):
             if cutlass.const_expr(
                 self.cfg.use_paged_kv and not self.cfg.stages_page_offsets_in_smem
             ):
-                from .helpers_paged import _load_block_table_row_bounds
+                if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                    kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+                    kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+                else:
+                    from .helpers_paged import _load_block_table_row_bounds
 
-                kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
-                    Int32(self.block_table_row_stride),
-                    self.cfg,
-                    seqlen_k,
-                    batch_coord,
-                )
+                    kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                        Int32(self.block_table_row_stride),
+                        self.cfg,
+                        seqlen_k,
+                        batch_coord,
+                    )
         if cutlass.const_expr(self.cfg.kv_tile_start_window_size_left > 0):
             if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
                 kv_tile_start = bottom_right_window_tile_start(
@@ -1065,19 +1090,24 @@ class GmemQKVResource(MemoryResource):
             self.cfg, stage_info.work_tile.tile_idx
         )
 
-        from .helpers_paged import _load_runtime_seq_len_kv
+        if cutlass.const_expr(self.cfg.has_uniform_varlen):
+            cached_seqlen_kv = Int32(self.cfg.uniform_seq_len_k)
+            kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
+            kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
+        else:
+            from .helpers_paged import _load_runtime_seq_len_kv
 
-        cached_seqlen_kv = _load_runtime_seq_len_kv(
-            self.seqlens_kv, self.max_seq_len_kv, batch_coord
-        )
-        from .helpers_paged import _load_block_table_row_bounds
+            cached_seqlen_kv = _load_runtime_seq_len_kv(
+                self.seqlens_kv, self.max_seq_len_kv, batch_coord
+            )
+            from .helpers_paged import _load_block_table_row_bounds
 
-        kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
-            Int32(self.block_table_row_stride),
-            self.cfg,
-            cached_seqlen_kv,
-            batch_coord,
-        )
+            kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
+                Int32(self.block_table_row_stride),
+                self.cfg,
+                cached_seqlen_kv,
+                batch_coord,
+            )
         window_q_offset = Int32(self.q_offset_default)
         kv_tile_start = Int32(0)
         if cutlass.const_expr(self.cfg.kv_tile_start_window_size_left > 0):
@@ -2062,7 +2092,7 @@ class SmemKVResource(MemoryResource):
     @consumer_work(returns=desc_v_base)
     @cute.jit
     def v_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
-        """Build a nonpaged V SMEM descriptor -> desc_v_base."""
+        """Build a V SMEM descriptor that needs no paged-tail clear."""
         return self._build_v_descriptor(stage_info)
 
     @consumer_work(returns=desc_v_base)
@@ -2584,9 +2614,7 @@ class TmemSPResource(MemoryResource):
         once in the softmax task HEAD, before the K/V loop, so loop and tail
         masks reuse the cached offset instead of rereading the request metadata.
         """
-        if cutlass.const_expr(
-            self.cfg.has_uniform_varlen and not self.cfg.use_paged_kv
-        ):
+        if cutlass.const_expr(self.cfg.has_uniform_varlen):
             return Int32(self.cfg.uniform_seq_len_k - self.cfg.uniform_seq_len_q)
         batch_coord = self._varlen_batch_coord(stage_info)
         if cutlass.const_expr(self.cfg.has_uniform_varlen):
@@ -2607,11 +2635,11 @@ class TmemSPResource(MemoryResource):
     @cute.jit
     def cache_seqlen_k(self, stage_info: StageInfo) -> Int32:
         """Cache the request-local K/V extent once per work tile."""
+        if cutlass.const_expr(self.cfg.has_uniform_varlen):
+            return Int32(self.cfg.uniform_seq_len_k)
         if cutlass.const_expr(self.cfg.use_paged_kv):
             batch_coord = self._varlen_batch_coord(stage_info)
             return Int32(self.seq_lens_kv[batch_coord])
-        if cutlass.const_expr(self.cfg.has_uniform_varlen):
-            return Int32(self.cfg.uniform_seq_len_k)
         batch_coord = self._varlen_batch_coord(stage_info)
         cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
         return Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k

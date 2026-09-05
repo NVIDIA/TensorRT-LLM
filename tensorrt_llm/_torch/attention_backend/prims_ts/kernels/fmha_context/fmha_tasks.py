@@ -806,7 +806,7 @@ def create_mma_task(
                     to.set_p_base(tmem_p_base=tmem_p_base)
 
                     skv.wait()
-                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                         desc_v_base = skv.v_desc_paged(
                             section=FmhaStage.Loop,
                             seqlen_k=v_seqlen_k,
@@ -822,7 +822,7 @@ def create_mma_task(
                     skv.release()
 
                     skv.wait()
-                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                         desc_v_base = skv.v_desc_paged(
                             section=FmhaStage.Loop,
                             seqlen_k=v_seqlen_k,
@@ -846,7 +846,7 @@ def create_mma_task(
                 to.set_p_base(tmem_p_base=tmem_p_base)
                 for head_dim_stage_idx in range(num_head_dim_stages_v):
                     skv.wait()
-                    if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                         desc_v_base = skv.v_desc_paged(
                             section=FmhaStage.Tail,
                             seqlen_k=v_seqlen_k,
@@ -960,7 +960,7 @@ def create_mma_task(
                     sp0.p_read()
                     for head_dim_stage_idx in range(num_head_dim_stages_v):
                         skv.wait()
-                        if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                        if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                             desc_v_base = skv.v_desc_paged(
                                 section=FmhaStage.Loop,
                                 seqlen_k=v_seqlen_k,
@@ -1078,7 +1078,7 @@ def create_mma_task(
             # Release K0 (done with QK→S0 and QK→S1), then consume V0.
             skv.release()
             skv.wait()
-            if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+            if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                 desc_v_base = skv.v_desc_paged(
                     section=FmhaStage.Head,
                     seqlen_k=v_seqlen_k,
@@ -1125,7 +1125,7 @@ def create_mma_task(
                 # Release Ki+1, then wait Vi+1.
                 skv.release()
                 skv.wait()
-                if cutlass.const_expr(smem_q.cfg.use_paged_kv):
+                if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
                     desc_v_base = skv.v_desc_paged(
                         section=FmhaStage.Loop,
                         tile_offset=1,
