@@ -6951,11 +6951,17 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    def test_dflash(self):
+    @pytest.mark.parametrize("dflash_attention_backend", ["VANILLA", "FA4"])
+    def test_dflash(self, dflash_attention_backend):
+        if dflash_attention_backend == "FA4" and get_sm_version() != 90:
+            pytest.skip("FA4 DFlash attention backend is allowed on SM90 only")
+
         target_model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
         dflash_model_path = f"{llm_models_root()}/Qwen3.5-4B-DFlash"
-        spec_config = DFlashDecodingConfig(max_draft_len=4,
-                                           speculative_model=dflash_model_path)
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model=dflash_model_path,
+            attention_backend=dflash_attention_backend)
 
         # Use lower threshold for H20
         is_h20_gpu = check_device_contain(
@@ -6966,6 +6972,8 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                  trust_remote_code=True,
                  max_seq_len=4096,
                  max_batch_size=32,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=512,
                  kv_cache_config=self.kv_cache_config,
                  cuda_graph_config=self.cuda_graph_config,
                  speculative_config=spec_config,

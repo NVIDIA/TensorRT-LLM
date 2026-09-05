@@ -19,7 +19,12 @@ try:
 except ImportError:
     _flashinfer_rope = None
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
-from ..speculative.dflash_attention import get_dflash_flash_attention, get_dflash_trtllm_gen_ops
+from ..speculative.dflash_attention import (
+    get_dflash_fa4_fwd,
+    get_dflash_flash_attention,
+    get_dflash_paged_append,
+    get_dflash_trtllm_gen_ops,
+)
 from ..speculative.interface import SpeculativeDecodingMode
 from .modeling_utils import get_model_architecture, register_draft_model
 
@@ -114,13 +119,21 @@ class DFlashForCausalLM(nn.Module):
             "block_size", getattr(pretrained_config, "block_size", None)
         )
         self.dflash_attention_backend = dflash_attention_backend
+        # Each backend loads only its own ops; the rest stay None so the
+        # shared paged prologue can read them unconditionally.
+        self._dflash_trtllm_gen_ops = None
+        self._dflash_fa4_fwd = None
+        self._dflash_paged_append = None
         if self.dflash_attention_backend == "VANILLA":
             self._dflash_flash_attention = get_dflash_flash_attention()
         elif self.dflash_attention_backend == "TRTLLM":
             self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        elif self.dflash_attention_backend == "FA4":
+            self._dflash_fa4_fwd = get_dflash_fa4_fwd()
+            self._dflash_paged_append = get_dflash_paged_append()
         else:
             raise ValueError(
-                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
                 f"{self.dflash_attention_backend!r}."
             )
         self._dflash_trtllm_gen_workspace = None
@@ -759,30 +772,49 @@ class DFlashForCausalLM(nn.Module):
                 counter_bytes, dtype=torch.uint8, device=device
             )
 
+        self._prepare_dflash_index_buffers(device, max_batch_size, block_size)
+
+    def _prepare_dflash_index_buffers(
+        self,
+        device: torch.device,
+        max_batch_size: int,
+        block_size: int,
+        need_batch_indices: bool = True,
+    ) -> None:
+        """Allocate the static indices that place a block's K/V in the cache.
+
+        Both backends need the intra-block column offsets. Only the paged
+        backends read the batch-index rows, so VANILLA leaves them unallocated
+        """
         append_batch_indices = self._dflash_batch_indices
         block_offsets = self._dflash_block_offsets
-        static_indices_need_allocation = (
-            append_batch_indices is None
-            or block_offsets is None
-            or append_batch_indices.device != device
+        need_offsets = (
+            block_offsets is None
             or block_offsets.device != device
-            or append_batch_indices.size(0) < max_batch_size
-            or append_batch_indices.size(1) != block_size
             or block_offsets.numel() != block_size
         )
-        if static_indices_need_allocation:
-            if is_capturing:
-                raise RuntimeError(
-                    "DFlash TRTLLM-Gen index buffers must be allocated at the "
-                    "required size before CUDA graph capture."
-                )
+        need_indices = need_batch_indices and (
+            append_batch_indices is None
+            or append_batch_indices.device != device
+            or append_batch_indices.size(0) < max_batch_size
+            or append_batch_indices.size(1) != block_size
+        )
+        if not (need_offsets or need_indices):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DFlash index buffers must be allocated at the required "
+                "size before CUDA graph capture."
+            )
+        if need_offsets:
+            self._dflash_block_offsets = torch.arange(block_size, dtype=torch.int32, device=device)
+        if need_indices:
             self._dflash_batch_indices = (
                 torch.arange(max_batch_size, dtype=torch.int32, device=device)
                 .view(-1, 1)
                 .expand(-1, block_size)
                 .contiguous()
             )
-            self._dflash_block_offsets = torch.arange(block_size, dtype=torch.int32, device=device)
 
     def dflash_forward(
         self,
@@ -809,17 +841,21 @@ class DFlashForCausalLM(nn.Module):
         Returns:
             [B * block_size, hidden_size]
         """
-        if self.dflash_attention_backend == "TRTLLM":
+        is_paged = self.dflash_attention_backend in ("TRTLLM", "FA4")
+        if is_paged:
             if ctx_kv_cache is None or ctx_page_table is None:
                 raise RuntimeError(
-                    "DFlash TRTLLM-Gen requires a paged context cache and page table."
+                    f"DFlash {self.dflash_attention_backend} requires a paged "
+                    "context cache and page table."
                 )
             trtllm_gen_ops = self._dflash_trtllm_gen_ops
+            fa4_fwd = self._dflash_fa4_fwd
+            paged_append = self._dflash_paged_append
         elif self.dflash_attention_backend == "VANILLA":
             flash_attention = self._dflash_flash_attention
         else:
             raise ValueError(
-                "DFlash attention backend must be VANILLA or TRTLLM, got "
+                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
                 f"{self.dflash_attention_backend!r}."
             )
 
@@ -855,22 +891,25 @@ class DFlashForCausalLM(nn.Module):
             q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions, dtype=rope_dtype)
         _rope = RotaryEmbedding.apply_rotary_pos_emb
 
-        # cache_seqlens (BEFORE append). flash_attn appends block_size
-        # k/v at cache_seqlens[i]..+block_size for batch i.
+        # cache_seqlens BEFORE the block's K/V are stored.
         cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+        seq_lens_after = cache_seqlens_i32 + block_size
 
-        if self.dflash_attention_backend == "TRTLLM":
+        if is_paged:
             max_batch_size = ctx_page_table.size(0)
-            self._prepare_dflash_trtllm_gen_buffers(
-                hidden_states.dtype,
-                hidden_states.device,
-                max_batch_size,
-                block_size,
-                num_heads_per_rank,
-                num_kv_heads_per_rank,
-                head_dim,
-            )
+            if self.dflash_attention_backend == "TRTLLM":
+                self._prepare_dflash_trtllm_gen_buffers(
+                    hidden_states.dtype,
+                    hidden_states.device,
+                    max_batch_size,
+                    block_size,
+                    num_heads_per_rank,
+                    num_kv_heads_per_rank,
+                    head_dim,
+                )
+            else:  # FA4 needs no workspace or counter buffers.
+                self._prepare_dflash_index_buffers(hidden_states.device, max_batch_size, block_size)
             block_tables = ctx_page_table.index_select(0, cache_batch_idx_i32.long())
             pages_per_slot = block_tables.size(1)
             page_size = ctx_kv_cache.size(-2)
@@ -882,7 +921,6 @@ class DFlashForCausalLM(nn.Module):
                 dtype=torch.int32,
                 device=hidden_states.device,
             )
-            seq_lens_after = cache_seqlens_i32 + block_size
             kv_last_page_len = ((seq_lens_after - 1) % page_size) + 1
             batch_indices = self._dflash_batch_indices
             append_batch_indices = batch_indices[:B].reshape(-1)
@@ -890,6 +928,20 @@ class DFlashForCausalLM(nn.Module):
                 (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets)
                 .reshape(-1)
                 .contiguous()
+            )
+        else:  # VANILLA
+            # Slot and column that each block K/V row occupies
+            self._prepare_dflash_index_buffers(
+                ctx_k_cache.device,
+                ctx_k_cache.size(0),
+                block_size,
+                need_batch_indices=False,
+            )
+            append_batch_indices = (
+                cache_batch_idx_i32.view(-1, 1).expand(-1, block_size).reshape(-1).long()
+            )
+            append_positions = (
+                (cache_seqlens_i32.view(-1, 1) + self._dflash_block_offsets).reshape(-1).long()
             )
 
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
@@ -1070,7 +1122,53 @@ class DFlashForCausalLM(nn.Module):
                         causal=False,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
+            elif self.dflash_attention_backend == "FA4":
+                layer_cache = ctx_kv_cache[layer_idx]
+                paged_append(
+                    append_key=k_noise_bshd.reshape(
+                        -1, num_kv_heads_per_rank, head_dim
+                    ).contiguous(),
+                    append_value=v_noise_bshd.reshape(
+                        -1, num_kv_heads_per_rank, head_dim
+                    ).contiguous(),
+                    batch_indices=append_batch_indices,
+                    positions=append_positions,
+                    paged_kv_cache=layer_cache,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    kv_last_page_len=kv_last_page_len,
+                    kv_layout="HND",
+                )
+                # FA4 wants NHD pages, [pages, page_size, nkv, hd]. Pool is
+                # HND so transpose: stride(-1) == 1, so no copy is materialized.
+                k_pages = layer_cache[:, 0].transpose(1, 2)
+                v_pages = layer_cache[:, 1].transpose(1, 2)
+                window_left, window_right = window_size
+                # pack_gqa=None lets FA4 enable packing itself whenever
+                # q_heads > kv_heads, including on windowed layers.
+                out, *_ = fa4_fwd(
+                    Q_bshd,
+                    k_pages,
+                    v_pages,
+                    seqused_k=seq_lens_after,
+                    page_table=block_tables,
+                    softmax_scale=head_dim**-0.5,
+                    causal=causal,
+                    window_size_left=None if window_left < 0 else window_left,
+                    window_size_right=None if window_right < 0 else window_right,
+                    num_splits=1,  # SM90 has no SplitKV kernel
+                    pack_gqa=None,
+                    return_lse=False,
+                )
             else:  # VANILLA, validated before entering the layer loop.
+                # Store this layer's block K/V, then attend read-only.
+                kv_row_shape = (-1, num_kv_heads_per_rank, head_dim)
+                ctx_k_cache[append_batch_indices, layer_idx, append_positions] = (
+                    k_noise_bshd.reshape(kv_row_shape)
+                )
+                ctx_v_cache[append_batch_indices, layer_idx, append_positions] = (
+                    v_noise_bshd.reshape(kv_row_shape)
+                )
                 layer_k_cache = ctx_k_cache[:, layer_idx]
                 layer_v_cache = ctx_v_cache[:, layer_idx]
 
@@ -1096,9 +1194,7 @@ class DFlashForCausalLM(nn.Module):
                     q=q_in,
                     k_cache=layer_k_cache,
                     v_cache=layer_v_cache,
-                    k=k_noise_bshd,
-                    v=v_noise_bshd,
-                    cache_seqlens=cache_seqlens_i32,
+                    cache_seqlens=seq_lens_after,
                     cache_batch_idx=cache_batch_idx_i32,
                     causal=causal,
                     window_size=window_size,

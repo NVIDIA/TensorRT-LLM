@@ -1872,9 +1872,10 @@
     {
       "allowed_values": [
         "VANILLA",
-        "TRTLLM"
+        "TRTLLM",
+        "FA4"
       ],
-      "annotation": "Literal['VANILLA', 'TRTLLM']",
+      "annotation": "Literal['VANILLA', 'TRTLLM', 'FA4']",
       "converter": "",
       "kind": "categorical",
       "path": "speculative_config.attention_backend"

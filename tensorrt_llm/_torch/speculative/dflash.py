@@ -15,11 +15,12 @@
 
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -28,8 +29,16 @@ from ..attention.backends import AttentionMetadata
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
-from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
+from .dflash_attention import (
+    get_dflash_paged_append,
+    validate_dflash_fa4_runtime,
+    validate_dflash_trtllm_gen_runtime,
+)
 from .interface import SpecMetadata, SpecWorkerBase
+
+# Backends that keep the draft's private context K/V in a paged HND pool.
+# They share the pool layout, page table and paged append op
+_PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
@@ -124,11 +133,14 @@ class DFlashSpecMetadata(SpecMetadata):
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
             current = set(self.request_ids)
+            evicted = {}
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot] = 0
+                    evicted[slot] = 0
+                    worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
+            worker._write_ctx_len(evicted)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -157,11 +169,13 @@ class DFlashSpecMetadata(SpecMetadata):
             return
         i = self._layer_to_idx.get(layer_id)
         if i is not None:
-            num_tokens = hidden_states.shape[0]
             to_save = hidden_states + residual if residual is not None else hidden_states
-            self.captured_hidden_states[
-                :num_tokens, i * self.hidden_size : (i + 1) * self.hidden_size
-            ].copy_(to_save, non_blocking=True)
+            inplace_slice_copy(
+                self.captured_hidden_states,
+                to_save,
+                i * self.hidden_size,
+                (i + 1) * self.hidden_size,
+            )
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
@@ -207,9 +221,14 @@ class DFlashWorker(SpecWorkerBase):
         # graph compatible.
         self._ctx_buf_inited = False
         self._ctx_len = None
+        # Host shadows of _ctx_len and of each request's prompt progress.
+        self._ctx_len_host = None
+        self._req_ctx_pos = {}
         # Snapshot for rolling back in-place _ctx_len updates when a forward
         # fails (or after warmup). See _ensure_spec_dec_state_restored.
         self._saved_ctx_len = None
+        self._saved_ctx_len_host = None
+        self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
         # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
         # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
@@ -227,6 +246,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
+        self._ctx_paged_append = None
         self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
@@ -314,10 +334,12 @@ class DFlashWorker(SpecWorkerBase):
         num_slots = max_batch + 1
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_len_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
+        self._req_ctx_pos = {}
 
         # checkpoint's trained block width
         self._resolved_block_size = getattr(draft_model, "block_size", None) or (
@@ -344,19 +366,23 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         capacity = self._max_ctx + self._compute_block_size
-        if self._dflash_attention_backend == "TRTLLM":
+        if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
             page_size = self._ctx_page_size
-            has_context_attention = any(
-                not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
-            )
-            validate_dflash_trtllm_gen_runtime(
-                dtype=dtype,
-                num_heads=nh,
-                num_kv_heads=nkv,
-                head_dim=hd,
-                tokens_per_block=page_size,
-                has_context_attention=has_context_attention,
-            )
+            if self._dflash_attention_backend == "TRTLLM":
+                has_context_attention = any(
+                    not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
+                )
+                validate_dflash_trtllm_gen_runtime(
+                    dtype=dtype,
+                    num_heads=nh,
+                    num_kv_heads=nkv,
+                    head_dim=hd,
+                    tokens_per_block=page_size,
+                    has_context_attention=has_context_attention,
+                )
+            else:  # FA4 reads the same HND page pool, with its own kernel.
+                validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
+                self._ctx_paged_append = get_dflash_paged_append()
             self._ctx_pages_per_slot = (capacity + page_size - 1) // page_size
             total_pages = num_slots * self._ctx_pages_per_slot
             # HND layout consumed by both FlashInfer's paged append and the
@@ -391,6 +417,12 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}"
         )
 
+    def _get_ctx_paged_append(self) -> Callable[..., None]:
+        """flashinfer paged append, shared by the TRTLLM and FA4 backends."""
+        if self._ctx_paged_append is None:
+            self._ctx_paged_append = get_dflash_paged_append()
+        return self._ctx_paged_append
+
     def _store_context_kv_paged(
         self,
         k: torch.Tensor,
@@ -398,7 +430,7 @@ class DFlashWorker(SpecWorkerBase):
         slots: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+        append_paged_kv_cache = self._get_ctx_paged_append()
 
         # Convert at most once and reuse for every layer. Calling ``.to()`` in
         # the op call would allocate converted tensors once per layer when the
@@ -407,7 +439,7 @@ class DFlashWorker(SpecWorkerBase):
         positions_i32 = positions.to(torch.int32)
         kv_indices = self._ctx_page_table.flatten().contiguous()
         for layer_idx in range(k.size(1)):
-            trtllm_gen_ops.append_paged_kv_cache(
+            append_paged_kv_cache(
                 append_key=k[:, layer_idx].contiguous(),
                 append_value=v[:, layer_idx].contiguous(),
                 batch_indices=slots_i32,
@@ -462,6 +494,30 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
+    def _write_ctx_len(self, updates: dict[int, int]) -> None:
+        """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
+        if not updates:
+            return
+        for slot, value in updates.items():  # Update host side mirror
+            self._ctx_len_host[slot] = value
+
+        slots, values = zip(*updates.items())
+        pinned = prefer_pinned()
+        slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
+        vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+        self._ctx_len.index_copy_(
+            0,
+            slots_pinned.to("cuda", non_blocking=True),
+            vals_pinned.to("cuda", non_blocking=True),
+        )
+
+    def _restore_ctx_len_host(self) -> None:
+        """Roll the host shadows back to their pre-forward snapshot."""
+        if self._saved_ctx_len_host is not None:
+            self._ctx_len_host = list(self._saved_ctx_len_host)
+        if self._saved_req_ctx_pos is not None:
+            self._req_ctx_pos = dict(self._saved_req_ctx_pos)
+
     def _store_prefill_context(
         self,
         draft_model,
@@ -493,11 +549,14 @@ class DFlashWorker(SpecWorkerBase):
         ctx_proj = draft_model.project_target_hidden(ctx_hs)
 
         # Split by request and store/append accumulated context.
-        # Context requests may arrive in chunks (chunked prefill), so we
-        # must APPEND successive chunks for the same request rather than
-        # overwriting.  If a previously-finished request id is reused for a
-        # brand-new request, the new chunk's first position will be 0, which
-        # signals a fresh start → replace instead of append.
+        # Context requests may arrive in chunks (chunked prefill), so we must
+        # APPEND successive chunks for the same request rather than overwriting.
+        # A chunk is only an append if it starts where the last one ended
+
+        # Scalar (non-rope) token indices on the host. The device tensor holds
+        # the same values, but reading it costs a D2H sync per request.
+        host_pos = spec_metadata.host_position_ids
+        ctx_len_updates = {}
         offset = 0
         num_contexts = attn_metadata.num_contexts
         for i in range(num_contexts):
@@ -506,41 +565,55 @@ class DFlashWorker(SpecWorkerBase):
             chunk_proj = ctx_proj[offset : offset + slen].detach()
             chunk_pos = position_ids[offset : offset + slen].long().detach()
 
-            first_pos = chunk_pos[0].item() if slen > 0 else 0
+            if slen == 0:
+                first_pos = 0
+            elif host_pos is not None:
+                first_pos = int(host_pos[offset])
+            else:
+                first_pos = chunk_pos[0].item()
 
-            # Assign slot for new requests or reset for reused IDs
-            if req_id not in self._req_to_slot or first_pos == 0:
-                if req_id in self._req_to_slot:
-                    old_slot = self._req_to_slot[req_id]
-                    self._ctx_len[old_slot] = 0
+            # A chunk continues what we already stored only if it starts exactly
+            # where the previous one ended. Everything else -- a fresh request, a
+            # request id reused after completion, a prefill restarted after
+            # preemption -- has to start from a clean slot.
+            old_slot = self._req_to_slot.get(req_id)
+            if old_slot is None or self._req_ctx_pos.get(req_id) != first_pos:
+                if old_slot is not None:
+                    ctx_len_updates[old_slot] = 0
+                    del self._req_to_slot[req_id]
                     self._free_slots.append(old_slot)
                 if not self._free_slots:
                     logger.warning("DFlash: no free slots, skipping context store")
+                    self._req_ctx_pos.pop(req_id, None)
                     offset += slen
                     continue
                 slot = self._free_slots.popleft()
                 self._req_to_slot[req_id] = slot
-                self._ctx_len[slot] = 0
+                ctx_len_updates[slot] = 0
 
             slot = self._req_to_slot[req_id]
-            cur = int(self._ctx_len[slot].item())
+            cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
+            # Anchor to the true position rather than accumulating, and advance
+            # even when the slot is full so the next chunk still reads as a
+            # continuation.
+            self._req_ctx_pos[req_id] = first_pos + slen
             if actual > 0:
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._dflash_attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
                     else self._ctx_k_buf.dtype
                 )
                 chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
-                self._ctx_len[slot] = end
+                ctx_len_updates[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
                 chunk_k, chunk_v = draft_model.precompute_context_kv(
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                if self._dflash_attention_backend == "TRTLLM":
+                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     self._store_context_kv_paged(
                         chunk_k,
                         chunk_v,
@@ -551,6 +624,8 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
+
+        self._write_ctx_len(ctx_len_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
@@ -571,6 +646,7 @@ class DFlashWorker(SpecWorkerBase):
             # A failed forward must not keep this iteration's in-place
             # _ctx_len updates: roll back to the pre-forward snapshot.
             self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_host()
             self._ctx_len_restore_pending = False
 
     def _forward_impl(
@@ -617,6 +693,8 @@ class DFlashWorker(SpecWorkerBase):
             # during capture aborts the graph itself, and captured ops do not
             # mutate _ctx_len until replay.
             self._saved_ctx_len = self._ctx_len.clone()
+            self._saved_ctx_len_host = list(self._ctx_len_host)
+            self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
         self._execute_guided_decoder_if_present(logits)
@@ -677,7 +755,10 @@ class DFlashWorker(SpecWorkerBase):
                     for rid in spec_metadata.request_ids
                 ]
                 self._batch_to_slot[:num_seqs].copy_(
-                    torch.tensor(mapping, dtype=torch.long, device="cuda")
+                    torch.tensor(
+                        mapping, dtype=torch.long, device="cpu", pin_memory=prefer_pinned()
+                    ),
+                    non_blocking=True,
                 )
 
         inputs = self.prepare_1st_drafter_inputs(
@@ -789,6 +870,7 @@ class DFlashWorker(SpecWorkerBase):
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
             self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
         return {
@@ -960,7 +1042,7 @@ class DFlashWorker(SpecWorkerBase):
                 # dflash_forward reads these directly via cache_batch_idx.
                 cache_dtype = (
                     self._ctx_kv_buf.dtype
-                    if self._dflash_attention_backend == "TRTLLM"
+                    if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS
                     else self._ctx_k_buf.dtype
                 )
                 k_new, v_new = draft_model.precompute_context_kv(
@@ -971,7 +1053,7 @@ class DFlashWorker(SpecWorkerBase):
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                if self._dflash_attention_backend == "TRTLLM":
+                if self._dflash_attention_backend in _PAGED_ATTENTION_BACKENDS:
                     self._store_context_kv_paged(k_new, v_new, slot_long, col_long)
                 else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot_long, :, col_long] = k_new

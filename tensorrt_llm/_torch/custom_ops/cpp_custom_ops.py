@@ -435,6 +435,13 @@ def _register_fake():
     def _(input: torch.Tensor, scale: torch.Tensor):
         return torch.empty_like(input, dtype=torch.float8_e4m3fn), scale.clone()
 
+    @torch.library.register_fake("tensorrt_llm::quantize_e4m3_activation")
+    def _(activation: torch.Tensor):
+        scale_shape = list(activation.shape[:-1]) + [1]
+        return (activation.new_empty(activation.shape,
+                                     dtype=torch.float8_e4m3fn),
+                activation.new_empty(scale_shape, dtype=activation.dtype))
+
     @torch.library.register_fake("trtllm::fp4_quantize")
     def _(
         input: torch.Tensor,
