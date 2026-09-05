@@ -1,0 +1,49 @@
+# Extra LLM API options for trtllm-serve with the Mooncake store KV connector.
+#
+# Offloads KV pages to a Mooncake distributed store, a shared CPU memory pool
+# addressed by content, so a prefix computed by one engine can be replayed by
+# another. This is a different component from the Mooncake transfer engine used
+# by the C++ cache transceiver for disaggregated prefill/decode handoff; the two
+# compose rather than conflict.
+#
+# Prerequisites:
+#   - Mooncake Python bindings: pip install mooncake-transfer-engine
+#     (present in the release container; the C++ source build does not
+#     provide MooncakeDistributedStore)
+#   - A running Mooncake master, and a metadata server unless using
+#     P2PHANDSHAKE. See https://kvcache-ai.github.io/Mooncake/
+#   - MOONCAKE_CONFIG_PATH pointing at a Mooncake JSON config, for example:
+#       {
+#         "metadata_server": "http://127.0.0.1:8080/metadata",
+#         "master_server_address": "127.0.0.1:50051",
+#         "protocol": "rdma",
+#         "device_name": "mlx5_0",
+#         "global_segment_size": "32GiB",
+#         "local_buffer_size": "1GiB"
+#       }
+#
+# Optional environment overrides:
+#   TRTLLM_MOONCAKE_STORE_ROLE       producer | consumer | both   (default both)
+#   TRTLLM_MOONCAKE_STORE_PREFIX     key prefix, to isolate deployments sharing
+#                                    one pool                    (default trtllm)
+#   TRTLLM_MOONCAKE_STORE_MODEL_KEY  identity keys are namespaced by
+#                                    (default: model directory basename)
+#
+# Example:
+#   export MOONCAKE_CONFIG_PATH=/path/to/mooncake.json
+#   trtllm-serve <hf_model> --backend pytorch --host 0.0.0.0 --port 8000 \
+#     --extra_llm_api_options /path/to/this/file
+
+kv_cache_config:
+  # The connector describes its pools through register_kv_cache_layout, which
+  # only KVCacheManagerV2 implements.
+  use_kv_cache_manager_v2: true
+  # Local reuse still runs first; the store serves whatever the device missed.
+  enable_block_reuse: true
+  # GPU-only tiers are required: a page evicted to host or disk has its GPU slot
+  # reassigned, which would invalidate the addresses registered with the store.
+  host_cache_size: 0
+  disk_cache_size: 0
+
+kv_connector_config:
+  connector: mooncake-store
