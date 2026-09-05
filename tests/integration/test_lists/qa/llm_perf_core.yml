@@ -4,15 +4,15 @@ llm_perf_core:
 # Test Conditions Index
 # ===============================================================================
 # 1: All GPUs common tests(L40S, H100, GB200, B200, B300, GB300, RTX-6000-Server test cases)
-# 2: L40S, H100, H20
-# 3: H100, H20 test cases
-# 4: H100, H20, GB200, B200, B300, GB300, RTX6000-Server test cases
+# 2: L40S, H100
+# 3: H100, test cases
+# 4: H100, GB200, B200, B300, GB300, RTX6000-Server test cases
 # 5: GB200, B200, B300, GB300, RTX6000-Server test cases
 # 6: B200, GB200, B300, GB300 test cases
 # 7: B200, B300 test cases
 # 8: B300 test cases
-# 9: H100, H20, B200, B300, RTX6000-Server test cases
-# 10: H20, B200, B300, RTX6000-Server test cases
+# 9: H100, B200, B300, RTX6000-Server test cases
+# 10: B200, B300, RTX6000-Server test cases
 # 11: RTX-6000 Server test cases
 # ===============================================================================
 
@@ -38,7 +38,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3_30b_a3b-bench-pytorch-bfloat16-maxnt:2048-input_output_len:8000,1000-reqs:64-con:1-pp:4-gpus:4]
 
 
-# 2: L40S, H100, H20
+# 2: L40S, H100
 - condition:
     ranges:
       system_gpu_count:
@@ -52,7 +52,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-tp:2-gpus:2] #min_latency
 
 
-# 3: H100, H20 test cases
+# 3: H100 test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -78,7 +78,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:8000,1000-con:250-tp:2-gpus:2] #max_throughput
 
 
-# 4: H100, H20, GB200, B200, B300, GB300, RTX6000-Server test cases
+# 4: H100, GB200, B200, B300, GB300, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -273,7 +273,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
 
 
-# 9: H100, H20, B200, B300, RTX6000-Server test cases
+# 9: H100, B200, B300, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
@@ -294,7 +294,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.5_397b_a17b_fp8-bench-pytorch-float8-maxbs:512-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] #max_throughput
 
 
-# 10: H20, B200, B300, RTX6000-Server test cases
+# 10: B200, B300, RTX6000-Server test cases
 - condition:
     ranges:
       system_gpu_count:
