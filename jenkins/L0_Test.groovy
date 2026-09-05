@@ -5389,7 +5389,17 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // keeps its own for logging and for port sectioning in getHostNodeName().
         // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
         // the compute node, where one name shared by every node would break locality.
-        withEnv(["PMIX_HOSTNAME=mpi-node0"]) {
+        // PRRTE also refuses to fork its DVM as root without the ALLOW_RUN_AS_ROOT
+        // pair (Open MPI 4 only checked that in mpirun). An outer `mpirun
+        // --allow-run-as-root` does not cover the DVM a nested MPI_Comm_spawn
+        // starts, so test_mpi_session's spawn dies with MPI_ERR_UNKNOWN.
+        withEnv([
+            "OMPI_ALLOW_RUN_AS_ROOT=1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PRTE_ALLOW_RUN_AS_ROOT=1",
+            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PMIX_HOSTNAME=mpi-node0",
+        ]) {
             runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
         }
     }, {
