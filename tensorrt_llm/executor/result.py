@@ -125,6 +125,7 @@ class CompletionOutput:
         token_ids_diff (List[int]): Newly generated token ids.
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
+        routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
     """
     index: int
     text: str = ""
@@ -157,6 +158,25 @@ class CompletionOutput:
     @property
     def length(self) -> int:
         return len(self.token_ids)
+
+    @property
+    def routed_experts(self) -> Optional[torch.Tensor]:
+        """Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3).
+
+        Shape ``[seq_len - 1, num_moe_layers, top_k]`` when requested via
+        ``SamplingParams.return_routed_experts`` (with the engine-level
+        ``enable_return_routed_experts``); ``None`` otherwise. Surfaced from
+        ``additional_generation_outputs["routed_experts"]``.
+        """
+        outs = self.additional_generation_outputs
+        if not outs or "routed_experts" not in outs:
+            return None
+        val = outs["routed_experts"]
+        if isinstance(val, (list, tuple)):
+            if not val:
+                return None
+            return val[0] if len(val) == 1 else torch.cat(list(val), dim=0)
+        return val
 
     @property
     def text_diff(self) -> str:
