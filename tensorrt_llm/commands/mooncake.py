@@ -198,7 +198,7 @@ def mooncake_master(
     "--metadata_server",
     type=str,
     default=None,
-    help="Mooncake metadata service. Defaults to --config's.",
+    help="Mooncake metadata service. Defaults to --config's, else P2PHANDSHAKE.",
 )
 @click.option(
     "--ready_file",
@@ -238,7 +238,10 @@ def mooncake_donor(
         resolve_master_address,
         wait_for_master,
     )
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import CONFIG_PATH_ENV
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+        CONFIG_PATH_ENV,
+        DEFAULT_METADATA_SERVER,
+    )
 
     raw = {}
     config = config or os.getenv(CONFIG_PATH_ENV)
@@ -264,7 +267,7 @@ def mooncake_donor(
         donating,
         protocol=protocol or raw.get("protocol", "rdma"),
         device_name=device_name or raw.get("device_name", "") or "",
-        metadata_server=metadata_server or raw.get("metadata_server", ""),
+        metadata_server=(metadata_server or raw.get("metadata_server") or DEFAULT_METADATA_SERVER),
         local_buffer_size=parse_size(
             raw.get("local_buffer_size_donor", DEFAULT_DONOR_LOCAL_BUFFER_SIZE)
         ),

@@ -56,6 +56,11 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
 DEFAULT_CACHE_PREFIX = "trtllm"
 DEFAULT_STAGING_BUFFER_SIZE = 536870912
+#: Mooncake's own peer-to-peer handshake, which keeps a separate metadata
+#: process out of the deployment. Nothing else is a sensible fallback: an empty
+#: connstring is not one of the forms `store.setup` accepts, so a config that
+#: leaves the field out means this rather than meaning no metadata service.
+DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -142,8 +147,8 @@ def provisioned_config_path() -> Optional[str]:
 class MooncakeStoreConnectorConfig:
     """Everything needed to open a store handle and name keys in it."""
 
-    metadata_server: str
     master_server_address: str
+    metadata_server: str = DEFAULT_METADATA_SERVER
     protocol: str = "rdma"
     device_name: str = ""
     global_segment_size: int = DEFAULT_GLOBAL_SEGMENT_SIZE
@@ -188,8 +193,8 @@ class MooncakeStoreConnectorConfig:
         with open(path) as handle:
             raw = json.load(handle)
         return MooncakeStoreConnectorConfig(
-            metadata_server=raw.get("metadata_server", ""),
             master_server_address=raw.get("master_server_address", ""),
+            metadata_server=raw.get("metadata_server") or DEFAULT_METADATA_SERVER,
             protocol=raw.get("protocol", "rdma"),
             device_name=raw.get("device_name", ""),
             global_segment_size=parse_size(

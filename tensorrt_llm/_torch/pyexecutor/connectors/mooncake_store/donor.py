@@ -39,7 +39,7 @@ from typing import Any, Iterator, Optional
 
 from tensorrt_llm.logger import logger
 
-from .config import parse_size
+from .config import DEFAULT_METADATA_SERVER, parse_size
 from .master import (
     local_address,
     master_timeout,
@@ -64,7 +64,7 @@ def donate_segment(
     segment_size: int,
     protocol: str = "rdma",
     device_name: str = "",
-    metadata_server: str = "",
+    metadata_server: str = DEFAULT_METADATA_SERVER,
     local_buffer_size: int = DEFAULT_DONOR_LOCAL_BUFFER_SIZE,
     hostname: Optional[str] = None,
 ) -> Iterator[str]:
@@ -95,7 +95,7 @@ def donate_segment(
         f"as capacity only, no reads or writes: host={host} "
         f"segment_size={donated} ({segment_size} bytes) "
         f"protocol={protocol} device={device_name or '(none)'} "
-        f"metadata_server={metadata_server or '(none)'} "
+        f"metadata_server={metadata_server} "
         f"local_buffer_size={local_buffer_size} bytes"
     )
 

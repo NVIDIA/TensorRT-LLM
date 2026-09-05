@@ -442,6 +442,17 @@ def test_config_env_var_wins_over_the_run_directory(tmp_path, monkeypatch):
     assert MooncakeStoreConnectorConfig.from_env().master_server_address == "external:50051"
 
 
+@pytest.mark.parametrize("named", [{}, {"metadata_server": ""}], ids=["omitted", "empty"])
+def test_config_metadata_server_falls_back_to_the_handshake(tmp_path, monkeypatch, named):
+    # No metadata service means Mooncake's peer-to-peer handshake. An empty
+    # connstring is not one of the forms setup accepts, so leaving the field
+    # out of a hand-written config must not reach it.
+    path = tmp_path / "metadata.json"
+    path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051", **named}))
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(path))
+    assert MooncakeStoreConnectorConfig.from_env().metadata_server == "P2PHANDSHAKE"
+
+
 def test_config_model_key_defaults_to_basename(store_config, tmp_path, monkeypatch):
     path = tmp_path / "no_model_key.json"
     path.write_text(json.dumps({"master_server_address": "127.0.0.1:50051"}))

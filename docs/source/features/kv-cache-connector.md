@@ -215,6 +215,8 @@ Topology can equally come from a JSON file named by `MOONCAKE_CONFIG_PATH`, usin
 }
 ```
 
+Only `master_server_address` is required. `metadata_server` may be left out, in which case it is `P2PHANDSHAKE`, Mooncake's peer-to-peer handshake, which is also what `mooncake_store` and `mooncake_donation` default to; the example above names a metadata service instead.
+
 An inherited `MOONCAKE_CONFIG_PATH` wins over `mooncake_store` and is logged as doing so, so an orchestrator that already provisions the pool, as the SLURM benchmark harness does, keeps working unchanged.
 
 Three further settings are TensorRT-LLM's rather than Mooncake's, and stay in the environment because they are per process rather than per pool:
