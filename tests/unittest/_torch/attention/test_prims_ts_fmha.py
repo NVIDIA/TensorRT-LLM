@@ -22,18 +22,18 @@ import pytest
 import torch
 from packaging.version import Version
 
-import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
-import tensorrt_llm._torch.attention_backend.fmha.utils as fmha_utils
-import tensorrt_llm._torch.attention_backend.prims_ts as prims_ts_package
-import tensorrt_llm._torch.attention_backend.prims_ts.context as prims_context_module
-import tensorrt_llm._torch.attention_backend.prims_ts.decode as prims_decode_module
-import tensorrt_llm._torch.attention_backend.prims_ts.mla_decode as prims_mla_module
-from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
-from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams
-from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
-from tensorrt_llm._torch.attention_backend.fmha.registry import get_enabled_fmha_lib_classes
-from tensorrt_llm._torch.attention_backend.interface import (
+import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
+import tensorrt_llm._torch.attention.backends.fmha.utils as fmha_utils
+import tensorrt_llm._torch.attention.backends.prims_ts as prims_ts_package
+import tensorrt_llm._torch.attention.backends.prims_ts.context as prims_context_module
+import tensorrt_llm._torch.attention.backends.prims_ts.decode as prims_decode_module
+import tensorrt_llm._torch.attention.backends.prims_ts.mla_decode as prims_mla_module
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     PredefinedAttentionMask,

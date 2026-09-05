@@ -272,7 +272,7 @@ files that TensorRT-LLM modifies.
 
 The `flashinfer-prims-ts` entry selects the complete Python tree under
 `flashinfer/attention/prims_ts` and materializes it at
-`tensorrt_llm/_torch/attention_backend/prims_ts`. The `**/*.py` selection
+`tensorrt_llm/_torch/attention/backends/prims_ts`. The `**/*.py` selection
 deliberately omits upstream README files. Its persistent patch contains only
 TensorRT-LLM integration and compatibility adaptations; all other selected
 files remain exact upstream copies.

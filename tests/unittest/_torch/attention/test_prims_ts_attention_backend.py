@@ -109,7 +109,7 @@ def test_prims_ts_context_zero_fills_nan_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
 ) -> None:
-    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
+    from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
 
     original_run = BatchPrefillPagedTSWrapper.run
     poisoned_tails: list[tuple[int, int]] = []
@@ -191,9 +191,9 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
 def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tensorrt_llm._torch.attention_backend.fmha.prims_ts as prims_ts_module
-    from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    import tensorrt_llm._torch.attention.backends.fmha.prims_ts as prims_ts_module
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         get_prims_ts_batch_decode_workspace_size,
     )
 
@@ -347,8 +347,8 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import tensorrt_llm._torch.attention_backend.prims_ts.context as context_module
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    import tensorrt_llm._torch.attention.backends.prims_ts.context as context_module
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchPrefillPagedTSWrapper,
         batch_prefill_with_paged_kv_cache,
     )
@@ -506,7 +506,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
 
 def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
         prims_ts_batch_decode_with_kv_cache,
@@ -646,7 +646,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 
 
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,
         get_prims_ts_batch_mla_decode_workspace_size,
         prims_ts_batch_mla_decode_with_kv_cache,
@@ -797,7 +797,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay() -> None:
 
 
 def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
         prims_ts_batch_decode_with_kv_cache,
@@ -973,7 +973,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
 
 
 def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> None:
-    from tensorrt_llm._torch.attention_backend.prims_ts import (
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
         prims_ts_batch_decode_with_kv_cache,
@@ -1079,8 +1079,8 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
 
 
 def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tensorrt_llm._torch.attention_backend.fmha.fallback import FallbackFmha
-    from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
     calls = {"fallback": 0, "prims_context": 0}
     fallback_forward = FallbackFmha.forward

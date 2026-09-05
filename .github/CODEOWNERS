@@ -493,7 +493,7 @@
 /requirements.txt @NVIDIA/trt-llm-oss-compliance
 /scripts/vendor_sources.py @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /setup.py @NVIDIA/trt-llm-oss-compliance
-/tensorrt_llm/_torch/attention_backend/prims_ts/** @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
+/tensorrt_llm/_torch/attention/backends/prims_ts/** @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
 /triton_kernels/** @NVIDIA/trt-llm-oss-compliance

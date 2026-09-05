@@ -52,7 +52,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
 
 
 def test_msa_import_preserves_cute_compile_option_selection() -> None:
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 

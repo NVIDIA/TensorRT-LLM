@@ -1527,7 +1527,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention_backend/prims_ts/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

@@ -82,7 +82,7 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
 def _count_prims_ts_phase_calls(mocker):
     """Count PrimTS phase launches while keeping the real kernels installed."""
-    from tensorrt_llm._torch.attention_backend.fmha.prims_ts import PrimsTSFmha
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
     calls = {
         "context": 0,

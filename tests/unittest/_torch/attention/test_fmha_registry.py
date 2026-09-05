@@ -15,7 +15,7 @@
 
 import pytest
 
-from tensorrt_llm._torch.attention_backend.fmha import registry
+from tensorrt_llm._torch.attention.backends.fmha import registry
 
 PRIMS_TS = "prims_ts"
 

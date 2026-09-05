@@ -373,7 +373,7 @@ The FMHA package is split by role:
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
 - `fmha/prims_ts.py` adapts TRT-LLM inputs and paged-cache metadata to the
   vendored PrimTS kernels. Before changing the managed source under
-  `attention_backend/prims_ts`, read the
+  `backends/prims_ts`, read the
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Land
   upstream-worthy changes in FlashInfer and update the vendor lock; keep only
   TRT-LLM-specific adaptations in the persistent patch.

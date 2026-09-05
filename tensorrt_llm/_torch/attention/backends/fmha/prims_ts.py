@@ -25,7 +25,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from packaging.version import InvalidVersion, Version
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import binding_to_torch_dtype, get_sm_version
@@ -40,12 +43,12 @@ from .phased import FmhaParams, PhasedFmha
 from .utils import get_kv_page_offset
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.prims_ts.context import BatchPrefillPagedTSWrapper
-    from tensorrt_llm._torch.attention_backend.prims_ts.decode import BatchDecodePagedTSWrapper
-    from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+    from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillPagedTSWrapper
+    from tensorrt_llm._torch.attention.backends.prims_ts.decode import BatchDecodePagedTSWrapper
+    from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
     )
-    from tensorrt_llm._torch.attention_backend.trtllm import (
+    from tensorrt_llm._torch.attention.backends.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
     )
@@ -484,7 +487,7 @@ class PrimsTSFmha(PhasedFmha):
             return wrapper
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PrimTS context must be planned before CUDA graph capture.")
-        from tensorrt_llm._torch.attention_backend.prims_ts.context import (
+        from tensorrt_llm._torch.attention.backends.prims_ts.context import (
             BatchPrefillPagedTSWrapper,
         )
 
@@ -533,7 +536,7 @@ class PrimsTSFmha(PhasedFmha):
             return wrapper
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PrimTS decode must be planned before CUDA graph capture.")
-        from tensorrt_llm._torch.attention_backend.prims_ts.decode import BatchDecodePagedTSWrapper
+        from tensorrt_llm._torch.attention.backends.prims_ts.decode import BatchDecodePagedTSWrapper
 
         wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
         wrapper.plan(
@@ -579,7 +582,7 @@ class PrimsTSFmha(PhasedFmha):
             return wrapper
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PrimTS MLA decode must be planned before CUDA graph capture.")
-        from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+        from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
             BatchMLADecodePagedTSWrapper,
         )
 
@@ -692,7 +695,7 @@ class PrimsTSFmha(PhasedFmha):
         window_left = -1
 
         if self.attn.is_mla_enable:
-            from tensorrt_llm._torch.attention_backend.prims_ts import (
+            from tensorrt_llm._torch.attention.backends.prims_ts import (
                 get_prims_ts_batch_mla_decode_workspace_size,
             )
 
@@ -711,7 +714,7 @@ class PrimsTSFmha(PhasedFmha):
                 device=q.device,
             )
         else:
-            from tensorrt_llm._torch.attention_backend.prims_ts import (
+            from tensorrt_llm._torch.attention.backends.prims_ts import (
                 get_prims_ts_batch_decode_workspace_size,
             )
 

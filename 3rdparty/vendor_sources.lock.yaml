@@ -5,7 +5,7 @@ vendors:
     branch: trtllm-prims-ts
     commit: e500966b575ab83db7c0e84e5a0f8fde6a4f3505
     source: flashinfer/attention/prims_ts
-    destination: tensorrt_llm/_torch/attention_backend/prims_ts
+    destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
