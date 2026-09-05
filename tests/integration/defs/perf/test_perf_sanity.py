@@ -585,15 +585,15 @@ def add_perf_metric_value(
             new_data[f"d_{metric_name}"] = float(value)
 
 
-# Metrics where larger is better
+# Metrics where larger is better: rates, plus 'al' (mean accepted draft tokens
+# per iteration, a count). Direction is read in two opposite senses, so a metric
+# on the wrong list is wrong in every one of them -- see "Metric Definitions" in
+# README_test_perf_sanity.md.
 MAXIMIZE_METRICS = [
     "d_seq_throughput",
     "d_token_throughput",
     "d_total_token_throughput",
     "d_user_throughput",
-    "d_mean_tpot",
-    "d_median_tpot",
-    "d_p99_tpot",
     "d_al",
 ]
 
@@ -605,6 +605,12 @@ MINIMIZE_METRICS = [
     "d_mean_itl",
     "d_median_itl",
     "d_p99_itl",
+    # TPOT is "Time per Output Token (ms)": benchmark_serving computes it as
+    # (e2e_latency - ttft) / (output_len - 1), so it is a latency like its
+    # ttft/itl/e2el siblings, not a rate (https://nvbugs/6706765).
+    "d_mean_tpot",
+    "d_median_tpot",
+    "d_p99_tpot",
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",
