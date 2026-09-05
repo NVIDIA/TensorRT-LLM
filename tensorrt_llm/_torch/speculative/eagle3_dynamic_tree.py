@@ -517,6 +517,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             spec_metadata.gather_ids,
             accepted_tokens,
             num_contexts,
+            prompt_lookahead_tokens=(spec_metadata.context_prompt_lookahead_tokens),
         )
 
         if num_gens > 0:

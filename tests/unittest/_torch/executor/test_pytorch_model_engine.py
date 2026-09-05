@@ -177,10 +177,25 @@ def _create_request_with_tokens(tokens: list[int], req_id: int) -> LlmRequest:
 
 
 def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
+    """An internal chunk hands back the next prompt token; the last one does not.
+
+    The boundary is read off the request's live chunking state rather than a
+    Python-side prompt length, which a preemption leaves stale.
+    """
     request = _create_request_with_tokens([10, 11, 12, 13, 14], 1)
 
+    request.context_chunk_size = 2
     assert _get_context_prompt_lookahead_token(request, 2) == 12
+
+    # A reused prefix advances the live cursor while py_prompt_len remains the
+    # original prompt length. Internal chunk [2, 4) still looks up token 4.
+    request.context_current_position = 2
+    request.context_chunk_size = 2
     assert _get_context_prompt_lookahead_token(request, 4) == 14
+
+    # Final chunk [2, 5): nothing follows in the prompt, so the drafter falls
+    # back to the token the target just sampled.
+    request.context_chunk_size = 3
     assert (_get_context_prompt_lookahead_token(
         request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
 

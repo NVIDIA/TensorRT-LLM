@@ -2873,6 +2873,39 @@ def test_branch_snapshot_skipped_when_reuse_already_reached_the_fork():
     assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
 
 
+def test_branch_snapshot_uses_cache_depth_before_request_cursor_is_rewound():
+    """A shallower retry must apply points hidden by the stale request cursor."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=192)
+    kv_cache = _fake_reuse_match(divergence=128, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+
+    assert request.context_current_position == 192
+    assert request.expect_snapshot_points == [128, 256]
+    assert mgr._branch_snapshot_points == {1: 128}
+    assert mgr._branch_snapshots_skipped_total == {}
+
+
+def test_branch_snapshot_reapplies_after_resume_retry_with_stale_cursor():
+    """A saved point must survive a failed resume and existing-cache retry."""
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=192)
+    kv_cache = _fake_reuse_match(divergence=128, reused=64)
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
+    request.expect_snapshot_points = []
+    mgr._apply_branch_snapshot_point(request)
+    assert request.expect_snapshot_points == [256]
+
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=None)
+
+    assert request.context_current_position == 192
+    assert request.expect_snapshot_points == [128, 256]
+    assert mgr._branch_snapshot_points == {1: 128}
+    assert mgr._branch_snapshots_skipped_total == {"no_fresh_match": 1}
+
+
 def test_branch_snapshot_skipped_at_or_after_the_prompt_end():
     """The prompt end is snapshotted unconditionally, so this adds nothing."""
     mgr = _branch_snapshot_manager()

@@ -464,7 +464,7 @@ def test_build_routes_compression_manager_by_capabilities(
     creator = object.__new__(util_mod.KvCacheCreator)
     creator._skip_est = False
     creator._max_seq_len = 1024
-    creator._kv_cache_config = SimpleNamespace()
+    creator._kv_cache_config = SimpleNamespace(enable_block_reuse=False)
     compression_config = SimpleNamespace(algorithm="triattention")
     pretrained_config = object()
     creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)

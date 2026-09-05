@@ -22,6 +22,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -83,14 +84,17 @@ def _make_creator(
 
 class TestSplitGpuBudgetForDraft:
     @pytest.mark.parametrize(
-        "is_external_drafter",
-        [True, False],
-        ids=["external_dflash", "eagle3_mtp"],
+        "mode",
+        [
+            SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL,
+            SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        ],
+        ids=["external_draft_target", "eagle3_mtp"],
     )
     def test_one_model_draft_cost_uses_derived_kv_config(
         self,
         mocker,
-        is_external_drafter,
+        mode,
     ) -> None:
         class DraftModelConfig:
             quant_config = None
@@ -107,9 +111,10 @@ class TestSplitGpuBudgetForDraft:
                 return 1
 
         creator = object.__new__(KvCacheCreator)
-        target_kv_config = KvCacheConfig(max_attention_window=[16384])
-        mode = Mock()
-        mode.is_external_drafter.return_value = is_external_drafter
+        target_kv_config = KvCacheConfig(
+            enable_block_reuse=False,
+            max_attention_window=[16384],
+        )
 
         target_model_config = SimpleNamespace(is_encoder_decoder=False)
         draft_model_config = DraftModelConfig()
@@ -155,11 +160,10 @@ class TestSplitGpuBudgetForDraft:
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
         assert target_kv_config.max_attention_window == [16384]
-        if is_external_drafter:
+        if mode.is_external_drafter():
             assert get_manager_cls.call_args.args[1] is draft_kv_config
         else:
             get_manager_cls.assert_not_called()
-        mode.is_dflash.assert_not_called()
 
     def test_v1_mixed_draft_build_uses_original_max_seq_len(self, mocker):
         c = _make_creator(max_gpu_total_bytes=10 * GB)

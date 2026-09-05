@@ -2944,6 +2944,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """
 
     _supports_additional_snapshot_offsets = True
+    # Recurrent-state snapshots use a specialized commit/history protocol, so
+    # keep main-like reuse endpoints and the existing unpaired draft path.
+    _supports_reuse_match_backoff = False
 
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
     # model — and any partially-constructed instance that sets only the fields it
@@ -3430,6 +3433,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
         if num_lookup_tokens is None:
             self._skip_branch_snapshot("no_fresh_match")
+            # A fresh lookup can record a point before resume() fails. On the
+            # next attempt, reapply that point against the cache's authoritative
+            # reuse depth: the request cursor is not rewound until preparation
+            # succeeds and may still describe a deeper, abandoned attempt.
+            if req.py_request_id in self._branch_snapshot_points:
+                self._apply_branch_snapshot_point(
+                    req, context_current_position=kv_cache.num_committed_tokens)
             return
 
         diagnostics = cast(_PrefixReuseDiagnostics, kv_cache)
@@ -3456,7 +3466,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._skip_branch_snapshot("aligned_to_zero")
             return
         # Reuse already reached the fork, so a snapshot there exists.
-        if point <= req.context_current_position:
+        if point <= reused:
             self._skip_branch_snapshot("already_reused")
             return
         # The prompt end is snapshotted unconditionally anyway.
@@ -3465,7 +3475,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         self._branch_snapshot_points[req.py_request_id] = point
-        self._apply_branch_snapshot_point(req)
+        self._apply_branch_snapshot_point(req, context_current_position=reused)
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
@@ -3476,7 +3486,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for request in requests:
             self._apply_branch_snapshot_point(request)
 
-    def _apply_branch_snapshot_point(self, request: LlmRequest) -> None:
+    def _apply_branch_snapshot_point(
+        self,
+        request: LlmRequest,
+        context_current_position: Optional[int] = None,
+    ) -> None:
         # prompt_len is unioned in unconditionally: try_commit_blocks derives
         # commit_limit from max(snapshot_points), so a lone branch point below
         # the prompt end would silently stop commits there and lose the
@@ -3484,7 +3498,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         points = set(request.expect_snapshot_points)
         points.add(request.prompt_len)
         point = self._branch_snapshot_points.get(request.py_request_id)
-        if point is not None and point > request.context_current_position:
+        current_position = (request.context_current_position
+                            if context_current_position is None else
+                            context_current_position)
+        if point is not None and point > current_position:
             points.add(point)
         request.expect_snapshot_points = sorted(points)
 
