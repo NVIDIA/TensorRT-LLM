@@ -147,6 +147,7 @@ class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
         self.encoder_calls = 0
         self.audio_tower = None
         self.embed_audio = object()
+        self._initialize_multimodal_encoder_cache(4096)
 
     @property
     def embedding_dim(self) -> int:
