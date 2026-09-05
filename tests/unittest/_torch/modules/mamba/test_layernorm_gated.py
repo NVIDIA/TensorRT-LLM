@@ -15,8 +15,10 @@
 
 import pytest
 import torch
+import triton
 from utils.util import getSMVersion
 
+import tensorrt_llm._torch.modules.mamba.layernorm_gated as layernorm_gated
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
 from tensorrt_llm.math_utils import ceil_div, pad_up
@@ -36,6 +38,18 @@ skip_unless_nvfp4_kernel = pytest.mark.skipif(
     getSMVersion() < 100 or not fused_gated_rmsnorm_quant_available(),
     reason="Requires SM100+ (Blackwell) and trtllm.fused_gated_rmsnorm_quant op",
 )
+
+
+def test_multirow_pdl_requires_underfilled_grid_and_enabled_policy(monkeypatch):
+    monkeypatch.setattr(layernorm_gated, "_multi_processor_count", lambda _device: 148)
+    monkeypatch.setattr(layernorm_gated, "get_sm_version", lambda: 103)
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "1")
+    assert layernorm_gated._multirow_pdl(48, 0)
+    assert not layernorm_gated._multirow_pdl(148, 0)
+
+    monkeypatch.setenv("TRTLLM_ENABLE_PDL", "0")
+    assert not layernorm_gated._multirow_pdl(48, 0)
 
 
 def reference_rmsnorm_gated(
@@ -259,6 +273,48 @@ class TestRMSNormBasic:
 
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize("num_tokens,heads,N", [(1, 47, 128), (7, 8, 256), (2048, 48, 128)])
+    def test_token_major_pdl_launch_is_bitwise_invariant(self, num_tokens, heads, N):
+        """Enabling PDL must not change any output bit."""
+        device = "cuda"
+        dtype = torch.bfloat16
+        torch.manual_seed(11)
+        num_rows = num_tokens * heads
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 128, device=device, dtype=dtype)
+        z = wide[:, 128:].view(num_tokens, heads, N)
+
+        outputs = {}
+        for launch_with_pdl in (False, True):
+            output = torch.empty_like(x)
+            layernorm_gated._rms_norm_gated_fwd_multirow_kernel[
+                (triton.cdiv(num_rows, layernorm_gated._MULTIROW_ROWS),)
+            ](
+                x,
+                output,
+                weight,
+                z,
+                None,
+                None,
+                x.stride(0),
+                output.stride(0),
+                z.stride(0),
+                num_rows,
+                1e-6,
+                N=N,
+                ROWS=layernorm_gated._MULTIROW_ROWS,
+                HEADS_PER_TOK=heads,
+                GATE_SIGMOID=True,
+                WEIGHT_IS_DELTA=False,
+                LAUNCH_WITH_PDL=launch_with_pdl,
+                num_warps=layernorm_gated._MULTIROW_NUM_WARPS,
+                launch_pdl=launch_with_pdl,
+            )
+            outputs[launch_with_pdl] = output
+
+        assert torch.equal(outputs[True], outputs[False])
 
 
 @skip_no_cuda

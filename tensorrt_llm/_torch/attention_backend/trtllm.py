@@ -333,24 +333,25 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         capture_graph = self.is_cuda_graph
 
-        self.prompt_lens_cuda = self.get_empty(
+        # Prompt and KV lengths are refreshed together. Sharing one two-row
+        # staging buffer turns two tiny host-to-device copies into one.
+        self._seq_lens_stage_cuda = self.get_empty(
             buffers,
-            (self.max_num_sequences, ),
-            cache_name="prompt_lens_cuda",
+            (2, self.max_num_sequences),
+            cache_name="seq_lens_stage_cuda",
             dtype=torch.int,
             capture_graph=capture_graph,
         )
-        self.prompt_lens_cpu = torch.empty_like(
-            self.prompt_lens_cuda,
+        self._seq_lens_stage_cpu = torch.empty_like(
+            self._seq_lens_stage_cuda,
             device='cpu',
             pin_memory=prefer_pinned(),
         )
-        self.kv_lens_cuda = self.get_empty_like(
-            buffers,
-            self.prompt_lens_cuda,
-            cache_name="kv_lens_cuda",
-            capture_graph=capture_graph,
-        )
+        self.prompt_lens_cuda = self._seq_lens_stage_cuda[0]
+        self.kv_lens_cuda = self._seq_lens_stage_cuda[1]
+        self.prompt_lens_cpu = self._seq_lens_stage_cpu[0]
+        # This row excludes num_extra_kv_tokens, unlike self.kv_lens.
+        self._kv_lens_stage_cpu = self._seq_lens_stage_cpu[1]
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=prefer_pinned())
@@ -566,6 +567,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 pin_memory=prefer_pinned(),
             )
 
+    def _snapshot_seq_lens_for_copy(self) -> torch.Tensor:
+        """Return an immutable source for the asynchronous sequence-length H2D."""
+        # The overlap scheduler may refill the persistent host views while the
+        # preceding H2D is still queued. A fresh snapshot lets the caching host
+        # allocator retain that copy's source until the transfer completes.
+        snapshot = torch.empty_like(
+            self._seq_lens_stage_cpu,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        snapshot.copy_(self._seq_lens_stage_cpu)
+        return snapshot
+
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadata.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
@@ -726,8 +740,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -754,9 +766,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        self._kv_lens_stage_cpu[:self.num_seqs].copy_(kv_lens[:self.num_seqs])
+        # Neither device row is consumed before this point. Columns beyond the
+        # active batch retain their previous staged values and are not read.
+        seq_lens_snapshot = self._snapshot_seq_lens_for_copy()
+        self._seq_lens_stage_cuda.copy_(seq_lens_snapshot, non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

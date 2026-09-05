@@ -16,6 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -138,6 +141,18 @@ _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
 
 
+@functools.lru_cache(maxsize=None)
+def _multi_processor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _multirow_pdl(grid_size: int, device_index: int) -> bool:
+    """Use PDL only when the launch grid cannot cover all SMs by itself."""
+    return (grid_size < _multi_processor_count(device_index)
+            and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+            and get_sm_version() >= 90)
+
+
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
@@ -160,6 +175,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     WEIGHT_IS_DELTA: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -174,6 +190,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
@@ -201,6 +219,9 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if LAUNCH_WITH_PDL:
+        # Release only after both Rstd (when present) and Y have been stored.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -258,9 +279,11 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
-    with torch.cuda.device(x.device.index):
-        _rms_norm_gated_fwd_multirow_kernel[grid](
+    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+    device_index = x.device.index
+    launch_with_pdl = _multirow_pdl(grid_size, device_index)
+    with torch.cuda.device(device_index):
+        _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
             x,
             out,
             weight,
@@ -277,7 +300,9 @@ def rms_norm_gated_token_major(
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=_MULTIROW_NUM_WARPS,
+            launch_pdl=launch_with_pdl,
         )
     return out
 
@@ -345,9 +370,11 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid = (triton.cdiv(M, _MULTIROW_ROWS), )
-        with torch.cuda.device(x.device.index):
-            _rms_norm_gated_fwd_multirow_kernel[grid](
+        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+        device_index = x.device.index
+        launch_with_pdl = _multirow_pdl(grid_size, device_index)
+        with torch.cuda.device(device_index):
+            _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
                 x,
                 out,
                 weight,
@@ -364,7 +391,9 @@ def _layer_norm_fwd(
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
+                LAUNCH_WITH_PDL=launch_with_pdl,
                 num_warps=_MULTIROW_NUM_WARPS,
+                launch_pdl=launch_with_pdl,
             )
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel

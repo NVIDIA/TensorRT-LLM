@@ -5178,14 +5178,16 @@ class PyTorchModelEngine(ModelEngine):
             self.position_ids_cuda[:num_requests].add_(1)
         num_cached_tokens_per_seq = positions.tolist()
 
-        # Gather this step's input tokens from the previous iteration's device
-        # sample buffer; the seq-slot indices in previous_batch_indices_cuda
-        # are unchanged since the last full pass.
+        # Gather committed tokens directly into the persistent model-input
+        # buffer. Advanced indexing would allocate a temporary and then copy it.
         previous_slots = self.previous_batch_indices_cuda[:num_requests]
-        new_tokens = new_tensors_device.new_tokens[:1, previous_slots, :self.
-                                                   max_beam_width]
-        self.input_ids_cuda[:num_requests * self.max_beam_width].copy_(
-            new_tokens.flatten(), non_blocking=True)
+        torch.index_select(
+            new_tensors_device.new_tokens[0, :, :self.max_beam_width],
+            0,
+            previous_slots,
+            out=self.input_ids_cuda[:num_requests * self.max_beam_width].view(
+                num_requests, self.max_beam_width),
+        )
 
         if not attn_metadata.is_cuda_graph:
             attn_metadata.seq_lens = cache['seq_lens_ones']

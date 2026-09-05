@@ -1786,7 +1786,8 @@ void run(Data const& data, void* stream)
 
         if (useCoop)
         {
-            launchInitExpertCounts(data, numThreadsHist, stream);
+            // The preceding histogram-scores kernel clears both expert-count
+            // regions before publishing the Top-K scores consumed here.
             launchCoopKernel(lastKernelData, numBlocksCoop, numThreadsHist, stream);
         }
         else
