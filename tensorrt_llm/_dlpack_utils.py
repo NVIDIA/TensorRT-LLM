@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,13 @@ import ctypes
 from ctypes import (
     CFUNCTYPE,
     POINTER,
+    c_char_p,
     c_int,
     c_int64,
     c_size_t,
     c_uint8,
     c_uint16,
     c_void_p,
-    pointer,
 )
 
 import torch
@@ -75,35 +75,76 @@ DLManagedTensor._fields_ = [
 ]
 
 
-# A no-op deleter that doesn't perform any operation
+# Rank of the tensors this module produces: sizes the block's shape/strides arrays and is
+# reported as ndim, so all three move together.
+_NDIM = 2
+
+
+# The DLManagedTensor plus the shape and stride arrays it points at, in one contiguous
+# allocation so a single free reclaims all three.
+class _DLPackBlock(ctypes.Structure):
+    _fields_ = [
+        ("managed_tensor", DLManagedTensor),
+        ("shape", c_int64 * _NDIM),
+        ("strides", c_int64 * _NDIM),
+    ]
+
+
+_raw_calloc = ctypes.pythonapi.PyMem_RawCalloc
+_raw_calloc.restype = c_void_p
+_raw_calloc.argtypes = [c_size_t, c_size_t]
+
+_raw_free = ctypes.pythonapi.PyMem_RawFree
+_raw_free.restype = None
+_raw_free.argtypes = [c_void_p]
+
+_capsule_is_valid = ctypes.pythonapi.PyCapsule_IsValid
+_capsule_is_valid.restype = c_int
+_capsule_is_valid.argtypes = [ctypes.py_object, c_char_p]
+
+# py_object restype so ctypes adopts the reference PyCapsule_New returns (and raises if it
+# returns NULL) instead of us leaking it.
+_new_capsule = ctypes.pythonapi.PyCapsule_New
+_new_capsule.restype = ctypes.py_object
+_new_capsule.argtypes = [c_void_p, c_char_p, c_void_p]
+
+
+# The deleter DLPack requires the producer to supply: it releases the block, and only the
+# block -- the tensor data stays owned by the caller.
+#
+# The consumer invokes this from its storage destructor, which for PyTorch runs inside
+# ~TensorImpl, after THPVariable_clear has already freed the tensor's __dict__. So the block
+# must not depend on any Python object's lifetime; hence raw memory owned by this deleter
+# rather than a ctypes object kept alive by a Python reference.
 @CFUNCTYPE(None, POINTER(DLManagedTensor))
-def no_op_deleter(dmt_ptr):
-    # You can also call cudaFree here if you want to free memory when the tensor's lifecycle ends
-    pass
+def _free_dlpack_block(dmt_ptr):
+    # The DLManagedTensor is the first member of the block, so their addresses coincide.
+    _raw_free(dmt_ptr)
 
 
-# Wrapper class to prevent Python garbage collection of DLPack-related objects
 class CapsuleWrapper:
     """
-    A wrapper class that holds references to the PyCapsule and its associated data.
+    Holds the PyCapsule and owns its backing DLPack block until a consumer takes over.
 
-    This class prevents Python's garbage collector from collecting the shape_array and
-    managed_tensor objects while the capsule is still in use. It serves as a container
-    to maintain the lifecycle of all DLPack-related objects.
+    The block has exactly one owner. Importing the capsule (e.g. via
+    torch.utils.dlpack.from_dlpack) hands ownership to the consumer, which calls
+    _free_dlpack_block once the imported tensor dies -- possibly long after this wrapper is
+    gone. An unconsumed capsule's block stays ours, and __del__ releases it.
+
+    Telling those two cases apart relies on the DLPack requirement that a consumer rename
+    the capsule to "used_dltensor" when it takes ownership; a consumer that imported without
+    renaming would leave both sides believing they own the block.
     """
 
-    def __init__(self, capsule, shape_array, managed_tensor):
-        """
-        Initialize the CapsuleWrapper with the necessary objects.
-
-        Parameters:
-            capsule: The PyCapsule object that follows the DLPack protocol
-            shape_array: The array containing tensor shape information
-            managed_tensor: The DLManagedTensor instance that the capsule points to
-        """
+    def __init__(self, capsule, block_addr):
         self.capsule = capsule  # The main PyCapsule object that can be passed to other libraries
-        self._shape_array = shape_array  # Keep reference to prevent garbage collection
-        self._managed_tensor = managed_tensor  # Keep reference to prevent garbage collection
+        self._block_addr = block_addr
+
+    def __del__(self):
+        # A capsule still answering to "dltensor" was never imported (see class docstring),
+        # so its block is still ours to free.
+        if _capsule_is_valid(self.capsule, b"dltensor"):
+            _raw_free(self._block_addr)
 
 
 def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch_dtype, dev_id):
@@ -141,43 +182,34 @@ def create_dlpack_capsule(ptr, segment_size, segment_stride, num_segments, torch
     else:
         raise NotImplementedError(torch_dtype)
     bytes_per_element = bits_per_elements // 8
-    # Allocate space for shape (constructing a one-dimensional tensor here)
-    ShapeArrayType = c_int64 * 2  # 1 dimension
-    shape_array = ShapeArrayType(num_segments, segment_size // bytes_per_element)
-    stride_array = ShapeArrayType(segment_stride // bytes_per_element, 1)
-    # Set device information: GPU (device_type=2) and device_id=dev_id (modify as needed)
-    device = DLDevice(device_type=2, device_id=dev_id)
-    # Set data type
-    dtype = DLDataType(code=dldata_type_code, bits=bits_per_elements, lanes=1)
+    # Raw memory rather than ctypes objects, because the consumer outlives every Python
+    # reference held here -- see _free_dlpack_block for why.
+    block_addr = _raw_calloc(1, ctypes.sizeof(_DLPackBlock))
+    if not block_addr:
+        raise MemoryError("Failed to allocate DLPack block")
+    block = _DLPackBlock.from_address(block_addr)
+    managed_tensor = block.managed_tensor
+    # Shape (constructing a one-dimensional tensor here) and strides, in-place in the block
+    block.shape[:] = (num_segments, segment_size // bytes_per_element)
+    block.strides[:] = (segment_stride // bytes_per_element, 1)
     # Construct DLTensor
-    dltensor = DLTensor()
+    dltensor = managed_tensor.dl_tensor
     dltensor.data = c_void_p(ptr)
-    dltensor.device = device
-    dltensor.ndim = 2
-    dltensor.dtype = dtype
-    dltensor.shape = ctypes.cast(shape_array, POINTER(c_int64))
-    dltensor.strides = ctypes.cast(stride_array, POINTER(c_int64))
-    dltensor.byte_offset = 0
-    # Construct DLManagedTensor and set deleter to no-op (you can also call cudaFree here)
-    managed_tensor = DLManagedTensor()
-    managed_tensor.dl_tensor = dltensor
-    managed_tensor.manager_ctx = None
-    managed_tensor.deleter = no_op_deleter
-    # Note: Must ensure that shape_array and managed_tensor are not garbage collected by Python,
-    # A simple way is to attach them to the capsule object.
-    # Call PyCapsule_New to create capsule
-    PyCapsule_New = ctypes.pythonapi.PyCapsule_New
-    PyCapsule_New.restype = c_void_p
-    PyCapsule_New.argtypes = [c_void_p, ctypes.c_char_p, c_void_p]
-    # Allocate managed_tensor on the heap (note that pointer returns a pointer)
-    managed_tensor_ptr = pointer(managed_tensor)
-    # The capsule name must be "dltensor", as required by the DLPack specification
-    capsule_ptr = PyCapsule_New(managed_tensor_ptr, b"dltensor", None)
-    # Convert capsule_ptr to Python object
-    capsule = ctypes.cast(capsule_ptr, ctypes.py_object).value
-    # To prevent shape_array and managed_tensor from being collected, we attach them as attributes to the capsule
-    capsule_wrapper = CapsuleWrapper(capsule, shape_array, managed_tensor)
-    return capsule_wrapper
+    # Set device information: GPU (device_type=2) and device_id=dev_id (modify as needed)
+    dltensor.device = DLDevice(device_type=2, device_id=dev_id)
+    dltensor.ndim = _NDIM
+    dltensor.dtype = DLDataType(code=dldata_type_code, bits=bits_per_elements, lanes=1)
+    dltensor.shape = block.shape
+    dltensor.strides = block.strides
+    # byte_offset and manager_ctx stay 0/NULL from the calloc above.
+    managed_tensor.deleter = _free_dlpack_block
+    try:
+        capsule = _new_capsule(block_addr, b"dltensor", None)
+    except Exception:
+        _raw_free(block_addr)
+        raise
+    # The wrapper owns the block until a consumer imports the capsule and takes it over
+    return CapsuleWrapper(capsule, block_addr)
 
 
 def pack_strided_memory(

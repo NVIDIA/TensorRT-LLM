@@ -875,7 +875,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             if self._engine_dead and not f.done():
                 continue
             try:
-                f.result()
+                # A worker that dies *after* delivering its results (e.g. a segfault in
+                # its own teardown) queues no error, so _engine_dead is still False and
+                # the grace above was skipped. Bound the wait so that cannot wedge
+                # shutdown forever; pre_shutdown has already asked the worker to quit.
+                # Generous enough for an orderly teardown of a large engine.
+                f.result(timeout=180.0)
             except:
                 # The errors are already captured in mpi_done_callback, ignored
                 # here
