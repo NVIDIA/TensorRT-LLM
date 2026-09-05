@@ -29,7 +29,16 @@ def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
     Args:
         t: The tensor to convert
     """
-    assert t.dim() <= 2, "t.dim() should be less than or equal to 2"
+    if t.dim() > 2:
+        # MoeWeight is a 2D (height, width, pitch) cudaMemcpy2D descriptor, so a
+        # higher-rank weight -- e.g. a TRTLLM-Gen BlockMajorK expert weight,
+        # [K / blockK, Mn, blockK] -- is described by its leading dims collapsed,
+        # which covers the same bytes. Contiguity makes that flatten a view; a
+        # copy would leave weight_ptr dangling once this function returns.
+        assert t.is_contiguous(), (
+            f"a {t.dim()}D weight must be contiguous to be described by a "
+            f"single pitch, shape={tuple(t.shape)}, strides={t.stride()}")
+        t = t.flatten(0, -2)
     shape = [1, 1]
     pitch = 1
     elt_size = torch.tensor([], dtype=t.dtype).element_size()
@@ -125,8 +134,6 @@ class HostMoeTensorSharer:
             expert_id: The ID of the expert
             name: The name of the weight
         """
-        assert len(tensor_shape
-                   ) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert 0 <= expert_id < self.expert_count
         assert expert_id < self.expert_start or expert_id >= self.expert_end
         if name not in self.name_info:
@@ -148,8 +155,6 @@ class HostMoeTensorSharer:
             name: The name of the weight
             t: The weight tensor
         """
-        assert len(
-            t.shape) <= 2, "tensor_shape dim must be less than or equal to 2"
         assert t.is_contiguous() == True, "t.is_contiguous() must be True"
         assert (expert_id, name) not in self.shared_tensors.keys()
         assert self.expert_start <= expert_id < self.expert_end
