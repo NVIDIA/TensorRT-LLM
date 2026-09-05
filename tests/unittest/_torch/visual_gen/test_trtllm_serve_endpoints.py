@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """trtllm-serve visual_gen endpoints tests.
 
 Tests all endpoints registered for the VISUAL_GEN server role
@@ -31,6 +34,7 @@ import torch
 from fastapi.testclient import TestClient
 from PIL import Image
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
@@ -129,6 +133,23 @@ def _server_timing_ms(headers, name: str) -> float:
         if part.startswith(f"{name};dur="):
             return float(part[len(f"{name};dur=") :])
     raise AssertionError(f"{name!r} not in Server-Timing: {server_timing!r}")
+
+
+def _set_deterministic_server_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hold the clock at 10 until mock generation starts, then advance to 15."""
+    current_time = 10.0
+    original_generate_async = MockVisualGen.generate_async
+
+    def now(_self: AdjustedSteadyClock) -> float:
+        return current_time
+
+    def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
+        nonlocal current_time
+        current_time = 15.0
+        return original_generate_async(self, inputs=inputs, params=params)
+
+    monkeypatch.setattr(AdjustedSteadyClock, "now", now)
+    monkeypatch.setattr(MockVisualGen, "generate_async", generate_async)
 
 
 def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
@@ -666,25 +687,17 @@ class TestImageGeneration:
         assert _server_timing_ms(resp.headers, "total") > 0
 
     def test_image_generation_total_anchored_to_server_arrival(self, image_client, monkeypatch):
-        """``total`` measures from the middleware's arrival stamp, not from a
-        handler-local clock — this route is handed an already-parsed
-        ``ImageGenerationRequest``, so stamping in the handler would silently
-        exclude body parsing.
-
-        Backdating only the middleware's clock leaves the handler's end
-        reading on the real one, so ``total`` must absorb the full offset.
-        """
-        import tensorrt_llm.serve.responses_utils as _ru
-
-        real = _ru.get_steady_clock_now_in_seconds
-        monkeypatch.setattr(_ru, "get_steady_clock_now_in_seconds", lambda: real() - 5.0)
+        """``total`` uses the shared adjusted clock from arrival to completion."""
+        _set_deterministic_server_clock(monkeypatch)
+        # An unrelated read must not advance the clock before request arrival.
+        assert AdjustedSteadyClock().now() == 10.0
 
         resp = image_client.post(
             "/v1/images/generations",
             json={"prompt": "timing", "response_format": "b64_json", "size": "64x64"},
         )
         assert resp.status_code == 200
-        assert _server_timing_ms(resp.headers, "total") >= 5000.0
+        assert _server_timing_ms(resp.headers, "total") == 5000.0
 
     def test_image_generation_with_optional_params(self, image_client):
         resp = image_client.post(
@@ -1128,8 +1141,9 @@ class TestImageEdit:
         assert content.headers["content-type"] == "image/png"
 
     def test_image_edit_server_timing_has_total(self, tmp_path, monkeypatch):
-        """The edit route reports ``total`` too (real wall-clock, so > 0)."""
+        """The edit route reports ``total`` using the shared adjusted clock."""
         client, _ = self._client(tmp_path, monkeypatch)
+        _set_deterministic_server_clock(monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
@@ -1143,7 +1157,7 @@ class TestImageEdit:
         assert resp.status_code == 200
         assert _server_timing_ms(resp.headers, "generation") == 1250.0
         assert _server_timing_ms(resp.headers, "denoise") == 750.0
-        assert _server_timing_ms(resp.headers, "total") > 0
+        assert _server_timing_ms(resp.headers, "total") == 5000.0
 
     def test_image_edit_response_format_path_returns_on_disk_path(self, tmp_path, monkeypatch):
         """``response_format='path'`` returns the server-side output path
@@ -1496,9 +1510,10 @@ class TestVideoGenerationSync:
         assert resp.headers["content-type"] == "video/mp4"
         _assert_visual_gen_server_timing(resp.headers)
 
-    def test_sync_video_server_timing_has_total(self, video_client):
+    def test_sync_video_server_timing_has_total(self, video_client, monkeypatch):
         """The sync Server-Timing header carries generation, denoise, and the
-        new ``total`` (full server time; real wall-clock, so only checked > 0)."""
+        full server time from the shared adjusted clock."""
+        _set_deterministic_server_clock(monkeypatch)
         resp = video_client.post(
             "/v1/videos/sync",
             json={
@@ -1513,7 +1528,7 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert _server_timing_ms(resp.headers, "generation") == 1250.0
         assert _server_timing_ms(resp.headers, "denoise") == 750.0
-        assert _server_timing_ms(resp.headers, "total") > 0
+        assert _server_timing_ms(resp.headers, "total") == 5000.0
         assert len(resp.content) > 0
 
     def test_deprecated_generations_alias_routes_to_sync(self, video_client):
@@ -2553,11 +2568,15 @@ class TestVideoTensorResponse:
         assert "video" in loaded
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
-    def test_sync_tensor_path_returns_readable_output_path(self, video_audio_client, fmt):
+    def test_sync_tensor_path_returns_readable_output_path(
+        self, video_audio_client, fmt, monkeypatch
+    ):
+        _set_deterministic_server_clock(monkeypatch)
         resp = self._post_sync(video_audio_client, fmt, "path")
         assert resp.status_code == 200
         # path responses carry the Server-Timing metrics too.
         _assert_visual_gen_server_timing(resp.headers)
+        assert _server_timing_ms(resp.headers, "total") == 5000.0
         data = resp.json()
         assert set(data) >= {"id", "output_path"}
         # Co-located client reads the returned server-side path directly.
@@ -3067,10 +3086,7 @@ class TestAsyncVideoTransport:
         ``VideoJob.request_started`` and closes ``total`` out in a background
         task, so the stamp and the end reading must stay on one clock.
         """
-        import tensorrt_llm.serve.responses_utils as _ru
-
-        real = _ru.get_steady_clock_now_in_seconds
-        monkeypatch.setattr(_ru, "get_steady_clock_now_in_seconds", lambda: real() - 5.0)
+        _set_deterministic_server_clock(monkeypatch)
 
         resp = await async_video_client.post(
             "/v1/videos",
@@ -3089,7 +3105,7 @@ class TestAsyncVideoTransport:
 
         content = await async_video_client.get(f"/v1/videos/{video_id}/content")
         assert content.status_code == 200
-        assert _server_timing_ms(content.headers, "total") >= 5000.0
+        assert _server_timing_ms(content.headers, "total") == 5000.0
 
     @pytest.mark.asyncio
     async def test_async_file_still_returns_file_response(self, async_video_client):
