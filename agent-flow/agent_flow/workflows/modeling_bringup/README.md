@@ -190,6 +190,49 @@ you) to read when deciding whether and how to intervene.
 
 ![Human-in-the-loop operation](docs/human-in-the-loop.svg)
 
+## Running without MCP tools
+
+Some machines forbid an agent harness from registering MCP servers of its own:
+an enterprise-managed MCP config (`managed-mcp.json`) makes Claude Code abort
+when the SDK configures one, and a hardened runner may block dynamic tool
+registration outright. Because `modeling-bringup` normally hands every agent a
+set of in-process MCP tools (`append_*_progress`, `read_latest_progress`,
+`read_human_feedback`, `update_status`, `read_status`), the run fails at startup
+in those environments.
+
+Pass `--no-mcp-tools` to run without them:
+
+```bash
+modeling-bringup \
+    --task task.yaml \
+    --workspace workspace/modeling-bringup \
+    --no-mcp-tools
+```
+
+The switch is manual and applies to every agent at once, on both the
+Claude Code and Codex backends — there is no auto-detection, so a run behaves
+identically everywhere unless you ask for this mode. The workflow itself is
+unchanged: same plan-build-verify loop, same workspace files, same
+checkpoint/resume behavior. Only the transport changes. The orchestrator inlines
+the context the `read_*` tools used to return directly into each prompt, and
+each agent ends its turn by writing a small handoff file to
+`<workspace>/.turn/<role>.yaml` that the orchestrator validates and folds back
+into `progress.yaml`.
+
+Two things behave differently in this mode:
+
+- `ask_human` is unavailable, so `--no-mcp-tools` cannot be combined with
+  `--plan-human-review` or `--build-human-review`. The run aborts up front with
+  an explanatory error rather than silently dropping the human checkpoint.
+- If an agent ends a turn without a valid handoff file, the orchestrator
+  re-prompts it once and then fails the run. A crash with `HandoffError` in this
+  mode means the agent did not follow the recording protocol, not that the
+  bring-up itself failed — rerun to resume from the last checkpoint.
+
+For the protocol details and the per-role handoff schema, see
+[No-MCP mode](../agent_team/README.md#no-mcp-mode---no-mcp-tools) in the
+`agent_team` README.
+
 ## Task file
 
 The three required fields are `reference_code_path`, `checkpoint_path`, and

@@ -159,6 +159,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--feedback is absent. Off by default.",
     )
     parser.set_defaults(trigger_replan_with_feedback=False)
+    parser.add_argument(
+        "--no-mcp-tools",
+        dest="use_in_process_tools",
+        action="store_false",
+        help="Disable the workflow's in-process MCP tools for every role, on "
+        "both the claude-code and codex backends. Progress and status then "
+        "flow through the backends' built-in file tools plus orchestrator "
+        "parsing/injection: the read tools are replaced by context inlined "
+        "into each prompt, and the `append_*_progress` / `update_status` "
+        "tools by a per-turn handoff file the orchestrator reads back. "
+        "`ask_human` is unavailable in this mode, so --plan-human-review and "
+        "--build-human-review are rejected. Use this on machines where a "
+        "dynamically configured MCP server is blocked (e.g. an enterprise "
+        "managed-mcp.json lockdown). On by default (MCP tools enabled).",
+    )
+    parser.set_defaults(use_in_process_tools=True)
     return parser.parse_args(argv)
 
 
@@ -180,6 +196,7 @@ def main(argv: list[str] | None = None, *, prompts: PromptBundle | None = None) 
         acceptance_criteria=args.acceptance_criteria,
         feedback=args.feedback,
         prompts=prompts,
+        use_in_process_tools=args.use_in_process_tools,
     ) as workflow:
         workflow.run(args.task)
 
