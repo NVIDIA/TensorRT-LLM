@@ -19,9 +19,11 @@
 #include "kv_cache_manager_v2/exceptions.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -190,6 +192,14 @@ HostMem::HostMem(size_t size)
     {
         return;
     }
+    auto const initStarted = std::chrono::steady_clock::now();
+    auto const elapsedMs = [&initStarted]() -> long long
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - initStarted)
+            .count();
+    };
+    TLLM_LOG_INFO("[KVCM V2 host] allocation start: bytes=%zu, gib=%.2f, thp=%d", size,
+        static_cast<double>(size) / static_cast<double>(1ULL << 30), static_cast<int>(mUseThp));
     mAddr = hostMmap(size);
     TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
     mSize = size;
@@ -202,6 +212,10 @@ HostMem::HostMem(size_t size)
             parallelPrefault(prefaultThreads);
         }
         registerToCuda();
+        TLLM_LOG_INFO(
+            "[KVCM V2 host] allocation complete: address=%p, bytes=%zu, registered_chunks=%d, "
+            "elapsed_ms=%lld",
+            reinterpret_cast<void*>(mAddr), mSize, mNumRegisteredChunks, elapsedMs());
     }
     catch (...)
     {

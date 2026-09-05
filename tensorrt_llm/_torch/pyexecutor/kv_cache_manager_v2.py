@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import sys
+import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -1213,14 +1214,25 @@ class KVCacheManagerV2(BaseResourceManager):
 
         candidate: Optional[KVCacheManagerPy] = None
         if not has_host_cache_tier:
+            init_started = time.monotonic()
+            logger.info("[KVCM V2 init] manager construction without host tier start")
             candidate = KVCacheManagerPy(
                 config,
                 event_manager=self.event_manager,
                 cold_page_codec=create_cold_page_codec(config),
             )
+            logger.info(
+                f"[KVCM V2 init] manager construction without host tier complete: "
+                f"elapsed={time.monotonic() - init_started:.3f}s"
+            )
         else:
             init_error: Optional[Exception] = None
             local_init_status = _KVCacheManagerInitStatus.KEEP_HOST
+            init_started = time.monotonic()
+            logger.info(
+                f"[KVCM V2 init] manager construction with host tier start: "
+                f"host_quota={host_quota / (1 << 30):.2f}GiB"
+            )
             try:
                 candidate = KVCacheManagerPy(
                     config,
@@ -1228,11 +1240,20 @@ class KVCacheManagerV2(BaseResourceManager):
                     cold_page_codec=create_cold_page_codec(config),
                 )
             except Exception as error:
+                logger.warning(
+                    f"[KVCM V2 init] manager construction with host tier failed: "
+                    f"elapsed={time.monotonic() - init_started:.3f}s, error={error!r}"
+                )
                 if isinstance(error, (CuError, KVCacheOutOfMemoryError)):
                     local_init_status = _KVCacheManagerInitStatus.USE_NO_HOST
                 else:
                     init_error = error.with_traceback(None)
                     local_init_status = _KVCacheManagerInitStatus.ABORT
+            else:
+                logger.info(
+                    f"[KVCM V2 init] manager construction with host tier complete: "
+                    f"elapsed={time.monotonic() - init_started:.3f}s"
+                )
 
             init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
 

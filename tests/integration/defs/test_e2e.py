@@ -45,6 +45,29 @@ _MINIMAX_M3_EVAL_CONFIG = {
         "enable_block_reuse": False,
     },
     "max_seq_len": 4096,
+    # Diagnostic control for https://nvbugs/6656598: preserve mandatory KVCM
+    # V2 and overlap while disabling only the eager layer-boundary fusion.
+    "disable_overlap_scheduler": False,
+    "env_overrides": {
+        "TLLM_MINIMAX_M3_FORWARD_DIAGNOSTICS": "1",
+        "TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED": "1",
+    },
+    "print_iter_log": True,
+}
+
+_KIMI_K2_EVAL_DIAGNOSTIC_CONFIG = {
+    # Diagnostic control for https://nvbugs/6656598: preserve the inherited
+    # 262K context, KVCM V1, and overlap while disabling only the eager
+    # layer-boundary fusion.
+    "disable_overlap_scheduler": False,
+    "env_overrides": {
+        "TLLM_DEEPSEEKV3_FORWARD_DIAGNOSTICS": "1",
+        "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED": "1",
+    },
+    "kv_cache_config": {
+        "use_kv_cache_manager_v2": False,
+    },
+    "print_iter_log": True,
 }
 
 
@@ -1651,6 +1674,12 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
+# Both parameterizations require a 16-rank model world (tp_size * pp_size).
+# This marker checks the external MPI world when present, so a 4-node x 4-GPU run passes even though
+# each node exposes only 4 devices. With MPI world size 1, the fixture checks the local device count
+# instead, allowing a 16-GPU node to spawn the workers. skip_less_device(4) remains a separate
+# per-node guard.
+@pytest.mark.skip_less_mpi_world_size(16)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
@@ -1668,7 +1697,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
     pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
+                 _KIMI_K2_EVAL_DIAGNOSTIC_CONFIG,
                  marks=skip_pre_blackwell,
                  id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
@@ -1705,7 +1734,6 @@ def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
         run_cmd.append(f"--config={config_path}")
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
-
     try:
         # run the command with trtllm-llmapi-launch pytest wrapper
         output = subprocess.check_output(run_cmd,
