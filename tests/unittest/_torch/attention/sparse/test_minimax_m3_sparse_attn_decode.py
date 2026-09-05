@@ -36,24 +36,6 @@ skip_not_sm100 = pytest.mark.skipif(
 )
 
 
-def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
-    """Flatten a block table into the per-request page ids fmha_sm100 consumes.
-
-    build_kv_page_indices reads those ids out of a token-level slot map, so this
-    rebuilds the map the block table implies and lets the production helper do
-    the flattening.
-    """
-    batch, max_pages = block_table.shape
-    intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
-    req_to_token = (block_table.cpu().to(torch.int32) * PAGE_SIZE).unsqueeze(2) + intra
-    return build_kv_page_indices(
-        req_to_token.reshape(batch, max_pages * PAGE_SIZE),
-        torch.arange(batch, dtype=torch.int32),
-        kv_lens_cpu,
-        PAGE_SIZE,
-    )
-
-
 def _reference_sparse_decode(
     q: torch.Tensor,
     k_paged: torch.Tensor,
@@ -397,7 +379,7 @@ def test_sparse_decode_matches_msa_kernel():
 
     qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
     kv_lens_cpu = torch.tensor(seq_lens, dtype=torch.int32)
-    kv_indices = _flat_page_table(block_table, kv_lens_cpu).cuda()
+    kv_indices = build_kv_page_indices(block_table.cpu(), kv_lens_cpu, PAGE_SIZE).cuda()
     msa_out = torch.empty_like(q)
     run_msa_sparse_gqa(
         q.to(torch.float8_e4m3fn),
