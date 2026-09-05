@@ -656,7 +656,13 @@ def test_flag_unset_preserves_legacy_backend_env_precedence(monkeypatch):
         ("UCX", "CPP", "UCX", False),
     ],
 )
-def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_backend, expected):
+def test_cpp_capability_is_config_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    runtime: str | None,
+    nixl_backend: str | None,
+    expected: bool,
+) -> None:
     if nixl_backend is not None:
         monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, nixl_backend)
     config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
@@ -680,15 +686,17 @@ def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_bac
 
     transceiver = BindKvCacheTransceiver(Mock(), dist, kv_cache_manager, Mock(), config)
 
+    assert transceiver.consumes_transfer_buffer
     assert transceiver.supports_inflight_request_cancellation() is expected
     constructor.assert_called_once()
 
 
-def test_python_transceiver_capability_defaults_to_unsupported():
+def test_python_transceiver_capability_defaults_to_unsupported() -> None:
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
 
+    assert not transceiver.consumes_transfer_buffer
     assert not transceiver.supports_inflight_request_cancellation()
     assert not transceiver.has_poisoned_transfer_buffer()
 

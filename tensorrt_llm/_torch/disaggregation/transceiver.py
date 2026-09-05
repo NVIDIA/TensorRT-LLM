@@ -79,6 +79,10 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    @property
+    def consumes_transfer_buffer(self) -> bool:
+        return False
+
     def __init__(
         self,
         mapping: Mapping,
