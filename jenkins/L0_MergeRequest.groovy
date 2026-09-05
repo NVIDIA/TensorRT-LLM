@@ -154,6 +154,10 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def MAINTENANCE_CONFIG_PATH = "jenkins/config/maintenance_stages.txt"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -241,6 +245,7 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
+    (MAINTENANCE_ENTRIES): [],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
@@ -437,6 +442,80 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
 }
 
+def parseMaintenanceConfig(String content, String source)
+{
+    def entries = [:]
+    content.readLines().eachWithIndex { rawLine, index ->
+        def line = rawLine.trim()
+        if (!line || line.startsWith('#')) {
+            return
+        }
+        def fields = line.split(/\|/, 2).collect { field -> field.trim() }
+        if (fields.size() != 2 || !fields[0] || !fields[1]) {
+            error "Invalid maintenance entry at ${source}:${index + 1}; " +
+                  "expected '<stage-or-pattern> | <reason>'."
+        }
+        if (entries.containsKey(fields[0])) {
+            echo "WARNING: Duplicate maintenance pattern '${fields[0]}' at " +
+                 "${source}:${index + 1}; " +
+                 "the first entry is used."
+        } else {
+            entries[fields[0]] = [pattern: fields[0], reason: fields[1]]
+        }
+    }
+    return entries
+}
+
+def mergeMaintenanceConfig(String totContent, String currentContent, String diff)
+{
+    def effective = parseMaintenanceConfig(totContent, "target TOT")
+    def current = parseMaintenanceConfig(currentContent, "PR file")
+    def additions = parseMaintenanceConfig(diff.readLines().findAll { line ->
+        line.startsWith('+') && !line.startsWith('+++')
+    }.collect { line -> line.substring(1) }.join('\n'), "PR additions")
+    def deletions = parseMaintenanceConfig(diff.readLines().findAll { line ->
+        line.startsWith('-') && !line.startsWith('---')
+    }.collect { line -> line.substring(1) }.join('\n'), "PR deletions")
+
+    (deletions.keySet() - additions.keySet()).each { pattern -> effective.remove(pattern) }
+    additions.keySet().each { pattern ->
+        if (!current.containsKey(pattern)) {
+            error "Maintenance pattern '${pattern}' was added in the diff but is missing from the PR file."
+        }
+        effective[pattern] = current[pattern]
+    }
+    return effective.values().toList()
+}
+
+def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputFile)
+{
+    if (targetCommit) {
+        try {
+            sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/" +
+               "${targetCommit}/${sourcePath} -O ${outputFile}"
+            return true
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to checkout ${sourcePath} by public target commit. Error: ${e.toString()}"
+        }
+    }
+
+    try {
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, sourcePath, ".")
+        }
+        def sourceFileName = sourcePath.tokenize('/').last()
+        sh "mv ${sourceFileName} ${outputFile}"
+        return true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to checkout ${sourcePath} from internal GitLab repository. Error: ${e.toString()}"
+    }
+    return false
+}
+
 def mergeWaiveList(pipeline, globalVars)
 {
     // Get current waive list
@@ -450,7 +529,6 @@ def mergeWaiveList(pipeline, globalVars)
     echo "Target branch: ${targetBranch}"
 
     def targetBranchTOTCommit = ""
-    def isGetTOTWaiveList = false
     try {
         withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PASSWORD')]) {
             def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
@@ -462,34 +540,65 @@ def mergeWaiveList(pipeline, globalVars)
             targetBranchTOTCommit = json[0].sha
         }
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
-        isGetTOTWaiveList = true
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "Failed to checkout TOT waive list from public GitHub repository. Error: ${e.toString()}"
+        echo "Failed to resolve the target branch TOT commit from public GitHub. Error: ${e.toString()}"
     }
 
-    if (!isGetTOTWaiveList) {
-        try {
-            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, "tests/integration/test_lists/waives.txt", ".")
-            }
-            sh "mv waives.txt waives_TOT_.txt"
-            isGetTOTWaiveList = true
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            echo "Failed to checkout TOT waive list from internal GitLab repository. Error: ${e.toString()}"
-        }
-    }
-
+    def waiveTot = "waives_TOT_${targetBranchTOTCommit}.txt"
+    def isGetTOTWaiveList = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, "tests/integration/test_lists/waives.txt", waiveTot)
     if (!isGetTOTWaiveList) {
         catchError(
             buildResult: 'SUCCESS',
             stageResult: 'UNSTABLE') {
             error "Failed to get TOT waive list. Fallback to use the default test waive list from the PR."
         }
+    }
+
+    def maintenanceTot = "maintenance_stages_TOT_${targetBranchTOTCommit}.txt"
+    def maintenanceSource = "${LLM_ROOT}/${MAINTENANCE_CONFIG_PATH}"
+    def isGetTOTMaintenanceConfig = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, MAINTENANCE_CONFIG_PATH, maintenanceTot)
+    def maintenanceCurrent = fileExists(maintenanceSource) ? readFile(maintenanceSource) : ""
+    if (!isGetTOTMaintenanceConfig) {
+        if (!fileExists(maintenanceSource)) {
+            error "Failed to get maintenance config from the target branch or PR checkout."
+        }
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Failed to get target maintenance config. " +
+                  "Fallback to the PR checkout, which may not reflect the latest target branch."
+        }
+        globalVars[MAINTENANCE_ENTRIES] = parseMaintenanceConfig(
+            maintenanceCurrent, "PR fallback").values().toList()
+    } else {
+        def maintenanceDiff = ""
+        try {
+            def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
+                pipeline, globalVars, MAINTENANCE_CONFIG_PATH)
+            if (fetchedMaintenanceDiff == null) {
+                echo "WARNING: Maintenance config diff is unavailable. Using target TOT entries."
+            } else {
+                maintenanceDiff = fetchedMaintenanceDiff
+            }
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "WARNING: Failed to get maintenance config diff. " +
+                 "Using target TOT entries. Error: ${e.toString()}"
+        }
+        if (!fileExists(maintenanceSource) && maintenanceDiff) {
+            error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
+        }
+        globalVars[MAINTENANCE_ENTRIES] = mergeMaintenanceConfig(
+            readFile(maintenanceTot), maintenanceCurrent, maintenanceDiff)
+    }
+    echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
+
+    if (!isGetTOTWaiveList) {
         return
     }
 
@@ -504,7 +613,7 @@ def mergeWaiveList(pipeline, globalVars)
         sh """
             python3 mergeWaiveList.py \
             --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
-            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+            --latest-waive-list=${waiveTot} \
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
