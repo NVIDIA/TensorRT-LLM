@@ -3,18 +3,18 @@
 set -ex
 
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-CUDA_VER="13.2" # 13.2.1
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
+CUDA_VER="13.4" # image reports CUDA_VERSION=13.4.1.012
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.22.0.52-1"
-NCCL_VER="2.30.4-1+cuda13.2"
-CUBLAS_VER="13.4.1.2-1"
+CUDNN_VER="9.25.0.28-1" # TODO(dlfw-26.08): exact internal build, not yet on the public CUDA apt repo (public max is 9.25.0.15-1)
+NCCL_VER="2.30.7-1+cuda13.3"
+CUBLAS_VER="13.7.0.27-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.2.78-1"
-CUDA_RUNTIME="13.2.75-1"
-CUDA_DRIVER_VERSION="595.58.03-1.el8"
+NVRTC_VER="13.4.59-1"
+CUDA_RUNTIME="13.4.49-1" # TODO(dlfw-26.08): rockylinux only; the public cuda-toolkit-13-4-* rpms are not released yet
+CUDA_DRIVER_VERSION="615.65.02-1.el8" # TODO(dlfw-26.08): rockylinux only; taken from the image's CUDA_DRIVER_VERSION, re-check the rpm release suffix once cuda-compat-13-4 is published
 
 for i in "$@"; do
     case $i in
@@ -48,32 +48,40 @@ install_ubuntu_requirements() {
     rm cuda-keyring_1.1-1_all.deb
 
     apt-get update
-    if [[ $(apt list --installed | grep libcudnn9) ]]; then
-      apt-get remove --purge -y libcudnn9*
-    fi
-    if [[ $(apt list --installed | grep libnccl) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libnccl*
-    fi
-    if [[ $(apt list --installed | grep libcublas) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages libcublas*
-    fi
-    if [[ $(apt list --installed | grep cuda-nvrtc-dev) ]]; then
-      apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev*
-    fi
 
     CUDA_MAJOR_VER=$(echo $CUDA_VER | cut -d. -f1)
     CUBLAS_MAJOR_VER=$(echo $CUBLAS_VER | cut -d. -f1)
     NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
-    apt-get install -y --no-install-recommends \
-        libcudnn9-cuda-13=${CUDNN_VER} \
-        libcudnn9-dev-cuda-13=${CUDNN_VER} \
-        libcudnn9-headers-cuda-13=${CUDNN_VER} \
-        libnccl2=${NCCL_VER} \
-        libnccl-dev=${NCCL_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
-        libcublas${CUBLAS_MAJOR_VER}-dev-cuda-${CUDA_MAJOR_VER}=${CUBLAS_VER} \
-        cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER}
+    # Skip remove+reinstall for any library already at the target version (e.g. pre-installed
+    # by the base image at a version not yet published to the public CUDA apt repo).
+    installed_pkg_version() {
+        dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true
+    }
+
+    PKGS_TO_INSTALL=()
+    if [[ "$(installed_pkg_version libcudnn9-cuda-13)" != "${CUDNN_VER}" ]]; then
+        apt-get remove --purge -y libcudnn9* || true
+        PKGS_TO_INSTALL+=(libcudnn9-cuda-13=${CUDNN_VER} libcudnn9-dev-cuda-13=${CUDNN_VER} libcudnn9-headers-cuda-13=${CUDNN_VER})
+    fi
+    if [[ "$(installed_pkg_version libnccl2)" != "${NCCL_VER}" ]]; then
+        apt-get remove --purge -y --allow-change-held-packages libnccl* || true
+        PKGS_TO_INSTALL+=(libnccl2=${NCCL_VER} libnccl-dev=${NCCL_VER})
+    fi
+    # NOTE: package name is libcublas-<CUDA_MAJOR>-<CUDA_MINOR> (matches cuda-nvrtc-dev's
+    # naming), not libcublas<CUBLAS_MAJOR>-cuda-<CUDA_MAJOR> (that's a separate, older package).
+    if [[ "$(installed_pkg_version libcublas-${NVRTC_CUDA_VERSION})" != "${CUBLAS_VER}" ]]; then
+        apt-get remove --purge -y --allow-change-held-packages libcublas* || true
+        PKGS_TO_INSTALL+=(libcublas-${NVRTC_CUDA_VERSION}=${CUBLAS_VER} libcublas-dev-${NVRTC_CUDA_VERSION}=${CUBLAS_VER})
+    fi
+    if [[ "$(installed_pkg_version cuda-nvrtc-dev-${NVRTC_CUDA_VERSION})" != "${NVRTC_VER}" ]]; then
+        apt-get remove --purge -y --allow-change-held-packages cuda-nvrtc-dev* || true
+        PKGS_TO_INSTALL+=(cuda-nvrtc-dev-${NVRTC_CUDA_VERSION}=${NVRTC_VER})
+    fi
+
+    if [ ${#PKGS_TO_INSTALL[@]} -gt 0 ]; then
+        apt-get install -y --no-install-recommends "${PKGS_TO_INSTALL[@]}"
+    fi
 
     apt-get clean
     rm -rf /var/lib/apt/lists/*

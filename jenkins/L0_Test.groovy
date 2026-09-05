@@ -71,7 +71,7 @@ ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.08-py3"
 
 MODEL_EXPRESS_VERSION = "0.4.1"
 MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
@@ -3347,6 +3347,9 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Gets the HOST_NODE_NAME from the current environment.
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
+ * The name must stay distinct per pod: getStartingPortForHost() hands out a
+ * private port section per name.
+ *
  * @return The host node name
  */
 def getHostNodeName() {
@@ -3994,7 +3997,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
             // --validate --parity: after --l0/--qa generate the collectable lists, assert every
             // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.08 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -5380,7 +5383,25 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        // Open MPI 5 fails a singleton MPI_Comm_spawn -- one per MpiPoolSession
+        // worker -- once the hostname PMIx is handed reaches 31 characters, and the
+        // pod name is 63. PMIX_HOSTNAME replaces only the name PMIx uses, so the pod
+        // keeps its own for logging and for port sectioning in getHostNodeName().
+        // Not inside runLLMTestlistOnPlatformImpl: the SLURM path runs that too, on
+        // the compute node, where one name shared by every node would break locality.
+        // PRRTE also refuses to fork its DVM as root without the ALLOW_RUN_AS_ROOT
+        // pair (Open MPI 4 only checked that in mpirun). An outer `mpirun
+        // --allow-run-as-root` does not cover the DVM a nested MPI_Comm_spawn
+        // starts, so test_mpi_session's spawn dies with MPI_ERR_UNKNOWN.
+        withEnv([
+            "OMPI_ALLOW_RUN_AS_ROOT=1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PRTE_ALLOW_RUN_AS_ROOT=1",
+            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+            "PMIX_HOSTNAME=mpi-node0",
+        ]) {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+        }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -6831,10 +6852,25 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             echo "###### Extra PyTorch CUDA 13.2 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
+                            // TODO(dlfw-26.08): bump together with requirements.txt's torch/triton pins once
+                            // public torch>=2.13.0 and a matching public triton are released.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
-                        def libEnv = []
+                        // A stock image, so nothing here went through Dockerfile.multi or
+                        // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
+                        // redone by hand, or checkPipInstall's quickstart hangs in
+                        // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
+                        // root without these (Open MPI 4 only checked that in mpirun), and
+                        // PMIX_HOSTNAME is the 31-character limit -- see
+                        // runLLMTestlistOnPlatform.
+                        def libEnv = [
+                            "OMPI_ALLOW_RUN_AS_ROOT=1",
+                            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PMIX_HOSTNAME=mpi-node0",
+                        ]
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {
                                 trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)

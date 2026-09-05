@@ -370,8 +370,10 @@ def _worker_environment(gpu_ids: tuple[str, ...], transfer_log_dir: Path) -> dic
             "MX_TRANSFER_LOG_DIR": str(transfer_log_dir),
             # NIXL's wheel bundles UCX. Keep OpenMPI's UCX-capable components
             # from loading the container UCX stack into the same process.
+            # Exclusion rather than a component name for osc: pt2pt is gone in
+            # Open MPI 5, and naming a survivor would break the same way again.
             "OMPI_MCA_pml": "ob1",
-            "OMPI_MCA_osc": "pt2pt",
+            "OMPI_MCA_osc": "^ucx",
             "OMPI_MCA_btl": "self,vader,tcp",
             "OMPI_MCA_coll": "^hcoll,ucc",
             "PYTHONUNBUFFERED": "1",

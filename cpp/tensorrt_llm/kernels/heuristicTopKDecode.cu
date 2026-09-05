@@ -170,24 +170,39 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // Explicit instantiations — 6 (dtype × K) combos. Launchers dispatch on
 // runtime topK via switch, so all 6 must be available at link time.
 // Trailing `int` is the compressRatio parameter (1 = V3.2, 4 = V4 indexer).
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<512>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<1024>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<2048>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
+//
+// The parameter list must repeat the kernel definition's spelling verbatim —
+// both `__restrict__` and any top-level `const` on a by-value parameter.
+// cudafe1 rewrites every parameter into a reference when it emits
+// `__wrapper__device_stub_*`, so qualifiers that overload resolution would
+// normally ignore become part of the signature it has to match. With a Clang
+// host compiler (`-ccbin=clang++`) a mismatch surfaces as "no function
+// template matches function template specialization". The scalars below are
+// deliberately unqualified because the definition declares them that way.
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernel<512>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<1024>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<2048>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
 
 // Dispatch on topK at runtime — each TopK-instantiation gets its own smem
 // size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn pointer
@@ -199,6 +214,51 @@ template __global__ void heuristicTopKMultiRowKernel<2048>(
 // (int4 of 16-bit). In TRT-LLM the logits stride is always a multiple of
 // tokens_per_block (≥64), so the alignment check is never hit at runtime
 // — it's an assert against caller misuse.
+// Hoisted out of `launchHeuristicTopKDecodeImpl` (was a C++20 templated
+// lambda `[&]<int TopK>()`) for the same reason as
+// `detail::launchHeuristicTopKImpl` in heuristic_topk.cuh: taking the address
+// of `heuristicTopKMultiRowKernel<TopK>` / `heuristicTopKMultiRowKernelDtype
+// <InputT, TopK>` from inside a templated capturing lambda confuses nvcc's
+// cudafe1 stub generator, surfacing as an "explicit specialization ... after
+// instantiation" build error. A regular function template avoids the quirk
+// and stays in C++17 (no templated-lambda extension warning).
+template <typename InputT, int TopK>
+void launchHeuristicTopKMultiRowImpl(InputT const* logits, int const* seqLens, int const* preIdx, int* outIndices,
+    InputT* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
+    int compressRatio, cudaStream_t stream)
+{
+    // bf16/fp16 path also uses fp32 keys[] in smem (down-conversion deferred).
+    using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
+    size_t const smemSize = sizeof(SmemT);
+
+    auto kfn = []()
+    {
+        if constexpr (std::is_same_v<InputT, float>)
+            return heuristicTopKMultiRowKernel<TopK>;
+        else
+            return heuristicTopKMultiRowKernelDtype<InputT, TopK>;
+    }();
+
+    if (smemSize > 48u * 1024u)
+    {
+        cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
+    }
+
+    cudaLaunchConfig_t config;
+    config.gridDim = numRows;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = smemSize;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
+        preIdxStride, preIdxCount, compressRatio);
+}
+
 template <typename InputT>
 void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     InputT* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
@@ -211,45 +271,20 @@ void launchHeuristicTopKDecodeImpl(InputT const* logits, int const* seqLens, int
     TLLM_CHECK_WITH_INFO(stride0 % kAlign == 0 || numRows <= 1,
         "heuristicTopKDecode requires logits stride0 divisible by %d for multi-row launch", kAlign);
 
-    auto launchOne = [&]<int TopK>()
-    {
-        // bf16/fp16 path also uses fp32 keys[] in smem (down-conversion deferred).
-        using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
-        size_t const smemSize = sizeof(SmemT);
-
-        auto kfn = []()
-        {
-            if constexpr (std::is_same_v<InputT, float>)
-                return heuristicTopKMultiRowKernel<TopK>;
-            else
-                return heuristicTopKMultiRowKernelDtype<InputT, TopK>;
-        }();
-
-        if (smemSize > 48u * 1024u)
-        {
-            cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-        }
-
-        cudaLaunchConfig_t config;
-        config.gridDim = numRows;
-        config.blockDim = BLOCK_SIZE;
-        config.dynamicSmemBytes = smemSize;
-        config.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-        config.numAttrs = 1;
-        config.attrs = attrs;
-
-        cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
-            preIdxStride, preIdxCount, compressRatio);
-    };
-
     switch (topK)
     {
-    case 512: launchOne.template operator()<512>(); break;
-    case 1024: launchOne.template operator()<1024>(); break;
-    case 2048: launchOne.template operator()<2048>(); break;
+    case 512:
+        launchHeuristicTopKMultiRowImpl<InputT, 512>(logits, seqLens, preIdx, outIndices, scratchValues, stride0,
+            next_n, topK, preIdxStride, preIdxCount, numRows, compressRatio, stream);
+        break;
+    case 1024:
+        launchHeuristicTopKMultiRowImpl<InputT, 1024>(logits, seqLens, preIdx, outIndices, scratchValues, stride0,
+            next_n, topK, preIdxStride, preIdxCount, numRows, compressRatio, stream);
+        break;
+    case 2048:
+        launchHeuristicTopKMultiRowImpl<InputT, 2048>(logits, seqLens, preIdx, outIndices, scratchValues, stride0,
+            next_n, topK, preIdxStride, preIdxCount, numRows, compressRatio, stream);
+        break;
     default: TLLM_THROW("heuristicTopKDecode: topK validated above; unreachable");
     }
 }
