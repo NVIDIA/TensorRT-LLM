@@ -7695,6 +7695,8 @@ class PyExecutor:
         """Start async KV sends for finished context-only disagg requests."""
         if not self.kv_cache_transceiver:
             return
+        bridge_enabled = (getattr(self.kv_cache_transceiver,
+                                  "_fp4_mla_bridge_enabled", False) is True)
         # Do not send more chunks after an in-flight cancellation.
         cancel_pending_ids = set(getattr(self, "canceled_req_ids", ()))
         for req in scheduled_requests:
@@ -7721,6 +7723,19 @@ class PyExecutor:
 
                     # Send the monolithic slice or final pipelined chunk.
                     self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    # Bridge validation can safely reject before creating a
+                    # transfer session. Release the matching async-manager
+                    # claim immediately; there is no physical accessor whose
+                    # retirement must be polled.
+                    bridge_rejected = (
+                        bridge_enabled and getattr(req, "state", None)
+                        == LlmRequestState.DISAGG_TRANS_ERROR and
+                        not self.kv_cache_transceiver.has_inflight_transfer(req)
+                    )
+                    if bridge_rejected:
+                        self._end_transfer_and_maybe_terminate(req)
+                        continue
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
