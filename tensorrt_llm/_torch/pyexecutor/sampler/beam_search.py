@@ -45,7 +45,7 @@ from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
 from .ops.flashinfer import radix_topk_op
 from .ops.vanilla import StrategyMetadata
-from .sampler_common import _get_beam_width_in, _unwrap_singleton, int_tensor
+from .sampler_common import _get_beam_width_in, int_tensor
 from .sampler_features import _SideStreamCopier
 
 BEAM_SEARCH_PAD_TOKEN = -1
@@ -1138,10 +1138,7 @@ def _prepare_beam_history_cba(
     active_width = _get_beam_width_in(request)
     return_log_probs = request.py_return_log_probs
 
-    length_penalty = (
-        _unwrap_singleton(cast(Optional[list[float]], request.sampling_config.length_penalty))
-        or 0.0
-    )
+    length_penalty = request.sampling_config.length_penalty or 0.0
 
     def _builder() -> BeamHistory | None:
         if not cba_group.should_stop[row].item():

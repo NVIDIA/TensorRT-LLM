@@ -29,9 +29,11 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
-    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
+    load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -277,6 +279,10 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
 
+    # locality domain execution policy (controls partitioned linear/MoE execution)
+    locality_domain_policy: LocalityDomainPolicy = field(
+        default_factory=LocalityDomainPolicy)
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
@@ -313,6 +319,14 @@ class ModelConfig(Generic[TConfig]):
         super().__setattr__(key, value)
 
     def __post_init__(self):
+        if self.pretrained_config and self.sparse_attention_config:
+            # Sparse geometry can come from the checkpoint. Resolve it once so
+            # cache allocation, CUDA-graph routing, and model layers all read
+            # the same concrete values.
+            self.sparse_attention_config = (
+                self.sparse_attention_config._resolve_checkpoint_defaults(
+                    self.pretrained_config))
+
         if self.pretrained_config:
             self.is_encoder_decoder = self.is_encoder_decoder_model(
                 self.pretrained_config)
@@ -350,6 +364,8 @@ class ModelConfig(Generic[TConfig]):
             self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["locality_domain_policy"] = self.locality_domain_policy
 
     def is_moe_max_num_tokens_default(self) -> bool:
         """Whether ``moe_max_num_tokens`` was derived rather than configured.
@@ -1524,14 +1540,14 @@ class ModelConfig(Generic[TConfig]):
 
         Pure model property: independent of which KV cache manager will run.
         For non-hybrid models this equals num_hidden_layers. For hybrid Mamba
-        models (Nemotron-hybrid, Qwen3-hybrid) it returns only the attention
+        models (Nemotron-hybrid, Qwen3-hybrid, Qwen4-Exp) it returns only the attention
         count derived from the layer pattern; mamba layers are reported by
         ``get_num_mamba_layers``.
         """
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("*")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
         if is_kimi_linear(cfg):
             return get_kimi_linear_num_attention_layers(cfg)
@@ -1542,7 +1558,7 @@ class ModelConfig(Generic[TConfig]):
         cfg = self.pretrained_config
         if is_nemotron_hybrid(cfg):
             return cfg.hybrid_override_pattern.count("M")
-        if is_qwen3_hybrid(cfg):
+        if is_qwen3_hybrid(cfg) or is_qwen4_exp(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         if is_kimi_linear(cfg):

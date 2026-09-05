@@ -19,6 +19,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as torch_dist
@@ -453,7 +454,6 @@ def test_async_encoder_step_lifecycle():
         ready_event=ready_event,
     )
     future = Mock()
-    future.done.side_effect = [False, True]
     future.result.return_value = result
     executor = _make_async_encoder_executor(future)
     active_request = types.SimpleNamespace(
@@ -473,10 +473,13 @@ def test_async_encoder_step_lifecycle():
         )
     )
 
+    # The launch is joined inline (https://nvbugs/6683840); publication stays
+    # asynchronous, waiting on ready_event rather than the future.
     executor._submit_encoder_step(requests)
-    executor._poll_encoder_steps()
 
-    future.result.assert_not_called()
+    future.result.assert_called_once_with()
+    future.done.assert_not_called()
+    ready_event.query.assert_not_called()
     executor._publish_encoder_step.assert_not_called()
     assert executor.inflight_req_ids.ids == {11, 12}
     assert len(executor.pending_encoder_steps) == 1
@@ -2159,8 +2162,9 @@ def test_generic_disagg_adp_mixed_rank_states_stay_queueable():
     assert rank_batch_sizes == [1, 1]
 
     for stub, batch_size in zip((busy_rank, terminal_rank), rank_batch_sizes, strict=True):
-        stub.dist.tp_allgather.side_effect = None
-        stub.dist.tp_allgather.return_value = rank_batch_sizes
+        stub.dist.tp_allgather_int64 = Mock(
+            return_value=np.array([[size] for size in rank_batch_sizes])
+        )
         can_queue, can_queue_this_rank = PyExecutor._can_queue(
             stub, types.SimpleNamespace(batch_size=batch_size)
         )
@@ -2304,8 +2308,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     first_dummy = stub._pending_adp_dummy_request
     assert first_dummy is not None
 
-    stub.dist.tp_allgather.side_effect = None
-    stub.dist.tp_allgather.return_value = [1, 0]
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [0]]))
     can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
     assert can_queue is False
     PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
@@ -2314,7 +2317,7 @@ def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
     spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
 
-    stub.dist.tp_allgather.return_value = [1, 1]
+    stub.dist.tp_allgather_int64 = Mock(return_value=np.array([[1], [1]]))
     _run_pad(stub)
     second_dummy = stub._pending_adp_dummy_request
     assert second_dummy is not None
@@ -3256,8 +3259,8 @@ class TestAdpBalanceExcludesPadDummies:
         """per_rank: list of (num_ctx, num_gen, num_real) as allgathered."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock()
-        executor.dist.tp_allgather = Mock(
-            return_value=[[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank]
+        executor.dist.tp_allgather_int64 = Mock(
+            return_value=np.array([[ctx, gen, ctx + gen, real] for ctx, gen, real in per_rank])
         )
         executor.max_batch_size = 64
         executor.attention_dp_enable_balance = True
@@ -3326,7 +3329,7 @@ class TestAdpBalanceExcludesPadDummies:
             ],
         )
 
-        gathered = executor.dist.tp_allgather.call_args[0][0]
+        gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
 

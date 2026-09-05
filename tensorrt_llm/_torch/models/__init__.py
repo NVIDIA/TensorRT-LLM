@@ -84,6 +84,8 @@ __all__ = [
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeVLModel",
     "Qwen3_5VLModel",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
     "QwenImageBenchModel",
     "SeedOssForCausalLM",
     "SiglipVisionModel",

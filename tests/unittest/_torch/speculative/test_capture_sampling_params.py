@@ -68,9 +68,9 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             sampling_config = requests[0].sampling_config
             # Sampling params round-trip through a C++ binding as float32, so
             # compare with tolerance rather than exact equality.
-            self.assertAlmostEqual(sampling_config.temperature[0], CAPTURE_TEMPERATURE, places=6)
-            self.assertEqual(sampling_config.top_k, [CAPTURE_TOP_K])
-            self.assertAlmostEqual(sampling_config.top_p[0], CAPTURE_TOP_P, places=6)
+            self.assertAlmostEqual(sampling_config.temperature, CAPTURE_TEMPERATURE, places=6)
+            self.assertEqual(sampling_config.top_k, CAPTURE_TOP_K)
+            self.assertAlmostEqual(sampling_config.top_p, CAPTURE_TOP_P, places=6)
         finally:
             kv_cache_manager.shutdown()
 
@@ -90,9 +90,9 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
 def _request(temperature=None, top_k=None, top_p=None, slot=0):
     return types.SimpleNamespace(
         sampling_config=types.SimpleNamespace(
-            temperature=[temperature] if temperature is not None else None,
-            top_k=[top_k] if top_k is not None else None,
-            top_p=[top_p] if top_p is not None else None,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
