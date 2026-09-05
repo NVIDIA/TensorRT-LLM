@@ -22,6 +22,16 @@ from typing import Any, Mapping, Optional, Protocol
 # ``request.conversation_params`` only when the body omits it. Routers then read
 # ``conversation_params.conversation_id`` to keep later turns of the same
 # conversation on the same backend when sticky conversation routing is enabled.
+#
+# This module implements only the base "body > header" resolution (precedence
+# steps 3 and 4 below). The disagg sub-agent parent-session override
+# (``conversation_affinity_header_for_subagents``) is layered on TOP of this at
+# the disagg serve edge -- see ``OpenAIDisaggServer._extract_conversation_id``
+# for the full precedence:
+#   1. [future TODO] a sub-agent parent-affinity id from the request BODY.
+#   2. the configured sub-agent parent-session HEADER.
+#   3. ``conversation_params.conversation_id`` from the request BODY.
+#   4. a conversation-id HEADER (below).
 CONVERSATION_ID_HEADERS = (
     "x-session-id",
     "x-correlation-id",
@@ -39,10 +49,35 @@ def get_request_conversation_id(request: RequestWithConversationParams) -> Optio
     return None if conversation_params is None else conversation_params.conversation_id
 
 
-def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:
+def extract_subagent_parent_id(
+    headers: Optional[Mapping[str, str]],
+    subagent_affinity_header: Optional[str],
+) -> Optional[str]:
+    """Return the sub-agent parent-session header value, stripped, or None.
+
+    When a deployment configures ``conversation_affinity_header_for_subagents``
+    (e.g. the Dynamo header ``X-Dynamo-Parent-Session-ID`` that an agent gateway
+    attaches to every sub-agent request but NOT to a main-agent request), this
+    returns that header's value -- the id a sub-agent should co-locate on. A
+    main-agent request lacks the header and yields None.
+    """
+    if not subagent_affinity_header or headers is None:
+        return None
+    lower_headers = {str(key).lower(): value for key, value in headers.items()}
+    parent_id = lower_headers.get(str(subagent_affinity_header).strip().lower())
+    if parent_id is None:
+        return None
+    parent_id = str(parent_id).strip()
+    return parent_id or None
+
+
+def extract_conversation_id_from_headers(
+    headers: Optional[Mapping[str, str]],
+) -> Optional[str]:
     if headers is None:
         return None
     lower_headers = {str(key).lower(): value for key, value in headers.items()}
+
     for header_name in CONVERSATION_ID_HEADERS:
         conversation_id = lower_headers.get(header_name)
         if conversation_id is None:
@@ -59,7 +94,11 @@ def resolve_request_conversation_id(
 ) -> Optional[str]:
     """Return conversation_params.conversation_id populated at the serve edge.
 
-    Body ``conversation_params.conversation_id`` takes precedence over headers.
+    Base "body > header" resolution: body
+    ``conversation_params.conversation_id`` takes precedence over the
+    conversation-id headers, which are consulted only when the body omits it.
+    The disagg sub-agent parent-session override is applied on top of this by
+    ``OpenAIDisaggServer._extract_conversation_id``; see the module docstring.
     """
     conversation_params = request.conversation_params
     if conversation_params is not None:

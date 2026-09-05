@@ -174,8 +174,13 @@ class ConversationManager:
         if conversation_id is None:
             return
 
-        state = self._conversation_states[conversation_id]
-        if state.current_request_id != request_id:
+        # Use .get() (like finish_request): a concurrent request sharing this
+        # conversation_id may have registered as current and then popped the
+        # state (finished/cancelled with no pending drop handles) before this
+        # one reaches here. Sub-agent ctx affinity makes concurrent same-id
+        # siblings the norm, so index the state defensively rather than raising.
+        state = self._conversation_states.get(conversation_id)
+        if state is None or state.current_request_id != request_id:
             return
 
         drop_handle = kv_cache.plan_committed_block_drop()

@@ -139,6 +139,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 if hooks:
                     hooks.on_ctx_dispatch(request)
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
+                self._apply_ctx_subagent_affinity(ctx_req)
                 # ctx generator is empty
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
@@ -208,6 +209,36 @@ class OpenAIDisaggregatedService(OpenAIService):
             }
         )
         return ctx_request
+
+    @staticmethod
+    def _apply_ctx_subagent_affinity(ctx_req: UCompletionRequest) -> None:
+        """Re-pin the CONTEXT request to the sub-agent's parent id (context scope).
+
+        The frontend (``_extract_conversation_id`` with
+        ``subagent_affinity_scope == "context"``) stashes the parent-session id
+        in the server-private ``conversation_params.subagent_ctx_affinity_id``.
+        Here we swap it into ``conversation_id`` ON A COPY carried only by the
+        ctx request, so ctx routing / KV reuse pins to the parent while the gen
+        request (built from the untouched original request) keeps the
+        sub-agent's own id and load-balances. Applied in both the context-first
+        and generation-first schedule paths, before ctx-router selection.
+
+        TODO(TRTLLM-16022): with the CTX worker's ConversationManager on the V2
+        ``per_conversation`` reuse policy, pinning every sibling to the parent
+        conversation_id makes it see concurrent siblings as overlapping turns --
+        it keeps only one active turn and logs a warning for the rest, so those
+        sibling contexts drop out of per-conversation drop-plan tracking (they
+        still share the parent-prefix KV, which is the reuse we want). Accepted
+        tradeoff for now; the clean fix is to represent the instance/ADP
+        affinity key separately from the conversation-bookkeeping id so siblings
+        co-locate without colliding. See the matching TODO in
+        ``OpenAIDisaggServer._extract_conversation_id``.
+        """
+        cp = ctx_req.conversation_params
+        if cp is not None and cp.subagent_ctx_affinity_id:
+            ctx_req.conversation_params = cp.model_copy(
+                update={"conversation_id": cp.subagent_ctx_affinity_id}
+            )
 
     def _get_gen_request(
         self,
@@ -385,10 +416,16 @@ class OpenAIDisaggregatedService(OpenAIService):
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
                 hooks.on_ctx_dispatch(request)
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
-                request, req_id=disagg_request_id
-            )
+            # Build the ctx request and apply ctx-only sub-agent affinity BEFORE
+            # ctx-router selection, so the parent-session id (context scope)
+            # actually pins the ctx placement here too -- mirroring
+            # _send_disagg_request_ctx_first. Routing by ctx_req instead of the
+            # raw request is safe: both carry the same prompt/conversation_params.
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            self._apply_ctx_subagent_affinity(ctx_req)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                ctx_req, req_id=disagg_request_id
+            )
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,

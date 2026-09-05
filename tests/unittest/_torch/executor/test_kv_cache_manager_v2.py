@@ -25,6 +25,7 @@ from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    ConversationManager,
     KVCacheManagerV2,
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
@@ -1054,6 +1055,39 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+def _fake_conversation_request(request_id: int, conversation_id: str):
+    return SimpleNamespace(
+        py_request_id=request_id,
+        is_dummy_request=False,
+        py_conversation_params=SimpleNamespace(conversation_id=conversation_id),
+    )
+
+
+def test_conversation_manager_save_drop_plan_after_sibling_pops_state() -> None:
+    # Sub-agent ctx affinity co-locates concurrent siblings under one
+    # conversation id. If the registered sibling finishes/cancels with no pending
+    # drop handle it pops the conversation state; a later save_drop_plan() from an
+    # ignored sibling must be a no-op, not a KeyError (which would crash the
+    # executor's resource-update path).
+    manager = ConversationManager(max_num_turns=8)
+    request_a = _fake_conversation_request(1, "parent-id")
+    request_b = _fake_conversation_request(2, "parent-id")
+
+    manager.prepare_request(request_a)  # A becomes the current request
+    with patch("tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning") as mock_warning:
+        manager.prepare_request(request_b)  # B overlaps -> warned and ignored
+        mock_warning.assert_called_once()
+
+    # A is cancelled/finished with no pending drop handles -> state is popped.
+    manager.finish_request(request_a)
+    assert "parent-id" not in manager._conversation_states
+
+    # B reports its (empty) drop plan after the state is gone: must not raise.
+    kv_cache = SimpleNamespace(plan_committed_block_drop=lambda: None)
+    manager.save_drop_plan(request_b, kv_cache)  # KeyError before the .get() fix
+    assert "parent-id" not in manager._conversation_states
 
 
 def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() -> None:

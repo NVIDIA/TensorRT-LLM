@@ -20,6 +20,7 @@ from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import openai_disagg_server
+from tensorrt_llm.serve.conversation_id import extract_subagent_parent_id
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -221,3 +222,186 @@ def test_disagg_config_rejects_non_bool_request_chat_template_opt_in(value):
             generation_servers={"num_instances": 0},
             allow_request_chat_template=value,
         )
+
+
+# --- sub-agent conversation affinity (conversation_affinity_header_for_subagents) ---
+
+_PARENT_HEADER = "X-Dynamo-Parent-Session-ID"
+
+
+def test_extract_conversation_id_context_scope_pins_ctx_keeps_own_id():
+    # Sub-agent request carries the parent header. In "context" scope the
+    # conversation_id stays the sub-agent's own id (so gen load-balances) while
+    # the parent id is stashed for the ctx request only.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id", _PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "context",
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert request.conversation_params.subagent_ctx_affinity_id == "parent-id"
+
+
+def test_extract_conversation_id_context_scope_main_agent_falls_back():
+    # Main-agent request lacks the parent header -> graceful fallback to
+    # X-Session-ID, and no ctx affinity id is stashed.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id"}),
+        _PARENT_HEADER,
+        "context",
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_conversation_id_both_scope_overrides_with_parent_id():
+    # "both" scope: the parent header overrides the conversation id for both fleets.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id", _PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "both",
+    )
+    assert request.conversation_params.conversation_id == "parent-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_conversation_id_both_scope_main_agent_falls_back():
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id"}),
+        _PARENT_HEADER,
+        "both",
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_conversation_id_feature_off_ignores_parent_header():
+    # No header configured (default) -> the parent header is ignored entirely.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id", _PARENT_HEADER: "parent-id"}),
+    )
+    assert request.conversation_params.conversation_id == "own-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_conversation_id_context_scope_parent_header_beats_body_for_ctx_only():
+    # Precedence: the parent-session HEADER (step 2) outranks a body
+    # conversation_id (step 3) for the in-scope fleet. In "context" scope only
+    # the CTX request is re-pinned (via subagent_ctx_affinity_id), while the
+    # GEN-facing conversation_id keeps the canonical body id.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="body-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id", _PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "context",
+    )
+    # GEN keeps the canonical body id; CTX is re-pinned to the parent downstream.
+    assert request.conversation_params.conversation_id == "body-id"
+    assert request.conversation_params.subagent_ctx_affinity_id == "parent-id"
+
+
+def test_extract_conversation_id_both_scope_parent_header_beats_body():
+    # In "both" scope the parent header (step 2) overrides the body
+    # conversation_id (step 3) outright, so both fleets pin to the parent.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="body-id"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id", _PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "both",
+    )
+    assert request.conversation_params.conversation_id == "parent-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_conversation_id_context_scope_parent_only_synthesizes_own_id():
+    # "context" scope with ONLY the parent header (no body id, no session
+    # header): synthesize a unique own id so the ctx request can pin to the
+    # parent (via subagent_ctx_affinity_id) while gen load-balances on the
+    # synthesized id.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    assert request.conversation_params is None
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({_PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "context",
+    )
+    assert request.conversation_params.conversation_id.startswith("subagent:")
+    assert request.conversation_params.conversation_id != "parent-id"
+    assert request.conversation_params.subagent_ctx_affinity_id == "parent-id"
+
+
+def test_extract_conversation_id_both_scope_parent_only_creates_conversation_params():
+    # "both" scope with ONLY the parent header (no body id, no session header):
+    # conversation_params is created from the parent id so both fleets pin to it.
+    request = CompletionRequest(model="test-model", prompt="hello")
+    assert request.conversation_params is None
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({_PARENT_HEADER: "parent-id"}),
+        _PARENT_HEADER,
+        "both",
+    )
+    assert request.conversation_params.conversation_id == "parent-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+@pytest.mark.parametrize("scope", ["context", "both"])
+def test_extract_conversation_id_clears_client_supplied_ctx_affinity_id(scope):
+    # subagent_ctx_affinity_id is server-private: a client cannot enable ctx
+    # affinity by putting it in the request body. The edge clears it and only
+    # re-sets it from the trusted parent header (context scope). Here the
+    # feature is OFF (no header configured), so it must end up None.
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="body-id", subagent_ctx_affinity_id="attacker-id"
+        ),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        _raw_request({"X-Session-ID": "own-id"}),
+        None,
+        scope,
+    )
+    assert request.conversation_params.conversation_id == "body-id"
+    assert request.conversation_params.subagent_ctx_affinity_id is None
+
+
+def test_extract_subagent_parent_id_edge_cases():
+    # Not configured -> None even if the header is present.
+    assert extract_subagent_parent_id(Headers({_PARENT_HEADER: "parent-id"}), None) is None
+    # Configured but absent -> None (this is what triggers the fallback).
+    assert extract_subagent_parent_id(Headers({"X-Session-ID": "own-id"}), _PARENT_HEADER) is None
+    # Present: value is stripped and the header lookup is case-insensitive.
+    assert (
+        extract_subagent_parent_id(
+            Headers({_PARENT_HEADER.lower(): "  parent-id  "}), _PARENT_HEADER
+        )
+        == "parent-id"
+    )
+    # Present but blank -> None.
+    assert extract_subagent_parent_id(Headers({_PARENT_HEADER: "   "}), _PARENT_HEADER) is None
+    # No headers -> None.
+    assert extract_subagent_parent_id(None, _PARENT_HEADER) is None

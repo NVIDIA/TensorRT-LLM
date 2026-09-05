@@ -12,6 +12,7 @@ from mpi4py.MPI import COMM_WORLD, Comm
 from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
+from ..logger import logger
 
 __all__ = [
     'ServerConfig',
@@ -166,6 +167,40 @@ class DisaggServerConfig():
     # "Connection reset by peer" on a reused connection.
     server_keep_alive_timeout: int = 10
     internal_request_auth_key: Optional[str] = None
+    # Name of the HTTP header carrying a sub-agent's parent-session id (e.g.
+    # "X-Dynamo-Parent-Session-ID"). When set, the disagg frontend prefers this
+    # header over X-Session-ID when resolving a request's conversation id, so a
+    # sub-agent is routed to the same instance (and, via the forwarded body
+    # conversation_params, the same attention-DP rank) as its parent --
+    # maximizing shared-prefix KV reuse. Which fleet(s) this pins is set by
+    # ``subagent_affinity_scope`` below (the CONTEXT instance by default; the
+    # GENERATION instance too under "both"). A main-agent request lacks this
+    # header and falls back to the default X-Session-ID resolution.
+    #
+    # Prerequisites (this header only supplies the conversation id; the routers
+    # decide whether that id changes placement):
+    #   - Instance affinity requires the relevant disagg router to be the
+    #     ``conversation`` router: the CTX router for "context" scope, and both
+    #     the CTX and GEN routers for "both" scope. With any other router type
+    #     (round_robin, kv_cache_aware, ...) the conversation id does not pin an
+    #     instance and this feature is inactive -- extract_disagg_cfg() emits a
+    #     startup warning in that case rather than rejecting the config.
+    #   - Attention-DP rank affinity additionally requires the worker to be
+    #     started with attention_dp_config.kv_cache_routing_conversation_affinity
+    #     = True; otherwise the request still lands on the parent's instance but
+    #     may pick a different ADP rank.
+    conversation_affinity_header_for_subagents: Optional[str] = None
+    # Which disagg fleets honor conversation_affinity_header_for_subagents.
+    #   "context" (default): only the CONTEXT request pins to the parent id
+    #     (shared prefill KV reuse); the GEN request keeps the sub-agent's own
+    #     id and load-balances across the gen fleet. Avoids collapsing a whole
+    #     sub-agent tree onto one small-batch gen instance, whose few decode
+    #     slots would then queue and inflate TTFT. Requires the CTX router to be
+    #     the ``conversation`` router.
+    #   "both": the parent header overrides the conversation id for BOTH fleets.
+    #     Requires both the CTX and GEN routers to be the ``conversation`` router.
+    # No effect unless conversation_affinity_header_for_subagents is set.
+    subagent_affinity_scope: Literal['context', 'both'] = 'context'
 
 
 @dataclass
@@ -235,29 +270,31 @@ def parse_disagg_config_file(yaml_config_file: str):
         return disagg_server_config
 
 
-def extract_disagg_cfg(hostname: str = 'localhost',
-                       port: int = 8000,
-                       max_retries: int = 1,
-                       perf_metrics_max_requests: int = 0,
-                       return_perf_metrics: bool = False,
-                       perf_metrics_output_dir: Optional[str] = None,
-                       context_servers: Optional[dict] = None,
-                       generation_servers: Optional[dict] = None,
-                       conditional_disagg_config: Optional[dict] = None,
-                       otlp_config: Optional[dict] = None,
-                       disagg_cluster: Optional[dict] = None,
-                       node_id: Optional[int] = None,
-                       schedule_style: Literal[
-                           'context_first',
-                           'generation_first'] = 'context_first',
-                       allow_request_chat_template: bool = False,
-                       gen_strip_message_history: bool = False,
-                       gen_tokids_ctxbytes: bool = False,
-                       num_workers: int = 1,
-                       disagg_coordinator_url: Optional[str] = None,
-                       server_keep_alive_timeout: int = 10,
-                       internal_request_auth_key: Optional[str] = None,
-                       **kwargs: Any) -> DisaggServerConfig:
+def extract_disagg_cfg(
+        hostname: str = 'localhost',
+        port: int = 8000,
+        max_retries: int = 1,
+        perf_metrics_max_requests: int = 0,
+        return_perf_metrics: bool = False,
+        perf_metrics_output_dir: Optional[str] = None,
+        context_servers: Optional[dict] = None,
+        generation_servers: Optional[dict] = None,
+        conditional_disagg_config: Optional[dict] = None,
+        otlp_config: Optional[dict] = None,
+        disagg_cluster: Optional[dict] = None,
+        node_id: Optional[int] = None,
+        schedule_style: Literal['context_first',
+                                'generation_first'] = 'context_first',
+        allow_request_chat_template: bool = False,
+        gen_strip_message_history: bool = False,
+        gen_tokids_ctxbytes: bool = False,
+        num_workers: int = 1,
+        disagg_coordinator_url: Optional[str] = None,
+        server_keep_alive_timeout: int = 10,
+        internal_request_auth_key: Optional[str] = None,
+        conversation_affinity_header_for_subagents: Optional[str] = None,
+        subagent_affinity_scope: str = 'context',
+        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
     internal_request_auth_key = _extract_internal_request_auth_key(
@@ -329,7 +366,51 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.server_keep_alive_timeout = validate_config_non_negative_int(
         server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key
+    config.conversation_affinity_header_for_subagents = (
+        conversation_affinity_header_for_subagents)
+    if subagent_affinity_scope not in ('context', 'both'):
+        raise ValueError(
+            "subagent_affinity_scope must be 'context' or 'both', got "
+            f"{subagent_affinity_scope!r}")
+    config.subagent_affinity_scope = subagent_affinity_scope
+    _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
+    """Warn when sub-agent affinity is configured but its router prerequisite is unmet.
+
+    Instance affinity only takes effect when the relevant fleet uses the
+    ``conversation`` router (CTX for "context" scope; CTX and GEN for "both").
+    With any other router type the parent-session id does not pin an instance, so
+    the feature is silently inactive. We warn instead of rejecting so a config can
+    still be brought up (e.g. while the routers are being reconfigured).
+    """
+    if not config.conversation_affinity_header_for_subagents:
+        return
+
+    def _router_type(router_config: Optional[RouterConfig]) -> Optional[str]:
+        return router_config.type if router_config is not None else None
+
+    relevant = [("context", _router_type(config.ctx_router_config))]
+    if config.subagent_affinity_scope == 'both':
+        relevant.append(("generation", _router_type(config.gen_router_config)))
+
+    # create_router() resolves the type case-insensitively (router_type.lower()),
+    # so treat e.g. "Conversation" as the conversation router here too.
+    non_conversation = [
+        f"{fleet} router is {router_type!r}" for fleet, router_type in relevant
+        if (router_type or "").lower() != "conversation"
+    ]
+    if non_conversation:
+        logger.warning(
+            "conversation_affinity_header_for_subagents="
+            f"{config.conversation_affinity_header_for_subagents!r} with "
+            f"subagent_affinity_scope={config.subagent_affinity_scope!r} requires "
+            "the 'conversation' router on the affected fleet(s), but "
+            f"{', '.join(non_conversation)}. Sub-agent instance affinity is "
+            "INACTIVE for those fleet(s); the parent-session id will not pin an "
+            "instance.")
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
