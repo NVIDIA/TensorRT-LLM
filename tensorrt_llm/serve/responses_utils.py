@@ -757,6 +757,33 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
+# The Responses API spells a text part `input_text` on the way in and
+# `output_text` on the way out; the chat-completions content parser knows only
+# `text`. Both mean the same thing, so they are translated rather than
+# rejected.
+_RESPONSES_TEXT_PART_TYPES = frozenset(("input_text", "output_text"))
+
+
+def _chat_content_parts(content: list) -> list:
+    """Rewrite Responses-only text parts into the chat vocabulary.
+
+    Everything else is passed through untouched: `image_url` and friends are
+    already understood downstream, and flattening the list to a plain string
+    would drop them.
+    """
+    parts = []
+    for part in content:
+        part_type = part.get("type") if isinstance(part, dict) else getattr(
+            part, "type", None)
+        if part_type in _RESPONSES_TEXT_PART_TYPES:
+            text = part.get("text") if isinstance(part, dict) else getattr(
+                part, "text", None)
+            parts.append({"type": "text", "text": text or ""})
+        else:
+            parts.append(part)
+    return parts
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem]
 ) -> Optional[ChatCompletionMessageParam]:
@@ -767,12 +794,38 @@ def _response_output_item_to_chat_completion_message(
 
     match item_type:
         case "":
-            if "role" in item:
-                return item
-            else:
+            if "role" not in item:
                 raise ValueError(f"Invalid input message item: {item}")
+            content = item.get("content")
+            if isinstance(content, list):
+                # An item with a role and no `type` is the API's
+                # EasyInputMessage, where `type` defaults to "message". Its
+                # parts are spelled in the Responses vocabulary, so passing
+                # them through untouched hands `input_text` / `output_text` to
+                # the chat-completions parser, which knows neither and fails
+                # the request. The explicit "message" branch below already
+                # handles those parts, so leaving this one verbatim made
+                # success depend on a field the client may omit.
+                return {**item, "content": _chat_content_parts(content)}
+            return item
         case "message" | "reasoning":
             content = item.get("content") or []
+            if not content and item_type == "reasoning":
+                # Reasoning does not have to carry `content`. The API puts the
+                # text in `summary` when a summary was requested and in
+                # `encrypted_content` when it was not, and an item with neither
+                # populated is a shape OpenAI itself emits. Falling back to the
+                # summary keeps whatever text exists; when nothing readable is
+                # left the item is skipped rather than rejected, because the
+                # reasoning was already absent from the payload and failing
+                # here costs the whole conversation instead.
+                summary = item.get("summary") or []
+                summary_text = "".join(
+                    part.get("text") or "" if isinstance(part, dict) else (
+                        getattr(part, "text", "") or "") for part in summary)
+                if not summary_text:
+                    return None
+                return {"role": "assistant", "reasoning": summary_text}
             if not content:
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"

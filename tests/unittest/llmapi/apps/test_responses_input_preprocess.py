@@ -393,3 +393,121 @@ def test_meaningful_values_survive_the_null_scrub():
     )
     assert request.temperature == 0.25
     assert request.tool_choice == "none"
+
+
+def test_reasoning_without_content_falls_back_to_the_summary():
+    """The text is in `summary` whenever a summary was requested.
+
+    Reading only `content` threw the summary away and then rejected the item
+    for being empty, so a client that asked for reasoning summaries lost both
+    the reasoning and the turn.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "weighed two options"}],
+        }
+    )
+
+    assert msg == {"role": "assistant", "reasoning": "weighed two options"}
+
+
+def test_reasoning_with_nothing_readable_is_skipped_not_rejected():
+    """A shape OpenAI emits, and one a client replays back verbatim.
+
+    With `encrypted_content` and no summary there is no reasoning text in the
+    payload to preserve. Raising here does not save anything -- the text was
+    already absent -- it just fails the whole request, which ends the
+    conversation rather than the turn.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "gAAAAA",
+        }
+    )
+
+    assert msg is None
+
+
+def test_a_message_with_no_content_is_still_rejected():
+    """The tolerance above is specific to reasoning.
+
+    A message carries its text in `content` and nowhere else, so an empty one
+    is malformed and silently dropping it would lose something the client
+    believed it had sent.
+    """
+    with pytest.raises(ValueError):
+        _response_output_item_to_chat_completion_message(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [],
+            }
+        )
+
+
+def test_role_without_type_gets_its_parts_translated():
+    """`type` is optional on an input message; the parts still need rewriting.
+
+    This is the API's EasyInputMessage. Returning it verbatim handed
+    `input_text` to the chat-completions content parser, which knows only
+    `text` and failed the request with "Unknown part type: input_text" -- so
+    whether a request worked depended on a field the client may leave out.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }
+    )
+
+    assert msg == {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+
+
+def test_an_assistant_turn_replayed_without_a_type_is_accepted():
+    """Replaying this server's own output must not need a field it omits.
+
+    The assistant parts come back spelled `output_text`, which is what the
+    Responses API calls them.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }
+    )
+
+    assert msg == {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}
+
+
+def test_non_text_parts_survive_the_translation():
+    """Only the two Responses-only text spellings are rewritten.
+
+    Flattening the list to a string would have been simpler and would have
+    dropped the image, which the downstream parser does understand.
+    """
+    image = {"type": "image_url", "image_url": {"url": "http://example/x.png"}}
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "what is this"}, image],
+        }
+    )
+
+    assert msg["content"] == [{"type": "text", "text": "what is this"}, image]
+
+
+def test_a_plain_string_content_is_left_alone():
+    """The common shape must not be disturbed by the list handling."""
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "user",
+            "content": "hello",
+        }
+    )
+
+    assert msg == {"role": "user", "content": "hello"}
