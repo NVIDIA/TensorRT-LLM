@@ -26,15 +26,23 @@ test) can grab the port in the gap between the probe close and the re-bind, so a
 single allocation is not enough on busy nodes -- we must re-allocate and retry.
 """
 
+import sys
+from pathlib import Path
+
 import torch.multiprocessing as mp
 
-# The CI-aware allocator lives in tests/integration/defs/common.py. Adding that
-# directory to sys.path lets us reuse it (it tracks allocated ports per-process
-# so sequential tests don't collide, and honors CONTAINER_PORT_START/NUM).
-__extra_import_path__ = ["~/tests/integration"]
-from defs.common import get_free_port_in_ci
-
 _ADDR_IN_USE_MARKERS = ("EADDRINUSE", "address already in use")
+
+
+def _get_free_port_in_ci() -> int:
+    # Import lazily so mp.spawn child imports do not load tensorrt_llm before
+    # the test process has established its package environment.
+    integration_dir = Path(__file__).resolve().parents[4] / "integration"
+    if str(integration_dir) not in sys.path:
+        sys.path.insert(0, str(integration_dir))
+    from defs.common import get_free_port_in_ci
+
+    return get_free_port_in_ci()
 
 
 def _is_addr_in_use(exc: BaseException) -> bool:
@@ -53,7 +61,7 @@ def spawn_with_retry(spawn_fn, max_retries: int = 10):
     """
     last_exc: BaseException | None = None
     for _ in range(max_retries):
-        port = get_free_port_in_ci()
+        port = _get_free_port_in_ci()
         try:
             spawn_fn(port)
             return
