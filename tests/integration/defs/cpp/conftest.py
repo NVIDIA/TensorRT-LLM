@@ -198,6 +198,9 @@ def build_kv_cache_compression_tests(request, build_type):
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         configure_only=True,
+        # Same reason as build_google_tests: no libnvrtc_static.a in the DLFW
+        # base image, and this build has no BOLT to turn dynamic linking on.
+        nvrtc_dynamic_linking=True,
     )
 
     build_dir = _cpp.find_build_dir(build_type)
