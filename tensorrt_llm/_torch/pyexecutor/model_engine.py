@@ -67,6 +67,8 @@ from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
+from ..nccl_window_tensor_scope import (install_eager_nccl_window_tensor_scopes,
+                                        nccl_window_tensor_scope)
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -736,6 +738,7 @@ class PyTorchModelEngine(ModelEngine):
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
+            self._nccl_window_tensor_scope_hooks = []
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
@@ -775,6 +778,8 @@ class PyTorchModelEngine(ModelEngine):
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
+                self._nccl_window_tensor_scope_hooks = (
+                    install_eager_nccl_window_tensor_scopes(self.model))
         except Exception as e:
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
@@ -3613,7 +3618,7 @@ class PyTorchModelEngine(ModelEngine):
            GMS client; see :meth:`ModelLoader.cleanup`).
         2. The model module reference, and the MM item scheduler, which
            holds one of its own.
-        3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        3. Executor-owned CUDA Graphs (via :meth:`_release_cuda_graphs`).
         4. Input processors.
 
         Idempotency:
@@ -3626,8 +3631,8 @@ class PyTorchModelEngine(ModelEngine):
             deliberately does *not* call this: it is also invoked mid-init by
             ``configure_kv_cache_capacity``, which reads ``model`` right
             afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
-            instead.
+            uses an explicit temporary-executor shutdown and then drops its
+            reference instead.
         """
         if self._cleanup_done:
             return
@@ -3647,7 +3652,10 @@ class PyTorchModelEngine(ModelEngine):
         self._mm_item_scheduler = None
         self.model = None
 
-        self._release_cuda_graphs()
+        # Destruction timing is not rank-symmetric. Explicit executor shutdown
+        # already releases owners at its coordinated graph teardown boundary;
+        # a destructor may reset graphs but must not change buffer eligibility.
+        self._release_cuda_graphs(release_nccl_window_owners=False)
         self.input_processor = None
 
         # Release model weights.
@@ -3762,18 +3770,40 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
-    def _release_cuda_graphs(self):
+    def _release_model_owned_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ):
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
+                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph",
+                                             None)
+                if clear_blocks_graph is not None:
+                    clear_blocks_graph(
+                        release_nccl_window_owners=release_nccl_window_owners)
+
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ):
         if self._torch_compile_backend is not None:
-            self._torch_compile_backend.clear_piecewise_cuda_graphs()
+            self._torch_compile_backend.clear_piecewise_cuda_graphs(
+                release_nccl_window_owners=release_nccl_window_owners)
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear()
+            self.cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
         if (hasattr(self, 'breakable_cuda_graph_runner')
                 and self.breakable_cuda_graph_runner is not None):
-            self.breakable_cuda_graph_runner.clear()
+            self.breakable_cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
         if hasattr(self, 'encoder_cuda_graph_runner'
                    ) and self.encoder_cuda_graph_runner is not None:
-            self.encoder_cuda_graph_runner.clear()
+            self.encoder_cuda_graph_runner.clear(
+                release_nccl_window_owners=release_nccl_window_owners)
 
     def get_max_num_sequences(self) -> int:
         """
@@ -7683,10 +7713,14 @@ class PyTorchModelEngine(ModelEngine):
             attrs["events"] = weakref.ref(self._torch_compile_backend.events)
             attrs["global_stream"] = torch.cuda.current_stream()
 
-        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
-            return trace_func(self.model.forward)(**kwargs)
-        else:
-            return self.model.forward(**kwargs)
+        # This boundary stays outside torch.compile, so one lease scope covers
+        # eager, compiled, and CUDA-graph model execution.
+        with nccl_window_tensor_scope(kwargs) as scope:
+            if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+                outputs = trace_func(self.model.forward)(**kwargs)
+            else:
+                outputs = self.model.forward(**kwargs)
+            return scope.escape(outputs)
 
     @nvtx_range("_forward_step")
     def _forward_step(self,

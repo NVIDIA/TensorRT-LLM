@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
-from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig, SharedGraphPool
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
@@ -989,8 +989,9 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
         config: CUDAGraphRunnerConfig,
         lora_state_getter: Callable[[], str],
         topology_getter: Callable[[], str],
+        shared_pool: Optional[SharedGraphPool] = None,
     ) -> None:
-        super().__init__(config)
+        super().__init__(config, shared_pool)
         self._lora_state_getter = lora_state_getter
         self._topology_getter = topology_getter
 
@@ -1105,6 +1106,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
             lambda: self.transformer.active_topology,
+            self._get_or_create_cuda_graph_shared_pool(),
         )
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(

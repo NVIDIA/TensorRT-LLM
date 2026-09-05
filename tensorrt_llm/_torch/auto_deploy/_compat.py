@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 
@@ -243,6 +243,7 @@ else:
 # Utility functions
 # ---------------------------------------------------------------------------
 if TRTLLM_AVAILABLE:
+    from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
     from tensorrt_llm._torch.utils import make_weak_ref
     from tensorrt_llm._utils import (
         get_free_port,
@@ -254,6 +255,15 @@ if TRTLLM_AVAILABLE:
         str_dtype_to_torch,
     )
 else:
+
+    @contextmanager
+    def nccl_window_graph_capture(
+        graph: torch.cuda.CUDAGraph, pool: Any, **capture_kwargs: Any
+    ) -> Iterator[None]:
+        """Capture without NCCL window ownership in standalone mode."""
+        with torch.cuda.graph(graph, pool=pool, **capture_kwargs):
+            yield
+
     # -- get_free_port --
     def get_free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

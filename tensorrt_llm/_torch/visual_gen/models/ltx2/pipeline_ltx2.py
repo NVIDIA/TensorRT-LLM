@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
@@ -498,13 +499,14 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             gc.collect()
             torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
+        graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+        with nccl_window_graph_capture(graph, graph_pool):
             output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self.graph_outputs[key] = self._make_output_ref(output)
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
 
         if self._shared_pool is not None and self._shared_pool.handle is None:
             self._shared_pool.handle = self.memory_pool
@@ -835,6 +837,7 @@ class LTX2Pipeline(BasePipeline):
 
         runner = _LTX2CUDAGraphRunner(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
+            self._get_or_create_cuda_graph_shared_pool(),
         )
         self.transformer.register_cuda_graph_extra_key_fns(runner)
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""

@@ -22,6 +22,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
@@ -545,15 +546,23 @@ class ADEngine(ModelEngine):
             PyTorchModelEngine._execute_logit_post_processors, self
         )
 
-    def _release_cuda_graphs(self) -> None:
+    def _release_cuda_graphs(
+        self,
+        *,
+        release_nccl_window_owners: bool = True,
+    ) -> None:
         def _reset_cuda_graph(graph: object) -> None:
             if isinstance(graph, torch.cuda.CUDAGraph):
                 graph.reset()
 
+        graph_pools = set()
         model = getattr(self, "model", None)
         if model is not None:
             for module in model.modules():
                 if module.__class__.__name__ == "CapturedGraph":
+                    graph_pool = getattr(module, "_cuda_graph_mem_pool", None)
+                    if graph_pool is not None:
+                        graph_pools.add(graph_pool)
                     cudagraphs = getattr(module, "cudagraphs", None)
                     if isinstance(cudagraphs, dict):
                         for graph in list(cudagraphs.values()):
@@ -569,6 +578,9 @@ class ADEngine(ModelEngine):
                         static_input_buffers.clear()
 
                 if module.__class__.__name__ == "ADPiecewiseRunner":
+                    graph_pool = getattr(module, "_graph_pool", None)
+                    if graph_pool is not None:
+                        graph_pools.add(graph_pool)
                     entries = getattr(module, "entries", None)
                     if isinstance(entries, dict):
                         for entry in entries.values():
@@ -576,6 +588,9 @@ class ADEngine(ModelEngine):
                         entries.clear()
                     module._graph_pool = None
 
+        if release_nccl_window_owners:
+            for graph_pool in graph_pools:
+                release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
     def _store_prefill_multimodal_metadata(

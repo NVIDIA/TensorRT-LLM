@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 from dataclasses import dataclass
@@ -18,6 +21,8 @@ from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
+from ..nccl_window_graph import (nccl_window_graph_capture,
+                                 release_nccl_window_graph_owner)
 from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
@@ -437,7 +442,9 @@ class CUDAGraphRunner:
         return CUDAGraphRunner._get_mrope_position_delta(request) is not None
 
     def __del__(self):
-        self.clear()
+        # GC timing is not rank-symmetric, so destructor cleanup must not make
+        # graph-owned NCCL windows eligible for reuse.
+        self.clear(release_nccl_window_owners=False)
 
     def maybe_get_cuda_graph(
         self,
@@ -670,7 +677,8 @@ class CUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
@@ -1058,8 +1066,9 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
         """Releases all captured graphs and the associated memory pool."""
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -1068,6 +1077,8 @@ class CUDAGraphRunner:
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None
+        if release_nccl_window_owners and graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()
 
 
@@ -1957,10 +1968,11 @@ class EncoderCUDAGraphRunner:
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph,
-                                  pool=self.memory_pool,
-                                  stream=self._get_capture_stream(),
-                                  capture_error_mode="thread_local"):
+            graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph,
+                                           graph_pool,
+                                           stream=self._get_capture_stream(),
+                                           capture_error_mode="thread_local"):
                 if capture_h2d is not None:
                     capture_h2d()
                 output = forward_fn(capture_inputs)
@@ -2149,7 +2161,8 @@ class EncoderCUDAGraphRunner:
     def get_graph_pool(self):
         return self.memory_pool
 
-    def clear(self):
+    def clear(self, *, release_nccl_window_owners: bool = True):
+        graph_pool = self.memory_pool
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
@@ -2157,4 +2170,6 @@ class EncoderCUDAGraphRunner:
         self.graph_metadata.clear()
         del self.memory_pool
         self.memory_pool = None
+        if release_nccl_window_owners and graph_pool is not None:
+            release_nccl_window_graph_owner(graph_pool)
         torch.cuda.empty_cache()

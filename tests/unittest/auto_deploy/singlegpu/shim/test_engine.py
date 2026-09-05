@@ -193,6 +193,61 @@ def test_ad_engine_scheduling_config_defaults_without_ad_config():
         cache_seq_interface.shutdown()
 
 
+@pytest.mark.cpu_only
+def test_ad_engine_releases_nccl_window_graph_owners(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUDA graph teardown releases each distinct NCCL window owner after reset."""
+
+    class FakeCUDAGraph:
+        def __init__(self) -> None:
+            self.was_reset = False
+
+        def reset(self) -> None:
+            self.was_reset = True
+
+    captured_graph = FakeCUDAGraph()
+    first_piecewise_graph = FakeCUDAGraph()
+    second_piecewise_graph = FakeCUDAGraph()
+    all_graphs = [captured_graph, first_piecewise_graph, second_piecewise_graph]
+
+    captured_module = type("CapturedGraph", (), {})()
+    captured_module.cudagraphs = {"decode": captured_graph}
+    captured_module._cuda_graph_mem_pool = (1, 2)
+    captured_module._input_buffers = [object()]
+    captured_module._out_buffer_flat = [object()]
+
+    piecewise_modules = []
+    for graph in (first_piecewise_graph, second_piecewise_graph):
+        module = type("ADPiecewiseRunner", (), {})()
+        module.entries = {"segment": SimpleNamespace(cuda_graph=graph)}
+        module._graph_pool = (3, 4)
+        piecewise_modules.append(module)
+
+    engine = object.__new__(ADEngine)
+    engine.model = SimpleNamespace(modules=lambda: iter([captured_module, *piecewise_modules]))
+
+    released_pools = []
+
+    def release_graph_pool(graph_pool: tuple[int, int]) -> None:
+        assert all(graph.was_reset for graph in all_graphs)
+        released_pools.append(graph_pool)
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeCUDAGraph)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.shim.ad_executor.release_nccl_window_graph_owner",
+        release_graph_pool,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    engine._release_cuda_graphs()
+
+    assert set(released_pools) == {(1, 2), (3, 4)}
+    assert len(released_pools) == 2
+    assert captured_module.cudagraphs == {}
+    assert captured_module._cuda_graph_mem_pool is None
+    assert all(module.entries == {} for module in piecewise_modules)
+    assert all(module._graph_pool is None for module in piecewise_modules)
+
+
 @pytest.mark.parametrize("tokens_per_block", [0, 2])
 def test_demo_engine_sampling(tokens_per_block: int):
     """Test sampling logic specific to DemoEngine."""
