@@ -158,6 +158,34 @@ to markdown for humans — read the markdown, never edit either by hand).
   disappear from the config are kept, not dropped — dropping one would discard
   a reservation whose holder is still running.
 
+## The dashboard: collector, then renderer
+
+```
+python -m agent_flow.ops.dashboard              # one project, plain text
+python -m agent_flow.ops.dashboard --json       # the status dict itself
+python -m agent_flow.ops.dashboard --projects   # cross-project index
+python -m agent_flow.ops.project list           # the same index
+```
+
+`collector.collect(cfg)` returns a plain dict assembled from the verdict
+ledger, the two reservation tables (read without their locks — a viewer must
+never block a writer), the mailbox queue via one `mailbox.status()` call, and
+whether a workflow process is alive. `dashboard.py` only formats that dict, so
+a second renderer costs nothing and both are testable without a terminal. A
+curses view can be layered on the same dict later.
+
+Narration is optional in the strong sense: with no narrator configured, no
+binary on PATH, a non-zero exit or a timeout, the field reads
+`(narration unavailable)` and nothing else changes. A dashboard that cannot
+render without a model call stops working the day the model does.
+
+The `--projects` index gives one row per project: parent, start commit, final
+commit once it has been archived, flow state (running / idle / archived), last
+ledger row, scoreboard, allocations held and pending messages. Allocations are
+attributed by holder — the project name, or a `<project>/<role>` holder, or a
+role name no other indexed project declares, since a shared word like "coder"
+would otherwise show a second project's allocation as this one's.
+
 ## Archive and frozen viewing
 
 A finished project is archived by copying its run directory (logs, workspace,

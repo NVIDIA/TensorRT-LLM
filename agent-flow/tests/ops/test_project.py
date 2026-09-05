@@ -79,7 +79,7 @@ def test_project_list_reports_state(tmp_path, capsys):
     assert project.main(["--projects-root", str(root), "list"]) == 0
     out = capsys.readouterr().out
     assert "beta" in out
-    assert "1/2 gates passing" in out
+    assert "1/2" in out  # the index row: passing/total gates
 
 
 def test_project_list_with_no_projects(tmp_path, capsys):
