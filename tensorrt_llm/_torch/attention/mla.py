@@ -27,6 +27,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
@@ -161,6 +162,33 @@ def mla_custom_op_inplace(
 maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
+def _is_cute_dsl_fp8_bmm_available(sm_version: Optional[int] = None) -> bool:
+    if sm_version is None:
+        sm_version = get_sm_version()
+    if sm_version == 107:
+        return IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    return sm_version in (100, 103) and IS_CUTLASS_DSL_AVAILABLE
+
+
+def _cute_dsl_fp8_bmm_out(
+    mat1_fp8: torch.Tensor,
+    mat2_fp8: torch.Tensor,
+    mat1_scale: torch.Tensor,
+    mat2_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """FP8 block-scaled BMM through the CuTe DSL op for the current SM."""
+    sm_version = get_sm_version()
+    if sm_version == 107:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_rubin(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
+    elif sm_version in (100, 103):
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
+    else:
+        raise NotImplementedError(
+            f"CuTe DSL FP8 block-scaled BMM is not available on SM{sm_version}"
+        )
+
+
 def fp8_block_scaling_bmm_out(
     mat1: torch.Tensor,
     mat2_fp8: torch.Tensor,
@@ -188,9 +216,7 @@ def fp8_block_scaling_bmm_out(
     elif is_sm_100f(sm_version):
         if use_cute_dsl_blockscaling_bmm:
             mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(mat1)
-            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(
-                mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out
-            )
+            _cute_dsl_fp8_bmm_out(mat1_fp8, mat2_fp8, mat1_scale, mat2_scale, out)
             mat1_scale = None
         else:
             torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2), out=out)
