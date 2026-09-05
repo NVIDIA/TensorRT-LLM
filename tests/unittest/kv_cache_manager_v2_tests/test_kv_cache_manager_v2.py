@@ -814,6 +814,145 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if kv_cache.status != _KVCache.Status.CLOSED:
                     kv_cache.close()
 
+    @requires_cpp_backend
+    def test_resume_ignores_threshold_for_ssm_only_pool_group(self) -> None:
+        """A saturated SSM-only pool group must not veto resume.
+
+        max_util_for_resume reserves room for admitted requests to grow, but an
+        SSM state is a fixed one slot per sequence and never grows. Gating on it
+        would deadlock a hybrid model at high concurrency, since that pool sits
+        at ~100% whenever it is full.
+        """
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[GpuCacheTierConfig(quota=512 << 20)],
+            max_util_for_resume=0.9,
+            layers=[
+                SsmLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=23592960),
+                        BufferConfig(role=DataRole("conv_state"), size=829440),
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[BufferConfig(role=DataRole("key"), size=245760)],
+                ),
+            ],
+            enable_partial_reuse=False,
+            commit_min_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+
+        # The SSM lifecycle must own a pool group containing no attention
+        # lifecycle, otherwise the headroom legitimately applies to it and this
+        # test would be vacuous. Assert that rather than assume it.
+        ssm_lc = _introspection.ssm_life_cycle_id(self.manager)
+        self.assertIsNotNone(ssm_lc)
+        ssm_pg = _introspection.pool_group_index(self.manager, ssm_lc)
+        attn_pgs = {
+            _introspection.pool_group_index(self.manager, lc)
+            for lc in _introspection.attention_life_cycle_ids(self.manager)
+        }
+        self.assertNotIn(ssm_pg, attn_pgs)
+        self.assertEqual(len(attn_pgs), 1)
+        attn_pg = next(iter(attn_pgs))
+
+        def utilization() -> list[float]:
+            return list(_introspection.storage_utilization(self.manager, GPU_LEVEL))
+
+        def ssm_free() -> int:
+            return _introspection.storage_statistics(self.manager)[ssm_pg].free
+
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prior_caches: list[_KVCache] = []
+        try:
+            # Consume SSM slots (one per sequence) until that pool group is past
+            # the resume threshold but still has a slot left to hand out.
+            for _ in range(64):
+                if utilization()[ssm_pg] > cfg.max_util_for_resume and ssm_free() > 0:
+                    break
+                kv_cache = self.manager.create_kv_cache()
+                self.assertTrue(kv_cache.resume(stream))
+                self.assertTrue(kv_cache.resize(cfg.tokens_per_block))
+                prior_caches.append(kv_cache)
+
+            utilizations = utilization()
+            self.assertGreater(utilizations[ssm_pg], cfg.max_util_for_resume)
+            self.assertLess(utilizations[attn_pg], cfg.max_util_for_resume)
+            self.assertGreater(ssm_free(), 0)
+
+            # Previously the gate compared max() across pool groups against a
+            # single scalar, so the saturated SSM group rejected this resume.
+            admitted = self.manager.create_kv_cache()
+            prior_caches.append(admitted)
+            self.assertTrue(admitted.resume(stream))
+            self.assertTrue(admitted.resize(cfg.tokens_per_block))
+        finally:
+            for kv_cache in prior_caches:
+                if kv_cache.status != _KVCache.Status.CLOSED:
+                    kv_cache.close()
+
+    @requires_cpp_backend
+    def test_constant_size_pool_group_floor_ignores_growth_headroom(self) -> None:
+        """An SSM-only pool group is sized to its exact constraint floor.
+
+        Constraint-derived floors are inflated by 1/max_util_for_resume so an
+        admitted sequence has room to grow. A pool group whose life cycles all
+        have a constant per-sequence state size never grows and is never gated
+        on that threshold, so inflating its floor only wastes memory.
+        """
+        ssm_floor_slots = 12
+
+        def ssm_pool_slots(max_util: float, with_constraint: bool) -> int:
+            # Zero-capacity requests cost no attention pages but reserve one
+            # SSM slot each, so they isolate the recurrent floor.
+            constraints = (
+                [BatchDesc([KVCacheDesc(capacity=0, history_length=0)] * ssm_floor_slots)]
+                if with_constraint
+                else []
+            )
+            cfg = KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[GpuCacheTierConfig(quota=256 << 20)],
+                max_util_for_resume=max_util,
+                layers=[
+                    SsmLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[
+                            BufferConfig(role=DataRole("ssm_state"), size=23592960),
+                            BufferConfig(role=DataRole("conv_state"), size=829440),
+                        ],
+                    ),
+                    AttentionLayerConfig(
+                        layer_id=LayerId(1),
+                        buffers=[BufferConfig(role=DataRole("key"), size=245760)],
+                    ),
+                ],
+                constraints=constraints,
+                enable_partial_reuse=False,
+                commit_min_snapshot=True,
+            )
+            manager = KVCacheManager(cfg)
+            try:
+                ssm_lc = _introspection.ssm_life_cycle_id(manager)
+                self.assertIsNotNone(ssm_lc)
+                ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
+                return _introspection.storage_statistics(manager)[ssm_pg].total
+            finally:
+                manager.shutdown()
+
+        # Precondition: the floor must actually bind. If ratio-based sizing
+        # already exceeded it, the assertions below would hold vacuously.
+        self.assertLess(ssm_pool_slots(1.0, with_constraint=False), ssm_floor_slots)
+
+        # The floor is honoured exactly and does not scale with the headroom
+        # factor. Previously max_util=0.5 doubled it to 24 slots.
+        for max_util in (1.0, 0.5):
+            self.assertEqual(ssm_pool_slots(max_util, with_constraint=True), ssm_floor_slots)
+
     @parameterized.expand([(1,), (2,), (4,)])
     # @assert_no_ref_cycle
     def test_cache_reuse(self, num_reusable_requests: int) -> None:
@@ -2324,8 +2463,11 @@ class TestSSMSupport(unittest.TestCase):
         self,
         tokens_per_block: int = 32,
         gpu_quota: int = 32 << 20,
+        host_quota: int | None = None,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
+        ssm_buffer_size: int = 8192,
+        max_util_for_resume: float = 0.97,
         window_size: SlidingWindowSize = None,
         commit_min_snapshot: bool = True,
         enable_partial_reuse: bool = False,
@@ -2349,15 +2491,19 @@ class TestSSMSupport(unittest.TestCase):
                 SsmLayerConfig(
                     layer_id=LayerId(lid),
                     buffers=[
-                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                        BufferConfig(role=DataRole("ssm_state"), size=ssm_buffer_size),
                     ],
                 )
             )
             lid += 1
+        cache_tiers = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota is not None:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            cache_tiers=cache_tiers,
             layers=layers,
+            max_util_for_resume=max_util_for_resume,
             enable_partial_reuse=enable_partial_reuse,
             commit_min_snapshot=commit_min_snapshot,
         )
@@ -2393,6 +2539,112 @@ class TestSSMSupport(unittest.TestCase):
         resumed_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
         kv_cache.close()
+
+    @requires_cpp_backend
+    def test_resume_protects_resident_reuse_source_before_allocating(self) -> None:
+        """A deferred-state allocation must not evict its own reuse source."""
+        slot_size = 2 << 20
+        cfg = self._make_ssm_config(
+            gpu_quota=2 * slot_size,
+            host_quota=slot_size,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=slot_size,
+            max_util_for_resume=1.0,
+        )
+        self.manager = KVCacheManager(cfg)
+        gpu_stats = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+        host_level = CacheLevel(1)
+        host_stats = _introspection.storage_statistics(self.manager, host_level)[0]
+        self.assertEqual(gpu_stats.total, 2)
+        self.assertEqual(host_stats.total, 1)
+
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(cfg.tokens_per_block)]
+
+        seed = self.manager.create_kv_cache(custom_priority_callback=lambda _ordinal, _lc: 0)
+        self.assertTrue(seed.resume(stream))
+        seed.capacity = len(prompt)
+        seed.history_length = len(prompt)
+        seed.commit(prompt, is_end=True)
+        seed.close()
+
+        reused = self.manager.create_kv_cache(
+            input_tokens=prompt,
+            custom_priority_callback=lambda _ordinal, _lc: 0,
+        )
+        pressure = self.manager.create_kv_cache(custom_priority_callback=lambda _ordinal, _lc: 100)
+        caches = [reused, pressure]
+        try:
+            self.assertEqual(reused.num_committed_tokens, len(prompt))
+            self.assertTrue(pressure.resume(stream))
+            pressure.stop_committing()
+            pressure.suspend()
+
+            gpu_before = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_before = _introspection.storage_statistics(self.manager, host_level)[0]
+            reused_pages, _ = _introspection.active_page_stats(reused)
+            self.assertEqual(gpu_before.free, 0)
+            self.assertEqual(host_before.free, 1)
+            self.assertEqual(reused_pages[GPU_LEVEL], 1)
+
+            # The reuse source has lower eviction priority than the pressure page. Without the
+            # preflight, newGpuSlots() moves that source to the only host slot and activate()
+            # cannot bring it back. Protecting the source makes the pressure page the victim.
+            self.assertTrue(reused.resume(stream))
+        finally:
+            for kv_cache in reversed(caches):
+                if kv_cache.status != _KVCache.Status.CLOSED:
+                    kv_cache.close()
+            stream_holder.synchronize()
+
+    @requires_cpp_backend
+    def test_failed_offload_keeps_gpu_recurrent_pages_evictable(self) -> None:
+        """A full host tier must not drain the GPU eviction queue."""
+        host_level = CacheLevel(1)
+        cfg = self._make_ssm_config(
+            gpu_quota=8 << 20,
+            host_quota=4 << 20,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=1 << 20,
+            max_util_for_resume=1.0,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        gpu_slots = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0].total
+        host_slots = _introspection.storage_statistics(self.manager, host_level)[0].total
+        caches = []
+
+        try:
+            for _ in range(gpu_slots + host_slots):
+                kv_cache = self.manager.create_kv_cache()
+                caches.append(kv_cache)
+                self.assertTrue(kv_cache.resume(stream))
+                kv_cache.stop_committing()
+                kv_cache.suspend()
+
+            gpu_before = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_before = _introspection.storage_statistics(self.manager, host_level)[0]
+            self.assertEqual(gpu_before.free, 0)
+            self.assertEqual(host_before.free, 0)
+            self.assertGreater(gpu_before.evictable, 0)
+
+            blocked = self.manager.create_kv_cache()
+            caches.append(blocked)
+            self.assertFalse(blocked.resume(stream))
+            gpu_after = _introspection.storage_statistics(self.manager, GPU_LEVEL)[0]
+            host_after = _introspection.storage_statistics(self.manager, host_level)[0]
+
+            self.assertEqual(gpu_after.evictable, gpu_before.evictable)
+            self.assertEqual(host_after.free, host_before.free)
+            self.assertEqual(host_after.evictable, host_before.evictable)
+        finally:
+            for kv_cache in reversed(caches):
+                kv_cache.close()
+            stream_holder.synchronize()
 
     def test_no_reuse_with_ssm(self) -> None:
         """input_tokens are accepted but no prefix reuse happens without a prior snapshot."""
