@@ -279,10 +279,11 @@ def test_dflash_rejects_different_effective_rope(source):
         DFlashForCausalLM._validate_uniform_rope(wrapper)
 
 
-def _fake_dflash_mask_wrapper(config, sliding_layers_causal=False):
+def _fake_dflash_mask_wrapper(config, is_dflash2=False, sliding_layers_causal=False):
     wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.config = config
+    wrapper._is_dflash2 = is_dflash2
     wrapper._sliding_layers_causal = sliding_layers_causal
     return wrapper
 

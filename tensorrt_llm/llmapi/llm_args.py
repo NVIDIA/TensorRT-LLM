@@ -2998,6 +2998,45 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
+    def resolve_from_checkpoint(self) -> None:
+        """Fill unset fields from the draft checkpoint's ``config.json``.
+
+        Must run once ``speculative_model`` names a local directory:
+        ``target_layer_ids`` has no usable default, and without it no target
+        hidden states are captured. Called from validation for a local path,
+        and again from model loading once a HF repo id has been downloaded.
+        """
+        if self.speculative_model is None:
+            return
+        draft_config_path = os.path.join(str(self.speculative_model),
+                                         "config.json")
+        if not os.path.exists(draft_config_path):
+            return
+        with open(draft_config_path) as f:
+            dflash_cfg = json.load(f).get("dflash_config", {})
+
+        if self.target_layer_ids is None:
+            layer_ids = dflash_cfg.get("target_layer_ids")
+            if layer_ids is not None:
+                self.target_layer_ids = layer_ids
+        if self.mask_token_id is None:
+            mask_id = dflash_cfg.get("mask_token_id")
+            if mask_id is not None:
+                self.mask_token_id = mask_id
+
+        # The drafter is trained for one block size. Another size still runs,
+        # but acceptance length drops, so warn rather than silently serving a
+        # slower configuration.
+        block_size = dflash_cfg.get("block_size")
+        if block_size is not None and block_size != self.max_draft_len + 1:
+            logger.warning(
+                f"DFlash drafter {self.speculative_model} was trained with "
+                f"block_size={block_size}, but max_draft_len="
+                f"{self.max_draft_len} gives a runtime block size of "
+                f"{self.max_draft_len + 1}. Set max_draft_len="
+                f"{block_size - 1} to match the checkpoint; acceptance length "
+                "is likely to be lower otherwise.")
+
     @property
     def tokens_per_gen_step(self) -> int:
         """DFlash only needs K+1 tokens per gen request (K drafts + 1 bonus).
@@ -6263,26 +6302,9 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, DFlashDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # Resolve target_layer_ids and mask_token_id from draft model config if not set
-                needs_target_layer_ids = self.speculative_config.target_layer_ids is None
-                needs_mask_token_id = self.speculative_config.mask_token_id is None
-                if (needs_target_layer_ids or needs_mask_token_id
-                    ) and self.speculative_config.speculative_model is not None:
-                    draft_config_path = os.path.join(
-                        self.speculative_config.speculative_model,
-                        "config.json")
-                    if os.path.exists(draft_config_path):
-                        with open(draft_config_path) as f:
-                            draft_cfg = json.load(f)
-                        dflash_cfg = draft_cfg.get("dflash_config", {})
-                        if needs_target_layer_ids:
-                            layer_ids = dflash_cfg.get("target_layer_ids")
-                            if layer_ids is not None:
-                                self.speculative_config.target_layer_ids = layer_ids
-                        if needs_mask_token_id:
-                            mask_id = dflash_cfg.get("mask_token_id")
-                            if mask_id is not None:
-                                self.speculative_config.mask_token_id = mask_id
+                # A Hugging Face repo id is not readable yet; CachedModelLoader
+                # calls this again after the drafter is downloaded.
+                self.speculative_config.resolve_from_checkpoint()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):
                 spec_cfg = self.speculative_config
