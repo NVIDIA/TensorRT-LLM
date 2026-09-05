@@ -171,4 +171,14 @@ std::vector<RetentionPriorityAndDuration> KvCacheRetentionConfig::getPerBlockRet
     return perBlockRetentions;
 }
 
+std::optional<std::chrono::milliseconds> KvCacheRetentionConfig::getDiskRetentionMs() const
+{
+    return mDiskRetentionMs;
+}
+
+void KvCacheRetentionConfig::setDiskRetentionMs(std::optional<std::chrono::milliseconds> diskRetentionMs)
+{
+    mDiskRetentionMs = diskRetentionMs;
+}
+
 } // namespace tensorrt_llm::executor
