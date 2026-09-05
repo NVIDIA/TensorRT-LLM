@@ -105,6 +105,13 @@ def _resolve_disagg_transceiver_route(
     return backend, runtime
 
 
+def is_disagg_enabled(
+        cache_transceiver_config: Optional[CacheTransceiverConfig]) -> bool:
+    """Whether this executor participates in disaggregated serving."""
+    return (cache_transceiver_config is not None
+            and cache_transceiver_config.backend is not None)
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -2390,21 +2397,41 @@ def create_kv_cache_compression_manager(
 def compute_max_num_sequences(mapping: Mapping,
                               max_batch_size: int,
                               disable_overlap_scheduler: bool,
-                              enable_overlap_headroom: bool = False) -> int:
+                              enable_overlap_headroom: bool = False,
+                              is_disagg: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    ``enable_overlap_headroom`` is intentionally opt-in. Disaggregated
-    attention-DP needs a second non-PP slot set because the V2 scheduler can
-    backfill seats before the overlap scheduler releases the previous
-    iteration's terminal slots. Pipeline parallelism already sizes the pool
-    by ``pp_size``.
+    The pool must seat every request that can hold a slot at once, so it can
+    never be smaller than the capacity the admission path enforces. On a
+    disaggregated generation server that bound is ``KVCacheManagerV2``'s
+    ``IndexMapper``, which the V2 scheduler consults through
+    ``prepare_disagg_gen_init`` and which is deliberately sized at
+    ``2 * max_num_sequences`` so a batch in KV transfer can overlap a batch
+    that is generating. Sizing seats below that admits requests the pool
+    cannot seat: the KV transfer completes, ``add_slot`` finds the pool full
+    and raises, and because that happens on the executor's event-loop thread
+    the rank dies mid-collective and takes the job down with it. Mirroring the
+    coefficient here keeps the two in step.
+
+    ``enable_overlap_headroom`` is a separate, narrower concern and stays
+    opt-in: disaggregated attention-DP needs a second non-PP slot set because
+    the V2 scheduler can backfill seats before the overlap scheduler releases
+    the previous iteration's terminal slots. Pipeline parallelism already
+    sizes the pool by ``pp_size``.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
     else:
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
-    return max_batch_size * num_micro_batches
+    num_seats = max_batch_size * num_micro_batches
+    if is_disagg:
+        # Keep in step with the IndexMapper coefficient in
+        # KVCacheManagerV2.__init__. max() rather than another multiplication:
+        # the disagg and overlap-headroom factors both cover one extra set of
+        # in-flight sequences, so they overlap rather than compose.
+        num_seats = max(num_seats, max_batch_size * mapping.pp_size * 2)
+    return num_seats
 
 
 def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
@@ -2422,6 +2449,29 @@ def should_enable_disagg_adp_overlap_headroom(
                  and cache_transceiver_config.backend is not None)
     return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
             and not disable_overlap_scheduler)
+
+
+def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
+                                            kv_cache_manager) -> None:
+    """Fail at startup if the seat pool is smaller than what admission allows.
+
+    The KV cache manager is the component that decides whether a request may
+    enter the executor, and every request it admits eventually asks
+    ``SeqSlotManager`` for a seat. Should the pool be the smaller of the two,
+    the shortfall does not surface until the offending request arrives, at
+    which point ``add_slot`` raises on the event-loop thread, that rank stops
+    joining collectives, and its peers hang until the hang detector aborts the
+    job. Comparing the two bounds here converts that into a startup failure.
+    """
+    admission_bound = getattr(kv_cache_manager, "max_admissible_sequences",
+                              None)
+    if admission_bound is None or max_num_sequences >= admission_bound:
+        return
+    raise ValueError(
+        f"Sequence-slot pool ({max_num_sequences} seats) is smaller than the "
+        f"number of sequences {type(kv_cache_manager).__name__} can admit "
+        f"({admission_bound}). Requests would be admitted that cannot be "
+        "seated; see compute_max_num_sequences.")
 
 
 def create_py_executor_instance(
@@ -2459,15 +2509,18 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
+    is_disagg = is_disagg_enabled(cache_transceiver_config)
+
     if max_num_sequences is None:
         max_num_sequences = compute_max_num_sequences(
-            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
+            mapping,
+            max_batch_size,
+            llm_args.disable_overlap_scheduler,
+            is_disagg=is_disagg)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
     )
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
     for key, value in llm_args.extra_resource_managers.items():
         if key in resources:
             raise ValueError(
@@ -2622,6 +2675,7 @@ def create_py_executor_instance(
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
 
+    validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 

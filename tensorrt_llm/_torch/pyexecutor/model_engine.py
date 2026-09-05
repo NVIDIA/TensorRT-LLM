@@ -360,11 +360,15 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Disaggregated attention-DP can backfill a batch before the overlap
-        # scheduler releases the previous batch's terminal sequence slots.
-        from ._util import (compute_max_num_sequences,
+        # Two independent reasons the pool must exceed one forward batch:
+        # disaggregation admits up to the IndexMapper bound, and attention-DP
+        # under overlap can backfill a batch before the previous batch's
+        # terminal slots are released. Both are known before the model loads.
+        from ._util import (compute_max_num_sequences, is_disagg_enabled,
                             should_enable_disagg_adp_overlap_headroom,
                             should_enable_dsv4_adp_dummy_fixes)
+        self._is_disagg = is_disagg_enabled(
+            getattr(llm_args, "cache_transceiver_config", None))
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
@@ -374,6 +378,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
+            is_disagg=self._is_disagg,
         )
         self.dist = dist
         if dist is not None:
@@ -2680,11 +2685,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # The disaggregated attention-DP overlap path opts into larger metadata
-        # buffers. Passing None preserves the established max_num_requests
-        # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
+        # Slot-indexed metadata buffers must span the whole SeqSlotManager pool,
+        # whatever sizes it: py_seq_slot ranges over [0, max_num_seq_slots), and
+        # that exceeds max_num_requests under PP, attention-DP overlap headroom,
+        # and disaggregated serving alike.
+        num_seq_slots = self.max_num_seq_slots
         if no_cache:
             return get_spec_metadata(
                 spec_config,
