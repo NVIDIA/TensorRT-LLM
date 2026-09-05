@@ -23,9 +23,23 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 
 | List | Count | Contents |
 |------|-------|----------|
-| `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 14 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five gen_only-only `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` |
+| `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
+| `MINIMIZE_METRICS` | 17 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five gen_only-only `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+
+Direction is not cosmetic. `prepare_regressive_test_cases` reads it three times,
+in two opposite senses, so a metric on the wrong list is wrong in all three at
+once: `_calculate_diff` picks the sign of the reported delta,
+`calculate_baseline_metrics` keeps P95 (maximize) or P5 (minimize) of the
+smoothed history, and the gate picks which side of the bar counts as a
+regression. TPOT is a latency — "Time per Output Token (ms)", computed by
+`benchmark_serving` as `(e2e_latency - ttft) / (output_len - 1)` — and belongs on
+the minimize side. While its three statistics sat on the maximize side, gating on
+any of them was a provable no-op, because that branch tests
+`new < baseline*(1-threshold)`, which a rising latency never satisfies, and a
+real slowdown was reported as an improvement of the same magnitude
+(nvbugs/6706765 measured p99 TPOT worsening 2.5x, 6.08 → 15.24 ms, and printed
+`diff=+150.66%`).
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 
