@@ -68,8 +68,10 @@ MODEL_PATH_DICT = {
     "qwen3.5_122b_a10b": "Qwen3.5-122B-A10B",
     "qwen3.5_397b_a17b_fp8": "Qwen3.5-397B-A17B-FP8",
     "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
-    # Qwen3.6 (GDN linear-attn MoE, NVFP4)
+    # Qwen3.6 (GDN linear-attn MoE, NVFP4). The _mtp key is the same checkpoint
+    # benchmarked with one-model MTP drafting, so the two can be compared.
     "qwen3.6_35b_a3b_fp4": "Qwen3.6-35B-A3B-NVFP4",
+    "qwen3.6_35b_a3b_fp4_mtp": "Qwen3.6-35B-A3B-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
