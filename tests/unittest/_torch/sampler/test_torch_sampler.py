@@ -39,7 +39,6 @@ from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
-    convert_wordlist,
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -157,7 +156,7 @@ class TestStrategySelection:
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
         ) -> int:  # Torch sampler accesses this, but it does not affect this test
-            return self.sampling_config.beam_width
+            return cast(int, self.sampling_config.beam_width)
 
     def _check_params(self, params: SamplingParams):
         # cf. description of 'top_p' in doc-string of SamplingParams and
@@ -563,7 +562,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
@@ -575,7 +574,7 @@ def test_select_generated_logits(
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
-                return self.sampling_config.beam_width
+                return cast(int, self.sampling_config.beam_width)
 
         def _build_scheduled_requests() -> ScheduledRequests:
             scheduled_requests = ScheduledRequests()
@@ -1004,9 +1003,7 @@ class TestFinishReasons:
                 seq_slot=seq_slot,
                 input_tokens=prompt,
                 max_new_tokens=max_new_tokens,
-                stop_words_list=convert_wordlist(stop_words_list)
-                if stop_words_list is not None
-                else None,
+                stop_words_list=stop_words_list,
                 end_id=end_id,
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
@@ -1018,7 +1015,7 @@ class TestFinishReasons:
 
         def __repr__(self):
             return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.py_stop_words_list=})"
 
         @classmethod
         def build(
@@ -3631,37 +3628,10 @@ class TestTopPDecay:
         # reducing over the empty array, and must still take the array's maximum
         # when it has entries.
         #
-        # Build the request through SamplingParams, the way production does:
-        # _get_sampling_config() converts the flat list into the nested form the
-        # runtime SamplingConfig stores (OptVec<vector<SizeType32>>), which its
-        # setter accepts but a direct flat/None assignment does not.
+        # Build the request through SamplingParams, the way production does.
         request = self._mock_request(SamplingParams(top_p=0.9, beam_width_array=beam_width_array))
         assert _get_max_beam_width(request) == expected_max_width
         # The same request must survive admission: top_p_decay is unset, but
         # TopPDecayHandler.validate_request resolves the sampling params -- and
         # with them the beam width -- before it checks whether decay is active.
         self._make_sampler().validate_request(request)
-
-    @pytest.mark.parametrize(
-        "beam_width_array, expected_max_width",
-        [
-            (None, 1),
-            ([], 1),
-            # [[]] is how "no schedule" reaches the runtime config once the
-            # empty array has been wrapped; it must not be reduced over.
-            ([[]], 1),
-            ([[1]], 1),
-            ([[1, 2]], 2),
-            ([[3, 5, 7]], 7),
-        ],
-    )
-    def test_beam_width_array_max_accepts_nested_shape(
-        self, beam_width_array: list[list[int]] | None, expected_max_width: int
-    ) -> None:
-        # The runtime SamplingConfig stores OptVec<vector<SizeType32>>, so the
-        # nested form reaches _get_max_beam_width. SamplingParams' list[int]
-        # annotation cannot express it, so drive the helper directly with a stub
-        # carrying just the two fields it reads.
-        config = SimpleNamespace(beam_width=1, beam_width_array=beam_width_array)
-        request = cast(LlmRequest, SimpleNamespace(sampling_config=config))
-        assert _get_max_beam_width(request) == expected_max_width

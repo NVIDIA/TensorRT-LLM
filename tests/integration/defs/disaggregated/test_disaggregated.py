@@ -602,9 +602,15 @@ def run_client_tests(example_dir,
                         "Using `asyncio` in Python"
                     ]
                 elif "qwen3_32b_fp8" in test_desc:
+                    # https://nvbugs/6566734: the greedy completion of the raw
+                    # asyncio prompt is near-tied between answering the question
+                    # and continuing it; both are valid non-garbage outputs.
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio in Python is a library"
+                        [
+                            "Asyncio in Python is a library",
+                            "I have read that it is used for asynchronous programming"
+                        ]
                     ]
                 else:
                     expected_strings = [

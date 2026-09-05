@@ -55,6 +55,9 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.executor.admission import \
     DisaggTransferAdmissionController
+from ..disaggregation.executor.coordinator import (DisaggLoopDelegates,
+                                                   DisaggTransferCoordinator,
+                                                   NoopDisaggCoordinator)
 from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
 from ..disaggregation.executor.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
@@ -1138,8 +1141,8 @@ class PyExecutor:
             return
         timed_out = self._pending_timed_out_requests
         self._pending_timed_out_requests = []
-        any_timed_out = any(
-            self.dist.tp_allgather(bool(timed_out), small_payload=True))
+        any_timed_out = bool(
+            self.dist.tp_allgather_int64([bool(timed_out)]).any())
         if any_timed_out:
             self._handle_errors(error_msg="Request timed out (KV transfer)",
                                 requests=timed_out,
@@ -2535,10 +2538,8 @@ class PyExecutor:
                                    and is_dp_broadcast):
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
-            if self.kv_cache_transceiver:
-                fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
-                    self._apply_disagg_transfer_admission(
-                        fitting_disagg_gen_init_requests))
+            fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
+                self.disagg.admit(fitting_disagg_gen_init_requests))
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
@@ -2613,8 +2614,8 @@ class PyExecutor:
             )
 
             # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
-            self._check_disagg_ctx_cache_transfer_status(1)
-            self._check_kv_transfer_timeout()
+            self.disagg.reap_context_sends(1)
+            self.disagg.check_transfer_timeouts()
         else:
             raise RuntimeError(
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
@@ -2645,7 +2646,7 @@ class PyExecutor:
                         and self._agreed_need_adjustment()):
                     self._start_pp_rebalance_drain()
 
-                self._handle_disagg_cache_errors_synced()
+                self.disagg.handle_errors_synced()
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
@@ -2655,9 +2656,8 @@ class PyExecutor:
 
                 self._handle_control_request()
 
-                if self.kv_cache_transceiver:
-                    self._check_disagg_ctx_schedulable_status(new_requests)
-                    self._check_disagg_gen_transfer_status()
+                self.disagg.prepare_context_schedulable(new_requests)
+                self.disagg.poll_gen_transfers()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
@@ -2679,13 +2679,12 @@ class PyExecutor:
                             self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
-                    if self.kv_cache_transceiver:
-                        local_disagg_candidates = getattr(
-                            local_scheduler_output,
-                            "fitting_disagg_gen_init_requests", [])
-                        self._revert_deferred_disagg_gen_init_alloc(
-                            local_disagg_candidates,
-                            fitting_disagg_gen_init_requests)
+                    local_disagg_candidates = getattr(
+                        local_scheduler_output,
+                        "fitting_disagg_gen_init_requests", [])
+                    self.disagg.revert_deferred_gen_init(
+                        local_disagg_candidates,
+                        fitting_disagg_gen_init_requests)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -2696,11 +2695,8 @@ class PyExecutor:
                     self._pause_recompute_paused_requests(scheduled_batch)
 
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
-                if self.kv_cache_transceiver:
-                    self._prepare_disagg_gen_init(
-                        fitting_disagg_gen_init_requests)
-
-                    self._check_disagg_transfer_progress_when_idle()
+                self.disagg.receive_gen_init(fitting_disagg_gen_init_requests)
+                self.disagg.poll_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -2741,10 +2737,7 @@ class PyExecutor:
 
                     self._add_inflight_ids(scheduled_batch)
 
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
+                    self.disagg.prepare_transmission_completed(scheduled_batch)
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
@@ -2961,7 +2954,7 @@ class PyExecutor:
                     self._maybe_finish_pp_rebalance()
 
                 if not can_queue and self._pp_ring_is_drained():
-                    self._pace_idle_disagg_loop()
+                    self.disagg.pace_idle()
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -3363,8 +3356,7 @@ class PyExecutor:
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
                 # _handle_responses sees the request before it is terminated.
-                if self.kv_cache_transceiver:
-                    self._check_disagg_ctx_cache_transfer_status(0)
+                self.disagg.reap_context_sends(0)
                 sample_state_scheduled_requests = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
@@ -3506,8 +3498,8 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size,
-                                                    small_payload=True)
+            tp_batch_sizes = self.dist.tp_allgather_int64(
+                [scheduled_batch.batch_size])[:, 0].tolist()
             can_queue = 0 not in tp_batch_sizes
             can_queue_this_rank = scheduled_batch.batch_size > 0
         else:
@@ -3605,6 +3597,38 @@ class PyExecutor:
         if self._is_kv_manager_v2:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
+
+    @property
+    def disagg(self) -> DisaggTransferCoordinator:
+        """Disagg transfer entry points; built on first use."""
+        coordinator = self.__dict__.get("_disagg_coordinator")
+        if coordinator is None:
+            coordinator = self._build_disagg_coordinator()
+            self._disagg_coordinator = coordinator
+        return coordinator
+
+    def _build_disagg_coordinator(self) -> DisaggTransferCoordinator:
+        if getattr(self, "kv_cache_transceiver", None) is None:
+            return NoopDisaggCoordinator()
+        return DisaggTransferCoordinator(
+            DisaggLoopDelegates(
+                handle_errors_synced=self._handle_disagg_cache_errors_synced,
+                prepare_context_schedulable=self.
+                _check_disagg_ctx_schedulable_status,
+                poll_gen_transfers=self._check_disagg_gen_transfer_status,
+                check_transfer_timeouts=self._check_kv_transfer_timeout,
+                admit=self._apply_disagg_transfer_admission,
+                revert_deferred_gen_init=self.
+                _revert_deferred_disagg_gen_init_alloc,
+                receive_gen_init=self._prepare_disagg_gen_init,
+                poll_progress_when_idle=self.
+                _check_disagg_transfer_progress_when_idle,
+                prepare_transmission_completed=self.
+                _prepare_disagg_gen_transmission_complete,
+                send_completed_context=self._send_disagg_ctx_kv_async,
+                reap_context_sends=self._check_disagg_ctx_cache_transfer_status,
+                pace_idle=self._pace_idle_disagg_loop,
+            ))
 
     def _get_disagg_transfer_admission_controller(
             self) -> DisaggTransferAdmissionController:
@@ -3839,10 +3863,9 @@ class PyExecutor:
 
         self._handle_control_request()
 
-        if self.kv_cache_transceiver:
-            self._check_disagg_ctx_schedulable_status(new_requests)
-            self._check_disagg_gen_transfer_status()
-            self._check_kv_transfer_timeout()
+        self.disagg.prepare_context_schedulable(new_requests)
+        self.disagg.poll_gen_transfers()
+        self.disagg.check_transfer_timeouts()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -3937,13 +3960,12 @@ class PyExecutor:
         if self.kv_cache_transceiver:
             wait_for_disagg_gen_transfer_progress = False
             admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
-                self._apply_disagg_transfer_admission(
-                    scheduler_fitting_disagg_gen_init_requests))
+                self.disagg.admit(scheduler_fitting_disagg_gen_init_requests))
             # Prepare KV cache manager resources only for requests admitted
             # into the transfer window this iteration.
-            self._prepare_disagg_gen_init(admitted_disagg_gen_init_requests)
+            self.disagg.receive_gen_init(admitted_disagg_gen_init_requests)
 
-            self._check_disagg_transfer_progress_when_idle()
+            self.disagg.poll_progress_when_idle()
 
             # In gen-only benchmark mode, all requests must fit in KV cache
             # simultaneously. If some requests are stuck in INIT state and the
@@ -4305,7 +4327,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
-                self._handle_disagg_cache_errors_synced()
+                self.disagg.handle_errors_synced()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
@@ -4359,11 +4381,8 @@ class PyExecutor:
                 can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
+                    self.disagg.prepare_transmission_completed(scheduled_batch)
                     if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
-
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
@@ -4497,8 +4516,7 @@ class PyExecutor:
                     finished_requests = self._handle_responses()
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
-                    if self.kv_cache_transceiver:
-                        self._check_disagg_ctx_cache_transfer_status(0)
+                    self.disagg.reap_context_sends(0)
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
@@ -4551,7 +4569,7 @@ class PyExecutor:
                 self._flush_iter_stats_synced()
 
                 if not can_queue:
-                    self._pace_idle_disagg_loop()
+                    self.disagg.pace_idle()
 
                 self.iter_counter += 1
 
@@ -5134,7 +5152,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
-                self._handle_disagg_cache_errors_synced()
+                self.disagg.handle_errors_synced()
 
                 # Need to wait for the copy of previous iteration before
                 # modifying any host memory copied to GPU. Scheduler V2
@@ -5177,10 +5195,7 @@ class PyExecutor:
                     scheduled_batch)
 
                 if can_queue:
-                    if self.kv_cache_transceiver:
-                        # For generation requests which have completed KV cache transfer
-                        self._prepare_disagg_gen_transmission_complete(
-                            scheduled_batch)
+                    self.disagg.prepare_transmission_completed(scheduled_batch)
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
@@ -5427,7 +5442,7 @@ class PyExecutor:
                 self._kv_connector_terminate_requests()
 
                 if not can_queue:
-                    self._pace_idle_disagg_loop()
+                    self.disagg.pace_idle()
 
                 self.iter_counter += 1
 
@@ -5698,8 +5713,6 @@ class PyExecutor:
             # can be allowed once its semantics are defined (TRTLLM-14792).
             beam_width_array = sampling_config.beam_width_array
             if beam_width_array:
-                if isinstance(beam_width_array[0], (list, tuple)):
-                    beam_width_array = beam_width_array[0]
                 if any(b < a
                        for a, b in zip(beam_width_array, beam_width_array[1:])):
                     raise ValueError(
@@ -6104,10 +6117,10 @@ class PyExecutor:
              for req in context_requests]) + num_scheduled_generation_requests
         # Note: We use tp_allgather instead of tp_cp_allgather because we want to
         # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather([
+        responses_list = self.dist.tp_allgather_int64([
             num_scheduled_context_requests, num_scheduled_generation_requests,
             num_scheduled_tokens, num_real_generation_requests
-        ])
+        ]).tolist()
         all_ranks_num_real_generation_requests = [
             response[3] for response in responses_list
         ]
@@ -6343,13 +6356,13 @@ class PyExecutor:
     def _get_ctx_mla_kv_len_cap(self):
         """Cap on the summed context attended-KV length (total_kv_len) per forward step, cached.
 
-        The KV-cache estimator is the single decision point: it reserves the fp8 context-MLA workspace only
-        when KV-cache reuse can grow it past the profiled floor, and carries the exact token cap that reserve
+        The KV-cache estimator is the single decision point: it reserves context-MLA workspace only when
+        cached tokens can grow it past the profiled floor, and carries the exact token cap that reserve
         covers onto the KV manager as `fp8_ctx_mla_kv_len_cap` (`min(L_cap, budget/(k+w))`). The scheduler
         reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
-        A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
-        or estimation skipped -- means no admission cap is applied. A carried 0 is a real cap (a budget so
+        A carried value of None -- no affected MLA workspace or no reservation needed -- means no admission
+        cap is applied. A carried 0 is a real cap (a budget so
         tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
@@ -6366,7 +6379,7 @@ class PyExecutor:
         return self._ctx_mla_kv_len_cap
 
     def _warn_if_ctx_mla_kv_len_cap_degenerate(self) -> None:
-        """Surface an fp8 context-MLA admission cap too tight to batch context requests on.
+        """Surface a context-MLA admission cap too tight to batch context requests on.
 
         `_cap_context_by_total_kv_len` logs its deferrals at debug level, so a deployment whose budget
         lands here sees context throughput collapse with nothing in the log at default level. Called from
@@ -6394,7 +6407,7 @@ class PyExecutor:
         else:
             return
         logger.warning(
-            f"fp8 context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
+            f"context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
             f"{consequence}. Prefill batching is degraded, not incorrect -- generation is unaffected "
             "and requests still complete. The cap is the workspace reserve the KV-cache estimator "
             "could afford divided by its per-token cost, so the KV cache memory budget is the binding "
@@ -6417,8 +6430,9 @@ class PyExecutor:
         return min(attended, ctx_req.orig_prompt_len)
 
     def _cap_context_by_total_kv_len(self, context_requests):
-        """Trim scheduled context requests so their summed attended KV length stays within the fp8
-        context-MLA workspace reservation (KV-cache reuse can push total_kv_len far past `max_num_tokens`).
+        """Trim context requests to the summed attended-KV workspace reservation.
+
+        Cached prefixes can push total_kv_len far past `max_num_tokens`.
         The first request is always kept: it attends at most `max_seq_len` and at most its pool, both covered
         by the cap, so one request always fits and forward progress is guaranteed. Deferred requests stay
         active and retry next iteration, mirroring `_waiting_requests`.
@@ -6432,7 +6446,7 @@ class PyExecutor:
             if i > 0 and cumulative > cap:
                 logger.debug(
                     f"Deferring {len(context_requests) - i} context request(s): summed attended "
-                    f"KV length {cumulative} would exceed the fp8 context-MLA workspace cap {cap}."
+                    f"KV length {cumulative} would exceed the context-MLA workspace cap {cap}."
                 )
                 return context_requests[:i]
         return context_requests
@@ -6486,8 +6500,8 @@ class PyExecutor:
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
 
-        # Cap summed context attended-KV length so the fp8 context-MLA attention workspace stays within the
-        # headroom the estimator reserved for it (no-op for non-fp8-MLA models).
+        # Cap summed context attended-KV length so the context-MLA attention workspace stays within the
+        # headroom the estimator reserved for it (a no-op for unaffected models).
         scheduled_context_requests = self._cap_context_by_total_kv_len(
             scheduled_context_requests)
 
@@ -6571,7 +6585,7 @@ class PyExecutor:
             warmup(self.resource_manager)
 
     def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
-        """Queue encoder work, serializing it with decoder work under TP."""
+        """Queue encoder work, joining the launch before the caller runs the decoder."""
         executor = self.encoder_launch_executor
         if executor is None:
             raise RuntimeError("Encoder launch executor is unavailable.")
@@ -6607,8 +6621,18 @@ class PyExecutor:
                 self.inflight_req_ids.erase(request.request_id)
             return
 
+        # torch.fx's tracing state is process-global, so a dynamo compile on
+        # either thread captures the other's concurrent module calls
+        # (https://nvbugs/6683840). Join the launch, but leave ready_event
+        # unsynchronized so encoder kernels still overlap decoder work.
+        try:
+            result = future.result()
+        except Exception as e:
+            self._finish_failed_encoder_step(requests, e)
+            return
+
         self.pending_encoder_steps.append(
-            PendingEncoderStep(requests=requests, future=future))
+            PendingEncoderStep(requests=requests, future=future, result=result))
 
     @nvtx_range("_poll_encoder_steps")
     def _poll_encoder_steps(self) -> None:
@@ -7219,13 +7243,27 @@ class PyExecutor:
 
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=dummy_request_ids,
-                token_nums=token_nums,
-                is_gen=self._adp_dummy_is_gen,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            try:
+                dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                    request_ids=dummy_request_ids,
+                    token_nums=token_nums,
+                    is_gen=self._adp_dummy_is_gen,
+                    prepare_resource=True,
+                    max_num_draft_tokens=self.max_total_draft_tokens,
+                )
+            except OutOfPagesError:
+                dummy_requests = None
+            if not dummy_requests:
+                # Both KV cache managers report allocation failure by returning
+                # None, expecting the caller to retry on a later iteration. An
+                # empty batch is safe here because _can_queue() allgathers batch
+                # sizes, so every rank skips the forward pass together.
+                logger.warning_once(
+                    "Cannot allocate the attention DP pad dummy request; this "
+                    "rank schedules an empty batch and the fleet will retry.",
+                    key="adp_pad_dummy_alloc_failed")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -7648,10 +7686,9 @@ class PyExecutor:
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
         # Order matters: reaping before the connector registers its transfer
         # can release a request the connector still needs.
-        self._send_disagg_ctx_kv_async(scheduled_requests)
+        self.disagg.send_completed_context(scheduled_requests)
         self._save_kv_to_connector_async(scheduled_requests)
-        if self.kv_cache_transceiver:
-            self._check_disagg_ctx_cache_transfer_status(0)
+        self.disagg.reap_context_sends(0)
 
     def _send_disagg_ctx_kv_async(self,
                                   scheduled_requests: List[LlmRequest]) -> None:

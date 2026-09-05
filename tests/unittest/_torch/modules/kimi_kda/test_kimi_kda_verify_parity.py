@@ -23,12 +23,11 @@ import torch
 
 pytest.importorskip("fla")
 
+from kimi_kda_test_utils import get_production_decode_kernel_path
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (
-    get_production_decode_kernel_path,
-)
 
 
 class _Cfg:
@@ -82,11 +81,12 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
         ),
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=2,
         seq_lens=torch.tensor([1, 1]),
         kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
     )
 
-    output = attention(torch.empty(2, _Cfg.hidden_size), metadata)
+    output = attention(torch.empty(2, _Cfg.hidden_size, dtype=torch.bfloat16), metadata)
 
     assert output.shape == (2, _Cfg.hidden_size)
     assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
@@ -112,6 +112,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         conv_pool: torch.Tensor,
         ssm_pool: torch.Tensor,
         slot_indices: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         captured["slot_indices"] = slot_indices
         return torch.zeros_like(hidden_states)
@@ -140,6 +141,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     metadata = SimpleNamespace(
         num_contexts=1,
         num_ctx_tokens=1,
+        num_tokens=4,
         seq_lens=torch.tensor([1, 1], dtype=torch.int),
         seq_lens_cuda=torch.tensor([1, 1], dtype=torch.int, device="cuda"),
         kv_cache_manager=manager,
@@ -191,6 +193,7 @@ def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -
         mamba_metadata=mamba_metadata,
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=batch,
         seq_lens=torch.ones(batch, device=slot_indices.device, dtype=torch.int32),
         kv_cache_manager=cache_manager,
     )
@@ -212,6 +215,7 @@ def _prefill_metadata(
         mamba_metadata=mamba_metadata,
         num_contexts=batch,
         num_ctx_tokens=int(cu_seqlens[-1]),
+        num_tokens=int(cu_seqlens[-1]),
         seq_lens=cu_seqlens[1:] - cu_seqlens[:-1],
         kv_cache_manager=cache_manager,
     )
@@ -357,7 +361,8 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     ref_ssm = cache.temporal.clone()
     ref_outs, ref_conv_steps, ref_ssm_steps = [], [], []
     for t in range(t_steps):
-        out = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        core = runtime.forward_decode(x[:, t], ref_conv, ref_ssm, slot_indices)
+        out = runtime._project_output(core)
         ref_outs.append(out)
         ref_conv_steps.append(ref_conv.index_select(0, slot_indices).clone())
         ref_ssm_steps.append(ref_ssm.index_select(0, slot_indices).clone())
@@ -365,14 +370,24 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # --- Verify path: one call, intermediates into the scratch buffers. ---
     pristine_conv = cache.conv.clone()
     pristine_ssm = cache.temporal.clone()
-    out_verify = runtime.forward_verify(
+    verify_core = torch.empty(
+        batch * t_steps,
+        h,
+        lin["head_dim"],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    verify_result = runtime.forward_verify(
         x.reshape(batch * t_steps, cfg.hidden_size),
         t_steps,
         cache,
         cache.conv,
         cache.temporal,
         slot_indices,
+        output=verify_core,
     )
+    assert verify_result is verify_core
+    out_verify = runtime._project_output(verify_core)
 
     # Live pools must be untouched by verification.
     torch.testing.assert_close(cache.conv, pristine_conv, rtol=0, atol=0)

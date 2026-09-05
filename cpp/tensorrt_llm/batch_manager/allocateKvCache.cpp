@@ -36,7 +36,7 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
         {
             auto const requestId = llmReq->mRequestId;
             auto const promptLen = llmReq->mPromptLen;
-            auto const reqBeamWidth = llmReq->mSamplingConfig.beamWidth;
+            auto const reqBeamWidth = llmReq->mSamplingConfig.getBeamWidth();
             auto draftLength = llmReq->getNumDraftTokens();
 
             // Allocate/Reuse KV cache

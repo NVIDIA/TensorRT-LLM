@@ -57,7 +57,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs,
+from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
@@ -403,6 +404,9 @@ class BaseLLM:
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
                 ['_mpi_session', 'backend'])
+            if issubclass(llm_args_cls, TorchLlmArgs):
+                # Values are vetted by TorchLlmArgs._drop_removed_args.
+                valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
@@ -1988,7 +1992,6 @@ class _TorchLLM(BaseLLM):
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
@@ -2008,14 +2011,13 @@ class _TorchLLM(BaseLLM):
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that only arguments supported by the PyTorch backend are passed.
         """
-        torchllm_fields = set(TorchLlmArgs.model_fields.keys())
+        # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
+        accepted_keys = (set(TorchLlmArgs.model_fields.keys())
+                         | TORCH_LLMARGS_REMOVED_ARGS
+                         | {'_mpi_session', 'backend'})
 
         # Check if any arguments not supported by the PyTorch backend are passed.
-        unsupported_args = [
-            key for key in kwargs
-            if key not in torchllm_fields and key not in ('_mpi_session',
-                                                          'backend')
-        ]
+        unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
             raise ValueError(

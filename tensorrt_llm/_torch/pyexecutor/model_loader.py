@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
@@ -86,6 +87,12 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+)
+# Mistral realizes a per-layer attention window from its checkpoint config.
+# The dense profile is qualified only when every layer runs full attention.
+_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    sliding_windows=frozenset({"none"}),
 )
 
 
@@ -578,6 +585,19 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="mistral-for-causal-lm-bf16-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_mistral",
+                "MistralForCausalLM"),
+            architecture="MistralForCausalLM",
+            model_type="mistral",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS,
+        ),
     ))
 
     @classmethod
@@ -803,6 +823,21 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            requires_standard_hf_loading = any(
+                getattr(module, "_requires_standard_hf_loading", False)
+                for module in model.modules())
+            # Pinned-host parameters must be materialized and filled in place.
+            # AUTO uses the HF mapper that preserves their stable addresses;
+            # AUTO may still resolve to MX, so check the resolved format too.
+            uses_standard_hf_loader = (load_format == LoadFormat.AUTO
+                                       and checkpoint_loader.checkpoint_format
+                                       != "MX")
+            if requires_standard_hf_loading and not uses_standard_hf_loader:
+                raise ValueError(
+                    "Host-resident model weights currently require the standard "
+                    "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
+                    "loaders cannot materialize them")
 
             loads_draft_weights = (
                 self.spec_config is not None

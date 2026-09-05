@@ -51,8 +51,6 @@ class ModelConfig:
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: dict = None
     skip_cross_kv: bool = False
-    num_medusa_heads: int = 0
-    max_medusa_tokens: int = 0
     paged_state: bool = True
     mamba_conv1d_plugin: bool = True
     conv_kernel: int = 0

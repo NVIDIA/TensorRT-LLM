@@ -15,12 +15,22 @@ l0_b300:
       stage: pre_merge
       backend: pytorch
   tests:
-  # ------------- PyTorch tests ---------------
+  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
+  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
+  # is what picks them up:
+  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
+  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
+  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
+  #               rebind mpi4py's serializer at import time, which applies process-wide on
+  #               every stage that collects them, including where the tests themselves skip.
+  # The sparse/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
   - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
+  - unittest/_torch/modeling/test_qsa_runtime_wiring.py
+  - unittest/_torch/modeling/test_qwen4_exp_support.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -32,8 +42,12 @@ l0_b300:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
-  - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_top_k.py
+  - unittest/_torch/modules/test_qwen4_exp_hyper_connection.py
+  - unittest/_torch/modules/test_qwen4_exp_ple.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_kernels.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
