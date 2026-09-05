@@ -23,3 +23,5 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_1gpu_mtp3_trtllm_ple_offload
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
+  - unittest/_torch/modules/test_flashinfer_fused_add_add_rmsnorm.py
+  - unittest/_torch/modeling/test_modeling_deepseek_r1.py

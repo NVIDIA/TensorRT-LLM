@@ -53,8 +53,10 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
@@ -79,6 +81,19 @@ from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
+
+if IS_FLASHINFER_AVAILABLE:
+    import flashinfer.norm as flashinfer_norm
+else:
+    flashinfer_norm = None
+
+_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM_ENV = (
+    "TRTLLM_ENABLE_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM")
+
+
+def _is_wideep_flashinfer_add_add_rmsnorm_enabled() -> bool:
+    """Enable the WideEP fusion by default while preserving a zero rollback."""
+    return os.environ.get(_WIDEEP_FLASHINFER_ADD_ADD_RMSNORM_ENV, "1") == "1"
 
 
 @triton.jit
@@ -1127,8 +1142,13 @@ class Deepseekv3MoE(nn.Module):
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         return quant_config
 
-    def compute_routed_output(self, hidden_states, hidden_states_fp4,
-                              all_rank_num_tokens, do_finalize):
+    def compute_routed_output(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_fp4: Optional[Fp4QuantizedTensor],
+        all_rank_num_tokens: Optional[list[int]],
+        do_finalize: bool,
+    ) -> torch.Tensor | list[torch.Tensor | None]:
         # max-throughput
         use_dp_padding = False
         # Add DP padding on SM120 for context comm performance
@@ -1160,7 +1180,9 @@ class Deepseekv3MoE(nn.Module):
         all_rank_num_tokens: Optional[list[int]] = None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
-    ) -> torch.Tensor:
+        defer_shared_routed_add: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor
+                                                                 | None]:
         if not do_finalize:
             assert not self.use_dp
 
@@ -1196,6 +1218,24 @@ class Deepseekv3MoE(nn.Module):
             # routed_output already contains the shared expert contribution.
             shared_output = None
             routed_output = _compute_routed_output()
+
+        if defer_shared_routed_add:
+            can_defer = (do_finalize and self.use_dp and self.allreduce is None
+                         and isinstance(shared_output, torch.Tensor)
+                         and isinstance(routed_output, torch.Tensor)
+                         and shared_output.is_cuda and routed_output.is_cuda
+                         and shared_output.device == hidden_states.device
+                         and routed_output.device == hidden_states.device
+                         and shared_output.dim() == 2
+                         and routed_output.dim() == 2
+                         and shared_output.shape == hidden_states.shape
+                         and routed_output.shape == hidden_states.shape
+                         and shared_output.dtype == torch.bfloat16
+                         and routed_output.dtype == torch.bfloat16
+                         and shared_output.is_contiguous()
+                         and routed_output.is_contiguous())
+            if can_defer:
+                return shared_output, routed_output
 
         if not do_finalize:
             return [shared_output, *routed_output]
@@ -1299,6 +1339,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_fusion = os.environ.get(
             "TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
         self.enable_fusion &= not self.enable_attention_dp
+        self.enable_wideep_flashinfer_add_add_rmsnorm = (
+            _is_wideep_flashinfer_add_add_rmsnorm_enabled())
 
         # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(
@@ -1391,6 +1433,40 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                                 dtype=config.torch_dtype,
                                                 quantize_type=nvfp4_norm)
         self.next_layer_layernorm: RMSNorm = None
+
+    def _can_use_wideep_flashinfer_add_add_rmsnorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        do_finalize: bool,
+        spec_metadata: Optional[SpecMetadata],
+    ) -> bool:
+        return (self.enable_wideep_flashinfer_add_add_rmsnorm and do_finalize
+                and self.mapping.is_multi_node() and self.enable_attention_dp
+                and is_sm_100f() and IS_FLASHINFER_AVAILABLE
+                and IS_CUTLASS_DSL_AVAILABLE and flashinfer_norm is not None
+                and not getattr(flashinfer_norm, "_USE_CUDA_NORM", True)
+                and self.model_config.moe_backend == "CUTEDSL"
+                and isinstance(self.mlp, Deepseekv3MoE)
+                and self.mlp.allreduce is None and hidden_states.is_cuda
+                and residual.is_cuda and hidden_states.device == residual.device
+                and hidden_states.dim() == 2 and residual.dim() == 2
+                and hidden_states.shape == residual.shape
+                and hidden_states.shape[-1] == 7168
+                and hidden_states.dtype == torch.bfloat16
+                and residual.dtype == torch.bfloat16
+                and hidden_states.is_contiguous() and residual.is_contiguous()
+                and not self.fusion_config.POST_MOE_FUSION
+                and spec_metadata is None
+                and self.next_layer_layernorm is not None and
+                self.next_layer_layernorm.weight.device == hidden_states.device
+                and self.next_layer_layernorm.weight.dtype == torch.bfloat16
+                and self.next_layer_layernorm.weight.shape == (7168, )
+                and self.next_layer_layernorm.weight.is_contiguous()
+                and self.next_layer_layernorm.nvfp4_scale is None
+                and not self.next_layer_layernorm.return_hp_output
+                and not self.next_layer_layernorm.use_gemma
+                and not self.next_layer_layernorm.use_cuda_tile)
 
     def _get_decoder_layer_quant_config(
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
@@ -1507,7 +1583,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         spec_metadata: Optional[SpecMetadata] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+        def _run_MoE(
+            hidden_states: torch.Tensor,
+            hidden_states_fp4: Optional[Fp4QuantizedTensor],
+            do_finalize: bool,
+            defer_shared_routed_add: bool,
+        ) -> torch.Tensor | tuple[torch.Tensor,
+                                  torch.Tensor] | list[torch.Tensor | None]:
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
@@ -1516,6 +1598,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                           or self.mapping.tp_size == 1)),
                 do_finalize=do_finalize,
+                defer_shared_routed_add=defer_shared_routed_add,
             )
 
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1542,9 +1625,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
-        hidden_states = _run_MoE(hidden_states,
-                                 hidden_states_fp4=None,
-                                 do_finalize=do_finalize)
+        defer_shared_routed_add = self._can_use_wideep_flashinfer_add_add_rmsnorm(
+            hidden_states, residual, do_finalize, spec_metadata)
+        # This gate is a correctness boundary: the deferred path skips the
+        # normal post-MoE add and returns immediately after the fused norm.
+        hidden_states = _run_MoE(
+            hidden_states,
+            hidden_states_fp4=None,
+            do_finalize=do_finalize,
+            defer_shared_routed_add=defer_shared_routed_add,
+        )
+
+        if defer_shared_routed_add and isinstance(hidden_states, tuple):
+            shared_output, routed_output = hidden_states
+            return self.next_layer_layernorm.forward_with_additional_residual(
+                shared_output, routed_output, residual)
 
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
