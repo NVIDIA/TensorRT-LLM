@@ -1140,3 +1140,67 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+@pytest.mark.parametrize(
+    "setting, expected",
+    [
+        ("", None),
+        ("1", 0.0),
+        ("on", 0.0),
+        ("true", 0.0),
+        ("zero", 0.0),
+        ("0", 0.0),
+        ("-2.5", -2.5),
+        ("garbage", None),
+    ],
+)
+def test_kv_fill_value_parsing(setting, expected):
+    """The knobs are off when unset and ignore anything they cannot parse."""
+    assert kv_cache_v2_module._parse_kv_fill_value(setting, "TEST_VAR") == expected
+
+
+def test_kv_fill_value_parsing_nan():
+    value = kv_cache_v2_module._parse_kv_fill_value("nan", "TEST_VAR")
+    assert value is not None and np.isnan(value)
+
+
+def test_fill_kv_pages_float_buffer():
+    buffer = torch.ones(4, 3, 2)
+    kv_cache_v2_module._fill_kv_pages(buffer, [1, 3], 0.0)
+    assert torch.equal(buffer[0], torch.ones(3, 2))
+    assert torch.equal(buffer[1], torch.zeros(3, 2))
+    assert torch.equal(buffer[2], torch.ones(3, 2))
+    assert torch.equal(buffer[3], torch.zeros(3, 2))
+
+
+def test_fill_kv_pages_packed_buffer():
+    """A packed sub-byte pool is int8: zero stays zero, anything else poisons."""
+    buffer = torch.ones(3, 4, dtype=torch.int8)
+    kv_cache_v2_module._fill_kv_pages(buffer, [0], 0.0)
+    kv_cache_v2_module._fill_kv_pages(buffer, [2], float("nan"))
+    assert torch.equal(buffer[0], torch.zeros(4, dtype=torch.int8))
+    assert torch.equal(buffer[1], torch.ones(4, dtype=torch.int8))
+    assert torch.equal(buffer[2], torch.full((4,), 0x7F, dtype=torch.int8))
+
+
+def test_fill_kv_pages_empty_is_a_noop():
+    buffer = torch.ones(2, 2)
+    kv_cache_v2_module._fill_kv_pages(buffer, [], 0.0)
+    assert torch.equal(buffer, torch.ones(2, 2))
+
+
+def test_guard_page_accessors_report_no_guard_by_default():
+    """With the guard page off, backends see ``None`` and keep page 0."""
+    manager = SimpleNamespace(_guard_page_by_layer={})
+    assert KVCacheManagerV2.guard_page_index(manager, 0) is None
+    assert KVCacheManagerV2.guard_page_indices(manager) == frozenset()
+
+
+def test_guard_page_accessors_report_reserved_pages():
+    # Layers in one pool can carry different page-index scales, so one
+    # reservation can surface as more than one index.
+    manager = SimpleNamespace(_guard_page_by_layer={0: 7, 1: 14, 2: 7})
+    assert KVCacheManagerV2.guard_page_index(manager, 1) == 14
+    assert KVCacheManagerV2.guard_page_index(manager, 9) is None
+    assert KVCacheManagerV2.guard_page_indices(manager) == frozenset({7, 14})

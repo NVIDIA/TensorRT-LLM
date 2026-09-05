@@ -597,7 +597,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # FlashInfer may dereference page IDs before applying window_left, so
         # keep masked positions in range. The SWA mask excludes their values
         # from the attention result.
-        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX, 0)
+        #
+        # Page 0 is a live page owned by whichever request holds it, so parking
+        # there has the kernel dereference a stranger's keys and values, with
+        # the mask as the only thing keeping them out of the result. When the
+        # KV cache manager has reserved a guard page (TRTLLM_KV_GUARD_PAGE),
+        # park on that instead: a page no request can own, holding a known
+        # pattern. The default -- no guard page -- keeps page 0.
+        page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX,
+                                  self._swa_park_page(layer_idx))
+
+    def _swa_park_page(self, layer_idx: int) -> int:
+        """Page index that masked-out entries are pointed at for this layer."""
+        guard = getattr(self.kv_cache_manager, 'guard_page_index', None)
+        if guard is None:
+            return 0
+        page = guard(layer_idx)
+        return 0 if page is None else int(page)
 
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.

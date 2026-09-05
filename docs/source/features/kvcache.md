@@ -214,6 +214,35 @@ The property ```copy_on_partial_reuse``` specifies whether a block should be cop
 
 Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as ```max_attention_window = [4096,256]```. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.
 
+### Debugging Aids
+
+Two opt-in environment variables help when a result looks like it came from KV
+pages the request does not own -- a stale page handed over by a previous owner,
+or a page-table slot the attention mask was supposed to cover. Both are off
+unless set, and when unset nothing about allocation, page contents or reported
+block counts changes. Both are diagnostic only: they cost extra work and are
+not meant for production serving. They apply to `KVCacheManagerV2`.
+
+Each accepts the same fill value: `1`, `on`, `true` or `zero` for zeros, `nan`
+for NaN (any uncovered read then fails immediately and visibly rather than
+producing a plausible number), or any number for that constant.
+
+- `TRTLLM_KV_GUARD_PAGE` reserves one page that no request can be given, fills
+  it with the chosen pattern, and publishes its per-layer index. Attention
+  backends that have to keep masked-out page-table entries in range park them
+  on this page instead of on page 0, which is a live page belonging to whatever
+  request holds it. The mask still decides the result; what changes is that a
+  masking bug reads a recognisable pattern instead of a stranger's keys and
+  values. Costs one page and one index-mapper slot.
+- `TRTLLM_KV_FRESH_PAGE_FILL` writes the pattern into pages as a request is
+  given them, so a read past what the request itself wrote returns the pattern
+  rather than the previous owner's data. Pages covering the reused/committed
+  prefix are never overwritten. Costs one fill per layer per new allocation
+  plus a device synchronization.
+
+Both announce themselves once at warning level when they take effect, so a log
+shows whether the switch actually did anything.
+
 ### Deprecated Properties
 
 Property ```use_uvm``` has been deprecated and will be removed in a future release.
