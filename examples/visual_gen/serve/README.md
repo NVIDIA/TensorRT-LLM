@@ -42,6 +42,9 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
    trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
 
+   # Cosmos3 — configs live one directory up, shared with the offline examples
+   trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml > /tmp/serve.log 2>&1 &
 
@@ -60,6 +63,7 @@ Current supported & tested models:
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
 5. Qwen-Image for image generation (t2i)
+6. Cosmos3 for video (t2v, i2v/ti2v, v2v), video with synchronized audio (t2av), and image (t2i) generation — see [Cosmos3](#cosmos3-t2v--i2v--v2v--t2av--t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
@@ -251,6 +255,212 @@ python delete_video.py http://your-server:8000/v1
 3. Delete the video
 4. Verify video returns `NotFoundError`
 5. Test deletion of non-existent video
+
+---
+
+## Cosmos3 (T2V / I2V / V2V / T2AV / T2I)
+
+Cosmos3 serves every generation mode from a single checkpoint. Nothing selects
+the mode but the request itself:
+
+| Mode | Endpoint | What selects it |
+|------|----------|-----------------|
+| T2V — text-to-video | `/v1/videos/generations`, `/v1/videos` | default |
+| I2V / TI2V — image-conditioned video | same | `input_reference` whose content is an image |
+| V2V — video-conditioned video | same | `input_reference` whose content is a video |
+| T2AV — video with synchronized audio | same | `extra_params: {"enable_audio": true}` |
+| T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
+| Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` |
+
+`input_reference` is classified by content, not by filename or field — image
+bytes route to I2V, video bytes to V2V. This section is the served analogue of
+the offline usage block in
+[`../models/cosmos3/README.md`](../models/cosmos3/README.md).
+
+### Starting the server
+
+Cosmos3 deployment configs live in `../configs/` (one level up from here) and
+are shared with the offline examples:
+
+```bash
+# 1 GPU (Nano or Super)
+trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# 4 GPU / 8 GPU (Super): trtllm-serve spawns the workers itself, no torchrun/mpirun
+trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
+trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gpu.yaml
+
+# 1 GPU text-to-image deployment: warms the 1024x1024 single-frame shape
+# instead of the omni video shape
+trtllm-serve nvidia/Cosmos3-Super-Text2Image-4Step --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
+```
+
+`nvidia/Cosmos3-Super-Image2Video-4Step` and `nvidia/Cosmos3-Edge` need no
+config: their defaults already are the deployed shape. A local checkpoint
+directory works in place of any Hub ID.
+
+Guardrails are enabled by default and the server will not start without them —
+install and authenticate per
+[Guardrails](../models/cosmos3/README.md#guardrails) before serving.
+
+### Per-mode requests
+
+Cosmos3 supplies its own defaults for every field, so `prompt` alone is a
+complete request; the examples pass the shape explicitly to show what is being
+asked for. Query the loaded pipeline for the values it will use:
+
+```python
+generator = VisualGen(model="nvidia/Cosmos3-Nano")
+print(generator.default_params)      # resolution, frames, fps, steps, guidance
+print(generator.extra_param_specs)   # accepted extra_params keys
+```
+
+**T2V — text-to-video**
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos/generations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A cute puppy playing with a ball in a park",
+    "size": "1280x720",
+    "num_frames": 189,
+    "fps": 24
+  }' \
+  -o cosmos3_t2v.mp4
+```
+
+To reuse an offline prompt file verbatim:
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos/generations" \
+  -H "Content-Type: application/json" \
+  -d "$(jq '{prompt: .prompt, size: "1280x720", num_frames: 189, fps: 24}' ../models/cosmos3/prompts/t2v.json)" \
+  -o cosmos3_t2v.mp4
+```
+
+The bundled scripts drive this mode as-is (`seconds * fps` derives the frame
+count; 7.875 x 24 = 189):
+
+```bash
+python sync_video_gen.py --mode t2v --model nvidia/Cosmos3-Nano \
+    --prompt "A cute puppy playing with a ball in a park" \
+    --size 1280x720 --duration 7.875 --fps 24
+```
+
+**I2V / TI2V — image-conditioned video**
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos/generations" \
+  -F "prompt=She turns around and smiles, then slowly walks out of the frame" \
+  -F "input_reference=@./media/woman_skyline_original_720p.jpeg" \
+  -F "size=1280x720" \
+  -F "num_frames=189" \
+  -F "fps=24" \
+  -o cosmos3_i2v.mp4
+```
+
+```bash
+python sync_video_gen.py --mode ti2v --model nvidia/Cosmos3-Nano \
+    --prompt "She turns around and smiles, then slowly walks out of the frame" \
+    --image ./media/woman_skyline_original_720p.jpeg \
+    --size 1280x720 --duration 7.875 --fps 24
+```
+
+**V2V — video-conditioned video**
+
+Upload an MP4/AVI instead of an image; see
+[Video-to-Video](#video-to-video-multipart-with-file-upload-cosmos3) in the curl
+quick reference for the conditioning knobs. Only the first (or last, per
+`condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` reference
+frames condition the output — 5 frames with the defaults. Output size is fixed
+by the request; references are center-cropped, not aspect-matched. Validated for
+Nano / Super only.
+
+**T2AV — video with synchronized audio**
+
+```bash
+curl -X POST "http://localhost:8000/v1/videos/generations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A cute puppy playing with a ball in a park",
+    "size": "1280x720",
+    "num_frames": 189,
+    "fps": 24,
+    "extra_params": {"enable_audio": true}
+  }' \
+  -o cosmos3_t2av.mp4
+```
+
+Add an image `input_reference` for image-conditioned audio-video (TI2AV). In
+multipart form-data, `extra_params` is sent as a JSON-encoded string:
+`-F 'extra_params={"enable_audio": true}'`.
+
+Audio needs an audio-capable checkpoint (Nano / Super; Cosmos3-Edge has no audio
+tower). On a checkpoint without one, `enable_audio` is accepted and video-only
+output is returned. The audio track is muxed into the container only by the
+FFmpeg encoder — the pure-Python AVI fallback drops it. Request
+`"format": "safetensors"` (or `"pt"`) to get the video and audio tensors plus
+`frame_rate` / `audio_sample_rate` in one payload instead.
+
+**T2I — text-to-image**
+
+Text-to-image goes to the image endpoint. Cosmos3 switches to its image-mode
+defaults and generates a single frame:
+
+```bash
+curl -s -X POST "http://localhost:8000/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A medium shot of a modern robotics research laboratory",
+    "size": "1024x1024",
+    "response_format": "b64_json",
+    "extra_params": {"output_type": "image"}
+  }' \
+  | python3 -c "import base64,json,sys; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" \
+  > cosmos3_t2i.png
+```
+
+With the default `"response_format": "url"` the response carries a
+`/v1/images/{image_id}/content` URL to download instead.
+
+**Reasoner — chat**
+
+A Cosmos3 checkpoint holds two models: the **Reasoner** (a Qwen3-VL-based VLM)
+and the **Generator** (video / image diffusion). `--visual_gen_args` selects
+which one `trtllm-serve` loads — omit it to serve the Reasoner:
+
+```bash
+trtllm-serve nvidia/Cosmos3-Nano --port 8000
+```
+
+```bash
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Cosmos3-Nano",
+    "messages": [{"role": "user", "content": "Describe what a robot arm does."}],
+    "max_tokens": 60
+  }'
+```
+
+The two are mutually exclusive: a Reasoner server returns 404 on `/v1/videos/*`
+and `/v1/images/*`, and a generation server has no `/v1/chat/completions`.
+
+### Notes
+
+- **A guardrail block surfaces as HTTP 500** (`Video generation failed` /
+  `Image generation failed`): the pipeline returns an empty result rather than a
+  distinguishable error.
+- **Distilled checkpoints** (`...-4Step`) fix their step count and guidance;
+  simplest is to omit `num_inference_steps` and `guidance_scale`. A value that
+  matches the checkpoint is accepted, a conflicting one returns HTTP 400 naming
+  the value it requires.
+- **Prompt quality**: the checkpoints were tuned on the structured captions the
+  model cards ship, which give noticeably cleaner output than a one-line summary.
+  Send one as the `prompt` string, and the offline example's
+  [negative prompt](../models/cosmos3/cosmos3_negative_prompt.json) as
+  `negative_prompt` — JSON-shaped prompts are re-parsed, so formatting does not
+  matter.
 
 ---
 
