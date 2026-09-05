@@ -1016,8 +1016,13 @@ class Qwen3NextModel(DecoderModel):
 
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            attn_metadata.mamba_metadata = Mamba2Metadata(
-                attn_metadata.max_num_requests, chunk_size=128)
+            # AttentionMetadata.prepare() already ran for this step, so the
+            # replacement has to be prepared here or every request would read
+            # the zero-initialized state_indices, i.e. SSM slot 0.
+            mamba_metadata = Mamba2Metadata(attn_metadata.max_num_requests,
+                                            chunk_size=128)
+            attn_metadata.mamba_metadata = mamba_metadata
+            mamba_metadata.prepare(attn_metadata)
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
