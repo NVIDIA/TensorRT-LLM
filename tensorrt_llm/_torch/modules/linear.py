@@ -1228,13 +1228,29 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
+        sm_version = get_sm_version()
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
+                if sm_version in (100, 103):
+                    output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
+                else:
+                    # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
+                    # other sm_100f GPUs (e.g. sm107) keep honoring the DeepGEMM
+                    # opt-out with the trtllm-gen kernel, which consumes the
+                    # same raw fp32 scales.
+                    if module.use_cute_dsl_blockscaling_mm:
+                        logger.warning_once(
+                            "use_cute_dsl_blockscaling_mm: no CuTe DSL FP8 "
+                            f"block-scale GEMM on SM{sm_version}; using the "
+                            "trtllm-gen kernel instead.",
+                            key="cute_dsl_fp8_blockscale_unsupported_sm")
+                    output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
             else:
                 output = torch.ops.trtllm.fp8_swap_ab_gemm(
                     input,
@@ -1242,7 +1258,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
-        elif get_sm_version() == 120:
+        elif sm_version == 120:
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
