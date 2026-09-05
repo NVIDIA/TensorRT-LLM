@@ -21,6 +21,7 @@ from typing import AsyncGenerator, Optional
 
 from .._utils import nvtx_range_debug
 from ..llmapi.utils import logger_debug
+from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
 
@@ -57,8 +58,9 @@ class RpcWorkerMixin:
         self._postproc_input_queues = None
         self._postproc_collector = None
         self._postproc_collector_thread = None
+        self._postproc_futures = []
 
-    def init_postproc_workers(self):
+    def init_postproc_workers(self) -> None:
         """Spawn local PostprocWorker processes feeding the RPC response stream.
 
         The classic (MPI proxy) path gives each PostprocWorker a dedicated
@@ -99,8 +101,21 @@ class RpcWorkerMixin:
         # here: the spawn bootstrap re-imports the Ray worker's __main__,
         # which deadlocks inside a Ray actor (verified empirically).
         self._postproc_pool = ProcessPoolExecutor(max_workers=num)
+
+        def _on_postproc_worker_done(fut) -> None:
+            # ProcessPoolExecutor stores task exceptions on the Future and
+            # never raises them in the parent. A postproc child that dies
+            # outside per-request handling would otherwise fail silently and
+            # leave its requests pending forever; surface the exception on the
+            # worker's background-error path so the next response turns into
+            # an ErrorResponse for the client.
+            exc = fut.exception()
+            if exc is not None and not self.shutdown_event.is_set():
+                logger.error(f"PostprocWorker process died: {exc}")
+                self._error_queue.put(exc)
+
         for i in range(num):
-            self._postproc_pool.submit(
+            fut = self._postproc_pool.submit(
                 postproc_worker_main,
                 self._postproc_input_queues[i].address,
                 [self._postproc_collector.address],
@@ -108,8 +123,10 @@ class RpcWorkerMixin:
                 PostprocWorker.default_record_creator,
                 self.postproc_config.post_processor_hook,
             )
+            fut.add_done_callback(_on_postproc_worker_done)
+            self._postproc_futures.append(fut)
 
-        def _collect_postproc_outputs():
+        def _collect_postproc_outputs() -> None:
             while not self.shutdown_event.is_set():
                 batch = self._postproc_collector.get()
                 if batch is None:
@@ -123,7 +140,7 @@ class RpcWorkerMixin:
         )
         self._postproc_collector_thread.start()
 
-    def shutdown_postproc_workers(self):
+    def shutdown_postproc_workers(self) -> None:
         """Best-effort teardown of the local postproc pool (idempotent)."""
         if self._postproc_input_queues:
             for q in self._postproc_input_queues:

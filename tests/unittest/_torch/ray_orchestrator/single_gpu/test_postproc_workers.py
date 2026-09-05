@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Postprocess parallelism under the Ray orchestrator.
 
 The rank-0 RayGPUWorker spawns a local PostprocWorker pool; finished
@@ -55,7 +57,7 @@ def _generate_sync(num_postprocess_workers: int) -> list[str]:
         return [output.outputs[0].text for output in outputs]
 
 
-def test_postproc_workers_match_inline():
+def test_postproc_workers_match_inline() -> None:
     """Greedy outputs with workers=2 must equal the inline workers=0 path."""
     baseline = _generate_sync(0)
     assert all(text for text in baseline)
@@ -63,18 +65,18 @@ def test_postproc_workers_match_inline():
     assert with_postproc == baseline
 
 
-def test_streaming_control_no_postproc():
+def test_streaming_control_no_postproc() -> None:
     """Control: streaming with workers=0 must work (isolates any pre-existing
     ray-streaming issue from the postproc path)."""
     _streaming_body(num_postprocess_workers=0)
 
 
-def test_postproc_workers_streaming():
+def test_postproc_workers_streaming() -> None:
     """Streaming rides the same Output records; final text must match sync."""
     _streaming_body(num_postprocess_workers=2)
 
 
-def _streaming_body(num_postprocess_workers: int):
+def _streaming_body(num_postprocess_workers: int) -> None:
     sampling_params = SamplingParams(temperature=0, max_tokens=32)
 
     with _make_llm(num_postprocess_workers) as llm:
@@ -87,7 +89,12 @@ def _streaming_body(num_postprocess_workers: int):
             return final.outputs[0].text
 
         async def run_all() -> list[str]:
-            return await asyncio.gather(*[collect(p) for p in PROMPTS])
+            # Bound the collection: the streaming iterator waits on an
+            # unbounded queue, so a missing terminal response would otherwise
+            # hang the test past its stage budget.
+            return await asyncio.wait_for(
+                asyncio.gather(*[collect(p) for p in PROMPTS]), timeout=300
+            )
 
         streamed_texts = asyncio.run(run_all())
 

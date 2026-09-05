@@ -106,6 +106,11 @@ class BaseWorker(GenerationExecutor):
             postprocess_tokenizer_dir=postproc_config.postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor,
         )
+        # GenerationExecutor.__init__ rebuilds postproc_config from the two
+        # fields above, dropping the rest (e.g. post_processor_hook). Workers
+        # that spawn their own postproc pool (RpcWorkerMixin) need the full
+        # configuration, so keep the caller-provided one.
+        self.postproc_config = postproc_config
 
         # inputs
         self._engine = engine
@@ -260,9 +265,9 @@ class BaseWorker(GenerationExecutor):
         self.result_queue = queue
 
     def set_postproc_queues(self,
-                            queues: List["IpcQueue"],
+                            queues: list["IpcQueue"],
                             *,
-                            coexist_with_result_queue: bool = False):
+                            coexist_with_result_queue: bool = False) -> None:
         """ Set the IPC queues for feeding post-processing processes.
 
         coexist_with_result_queue: the classic proxy gives each PostprocWorker
@@ -1619,8 +1624,14 @@ def _send_rsp(
     # response stream feed) AND postproc input queues at the same time, and
     # raw responses must go to the postproc workers first — their finished
     # Output records re-enter the result_queue via the collector thread
-    # (see RpcWorkerMixin.init_postproc_workers).
-    if postproc_batches is not None:
+    # (see RpcWorkerMixin.init_postproc_workers). ErrorResponse records are
+    # exempt when a direct route exists: PostprocWorker reads input.rsp.result,
+    # which they lack, so they ride the result queue instead (the proxy demux
+    # already terminates on them).
+    _error_with_direct_route = (isinstance(response, ErrorResponse)
+                                and (worker.frontend_result_queues is not None
+                                     or worker.result_queue is not None))
+    if postproc_batches is not None and not _error_with_direct_route:
         _send_rsp_to_postproc(worker, response, postproc_batches)
     elif worker.frontend_result_queues is not None:
         # Route to the origin frontend's result lane; None/out-of-range ids
