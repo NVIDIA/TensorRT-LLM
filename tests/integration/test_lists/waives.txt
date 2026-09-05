@@ -138,7 +138,6 @@ full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct] SKIP (https://nvbugs/6275959)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
-full:DGX_B200/disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6594241)
 full:DGX_B200/unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py::test_kda_mixer_empty_prefill SKIP (https://nvbugs/6705034)
 full:DGX_B200/unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestFlux1TextToImage SKIP (https://nvbugs/6720944)
 full:DGX_B200/unittest/_torch/visual_gen/test_trtllm_serve_e2e.py::TestFlux2TextToImage SKIP (https://nvbugs/6720944)
