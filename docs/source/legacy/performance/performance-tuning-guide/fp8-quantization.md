@@ -56,7 +56,10 @@ if __name__ == '__main__':
     main()
 ```
 
-For an example of how to build an fp8 engine using the [TensorRT-LLM CLI workflow](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) flow see [TensorRT-LLM LLaMA examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama). In short you first run [`examples/quantization/quantize.py`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization) to quantize and convert the model checkpoint to TensorRT-LLM format and then use `trtllm-build`.
+The legacy `examples/quantization/quantize.py` / `trtllm-build` CLI workflow
+(and the deleted `examples/models/core/llama` tree) has been removed with the
+TensorRT backend. Use the `LLM` API `QuantConfig` example above, or see
+[TensorRT Backend Removal](../../tensorrt-backend-removal.md).
 
 > ***Note: While quantization aims to preserve model accuracy this is not guaranteed and it is extremely important you check that the quality of outputs remains sufficient after quantization.***
 
@@ -86,7 +89,9 @@ quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                            kv_cache_quant_algo=QuantAlgo.FP8)
 ```
 
-If you are using the [CLI flow for building engines](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) pass `--kv_cache_dtype fp8` to [`examples/quantization/quantize.py`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/quantization).
+The legacy CLI `--kv_cache_dtype` path via `examples/quantization/quantize.py`
+has been removed; set `kv_cache_quant_algo=QuantAlgo.FP8` in `QuantConfig` as
+shown above (see [TensorRT Backend Removal](../../tensorrt-backend-removal.md)).
 
 ### Performance with Quantized KV Cache
 
