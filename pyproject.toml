@@ -40,6 +40,7 @@ fix = true
 force-exclude = true
 exclude = [
     "**3rdparty/**",
+    "tensorrt_llm/_torch/attention/backends/prims_ts/**",
     "triton_kernels/**",
 ]
 

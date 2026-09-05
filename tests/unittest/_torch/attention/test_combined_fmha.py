@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -55,14 +56,14 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     metadata = SimpleNamespace(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
-        num_contexts=1,
-        num_ctx_tokens=2,
-        num_generations=1,
-        kv_lens_cuda_runtime=torch.tensor([2, 5], dtype=torch.int32),
-        kv_lens_runtime=torch.tensor([2, 5], dtype=torch.int32),
-        prompt_lens_cuda_runtime=torch.tensor([2, 1], dtype=torch.int32),
-        prompt_lens_cpu_runtime=torch.tensor([2, 1], dtype=torch.int32),
-        beam_width=1,
+        num_contexts=2,
+        num_ctx_tokens=3,
+        num_generations=4,
+        kv_lens_cuda_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
+        beam_width=2,
         cache_indirection=None,
         tokens_per_block=32,
         kv_cache_manager=None,
@@ -70,35 +71,39 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         is_spec_decoding_enabled=False,
     )
     forward_args = AttentionForwardArgs(
-        output=torch.empty((3, 4)),
+        output=torch.empty((7, 4)),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=8,
     )
 
-    combined_fmha.forward(torch.empty((3, 4)), None, None, metadata, forward_args)
+    combined_fmha.forward(torch.empty((7, 4)), None, None, metadata, forward_args)
 
     assert events == [
         ("prepare", "context"),
         ("prepare", "generation"),
-        ("run", "context", FmhaPhase.CONTEXT, 2),
-        ("run", "generation", FmhaPhase.GENERATION, 1),
+        ("run", "context", FmhaPhase.CONTEXT, 3, 2, 2),
+        ("run", "generation", FmhaPhase.GENERATION, 4, 4, 2),
     ]
     assert metadata.effective_workspace.numel() == 8
 
 
 def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
-    attn = FakeAttention()
+    attn = FakeAttention(local_layer_idx=3)
     combined_fmha = CombinedFmha(attn)
-    kv_cache_manager = SimpleNamespace(
-        impl=SimpleNamespace(get_page_index_upper_bound=lambda: 23),
-        blocks_in_primary_pool=23,
-        num_local_layers=4,
-    )
+    calls: list[tuple[int, object]] = []
+
+    def get_page_index_upper_bound(local_layer_idx: int, role: object) -> int:
+        calls.append((local_layer_idx, role))
+        return 23
+
+    kv_cache_manager = object.__new__(KVCacheManagerV2)
+    kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
     assert (
         combined_fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=kv_cache_manager))
         == 23
     )
+    assert calls == [(3, Role.KEY)]
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
@@ -145,6 +150,7 @@ def test_flashinfer_context_fallback_scope(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
     attn = FakeAttention()
     attn.sparse_params = None
     attn.position_embedding_type = 0
@@ -230,6 +236,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
     attn = SimpleNamespace(
         is_mla_enable=False,
         sparse_params=None,

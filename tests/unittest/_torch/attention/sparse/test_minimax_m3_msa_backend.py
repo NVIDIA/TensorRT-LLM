@@ -32,6 +32,7 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
 
     cute = ModuleType("cutlass.cute")
     cute.core = SimpleNamespace()
+    cute.ThrCopy = object()
     cute.ThrMma = object()
     cute.make_rmem_tensor = object()
     cutlass = ModuleType("cutlass")
@@ -43,10 +44,31 @@ def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monk
     msa_package_available.cache_clear()
     try:
         assert msa_package_available()
+        assert cute.core.ThrCopy is cute.ThrCopy
         assert cute.core.ThrMma is cute.ThrMma
         assert cute.make_fragment is cute.make_rmem_tensor
     finally:
         msa_package_available.cache_clear()
+
+
+def test_msa_import_preserves_cute_compile_option_selection() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    import cutlass.cute as cute
+
+    original_compile = cute.compile
+    from fmha_sm100.cute import interface as sparse_interface
+
+    del sparse_interface
+    assert cute.compile is original_compile
+    assert callable(cute.compile)
+    selected_compile = cute.compile[cute.FrontendNext]
+    assert callable(selected_compile)
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):

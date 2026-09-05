@@ -27,8 +27,21 @@ import torch
 from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
+
+def _install_cutlass_dsl_compatibility() -> None:
+    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
+    import cutlass.cute as cute
+
+    for name in ("ThrCopy", "ThrMma"):
+        if not hasattr(cute.core, name) and hasattr(cute, name):
+            setattr(cute.core, name, getattr(cute, name))
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        cute.make_fragment = cute.make_rmem_tensor
+
+
 _flash_attn_fwd_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import _flash_attn_fwd
 except (ImportError, OSError) as e:
     _flash_attn_fwd = None
