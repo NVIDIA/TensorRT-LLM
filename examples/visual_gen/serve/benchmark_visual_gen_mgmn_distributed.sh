@@ -182,26 +182,40 @@ wait_for_server
 # Step 2: Run benchmark (rank-0 node only)
 # ---------------------------------------------------------------------------
 
+# Generation config now travels in a workload document, not on the command line.
+WORKLOAD_FILE="${RESULT_DIR}/workload.yaml"
+mkdir -p "${RESULT_DIR}"
+{
+  echo "backend: ${BACKEND}"
+  echo "common_params:"
+  echo "  width: ${SIZE%%x*}"
+  echo "  height: ${SIZE##*x}"
+  echo "  num_inference_steps: ${NUM_INFERENCE_STEPS}"
+  echo "  guidance_scale: ${GUIDANCE_SCALE}"
+  echo "  seed: ${SEED}"
+  if [ "$BACKEND" = "openai-videos" ]; then
+    echo "  num_frames: ${NUM_FRAMES}"
+    echo "  frame_rate: ${FPS}"
+  fi
+  echo "requests:"
+  # YAML single-quoted: only ' needs escaping, by doubling, so a prompt carrying
+  # quotes or backslashes stays the prompt the run measured.
+  for _ in $(seq 1 "${NUM_PROMPTS}"); do
+    echo "  - prompt: '${PROMPT//\'/\'\'}'"
+  done
+} > "${WORKLOAD_FILE}"
+
 export BENCHMARK_CMD="python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
     --model ${MODEL} \
     --backend ${BACKEND} \
     --host ${MASTER_ADDR} \
     --port ${SERVER_PORT} \
-    --prompt \"${PROMPT}\" \
-    --num-prompts ${NUM_PROMPTS} \
-    --size ${SIZE} \
-    --num-inference-steps ${NUM_INFERENCE_STEPS} \
-    --guidance-scale ${GUIDANCE_SCALE} \
-    --seed ${SEED} \
+    --workload ${WORKLOAD_FILE} \
     --max-concurrency ${MAX_CONCURRENCY} \
     --save-result \
     --save-detailed \
     --result-dir ${RESULT_DIR} \
     --metric-percentiles 50,90,99"
-
-if [ "$BACKEND" = "openai-videos" ]; then
-    BENCHMARK_CMD="${BENCHMARK_CMD} --num-frames ${NUM_FRAMES} --fps ${FPS}"
-fi
 
 echo ""
 echo "Step 2: Running benchmark..."

@@ -64,18 +64,37 @@ MATCH_KEYS = [
     "l_max_concurrency",
 ]
 
-RESULT_METRIC_PATHS = {
-    "d_request_throughput": "request_throughput",
-    "d_per_gpu_throughput": "per_gpu_throughput",
-    "d_mean_latency": "mean_latency",
-    "d_median_latency": "median_latency",
-    "d_p90_latency": "percentiles_latency.p90",
-    "d_p99_latency": "percentiles_latency.p99",
-    "d_mean_generation": "mean_generation",
-    "d_median_generation": "median_generation",
-    "d_p90_generation": "percentiles_generation.p90",
-    "d_p99_generation": "percentiles_generation.p99",
-}
+
+def latency_series(backend: str) -> str:
+    """The result series the gate calls latency, which the routes measure differently.
+
+    The video route is asynchronous, so its e2e span also carries the /content
+    fetch and the encode; gen_latency stops at the postprocessing transition and
+    is the closer analogue of an image route's whole synchronous request, which
+    is what e2e_latency is there -- image routes report no gen_latency at all.
+    """
+    return "gen_latency" if backend == "openai-videos" else "e2e_latency"
+
+
+def result_metric_paths(backend: str) -> dict[str, str]:
+    """Where each gated metric lives in the result JSON, for one route.
+
+    The generation series reads the Server-Timing "generation" header rather
+    than the client-side gen_latency, so it measures engine wall clock without
+    network or polling granularity. That header lives under --save-detailed.
+    """
+    latency = latency_series(backend)
+    return {
+        "d_request_throughput": "request_throughput",
+        "d_mean_latency": f"{latency}.mean",
+        "d_median_latency": f"{latency}.median",
+        "d_p90_latency": f"{latency}.percentiles.p90",
+        "d_p99_latency": f"{latency}.percentiles.p99",
+        "d_mean_generation": "timings.server_gen.mean",
+        "d_median_generation": "timings.server_gen.median",
+        "d_p90_generation": "timings.server_gen.percentiles.p90",
+        "d_p99_generation": "timings.server_gen.percentiles.p99",
+    }
 
 
 def _get_nested_value(data: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -126,7 +145,7 @@ def extract_visual_gen_metrics(result_data: dict[str, Any]) -> dict[str, float]:
     metrics: dict[str, float] = {}
     missing_paths: list[str] = []
 
-    for metric_name, path in RESULT_METRIC_PATHS.items():
+    for metric_name, path in result_metric_paths(str(result_data["backend"])).items():
         value = _get_nested_value(result_data, path)
         if value is None:
             missing_paths.append(path)
@@ -157,13 +176,6 @@ def build_visual_gen_db_entry(
 ) -> dict[str, Any]:
     """Build one OpenSearch document from VisualGen config and result JSON."""
     expected_num_gpus = get_visual_gen_num_gpus_from_server_config(server_config)
-    result_num_gpus = int(result_data.get("num_gpus", expected_num_gpus))
-    if result_num_gpus != expected_num_gpus:
-        raise ValueError(
-            "Benchmark result GPU count mismatch: "
-            f"result={result_num_gpus}, expected={expected_num_gpus}"
-        )
-
     client_name = str(client_config.get("name", "default"))
     entry = {
         "s_runtime": "visual_gen",
@@ -201,4 +213,6 @@ def build_visual_gen_db_entry(
         "s_test_case_name": f"{server_name}-{client_name}",
     }
     entry.update(extract_visual_gen_metrics(result_data))
+    # The client no longer knows the topology, so per-GPU throughput is derived here.
+    entry["d_per_gpu_throughput"] = entry["d_request_throughput"] / expected_num_gpus
     return entry
