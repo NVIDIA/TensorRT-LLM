@@ -230,18 +230,17 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             end_id=-1,
             return_perf_metrics=True,
         )
-        scheduling_params = [SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)]
+        # Sequential requests on an otherwise idle default router are assigned
+        # to the same ADP rank, so explicit rank pinning is unnecessary here.
 
         cold_output = llm.generate(
             [prompt_token_ids],
             sampling_params=sampling_params,
-            scheduling_params=scheduling_params,
             use_tqdm=False,
         )[0].outputs[0]
         warm_output = llm.generate(
             [prompt_token_ids],
             sampling_params=sampling_params,
-            scheduling_params=scheduling_params,
             use_tqdm=False,
         )[0].outputs[0]
 
