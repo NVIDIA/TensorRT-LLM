@@ -8,7 +8,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local MP4/AVI file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); the encoded bytes pass through and each worker decodes just that window on NVDEC (see [Media I/O dependencies](#media-io-dependencies)). Validated for Nano / Super only.
 - **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint also accepts a precomputed control clip (`{"edge": "control.mp4"}` — the example reads it and sends encoded bytes, the same contract as the `video` reference). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames) — but only past the first chunk, so raise `num_frames` above the pipeline default to generate one: it bounds how many frames are decoded from the inputs, and so how long the output can be. A single-hint request picks up that hint's tuned sampling preset — guidance scale, control guidance and flow shift — for any of those the request leaves unset; requests with several hints fall back to the generic video defaults. The active hint names are also appended to the prompt as a one-sentence control-adherence directive; pass `"emphasize_control_in_prompt": false` to suppress it for clean baselines or ablations.
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
-- **Action** — policy / forward dynamics / inverse dynamics generation (pass `--action_mode`); `inverse_dynamics` reads its observation clip from `--video_path` (MP4/AVI, decoded on worker NVDEC like V2V). Action and audio generation are mutually exclusive. A predicted trajectory has no representation in a video container, so action runs are saved as `safetensors` or `pt`, keeping the rollout and the action tensor in one payload — over `trtllm-serve` the default `format=auto` selects that payload automatically, and an explicit `mp4`/`avi` is rejected.
+- **Action** — policy / forward dynamics / inverse dynamics generation (`--action_mode` selects the generic workflow; a checkpoint carrying a `policy` manifest selects policy automatically). `inverse_dynamics` reads its observation clip from `--video_path` (MP4/AVI, decoded on worker NVDEC like V2V). State-conditioned policy requests supply the current model-space state through `action`; the model pipeline does not perform robot-protocol conversion. Action and audio generation are mutually exclusive. A predicted trajectory has no representation in a video container, so action runs are saved as `safetensors` or `pt`, keeping the rollout and the action tensor in one payload. Over `trtllm-serve`, checkpoint-selected Policy also makes `format=auto` resolve to `safetensors`, so `format` may be omitted; generic Action requests that explicitly set `action_mode` may likewise leave `format=auto`.
 
 ## Checkpoints
 
@@ -18,7 +18,8 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
-- [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone supporting **T2I / T2V / I2V only**: no audio tower, and the checkpoint's action weights are not supported by this pipeline yet. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
+- [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
+- [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
 ## Guardrails
 
@@ -64,12 +65,16 @@ A prompt file may hold any of three shapes:
 | Shape | Example | Notes |
 |---|---|---|
 | Omni prompt object | `prompts/t2v.json` | `prompt` plus optional `model_mode`, `vision_path`, `enable_audio`, which supply defaults for the matching flags |
+| Omni object with structured prompt | `prompts/action_policy.json` | the nested `prompt` object is serialized as the exact model input while retaining request options such as `vision_path` |
 | Structured caption | a checkpoint's `assets/example_i2v_prompt.json` | the object *is* the caption; carries no options |
 | Plain text | any `.txt` | used verbatim |
 
 Structured captions are what the model cards ship and what the checkpoints were
 tuned on; they give noticeably cleaner output than a one-line summary.
 `--negative_prompt` defaults to `cosmos3_negative_prompt.json` in this directory.
+The bundled Action prompts contain the caption metadata for their documented
+domain and 16:9 reference. Update the nested timing and canvas fields along with
+the action text when using a different domain or reference aspect ratio.
 
 ## Usage
 
@@ -180,6 +185,20 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --raw_action_dim 10 \
     --output_path policy_rollout.safetensors \
     --action_output_path policy_action.json
+
+# Edge DROID policy. The checkpoint manifest selects policy mode, so
+# --action_mode is optional. observation.png must already be the DROID concat
+# view (wrist on top, left/right exterior views below). current_state.json is
+# [joint_0, ..., joint_6, gripper] in the model's convention; the reference
+# RoboLab client maps its gripper value with 1 - value before/after inference.
+# Edit the action description in the prompt file for each request.
+python cosmos3.py --model nvidia/Cosmos3-Edge-Policy-DROID \
+    --prompt_file prompts/action_edge_policy_droid.json \
+    --image_path /path/to/observation.png \
+    --action_json current_state.json \
+    --negative_prompt "" \
+    --output_path droid_policy.safetensors \
+    --action_output_path droid_policy.action.json
 
 # Action — forward dynamics (first frame + action trajectory -> rollout video)
 # action_trajectory.json is a [T, D] list of lists; D is the embodiment's action

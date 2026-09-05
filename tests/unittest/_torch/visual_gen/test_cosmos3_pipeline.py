@@ -39,6 +39,7 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import resolve_action_content_size
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
@@ -63,6 +64,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFF
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.media.decoding import video_stream_info
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = [pytest.mark.cosmos3, pytest.mark.usefixtures("disable_cosmos3_guardrails")]
@@ -1402,6 +1404,7 @@ class TestCosmos3Action:
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
+        video = _V2V_FIXTURE_MP4.read_bytes()
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
@@ -1414,13 +1417,22 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             # The clip is chunk + 1 frames, and the fixture holds NUM_FRAMES.
             action_chunk_size=NUM_FRAMES - 1,
-            video=_V2V_FIXTURE_MP4.read_bytes(),
+            video=video,
         )
+        source_info = video_stream_info(video)
+        assert source_info is not None
+        content_h, content_w = resolve_action_content_size(
+            source_info.height,
+            source_info.width,
+            self.ACTION_HEIGHT,
+            self.ACTION_WIDTH,
+        )
+        spatial_factor = cosmos3_pipeline.vae_scale_factor_spatial
         _assert_valid_video(
             result.video,
             num_frames=NUM_FRAMES,
-            height=self.ACTION_HEIGHT,
-            width=self.ACTION_WIDTH,
+            height=max(content_h // spatial_factor, 1) * spatial_factor,
+            width=max(content_w // spatial_factor, 1) * spatial_factor,
         )
         _assert_valid_action(
             result.action,
@@ -1499,7 +1511,7 @@ class TestCosmos3Action:
         with pytest.raises(Exception):
             _run_forward(
                 cosmos3_pipeline,
-                image="/nonexistent/action_reference_frame.png",
+                image=b"not an encoded image",
                 height=self.ACTION_HEIGHT,
                 width=self.ACTION_WIDTH,
                 num_frames=self.ACTION_FRAMES,

@@ -328,6 +328,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_policy_droid_example TIMEOUT (20)
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_layered_example
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_edit_example

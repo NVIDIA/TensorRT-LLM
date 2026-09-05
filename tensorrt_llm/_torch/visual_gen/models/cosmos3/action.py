@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import json
-import math
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +12,6 @@ import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
-
-from tensorrt_llm.logger import logger
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
@@ -99,77 +95,8 @@ def resolve_raw_action_dim(
     return widths.pop() if len(widths) == 1 else None
 
 
-# Camera perspective -> framing sentence. The action model was trained on these
-# exact sentences, so they are reproduced verbatim rather than paraphrased.
-ACTION_VIEWPOINT_TEMPLATES: dict[str, str] = {
-    "ego_view": "This video is captured from a first-person perspective looking at the scene.",
-    "third_person_view": (
-        "This video is captured from a third-person perspective looking towards the agent "
-        "from the front."
-    ),
-    "wrist_view": "This video is captured from a wrist-mounted camera.",
-    "concat_view": "This video contains concatenated views from multiple camera perspectives.",
-}
-
-DEFAULT_ACTION_VIEW_POINT = "ego_view"
-
 # Canonical ``W,H`` labels; every action canvas is one of these bucket shapes.
 ACTION_ASPECT_RATIO_LABELS = ("1,1", "4,3", "3,4", "16,9", "9,16")
-
-
-def action_aspect_ratio_label(height: int, width: int) -> str:
-    """Closest canonical aspect label, e.g. 832x480 -> ``"16,9"``.
-
-    Bucket sizes are only approximately their label (832/480 is 1.733, not
-    1.778), so the label is matched by nearest ratio instead of reducing H/W.
-    """
-    ratio = width / height if height > 0 else 1.0
-    return min(
-        ACTION_ASPECT_RATIO_LABELS,
-        key=lambda label: abs(int(label.split(",")[0]) / int(label.split(",")[1]) - ratio),
-    )
-
-
-def build_action_json_prompt(
-    description: str,
-    *,
-    view_point: str | None,
-    num_frames: int,
-    frame_rate: float,
-    height: int,
-    width: int,
-) -> str:
-    """Build the structured action caption the action model was trained on.
-
-    Replaces the flat duration/resolution templates used by the video paths: the
-    JSON already carries duration, fps, resolution and aspect ratio. Key order is
-    part of the trained format and is preserved.
-    """
-    duration_seconds = num_frames / frame_rate if frame_rate > 0 else 0.0
-    if not math.isfinite(duration_seconds) or duration_seconds < 0:
-        duration_seconds = 0.0
-    minutes, seconds = divmod(round(duration_seconds), 60)
-
-    text = description.strip()
-    if text and not text.endswith((".", "!", "?")):
-        text = f"{text}."
-
-    framing = ACTION_VIEWPOINT_TEMPLATES.get(view_point) if view_point is not None else None
-    if view_point is not None and framing is None:
-        logger.warning(
-            f"Unrecognized Cosmos3 action view_point={view_point!r}; expected one of "
-            f"{sorted(ACTION_VIEWPOINT_TEMPLATES)}. Dropping the cinematography.framing field."
-        )
-
-    prompt: dict[str, Any] = {}
-    if framing:
-        prompt["cinematography"] = {"framing": framing}
-    prompt["actions"] = [{"time": f"0:00-{minutes}:{seconds:02d}", "description": text}]
-    prompt["duration"] = f"{int(duration_seconds)}s"
-    prompt["fps"] = float(frame_rate)
-    prompt["resolution"] = {"H": int(height), "W": int(width)}
-    prompt["aspect_ratio"] = action_aspect_ratio_label(height, width)
-    return json.dumps(prompt)
 
 
 VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
@@ -371,6 +298,29 @@ def load_action_tensor(action: Any = None) -> torch.Tensor:
     return tensor
 
 
+def load_action_state(action: Any = None) -> torch.Tensor:
+    """Load one current-state row for state-conditioned policy generation."""
+    if action is None:
+        raise ValueError(
+            "Cosmos3 policy use_state=true requires the current state in action "
+            "with shape [D] or [1, D]."
+        )
+    if isinstance(action, torch.Tensor):
+        tensor = action.detach().to(dtype=torch.float32)
+    else:
+        tensor = torch.as_tensor(np.asarray(action), dtype=torch.float32)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim == 3 and tensor.shape[0] == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.ndim != 2 or tensor.shape[0] != 1:
+        raise ValueError(
+            "Cosmos3 policy current state must have shape [D] or [1, D], "
+            f"got {tuple(tensor.shape)}."
+        )
+    return tensor
+
+
 def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
     key = str(resolution)
     if key not in VIDEO_RES_SIZE_INFO:
@@ -478,12 +428,42 @@ def action_reference_frame_step(source_frame_rate: float | None, target_frame_ra
     return max(1, round(source_frame_rate / target_frame_rate))
 
 
+def resolve_action_content_size(
+    source_h: int, source_w: int, target_h: int, target_w: int
+) -> tuple[int, int]:
+    """Resolve the content size before bottom/right canvas padding.
+
+    Args:
+        source_h: Source image height in pixels.
+        source_w: Source image width in pixels.
+        target_h: Target canvas height in pixels.
+        target_w: Target canvas width in pixels.
+
+    Returns:
+        The aspect-preserving, non-upscaled content size as
+        ``(content_h, content_w)``.
+    """
+    scale = min(target_w / source_w, target_h / source_h, 1.0)
+    content_w = max(1, int(scale * source_w + 0.5))
+    content_h = max(1, int(scale * source_h + 0.5))
+    return content_h, content_w
+
+
 def resize_and_pad_action_image(
     image: PIL.Image.Image, target_h: int, target_w: int
 ) -> PIL.Image.Image:
-    scale = min(target_w / image.width, target_h / image.height, 1.0)
-    resize_w = max(1, int(scale * image.width + 0.5))
-    resize_h = max(1, int(scale * image.height + 0.5))
+    """Resize an RGB action image and pad it to the target canvas.
+
+    Args:
+        image: RGB PIL image to resize and pad.
+        target_h: Target canvas height in pixels.
+        target_w: Target canvas width in pixels.
+
+    Returns:
+        An RGB PIL image with size ``(target_w, target_h)``. The content keeps
+        its aspect ratio and any padding is added on the bottom and right.
+    """
+    resize_h, resize_w = resolve_action_content_size(image.height, image.width, target_h, target_w)
     if (resize_w, resize_h) != image.size:
         image = image.resize((resize_w, resize_h), PIL.Image.Resampling.BICUBIC)
 
@@ -502,6 +482,41 @@ def resize_and_pad_action_image(
     return PIL.Image.fromarray(padded)
 
 
+def crop_action_latent(
+    latent: torch.Tensor,
+    content_h: int,
+    content_w: int,
+    spatial_compression_factor: int,
+) -> torch.Tensor:
+    """Remove action canvas padding from a VAE latent without copying it.
+
+    Args:
+        latent: VAE latent with shape ``[..., latent_h, latent_w]``. Any
+            PyTorch dtype is accepted and preserved because cropping returns a
+            view.
+        content_h: Unpadded content height in image pixels.
+        content_w: Unpadded content width in image pixels.
+        spatial_compression_factor: Positive VAE spatial compression factor.
+
+    Returns:
+        A view with shape
+        ``[..., max(content_h // spatial_compression_factor, 1),
+        max(content_w // spatial_compression_factor, 1)]`` on the same device
+        and with the same dtype as ``latent``.
+    """
+    latent_h = max(content_h // spatial_compression_factor, 1)
+    latent_w = max(content_w // spatial_compression_factor, 1)
+    if latent_h > latent.shape[-2] or latent_w > latent.shape[-1]:
+        raise ValueError(
+            "Cosmos3 action content exceeds encoded latent size: "
+            f"content={(content_h, content_w)}, factor={spatial_compression_factor}, "
+            f"latent={tuple(latent.shape)}."
+        )
+    if latent.shape[-2:] == (latent_h, latent_w):
+        return latent
+    return latent[..., :latent_h, :latent_w]
+
+
 def prepare_action_latents(
     *,
     mode: str,
@@ -512,6 +527,7 @@ def prepare_action_latents(
     device: torch.device,
     dtype: torch.dtype,
     action_input: Any = None,
+    use_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Prepare action latents and conditioning masks for a denoise request.
 
@@ -519,7 +535,7 @@ def prepare_action_latents(
         mode: Cosmos3 action mode. ``forward_dynamics`` conditions all action
             tokens on ``action_input``; ``policy`` and ``inverse_dynamics`` start
             from action noise and predict the raw action dimensions.
-        action_chunk_size: Number of action tokens in the generated trajectory.
+        action_chunk_size: Number of future action tokens to generate.
         raw_action_dim: Number of semantic action dimensions before padding.
             Required for ``policy`` and ``inverse_dynamics``. For
             ``forward_dynamics``, omitted values are inferred from
@@ -529,13 +545,22 @@ def prepare_action_latents(
         device: Target device for the returned tensors.
         dtype: Target dtype for the returned tensors.
         action_input: Forward-dynamics action trajectory with shape ``[T, D]``.
+            In policy mode with ``use_state=True``, the current model-space
+            state with shape ``[D]`` or ``[1, D]``.
+        use_state: Whether policy mode prepends and conditions one current-state
+            row. The row is internal context, not a predicted action.
 
     Returns:
         Tuple of ``(action_latents, action_velocity_mask, clean_action,
-        raw_action_dim)``. The tensors have shape ``[1, action_chunk_size,
-        action_dim]`` except the mask, which has shape ``[1, action_chunk_size,
-        1]``.
+        raw_action_dim)``. With ``use_state=True``, the tensors have
+        ``action_chunk_size + 1`` rows; otherwise they have
+        ``action_chunk_size`` rows.
     """
+    if use_state and mode != ACTION_MODE_POLICY:
+        raise ValueError("Cosmos3 use_state is supported only for policy action mode.")
+
+    state_rows = 1 if use_state else 0
+    action_length = action_chunk_size + state_rows
     if mode == ACTION_MODE_FORWARD_DYNAMICS:
         action = load_action_tensor(action_input)
         if action.shape[0] < action_chunk_size:
@@ -551,12 +576,23 @@ def prepare_action_latents(
                 f"got raw_action_dim={raw_action_dim}, action width={action.shape[-1]}."
             )
         clean_action = pad_action_to_dim(action, action_dim)
+    elif use_state:
+        state = load_action_state(action_input)
+        if raw_action_dim is None:
+            raw_action_dim = int(state.shape[-1])
+        elif int(raw_action_dim) != int(state.shape[-1]):
+            raise ValueError(
+                "Cosmos3 policy raw_action_dim must match the current state width; "
+                f"got raw_action_dim={raw_action_dim}, state width={state.shape[-1]}."
+            )
+        clean_action = torch.zeros(action_length, action_dim, dtype=torch.float32)
+        clean_action[0] = pad_action_to_dim(state, action_dim)[0]
     else:
         if raw_action_dim is None:
             raise ValueError(
                 "Cosmos3 action_mode='policy' and 'inverse_dynamics' require raw_action_dim."
             )
-        clean_action = torch.zeros(action_chunk_size, action_dim, dtype=torch.float32)
+        clean_action = torch.zeros(action_length, action_dim, dtype=torch.float32)
 
     raw_action_dim = int(raw_action_dim)
     if raw_action_dim <= 0 or raw_action_dim > action_dim:
@@ -567,12 +603,14 @@ def prepare_action_latents(
     clean_action = clean_action.to(device=device, dtype=dtype).unsqueeze(0)
     condition_mask = build_action_condition_mask(
         mode,
-        action_chunk_size,
+        action_length,
         device=device,
         dtype=dtype,
     )
+    if use_state:
+        condition_mask[:, 0, :] = 1.0
     noise = randn_tensor(
-        (1, action_chunk_size, action_dim),
+        (1, action_length, action_dim),
         generator=generator,
         device=device,
         dtype=dtype,
