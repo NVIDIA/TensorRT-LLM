@@ -200,7 +200,6 @@ class _CuDNNProblemShape:
     k_strides: Tuple[int, ...]
     v_strides: Tuple[int, ...]
     o_strides: Tuple[int, ...]
-    stats_strides: Tuple[int, ...]
 
 
 # ============================================================================
@@ -434,9 +433,10 @@ class CuDNNAttention(AttentionBackend):
         outputs: Dict[str, Any] = {"o": o_t}
 
         if with_lse:
+            # Stats follows HN1 layout, unlike input tensors.
             stats_dims = (s.b, s.h_q, s.s_q, 1)
             stats_t.set_output(True).set_dim(list(stats_dims)).set_stride(
-                list(s.stats_strides)
+                _row_major_stride(*stats_dims)
             ).set_data_type(f32)
             outputs["stats"] = stats_t
         # The quantized nodes emit amax(S) / amax(O) for calibration; inference binds
@@ -673,9 +673,8 @@ class CuDNNAttention(AttentionBackend):
             q_strides=tuple(buffers["q"].stride()),
             k_strides=tuple(buffers["k"].stride()),
             v_strides=tuple(buffers["v"].stride()),
-            # O and stats are written straight into NHD buffers, likewise via strides.
+            # O is written straight into an NHD buffer, likewise via strides.
             o_strides=(s_q * h_q * d_v, d_v, h_q * d_v, 1),
-            stats_strides=(s_q * h_q, 1, h_q, 1),
         )
         bundle = self._get_or_build_graph(
             self.recipe,
@@ -693,8 +692,8 @@ class CuDNNAttention(AttentionBackend):
 
         stats: Optional[torch.Tensor] = None
         if with_lse:
-            stats = torch.empty(b, s_q, h_q, 1, dtype=torch.float32, device=device)
-            tensor_map[bundle.outputs["stats"]] = stats.transpose(1, 2)
+            stats = torch.empty(b, h_q, s_q, 1, dtype=torch.float32, device=device)
+            tensor_map[bundle.outputs["stats"]] = stats
         for amax_name in ("amax_s", "amax_o"):
             if amax_name in bundle.outputs:
                 tensor_map[bundle.outputs[amax_name]] = torch.empty(
@@ -703,9 +702,8 @@ class CuDNNAttention(AttentionBackend):
 
         self._execute_graph(bundle, tensor_map, device)
 
-        # stats were written with [B, S, H, 1] strides, which is the [B, S, H] LSE
-        # layout the other backends expose once the trailing axis is dropped.
-        lse = None if stats is None else stats.squeeze(-1)
+        # Stats is packed [B, H, S, 1]; other backends expose LSE as [B, S, H].
+        lse = None if stats is None else stats.squeeze(-1).transpose(1, 2).contiguous()
         return output, lse
 
     def forward(
