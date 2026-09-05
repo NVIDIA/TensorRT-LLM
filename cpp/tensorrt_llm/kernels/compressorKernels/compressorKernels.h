@@ -47,6 +47,11 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int kv_score_elem_bytes,                     // bytes per element for kv_score (2=bf16, 4=fp32)
     int state_elem_bytes,                        // bytes per element for paged state (2=bf16, 4=fp32)
     int out_elem_bytes,                          // bytes per element for output
+    int32_t const* new_tokens_per_seq,           // [bsz] or nullptr; per-request tokens appended
+                                                 // this step. nullptr means every request appended
+                                                 // next_n (the uniform case); non-null makes next_n
+                                                 // an upper bound only, for DSpark ragged
+                                                 // verification.
     cudaStream_t stream);
 
 // Prefill kernel: bulk compression with per-token gather/scatter + state update.

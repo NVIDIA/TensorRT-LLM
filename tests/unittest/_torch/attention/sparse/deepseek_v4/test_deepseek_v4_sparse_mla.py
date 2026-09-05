@@ -18,7 +18,6 @@ Tests for DeepSeek-V4 sparse MLA attention.
 """
 
 import math
-import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -27,7 +26,6 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
@@ -39,7 +37,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -104,6 +101,11 @@ class RopeConfig:
 
 # Layers to test: layer 0 → compress_ratio=1, layer 1 → ratio=4, layer 2 → ratio=128
 TEST_LAYERS = [0, 1, 2]
+
+# The widest generation window the parameterized test exercises, i.e. the static
+# ceiling the DSA metadata sizes its expanded buffers from. Matches
+# DeepSeek-V4-Pro-DSpark's max_draft_len=5 -> next_n=6.
+MAX_GENERATION_SEQ_LEN_Q = 6
 
 
 # RoPE helpers
@@ -398,6 +400,33 @@ def calculate_deepseek_v4_ref_ctx_sparse(
     return torch.cat(ref_results, dim=0)
 
 
+def _seq_lens_q_or_uniform(
+    num_query_tokens: int, num_requests: int, seq_lens_q: Optional[List[int]]
+) -> List[int]:
+    """Per-request query-token counts, defaulting to the uniform split.
+
+    The reference implementations below used to derive this as
+    ``num_query_tokens // num_requests``. That is the assumption under test once
+    a scheduler can hand each request its own verify window, so it is a
+    parameter now; passing None keeps the historical behavior for callers whose
+    batches really are uniform.
+    """
+    if seq_lens_q is not None:
+        assert len(seq_lens_q) == num_requests, (
+            f"got {len(seq_lens_q)} query lengths for {num_requests} requests"
+        )
+        assert sum(seq_lens_q) == num_query_tokens, (
+            f"query lengths sum to {sum(seq_lens_q)} but {num_query_tokens} "
+            f"query tokens were supplied"
+        )
+        return [int(v) for v in seq_lens_q]
+    assert num_query_tokens % num_requests == 0, (
+        f"{num_query_tokens} query tokens do not split evenly across "
+        f"{num_requests} requests; pass seq_lens_q explicitly"
+    )
+    return [num_query_tokens // num_requests] * num_requests
+
+
 def _rotate_gen_inputs(
     fused_q: torch.Tensor,
     q_pe: torch.Tensor,
@@ -408,23 +437,27 @@ def _rotate_gen_inputs(
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    seq_lens_q: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     num_requests = len(seq_lens_kv)
-    seq_len_q = fused_q.shape[0] // num_requests
+    q_lens = _seq_lens_q_or_uniform(fused_q.shape[0], num_requests, seq_lens_q)
+    q_starts = [0]
+    for q_len in q_lens:
+        q_starts.append(q_starts[-1] + q_len)
 
     fused_q_rot = fused_q.clone()
     new_latent_list = []
 
     for i in range(num_requests):
         past_len = seq_lens_kv[i]
+        seq_len_q = q_lens[i]
+        lo, hi = q_starts[i], q_starts[i + 1]
 
-        fused_q_seq = fused_q_rot[i * seq_len_q : (i + 1) * seq_len_q].unflatten(
-            -1, [num_heads, fused_head_dim]
-        )
-        q_pe_seq = q_pe[i * seq_len_q : (i + 1) * seq_len_q]
-        compressed_kv_seq = compressed_kv[i * seq_len_q : (i + 1) * seq_len_q]
-        k_pe_seq = k_pe[i * seq_len_q : (i + 1) * seq_len_q].unsqueeze(-2)
+        fused_q_seq = fused_q_rot[lo:hi].unflatten(-1, [num_heads, fused_head_dim])
+        q_pe_seq = q_pe[lo:hi]
+        compressed_kv_seq = compressed_kv[lo:hi]
+        k_pe_seq = k_pe[lo:hi].unsqueeze(-2)
 
         cos, sin = rope_cos_sin[past_len : past_len + seq_len_q].chunk(2, dim=-2)
 
@@ -464,27 +497,29 @@ def calculate_deepseek_v4_ref_gen_sparse(
     q_scaling: float,
     compress_ratio: int,
     attn_sink: Optional[torch.Tensor] = None,
+    seq_lens_q: Optional[List[int]] = None,
 ):
     """Reference attention for DeepSeek-V4 generation phase."""
     fused_head_dim = kv_lora_rank + qk_rope_head_dim
     bmm1_scale = 1 / (math.sqrt(qk_nope_head_dim + qk_rope_head_dim) * q_scaling)
     num_requests = len(seq_lens_kv)
-    seq_len_q = fused_q_rot.shape[0] // num_requests
+    q_lens = _seq_lens_q_or_uniform(fused_q_rot.shape[0], num_requests, seq_lens_q)
+    q_starts = [0]
+    for q_len in q_lens:
+        q_starts.append(q_starts[-1] + q_len)
 
     ref_results = []
     latent_cache_list = []
     total_past_tokens = 0
     for i in range(num_requests):
         past_len = seq_lens_kv[i]
+        seq_len_q = q_lens[i]
+        lo, hi = q_starts[i], q_starts[i + 1]
 
-        fused_q_seq = fused_q_rot[i * seq_len_q : (i + 1) * seq_len_q].unflatten(
-            -1, [num_heads, fused_head_dim]
-        )
+        fused_q_seq = fused_q_rot[lo:hi].unflatten(-1, [num_heads, fused_head_dim])
 
         # New token's latent cache
-        new_token_latent = new_latent_cache[i * seq_len_q : (i + 1) * seq_len_q].unsqueeze(
-            -2
-        )  # [seq_len_q, 1, head_dim]
+        new_token_latent = new_latent_cache[lo:hi].unsqueeze(-2)  # [seq_len_q, 1, head_dim]
 
         # Past latent cache
         past_latent = latent_cache_ref[total_past_tokens : total_past_tokens + past_len].unsqueeze(
@@ -509,7 +544,7 @@ def calculate_deepseek_v4_ref_gen_sparse(
             # Compressed KV
             if compress_ratio > 1 and compressed_ref_data is not None:
                 if compress_ratio == 4 and compressed_topk_indices is not None:
-                    row = i * seq_len_q + qi
+                    row = lo + qi
                     indices_row = compressed_topk_indices[row]
                     valid = indices_row[indices_row >= 0]
                     comp_kv = compressed_ref_data[i][valid.long()]
@@ -546,11 +581,21 @@ def calculate_deepseek_v4_ref_gen_sparse(
     return ref_result, new_latent_cache_out
 
 
-def _allocate_kv_cache_for_generation(cache_manager, requests: List[LlmRequest]):
-    for req in requests:
-        assert cache_manager.try_allocate_generation(req), (
-            f"Failed to allocate generation KV cache for request {req.py_request_id}"
-        )
+def _allocate_kv_cache_for_generation(
+    cache_manager, requests: List[LlmRequest], num_new_tokens: int = 1
+):
+    """Extend each request's KV allocation by ``num_new_tokens``.
+
+    One call covers one token. A speculative step appends `1 + draft_len` of
+    them, and the shortfall only bites once a request crosses a page boundary --
+    at which point the block table has no entry for the new block and the read
+    is an illegal access rather than a clean failure.
+    """
+    for _ in range(num_new_tokens):
+        for req in requests:
+            assert cache_manager.try_allocate_generation(req), (
+                f"Failed to allocate generation KV cache for request {req.py_request_id}"
+            )
 
 
 def _create_rope_config(scenario: Scenario) -> RopeConfig:
@@ -619,7 +664,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     torch.manual_seed(42)
 
     context_lengths = [1]
-    local_num_heads = int(os.environ.get("DSV4_REPRO_LOCAL_NUM_HEADS", "16"))
+    local_num_heads = 16
     layer_idx = 0
     ratio = scenario.compress_ratios[layer_idx]
     assert ratio == 1
@@ -670,8 +715,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     )
     layer.update_quant_config(None)
     attn_sink = torch.randn(local_num_heads, dtype=torch.float32, device=device).mul_(0.5)
-    if not os.environ.get("DSV4_REPRO_NO_SINK"):
-        layer.attn_sink = torch.nn.Parameter(attn_sink, requires_grad=False)
+    layer.attn_sink = torch.nn.Parameter(attn_sink, requires_grad=False)
 
     attn_metadata = DeepseekV4TrtllmAttentionMetadata(
         seq_lens=torch.tensor(context_lengths, dtype=torch.int),
@@ -702,75 +746,7 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
     fused_q = torch.cat([q_nope, q_pe], dim=-1).view(1, local_num_heads * head_dim)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
-    simple_swa_pool = None
-    if os.environ.get("DSV4_REPRO_SIMPLE_POOL"):
-        simple_swa_pool = torch.empty(
-            (cache_manager.tokens_per_block, head_dim), dtype=dtype, device=device
-        )
-        simple_swa_pool.zero_()
-        simple_swa_pool_ptr = simple_swa_pool.data_ptr()
-        cache_manager.kv_cache_pool_pointers[0, 0] = simple_swa_pool_ptr
-        attn_metadata.host_kv_cache_pool_pointers[0, 0] = simple_swa_pool_ptr
-        attn_metadata.sparse_mla_base_ptrs[1] = simple_swa_pool_ptr
-        attn_metadata.swa_buffer_ptrs[layer_idx] = simple_swa_pool_ptr
-        attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][0].fill_(-1)
-        attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][0, 0] = 0
-        torch.cuda.synchronize()
-
-    if os.environ.get("DSV4_REPRO_PRINT_PARAMS"):
-        sparse_attn_indices, _ = layer.sparse_attn_predict(
-            fused_q,
-            None,
-            attn_metadata,
-            AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
-                q_pe=q_pe,
-            ),
-        )
-        torch.cuda.synchronize()
-        print("DSV4_REPRO local_num_heads", local_num_heads)
-        print(
-            "DSV4_REPRO token_stride",
-            get_token_bytes(
-                head_dim,
-                sparse_config.index_head_dim,
-                ratio,
-                DeepseekV4AttentionType.SWA,
-                False,
-            ),
-        )
-        print("DSV4_REPRO tokens_per_block", cache_manager.tokens_per_block)
-        print("DSV4_REPRO max_blocks_per_seq", cache_manager.max_blocks_per_seq)
-        print("DSV4_REPRO max_seq_len", cache_manager.max_seq_len)
-        print("DSV4_REPRO metadata_max_seq_len", attn_metadata.max_seq_len)
-        print("DSV4_REPRO kv_lens_runtime", attn_metadata.kv_lens_runtime[:1].cpu().tolist())
-        print("DSV4_REPRO host_total_kv_lens", attn_metadata.host_total_kv_lens.cpu().tolist())
-        print(
-            "DSV4_REPRO prompt_lens_runtime",
-            attn_metadata.prompt_lens_cpu_runtime[:1].cpu().tolist(),
-        )
-        print("DSV4_REPRO swa_pool_base_ptr", attn_metadata.sparse_mla_base_ptrs[1])
-        print("DSV4_REPRO swa_buffer_ptr", attn_metadata.swa_buffer_ptrs[layer_idx])
-        print(
-            "DSV4_REPRO block_table_swa",
-            attn_metadata.block_tables[(1, DeepseekV4AttentionType.SWA)][:1, :4].cpu().tolist(),
-        )
-        print("DSV4_REPRO sparse_attn_indices", sparse_attn_indices.cpu().tolist())
-        print("DSV4_REPRO sparse_attn_indices_dtype", sparse_attn_indices.dtype)
-        print(
-            "DSV4_REPRO sparse_mla_topk_lens",
-            attn_metadata.sparse_mla_topk_lens[ratio][:1].cpu().tolist(),
-        )
-        print(
-            "DSV4_REPRO sparse_mla_topk_lens_dtype", attn_metadata.sparse_mla_topk_lens[ratio].dtype
-        )
-
     softmax_stats_tensor = None
-    if os.environ.get("DSV4_REPRO_SOFTMAX_STATS"):
-        softmax_stats_tensor = torch.empty(
-            (1, local_num_heads, 2), dtype=torch.float32, device=device
-        )
 
     result = layer.forward(
         fused_q.clone(),
@@ -817,10 +793,35 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("context_lengths", [[4399], [14, 508, 3947], [2, 1406, 3327]])
-@pytest.mark.parametrize("num_generation_steps", [2])
-def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps: int):
-    generation_seq_len_q = 1
+# The query width per generation request. Speculative decoding makes this the
+# batch-wide `1 + draft_len`. Cover every context layout at width one, then the
+# lower and upper speculative widths on the heterogeneous page-boundary layout.
+# Pinning every case at width one left width-dependent strides in the DSA
+# generation path untested: buffers are laid out at the static ceiling while the
+# kernels are launched at the runtime width, and when the two disagree the result
+# is either misattributed rows or a hang, never an error.
+#
+# Coverage limit, stated because it is not obvious and it matters: this test
+# supplies `topk_indices` directly for the compress_ratio=4 layer, so
+# `Indexer.forward` -- the paged-MQA-logits plus top-k path that consumes
+# `kv_lens_expanded` / `block_table_expanded` / the DeepGEMM schedule -- never
+# runs here. Those buffers are exactly where a wrong stride misattributes rows,
+# so widening this parameterization does NOT by itself cover that. Verified
+# empirically: reverting the stride fix leaves all original Cartesian cases
+# green. What this does cover is the RoPE, KV-write, sparse-MLA and compressor
+# paths at widths other than one, which was previously nothing at all.
+@pytest.mark.parametrize(
+    "context_lengths,generation_seq_len_q",
+    [
+        ([4399], 1),
+        ([14, 508, 3947], 1),
+        ([2, 1406, 3327], 1),
+        ([14, 508, 3947], 2),
+        ([14, 508, 3947], 6),
+    ],
+)
+def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q: int):
+    num_generation_steps = 2
     scenario = Scenario()
     device = torch.device("cuda")
     dtype = scenario.dtype
@@ -1144,7 +1145,9 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
     # 8. Generation steps
     for step in range(num_generation_steps):
         print(f"\n=== Generation step {step + 1} ===")
-        _allocate_kv_cache_for_generation(cache_manager, requests)
+        _allocate_kv_cache_for_generation(
+            cache_manager, requests, num_new_tokens=generation_seq_len_q
+        )
 
         cached_lens = [ctx_len + step * generation_seq_len_q for ctx_len in context_lengths]
         kv_lens = [cl + generation_seq_len_q for cl in cached_lens]
@@ -1182,6 +1185,21 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
             enable_flash_mla=torch.cuda.get_device_capability() == (9, 0),
             sparse_attention_config=sparse_config,
         )
+        # Reproduce the split the engine actually runs with rather than sizing
+        # everything to the current width. `max_draft_tokens` is the static
+        # ceiling: the engine hands it `tokens_per_gen_step - 1` once (via
+        # update_spec_dec_param) and never moves it, and every expanded buffer
+        # is sized from it so a shorter step cannot trigger a reallocation
+        # mid-capture. The per-step width arrives separately, through
+        # `runtime_tokens_per_gen_step`. Letting the two differ is the whole
+        # point: when they were conflated, a step narrower than the ceiling
+        # wrote its kv_lens and block table one stride apart and read them back
+        # at another. Set post-construction and rebuild the width-dependent
+        # buffers, which is exactly what update_spec_dec_param does.
+        gen_metadata.max_draft_tokens = MAX_GENERATION_SEQ_LEN_Q - 1
+        gen_metadata.runtime_tokens_per_gen_step = generation_seq_len_q
+        gen_metadata._create_kv_lens_2d_buffer()
+        gen_metadata.create_expanded_buffers()
         gen_metadata.prepare()
 
         for layer_idx in TEST_LAYERS:
@@ -1214,11 +1232,19 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
                 None,  # quant_q_buffer
             )
 
-            # Build topk_indices for ratio=4
+            # Build topk_indices for ratio=4. One row per *query token*, not
+            # per request: query token j of a request cached at L sits at
+            # position L + j and so sees a different number of compressed
+            # tokens. Collapsing that to one row per request is the same
+            # uniform-window assumption this test is parameterized to break.
             topk_indices = None
             if ratio == 4:
                 topk_indices = _build_compressed_topk_indices(
-                    [kv - 1 for kv in kv_lens],
+                    [
+                        cached_len + j
+                        for cached_len in cached_lens
+                        for j in range(generation_seq_len_q)
+                    ],
                     ratio,
                     scenario.index_topk,
                     device,
