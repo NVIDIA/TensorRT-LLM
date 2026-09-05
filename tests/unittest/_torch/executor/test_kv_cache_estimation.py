@@ -18,11 +18,18 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import (
+    CacheCost,
+    KvCacheCreator,
+    _create_kv_cache_manager,
+    _derive_layer_type_attention_windows,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
@@ -880,8 +887,6 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     and OOM risk during KV cache estimation).
     """
 
-    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
-
     captured_kwargs = {}
 
     class _RecordingManager:
@@ -1014,8 +1019,6 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 ) -> None:
     import torch
 
-    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
-
     captured_configs = []
 
     class _RecordingKVCacheManagerV2(KVCacheManagerV2):
@@ -1121,3 +1124,347 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     assert draft_config.pool_ratio == [1.0]
     assert create_manager.call_args.kwargs["cold_page_codec_provider"] is codec_provider
     assert creator._kv_cache_config.pool_ratio == target_pool_ratio
+
+
+# ---------------------------------------------------------------------------
+# Per-layer attention windows derived from a mixed layer_types schedule
+# ---------------------------------------------------------------------------
+#
+# A config that publishes a mixed sliding/full `layer_types` schedule with a
+# single `sliding_window` needs one window per layer; otherwise
+# KVCacheManagerV2 places every layer in one full-context pool and the sliding
+# layers keep blocks they can never read.  `_derive_layer_type_attention_windows`
+# derives that list from the config; `_derive_v2_layer_type_attention_windows`
+# applies it only for `KVCacheManagerV2` and only when the user supplied no
+# `max_attention_window`, both in `_create_kv_cache_manager` (tested here) and
+# in the static per-token cost model the creator splits the GPU budget with
+# (tested in `test_kv_cache_budget_split.py`); `KVCacheManager` (V1) keeps the
+# single-window default.
+
+_SLIDING = "sliding_attention"
+_FULL = "full_attention"
+
+
+def test_derive_layer_type_windows_mixed_schedule_follows_layer_order() -> None:
+    config = SimpleNamespace(
+        layer_types=[_SLIDING, _FULL, _SLIDING, _SLIDING, _FULL],
+        num_hidden_layers=5,
+        sliding_window=512,
+    )
+
+    assert _derive_layer_type_attention_windows(config, 4096) == [512, 4096, 512, 512, 4096]
+
+
+def test_derive_layer_type_windows_repeats_short_layer_types_pattern() -> None:
+    """A `layer_types` pattern shorter than the layer count repeats, as in
+    `get_layer_attention_window`."""
+    config = SimpleNamespace(
+        layer_types=[_SLIDING, _SLIDING, _FULL],
+        num_hidden_layers=6,
+        sliding_window=256,
+    )
+
+    assert _derive_layer_type_attention_windows(config, 1024) == [256, 256, 1024, 256, 256, 1024]
+
+
+@pytest.mark.parametrize(
+    "layer_types", [[_FULL] * 4, [_SLIDING] * 4], ids=["all_full", "all_sliding"]
+)
+def test_derive_layer_type_windows_uniform_schedule_is_none(layer_types: list[str]) -> None:
+    config = SimpleNamespace(layer_types=layer_types, num_hidden_layers=4, sliding_window=512)
+
+    assert _derive_layer_type_attention_windows(config, 4096) is None
+
+
+@pytest.mark.parametrize("sliding_window", [4096, 8192], ids=["equal_to_max_seq_len", "above"])
+def test_derive_layer_type_windows_caps_window_at_max_seq_len(sliding_window: int) -> None:
+    """A window at or above `max_seq_len` is capped to `max_seq_len`; every
+    layer then resolves to the same window, so the single-window default stands."""
+    config = SimpleNamespace(
+        layer_types=[_SLIDING, _FULL],
+        num_hidden_layers=2,
+        sliding_window=sliding_window,
+    )
+
+    assert _derive_layer_type_attention_windows(config, 4096) is None
+
+
+def test_derive_layer_type_windows_disabled_sliding_window_is_none() -> None:
+    config = SimpleNamespace(
+        layer_types=[_SLIDING, _FULL],
+        num_hidden_layers=2,
+        sliding_window=512,
+        use_sliding_window=False,
+    )
+
+    assert _derive_layer_type_attention_windows(config, 4096) is None
+
+
+@pytest.mark.parametrize(
+    ("sliding_window", "use_sliding_window"),
+    [([512, 1024], None), (None, True)],
+    ids=["multiple_window_sizes", "missing_window"],
+)
+def test_derive_layer_type_windows_unsupported_metadata_warns_and_falls_back(
+    sliding_window: list[int] | None,
+    use_sliding_window: bool | None,
+) -> None:
+    config = SimpleNamespace(
+        layer_types=[_SLIDING, _FULL],
+        num_hidden_layers=2,
+        sliding_window=sliding_window,
+        use_sliding_window=use_sliding_window,
+    )
+
+    with patch("tensorrt_llm._torch.pyexecutor._util.logger") as mock_logger:
+        assert _derive_layer_type_attention_windows(config, 4096) is None
+
+    mock_logger.warning.assert_called_once()
+    assert "falling back" in mock_logger.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(layer_types=[_SLIDING, _FULL], sliding_window=512),
+        SimpleNamespace(layer_types=[_SLIDING, _FULL], num_hidden_layers=0, sliding_window=512),
+        SimpleNamespace(layer_types=[_SLIDING, _FULL], num_hidden_layers=None, sliding_window=512),
+    ],
+    ids=["missing", "zero", "none"],
+)
+def test_derive_layer_type_windows_without_layer_count_is_none(config: SimpleNamespace) -> None:
+    assert _derive_layer_type_attention_windows(config, 4096) is None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(num_hidden_layers=4, sliding_window=512),
+        SimpleNamespace(num_hidden_layers=4, sliding_window=512, layer_types=None),
+        SimpleNamespace(num_hidden_layers=4, sliding_window=512, layer_types=[]),
+    ],
+    ids=["missing", "none", "empty"],
+)
+def test_derive_layer_type_windows_without_layer_types_is_none(config: SimpleNamespace) -> None:
+    assert _derive_layer_type_attention_windows(config, 4096) is None
+
+
+def _create_manager_and_capture_config(
+    pretrained: SimpleNamespace,
+    kv_cache_config: KvCacheConfig,
+    max_seq_len: int,
+    manager_cls: type[KVCacheManager] | type[KVCacheManagerV2] = KVCacheManagerV2,
+    **factory_overrides: object,
+) -> KvCacheConfig:
+    """Run `_create_kv_cache_manager` with a recording subclass of `manager_cls`
+    and return the `KvCacheConfig` the manager was constructed with.
+    `factory_overrides` replace the default keyword arguments of the factory
+    call (for example `spec_config`, `layer_mask` or `kv_cache_type`)."""
+    captured = []
+
+    class _RecordingManager(manager_cls):
+        def __init__(
+            self, kv_cache_config: KvCacheConfig, _kv_cache_type: object, **kwargs: object
+        ) -> None:
+            captured.append(kv_cache_config)
+
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+
+    factory_kwargs: dict[str, object] = dict(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingManager,
+        mapping=Mock(),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=32,
+        max_seq_len=max_seq_len,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=1024,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+    factory_kwargs.update(factory_overrides)
+    _create_kv_cache_manager(**factory_kwargs)
+
+    assert len(captured) == 1
+    return captured[0]
+
+
+def _mixed_schedule_pretrained(layer_types: list[str], **overrides: object) -> SimpleNamespace:
+    fields = dict(
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=len(layer_types),
+        vocab_size=32000,
+        layer_types=layer_types,
+        sliding_window=512,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) -> SimpleNamespace:
+    """The fields `get_num_spec_layers` and `should_use_separate_draft_kv_cache`
+    read from an Eagle3 one-model speculative config."""
+    return SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL,
+        _use_shared_kv_cache=False,
+        _allow_separate_draft_kv_cache=True,
+        _num_draft_hidden_layers=num_draft_hidden_layers,
+    )
+
+
+def test_create_kv_cache_manager_derives_windows_from_mixed_layer_types() -> None:
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+    )
+
+    assert manager_config.max_attention_window == [512, 512, 2048, 512]
+    # The caller's config is left untouched, like the other per-layer paths.
+    assert manager_config is not kv_cache_config
+    assert kv_cache_config.max_attention_window is None
+
+
+def test_create_kv_cache_manager_v1_keeps_single_window_default() -> None:
+    """`KVCacheManager` (V1) never receives derived windows: a per-layer list
+    would move it to the VSWA layout, which the creator's budget split and the
+    KV connector checks decide from the user's `max_attention_window`."""
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        manager_cls=KVCacheManager,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None
+
+
+@pytest.mark.parametrize("manager_cls", [KVCacheManager, KVCacheManagerV2], ids=["v1", "v2"])
+def test_create_kv_cache_manager_keeps_user_supplied_max_attention_window(
+    manager_cls: type[KVCacheManager] | type[KVCacheManagerV2],
+) -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[777])
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        manager_cls=manager_cls,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window == [777]
+
+
+def test_create_kv_cache_manager_leaves_uniform_schedule_alone() -> None:
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_FULL] * 4),
+        kv_cache_config,
+        max_seq_len=2048,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None
+
+
+def test_create_kv_cache_manager_gemma4_hybrid_keeps_its_own_derivation() -> None:
+    """The Gemma4 hybrid branch runs first; the generic derivation must not
+    preempt or override it."""
+    pretrained = _mixed_schedule_pretrained(
+        [_SLIDING, _FULL, _SLIDING],
+        head_dim=128,
+        global_head_dim=256,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor._util._derive_layer_type_attention_windows",
+        return_value=None,
+    ) as derive:
+        manager_config = _create_manager_and_capture_config(
+            pretrained, KvCacheConfig(), max_seq_len=2048
+        )
+
+    derive.assert_not_called()
+    assert manager_config.max_attention_window == [512, 2048, 512]
+
+
+@pytest.mark.parametrize(
+    ("layer_mask", "expected_windows"),
+    [
+        (None, [512, 512, 2048, 512, 2048, 2048]),
+        ([True] * 4, [512, 512, 2048, 512]),
+    ],
+    ids=["spec_layers_appended", "target_only_mask"],
+)
+def test_create_kv_cache_manager_keeps_appended_spec_layers_full_context(
+    layer_mask: list[bool] | None,
+    expected_windows: list[int],
+) -> None:
+    """Without a `layer_mask`, `get_pp_layers` appends the one-model speculative
+    layers after the decoder layers and V2 reads the window list modulo its
+    length, so the derived list gets one full-context entry per appended layer.
+    A target-only mask holds the decoder layers alone and needs no extra entry."""
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        KvCacheConfig(),
+        max_seq_len=2048,
+        spec_config=_eagle3_one_model_spec_config(num_draft_hidden_layers=2),
+        layer_mask=layer_mask,
+    )
+
+    assert manager_config.max_attention_window == expected_windows
+
+
+def test_create_kv_cache_manager_leaves_separate_draft_layers_alone() -> None:
+    """The separate one-model draft manager holds only the draft layers appended
+    after the decoder stack; its windows come from the draft config through the
+    creator, so the mixed decoder schedule must not be applied to it."""
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        spec_config=_eagle3_one_model_spec_config(),
+        layer_mask=[False] * 4 + [True],
+        num_layers=1,
+        is_draft=True,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None
+
+
+def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> None:
+    """The cross-attention pool stores encoder-side KV, which the decoder's
+    `layer_types` do not describe."""
+    kv_cache_config = KvCacheConfig()
+
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        kv_cache_type=batch_manager.CacheType.CROSS,
+        num_layers=4,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window is None

@@ -466,6 +466,74 @@ def _normalize_attention_windows(
     return normalized
 
 
+def _derive_layer_type_attention_windows(
+    config: object,
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    """Per-layer attention windows for a mixed sliding/full-attention config.
+
+    Returns one entry per decoder layer (sliding layers get the model's
+    `sliding_window`, full-attention layers `max_seq_len`, both capped at
+    `max_seq_len`), or `None` when the config has no `layer_types`, when
+    every layer resolves to the same window so the single-window default is
+    already right, or when the window metadata cannot be interpreted (a
+    warning is logged and the default applies).
+    """
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        return None
+    if not getattr(config, "layer_types", None):
+        return None
+    try:
+        windows = [
+            get_layer_attention_window(config, layer_idx)
+            for layer_idx in range(num_layers)
+        ]
+    except (NotImplementedError, ValueError) as error:
+        logger.warning(
+            "Unable to derive per-layer attention windows from layer_types "
+            f"({error}); falling back to the single-window default.")
+        return None
+    if not any(window is not None for window in windows):
+        return None
+    resolved = [
+        int(max_seq_len if window is None else min(window, max_seq_len))
+        for window in windows
+    ]
+    if len(set(resolved)) == 1:
+        return None
+    return resolved
+
+
+def _derive_v2_layer_type_attention_windows(
+    kv_cache_config: KvCacheConfig,
+    kv_cache_manager_cls: type,
+    model_config: ModelConfig,
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    """Per-layer windows a KVCacheManagerV2 for `model_config` is built with.
+
+    Shared by the static per-token cost model
+    (`KvCacheCreator._per_manager_cache_cost`) and `_create_kv_cache_manager`,
+    so the budget split sizes a manager from the same windows the manager
+    receives. Returns `None`, leaving `kv_cache_config` as is, when the user
+    supplied `max_attention_window`, for any class other than KVCacheManagerV2
+    (KVCacheManager keeps the single-window default), for Gemma4 hybrid
+    configs (`_create_kv_cache_manager` derives their per-layer layout in its
+    own branch) and when `_derive_layer_type_attention_windows` has nothing
+    to derive.
+    """
+    if kv_cache_config.max_attention_window is not None:
+        return None
+    if not (isinstance(kv_cache_manager_cls, type)
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+        return None
+    config = model_config.pretrained_config
+    if is_gemma4_hybrid(config):
+        return None
+    return _derive_layer_type_attention_windows(config, max_seq_len)
+
+
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
@@ -750,6 +818,14 @@ class KvCacheCreator:
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
+        derived_windows = _derive_v2_layer_type_attention_windows(
+            kv_cache_config, manager_cls, model_config, self._max_seq_len)
+        if derived_windows is not None:
+            # Cost the manager with the per-layer windows
+            # `_create_kv_cache_manager` builds it with, so the budget split
+            # between the target and draft managers matches their pools.
+            kv_cache_config = kv_cache_config.model_copy(
+                update={"max_attention_window": derived_windows})
         return CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -2432,6 +2508,40 @@ def _create_kv_cache_manager(
                 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]
+    elif kv_cache_type == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF:
+        # Same derivation for any other model that publishes a mixed
+        # sliding/full `layer_types` schedule plus a single `sliding_window`,
+        # for KVCacheManagerV2 only: without it V2 would put every layer in
+        # one full-context pool, so the bounded layers would keep blocks they
+        # can never read. KVCacheManager (V1) keeps the single-window default:
+        # a derived list would move it to the VSWA layout, which the creator's
+        # budget split and the KV connector checks decide from the user's
+        # `max_attention_window` before this point. A user-supplied window
+        # always wins. The cross-attention pool holds encoder-side KV that the
+        # decoder's `layer_types` do not describe, so it keeps the default too.
+        derived_windows = _derive_v2_layer_type_attention_windows(
+            kv_cache_config, kv_cache_manager_cls, _model_config, max_seq_len)
+        if derived_windows is not None and layer_mask is None:
+            if spec_config is not None:
+                # `get_pp_layers` appends the one-model speculative layers
+                # after the decoder layers, and V2 reads the window list
+                # modulo its length: give them the full context the
+                # single-window default gave them.
+                derived_windows = derived_windows + [int(
+                    max_seq_len)] * get_num_spec_layers(spec_config)
+        elif (derived_windows is not None
+              and len(layer_mask) != len(derived_windows)):
+            # The mask spans layers beyond the decoder stack: this manager
+            # holds the separate one-model draft layers, whose windows the
+            # creator derives from the draft config instead.
+            derived_windows = None
+        if derived_windows is not None:
+            logger.info(
+                "Derived per-layer max_attention_window from layer_types for "
+                f"{kv_cache_manager_cls.__name__}: {derived_windows} "
+                f"({len(set(derived_windows))} distinct windows)")
+            kv_cache_config = copy.copy(kv_cache_config)
+            kv_cache_config.max_attention_window = derived_windows
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via
