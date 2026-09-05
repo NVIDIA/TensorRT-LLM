@@ -16,6 +16,7 @@
 import enum
 import os
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
@@ -34,21 +35,37 @@ from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig)
+                         TuningConfig, autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from .fast_custom_op import fast_custom_op
 
+# FlashInfer's CuTeDSL MXFP8 kernels need the CuTe DSL package; reuse the
+# TRT-LLM probe instead of importing flashinfer.cute_dsl, whose package init
+# eagerly loads unrelated CuTeDSL kernel modules.
+IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = False
 if IS_FLASHINFER_AVAILABLE:
-    from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
+    from flashinfer.fp4_quantization import \
+        nvfp4_quantize as _flashinfer_nvfp4_quantize
+    try:
+        # Top-level flashinfer exports; already imported with flashinfer.
+        from flashinfer import autotune as _flashinfer_autotune
+        from flashinfer import mm_mxfp8 as _flashinfer_mm_mxfp8
+        from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
+    except ImportError:
+        pass
+    else:
+        IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE = IS_CUTLASS_DSL_AVAILABLE
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2)
+                     get_power_of_2_num_tokens_buckets,
+                     is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
+                     next_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
@@ -553,6 +570,9 @@ def _(
 
 
 _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
+_MXFP8_QUANTIZE_AUTOTUNED_OP = "trtllm::mxfp8_quantize_autotuned::quantize"
+_FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP = (
+    "trtllm::flashinfer_mxfp8_gemm_autotuned::gemm")
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
@@ -702,6 +722,136 @@ def _(
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
+
+
+def is_flashinfer_mxfp8_cute_dsl_available() -> bool:
+    """Whether FlashInfer's CuTeDSL MXFP8 quantizer and GEMM can be profiled."""
+    return IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+
+
+class MXFP8QuantizeRunner(TunableRunner):
+    """Profile the native and FlashInfer CuTeDSL MXFP8 activation quantizers."""
+
+    TRTLLM = -1
+    CUTE_DSL = 0
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_power_of_2_num_tokens_buckets, next_positive_power_of_2), ))
+
+    def __init__(self, input_dtype: torch.dtype) -> None:
+        self.input_dtype = input_dtype
+
+    def unique_id(self) -> Tuple[torch.dtype]:
+        return (self.input_dtype, )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [self.TRTLLM, self.CUTE_DSL]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = TRTLLM,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        activation = inputs[0]
+        if tactic == self.CUTE_DSL:
+            return _flashinfer_mxfp8_quantize(
+                activation,
+                is_sf_swizzled_layout=True,
+                alignment=32,
+                enable_pdl=None,
+                backend="cute-dsl",
+            )
+        return torch.ops.trtllm.mxfp8_quantize(activation, True)
+
+
+class FlashInferMXFP8GemmRunner(TunableRunner):
+    """Profile the FlashInfer CUTLASS and CuTeDSL MXFP8 GEMMs."""
+
+    CUTLASS = -1
+    CUTE_DSL = 0
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_power_of_2_num_tokens_buckets,
+            next_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, _mxfp8_scale_infer_shape), ),
+    )
+
+    def __init__(self, output_dtype: torch.dtype) -> None:
+        self.output_dtype = output_dtype
+
+    def unique_id(self) -> Tuple[torch.dtype]:
+        return (self.output_dtype, )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [self.CUTLASS, self.CUTE_DSL]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = CUTLASS,
+    ) -> torch.Tensor:
+        act, act_scale, weight, weight_scale = inputs
+        if tactic == self.CUTLASS:
+            # The enclosing FlashInfer tuning context profiles the CUTLASS
+            # tactics for this shape, exactly as the eager path does.
+            backend = "cutlass"
+            context = nullcontext()
+        else:
+            # FlashInfer's tuning mode is reference counted, so only skip_ops
+            # keeps it from JIT-compiling its whole CuTeDSL config sweep here;
+            # the CuTeDSL heuristic config is used instead.
+            backend = "cute-dsl"
+            context = _flashinfer_autotune(tune_mode=False,
+                                           skip_ops="mxfp8_gemm")
+        with context:
+            return _flashinfer_mm_mxfp8(
+                act,
+                weight.t(),
+                act_scale,
+                weight_scale,
+                out_dtype=self.output_dtype,
+                use_8x4_sf_layout=False,
+                backend=backend,
+            )
+
+
+def _choose_mxfp8_tactic(custom_op: str, runner: TunableRunner,
+                         inputs: List[torch.Tensor], tune: bool) -> int:
+    """Profile the current token bucket once per process, then reuse its winner."""
+    with autotune(tune_mode=tune, skip_dynamic_tuning_buckets=True):
+        _, tactic = AutoTuner.get().choose_one(custom_op, [runner],
+                                               runner.tuning_config, inputs)
+    return tactic
+
+
+def mxfp8_graph_tuned_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """MXFP8 quantize + GEMM with per-bucket tuned backends for generation graphs.
+
+    ``tune`` profiles the quantizer (native vs. CuTeDSL) and the GEMM
+    (FlashInfer CUTLASS vs. CuTeDSL) for this shape's token bucket; otherwise
+    the in-process winners are dispatched, as during graph capture.
+    """
+    quantize_runner = MXFP8QuantizeRunner(input.dtype)
+    quantize_inputs = [input]
+    act, act_scale = quantize_runner(
+        quantize_inputs,
+        tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
+                                    quantize_runner, quantize_inputs, tune))
+    gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
+    gemm_inputs = [act, act_scale, weight, weight_scale]
+    return gemm_runner(gemm_inputs,
+                       tactic=_choose_mxfp8_tactic(
+                           _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
+                           gemm_inputs, tune))
 
 
 class FP4GemmRunner(TunableRunner):

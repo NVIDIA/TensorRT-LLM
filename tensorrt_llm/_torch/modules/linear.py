@@ -16,7 +16,8 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    BufferKind, mxfp8_graph_tuned_linear)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -3225,7 +3226,10 @@ class MXFP8LinearMethod(LinearMethodBase):
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
         with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
         while tuning or capturing decode CUDA graphs; eager execution remains
-        on the native TensorRT-LLM op.
+        on the native TensorRT-LLM op. With ``tune_graph_backends`` set by
+        the engine, generation-graph warmup also profiles the activation
+        quantizer (native vs. CuTeDSL) and the GEMM (FlashInfer CUTLASS vs.
+        CuTeDSL) per token bucket, and graph capture reuses the winners.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
@@ -3255,6 +3259,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                              f"'flashinfer', or 'auto', got {self.backend!r}")
         self._flashinfer_mxfp8 = None
         self._flashinfer_autotuned = False
+        # Set by PyTorchModelEngine for the graph-only "auto" backend: choose
+        # the quantizer and GEMM backends per generation-graph bucket instead
+        # of always pairing the native quantizer with FlashInfer CUTLASS.
+        self.tune_graph_backends = False
         if self.backend == "flashinfer":
             self._load_flashinfer(required=True)
         elif self.backend == "auto" and not self._load_flashinfer(
@@ -3324,6 +3332,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.backend == "auto":
             self.backend = "trtllm"
             self._flashinfer_autotuned = False
+            self.tune_graph_backends = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3365,43 +3374,56 @@ class MXFP8LinearMethod(LinearMethodBase):
             input = input.reshape(-1, input.shape[-1])
 
         if self.use_cutlass:
-            # Dynamic MXFP8 activation quantization (swizzled SF layout), then
-            # the CUTLASS block-scaled e4m3xe4m3 GEMM.
-            act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
-                input.contiguous(), True)
-            use_flashinfer = self.backend == "flashinfer" or (
-                self.backend == "auto" and
-                (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
-                 (self._flashinfer_autotuned
-                  and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
-            if use_flashinfer:
-                flashinfer_mxfp8 = self._flashinfer_mxfp8
-                assert flashinfer_mxfp8 is not None
-                output = flashinfer_mxfp8(
-                    act_e4m3,
-                    module.weight.t(),
-                    act_sf,
-                    module.weight_scale,
-                    out_dtype=module.dtype,
-                    use_8x4_sf_layout=False,
-                    backend="cutlass",
-                )
-            else:
-                # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
-                global_scale = torch.ones([1],
-                                          dtype=torch.float32,
-                                          device=input.device)
-                gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
-                        if self.needs_native_autotune else
-                        torch.ops.trtllm.mxfp8_mxfp8_gemm)
-                output = gemm(
-                    act_e4m3,
-                    act_sf,
+            input = input.contiguous()
+            if (self.tune_graph_backends
+                    and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
+                # Generation-graph warmup profiles the quantizer and GEMM
+                # backends per token bucket; capture reuses the winners.
+                output = mxfp8_graph_tuned_linear(
+                    input,
                     module.weight,
                     module.weight_scale,
-                    global_scale,
                     module.dtype,
+                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
                 )
+            else:
+                # Dynamic MXFP8 activation quantization (swizzled SF layout),
+                # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
+                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                use_flashinfer = self.backend == "flashinfer" or (
+                    self.backend == "auto" and
+                    (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
+                     (self._flashinfer_autotuned
+                      and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
+                if use_flashinfer:
+                    flashinfer_mxfp8 = self._flashinfer_mxfp8
+                    assert flashinfer_mxfp8 is not None
+                    output = flashinfer_mxfp8(
+                        act_e4m3,
+                        module.weight.t(),
+                        act_sf,
+                        module.weight_scale,
+                        out_dtype=module.dtype,
+                        use_8x4_sf_layout=False,
+                        backend="cutlass",
+                    )
+                else:
+                    # globalScale is the alpha multiplier; pure MXFP8xMXFP8
+                    # uses 1.0.
+                    global_scale = torch.ones([1],
+                                              dtype=torch.float32,
+                                              device=input.device)
+                    gemm = (torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+                            if self.needs_native_autotune else
+                            torch.ops.trtllm.mxfp8_mxfp8_gemm)
+                    output = gemm(
+                        act_e4m3,
+                        act_sf,
+                        module.weight,
+                        module.weight_scale,
+                        global_scale,
+                        module.dtype,
+                    )
             if bias is not None:
                 output = output + bias
         else:

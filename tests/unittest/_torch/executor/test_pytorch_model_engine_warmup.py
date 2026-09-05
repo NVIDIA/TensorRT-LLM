@@ -655,6 +655,139 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.use_native_autotuner)
         self.assertFalse(method.needs_native_autotune)
 
+    def _run_mxfp8_graph_backend_warmup(self, *, cute_dsl_available=True, pipeline_parallel=False):
+        """Run autotuner warmup for an M3-style engine and record the tuning passes."""
+        calls = []
+
+        @contextlib.contextmanager
+        def trtllm_autotune(**kwargs):
+            calls.append("trtllm_autotune_enter")
+            yield
+            calls.append("trtllm_autotune_exit")
+
+        @contextlib.contextmanager
+        def flashinfer_autotune():
+            calls.append("flashinfer_autotune_enter")
+            yield
+            calls.append("flashinfer_autotune_exit")
+
+        flashinfer_module = ModuleType("flashinfer")
+        flashinfer_module.mm_mxfp8 = Mock()
+        flashinfer_module.autotune = Mock(side_effect=flashinfer_autotune)
+        tuner = SimpleNamespace(
+            setup_distributed_state=Mock(),
+            cache_pp_recv=Mock(),
+            cache_pp_send=Mock(),
+            clean_pp_flag=Mock(),
+            profiling_cache={},
+            print_profiling_cache=Mock(),
+        )
+        dist = SimpleNamespace(pp_allgather=Mock(side_effect=lambda flags: [flags, flags]))
+
+        with (
+            patch.dict(sys.modules, {"flashinfer": flashinfer_module}),
+            patch(
+                "tensorrt_llm._torch.modules.linear._mxfp8_cutlass_op_available",
+                return_value=True,
+            ),
+            patch(
+                "tensorrt_llm._torch.custom_ops.torch_custom_ops.is_flashinfer_mxfp8_cute_dsl_available",
+                return_value=cute_dsl_available,
+            ),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("TRTLLM_MXFP8_GEMM_BACKEND", None)
+            os.environ.pop("TLLM_AUTOTUNER_CACHE_PATH", None)
+            method = MXFP8LinearMethod()
+            engine = SimpleNamespace(
+                llm_args=SimpleNamespace(enable_autotuner=True),
+                cuda_graph_runner=SimpleNamespace(enabled=True),
+                model=SimpleNamespace(
+                    modules=lambda: [
+                        SimpleNamespace(_use_flashinfer_mxfp8_decode_graph_default=True),
+                        SimpleNamespace(quant_method=method),
+                    ]
+                ),
+                kv_cache_manager_key="kv_cache",
+                max_num_tokens=16,
+                batch_size=16,
+                max_seq_len=2,
+                original_max_draft_len=0,
+                mapping=SimpleNamespace(tp_size=1, has_pp=lambda: pipeline_parallel),
+                dist=dist,
+                is_draft_model=False,
+                guided_decoder=None,
+                max_total_draft_tokens=0,
+                no_cuda_graph=lambda: contextlib.nullcontext(),
+                _create_warmup_request=Mock(return_value=object()),
+                _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
+                _should_run_warmup_batch=Mock(return_value=True),
+                _release_megamoe_profiling_scratch=Mock(),
+                forward=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
+            )
+            kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+            resource_manager = SimpleNamespace(
+                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+            )
+
+            with (
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.AutoTuner.get",
+                    return_value=tuner,
+                ),
+                patch(
+                    "tensorrt_llm._torch.pyexecutor.model_engine.autotune",
+                    side_effect=trtllm_autotune,
+                ),
+                patch.object(MXFP8GemmRunner, "sync_all_tactic_caches"),
+                patch("torch.cuda.synchronize"),
+                patch("torch.cuda.empty_cache"),
+                patch("tensorrt_llm._torch.pyexecutor.model_engine.clear_memory_buffers"),
+            ):
+                PyTorchModelEngine._run_autotuner_warmup(engine, resource_manager)
+
+        return calls, method
+
+    _EAGER_MXFP8_WARMUP_CALLS = [
+        "trtllm_autotune_enter",
+        "forward",
+        "forward",
+        "trtllm_autotune_exit",
+        "flashinfer_autotune_enter",
+        "forward",
+        "forward",
+        "flashinfer_autotune_exit",
+    ]
+
+    def test_mxfp8_graph_backend_tuning_is_armed_alongside_eager_passes(self):
+        """An eligible M3 engine keeps both eager passes and arms per-bucket graph tuning."""
+        calls, method = self._run_mxfp8_graph_backend_warmup()
+
+        self.assertEqual(calls, self._EAGER_MXFP8_WARMUP_CALLS)
+        self.assertEqual(method.backend, "auto")
+        self.assertTrue(method.tune_graph_backends)
+        self.assertTrue(method._flashinfer_autotuned)
+        self.assertTrue(method._native_autotuned)
+
+    def test_mxfp8_graph_backend_tuning_needs_cute_dsl_and_no_pipeline_parallel(self):
+        """Missing CuTeDSL or pipeline parallelism keeps the plain FlashInfer graph path."""
+        # Pipeline parallelism drops the generation warmup request.
+        pp_calls = [
+            call for index, call in enumerate(self._EAGER_MXFP8_WARMUP_CALLS) if index not in (2, 6)
+        ]
+        cases = {
+            "missing_cutedsl": ({"cute_dsl_available": False}, self._EAGER_MXFP8_WARMUP_CALLS),
+            "pipeline_parallel": ({"pipeline_parallel": True}, pp_calls),
+        }
+        for name, (kwargs, expected_calls) in cases.items():
+            with self.subTest(name=name):
+                calls, method = self._run_mxfp8_graph_backend_warmup(**kwargs)
+
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(method.backend, "auto")
+                self.assertFalse(method.tune_graph_backends)
+                self.assertTrue(method._flashinfer_autotuned)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2024,7 +2024,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
-        from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
+        from ..custom_ops.torch_custom_ops import (
+            MXFP8GemmRunner, is_flashinfer_mxfp8_cute_dsl_available)
         from ..modules.linear import (MXFP8LinearMethod,
                                       flashinfer_mxfp8_autotune)
 
@@ -2055,8 +2056,16 @@ class PyTorchModelEngine(ModelEngine):
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))
         if use_mxfp8_flashinfer_graph_default:
+            # Generation-graph warmup also profiles the MXFP8 quantizer and
+            # GEMM backends (native/CUTLASS vs. CuTeDSL) per token bucket.
+            # Pipeline parallelism keeps the plain FlashInfer path: the graph
+            # pass has no PP cache handoff, so a tuning cache miss there would
+            # block in the AutoTuner's cache_pp_recv.
+            tune_graph_backends = (is_flashinfer_mxfp8_cute_dsl_available()
+                                   and not self.mapping.has_pp())
             for quant_method in mxfp8_methods:
-                quant_method.enable_flashinfer_auto()
+                if quant_method.enable_flashinfer_auto():
+                    quant_method.tune_graph_backends = tune_graph_backends
         flashinfer_mxfp8_methods = [
             method for method in mxfp8_methods
             if method.needs_flashinfer_autotune
@@ -2091,12 +2100,15 @@ class PyTorchModelEngine(ModelEngine):
 
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
+        tune_mxfp8_graph_backends = any(method.tune_graph_backends
+                                        for method in mxfp8_methods)
 
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info(
             f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
             f"native MXFP8={enable_native_mxfp8_autotuner}, "
-            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
+            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner}, "
+            f"MXFP8 graph backend tuning={tune_mxfp8_graph_backends})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
