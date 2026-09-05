@@ -183,6 +183,9 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_weight_shapes_gated_and_nongated
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_unaligned_rows_raise_diagnostic
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_aligned_rows_accepted
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_bakes_situ_softcaps_as_uniform_scalars
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_plain_swiglu_carries_no_constants
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier

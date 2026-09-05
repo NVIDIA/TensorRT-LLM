@@ -46,6 +46,9 @@ l0_h100:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_weight_shapes_gated_and_nongated
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_unaligned_rows_raise_diagnostic
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_w4a16_aligned_rows_accepted
   # ------------- Kimi K3 MoE unit tests ---------------
   # Any-CUDA (Triton trtllm::situ_and_mul op + torch reference, requires_cuda
   # only; not SM100/SM103-gated), so they run on Hopper rather than consuming
