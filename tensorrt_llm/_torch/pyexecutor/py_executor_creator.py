@@ -812,10 +812,19 @@ def create_py_executor(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
             )
 
+        # VSWA allocates one pool per window size, which only
+        # `register_kv_cache_layout` can describe. `use_kv_cache_manager_v2` is
+        # tri-state and under "auto" the manager is not chosen until model
+        # loading, so reject here only when V2 is definitively off;
+        # `_maybe_init_kv_connector_manager` re-checks the manager actually
+        # built and rejects there if the selection landed on the flat-tensor
+        # path.
         max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and kv_cache_config.use_kv_cache_manager_v2 is False):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "on the V1 KV cache manager. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
