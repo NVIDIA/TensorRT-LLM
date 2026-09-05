@@ -230,6 +230,12 @@ class MoEDeployment:
     eplb_enabled: bool = False
     # True only for routed-expert LoRA targets.
     moe_lora_enabled: bool = False
+    # False when ``moe_disable_finalize_fusion`` is set or any LoRA is
+    # configured: both need an unfused FC2 so a seam is left for the LoRA GEMM.
+    fused_finalize_enabled: bool = True
+    # ``model_config.locality_domain_policy.enabled``. Whether the machine can
+    # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
+    locality_domain_requested: bool = False
 
     @property
     def smart_router(self) -> bool:
@@ -268,6 +274,9 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The impl only has a fused-finalize FC2 epilogue, and the caller disabled
+    # finalize fusion (explicitly, or implicitly by configuring LoRA).
+    FINALIZE_FUSION_REQUIRED = "finalize_fusion_required"
     # Not a capability verdict: the impl could run, but the resolver refuses to
     # route production traffic there. Kept separate so that "we chose not to"
     # never reads as "it cannot".
