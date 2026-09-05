@@ -1724,6 +1724,8 @@ class ModelLoader:
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
             allowed_backends,
+            disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin=self.
+            llm_args.disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin,
             use_cute_dsl_blockscaling_mm=self.llm_args.
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
@@ -1752,6 +1754,9 @@ class ModelLoader:
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
             'nvfp4_gemm_allowed_backends'] = config.nvfp4_gemm_allowed_backends
+        config.extra_attrs[
+            'disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin'] = (
+                config.disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin)
         config.extra_attrs[
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         # Store allreduce pre-allocation config for AllReduce module access.

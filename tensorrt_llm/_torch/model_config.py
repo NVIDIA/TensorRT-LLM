@@ -258,6 +258,9 @@ class ModelConfig(Generic[TConfig]):
     nvfp4_gemm_allowed_backends: List[str] = field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
 
+    # Default-off (disabled=False); set true to disable and retain the ATen fallback for Marlin NVFP4 models.
+    disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin: bool = False
+
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.

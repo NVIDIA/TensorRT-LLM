@@ -23,7 +23,9 @@ from torch import nn
 from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import Fp4QuantizedTensor, is_nvfp4_marlin_enabled
+from ..utils import (Fp4QuantizedTensor,
+                     allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin,
+                     is_nvfp4_marlin_enabled)
 
 # Hidden-dim bounds of the warp-specialized fused_add_rms_norm_quant kernel
 # (cpp/tensorrt_llm/thop/fusedAddRMSNormQuant.cpp).
@@ -168,8 +170,9 @@ class RMSNorm(nn.Module):
                     gather=True,
                     use_gemma=self.use_gemma,
                 )
-        elif IS_FLASHINFER_AVAILABLE and not is_nvfp4_marlin_enabled(
-        ) and hidden_states.dtype in (torch.float16, torch.bfloat16):
+        elif IS_FLASHINFER_AVAILABLE and hidden_states.dtype in (
+                torch.float16, torch.bfloat16) and (
+                    allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()):
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
                                       flashinfer_gemma_fused_add_rmsnorm,
                                       flashinfer_gemma_rmsnorm,
