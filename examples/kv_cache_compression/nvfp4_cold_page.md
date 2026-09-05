@@ -21,67 +21,10 @@ more reusable KV fit in the same cold-tier quota and reduce Page-migration bytes
 The benefit is largest when the workload has substantial prefix reuse and real
 cold-tier pressure.
 
-## Design and Enablement
-
-Enable the feature through the normal LLM configuration. `KvCacheConfig`
-selects the native C++ KVCacheManagerV2 and provisions the cold tiers;
-`ColdPageQuantizationCompressionConfig` selects the NVFP4 representation used
-at those tiers.
-
-```text
-LLM / trtllm-serve configuration
-  |
-  +-- KvCacheConfig
-  |     +-- use_kv_cache_manager_v2 = true
-  |     +-- runtime KV dtype = auto / FP16 / BF16 / FP8
-  |     `-- Host cache and/or Disk cache is provisioned
-  |
-  `-- ColdPageQuantizationCompressionConfig(quant="nvfp4")
-                       |
-                       v
-Cold-page compression manager
-  +-- selects compressible Attention buffer roles
-  +-- derives compact offsets and optional K/V global scales
-  `-- creates and registers the NVFP4 cold-page codec
-                       |
-                       v
-C++ KVCacheManagerV2
-  +-- owns Pages, Slots, cache levels, migration batches, streams, and events
-  +-- hot -> cold: fused NVFP4 encode + transfer
-  `-- cold -> hot: fused transfer + decode to the runtime KV type
-                       |
-                       v
-KVCM publishes the destination mapping with its normal completion ordering
-  `-- Attention consumes the normal GPU hot-page layout
-```
-
-KVCacheManagerV2 remains the storage and lifecycle owner. The compression
-manager owns the representation policy: buffer-role selection, compact layout,
-scales, and codec dispatch. This separation keeps Page identity, scheduling,
-reuse policy, allocation, and the Attention-visible GPU layout unchanged.
-
-The Page data path is:
-
-```text
-GPU hot Page (FP16/BF16/FP8 Attention KV)
-    |  KVCM selects a migration batch
-    |  fused NVFP4 encode + GPU-to-Host transfer
-    v
-Host cold Page (NVFP4 Attention data + block scales;
-                non-Attention and auxiliary buffers remain lossless)
-    |  optional pinned-Host staging to or from Disk
-    |  fused Host-to-GPU transfer + decode
-    v
-GPU hot Page (original runtime KV type)
-    |  KVCM publishes the restored Page
-    v
-Attention consumes the Page in its normal runtime layout
-```
-
 ## Feature Behavior
 
-Each cold Page is one compact storage blob. For conventional MHA/GQA, the K and
-V buffers are encoded as packed NVFP4 data plus one E4M3 block scale per 16
+Each cold Page is one compact storage blob. For conventional MHA/MQA/GQA, the K
+and V buffers are encoded as packed NVFP4 data plus one E4M3 block scale per 16
 scalar values. For key-only MLA, the latent Attention key is encoded. Auxiliary
 roles in the same Attention lifecycle, such as a DSA index key, are appended to
 the blob losslessly. Non-Attention lifecycles, including GDN, SSM, and Conv
@@ -114,7 +57,7 @@ Attention-visible GPU layout.
 
 | Cache type | Cold-page behavior |
 | --- | --- |
-| MHA and GQA Attention KV | Supported; K and V are encoded as NVFP4 data and block scales |
+| MHA, MQA, and GQA Attention KV | Supported; K and V are encoded as NVFP4 data and block scales |
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
