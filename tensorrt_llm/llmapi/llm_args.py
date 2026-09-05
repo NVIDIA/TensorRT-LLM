@@ -1081,11 +1081,30 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         default=False,
         description=
         "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
-        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
-        "threshold search iterations. Currently supported for index_topk ∈ "
-        "{512, 1024, 2048} on Blackwell (SM100+), with compress_ratio ∈ {1, 4} "
-        "(DSv3.2 + DSv4 indexers). Falls back to the production insertion/"
-        "radix Top-K path when prerequisites are not met.")
+        "indexer instead of the exact insertion/radix Top-K path. Currently "
+        "supported for index_topk ∈ {512, 1024, 2048} on Blackwell (SM100+), "
+        "with compress_ratio ∈ {1, 4} (DSv3.2 + DSv4 indexers). Falls back to "
+        "the production insertion/radix Top-K path when prerequisites are not "
+        "met. `use_self_sampling_topk` selects the GVR engine generation.")
+    use_self_sampling_topk: bool = Field(
+        default=True,
+        description=
+        "Select the GVR engine generation when enable_heuristic_topk is set: "
+        "True (default) runs the hint-free self-sampling engine, which derives "
+        "its search bracket from the current row and keeps no cross-step "
+        "state; False runs the temporal-hint engines, which reuse the "
+        "previous decode step's Top-K indices as hints. Ignored when "
+        "enable_heuristic_topk is False.")
+    use_gvr_emission: bool = Field(
+        default=False,
+        description=
+        "Enable the emission-assisted block-skip optimization for the "
+        "temporal-hint GVR engine. When set, the FP4 indexer epilogue emits "
+        "per-block max logits so the GVR Top-K can skip whole blocks. Only "
+        "takes effect with enable_heuristic_topk=True, use_self_sampling_topk="
+        "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
+        "self-sampling engine derives its bracket from the current row and "
+        "does not use emission.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1227,6 +1246,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1259,6 +1280,8 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1346,6 +1369,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1371,6 +1396,8 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,

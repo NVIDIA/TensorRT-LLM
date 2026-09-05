@@ -57,6 +57,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -126,11 +127,15 @@ def _set_torch_top_k(indexer: Indexer) -> None:
     )
 
 
-def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
+@pytest.mark.parametrize("use_self_sampling", [True, False])
+def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_sampling):
     sparse_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 4, 128],
         index_head_dim=96,
+        index_topk=512,
         indexer_k_dtype="fp8",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling,
     )
     sparse_metadata_params = sparse_config.to_sparse_metadata_params()
     metadata = object.__new__(DSAtrtllmAttentionMetadata)
@@ -144,8 +149,18 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     metadata.create_buffers_for_mla_rope_append = Mock()
     metadata.create_buffers_for_indexer = Mock()
 
-    with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=100,
+        ),
     ):
         DSAtrtllmAttentionMetadata.__post_init__(metadata)
 
@@ -153,6 +168,63 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     assert metadata.compress_ratios == [1, 4, 128]
     assert metadata._indexer_compress_ratio == 4
     assert metadata._tokens_per_block == 64
+    # The metadata mirror of the two-level dispatch drives prior allocation.
+    assert metadata.use_self_sampling_topk == use_self_sampling
+    assert metadata.needs_gvr_prior == (not use_self_sampling)
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        (dict(), True),
+        (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
+        (dict(enable_heuristic_topk=False), False),
+        (dict(use_self_sampling_topk=False), False),
+        (dict(is_cute_dsl_available=False), False),
+        (dict(sm_version=120), False),
+        (dict(index_topk=256), False),
+        (dict(compress_ratio=2), False),
+    ],
+)
+def test_use_self_sampling_gvr(kwargs, expected):
+    base = dict(
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=True,
+        index_topk=512,
+        compress_ratio=1,
+        is_cute_dsl_available=True,
+        sm_version=100,
+    )
+    base.update(kwargs)
+    assert use_self_sampling_gvr(**base) is expected
+
+
+@pytest.mark.parametrize("use_self_sampling_topk", [True, False])
+@pytest.mark.parametrize("use_gvr_emission", [False, True])
+def test_use_gvr_emission_threads_to_params(use_gvr_emission, use_self_sampling_topk):
+    """The emission block-skip flag (third GVR dispatch param) threads from the
+    sparse-attention config into both DSAParams and DSAMetadataParams,
+    independently of the V1/V2 selection. The runtime indexer gate additionally
+    requires the temporal-hint (V1) path + FP4 + paged-MQA to take effect."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling_topk,
+        use_gvr_emission=use_gvr_emission,
+    )
+    assert sparse_config.to_sparse_params().use_gvr_emission is use_gvr_emission
+    assert sparse_config.to_sparse_metadata_params().use_gvr_emission is use_gvr_emission
+
+
+def test_use_gvr_emission_defaults_off():
+    """Default keeps the emission block-skip optimization disabled end to end."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(index_topk=512)
+    assert sparse_config.use_gvr_emission is False
+    assert sparse_config.to_sparse_params().use_gvr_emission is False
+    assert sparse_config.to_sparse_metadata_params().use_gvr_emission is False
 
 
 @pytest.mark.parametrize(
@@ -209,6 +281,54 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         cute_dsl_radix.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "use_self_sampling,sm_version,msl_c,should_warmup",
+    [
+        (True, 100, 65536, True),
+        (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
+        (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
+        (True, 90, 65536, False),  # non-datacenter Blackwell
+    ],
+)
+def test_metadata_warmup_selfsampling_prefill_leg(
+    use_self_sampling, sm_version, msl_c, should_warmup
+):
+    """The self-sampling warmup drives BOTH the decode (varlen) and the prefill
+    engines; the prefill leg sits before the DeepGEMM decode-stride guard so an
+    odd msl_c cannot skip it."""
+    metadata = SimpleNamespace(
+        enable_gvr_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+        sparse_mla_topk=512,
+        _indexer_compress_ratio=4,
+        kv_cache_manager=SimpleNamespace(),
+        get_indexer_max_seq_len=Mock(return_value=msl_c),
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        num_sms=148,
+    )
+    ss_host = (
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(f"{ss_host}.warmup_prefill") as warmup_prefill,
+        patch(f"{ss_host}.warmup_varlen"),
+    ):
+        DSAtrtllmAttentionMetadata.warmup_selfsampling_topk(metadata, next_n=1, batch_sizes=[8])
+
+    if should_warmup:
+        warmup_prefill.assert_called_once_with(512, max(msl_c, 32768))
+    else:
+        warmup_prefill.assert_not_called()
+
+
 def test_kv_lens_row_reorder_threshold():
     """Prepare row order only when CuTe DSL GVR has enough decode rows."""
     num_sms = 16
@@ -218,8 +338,7 @@ def test_kv_lens_row_reorder_threshold():
         kv_lens_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
         row_order_buffer = torch.zeros(64, dtype=torch.int32, device="cuda")
         return SimpleNamespace(
-            enable_gvr_topk=True,
-            use_cute_dsl_topk=True,
+            needs_gvr_prior=True,
             num_generations=num_generations,
             num_sms=num_sms,
             max_draft_tokens=next_n - 1,
@@ -278,7 +397,9 @@ def test_gvr_prior_writeback_uses_aux_stream():
             enable_indexer_skip=True,
         )
         indexer = create_indexer(sparse_config)
-        indexer._enable_heuristic_topk = True
+        # temporal GVR consumes the prior; force it independent of hardware
+        indexer.top_k.decode_implementation = TopKImplementation.CUTE_DSL_GVR
+        indexer.top_k.gvr_self_sampling = False
         indexer.aux_stream = torch.cuda.Stream()
         metadata.gvr_prior_indices = torch.zeros(
             (cache_manager.num_local_layers, batch_size, index_topk),
@@ -343,6 +464,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.enable_context_mla_with_cached_kv = False
     metadata.enable_indexer_skip = False
     metadata.enable_gvr_topk = False
+    metadata.needs_gvr_prior = False
     metadata.get_empty = Mock(
         side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
     )
@@ -445,7 +567,7 @@ def test_indexer_post_load_weights_caches_fused_weight():
     [
         (False, False, TopKImplementation.CUDA_RADIX),
         (True, False, TopKImplementation.CUTE_DSL_RADIX),
-        (False, True, TopKImplementation.CUDA_GVR),
+        (False, True, TopKImplementation.CUTE_DSL_GVR),
         (True, True, TopKImplementation.CUTE_DSL_GVR),
     ],
 )
@@ -477,6 +599,62 @@ def test_indexer_configures_one_top_k_module(
     assert isinstance(indexer.top_k, TopK)
     assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert indexer.top_k.decode_implementation == expected_decode
+    if enable_heuristic:
+        # index_topk=128 misses the self-sampling prerequisites, so the
+        # default use_self_sampling_topk=True falls back to the temporal path.
+        assert not indexer.top_k.gvr_self_sampling
+        assert indexer.top_k.needs_gvr_prior
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "use_self_sampling,use_cute_dsl,expected_decode",
+    [
+        (True, False, TopKImplementation.CUTE_DSL_GVR),
+        (True, True, TopKImplementation.CUTE_DSL_GVR),
+        (False, True, TopKImplementation.CUTE_DSL_GVR),
+        (False, False, TopKImplementation.CUTE_DSL_GVR),
+    ],
+)
+def test_indexer_two_level_gvr_dispatch(
+    monkeypatch,
+    use_self_sampling,
+    use_cute_dsl,
+    expected_decode,
+):
+    # The retired TRTLLM_GVR_SELF_SAMPLING env must be ignored: with
+    # use_self_sampling_topk=False the temporal path must win regardless.
+    monkeypatch.setenv("TRTLLM_GVR_SELF_SAMPLING", "1")
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=512,
+        use_cute_dsl_topk=use_cute_dsl,
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer.top_k.decode_implementation == expected_decode
+    assert indexer.top_k.gvr_self_sampling == use_self_sampling
+    assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
+    # Prefill uses the self-sampling engine on exactly the self-sampling
+    # layers; the temporal-hint layers keep the exact radix prefill.
+    expected_prefill = (
+        TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
+    )
+    assert indexer.top_k.prefill_implementation == expected_prefill
 
 
 @skip_pre_hopper
@@ -3969,8 +4147,8 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         index_topk,
         prefill_implementation=TopKImplementation.CUDA_RADIX,
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
     )
-    indexer._enable_heuristic_topk = True
     metadata_skip.gvr_prior_indices = torch.zeros(
         (cache_manager.num_local_layers, batch_size, index_topk),
         device="cuda",
