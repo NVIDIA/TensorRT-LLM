@@ -56,18 +56,18 @@ def test_run_root_is_still_available_as_an_alias(cfg, run_root):
 def test_project_new_scaffolds_and_refuses_to_clobber(tmp_path, capsys):
     root = tmp_path / "projects"
     args = ["--projects-root", str(root)]
-    assert project.main([*args, "new", "alpha"]) == 0
+    assert project.main([*args, "new", "alpha", "--no-parent"]) == 0
     made = root / "alpha"
     assert (made / "agent-flow-ops.toml").is_file()
     assert (made / "workspace").is_dir() and (made / "logs").is_dir()
     body = (made / "agent-flow-ops.toml").read_text()
     assert "[project]" in body and 'name = "alpha"' in body
-    assert project.main([*args, "new", "alpha"]) == 3
+    assert project.main([*args, "new", "alpha", "--no-parent"]) == 3
 
 
 def test_project_list_reports_state(tmp_path, capsys):
     root = tmp_path / "projects"
-    project.main(["--projects-root", str(root), "new", "beta"])
+    project.main(["--projects-root", str(root), "new", "beta", "--no-parent"])
     (root / "beta" / "workspace" / "PASS-LEDGER.md").write_text(
         textwrap.dedent(
             """

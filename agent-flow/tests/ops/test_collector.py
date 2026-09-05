@@ -96,7 +96,7 @@ def test_a_broken_narrator_never_breaks_the_status(cfg, tmp_path):
 
 
 def _make_project(root, name, ledger=None, project_keys="", roles=None):
-    project.main(["--projects-root", str(root), "new", name])
+    project.main(["--projects-root", str(root), "new", name, "--no-parent"])
     d = root / name
     if ledger:
         (d / "workspace" / "PASS-LEDGER.md").write_text(textwrap.dedent(ledger))

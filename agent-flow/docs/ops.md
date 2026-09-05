@@ -235,6 +235,29 @@ python -m agent_flow.ops.project new <name>     # dirs + a project overlay
 python -m agent_flow.ops.project list           # every project and its state
 ```
 
+```
+python -m agent_flow.ops.project new <name> --parent <project>
+python -m agent_flow.ops.project new <name> --start-commit <sha>
+python -m agent_flow.ops.project new <name> --no-parent
+python -m agent_flow.ops.project check [<project dir>] [--checkout DIR]
+```
+
+`new` refuses to scaffold without a starting commit unless `--no-parent` is
+passed, and that refusal is the point: a project with no recorded start cannot
+say later which of its parent's verdicts its code still satisfies, and "it was
+green last week" is not evidence. `--parent` takes the final commit from the
+parent's archive manifest (the archive is what froze; the parent's live
+checkout has moved on), writes `parent` and `start_commit` into the project
+overlay, and puts the GIT rule into the scaffolded `workspace/TASK.md`: branch
+from that commit, the parent's ledger is frozen evidence, and a change touching
+the code path behind a parent gate reopens that gate and only that gate.
+
+`check` compares a checkout against the pin and prints the drift — `at`,
+`descends` (with commits ahead and behind), `diverged` (the pin is not an
+ancestor of HEAD, so the parent's verdicts may not apply), or `unknown-commit`
+(the pin is not in this checkout at all). Exit 0 for `at` / `descends` /
+`no-pin`, 1 otherwise.
+
 `new` creates the project root with `workspace/`, `logs/` and `evidence/`, and
 writes an `agent-flow-ops.toml` overlay naming the project and its roles. Fill
 in the role checkouts, drop the task file into the workspace, and point the
