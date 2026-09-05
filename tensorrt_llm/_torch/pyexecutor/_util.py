@@ -29,7 +29,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
+    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
@@ -1457,6 +1457,9 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
+            kv_events_config=None
+            if estimating_kv_cache or model_engine.is_draft_model else
+            self._llm_args.kv_cache_config.kv_events_config,
             cold_page_codec_provider=cold_page_codec_provider,
         )
 
@@ -2336,7 +2339,8 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
+        cold_page_codec_provider: Optional[object] = None,
+        kv_events_config: Optional[KVEventsConfig] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2475,6 +2479,12 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["kv_events_config"] = kv_events_config
+    elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
+        logger.warning(
+            "kv_cache_config.kv_events_config is set but streaming KV event "
+            "publishing requires KV cache manager V2; events will not be "
+            f"published for {kv_cache_manager_cls.__name__}.")
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 

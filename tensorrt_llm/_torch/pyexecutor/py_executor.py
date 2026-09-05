@@ -599,7 +599,9 @@ class PyExecutor:
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
-        self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
+        self.enable_kv_cache_events = self.kv_cache_manager is not None and (
+            self.kv_cache_manager.event_buffer_max_size > 0 or getattr(
+                self.kv_cache_manager, "streaming_kv_events_enabled", False))
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
         # AsyncTransferManager pin/unpin path is V1-only; V2 holds blocks via _KVCache refcount.
         self.enable_partial_reuse_for_disagg = (

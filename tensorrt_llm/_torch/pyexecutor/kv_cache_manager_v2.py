@@ -38,7 +38,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     IndexMapper,
     copy_batch_block_offsets_to_device,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -61,6 +61,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheEventManager,
     KVCacheIterationStatsDelta,
     LayerId,
+    LifeCycleId,
     PageIndexMode,
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
@@ -74,6 +75,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
@@ -85,6 +87,7 @@ from ...mapping import Mapping
 from ..utils import maybe_compile
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -893,6 +896,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        kv_events_config: Optional[KVEventsConfig] = None,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         **kwargs,
@@ -1016,8 +1020,41 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len if window_size is None else int(window_size)
             for window_size in self.max_attention_window_vec
         )
-        self.event_manager: Optional[KVCacheEventManager] = None
-        if self.event_buffer_max_size > 0:
+        self.event_manager: Optional[KVCacheEventManager | StreamingKVCacheEventManager] = None
+        streaming_events_enabled = (
+            kv_events_config is not None and kv_events_config.enable_kv_cache_events
+        )
+        if streaming_events_enabled:
+            if self.event_buffer_max_size > 0:
+                logger.warning(
+                    "Both kv_cache_config.event_buffer_max_size and streaming "
+                    "kv_events_config are enabled; streaming publishing takes "
+                    "precedence and the buffered get_kv_cache_events() poll path "
+                    "will return no events."
+                )
+            assert kv_events_config is not None
+            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
+            # publish/replay port ranges, all before any socket is bound.
+            validate_streaming_support(
+                kv_events_config,
+                pp_size=mapping.pp_size,
+                cp_size=mapping.cp_size,
+                # Ranks bind by global rank; only those sharing a host can collide.
+                ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
+                data_parallel_size=mapping.dp_size,
+                backend=KV_CACHE_MANAGER_V2_BACKEND,
+            )
+            if mapping.enable_attention_dp or mpi_rank() == 0:
+                # Constructing it is side-effect free; start() below binds the socket
+                # and starts the publisher thread once every other check has passed.
+                event_rank = mapping.rank if mapping.enable_attention_dp else 0
+                self.event_manager = StreamingKVCacheEventManager(
+                    kv_events_config,
+                    data_parallel_rank=event_rank,
+                    block_size=self.tokens_per_block,
+                    max_window_size=event_window_size,
+                )
+        elif self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
                 self.event_manager = KVCacheEventManager(
                     self.event_buffer_max_size,
@@ -1293,7 +1330,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
-                self._get_event_window_sizes_by_layer_group()
+                self._get_event_window_sizes_by_layer_group(
+                    attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
+                )
             )
             self.event_manager.add_created_event(
                 self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
@@ -1412,6 +1451,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
+
+        # Last: bind the publisher socket and start its thread only once every check
+        # above has passed. Constructing the manager is side-effect free, so a failure
+        # anywhere earlier -- including the rank-coordinated aborts, where this rank
+        # raises because a peer failed -- leaves nothing bound to clean up.
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+            self.event_manager.start()
+            logger.info("Streaming KV event fast path reuses V2 radix block hashes")
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
@@ -1736,21 +1783,33 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_event_layer_group_ids(self) -> List[int]:
         return [int(layer_group_id) for layer_group_id in range(len(self.impl.layer_grouping))]
 
-    def _get_event_window_sizes_by_layer_group(self) -> Dict[int, int]:
+    def _get_event_window_sizes_by_layer_group(
+        self, attention_only: bool = False
+    ) -> Dict[int, int]:
         # Assumes every layer in a group shares the same sliding_window_size,
         # which is how `impl.layer_grouping` partitions layers today. Only the
         # first layer's window is read; if the grouping policy ever permits
         # mixed windows in one group, this needs to fan out per-layer.
+        #
+        # `attention_only` is set for the streaming event manager, which tracks
+        # attention prefix reuse only: excluding SSM and other non-attention life cycles
+        # prevents a state life cycle (which reports max_seq_len as its window) from
+        # tying with the attention life cycle and being selected as the event target.
+        # The buffered manager keeps every layer group, so its windows are unchanged.
 
         def get_event_window_size(layer_id: int) -> int:
             layer_config = self.kv_cache_manager_py_config.layers[layer_id]
             window_size = getattr(layer_config, "sliding_window_size", None)
             return self.max_seq_len if window_size is None else int(window_size)
 
-        return {
-            int(layer_group_id): get_event_window_size(int(layer_ids[0]))
-            for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping)
-        }
+        window_sizes: Dict[int, int] = {}
+        for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
+            if attention_only:
+                life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
+                if not isinstance(life_cycle, AttnLifeCycle):
+                    continue
+            window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
+        return window_sizes
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
         for pool_group in self.impl.pool_group_descs:
@@ -3382,13 +3441,23 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache_stats
 
     def flush_iteration_events(self):
-        if self.event_manager is not None:
-            self.event_manager.flush_iteration_events()
+        event_manager = self.event_manager
+        if event_manager is not None:
+            event_manager.flush_iteration_events()
 
     def get_latest_events(self, timeout_ms: Optional[float] = None):
-        if self.event_manager is None:
+        # Streaming publishing pushes events out-of-band; in that mode the event
+        # manager's get_latest_events returns [], so the buffered pull path
+        # degrades cleanly instead of raising. Snapshot event_manager once so a
+        # concurrent shutdown cannot turn it into None between the check and use.
+        event_manager = self.event_manager
+        if event_manager is None:
             return []
-        return self.event_manager.get_latest_events(timeout_ms)
+        return event_manager.get_latest_events(timeout_ms)
+
+    @property
+    def streaming_kv_events_enabled(self) -> bool:
+        return isinstance(self.event_manager, StreamingKVCacheEventManager)
 
     def get_iteration_stats(self):
         if not self.enable_stats:
@@ -3967,6 +4036,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map.clear()
         self._request_stats_enabled_ids.clear()
         self.impl.shutdown()
+        # Shut the streaming event manager down last so removals emitted during
+        # cache / impl teardown (via the radix tree's own event-manager
+        # reference) are still flushed before the publisher stops. Do not null
+        # event_manager: get_latest_events/flush snapshot it and operate safely
+        # on a closed manager, so there is no teardown-time None race.
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+            self.event_manager.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
 

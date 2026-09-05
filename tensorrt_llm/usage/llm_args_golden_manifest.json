@@ -840,6 +840,44 @@
       "path": "kv_cache_config.kv_cache_event_hash_algo"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.buffer_steps"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.enable_kv_cache_events"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.hwm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.kv_events_config.max_queue_size"
+    },
+    {
+      "allowed_values": [
+        "null",
+        "zmq"
+      ],
+      "annotation": "Optional[Literal['null', 'zmq']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_events_config.publisher"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",

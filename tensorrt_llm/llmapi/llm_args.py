@@ -4027,6 +4027,59 @@ class MambaStateConfig(StrictBaseModel):
         "manager V2.")
 
 
+class KVEventsConfig(StrictBaseModel):
+    """Configuration for streaming (push-based) KV cache event publishing."""
+
+    enable_kv_cache_events: bool = Field(
+        default=False,
+        description=
+        "Whether to produce and publish KV cache events over the streaming (push) path."
+    )
+    publisher: Optional[Literal["null", "zmq"]] = Field(
+        default=None,
+        description=
+        "Publisher implementation. Defaults to 'zmq' when events are enabled and 'null' otherwise."
+    )
+    endpoint: str = Field(
+        default="tcp://*:5557",
+        min_length=1,
+        description=
+        "Base ZeroMQ endpoint the publisher binds. Each attention-DP rank binds "
+        "base_port+rank, so co-located engines (e.g. disaggregated prefill and "
+        "decode on one host) must use distinct base ports.")
+    replay_endpoint: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description=
+        "Optional base ZeroMQ endpoint used to replay KV cache events. Ranks apply "
+        "the same global base_port+rank convention as `endpoint`. Only ranks sharing a "
+        "host contend for a port, so the two base ports must be at least "
+        "ranks-per-host apart or a rank's replay bind collides with another rank's "
+        "publish bind on that host.")
+    buffer_steps: int = Field(
+        default=10_000,
+        gt=0,
+        description="Number of previously published batches retained for replay."
+    )
+    hwm: int = Field(default=100_000,
+                     gt=0,
+                     description="ZeroMQ publisher socket high-water mark. "
+                     "0 means unlimited in ZeroMQ, so it is disallowed here.")
+    max_queue_size: int = Field(
+        default=100_000,
+        gt=0,
+        description="Maximum number of batches queued for background publishing. "
+        "Must be positive; 0 would make the queue unbounded.")
+    topic: str = Field(
+        default="",
+        description="ZeroMQ subscription topic used for KV cache event batches."
+    )
+
+    def model_post_init(self, __context) -> None:
+        if self.publisher is None:
+            self.publisher = "zmq" if self.enable_kv_cache_events else "null"
+
+
 class BlockReuseConfig(StrictBaseModel):
     """Configuration for KV cache block reuse policies."""
 
@@ -4131,6 +4184,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The period in milliseconds to gather attention DP events across ranks."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    kv_events_config: Optional[KVEventsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, "
+        "each rank publishes its own events directly (e.g. over ZeroMQ) instead "
+        "of the buffered event_buffer_max_size gather/poll path.")
     enable_partial_reuse: bool = Field(
         default=True,
         description=
