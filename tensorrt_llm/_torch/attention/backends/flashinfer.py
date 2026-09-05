@@ -46,6 +46,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         log_attention_failure_context,
                         merge_attention_forward_args)
+from .page_table_check import check_page_table
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
 # check would force a CUDA context at import time.
@@ -255,8 +256,19 @@ class FlashInferWrappers:
     decode_block_table_active_width: int = field(default=0, repr=False)
 
 
+# Environment variable arming the host-side page-table check, and how many
+# reports one run may emit before it goes quiet.
+_PAGE_TABLE_CHECK_ENV = "TRTLLM_FI_PAGE_TABLE_CHECK"
+_PAGE_TABLE_CHECK_REPORTS = 20
+
+
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
+    # Report budget for the page-table check. A class attribute, because it
+    # bounds a run's log rather than a batch's, and deliberately unannotated so
+    # that @dataclass does not turn it into a field.
+    _page_table_check_budget = _PAGE_TABLE_CHECK_REPORTS
+
     workspace_buffer: Optional[torch.Tensor] = None
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
@@ -881,6 +893,64 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv_cuda[start:end],
             out=kv_lens_buffer[:self.num_generations],
         )
+
+    def _debug_validate_page_table(self, kv_lens_host, logical_num_blocks,
+                                   num_blocks) -> None:
+        """Diagnostic: check the page table handed to FlashInfer is well formed.
+
+        Every structural claim the kernel relies on is already on the host by
+        the time this runs -- the index mirrors, the indptr host copies and the
+        length arrays are all numpy or CPU tensors -- so the check costs no GPU
+        work and no synchronization, which is what makes it usable on a path
+        where a synchronization can hide the fault being chased.
+
+        Off unless ``TRTLLM_FI_PAGE_TABLE_CHECK`` is set. Reports are bounded,
+        because a malformed row repeats on every step of the request that owns
+        it, and one line is printed when the check is armed and finds nothing,
+        so that a clean run is distinguishable from a run the environment
+        variable never reached.
+        """
+        if not os.environ.get(_PAGE_TABLE_CHECK_ENV, "").strip():
+            return
+        cls = FlashInferAttentionMetadata
+        if cls._page_table_check_budget <= 0:
+            return
+        pool_size = getattr(self.kv_cache_manager, 'blocks_in_primary_pool',
+                            None)
+        pools = getattr(self, '_host_pool_indices', None) or {
+            0: getattr(self, '_host_paged_kv_indices', None)
+        }
+        host_pools = {
+            pool_id:
+            (indices.cpu().numpy() if torch.is_tensor(indices) else indices)
+            for pool_id, indices in pools.items()
+        }
+        try:
+            problems = check_page_table(
+                host_pools,
+                num_blocks,
+                logical_num_blocks,
+                kv_lens_host,
+                self.page_size,
+                pool_size=pool_size,
+            )
+        except Exception as exc:  # pragma: no cover - a diagnostic must not break a run
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check failed to run: {exc}")
+            return
+        if problems:
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check, {self.num_contexts} context / "
+                f"{self.num_generations} generation rows: " +
+                "; ".join(problems))
+        elif cls._page_table_check_budget == _PAGE_TABLE_CHECK_REPORTS:
+            cls._page_table_check_budget -= 1
+            logger.info(
+                f"[flashinfer] page table check armed and clean on a batch of "
+                f"{self.num_contexts} context / {self.num_generations} "
+                f"generation rows, pool size {pool_size}")
 
     def _prepare_full_draft_page_table(self) -> None:
         """Expose every allocated draft page and use device KV lengths."""
@@ -1755,6 +1825,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
+
+        self._debug_validate_page_table(kv_lens_host, logical_num_blocks,
+                                        num_blocks)
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
