@@ -1,5 +1,18 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import asyncio
 import json
@@ -400,7 +413,7 @@ class ConversationHistoryStore:
 
         def get_first_conversation_range_harmony():
             start_index = 0
-            end_index = 0
+            end_index = None
             for i, msg in enumerate(conversation):
                 if msg.author.role == Role.USER:
                     start_index = i
@@ -412,7 +425,7 @@ class ConversationHistoryStore:
 
         def get_first_conversation_range():
             start_index = 0
-            end_index = 0
+            end_index = None
             for i, msg in enumerate(conversation):
                 if msg.get("role", "") == "user":
                     start_index = i
@@ -427,6 +440,18 @@ class ConversationHistoryStore:
             start_index, end_index = get_first_conversation_range_harmony()
         else:
             start_index, end_index = get_first_conversation_range()
+
+        if end_index is None:
+            # Without a completed turn, remove the oldest non-instruction
+            # message so trimming makes progress and retains recent input.
+            # If only instructions remain, remove the oldest one instead.
+            start_index = end_index = 0
+            for i, msg in enumerate(conversation):
+                role = (msg.author.role if is_harmony_conversation else msg.get(
+                    "role", ""))
+                if role not in ("system", "developer"):
+                    start_index = end_index = i
+                    break
 
         del conversation[start_index:end_index + 1]
 
