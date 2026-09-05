@@ -612,6 +612,23 @@ class ModelConfig(Generic[TConfig]):
                     config.pre_quant_scale = layer_cfg['pre_quant_scale']
                 mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
+
+            # Mirror load_hf_quant_config: on DeepSeek-style MLA checkpoints
+            # the FP8 128x128 block boundaries do not necessarily align with
+            # the per-head split of kv_b_proj (e.g. GLM-5 has
+            # qk_nope_head_dim=192), so an FP8 block-scaled kv_b_proj must go
+            # through the dequant path instead of the per-head scale split.
+            has_fp8_kv_b_proj = any(
+                name.endswith(".self_attn.kv_b_proj")
+                and cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                for name, cfg in mixed_quant_configs.items())
+            if has_fp8_kv_b_proj:
+                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
+                existing = list(quant_config.exclude_modules or [])
+                quant_config.exclude_modules = existing + [
+                    pattern
+                    for pattern in default_exclude if pattern not in existing
+                ]
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
                 quant_config.group_size = 128
