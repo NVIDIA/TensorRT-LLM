@@ -4654,16 +4654,19 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     # so gate on GB300-class device memory. B300 clears this memory gate but
     # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
     # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
+    # platform selection and by the CI stage's gb300-only gpu wildcard,
+    # not by this marker.
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
     def test_w4a16_mxfp4(self, mode: str,
                          monkeypatch: pytest.MonkeyPatch) -> None:
         """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
 
-        No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
-        multinode pipeline (qualified on 4x4 GB300 nodes). Each mode mirrors
+        The baseline and sa legs run post-merge in the GB300 16-GPU 4-node CI
+        stage (test-db list l0_gb300_multi_nodes_node4_gpu16.yml); all three
+        modes of this test are also registered in qa/llm_function_multinode.txt
+        and run by QA's weekly multinode pipeline (qualified on 4x4 GB300
+        nodes; the reuse mode is QA-weekly-only). Each mode mirrors
         the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
         - keep them in sync when editing either. The `sa` leg additionally
         records spec-dec acceptance: AL/AR lines in the eval log (via
