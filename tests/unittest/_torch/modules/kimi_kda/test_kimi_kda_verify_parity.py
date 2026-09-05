@@ -26,6 +26,7 @@ pytest.importorskip("fla")
 from kimi_kda_test_utils import get_production_decode_kernel_path
 
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
 
@@ -90,6 +91,79 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
     assert output.shape == (2, _Cfg.hidden_size)
     assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
     assert captured["ssm_state_indices"].data_ptr() == state_indices.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_forward_uses_metadata_aligned_generation_state_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0)
+    captured: dict[str, torch.Tensor] = {}
+
+    def forward_prefill(
+        hidden_states: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        return torch.zeros_like(hidden_states)
+
+    def forward_verify(
+        hidden_states: torch.Tensor,
+        num_steps: int,
+        layer_cache: SimpleNamespace,
+        conv_pool: torch.Tensor,
+        ssm_pool: torch.Tensor,
+        slot_indices: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        captured["slot_indices"] = slot_indices
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(attention, "forward_prefill", forward_prefill)
+    monkeypatch.setattr(attention, "forward_verify", forward_verify)
+    layer_cache = SimpleNamespace(
+        conv=torch.empty(0, device="cuda"),
+        temporal=torch.empty(0, device="cuda"),
+    )
+
+    class KdaCacheManager:
+        use_kda_replay_update = True
+
+        def __init__(self) -> None:
+            self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+
+        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+            return self.state_indices[: len(request_ids)]
+
+        def mamba_layer_cache(self, layer_idx: int) -> SimpleNamespace:
+            return layer_cache
+
+    manager = KdaCacheManager()
+    mamba_metadata = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=4)
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_ctx_tokens=1,
+        num_tokens=4,
+        seq_lens=torch.tensor([1, 1], dtype=torch.int),
+        seq_lens_cuda=torch.tensor([1, 1], dtype=torch.int, device="cuda"),
+        kv_cache_manager=manager,
+        request_ids=[10, 11],
+        kv_cache_params=SimpleNamespace(
+            num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
+        ),
+    )
+    mamba_metadata.prepare(metadata)
+    metadata.mamba_metadata = mamba_metadata
+    hidden_states = torch.empty(4, _Cfg.hidden_size, device="cuda")
+    generation_slice = mamba_metadata.state_indices[1:]
+    aligned_indices = mamba_metadata.generation_state_indices
+
+    assert generation_slice.data_ptr() % 16 != 0
+    assert aligned_indices.data_ptr() % 16 == 0
+
+    output = attention(hidden_states, metadata)
+
+    assert output.shape == hidden_states.shape
+    assert captured["slot_indices"].data_ptr() == aligned_indices.data_ptr()
+    torch.testing.assert_close(aligned_indices, generation_slice)
 
 
 class _LayerCache:
