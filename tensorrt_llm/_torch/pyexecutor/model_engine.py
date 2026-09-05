@@ -468,11 +468,13 @@ class PyTorchModelEngine(ModelEngine):
             enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
         )
         self.dist = dist
+        self.llm_args = llm_args
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
             RouteCapture.create(rank=self.dist.rank,
-                                model_engine=self)  # R3 router-replay
-        self.llm_args = llm_args
+                                model_engine=self,
+                                enabled=llm_args.enable_return_routed_experts
+                                )  # R3 router-replay
         # Opt-in tiered sampling captured into the forward graph. Off by
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
