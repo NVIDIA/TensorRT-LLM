@@ -32,7 +32,7 @@ from .activation import ActivationParamShape, MoEActivation, activation_constant
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
-from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_deepgemm import DeepgemmCudaCppFp8BlockScalesImpl
 from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
@@ -51,8 +51,9 @@ from .impl_contract import (
     canonical_routing,
 )
 from .impl_environment import collect_moe_environment
+from .impl_identity import MOE_IMPL_REGISTRY, MoEImplId, MoEImplQuery
 from .interface import MoE
-from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from .mega_moe import DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl, MegaMoECuteDsl
 from .moe_load_balancer import get_moe_load_balancer
 
 if TYPE_CHECKING:
@@ -72,14 +73,20 @@ WIDEEP_DEPRECATION_MESSAGE = (
 #: the backend the other two are checked against. ``create_moe`` re-exports it.
 MoEImplClass = type[MoE] | type[MoEImplBase] | type[VanillaMoE]
 
-# Global priority: specialized first, broad fallbacks last.
+# Global priority: specialized first, broad fallbacks last. Both entrances
+# intersect their candidate set with this tuple -- ``_candidates_for`` against a
+# BACKEND_FAMILY entry, ``_candidates_for_impl_id`` against the registry -- so a
+# class missing from here resolves to an empty candidate list.
+# The DeepGEMM entries use the identity-derived names rather than the
+# ``DeepGemmFusedMoE`` / ``MegaMoEDeepGemm`` aliases, so what is ranked here
+# reads the same as what a resolution report prints.
 IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
-    MegaMoEDeepGemm,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
+    DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
     CuteDslFusedMoE,
     TRTLLMGenFusedMoE,
-    DeepGemmFusedMoE,
+    DeepgemmCudaCppFp8BlockScalesImpl,
     DenseGEMMFusedMoE,
     MarlinFusedMoE,
     TritonFusedMoE,
@@ -87,17 +94,19 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     VanillaMoE,  # reference implementation, never preferred
 )
 
-# Family membership only; IMPL_PRIORITY decides try order.
+# Family membership only; IMPL_PRIORITY decides try order. The coarse
+# ``moe_backend`` literal and a pinned identity reach the same class for the
+# DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTLASS": frozenset({CutlassFusedMoE}),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinFusedMoE}),
     "CUTEDSL": frozenset({CuteDslB12xFusedMoE, CuteDslFusedMoE}),
-    "DEEPGEMM": frozenset({DeepGemmFusedMoE}),
+    "DEEPGEMM": frozenset({DeepgemmCudaCppFp8BlockScalesImpl}),
     "DENSEGEMM": frozenset({DenseGEMMFusedMoE}),
     "TRTLLM": frozenset({TRTLLMGenFusedMoE}),
     "TRITON": frozenset({TritonFusedMoE}),
-    "MEGAMOE_DEEPGEMM": frozenset({MegaMoEDeepGemm}),
+    "MEGAMOE_DEEPGEMM": frozenset({DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl}),
     "MEGAMOE_CUTEDSL": frozenset({MegaMoECuteDsl}),
 }
 
@@ -334,6 +343,50 @@ def _candidates_for(backend: str) -> List[MoEImplClass]:
     return candidates
 
 
+def _coerce_impl_query(impl_id: Union[str, MoEImplId, MoEImplQuery]) -> MoEImplQuery:
+    """Accept a full identity, a partial query, or the text form of either.
+
+    Text goes through ``parse_query`` rather than field assignment because that
+    is the door which rejects unknown tokens, and a pinned identity most often
+    arrives as something a human wrote. Segment order carries no meaning:
+    tokens are matched to fields by value.
+    """
+    if isinstance(impl_id, MoEImplQuery):
+        return impl_id
+    text = impl_id.canonical() if isinstance(impl_id, MoEImplId) else impl_id
+    return MOE_IMPL_REGISTRY.parse_query(text)
+
+
+def _candidates_for_impl_id(query: MoEImplQuery) -> List[MoEImplClass]:
+    """Registered impls a pinned identity names, in global priority order.
+
+    No fallback is appended, which is the whole difference from
+    ``_candidates_for``. A caller that named an implementation is asking for
+    that one; running a substitute would attribute another kernel's numbers to
+    the identity that was pinned. So a pin whose gates all decline produces a
+    ``winner is None`` report and ``impl_class_for`` raises with the trail.
+
+    Matching nothing is the other failure, and it is a different one: it raises
+    here, before any candidate is considered, for the same reason an unknown
+    backend literal does -- there is no report worth returning when the request
+    named nothing that exists.
+    """
+    matched = {impl_cls for _, impl_cls in MOE_IMPL_REGISTRY.find(query)}
+    if not matched:
+        raise ValueError(
+            f"MoE impl {query.describe()!r} matches no registered implementation. "
+            f"Registered: {sorted(str(identity) for identity in MOE_IMPL_REGISTRY.identities())}"
+        )
+    ranked = [impl_cls for impl_cls in IMPL_PRIORITY if impl_cls in matched]
+    unranked = sorted(impl_cls.__name__ for impl_cls in matched.difference(ranked))
+    if unranked:
+        raise RuntimeError(
+            f"MoE impls are registered but absent from IMPL_PRIORITY, so a pinned "
+            f"request can never reach them: {unranked}"
+        )
+    return ranked
+
+
 #: ABI register name -> the ``MoEActivationSupport`` field declaring its shape.
 _CONSTANT_SHAPE_FIELDS: Dict[str, str] = {
     "alpha": "alpha_beta",
@@ -403,6 +456,7 @@ def resolve_moe_impl(
     routing: Optional["BaseMoeRoutingMethod | RoutingMethodType"] = None,
     layer_idx: Optional[int] = None,
     allow_degradation: bool = True,
+    impl_id: Optional[Union[str, MoEImplId, MoEImplQuery]] = None,
 ) -> MoEResolutionReport:
     """Resolve a MoE backend and return the full eligibility report.
 
@@ -412,7 +466,16 @@ def resolve_moe_impl(
     asked for. The rejection trail says which gate declined and why, so the
     caller does not have to re-derive the winner and compare classes.
 
-    Raises ValueError for unknown or deprecated backend literals.
+    ``impl_id`` pins a canonical implementation identity and, when given,
+    replaces ``model_config.moe_backend`` as the request. The two are separate
+    tracks on purpose: a backend literal names a coarse family and may degrade
+    to the fallback, while an identity names one registered implementation and
+    never degrades, so ``allow_degradation`` has nothing to act on here. A
+    partial identity is legal and is resolved among its matches by
+    ``IMPL_PRIORITY``, the same order the family path uses.
+
+    Raises ValueError for unknown or deprecated backend literals, for unknown
+    identity tokens, and for an identity that matches nothing registered.
     """
     if problem is None:
         problem = build_moe_problem(
@@ -430,9 +493,17 @@ def resolve_moe_impl(
     if deployment is None:
         deployment = build_moe_deployment(model_config, num_experts=problem.num_experts)
 
-    requested = model_config.moe_backend
-    candidates = _candidates_for(requested)
-    in_family = BACKEND_FAMILY[requested.upper()]
+    if impl_id is None:
+        requested = model_config.moe_backend
+        candidates = _candidates_for(requested)
+        requested_impls: FrozenSet[MoEImplClass] = BACKEND_FAMILY[requested.upper()]
+    else:
+        query = _coerce_impl_query(impl_id)
+        requested = query.describe()
+        candidates = _candidates_for_impl_id(query)
+        # Every candidate IS what was asked for, since no fallback was
+        # appended, so a winner on this path is always "pinned".
+        requested_impls = frozenset(candidates)
 
     # Ask all candidates so the report lists alternatives.
     rejected = []
@@ -469,7 +540,7 @@ def resolve_moe_impl(
 
     if winner_cls is None:
         selected_by = "failed"
-    elif winner_cls in in_family:
+    elif winner_cls in requested_impls:
         # Another family member still counts as pinned.
         selected_by = "pinned"
     else:

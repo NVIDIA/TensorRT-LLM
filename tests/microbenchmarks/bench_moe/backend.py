@@ -119,17 +119,21 @@ def get_backend_class(backend_type: MoeBackendType):
 
         return CuteDslFusedMoE
     if backend_type == MoeBackendType.DEEPGEMM:
-        from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+        # The identity-derived name rather than the ``DeepGemmFusedMoE`` alias,
+        # so ``_BACKEND_CLASS_TO_NAME`` in build.py keys off one spelling.
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
+            DeepgemmCudaCppFp8BlockScalesImpl,
+        )
 
-        return DeepGemmFusedMoE
+        return DeepgemmCudaCppFp8BlockScalesImpl
     if backend_type == MoeBackendType.DENSEGEMM:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 
         return DenseGEMMFusedMoE
     if backend_type == MoeBackendType.MEGAMOE_DEEPGEMM:
-        from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoEDeepGemm
+        from tensorrt_llm._torch.moe.fused_moe.mega_moe import DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
 
-        return MegaMoEDeepGemm
+        return DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl
     if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
         from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
 

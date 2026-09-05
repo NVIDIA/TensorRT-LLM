@@ -16,9 +16,12 @@
 
 Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
 
-* :class:`MegaMoEDeepGemm` — DeepGEMM ``fp8_fp4_mega_moe`` fused kernel for
-  W4A8_MXFP4_MXFP8 weights. ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the
-  DG-native weight tensors, scale conversion, and DeepGEMM weight transform.
+* :class:`DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl` — DeepGEMM ``fp8_fp4_mega_moe``
+  fused kernel for W4A8_MXFP4_MXFP8 weights. One class carries the identity and
+  the whole contract; ``MegaMoEDeepGemm`` is an alias onto it, kept for the
+  call sites that predate the identity.
+  ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the DG-native weight tensors,
+  scale conversion, and DeepGEMM weight transform.
 * :class:`MegaMoECuteDsl` — CuteDSL ``Sm100MegaMoEKernel`` fused dispatch +
   FC1 + activation + FC2 + combine kernel for NVFP4 weights. The kernel and
   helper sources are ported into
@@ -34,9 +37,10 @@ from .mega_moe_cute_dsl import (
     MegaMoECuteDslWeightView,
     is_megamoe_cute_dsl_runtime_available,
 )
-from .mega_moe_deepgemm import MegaMoEDeepGemm
+from .mega_moe_deepgemm import DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl, MegaMoEDeepGemm
 
 __all__ = [
+    "DeepgemmCudaCppW4a8Mxfp4Mxfp8Impl",
     "MegaMoECuteDsl",
     "MegaMoECuteDslWeightView",
     "MegaMoeCuteDslUnavailable",
