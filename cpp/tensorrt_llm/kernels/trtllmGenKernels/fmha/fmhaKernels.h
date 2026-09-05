@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <limits>
 #include <linux/limits.h>
@@ -848,6 +849,67 @@ private:
                 buildRelPath = buildAbsDir.substr(pos);
             }
 #endif
+
+            // FIRST, ask the loaded library where IT is -- not pip where the package is
+            // recorded, and not a child interpreter where it merely happens to be importable.
+            //
+            // `pip show` answers from an install record, and the record can disagree with the
+            // package this process actually loaded:
+            //   * a stale record survives `pip uninstall` when the files it names are already
+            //     gone ("Can't uninstall 'tensorrt_llm'. No files were found to uninstall.")
+            //     and keeps being reported afterwards;
+            //   * `pip` on PATH can belong to a different environment than this process;
+            //   * "Editable project location" is preferred below and never cross-checked
+            //     against "Location", so when the editable path is wrong the correct one is
+            //     not tried at all.
+            //
+            // Observed: a wheel installed into dist-packages, its headers present at
+            // <package>/include/trtllm_gen_kernels/fmha, `pip show` naming a source tree that
+            // had since been removed, and this assertion firing while the files were on disk
+            // in the package being executed.
+            //
+            // dladdr() names the file this very code was loaded from, so the answer is the
+            // running package by construction: no subprocess, no PATH resolution, and no
+            // second interpreter that could import a different tensorrt_llm than the one this
+            // process already holds. setup.py installs libs/ and include/ as siblings inside
+            // the package directory, so walk up from the library and take the first ancestor
+            // carrying the fmha include directory -- that covers <package>/libs/*.so without
+            // hard-coding how deep the library sits. The pip path below is left exactly as it
+            // was, as the fallback for layouts this does not cover.
+            {
+                Dl_info dlInfo{};
+                // Any static-storage address declared here lives in the object this code was
+                // linked into, which is precisely the object we want dladdr() to name.
+                if (dladdr(static_cast<void const*>(&execPathStr), &dlInfo) != 0 && dlInfo.dli_fname != nullptr
+                    && dlInfo.dli_fname[0] != '\0')
+                {
+                    std::error_code ec;
+                    auto libPath = std::filesystem::weakly_canonical(dlInfo.dli_fname, ec);
+                    if (ec)
+                    {
+                        libPath = std::filesystem::path(dlInfo.dli_fname);
+                    }
+                    auto fmhaIncludeSuffix = std::filesystem::path("include") / "trtllm_gen_kernels" / "fmha";
+                    // <package>/libs/libtensorrt_llm.so needs two hops; the bound keeps an
+                    // unexpected layout from walking all the way out to the filesystem root.
+                    auto dir = libPath.parent_path();
+                    for (int hops = 0; hops < 3 && !dir.empty(); ++hops)
+                    {
+                        auto fromLibrary = dir / fmhaIncludeSuffix;
+                        if (std::filesystem::exists(fromLibrary, ec))
+                        {
+                            execPathStr = (fromLibrary / "numb").string();
+                            return execPathStr;
+                        }
+                        auto parent = dir.parent_path();
+                        if (parent == dir)
+                        {
+                            break;
+                        }
+                        dir = std::move(parent);
+                    }
+                }
+            }
 
             // Always use pip show to find installation location at runtime
             char const* cmd = "pip show tensorrt_llm 2>/dev/null";
