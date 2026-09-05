@@ -1,11 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
-from typing import Callable, List, Optional, Union
+from collections.abc import Callable, Iterator
+from typing import List, Optional, Union
 
 import torch
 from torch.fx import Node
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
+from ..utils import get_model_extra_attrs
+
+
+class _PhaseSelectiveForward:
+    """
+    This utility class is used to selectively bypass torch.compile
+    for operations that do not need it (attention warmup, auto-tuning),
+    as well as for generation-only forwards, where the ordinary CUDA
+    graph machinery is deemed sufficient.
+    """
+
+    def __init__(self, eager_forward: Callable[..., object],
+                 compiled_forward: Callable[..., object]) -> None:
+        self._eager_forward = eager_forward
+        self._compiled_forward = compiled_forward
+        self._bypass_active = False
+
+    def __call__(self, *args, **kwargs) -> object:
+        """
+        The wrapper will enforce the eager forward function if:
+        1) The torch compile bypass is active (e.g., for auto-tuning), or
+        2) The batch is generation-only (rely on ordinary CUDA graphs)
+        """
+        attrs = get_model_extra_attrs()
+        attn_metadata_ref = attrs.get("attention_metadata") if attrs else None
+        attn_metadata = (attn_metadata_ref()
+                         if attn_metadata_ref is not None else None)
+        # This is the finalized batch classification after any
+        # context-to-generation promotion.
+        if (self._bypass_active or
+            (attn_metadata is not None and attn_metadata.num_contexts == 0)):
+            return self._eager_forward(*args, **kwargs)
+        return self._compiled_forward(*args, **kwargs)
+
+    @contextlib.contextmanager
+    def bypass(self) -> Iterator[None]:
+        """
+        Disable torch.compile for all forwards under this ctxt manager.
+        """
+        previous = self._bypass_active
+        self._bypass_active = True
+        try:
+            yield
+        finally:
+            self._bypass_active = previous
 
 
 def get_symint_val(i: Union[torch.SymInt | int]):
