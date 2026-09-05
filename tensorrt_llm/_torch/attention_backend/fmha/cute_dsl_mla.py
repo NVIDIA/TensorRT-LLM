@@ -54,14 +54,6 @@ class CuteDslMlaFmha(PhasedFmha):
             )
             return False
 
-        if attn.flashinfer_mla_backend is not None:
-            logger.debug(
-                "Standalone CuTe DSL MLA FMHA is unavailable: an explicit "
-                "flashinfer_mla_backend delegates MLA generation to "
-                "FlashInferTrtllmGenFmha."
-            )
-            return False
-
         if not IS_CUTLASS_DSL_AVAILABLE:
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
