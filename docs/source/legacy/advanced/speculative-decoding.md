@@ -63,13 +63,13 @@ This iterative process continues until a predefined stop conditions are met.
 An example orchestration script is available in the Triton backend repository’s
 [draft-target-model client example](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/client/python/draft_target_model_client.py).
 
-We provide two styles of running Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/ngram/run_dtm_ngram.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/run_dtm_ngram.py).
+For current Draft/Target usage with the PyTorch LLM API, see [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md) (Draft/Target section). The legacy `examples/draft_target_model` tree and `examples/ngram/run_dtm_ngram.py` script have been removed.
 
 ## NGram
 
 The NGram speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning. The NGram profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
 
-See document in [examples/ngram/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/README.md) and the code can be found in [examples/ngram/run_dtm_ngram.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/run_dtm_ngram.py).
+See [examples/ngram/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/README.md) and the NGram section in [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md). The legacy `examples/ngram/run_dtm_ngram.py` script has been removed.
 
 ## Medusa
 
@@ -149,7 +149,7 @@ So, only `9` candidates are specified.
 
 ### Using Medusa with TensorRT-LLM
 
-For guidance on constructing and executing Medusa with the Python runtime, consult the [Medusa README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/medusa/README.md). When utilizing the Inflight Fused Batching (IFB) with the C++ API, it is necessary to define the `medusa_choices` explicitly within the model configuration. For detailed instructions, refer to the [model configuration in TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration) for more details.
+The legacy `examples/medusa` tree has been removed, and Medusa is no longer available as a decoding type. This section is retained for historical context only. For current speculative decoding how-tos, see [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md). When utilizing Inflight Fused Batching (IFB) with the C++ API for supported methods, refer to the [model configuration in TensorRT-LLM backend](https://github.com/triton-inference-server/tensorrtllm_backend?tab=readme-ov-file#modify-the-model-configuration) for more details.
 
 #### Limitations
 
@@ -163,13 +163,13 @@ However, similar to any new model, you can follow the same approach to define yo
 
 The ReDrafter approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. However, unlike Medusa, it predicts draft tokens using a recurrent predictor, where each draft token depends on the previous one. This method also allows the use of beam search to identify more prominent draft tokens. For more details, please read [the ReDrafter paper](https://arxiv.org/html/2403.09919v1).
 
-TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. Please, visit the [ReDrafter README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/redrafter/README.md) for information about building and running the model. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
+TensorRT-LLM implements the ReDrafter model such that logits prediction, beam search, and draft token acceptance are performed inside the TensorRT engine. This contrasts with standard model inference, which only predicts logits and performs decoding outside the engine. Since the engine predicts explicit draft tokens instead of implicit tokens decoded from logits, we categorize this speculative decoding method as `explicit_draft_tokens`. The legacy `examples/redrafter` tree has been removed; see [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md) for current how-tos. ReDrafter supports both Inflight Fused Batching runtime and Python static batching runtime.
 
 ## EAGLE
 
 The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.
 
-Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine(EAGLE-1 and EAGLE-2 are both supported). Please, visit the [EAGLE README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md) for information about building and running the model.
+Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine(EAGLE-1 and EAGLE-2 are both supported). For current EAGLE how-tos, see the EAGLE 3 section in [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md). The legacy `examples/eagle` tree has been removed.
 
 > **EAGLE3 note.** If the EAGLE3 draft head config omits `draft_vocab_size`, TensorRT-LLM assumes it matches `vocab_size` and emits a warning. Set `draft_vocab_size` explicitly if the draft head uses a different vocabulary.
 
@@ -179,4 +179,4 @@ Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits
 
 ## Lookahead Decoding
 
-Lookahead decoding algorithm operates through two parallel computation branches within the same model: a lookahead branch that generates n-grams using a fixed-sized 2D window, and a verification branch that validates promising n-gram candidates. This approach eliminates the necessity for additional model training or fine-tuning and can be enabled for any autoregressive model. Refer to the [Lookahead decoding README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/lookahead/README.md) for information about building and running the model.
+Lookahead decoding algorithm operates through two parallel computation branches within the same model: a lookahead branch that generates n-grams using a fixed-sized 2D window, and a verification branch that validates promising n-gram candidates. This approach eliminates the necessity for additional model training or fine-tuning and can be enabled for any autoregressive model. The legacy `examples/lookahead` tree has been removed, and Lookahead is no longer available as a decoding type. This section is retained for historical context only. For current speculative decoding how-tos, see [Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md).
