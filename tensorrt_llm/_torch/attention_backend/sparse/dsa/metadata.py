@@ -196,6 +196,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.enable_gvr_topk = (
             sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        self.use_gvr_locality_domain = sparse_metadata_params.use_gvr_locality_domain
         self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
@@ -472,6 +473,45 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 num_rows_list=tuple(sorted(rows)),
                 row_stride=row_stride,
             )
+            if self.use_gvr_locality_domain and IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+                from ....locality_domain.gvr_topk import plan_gvr_topk_row_shards
+                from ....locality_domain.runtime import LocalityDomainRuntime
+                from ....locality_domain_utils import is_locality_domain_enabled
+
+                if is_locality_domain_enabled(torch.cuda.current_device()):
+                    runtime = LocalityDomainRuntime(num_partitions=2)
+                    topology = runtime.topology_identity()
+                    shard_rows: list[set[int]] = [set(), set()]
+                    for num_rows in rows:
+                        plan = plan_gvr_topk_row_shards(
+                            num_rows=num_rows,
+                            next_n=nn,
+                            score_width=msl_c,
+                            top_k=int(top_k),
+                            topology=topology,
+                        )
+                        if plan is None:
+                            continue
+                        if msl_c % 4 and any(shard.num_rows == 1 for shard in plan.shards):
+                            continue
+                        for shard in plan.shards:
+                            shard_rows[shard.partition_id].add(shard.num_rows)
+
+                    if all(shard_rows):
+                        runtime.fork()
+                        try:
+                            for partition_id, partition_rows in enumerate(shard_rows):
+                                with runtime.partition_context(partition_id):
+                                    _ss_host.warmup_varlen(
+                                        int(top_k),
+                                        msl_c * cr,
+                                        compress_ratio=cr,
+                                        next_n=nn,
+                                        num_rows_list=tuple(sorted(partition_rows)),
+                                        row_stride=row_stride,
+                                    )
+                        finally:
+                            runtime.join()
         except torch.cuda.OutOfMemoryError:
             # warmup is best-effort: the dispatch works without it (engines
             # JIT lazily outside capture), so do not fail engine init

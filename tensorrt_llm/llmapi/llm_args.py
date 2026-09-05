@@ -1105,6 +1105,23 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "False, and the FP4 paged-MQA-logits path; ignored otherwise. The "
         "self-sampling engine derives its bracket from the current row and "
         "does not use emission.")
+    use_gvr_locality_domain: bool = Field(
+        default=False,
+        status="prototype",
+        description="Enable prototype Rubin locality-domain row sharding for the "
+        "self-sampling GVR V2 decode Top-K. Only the already-produced logits "
+        "rows are split; the indexer logits producer remains full-device. "
+        "Only takes effect with enable_heuristic_topk=True, "
+        "use_self_sampling_topk=True, K in {512, 1024, 2048}, compression "
+        "ratio in {1, 4}, a supported GVR input format, SM107, Rubin CuTe "
+        "DSL support, at least two requests, and a sufficiently large "
+        "capture-stable workload envelope. Eligible smaller workloads keep "
+        "the full-device GVR path; other unsupported GVR configurations keep "
+        "the existing radix fallback. Disabled by default while the "
+        "provisional gain thresholds are tuned on R200. This prototype "
+        "supports one in-flight model execution per CUDA device; concurrent "
+        "GraphExec replay or multiple engines sharing a device are not yet "
+        "supported.")
     indexer_k_dtype: Literal["fp8", "fp4"] = Field(
         default="fp8",
         description=
@@ -1248,6 +1265,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            use_gvr_locality_domain=self.use_gvr_locality_domain,
             indexer_k_dtype=self.indexer_k_dtype,
             is_full_indexer_layer=self._is_full_indexer_layer(
                 pretrained_config, kwargs.get("layer_idx")),
@@ -1282,6 +1300,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            use_gvr_locality_domain=self.use_gvr_locality_domain,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
@@ -1371,6 +1390,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            use_gvr_locality_domain=self.use_gvr_locality_domain,
             indexer_k_dtype=self.indexer_k_dtype,
             compress_ratios=self.compress_ratios,
             window_size=self.window_size,
@@ -1398,6 +1418,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             enable_heuristic_topk=self.enable_heuristic_topk,
             use_self_sampling_topk=self.use_self_sampling_topk,
             use_gvr_emission=self.use_gvr_emission,
+            use_gvr_locality_domain=self.use_gvr_locality_domain,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,

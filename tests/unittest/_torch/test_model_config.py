@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import struct
 import types
@@ -228,6 +243,34 @@ def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="compress_ratios"):
         ModelConfig.from_pretrained(str(tmp_path))
+
+
+def test_deepseek_v32_preserves_gvr_locality_domain_config(tmp_path, monkeypatch):
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseek_v3 import DeepseekV3Config
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    pretrained_config = DeepseekV3Config(
+        architectures=["DeepseekV32ForCausalLM"],
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=2048,
+        indexer_rope_interleave=False,
+    )
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+
+    model_config = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            use_gvr_locality_domain=True,
+        ),
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    )
+
+    assert model_config.sparse_attention_config.use_gvr_locality_domain is True
 
 
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():

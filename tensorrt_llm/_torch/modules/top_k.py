@@ -4,14 +4,25 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import nullcontext
 from enum import Enum
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn as nn
 
 from tensorrt_llm.logger import logger
 
+from ..locality_domain.gvr_topk import (
+    GvrTopKRowShardPlan,
+    is_gvr_topk_locality_workload_large_enough,
+    plan_gvr_topk_row_shards,
+)
 from ..memory_buffer_utils import get_memory_buffers
+
+if TYPE_CHECKING:
+    from ..locality_domain.runtime import LocalityDomainRuntime
 
 
 class TopKImplementation(str, Enum):
@@ -48,6 +59,7 @@ class TopK(nn.Module):
         decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
         gvr_self_sampling: bool = True,
+        use_gvr_locality_domain: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -61,6 +73,14 @@ class TopK(nn.Module):
         # Second-level GVR dispatch for CUTE_DSL_GVR: True selects the
         # hint-free self-sampling engine, False the temporal-hint engine.
         self.gvr_self_sampling = gvr_self_sampling
+        # Rubin locality-domain row sharding is an explicit prototype opt-in.
+        # Runtime resources remain lazy so default and unsupported paths keep
+        # the original full-device GVR lifecycle.
+        self.use_gvr_locality_domain = use_gvr_locality_domain
+        self._gvr_locality_runtime: LocalityDomainRuntime | None = None
+        self._gvr_locality_capability: dict[int, bool] = {}
+        self._gvr_locality_topologies: dict[int, tuple[tuple[int, int], ...]] = {}
+        self._gvr_locality_ready_launches: set[tuple] = set()
         # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
         # owns the closed-loop emission state; only reachable on the temporal
         # (gvr_self_sampling=False) V1 path.
@@ -279,6 +299,215 @@ class TopK(nn.Module):
         )
         return radix_indices, radix_values
 
+    def _build_gvr_locality_launch(
+        self,
+        scores: torch.Tensor,
+        next_n: int,
+        max_seq_len: int,
+    ) -> tuple["LocalityDomainRuntime", GvrTopKRowShardPlan, tuple] | None:
+        """Build a capture-stable Rubin row-sharding launch, if eligible."""
+        if not self.use_gvr_locality_domain or not scores.is_cuda:
+            return None
+
+        score_width = min(int(max_seq_len), int(scores.shape[1]))
+        if not is_gvr_topk_locality_workload_large_enough(
+            num_rows=int(scores.shape[0]),
+            next_n=int(next_n),
+            score_width=score_width,
+            top_k=self.top_k,
+        ):
+            # In particular, BS=1 and small score envelopes never initialize
+            # locality-domain resources and retain the full-device launch.
+            return None
+
+        device_index = scores.get_device()
+        with torch.cuda.device(device_index):
+            from ..locality_domain_utils import (
+                get_current_locality_domain,
+                is_locality_domain_supported,
+            )
+
+            # Avoid recursively partitioning a Top-K already submitted under
+            # another locality-domain composite.
+            if get_current_locality_domain() is not None:
+                return None
+
+            capturing = torch.cuda.is_current_stream_capturing()
+            capable = self._gvr_locality_capability.get(device_index)
+            if capable is None:
+                if capturing:
+                    raise RuntimeError(
+                        "GVR locality-domain capability is cold during CUDA "
+                        "Graph capture; run this shape once eagerly before capture"
+                    )
+                from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+                properties = torch.cuda.get_device_properties(device_index)
+                sm_version = int(properties.major) * 10 + int(properties.minor)
+                capable = (
+                    sm_version == 107
+                    and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+                    and os.environ.get("DISABLE_LOCALITY_DOMAINS", "0") != "1"
+                    and is_locality_domain_supported(device_index)
+                )
+                self._gvr_locality_capability[device_index] = capable
+            if not capable:
+                logger.warning_once(
+                    "use_gvr_locality_domain=True but Rubin locality-domain "
+                    "execution is unavailable; keeping self-sampling GVR on "
+                    "the full-device stream.",
+                    key="gvr_locality_domain_unavailable",
+                )
+                return None
+
+            runtime = self._gvr_locality_runtime
+            if runtime is None:
+                if capturing:
+                    raise RuntimeError(
+                        "GVR locality-domain resources are cold during CUDA "
+                        "Graph capture; run this shape once eagerly before capture"
+                    )
+                from ..locality_domain.runtime import LocalityDomainRuntime
+
+                runtime = LocalityDomainRuntime(num_partitions=2)
+                self._gvr_locality_runtime = runtime
+
+            topology = self._gvr_locality_topologies.get(device_index)
+            if topology is None:
+                if capturing:
+                    raise RuntimeError(
+                        "GVR locality-domain topology is cold during CUDA Graph "
+                        "capture; run this shape once eagerly before capture"
+                    )
+                topology = runtime.topology_identity()
+                self._gvr_locality_topologies[device_index] = topology
+
+            properties = torch.cuda.get_device_properties(device_index)
+            device_num_sms = int(properties.multi_processor_count)
+            if any(total_sms != device_num_sms for _, total_sms in topology):
+                raise RuntimeError(
+                    "GVR locality-domain topology does not match the score "
+                    f"device: topology={topology}, device_num_sms={device_num_sms}"
+                )
+            try:
+                plan = plan_gvr_topk_row_shards(
+                    num_rows=int(scores.shape[0]),
+                    next_n=int(next_n),
+                    score_width=score_width,
+                    top_k=self.top_k,
+                    topology=topology,
+                )
+            except ValueError as error:
+                raise RuntimeError(f"invalid GVR locality-domain topology: {error}") from error
+            if plan is None:
+                return None
+
+            # run_varlen derives npad from shape[1] for a one-row launch. Do
+            # not turn a legal multi-row strided view into an illegal shard.
+            if any(shard.num_rows == 1 for shard in plan.shards) and scores.shape[1] % 4:
+                return None
+
+            shard_geometry = tuple(
+                (
+                    shard.num_rows,
+                    int(scores.shape[1]) if shard.num_rows == 1 else int(scores.stride(0)),
+                    shard.num_sms,
+                )
+                for shard in plan.shards
+            )
+            launch_key = (
+                device_index,
+                shard_geometry,
+                self.top_k,
+                int(max_seq_len),
+                int(next_n),
+                self.compress_ratio,
+                plan.topology,
+            )
+            if capturing and launch_key not in self._gvr_locality_ready_launches:
+                raise RuntimeError(
+                    "GVR locality-domain launchers or workspaces are cold "
+                    "during CUDA Graph capture; run this shape once eagerly "
+                    "before capture"
+                )
+            return runtime, plan, launch_key
+
+    def _run_gvr_locality_domain(
+        self,
+        runner: Callable[..., None],
+        scores: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        output_indices: torch.Tensor,
+        next_n: int,
+        max_seq_len: int,
+    ) -> bool:
+        """Run two non-overlapping GVR row slices on Rubin locality domains."""
+        launch = self._build_gvr_locality_launch(scores, next_n, max_seq_len)
+        if launch is None:
+            return False
+        runtime, plan, launch_key = launch
+
+        num_rows = int(scores.shape[0])
+        num_requests = num_rows // int(next_n)
+        if tuple(output_indices.shape) != (num_rows, self.top_k):
+            raise RuntimeError(
+                "GVR locality-domain output shape must match the unsplit "
+                f"launch: expected {(num_rows, self.top_k)}, got "
+                f"{tuple(output_indices.shape)}"
+            )
+        if sequence_lengths.dim() != 1 or int(sequence_lengths.shape[0]) != num_requests:
+            raise RuntimeError(
+                "GVR locality-domain sequence_lengths must have one entry "
+                f"per request: expected {(num_requests,)}, got "
+                f"{tuple(sequence_lengths.shape)}"
+            )
+        if sequence_lengths.device != scores.device or output_indices.device != scores.device:
+            raise RuntimeError(
+                "GVR locality-domain scores, sequence_lengths, and output_indices "
+                "must be on the same device"
+            )
+
+        # CPU tensors are useful for orchestration tests with a mocked launch
+        # plan/runtime. Production locality launches always enter the CUDA
+        # device guard above.
+        device_context = torch.cuda.device(scores.device) if scores.is_cuda else nullcontext()
+        with device_context:
+            runtime.fork()
+            try:
+                for shard in plan.shards:
+                    with runtime.partition_context(shard.partition_id):
+                        runner(
+                            scores[shard.row_start : shard.row_end],
+                            sequence_lengths[shard.request_start : shard.request_end],
+                            output_indices[shard.row_start : shard.row_end],
+                            next_n=next_n,
+                            compress_ratio=self.compress_ratio,
+                            max_seq_len=max_seq_len * self.compress_ratio,
+                        )
+            except Exception:
+                # Preserve the launch failure if cleanup also fails; the
+                # original exception is the actionable cause.
+                try:
+                    runtime.join()
+                except Exception:
+                    logger.exception(
+                        "failed to join Rubin locality-domain streams while "
+                        "handling a GVR Top-K launch failure"
+                    )
+                raise
+            runtime.join()
+
+        # Mark ready only after both launches and the join complete. The key
+        # covers every leaf cache/workspace dimension needed during capture.
+        self._gvr_locality_ready_launches.add(launch_key)
+        logger.info_once(
+            "Rubin locality-domain self-sampling GVR Top-K engaged; only "
+            "the already-produced Top-K rows are sharded (the logits "
+            "producer remains full-device).",
+            key="gvr_locality_domain_engaged",
+        )
+        return True
+
     def _forward_decode_gvr(
         self,
         scores: torch.Tensor,
@@ -323,14 +552,25 @@ class TopK(nn.Module):
                 # max_seq_len in compressed index space; run_varlen's value
                 # is in KV-token space like sequence_lengths, so multiply it
                 # back by the compression ratio.
-                selfsampling_topk_run_varlen(
-                    scores,
-                    sequence_lengths,
-                    output_indices,
-                    next_n=next_n,
-                    compress_ratio=self.compress_ratio,
-                    max_seq_len=max_seq_len * self.compress_ratio,
-                )
+                if not (
+                    self.use_gvr_locality_domain
+                    and self._run_gvr_locality_domain(
+                        selfsampling_topk_run_varlen,
+                        scores,
+                        sequence_lengths,
+                        output_indices,
+                        next_n,
+                        max_seq_len,
+                    )
+                ):
+                    selfsampling_topk_run_varlen(
+                        scores,
+                        sequence_lengths,
+                        output_indices,
+                        next_n=next_n,
+                        compress_ratio=self.compress_ratio,
+                        max_seq_len=max_seq_len * self.compress_ratio,
+                    )
                 return output_indices
             logger.warning_once(
                 "self-sampling GVR is selected but the decode scores do not "

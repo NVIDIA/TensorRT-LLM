@@ -87,6 +87,7 @@ class DSAMetadataParams(SparseMetadataParams):
     mtp_index_share: bool = False
     use_self_sampling_topk: bool = True
     use_gvr_emission: bool = False
+    use_gvr_locality_domain: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,10 @@ class DSAParams(SparseParams):
     # Emission block-skip for the temporal-hint engine; only meaningful with
     # enable_heuristic_topk=True and use_self_sampling_topk=False on FP4.
     use_gvr_emission: bool = False
+    # Prototype Rubin-only row sharding for self-sampling GVR V2. The logits
+    # producer remains full-device; only non-overlapping Top-K row slices are
+    # submitted to the two locality-domain streams.
+    use_gvr_locality_domain: bool = False
     indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True

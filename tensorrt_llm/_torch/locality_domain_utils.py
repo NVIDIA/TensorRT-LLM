@@ -35,7 +35,6 @@ from torch.cuda.memory import CUDAPluggableAllocator
 
 import tensorrt_llm as trtllm
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._utils import get_sm_version
 
 __all__ = [
     "get_locality_domain_stream",
@@ -226,18 +225,24 @@ def is_locality_domain_supported(device: int | None = None) -> bool:
         return False
 
 
-@lru_cache(maxsize=1)
-def is_locality_domain_enabled() -> bool:
+@lru_cache(maxsize=None)
+def is_locality_domain_enabled(device: int | None = None) -> bool:
     """
-    Check if LOCALITY_DOMAIN localization is enabled on this system.
+    Check whether LOCALITY_DOMAIN localization is enabled on a CUDA device.
+
+    Callers that may switch CUDA devices should pass an explicit ordinal so
+    the cached result cannot be inherited from a different device.
     """
     if os.getenv("DISABLE_LOCALITY_DOMAINS", "0") == "1":
         return False
     if not torch.cuda.is_available():
         return False
-    if get_sm_version() != 107:
+    if device is None:
+        device = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device)
+    if int(properties.major) * 10 + int(properties.minor) != 107:
         return False
-    return is_locality_domain_supported()
+    return is_locality_domain_supported(device)
 
 
 def get_current_locality_domain() -> int | None:
@@ -334,7 +339,7 @@ def locality_domain_device(locality_domain_id: int | None):
         raise ValueError(f"locality_domain_id must be 0, 1, or None, got {locality_domain_id}")
 
     # If LOCALITY_DOMAIN is not enabled, do nothing and keep current LOCALITY_DOMAIN as None
-    if not is_locality_domain_enabled():
+    if not is_locality_domain_enabled(torch.cuda.current_device()):
         yield
         return
 

@@ -1841,6 +1841,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "sparse_attention_config.use_gvr_locality_domain"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {

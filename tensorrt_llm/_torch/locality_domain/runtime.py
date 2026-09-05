@@ -29,6 +29,7 @@ import torch
 from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
 from tensorrt_llm._torch.locality_domain_utils import (
     end_for_all_locality_domain,
+    get_current_locality_domain,
     get_locality_domain_compute_sm_counts,
     get_locality_domain_mempool,
     get_locality_domain_stream,
@@ -84,6 +85,12 @@ class LocalityDomainRuntime:
         forward execution. Kernel runners read it via get_current_locality_domain().
         """
         with locality_domain_device(partition_id):
+            current_partition = get_current_locality_domain()
+            if current_partition != partition_id:
+                raise RuntimeError(
+                    "failed to enter the requested locality domain: "
+                    f"requested={partition_id}, current={current_partition}"
+                )
             with torch.cuda.stream(self.partition_stream(partition_id)):
                 yield
 

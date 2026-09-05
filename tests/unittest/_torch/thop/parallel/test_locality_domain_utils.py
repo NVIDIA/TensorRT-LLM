@@ -80,7 +80,10 @@ class TestLocalityDomainSupport:
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("tensorrt_llm._torch.locality_domain_utils.get_sm_version", return_value=100),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(major=10, minor=0),
+            ),
             patch(
                 "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_supported",
                 return_value=True,
@@ -93,13 +96,34 @@ class TestLocalityDomainSupport:
         is_locality_domain_enabled.cache_clear()
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("tensorrt_llm._torch.locality_domain_utils.get_sm_version", return_value=107),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(major=10, minor=7),
+            ),
             patch(
                 "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_supported",
                 return_value=True,
             ),
         ):
             assert is_locality_domain_enabled()
+        is_locality_domain_enabled.cache_clear()
+
+    def test_is_locality_domain_enabled_caches_per_explicit_device(self):
+        is_locality_domain_enabled.cache_clear()
+
+        def properties(device):
+            return SimpleNamespace(major=10, minor=7 if device == 1 else 0)
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_properties", side_effect=properties),
+            patch(
+                "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_supported",
+                return_value=True,
+            ),
+        ):
+            assert not is_locality_domain_enabled(0)
+            assert is_locality_domain_enabled(1)
         is_locality_domain_enabled.cache_clear()
 
 
@@ -242,6 +266,26 @@ class TestLocalityDomainComputeTopology:
         for bad in (0, 1, 3, 2.0):
             with pytest.raises(ValueError, match="num_partitions"):
                 LocalityDomainRuntime(num_partitions=bad)
+
+    def test_runtime_rejects_silent_partition_context_noop(self, monkeypatch):
+        @contextmanager
+        def no_op_partition_context(partition_id):
+            yield
+
+        monkeypatch.setattr(
+            locality_domain_runtime,
+            "locality_domain_device",
+            no_op_partition_context,
+        )
+        monkeypatch.setattr(
+            locality_domain_runtime,
+            "get_current_locality_domain",
+            lambda: None,
+        )
+
+        with pytest.raises(RuntimeError, match="failed to enter"):
+            with LocalityDomainRuntime().partition_context(0):
+                pass
 
     @pytest.mark.parametrize("locality_domain_id", [-1, 2])
     def test_compute_sm_counts_reject_invalid_partition(self, locality_domain_id):

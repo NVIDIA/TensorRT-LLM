@@ -789,6 +789,7 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
         compress_ratios=[1, 1, 4, 128, 4, 128, 4],
         q_split_threshold=2048,
         skip_indexer_for_short_seqs=False,
+        use_gvr_locality_domain=True,
     )
 
     model_config = ModelConfig.from_pretrained(
@@ -799,6 +800,7 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypa
     )
 
     assert model_config.sparse_attention_config.compress_ratios == [128, 128, 4, 128, 4, 128, 1, 4]
+    assert model_config.sparse_attention_config.use_gvr_locality_domain is True
     # V4 sparse MLA hardcodes window_size==128 (FMHA kernel TileSizeKV; see
     # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
     # __post_init__), so this is the only legal value here.

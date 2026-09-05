@@ -765,6 +765,7 @@ class Indexer(nn.Module):
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,
+            use_gvr_locality_domain=sparse_params.use_gvr_locality_domain,
         )
         # Emission block-skip is a temporal-hint (V1) optimization: the FP4
         # indexer epilogue emits per-block max logits the GVR Top-K consumes to

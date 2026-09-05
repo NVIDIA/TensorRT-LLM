@@ -244,6 +244,18 @@ def test_use_gvr_emission_defaults_off():
     assert sparse_config.to_sparse_metadata_params().use_gvr_emission is False
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_use_gvr_locality_domain_threads_to_params(enabled):
+    """The default-off prototype flag reaches both execution and warmup params."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        index_topk=512,
+        use_gvr_locality_domain=enabled,
+    )
+
+    assert sparse_config.to_sparse_params().use_gvr_locality_domain is enabled
+    assert sparse_config.to_sparse_metadata_params().use_gvr_locality_domain is enabled
+
+
 @pytest.mark.parametrize(
     "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
     [
@@ -601,6 +613,7 @@ def test_indexer_two_level_gvr_dispatch(
         use_cute_dsl_topk=use_cute_dsl,
         enable_heuristic_topk=True,
         use_self_sampling_topk=use_self_sampling,
+        use_gvr_locality_domain=True,
     )
 
     with (
@@ -617,6 +630,7 @@ def test_indexer_two_level_gvr_dispatch(
 
     assert indexer.top_k.decode_implementation == expected_decode
     assert indexer.top_k.gvr_self_sampling == use_self_sampling
+    assert indexer.top_k.use_gvr_locality_domain
     assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
 
 
