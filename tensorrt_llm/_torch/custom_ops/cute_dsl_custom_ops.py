@@ -9279,6 +9279,767 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (
             m, n), "CuTe DSL bf16 gemm output shape is incorrect"
 
+    # ======================================================================
+    # BF16 Dense Persistent GEMM / BMM (CuTe DSL) for SM107
+    # ======================================================================
+    # The SM107 runners subclass the Blackwell runners above only for the
+    # shared __init__/TunableRunner plumbing; tactic enumeration and launch
+    # are overridden in full so the Blackwell classes stay untouched. Every
+    # SM107 op raises unless get_sm_version() == 107 and the CuTe DSL package
+    # provides the SM107 helpers (IS_CUTLASS_DSL_RUBIN_AVAILABLE).
+
+    if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
+            PersistentDenseGemmKernel as Sm107Bf16PersistentDenseGemmKernel
+        from ..cute_dsl_kernels.rubin.dense_bf16_gemm_persistent import \
+            PersistentDenseGemmKernelPreferredCluster as \
+            Sm107Bf16PersistentDenseGemmKernelPreferredCluster
+    else:
+        Sm107Bf16PersistentDenseGemmKernel = None
+        Sm107Bf16PersistentDenseGemmKernelPreferredCluster = None
+
+    def _is_sm107_cute_dsl_available() -> bool:
+        return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    def _sm107_bf16_kernel_class(kernel_variant: str):
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            raise RuntimeError(
+                "CuTe DSL SM107 BF16 GEMM requires a CuTe DSL package with "
+                "SM107 support.")
+        if kernel_variant == "preferred_cluster":
+            return Sm107Bf16PersistentDenseGemmKernelPreferredCluster
+        return Sm107Bf16PersistentDenseGemmKernel
+
+    _SM107_BF16_MMA_TILER_MN_CANDIDATES = [(64, 128), (128, 128), (256, 128),
+                                           (256, 256)]
+    _SM107_BF16_CLUSTER_SHAPE_MN_CANDIDATES = [
+        (1, 1),
+        (1, 2),
+        (1, 4),
+        (2, 1),
+        (2, 2),
+        (2, 4),
+        (4, 1),
+        (4, 2),
+        (4, 4),
+    ]
+    _SM107_BF16_PREFERRED_CLUSTER_SHAPE_MN = (4, 2)
+    _SM107_BF16_FALLBACK_CLUSTER_SHAPE_MN = (2, 1)
+    # Cap on A/B pipeline stages; 0 keeps the kernel's auto-computed depth.
+    _SM107_BF16_MAX_NUM_AB_STAGE_CANDIDATES = [0]
+
+    def _sm107_bf16_valid_tactics(
+        m: int,
+        n: int,
+        k: int,
+        batch_size: int,
+        c_dtype_cutlass,
+        mma_tiler_mn_candi: List[Tuple[int, int]],
+        split_k_candi: Optional[List[int]],
+    ) -> List[Tuple]:
+        """Enumerate SM107 BF16 tactics shared by the GEMM and BMM runners.
+
+        Base tactics are ``("base", use_2cta_instrs, mma_tiler_mn,
+        cluster_shape_mn, max_num_ab_stage[, split_k_slices])``; the trailing
+        split-K field is present only when ``split_k_candi`` is given (GEMM).
+        Preferred-cluster tactics are ``("preferred_cluster", use_2cta_instrs,
+        mma_tiler_mn, preferred_cluster_shape_mn, fallback_cluster_shape_mn,
+        max_num_ab_stage)``.
+        """
+        a_major = "k"
+        b_major = "k"
+        c_major = "n"
+        use_2cta_instrs_candi = [False, True]
+
+        valid_tactics = []
+        base_kernel_class = _sm107_bf16_kernel_class("base")
+        for use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage in itertools.product(
+                use_2cta_instrs_candi, mma_tiler_mn_candi,
+                _SM107_BF16_CLUSTER_SHAPE_MN_CANDIDATES,
+                _SM107_BF16_MAX_NUM_AB_STAGE_CANDIDATES):
+            # CTA_N=256 with cluster_n=2 is an illegal memory access on SM107.
+            if mma_tiler_mn[1] == 256 and cluster_shape_mn[1] == 2:
+                continue
+            # An M-cluster wider than the available M-tiles leaves phantom
+            # CTAs (e.g. cluster_m=4 on the M=1 decode BMM) -> illegal access.
+            if not _bf16_cluster_m_fits(m, use_2cta_instrs, mma_tiler_mn,
+                                        cluster_shape_mn):
+                continue
+            if not base_kernel_class.can_implement(
+                    cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
+                    use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m, n, k,
+                    batch_size, a_major, b_major, c_major):
+                continue
+            if split_k_candi is None:
+                valid_tactics.append(("base", use_2cta_instrs, mma_tiler_mn,
+                                      cluster_shape_mn, max_num_ab_stage))
+            else:
+                for split_k_slices in split_k_candi:
+                    valid_tactics.append(
+                        ("base", use_2cta_instrs, mma_tiler_mn,
+                         cluster_shape_mn, max_num_ab_stage, split_k_slices))
+
+        preferred_cluster_shape_mn = _SM107_BF16_PREFERRED_CLUSTER_SHAPE_MN
+        fallback_cluster_shape_mn = _SM107_BF16_FALLBACK_CLUSTER_SHAPE_MN
+        preferred_kernel_class = _sm107_bf16_kernel_class("preferred_cluster")
+        for use_2cta_instrs, mma_tiler_mn, max_num_ab_stage in itertools.product(
+                use_2cta_instrs_candi, mma_tiler_mn_candi,
+                _SM107_BF16_MAX_NUM_AB_STAGE_CANDIDATES):
+            if not _bf16_cluster_m_fits(m, use_2cta_instrs, mma_tiler_mn,
+                                        preferred_cluster_shape_mn):
+                continue
+            if (_bf16_preferred_cluster_has_launchable_grid(
+                    m, n, batch_size, use_2cta_instrs, mma_tiler_mn,
+                    preferred_cluster_shape_mn, fallback_cluster_shape_mn)
+                    and preferred_kernel_class.can_implement(
+                        cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
+                        use_2cta_instrs, mma_tiler_mn,
+                        fallback_cluster_shape_mn, m, n, k, batch_size, a_major,
+                        b_major, c_major)
+                    and preferred_kernel_class.can_implement(
+                        cutlass.BFloat16, cutlass.Float32, c_dtype_cutlass,
+                        use_2cta_instrs, mma_tiler_mn,
+                        preferred_cluster_shape_mn, m, n, k, batch_size,
+                        a_major, b_major, c_major)):
+                valid_tactics.append(
+                    ("preferred_cluster", use_2cta_instrs, mma_tiler_mn,
+                     preferred_cluster_shape_mn, fallback_cluster_shape_mn,
+                     max_num_ab_stage))
+        return valid_tactics
+
+    def _parse_sm107_bf16_tactic(tactic):
+        """Decode a tactic into (kernel_variant, use_2cta_instrs, mma_tiler_mn,
+        preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
+        split_k_slices)."""
+        if (isinstance(tactic, tuple) and len(tactic) > 0
+                and isinstance(tactic[0], str)):
+            kernel_variant = tactic[0]
+            if kernel_variant == "preferred_cluster":
+                _, use_2cta_instrs, mma_tiler_mn, preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage = tactic
+                return (kernel_variant, use_2cta_instrs, mma_tiler_mn,
+                        preferred_cluster_shape_mn, cluster_shape_mn,
+                        max_num_ab_stage, 1)
+            if len(tactic) == 6:
+                _, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage, split_k_slices = tactic
+            else:
+                _, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, max_num_ab_stage = tactic
+                split_k_slices = 1
+            return (kernel_variant, use_2cta_instrs, mma_tiler_mn, None,
+                    cluster_shape_mn, max_num_ab_stage, split_k_slices)
+        if isinstance(tactic, tuple):
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
+        else:
+            use_2cta_instrs = False
+            mma_tiler_mn = (128, 128)
+            cluster_shape_mn = (1, 1)
+        return ("base", use_2cta_instrs, mma_tiler_mn, None, cluster_shape_mn,
+                0, 1)
+
+    def _sm107_bf16_gemm_kernel(kernel_variant: str,
+                                use_2cta_instrs: bool,
+                                mma_tiler_mn,
+                                preferred_cluster_shape_mn,
+                                cluster_shape_mn,
+                                max_num_ab_stage: int,
+                                split_k_slices: int = 1):
+        kernel_class = _sm107_bf16_kernel_class(kernel_variant)
+        if kernel_variant == "preferred_cluster":
+            return kernel_class(
+                acc_dtype=cutlass.Float32,
+                use_2cta_instrs=use_2cta_instrs,
+                mma_tiler_mn=mma_tiler_mn,
+                preferred_cluster_shape_mn=preferred_cluster_shape_mn,
+                fallback_cluster_shape_mn=cluster_shape_mn,
+                max_num_ab_stage=max_num_ab_stage,
+            )
+        return kernel_class(
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=use_2cta_instrs,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            max_num_ab_stage=max_num_ab_stage,
+            split_k_slices=split_k_slices,
+        )
+
+    def _sm107_bf16_occupancy(cluster_shape_mn, preferred_cluster_shape_mn):
+        # Persistent grid occupancy is baked into the compiled artifact.
+        max_active_clusters = get_max_activate_clusters(cluster_shape_mn[0] *
+                                                        cluster_shape_mn[1])
+        max_active_preferred_clusters = None
+        if preferred_cluster_shape_mn is not None:
+            max_active_preferred_clusters = get_max_activate_clusters(
+                preferred_cluster_shape_mn[0] * preferred_cluster_shape_mn[1])
+        return max_active_clusters, max_active_preferred_clusters
+
+    class CuteDSLBf16RubinBmmRunner(CuteDSLBf16BlackwellBmmRunner):
+        """SM107 BF16 batched GEMM: [B, M, K] @ [B, N, K] -> [B, M, N]."""
+        kernel_cache = dict()
+
+        # The output's M dim (inputs[2] dim 1) must track input0's bucketed
+        # M: without the constraint, profiling-cache keys embed the raw
+        # tuning-time M and every other runtime M misses the cache and falls
+        # back to the default tactic.
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 1, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 1, lambda input_shapes: input_shapes[0][1]), ),
+        )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple]:
+            if not _is_sm107_cute_dsl_available():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    "CuteDSL SM107 BF16 BMM skipping all tactics.")
+                return []
+            batch_size, m, k = inputs[0].shape
+            n = inputs[1].shape[1]
+            return _sm107_bf16_valid_tactics(
+                m, n, k, batch_size, cutlass.BFloat16,
+                _SM107_BF16_MMA_TILER_MN_CANDIDATES, None)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            (kernel_variant, use_2cta_instrs, mma_tiler_mn,
+             preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
+             _) = _parse_sm107_bf16_tactic(tactic)
+
+            a_tensor, b_tensor, c_tensor = inputs
+            batch_size, m, k = a_tensor.shape
+            n = b_tensor.shape[1]
+
+            # C is passed as [M, N, B]; from_dlpack captures the real strides so
+            # non-contiguous views are written by TMA without a copy.
+            c_tmp = c_tensor.permute(1, 2, 0)
+            c_layout_key = tuple(c_tmp.stride())
+
+            # A/B strides let the kernel consume non-contiguous views (e.g.
+            # [M,B,K].transpose(0,1), broadcast batch via expand, or sliced
+            # weight views) without a .contiguous() copy. CuTe tensors are
+            # (M, K, B) / (N, K, B): M/N stride = stride(1), B stride =
+            # stride(0), K must be innermost. The kernel is compiled K-major,
+            # so a transposed [B,N,K] view of a [B,K,N] tensor cannot be
+            # expressed and would silently compute the wrong product.
+            if a_tensor.shape[2] > 1 and a_tensor.stride(2) != 1:
+                raise ValueError(
+                    "cute_dsl_bf16_bmm_rubin requires A with K innermost "
+                    f"(stride 1 in the last dim); got a.stride()="
+                    f"{tuple(a_tensor.stride())} for a.shape="
+                    f"{tuple(a_tensor.shape)}.")
+            if b_tensor.shape[2] > 1 and b_tensor.stride(2) != 1:
+                raise ValueError(
+                    "cute_dsl_bf16_bmm_rubin requires B with K innermost "
+                    f"(stride 1 in the last dim); got b.stride()="
+                    f"{tuple(b_tensor.stride())} for b.shape="
+                    f"{tuple(b_tensor.shape)}.")
+            a_stride_m = a_tensor.stride(1)
+            a_stride_batch = a_tensor.stride(0)
+            b_stride_n = b_tensor.stride(1)
+            b_stride_batch = b_tensor.stride(0)
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(cutlass.BFloat16,
+                                 a_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(cutlass.BFloat16,
+                                 b_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            max_active_clusters, max_active_preferred_clusters = _sm107_bf16_occupancy(
+                cluster_shape_mn, preferred_cluster_shape_mn)
+            cache_key = (
+                kernel_variant,
+                use_2cta_instrs,
+                mma_tiler_mn,
+                preferred_cluster_shape_mn,
+                cluster_shape_mn,
+                max_num_ab_stage,
+                self.use_tvm_ffi,
+                c_layout_key,
+                max_active_clusters,
+                max_active_preferred_clusters,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(cutlass.BFloat16,
+                                     a_tensor.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    b_ptr = make_ptr(cutlass.BFloat16,
+                                     b_tensor.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                                               mma_tiler_mn,
+                                               preferred_cluster_shape_mn,
+                                               cluster_shape_mn,
+                                               max_num_ab_stage)
+                compile_args = [
+                    m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor,
+                    a_stride_m, a_stride_batch, b_stride_n, b_stride_batch
+                ]
+                if kernel_variant == "preferred_cluster":
+                    compile_args.extend(
+                        [max_active_preferred_clusters, max_active_clusters])
+                else:
+                    compile_args.append(max_active_clusters)
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_strided,
+                    *compile_args,
+                    stream=stream,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_tensor.data_ptr(),
+                    b_tensor.data_ptr(),
+                    c_tmp,
+                    a_stride_m,
+                    a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_cute_tensor,
+                    a_stride_m,
+                    a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
+                    stream=stream,
+                )
+
+    @torch.library.custom_op("trtllm::cute_dsl_bf16_bmm_rubin",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_bf16_bmm_rubin(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """SM107 counterpart of ``cute_dsl_bf16_bmm_blackwell``.
+
+        - input: [B, M, K], weight: [B, N, K], output: [B, M, N] (bf16).
+        """
+        if not _is_sm107_cute_dsl_available():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                "CuteDSL BF16 BMM SM107 requires SM107 and a CuTe DSL package "
+                "with SM107 support.")
+
+        tuner = AutoTuner.get()
+        runner = CuteDSLBf16RubinBmmRunner(use_tvm_ffi=use_tvm_ffi)
+        inputs = [input, weight, output]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_bmm_rubin::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_bf16_bmm_rubin")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+        n = mat_b.shape[1]
+        assert output.dtype == torch.bfloat16, "CuTe DSL bf16 bmm output dtype must be bf16"
+        assert output.shape == (
+            batch_size, m, n), "CuTe DSL bf16 bmm output shape is incorrect"
+
+    class CuteDSLBf16RubinGemmRunner(CuteDSLBf16BlackwellGemmRunner):
+        """SM107 BF16 GEMM for Linear layers: [M, K] @ [N, K]^T -> [M, N].
+
+        Adds direct split-K on top of the Blackwell runner: the kernel expands
+        the persistent scheduler's L dimension by ``split_k_slices`` and every
+        CTA reduce-adds its partial into the pre-zeroed output through TMA, so
+        no FP32 workspace or reduction launch is needed.
+        """
+        kernel_cache = dict()
+        # Split-K artifacts are shape-independent (tactic plus occupancy) and
+        # cached separately from the split=1 path.
+        split_k_gemm_cache = dict()
+
+        # See CuteDSLBf16RubinBmmRunner.tuning_config.
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, get_last_power_of_2_num_tokens_buckets,
+                last_positive_power_of_2), ),
+            constraint_specs=(ConstraintSpec(
+                2, 0, lambda input_shapes: input_shapes[0][0]), ),
+        )
+
+        def __init__(
+            self,
+            use_tvm_ffi: bool = True,
+            output_dtype: Optional[torch.dtype] = None,
+        ):
+            super().__init__(use_tvm_ffi=use_tvm_ffi)
+            self.output_dtype = output_dtype
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, self.output_dtype)
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[Tuple]:
+            if not _is_sm107_cute_dsl_available():
+                logger.debug(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    "CuteDSL SM107 BF16 GEMM skipping all tactics.")
+                return []
+
+            m, k = inputs[0].shape
+            n = inputs[1].shape[0]
+            c_dtype_cutlass = _TORCH_TO_CUTLASS_DTYPE[inputs[2].dtype]
+
+            mma_tiler_mn_candi = list(_SM107_BF16_MMA_TILER_MN_CANDIDATES)
+            # Skinny-M / small-N shapes under-use a 128x128 MMA tile (half the
+            # M rows wasted, coarse N tiling, few CTAs); offer smaller tiles so
+            # the autotuner can pick something closer to a 64x32 CTA tile.
+            if m <= 128 or n <= 512:
+                mma_tiler_mn_candi += [(64, 32), (64, 64), (128, 32), (128, 64)]
+
+            # split>1 is only offered for large-K, few-output-tile shapes where
+            # the extra K-parallelism outweighs the atomic-reduce cost. Dynamic
+            # autotuning may bucket input M while leaving C at the full M; the
+            # split-K path assumes the two match, so skip those buckets.
+            split_k_candi = [1]
+            if k >= 4096 and n <= 512 and inputs[2].shape[0] == m:
+                split_k_candi = [1, 2, 4, 8]
+
+            return _sm107_bf16_valid_tactics(m, n, k, 1, c_dtype_cutlass,
+                                             mma_tiler_mn_candi, split_k_candi)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic,
+        ) -> None:
+            (kernel_variant, use_2cta_instrs, mma_tiler_mn,
+             preferred_cluster_shape_mn, cluster_shape_mn, max_num_ab_stage,
+             split_k_slices) = _parse_sm107_bf16_tactic(tactic)
+
+            a_tensor, b_tensor, c_tensor = inputs
+            m, k = a_tensor.shape
+            n = b_tensor.shape[0]
+            batch_size = 1
+            if split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
+                raise RuntimeError(
+                    "BF16 split-K GEMM requires an [M, N] output, got "
+                    f"output.shape={tuple(c_tensor.shape)}, expected={(m, n)}.")
+
+            a_tensor = a_tensor.contiguous()
+            b_tensor = b_tensor.contiguous()
+            c_needs_copy = not c_tensor.is_contiguous()
+            c_buf = torch.empty_like(c_tensor) if c_needs_copy else c_tensor
+
+            a_batched = a_tensor.unsqueeze(0)  # [1, M, K]
+            b_batched = b_tensor.unsqueeze(0)  # [1, N, K]
+            c_tmp = c_buf.unsqueeze(-1)  # [M, N, 1]
+            c_layout_key = tuple(c_tmp.stride())
+            c_dtype_cutlass = _TORCH_TO_CUTLASS_DTYPE[c_tensor.dtype]
+
+            if split_k_slices > 1:
+                self._forward_split_k(
+                    a_batched,
+                    b_batched,
+                    c_buf,
+                    m,
+                    n,
+                    k,
+                    use_2cta_instrs,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    max_num_ab_stage,
+                    split_k_slices,
+                    c_dtype_cutlass,
+                )
+                if c_needs_copy:
+                    c_tensor.copy_(c_buf)
+                return
+
+            if not self.use_tvm_ffi:
+                a_ptr = make_ptr(cutlass.BFloat16,
+                                 a_batched.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(cutlass.BFloat16,
+                                 b_batched.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            max_active_clusters, max_active_preferred_clusters = _sm107_bf16_occupancy(
+                cluster_shape_mn, preferred_cluster_shape_mn)
+            cache_key = (
+                kernel_variant,
+                use_2cta_instrs,
+                mma_tiler_mn,
+                preferred_cluster_shape_mn,
+                cluster_shape_mn,
+                max_num_ab_stage,
+                self.use_tvm_ffi,
+                c_dtype_cutlass,
+                c_layout_key,
+                max_active_clusters,
+                max_active_preferred_clusters,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                if self.use_tvm_ffi:
+                    a_ptr = make_ptr(cutlass.BFloat16,
+                                     a_batched.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    b_ptr = make_ptr(cutlass.BFloat16,
+                                     b_batched.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cute.runtime.make_fake_stream(
+                        use_tvm_ffi_env_stream=True)
+
+                gemm = _sm107_bf16_gemm_kernel(kernel_variant, use_2cta_instrs,
+                                               mma_tiler_mn,
+                                               preferred_cluster_shape_mn,
+                                               cluster_shape_mn,
+                                               max_num_ab_stage)
+                compile_args = [
+                    m, n, k, batch_size, a_ptr, b_ptr, c_cute_tensor
+                ]
+                if kernel_variant == "preferred_cluster":
+                    compile_args.extend(
+                        [max_active_preferred_clusters, max_active_clusters])
+                else:
+                    compile_args.append(max_active_clusters)
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    *compile_args,
+                    stream=stream,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_batched.data_ptr(),
+                    b_batched.data_ptr(),
+                    c_tmp,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    c_cute_tensor,
+                    stream=stream,
+                )
+
+            if c_needs_copy:
+                c_tensor.copy_(c_buf)
+
+        def _forward_split_k(
+            self,
+            a_batched: torch.Tensor,
+            b_batched: torch.Tensor,
+            c_buf: torch.Tensor,
+            m: int,
+            n: int,
+            k: int,
+            use_2cta_instrs: bool,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            max_num_ab_stage: int,
+            split_k_slices: int,
+            c_dtype_cutlass,
+        ) -> None:
+            """Direct split-K: each K-slice reduce-adds into the zeroed C."""
+            batch_size = 1
+            c_tmp = c_buf.unsqueeze(-1)
+            c_layout_key = tuple(c_tmp.stride())
+            max_active_clusters = get_max_activate_clusters(
+                cluster_shape_mn[0] * cluster_shape_mn[1])
+            gemm_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                max_num_ab_stage,
+                split_k_slices,
+                self.use_tvm_ffi,
+                c_dtype_cutlass,
+                c_layout_key,
+                max_active_clusters,
+            )
+
+            a_ptr = make_ptr(cutlass.BFloat16,
+                             a_batched.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            b_ptr = make_ptr(cutlass.BFloat16,
+                             b_batched.data_ptr(),
+                             cute.AddressSpace.gmem,
+                             assumed_align=16)
+            if self.use_tvm_ffi:
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
+            else:
+                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+            def _c_cute_view():
+                return cute.runtime.from_dlpack(
+                    c_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+            compiled_gemm = self.__class__.split_k_gemm_cache.get(gemm_key)
+            if compiled_gemm is None:
+                gemm = _sm107_bf16_gemm_kernel("base",
+                                               use_2cta_instrs,
+                                               mma_tiler_mn,
+                                               None,
+                                               cluster_shape_mn,
+                                               max_num_ab_stage,
+                                               split_k_slices=split_k_slices)
+                compiled_gemm = cute.compile(
+                    gemm.wrapper,
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    _c_cute_view(),
+                    max_active_clusters,
+                    stream=stream,
+                    options="--opt-level 2 --enable-tvm-ffi"
+                    if self.use_tvm_ffi else "--opt-level 2",
+                )
+                self.__class__.split_k_gemm_cache[gemm_key] = compiled_gemm
+
+            # TMA ADD accumulates into C. Keep the zeroing on the launch stream
+            # and immediately adjacent to the GEMM so CUDA graph replay is safe.
+            c_buf.zero_()
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_batched.data_ptr(),
+                    b_batched.data_ptr(),
+                    c_tmp,
+                )
+            else:
+                compiled_gemm(
+                    m,
+                    n,
+                    k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    _c_cute_view(),
+                    stream=stream,
+                )
+
+    @torch.library.custom_op("trtllm::cute_dsl_bf16_gemm_rubin",
+                             mutates_args=("output", ),
+                             device_types="cuda")
+    def cute_dsl_bf16_gemm_rubin(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        """SM107 counterpart of ``cute_dsl_bf16_gemm_blackwell``.
+
+        Computes output = input @ weight^T
+        - input: [M, K], weight: [N, K], output: [M, N] (bf16 or fp32).
+        """
+        if not _is_sm107_cute_dsl_available():
+            raise ValueError(
+                f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                "CuteDSL BF16 GEMM SM107 requires SM107 and a CuTe DSL package "
+                "with SM107 support.")
+
+        tuner = AutoTuner.get()
+        runner = CuteDSLBf16RubinGemmRunner(use_tvm_ffi=use_tvm_ffi,
+                                            output_dtype=output.dtype)
+        inputs = [input, weight, output]
+        _, best_tactic = tuner.choose_one(
+            "trtllm::cute_dsl_bf16_gemm_rubin::gemm",
+            [runner],
+            runner.__class__.tuning_config,
+            inputs,
+        )
+        runner(inputs, tactic=best_tactic)
+
+    @torch.library.register_fake("trtllm::cute_dsl_bf16_gemm_rubin")
+    def _(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        output: torch.Tensor,
+        use_tvm_ffi: bool = True,
+    ) -> None:
+        m, k = mat_a.shape[0], mat_a.shape[1]
+        n = mat_b.shape[0]
+        assert output.dtype in (torch.bfloat16, torch.float32), \
+            "CuTe DSL bf16 gemm output dtype must be bf16 or fp32"
+        assert output.shape == (
+            m, n), "CuTe DSL bf16 gemm output shape is incorrect"
+
     # ------------------------------------------------------------------ #
     #  CuTE DSL FP4 Paged MQA Logits (Blackwell SM100)                   #
     # ------------------------------------------------------------------ #
