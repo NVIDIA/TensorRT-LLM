@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, cast
 
 import torch
@@ -25,7 +24,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 
-from .interface import Fmha
+from .interface import Fmha, FmhaParams
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -34,52 +33,21 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass(slots=True)
-class FmhaParams:
-    attn: "TrtllmAttention"
-    meta: "TrtllmAttentionMetadata"
-    fwd: AttentionForwardArgs
-    workspace: torch.Tensor
-    attention_input: Optional[torch.Tensor] = None
-    qkv_input: Optional[torch.Tensor] = None
-    key_input: Optional[torch.Tensor] = None
-    value_input: Optional[torch.Tensor] = None
-    context_buf: Optional[torch.Tensor] = None
-    sequence_lengths: Optional[torch.Tensor] = None
-    context_lengths: Optional[torch.Tensor] = None
-    input_seq_length: int = 0
-    max_past_kv_length: int = 0
-    max_attention_window_size: int = 0
-    cyclic_attention_window_size: int = 0
-    num_tokens: int = 0
-    seq_offset: int = 0
-    tokens_per_block: int = 64
-    kv_factor: int = 0
-    total_num_blocks: int = 0
-    # Context-only fields
-    batch_size: int = 0
-    # Generation-only fields
-    num_requests: int = 0
-    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
-    spec_decoding_position_offsets: Optional[torch.Tensor] = None
-    is_cross: bool = False
-
-
 class PhasedFmha(Fmha):
     """FMHA helper for paged-KV libraries that split work by request phase."""
 
     REQUIRES_PAGED_KV = True
+    # Set by libraries that address the paged KV pool tensor directly. Resolving it
+    # costs a slice + reshape, so it is opt-in.
+    NEEDS_KV_POOL = False
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self.kv_factor = 1 if attn.is_mla_enable else 2
-        kv_lora_rank = attn.kv_lora_rank or 0
-        self.generation_out_head_size = (
-            kv_lora_rank if attn.is_mla_enable and kv_lora_rank else attn.head_dim
-        )
-        self.context_out_head_size = (
-            attn.v_head_dim if attn.is_mla_enable and attn.v_head_dim else attn.head_dim
-        )
+        # Must match the buffer `TrtllmAttention.create_output` allocates, which is
+        # what `_build_params` takes this view over.
+        self.generation_out_head_size = attn.out_head_size(is_gen_only=True)
+        self.context_out_head_size = attn.out_head_size(is_gen_only=False)
 
     def _get_total_num_blocks(
         self,
@@ -110,7 +78,17 @@ class PhasedFmha(Fmha):
             return 0
         return int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * self.kv_factor
 
-    def prepare_workspace(
+    def get_fp8_context_fmha(
+        self,
+        q: torch.Tensor,
+        output: torch.Tensor,
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        is_gen_only: bool,
+    ) -> bool:
+        return False
+
+    def _build_params(
         self,
         q: torch.Tensor,
         k: Optional[torch.Tensor],
@@ -118,6 +96,121 @@ class PhasedFmha(Fmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
+        *,
+        fp8_context_fmha: bool,
+    ) -> FmhaParams:
+        """Build the common Python parameters used for sizing and execution."""
+        attn = self.attn
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError(f"{type(self).__name__} requires output.")
+
+        num_tokens = q.size(0)
+        is_gen_only = forward_args.attention_input_type == AttentionInputType.generation_only
+        out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
+        attention_window_size = forward_args.attention_window_size
+        cache_indirection = metadata.cache_indirection
+        max_attention_window_size = (
+            attention_window_size
+            if metadata.beam_width == 1
+            else (
+                cache_indirection.size(2)
+                if cache_indirection is not None
+                else attention_window_size
+            )
+        )
+        tokens_per_block = (
+            metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
+        )
+
+        kv_pool = None
+        if self.NEEDS_KV_POOL and metadata.kv_cache_manager is not None:
+            kv_pool = metadata.kv_cache_manager.get_buffers(attn.layer_idx)
+
+        return FmhaParams(
+            workspace=workspace,
+            fwd=forward_args,
+            # Python-only back-references for backends that need layer/metadata state
+            # the flat schema does not carry (e.g. the Triton custom-mask backend).
+            attn=attn,
+            meta=metadata,
+            qkv_or_q=q,
+            k=k,
+            v=v,
+            output=output.view(num_tokens, attn.num_heads, out_head_size),
+            sequence_length=metadata.kv_lens_cuda_runtime,
+            context_lengths=metadata.prompt_lens_cuda_runtime,
+            host_past_key_value_lengths=metadata.kv_lens_runtime,
+            host_context_lengths=metadata.prompt_lens_cpu_runtime,
+            # Layer config
+            layer_idx=attn.layer_idx,
+            local_layer_idx=attn.get_local_layer_idx(metadata),
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_size=attn.head_dim,
+            q_scaling=attn.q_scaling,
+            quant_mode=attn.quant_mode,
+            position_embedding_type=attn.position_embedding_type,
+            predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
+            attention_chunk_size=attn.attention_chunk_size,
+            has_fp8_kv_cache=bool(getattr(attn, "has_fp8_kv_cache", False)),
+            rope_params=attn.rope_params,
+            rotary_inv_freq=attn.rotary_inv_freq,
+            rotary_cos_sin=attn.rotary_cos_sin,
+            is_mla_enable=attn.is_mla_enable,
+            q_lora_rank=attn.q_lora_rank,
+            kv_lora_rank=attn.kv_lora_rank or 0,
+            qk_nope_head_dim=attn.qk_nope_head_dim or 0,
+            qk_rope_head_dim=attn.qk_rope_head_dim or 0,
+            v_head_dim=attn.v_head_dim,
+            rope_append=attn.rope_append,
+            # Runtime metadata
+            kv_cache_block_offsets=metadata.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
+            cache_indirection=cache_indirection,
+            max_context_q_len_override=metadata.max_context_q_len_override,
+            block_ids_per_seq=metadata.block_ids_per_seq,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+            spec_decoding_generation_lengths=metadata.spec_decoding_generation_lengths,
+            spec_decoding_position_offsets_for_cpp=metadata.spec_decoding_position_offsets_for_cpp,
+            spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
+            spec_decoding_bl_tree_mask_offset=metadata.spec_decoding_bl_tree_mask_offset,
+            spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
+            spec_bl_tree_first_sparse_mask_offset_kv=metadata.spec_bl_tree_first_sparse_mask_offset_kv,
+            flash_mla_tile_scheduler_metadata=metadata.flash_mla_tile_scheduler_metadata,
+            flash_mla_num_splits=metadata.flash_mla_num_splits,
+            trtllm_gen_jit_warmup=bool(metadata.trtllm_gen_jit_warmup),
+            is_cross=metadata.is_cross,
+            num_sparse_topk=metadata.num_sparse_topk or 0,
+            use_paged_context_fmha=metadata.use_paged_context_fmha,
+            paged_context_fmha=metadata.use_paged_context_fmha,
+            beam_width=metadata.beam_width,
+            max_num_requests=metadata.max_num_requests,
+            max_num_sequences=metadata.max_num_sequences or metadata.max_num_requests,
+            max_context_length=metadata.max_context_length,
+            max_seq_len=metadata.max_seq_len,
+            is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
+            use_spec_decoding=metadata.use_spec_decoding,
+            is_spec_dec_tree=metadata.is_spec_dec_tree,
+            force_prepare_spec_dec_tree_mask=metadata.force_prepare_spec_dec_tree_mask,
+            spec_decoding_target_max_draft_tokens=metadata.max_total_draft_tokens,
+            # Shared phase state
+            max_attention_window_size=max_attention_window_size,
+            cyclic_attention_window_size=attention_window_size,
+            tokens_per_block=tokens_per_block,
+            fp8_context_fmha=fp8_context_fmha,
+            kv_factor=self.kv_factor,
+            total_num_blocks=self._get_total_num_blocks(metadata),
+            kv_pool=kv_pool,
+            num_tokens=num_tokens,
+        )
+
+    def prepare_workspace(
+        self,
+        params: FmhaParams,
+        metadata: "TrtllmAttentionMetadata",
     ) -> None:
         pass
 
@@ -152,48 +245,23 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
-        self.prepare_workspace(
+        fp8_context_fmha = self.get_fp8_context_fmha(q, output, metadata, forward_args, is_gen_only)
+        params = self._build_params(
             q,
             k,
             v,
             metadata,
             forward_args,
             workspace,
+            fp8_context_fmha=fp8_context_fmha,
         )
+        self.prepare_workspace(params, metadata)
 
-        out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
-        out_tensor = output.view(num_tokens, attn.num_heads, out_head_size)
-
-        attention_window_size = forward_args.attention_window_size
-        cache_indirection = metadata.cache_indirection
-        max_attention_window_size = (
-            attention_window_size
-            if metadata.beam_width == 1
-            else (
-                cache_indirection.size(2)
-                if cache_indirection is not None
-                else attention_window_size
-            )
-        )
-        tokens_per_block = (
-            metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
-        )
-
-        params = FmhaParams(
-            attn=attn,
-            meta=metadata,
-            fwd=forward_args,
-            workspace=workspace,
-            max_attention_window_size=max_attention_window_size,
-            cyclic_attention_window_size=attention_window_size,
-            tokens_per_block=tokens_per_block,
-            kv_factor=self.kv_factor,
-            total_num_blocks=self._get_total_num_blocks(metadata),
-            is_cross=metadata.is_cross,
-        )
+        out_tensor = cast(torch.Tensor, params.output)
 
         sequence_length = metadata.kv_lens_cuda_runtime
         host_past_key_value_lengths = metadata.kv_lens_runtime
+        host_total_kv_lens = metadata.host_total_kv_lens
 
         if num_contexts > 0 and attention_input_type != AttentionInputType.generation_only:
             seq_offset = 0
@@ -206,23 +274,37 @@ class PhasedFmha(Fmha):
             max_past_kv_len = int(
                 host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
             )
+            # Encoder CUDA graphs capture a padded context extent; the override widens both
+            # the q length and the past-kv length so the captured shapes stay valid.
+            override = metadata.max_context_q_len_override
+            if override is not None:
+                override = int(override)
+                if override < max_context_q_len:
+                    raise ValueError(
+                        f"max_context_q_len_override ({override}) must be >= computed max "
+                        f"context q length ({max_context_q_len})."
+                    )
+                if override < max_past_kv_len:
+                    raise ValueError(
+                        f"max_context_q_len_override ({override}) must be >= computed max "
+                        f"past kv length ({max_past_kv_len})."
+                    )
+                max_context_q_len = override
+                max_past_kv_len = override
 
-            params.attention_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = params.attention_input
-            params.key_input = (
-                k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
-            )
-            params.value_input = (
-                v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
-            )
-            params.context_buf = out_tensor[token_offset : token_offset + num_ctx_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
+            params.qkv_or_q = q[token_offset : token_offset + num_ctx_tokens]
+            params.k = None if k is None else k[token_offset : token_offset + num_ctx_tokens]
+            params.v = None if v is None else v[token_offset : token_offset + num_ctx_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_ctx_tokens]
+            params.sequence_length = sequence_length[seq_offset:]
             params.context_lengths = context_lengths[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_ctx_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = max_context_q_len
-            params.batch_size = num_seqs
+            params.num_seqs = num_seqs
+            params.total_kv_len = int(host_total_kv_lens[0])
             if attn.is_mla_enable:
                 self.run_mla_context(params)
             else:
@@ -238,35 +320,32 @@ class PhasedFmha(Fmha):
             )
             input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
 
-            predicted_tokens_per_seq = attn.predicted_tokens_per_seq
-            spec_gen_lengths = None
-            spec_pos_offsets = None
-            if metadata.is_spec_decoding_enabled and predicted_tokens_per_seq > 1:
-                spec_gen_lengths = metadata.spec_decoding_generation_lengths
-                position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
-                if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
-                    position_offsets_for_cpp = position_offsets_for_cpp.view(
-                        metadata.max_num_requests, -1
-                    )
-                spec_pos_offsets = position_offsets_for_cpp
+            # The spec-decoding tensors are already on `params` from the metadata; only
+            # the position offsets need reshaping. Do not gate on
+            # `predicted_tokens_per_seq`: the native side asks for them whenever
+            # `use_spec_decoding` is set, which a non-MLA layer reaches with the default
+            # `predicted_tokens_per_seq` of 1.
+            position_offsets_for_cpp = metadata.spec_decoding_position_offsets_for_cpp
+            if position_offsets_for_cpp is not None and position_offsets_for_cpp.dim() == 1:
+                position_offsets_for_cpp = position_offsets_for_cpp.view(
+                    metadata.max_num_requests, -1
+                )
 
-            params.attention_input = q[token_offset : token_offset + num_gen_tokens]
-            params.qkv_input = params.attention_input
-            params.key_input = (
-                k[token_offset : token_offset + num_gen_tokens] if k is not None else None
-            )
-            params.value_input = (
-                v[token_offset : token_offset + num_gen_tokens] if v is not None else None
-            )
-            params.context_buf = out_tensor[token_offset : token_offset + num_gen_tokens]
-            params.sequence_lengths = sequence_length[seq_offset:]
+            params.qkv_or_q = q[token_offset : token_offset + num_gen_tokens]
+            params.k = None if k is None else k[token_offset : token_offset + num_gen_tokens]
+            params.v = None if v is None else v[token_offset : token_offset + num_gen_tokens]
+            params.output = out_tensor[token_offset : token_offset + num_gen_tokens]
+            params.sequence_length = sequence_length[seq_offset:]
+            params.context_lengths = metadata.prompt_lens_cuda_runtime[seq_offset:]
             params.max_past_kv_length = max_past_kv_len
             params.num_tokens = num_gen_tokens
             params.seq_offset = seq_offset
+            params.token_offset = token_offset
             params.input_seq_length = input_seq_length
+            params.num_seqs = num_seqs
             params.num_requests = num_seqs // metadata.beam_width
-            params.spec_decoding_generation_lengths = spec_gen_lengths
-            params.spec_decoding_position_offsets = spec_pos_offsets
+            params.total_kv_len = int(host_total_kv_lens[1])
+            params.spec_decoding_position_offsets_for_cpp = position_offsets_for_cpp
             if attn.is_mla_enable:
                 self.run_mla_generation(params)
             else:

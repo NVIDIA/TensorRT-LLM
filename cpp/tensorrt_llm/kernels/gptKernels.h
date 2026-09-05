@@ -70,7 +70,9 @@ enum class RotaryScalingType : int8_t
     kLINEAR = 1,
     kDYNAMIC = 2,
     kLONG = 3,
-    kLLAMA3 = 4
+    kLLAMA3 = 4,
+    kYARN = 5,
+    kMROPE = 6
 };
 
 struct BlockSparseParams

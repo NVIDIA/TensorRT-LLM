@@ -21,7 +21,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import (
+    TrtllmAttention,
+    TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.autotuner import AutoTuner
 
 
@@ -39,6 +42,11 @@ class _AttentionStub:
         self.kv_lora_rank = 512 if is_mla_enable else None
         self.head_dim = 576
         self.v_head_dim = 512 if is_mla_enable else None
+        self.qk_rope_head_dim = 64 if is_mla_enable else None
+        self.rope_append = True if is_mla_enable else None
+
+    def out_head_size(self, is_gen_only: bool) -> int:
+        return TrtllmAttention.out_head_size(self, is_gen_only)
 
 
 _MlaBackendPolicy: TypeAlias = Callable[[str, SimpleNamespace, int], str]
@@ -85,6 +93,14 @@ def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
     )
 
 
+@pytest.mark.parametrize("value, expected", [(None, 0), (0, 0), (8192, 8192)])
+def test_attention_chunk_size_uses_zero_for_native_disabled_value(
+    value: int | None,
+    expected: int,
+) -> None:
+    assert FlashInferTrtllmGenFmha._get_attention_chunk_size(value) == expected
+
+
 def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -121,12 +137,12 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
     with pytest.raises(RuntimeError, match="counter size arguments observed"):
         FlashInferTrtllmGenFmha.prepare_workspace(
             fmha,
-            q=SimpleNamespace(),
-            k=None,
-            v=None,
+            params=SimpleNamespace(
+                qkv_or_q=SimpleNamespace(),
+                fwd=SimpleNamespace(),
+                workspace=SimpleNamespace(),
+            ),
             metadata=metadata,
-            forward_args=SimpleNamespace(),
-            workspace=SimpleNamespace(),
         )
 
 

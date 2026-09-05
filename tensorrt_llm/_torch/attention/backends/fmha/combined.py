@@ -17,7 +17,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs, AttentionInputType)
 
 from .phased import FmhaParams, PhasedFmha
 
@@ -54,36 +55,49 @@ class CombinedFmha(PhasedFmha):
             raise RuntimeError("CombinedFmha generation implementation is not configured.")
         return self._generation_impl
 
+    @staticmethod
+    def _resolve_fp8_context_fmha(
+        impl: PhasedFmha,
+        params: FmhaParams,
+        metadata: "TrtllmAttentionMetadata",
+    ) -> None:
+        """Re-answer the phase's FP8 question through the impl that will run it.
+
+        ``PhasedFmha.forward`` resolves ``fp8_context_fmha`` once, against ``self``
+        -- which here is this router rather than either delegate, so it answers with
+        the base implementation's blanket ``False``. The flag is not advisory: the
+        trtllm-gen generation path keys the kernel it selects off it (it decides
+        whether Q is handed over as FP8), so a delegate that receives a value some
+        other implementation computed silently runs a different kernel than it does
+        when it owns the whole forward.
+        """
+        fwd = params.fwd
+        params.fp8_context_fmha = impl.get_fp8_context_fmha(
+            params.qkv_or_q,
+            params.output,
+            metadata,
+            fwd,
+            fwd.attention_input_type == AttentionInputType.generation_only,
+        )
+
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
     ) -> None:
-        context_impl = self._get_context_impl()
-        generation_impl = self._get_generation_impl()
-        context_impl.prepare_workspace(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            workspace,
-        )
-        generation_impl.prepare_workspace(
-            q,
-            k,
-            v,
-            metadata,
-            forward_args,
-            workspace,
-        )
+        # Both phases carve from the same workspace, so each impl must get a chance
+        # to grow it before either runs -- each under its own FP8 answer, since that
+        # is an input to how much scratch the phase needs.
+        for impl in (self._get_context_impl(), self._get_generation_impl()):
+            self._resolve_fp8_context_fmha(impl, params, metadata)
+            impl.prepare_workspace(params, metadata)
 
     def run_context(self, params: FmhaParams) -> None:
-        self._get_context_impl().run_context(params)
+        impl = self._get_context_impl()
+        self._resolve_fp8_context_fmha(impl, params, params.meta)
+        impl.run_context(params)
 
     def run_generation(self, params: FmhaParams) -> None:
-        self._get_generation_impl().run_generation(params)
+        impl = self._get_generation_impl()
+        self._resolve_fp8_context_fmha(impl, params, params.meta)
+        impl.run_generation(params)

@@ -32,6 +32,7 @@ from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .cpp_schema import cpp_metadata
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -904,78 +905,101 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
+    # Caller-facing output buffer, allocated here when absent. It is Python-only:
+    # the native side is handed the per-phase slice as ``FmhaParams.output``.
     output: Optional[torch.Tensor] = None
-    output_sf: Optional[torch.Tensor] = None
-
-    out_scale: Optional[torch.Tensor] = None
-    out_scale_sf: Optional[torch.Tensor] = None
-    kv_scale_orig_quant: Optional[torch.Tensor] = None
-    kv_scale_quant_orig: Optional[torch.Tensor] = None
-
-    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
-    attention_input_type: AttentionInputType = AttentionInputType.mixed
-    attention_window_size: Optional[int] = None
-    attention_mask_data: Optional[torch.Tensor] = None
-    attention_sinks: Optional[torch.Tensor] = None
-    relative_attention_bias: Optional[torch.Tensor] = None
-    relative_attention_max_distance: int = 0
-    cross_kv: Optional[torch.Tensor] = None
-
-    latent_cache: Optional[torch.Tensor] = None
-    q_pe: Optional[torch.Tensor] = None
-    mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    mrope_position_deltas: Optional[torch.Tensor] = None
-
-    softmax_stats_tensor: Optional[torch.Tensor] = None
-    chunked_prefill_buffer_batch_size: int = 1
-
-    cu_q_seqlens: Optional[torch.Tensor] = None
-    cu_kv_seqlens: Optional[torch.Tensor] = None
-    fmha_scheduler_counter: Optional[torch.Tensor] = None
-    # Testing only: skip the RoPE step of MLA generation (the standalone harness
-    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
-    # and inits the trtllm-gen scheduler buffers itself.
-    skip_mla_rope_generation: bool = False
-
-    mla_bmm1_scale: Optional[torch.Tensor] = None
-    mla_bmm2_scale: Optional[torch.Tensor] = None
-    quant_q_buffer: Optional[torch.Tensor] = None
-    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
-    # When non-None alongside `quant_q_buffer`, the C++ op skips
-    # `quantizeCopyInputToFp8Kernel`.
-    quant_scale_qkv: Optional[torch.Tensor] = None
-
-    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
-    enable_dsv4_epilogue_fusion: bool = False
+    output_sf: Optional[torch.Tensor] = cpp_metadata(ctype=None, default=None)
+    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_metadata(
+        ctype=torch.float32, default=None)
+    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_metadata(
+        ctype=torch.float32, default=None)
+    out_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                     default=None)
+    out_scale_sf: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                        default=None)
+    latent_cache: Optional[torch.Tensor] = cpp_metadata(default=None)
+    q_pe: Optional[torch.Tensor] = cpp_metadata(default=None)
+    mrope_rotary_cos_sin: Optional[torch.Tensor] = cpp_metadata(ctype=None,
+                                                                default=None)
+    mrope_position_deltas: Optional[torch.Tensor] = cpp_metadata(
+        ctype=torch.int32, default=None)
+    softmax_stats_tensor: Optional[torch.Tensor] = cpp_metadata(ctype=None,
+                                                                default=None)
+    attention_sinks: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                           default=None)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
+                                                        default=None)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
+                                                         default=None)
+    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_metadata(
+        ctype=torch.int32, default=None)
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                          default=None)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                          default=None)
+    quant_q_buffer: Optional[torch.Tensor] = cpp_metadata(ctype=None,
+                                                          default=None)
+    cross_kv: Optional[torch.Tensor] = cpp_metadata(default=None)
+    relative_attention_bias: Optional[torch.Tensor] = cpp_metadata(default=None)
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
+                                                           default=None)
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_metadata(
+        ctype=torch.float32, default=None)
+    enable_dsv4_epilogue_fusion: bool = cpp_metadata(default=False)
 
     # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
     # RAW kv_a_proj output and the context RoPE kernel norms it before RoPE + quant +
     # paged write, so the caller drops its own RMSNorm and concat.
-    kv_norm_weight: Optional[torch.Tensor] = None
-    kv_norm_eps: float = 1e-6
+    kv_norm_weight: Optional[torch.Tensor] = cpp_metadata(ctype=None,
+                                                          default=None)
+    kv_norm_eps: float = cpp_metadata(default=1e-06)
 
-    sage_attn_num_elts_per_blk_q: int = 0
-    sage_attn_num_elts_per_blk_k: int = 0
-    sage_attn_num_elts_per_blk_v: int = 0
-    sage_attn_qk_int8: bool = False
+    attention_mask: AttentionMask = None
+    attention_input_type: AttentionInputType = cpp_metadata(default=None)
+    attention_window_size: Optional[int] = cpp_metadata(default=None)
+    attention_mask_data: Optional[torch.Tensor] = cpp_metadata(ctype=torch.bool,
+                                                               default=None)
+    relative_attention_max_distance: int = cpp_metadata(default=0)
+    chunked_prefill_buffer_batch_size: int = cpp_metadata(default=1)
+    skip_mla_rope_generation: bool = cpp_metadata(default=False)
+    sage_attn_num_elts_per_blk_q: int = cpp_metadata(default=0)
+    sage_attn_num_elts_per_blk_k: int = cpp_metadata(default=0)
+    sage_attn_num_elts_per_blk_v: int = cpp_metadata(default=0)
+    sage_attn_qk_int8: bool = cpp_metadata(default=False)
+    is_fused_qkv: bool = cpp_metadata(default=False)
+    update_kv_cache: bool = cpp_metadata(default=True)
+    timestep: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
+                                                    default=None)
+    sparse_backend_args: Optional[SparseBackendForwardArgs] = cpp_metadata(
+        default=None)
+    sparse_runtime_params: SparseRuntimeParams = cpp_metadata(default=None)
 
-    is_fused_qkv: bool = False
-    update_kv_cache: bool = True
-    # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = None
+    def __post_init__(self) -> None:
+        # These types live in modules that import this one; resolve them after
+        # interface.py has finished defining its enums.
+        if self.attention_mask is None:
+            from tensorrt_llm._torch.attention.backends.interface import \
+                PredefinedAttentionMask
 
-    sparse_backend_args: Optional[SparseBackendForwardArgs] = None
-    sparse_runtime_params: SparseRuntimeParams = field(
-        default_factory=SparseRuntimeParams)
+            self.attention_mask = PredefinedAttentionMask.CAUSAL
+        if self.attention_input_type is None:
+            from tensorrt_llm._torch.attention.backends.interface import \
+                AttentionInputType
+
+            self.attention_input_type = AttentionInputType.mixed
+        if self.sparse_runtime_params is None:
+            from tensorrt_llm._torch.attention.backends.sparse.params import \
+                SparseRuntimeParams
+
+            self.sparse_runtime_params = SparseRuntimeParams()
 
     @property
-    def mask_type(self) -> int:
-        """Integer mask type accepted by the C++ attention op
-        (``causal`` or ``padding``)."""
+    def mask_type(self) -> AttentionMaskType:
+        """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
-            return int(AttentionMaskType.causal)
+            return AttentionMaskType.causal
         if self.attention_mask == PredefinedAttentionMask.FULL:
-            return int(AttentionMaskType.padding)
+            return AttentionMaskType.padding
         raise ValueError(
             f"Unexpected attention mask type: {self.attention_mask!r}")
 
@@ -985,23 +1009,19 @@ _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
 
 
 def merge_attention_forward_args(
-    forward_args: Optional[AttentionForwardArgs],
-    kwargs: Dict[str, Any],
-) -> AttentionForwardArgs:
+        forward_args: Optional[AttentionForwardArgs],
+        kwargs: Dict[str, Any]) -> AttentionForwardArgs:
     """Merge legacy attention kwargs into explicit forward arguments."""
-
     unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
-
     if forward_args is not None:
         if kwargs:
             raise ValueError(
                 "Pass attention forward options either through forward_args "
                 f"or as legacy kwargs, not both: {sorted(kwargs)}")
         return forward_args
-
     return AttentionForwardArgs(**kwargs)
 
 

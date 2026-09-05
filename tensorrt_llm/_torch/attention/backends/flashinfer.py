@@ -2610,7 +2610,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     kv_dtype=kv_cache.dtype,
                     q_scaling=self.q_scaling,
                     attention_window_size=None,
-                    attention_mask_type=int(AttentionMaskType.causal),
+                    attention_mask_type=AttentionMaskType.causal,
                     attention_mask_data=None,
                     flashinfer_backend=self.flashinfer_backend)
                 decode_forward(decode_plan_params, output[num_ctx_tokens:, :])
@@ -2625,7 +2625,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     and attention_mask_data is not None):
                 logger.warning_once("Falling back to causal attention",
                                     key="trtllm_gen_unsupported_custom_mask")
-                effective_mask_type = int(AttentionMaskType.causal)
+                effective_mask_type = AttentionMaskType.causal
                 effective_mask_data = None
 
             plan_params = metadata.plan(
@@ -2661,14 +2661,14 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         latent_cache = forward_args.latent_cache
         if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
-            attention_mask_type = int(AttentionMaskType.custom_mask)
+            attention_mask_type = AttentionMaskType.custom_mask
             attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(
             )
         elif forward_args.attention_mask == PredefinedAttentionMask.CAUSAL:
-            attention_mask_type = int(AttentionMaskType.causal)
+            attention_mask_type = AttentionMaskType.causal
             attention_mask_data = None
         elif forward_args.attention_mask == PredefinedAttentionMask.FULL:
-            attention_mask_type = int(AttentionMaskType.padding)
+            attention_mask_type = AttentionMaskType.padding
             attention_mask_data = None
         else:
             raise ValueError("Unexpected attention mask type")

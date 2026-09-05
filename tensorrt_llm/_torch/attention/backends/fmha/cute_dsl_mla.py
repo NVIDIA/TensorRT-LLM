@@ -15,7 +15,7 @@
 """CuTe DSL MLA decode FMHA library."""
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
@@ -42,6 +42,9 @@ _LOG2_E = math.log2(math.e)
 
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
+
+    # The kernel addresses the paged KV pool tensor directly.
+    NEEDS_KV_POOL = True
 
     @classmethod
     def is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -109,12 +112,16 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
-    def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
-        if getattr(attn, "has_fp8_kv_cache", False):
+    def _kernel_dtype_for(has_fp8_kv_cache: bool, q: torch.Tensor) -> Optional[torch.dtype]:
+        if has_fp8_kv_cache:
             return torch.float8_e4m3fn
         if q.dtype in (torch.float16, torch.bfloat16):
             return q.dtype
         return None
+
+    @classmethod
+    def _get_kernel_dtype(cls, attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
+        return cls._kernel_dtype_for(bool(getattr(attn, "has_fp8_kv_cache", False)), q)
 
     @staticmethod
     def _to_cutlass_dtype(dtype: torch.dtype):
@@ -389,9 +396,6 @@ class CuteDslMlaFmha(PhasedFmha):
         params: FmhaParams,
         kernel_dtype: torch.dtype,
     ) -> None:
-        attn = params.attn
-        meta = params.meta
-
         # dtype / batch / MLA-dim validity is already enforced before dispatch
         # (``is_available`` + ``_is_supported_with_reason`` + the kernel's
         # ``can_implement``), so they are taken as given here.
@@ -404,10 +408,10 @@ class CuteDslMlaFmha(PhasedFmha):
         batch_size = params.num_requests
         seq_len_q = num_tokens // batch_size
 
-        d_latent = attn.kv_lora_rank
-        d_rope = attn.qk_rope_head_dim
-        qk_nope_head_dim = attn.qk_nope_head_dim
-        num_heads = attn.num_heads
+        d_latent = params.kv_lora_rank
+        d_rope = params.qk_rope_head_dim
+        qk_nope_head_dim = params.qk_nope_head_dim
+        num_heads = params.num_heads
         page_size = params.tokens_per_block
 
         if kernel_dtype == torch.float8_e4m3fn and params.fwd.quant_q_buffer is not None:
@@ -416,7 +420,9 @@ class CuteDslMlaFmha(PhasedFmha):
             q_kernel = q if q.dtype == kernel_dtype else q.to(kernel_dtype)
         q_view = q_kernel.view(batch_size, seq_len_q, num_heads, d_latent + d_rope)
 
-        kv_pool = meta.kv_cache_manager.get_buffers(attn.layer_idx)
+        kv_pool = params.kv_pool
+        if kv_pool is None:
+            raise RuntimeError("CuTe DSL MLA decode requires a paged KV cache pool.")
         # Paged-pool layout normalization for both KV cache managers.
         # KVCacheManagerV2 exposes each layer as a densely-packed page pool.
         # KVCacheManagerV1 exposes a per-layer view over one interleaved pool,
@@ -453,15 +459,16 @@ class CuteDslMlaFmha(PhasedFmha):
                 f"kv_lora_rank={d_latent}, qk_rope_head_dim={d_rope}."
             )
 
-        block_offsets = meta.kv_cache_block_offsets
-        pool_mapping = meta.host_kv_cache_pool_mapping
+        block_offsets = params.kv_cache_block_offsets
+        pool_mapping = params.host_kv_cache_pool_mapping
         # Select this layer's [num_seqs, max_blocks] page table from the 4D
         # kv_cache_block_offsets.
-        local_layer_idx = attn.get_local_layer_idx(meta)
-        pool_idx = int(pool_mapping[local_layer_idx, 0])
+        pool_idx = int(pool_mapping[params.local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
-        page_table = page_table_layer[meta.num_contexts :].transpose(0, 1).to(torch.int32)
+        cache_seqs_base = params.sequence_length.to(torch.int32)
+        # ``seq_offset`` is the generation phase's first sequence index, i.e. the
+        # batch's context count.
+        page_table = page_table_layer[params.seq_offset :].transpose(0, 1).to(torch.int32)
         if layers_in_pool > 1:
             page_table = page_table + layer_in_pool
 
@@ -478,11 +485,11 @@ class CuteDslMlaFmha(PhasedFmha):
         # dynamic dim as a float32 ``torch.rand`` tensor while profiling, i.e.
         # 4x the int8 byte count, which may cause OOM.
         required_workspace_numel = math.ceil(
-            self._required_workspace_size(num_heads, seq_len_q, d_latent, meta.max_num_requests)
+            self._required_workspace_size(num_heads, seq_len_q, d_latent, params.max_num_requests)
             / params.workspace.element_size()
         )
         workspace = params.workspace[:required_workspace_numel]
-        softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
+        softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * params.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
             cached = getattr(self, "_cute_dsl_fp8_scale", None)
@@ -490,7 +497,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
                         "CuTe DSL MLA FMHA: fp8 decode scale was not cached for "
-                        f"layer {attn.layer_idx} before CUDA graph capture."
+                        f"layer {params.layer_idx} before CUDA graph capture."
                     )
                 softmax_scale = float(params.fwd.mla_bmm1_scale[1].item()) / _LOG2_E
                 output_scale = float(params.fwd.mla_bmm2_scale[0].item())
@@ -520,7 +527,7 @@ class CuteDslMlaFmha(PhasedFmha):
             softmax_scale,
             output_scale,
             # Max batch size for the AutoTuner to profile.
-            int(meta.max_num_requests),
+            int(params.max_num_requests),
             params.fwd.softmax_stats_tensor,
         )
 
@@ -528,20 +535,20 @@ class CuteDslMlaFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
-        if params.qkv_input is None:
-            raise RuntimeError("CuTe DSL MLA generation requires qkv_input.")
-        if params.context_buf is None:
-            raise RuntimeError("CuTe DSL MLA generation requires context_buf.")
-        if params.sequence_lengths is None:
-            raise RuntimeError("CuTe DSL MLA generation requires sequence lengths.")
+        if params.qkv_or_q is None:
+            raise RuntimeError("CuTe DSL MLA generation requires qkv_or_q.")
+        if params.output is None:
+            raise RuntimeError("CuTe DSL MLA generation requires output.")
+        if params.sequence_length is None:
+            raise RuntimeError("CuTe DSL MLA generation requires sequence_length.")
 
-        kernel_dtype = self._get_kernel_dtype(params.attn, params.qkv_input)
+        kernel_dtype = self._kernel_dtype_for(params.has_fp8_kv_cache, params.qkv_or_q)
         if kernel_dtype is None:
             raise RuntimeError("CuTe DSL MLA generation was selected for an unsupported dtype.")
 
         self._run_mla_decode(
-            params.qkv_input,
-            params.context_buf,
+            params.qkv_or_q,
+            params.output,
             params,
             kernel_dtype,
         )
@@ -570,13 +577,11 @@ class CuteDslMlaFmha(PhasedFmha):
 
     def prepare_workspace(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
+        params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        workspace: torch.Tensor,
     ) -> None:
+        q = cast(torch.Tensor, params.qkv_or_q)
+        workspace = cast(torch.Tensor, params.workspace)
         required_workspace_size = self._required_workspace_size(
             self.attn.num_heads,
             q.shape[0] // metadata.num_generations,
