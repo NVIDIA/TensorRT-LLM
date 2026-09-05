@@ -46,6 +46,14 @@ from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS  # noqa: E402
 MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 GUIDED_BACKEND = "xgrammar"
 
+# The engine is module-scoped, so the executor proxy's `proxy_dispatch_result_thread`
+# -- started lazily on the first dispatched request (executor/proxy.py) -- outlives
+# whichever test happens to submit first and is torn down with the fixture, not with
+# that test. pytest-threadleak snapshots per test, so it blames the first one to
+# drive Generate. The thread is the engine's to own rather than the test's, so exempt
+# the module, matching tests/unittest/grpc/smg/test_smg.py and test_openengine.py.
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 # The GPU requirement belongs to the engine fixture, not the module: the
 # pure-function tests below are the only coverage for the guide table and the
 # endpoint round trip, and they must still run on a CPU runner.
