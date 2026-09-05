@@ -16,7 +16,10 @@ import torch.nn.functional as F
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
@@ -38,7 +41,7 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .params import DSAParams, use_self_sampling_gvr
+from .params import DSAParams, is_gvr_cute_dsl_supported, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -705,6 +708,13 @@ class Indexer(nn.Module):
             compress_ratio=compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
             sm_version=get_sm_version(),
+            is_cute_dsl_rubin_available=IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+        )
+        gvr_cute_dsl_supported = is_gvr_cute_dsl_supported(
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            is_cute_dsl_rubin_available=IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+            sm_version=get_sm_version(),
+            use_self_sampling_topk=self._use_self_sampling_topk,
         )
         if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
             logger.warning_once(
@@ -723,28 +733,23 @@ class Indexer(nn.Module):
                 "use_self_sampling_topk=True but the self-sampling GVR "
                 "prerequisites are not met "
                 f"(cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                f"cutlass_dsl_rubin={IS_CUTLASS_DSL_RUBIN_AVAILABLE}, "
                 f"sm={get_sm_version()}, "
                 f"index_topk={sparse_params.index_topk}, "
-                f"compress_ratio={compress_ratio}); falling back to the "
-                "temporal GVR path (exact radix when the DSL engine is "
-                "unavailable).",
+                f"compress_ratio={compress_ratio}); falling back to temporal "
+                "GVR on SM100/103 or exact radix otherwise.",
                 key="gvr_self_sampling_prereq_fallback",
             )
         self.mtp_index_share = sparse_params.mtp_index_share
 
-        if (
-            self._enable_heuristic_topk
-            and IS_CUTLASS_DSL_AVAILABLE
-            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
-            # lacks the thread-block clusters both GVR engines use
-            and get_sm_version() in (100, 103)
-        ):
+        if self._enable_heuristic_topk and gvr_cute_dsl_supported:
             decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         else:
             if self._enable_heuristic_topk:
                 logger.warning_once(
                     "enable_heuristic_topk=True but the DSL GVR engine is "
                     f"unavailable (cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                    f"cutlass_dsl_rubin={IS_CUTLASS_DSL_RUBIN_AVAILABLE}, "
                     f"sm={get_sm_version()}); using the exact radix decode "
                     "top-K instead.",
                     key="gvr_prereq_radix_fallback",

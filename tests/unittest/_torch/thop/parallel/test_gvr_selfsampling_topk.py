@@ -32,7 +32,10 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for gvr_selfsampling_topk tests", allow_module_level=True)
@@ -40,19 +43,33 @@ if not torch.cuda.is_available():
 if not IS_CUTLASS_DSL_AVAILABLE:
     pytest.skip("cutlass DSL is required for gvr_selfsampling_topk tests", allow_module_level=True)
 
-if getSMVersion() not in (100, 103):
+_SM_VERSION = getSMVersion()
+if _SM_VERSION not in (100, 103) and not (_SM_VERSION == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE):
     pytest.skip(
-        "self-sampling GVR kernels target datacenter Blackwell (sm_100/103) "
-        "— same gate as the production dispatch; consumer Blackwell "
-        "(sm_120/121) lacks thread-block clusters",
+        "self-sampling GVR kernels require SM100/103 or SM107 with Rubin "
+        "CuTe DSL helpers — same gate as the production dispatch",
         allow_module_level=True,
     )
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k import (  # noqa: E402
     gvr_topk_decode_self_sampling_host as ss_host,
 )
 
 _DEV = "cuda"
+
+
+def _varlen_cache_key(rows, npad, top_k, n_env, next_n, compress_ratio):
+    num_sms, locality_domain_id = ss_host._execution_domain(torch.device(_DEV))
+    return (
+        rows,
+        npad,
+        top_k,
+        n_env,
+        next_n,
+        compress_ratio,
+        num_sms,
+        locality_domain_id,
+    )
 
 
 def _make_case(batch_size, n_valid, top_k, seed, hit_ratio=0.6):
@@ -705,7 +722,7 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     kv = torch.tensor([msl_c * cr, 900, nn - 1], dtype=torch.int32, device=_DEV)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-    key = (rows, npad, k, msl_c, nn, cr)
+    key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -770,7 +787,7 @@ def test_selfsampling_varlen_reg_parity_and_oracle():
         kv = torch.tensor([msl, max((k - 3) * cr, nn), nn - 1], dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -810,7 +827,7 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         )
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
-        key = (rows, npad, k, msl_c, nn, cr)
+        key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
         assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
@@ -837,7 +854,7 @@ def test_selfsampling_varlen_clus_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -863,7 +880,7 @@ def test_selfsampling_varlen_reg_cuda_graph():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
-    key = (rows, msl_c, k, msl_c, 1, cr)
+    key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
     assert ss_host._VARLEN_CACHE[key][0] == "reg", ss_host._VARLEN_CACHE[key][0]
     g = torch.cuda.CUDAGraph()
     out.fill_(-7)
@@ -891,7 +908,7 @@ def test_selfsampling_varlen_full_row_range():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=1, compress_ratio=cr, max_seq_len=msl_c * cr)
         torch.cuda.synchronize()
-        key = (rows, msl_c, k, msl_c, 1, cr)
+        key = _varlen_cache_key(rows, msl_c, k, msl_c, 1, cr)
         assert key in ss_host._VARLEN_CACHE, "row count must dispatch in-engine"
         ref_v = torch.topk(lg.float(), k, dim=1).values.sort(dim=1).values
         got = lg.float().gather(1, out.long().clamp_min(0)).sort(dim=1).values

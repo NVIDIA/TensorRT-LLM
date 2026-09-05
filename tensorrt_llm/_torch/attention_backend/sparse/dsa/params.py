@@ -20,6 +20,20 @@ if TYPE_CHECKING:
     pass
 
 
+def is_gvr_cute_dsl_supported(
+    *,
+    is_cute_dsl_available: bool,
+    is_cute_dsl_rubin_available: bool,
+    sm_version: int,
+    use_self_sampling_topk: bool,
+) -> bool:
+    """Return whether the CuTe DSL stack can run GVR on this architecture."""
+    return is_cute_dsl_available and (
+        sm_version in (100, 103)
+        or (sm_version == 107 and is_cute_dsl_rubin_available and use_self_sampling_topk)
+    )
+
+
 def use_self_sampling_gvr(
     *,
     enable_heuristic_topk: bool,
@@ -28,6 +42,7 @@ def use_self_sampling_gvr(
     compress_ratio: int,
     is_cute_dsl_available: bool,
     sm_version: int,
+    is_cute_dsl_rubin_available: bool = False,
 ) -> bool:
     """Return whether the two-level dispatch picks the self-sampling engine.
 
@@ -38,8 +53,12 @@ def use_self_sampling_gvr(
     return (
         enable_heuristic_topk
         and use_self_sampling_topk
-        and is_cute_dsl_available
-        and sm_version in (100, 103)
+        and is_gvr_cute_dsl_supported(
+            is_cute_dsl_available=is_cute_dsl_available,
+            is_cute_dsl_rubin_available=is_cute_dsl_rubin_available,
+            sm_version=sm_version,
+            use_self_sampling_topk=True,
+        )
         and index_topk in (512, 1024, 2048)
         and compress_ratio in (1, 4)
     )

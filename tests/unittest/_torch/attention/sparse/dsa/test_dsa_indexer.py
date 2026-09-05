@@ -57,7 +57,10 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention_backend.sparse.dsa.params import (
+    is_gvr_cute_dsl_supported,
+    use_self_sampling_gvr,
+)
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -181,6 +184,8 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
         (dict(enable_heuristic_topk=False), False),
         (dict(use_self_sampling_topk=False), False),
         (dict(is_cute_dsl_available=False), False),
+        (dict(sm_version=107), False),
+        (dict(sm_version=107, is_cute_dsl_rubin_available=True), True),
         (dict(sm_version=120), False),
         (dict(index_topk=256), False),
         (dict(compress_ratio=2), False),
@@ -193,10 +198,22 @@ def test_use_self_sampling_gvr(kwargs, expected):
         index_topk=512,
         compress_ratio=1,
         is_cute_dsl_available=True,
+        is_cute_dsl_rubin_available=False,
         sm_version=100,
     )
     base.update(kwargs)
     assert use_self_sampling_gvr(**base) is expected
+
+
+def test_sm107_gvr_admission_is_self_sampling_only():
+    """Temporal GVR remains restricted to its validated SM100/103 path."""
+    common = dict(
+        is_cute_dsl_available=True,
+        is_cute_dsl_rubin_available=True,
+        sm_version=107,
+    )
+    assert is_gvr_cute_dsl_supported(**common, use_self_sampling_topk=True)
+    assert not is_gvr_cute_dsl_supported(**common, use_self_sampling_topk=False)
 
 
 @pytest.mark.parametrize("use_self_sampling_topk", [True, False])
@@ -601,6 +618,38 @@ def test_indexer_two_level_gvr_dispatch(
     assert indexer.top_k.decode_implementation == expected_decode
     assert indexer.top_k.gvr_self_sampling == use_self_sampling
     assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
+
+
+@skip_pre_hopper
+def test_indexer_sm107_temporal_gvr_falls_back_to_radix():
+    """SM107 support is V2-only; requesting temporal V1 must not select GVR."""
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=512,
+        use_cute_dsl_topk=False,
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=False,
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_RUBIN_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=107,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer.top_k.decode_implementation == TopKImplementation.CUDA_RADIX
+    assert not indexer.top_k.gvr_self_sampling
+    assert not indexer.top_k.needs_gvr_prior
 
 
 @skip_pre_hopper

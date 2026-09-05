@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a).
+"""Self-sampling GVR top-K decode kernels (CuTe DSL, SM100/103 and SM107).
+
+SM107/Rubin is enabled only when the installed CuTe DSL exposes its Rubin
+helpers. This is source support, not an R200 performance-tuning claim.
 
 Sample-calibrated threshold ladders for exact single-pass top-K: the kernel
 derives its selection threshold from an in-kernel sample of the row itself
@@ -3038,18 +3041,29 @@ def workspace_bytes() -> int:
     return WS_BYTES
 
 
+def _host_dispatch_for(logits):
+    """Load the host router and resolve the tensor's execution-domain SMs.
+
+    Standalone/debug entries share the production topology resolver so SM107
+    cannot silently inherit the historical B200 148-SM plan. The import stays
+    lazy to avoid a device/host cycle during module initialization.
+    """
+    try:
+        from . import gvr_topk_decode_self_sampling_host as ct_dispatch
+    except ImportError:
+        import gvr_topk_decode_self_sampling_host as ct_dispatch
+    return ct_dispatch, ct_dispatch._available_num_sms(logits.get_device())
+
+
 def run(logits, pre_idx, n: int, out, ws):
     """torch-facing single-call entry: routes (b, n, k) through ct_dispatch,
     asserts the shape lands on gvr_main, launches the matching variant.
     ws: zero-initialised >=20,973,568-B CUDA buffer (reused across launches;
     the kernel restores the zeros it consumes)."""
-    try:
-        from . import gvr_topk_decode_self_sampling_host as ct_dispatch
-    except ImportError:
-        import gvr_topk_decode_self_sampling_host as ct_dispatch
+    ct_dispatch, num_sms = _host_dispatch_for(logits)
     b, npad = logits.shape
     k = pre_idx.shape[1]
-    r = ct_dispatch.route(b, int(n), npad, k)
+    r = ct_dispatch.route(b, int(n), npad, k, num_sms=num_sms)
     assert r["kernel"] == "main", f"shape routes to {r['kernel']}, not gvr_main"
     assert ws.numel() * ws.element_size() >= WS_BYTES
     rt = r["rt"]
@@ -4369,12 +4383,14 @@ def reg_topk(logits, pre_idx, n, out, rd=None):
     logits [b, npad] f32, pre_idx [b, k] i32, out [b, >=k] i32, n = valid len.
     rd: optional pre-computed ct_dispatch.route() dict (must be reg/regimg).
     """
+    ct_dispatch, num_sms = _host_dispatch_for(logits)
+    expected = ct_dispatch.route(
+        logits.shape[0], int(n), logits.shape[1], pre_idx.shape[1], num_sms=num_sms
+    )
     if rd is None:
-        try:
-            from .gvr_topk_decode_self_sampling_host import route
-        except ImportError:
-            from gvr_topk_decode_self_sampling_host import route
-        rd = route(logits.shape[0], int(n), logits.shape[1], pre_idx.shape[1])
+        rd = expected
+    else:
+        assert rd == expected, "pre-computed route does not match the current execution domain"
     assert rd["kernel"] in ("reg", "regimg"), rd["kernel"]
     tpl = rd["tpl"]
     rt = rd["rt"]
@@ -4473,6 +4489,8 @@ class GvrClusKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        *,
+        num_sms: int,
     ) -> None:
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
@@ -4489,6 +4507,8 @@ class GvrClusKernel:
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
         self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
+        self.num_sms = int(num_sms)
+        assert self.num_sms >= 1
         self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
@@ -4739,7 +4759,7 @@ class GvrClusKernel:
                 if x6 - ri * ri > ri:
                     r6 = ri + cutlass.Int32(1)
                 # aim_base: R = CS > 1 always for this family; bigf is the
-                # launch-computed occupancy flag (num_rows * CS <= 148).
+                # launch-computed occupancy flag (num_rows * CS <= num_sms).
                 aim = k << cutlass.Int32(1)
                 if bigf == cutlass.Int32(0):
                     if k >= cutlass.Int32(1024):
@@ -5631,7 +5651,7 @@ class GvrClusKernel:
         # of (rows, CS) so it is launch-computed, not an ABI scalar.
         b = out.shape[0]
         bigf = cutlass.Int32(0)
-        if b * cutlass.Int32(self.cs) <= cutlass.Int32(148):
+        if b * cutlass.Int32(self.cs) <= cutlass.Int32(self.num_sms):
             bigf = cutlass.Int32(1)
         self.kern(
             logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP, TGT, Q, SS2, TGT2, bigf
@@ -5659,6 +5679,8 @@ def get_compiled__clus(
     next_n: int = 1,
     cr_shift: int = 0,
     hint_free: bool = False,
+    *,
+    num_sms: int,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -5672,6 +5694,7 @@ def get_compiled__clus(
         int(next_n),
         int(cr_shift),
         bool(hint_free),
+        int(num_sms),
     )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
@@ -5689,6 +5712,7 @@ def get_compiled__clus(
         next_n=next_n,
         cr_shift=cr_shift,
         hint_free=hint_free,
+        num_sms=num_sms,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -5727,18 +5751,15 @@ def run__clus(logits, pre_idx, n: int, out):
     gvr_clus takes NO workspace."""
     import torch  # debug-entry only: module stays torch-free at import
 
-    try:
-        from . import gvr_topk_decode_self_sampling_host as ct_dispatch
-    except ImportError:
-        import gvr_topk_decode_self_sampling_host as ct_dispatch
+    ct_dispatch, num_sms = _host_dispatch_for(logits)
     b, npad = logits.shape
     k = pre_idx.shape[1]
-    r = ct_dispatch.route(b, int(n), npad, k)
+    r = ct_dispatch.route(b, int(n), npad, k, num_sms=num_sms)
     assert r["kernel"] == "clus", f"shape routes to {r['kernel']}, not gvr_clus"
     rt = r["rt"]
-    kobj = GvrClusKernel(*r["tpl"], scap=rt["SCAP"], cmp_=rt["CMP"])
+    kobj = GvrClusKernel(*r["tpl"], scap=rt["SCAP"], cmp_=rt["CMP"], num_sms=num_sms)
     assert r["smem"] == kobj.dyn_bytes, (r["smem"], kobj.dyn_bytes)
-    fn = get_compiled__clus(tuple(r["tpl"]), scap=rt["SCAP"], cmp_=rt["CMP"])
+    fn = get_compiled__clus(tuple(r["tpl"]), scap=rt["SCAP"], cmp_=rt["CMP"], num_sms=num_sms)
     dkv = torch.zeros(1, dtype=torch.int32, device=logits.device)  # dead varlen slot
     fn(
         logits,
@@ -5765,7 +5786,8 @@ def run_manual(logits, pre_idx, n: int, out, tpl, rt):
     the same CS; U only changes the chunk geometry)."""
     import torch  # debug-entry only: module stays torch-free at import
 
-    fn = get_compiled__clus(tuple(tpl), scap=rt["SCAP"], cmp_=rt["CMP"])
+    _, num_sms = _host_dispatch_for(logits)
+    fn = get_compiled__clus(tuple(tpl), scap=rt["SCAP"], cmp_=rt["CMP"], num_sms=num_sms)
     dkv = torch.zeros(1, dtype=torch.int32, device=logits.device)  # dead varlen slot
     fn(
         logits,
@@ -6662,12 +6684,14 @@ def regclus_topk(logits, pre_idx, n, out, rd=None):
     logits [b, npad] f32, pre_idx [b, k] i32, out [b, >=k] i32, n = valid len.
     rd: optional pre-computed ct_dispatch.route() dict (must be reg_clus).
     """
+    ct_dispatch, num_sms = _host_dispatch_for(logits)
+    expected = ct_dispatch.route(
+        logits.shape[0], int(n), logits.shape[1], pre_idx.shape[1], num_sms=num_sms
+    )
     if rd is None:
-        try:
-            from .gvr_topk_decode_self_sampling_host import route
-        except ImportError:
-            from gvr_topk_decode_self_sampling_host import route
-        rd = route(logits.shape[0], int(n), logits.shape[1], pre_idx.shape[1])
+        rd = expected
+    else:
+        assert rd == expected, "pre-computed route does not match the current execution domain"
     assert rd["kernel"] == "reg_clus", rd["kernel"]
     tpl = tuple(rd["tpl"])
     assert pre_idx.shape[1] <= tpl[0], "k <= BLK enforced by dispatch"

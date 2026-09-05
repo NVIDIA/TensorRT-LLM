@@ -15,15 +15,18 @@
 """Self-sampling GVR top-K decode — host side (dispatch, workspace, entry).
 
 Companion to ``gvr_topk_decode_self_sampling.py`` (the device module).
+Supports SM100/103 and capability-gated SM107/Rubin; the Rubin path is not
+yet performance-tuned or R200-validated.
 Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
-   ``route(b, n, npad, k)``;
-2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
-   torch caching allocator, with keep-alive + double-checked locking;
+   ``route(b, n, npad, k, num_sms=148)``;
+2. workspace — one zero-initialised slab per device/execution domain
+   (20,973,568 B) via the matching torch caching allocator or localized
+   mempool, with keep-alive + double-checked locking;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
-   bind-once launch cache keyed on ``(b, n, npad, k)``.
+   bind-once launch cache keyed on shape plus execution topology.
 
 OPERATOR CONTRACT (batch-uniform entries): ``n_valid`` is one host python
 int for the whole batch — every row shares the same valid prefix, in
@@ -72,8 +75,8 @@ def _device():
 # ===========================================================================
 """Pure-Python mirror of the GVR CUDA host dispatch (gvr_topk_launch).
 
-route(b, n, npad, k) is a PURE function of its four ints -- no env knobs, no
-GPU, stdlib only.  It returns the kernel family, its compile-time template
+route(b, n, npad, k, num_sms=148) is a PURE function of its integer inputs --
+no env knobs or GPU queries.  It returns the kernel family, its compile-time template
 tuple, the runtime scalar pack `rt`, grid/cluster/block geometry, smem size,
 and whether the family needs the workspace.
 
@@ -105,19 +108,40 @@ QUADC = 96  # crossing-bin O(mc^2) rank gate (streaming/reg paths)
 SNB = 256  # streaming-path bin count
 CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
+DEFAULT_NUM_SMS = 148  # B200 default; preserves the original pure-function contract
+_CLUSTER8_MAX_BATCH = 15  # B200-validated GPC packing limit
+MAX_SPLIT_ROWS = 160  # workspace MAXC; must match the device kernel
 
 
-def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def _cluster8_is_supported(batch_size: int, num_sms: int) -> bool:
+    """Apply the validated cluster-8 packing limit conservatively.
+
+    The 15-row limit is a GPC-packing constraint, not an SM-wave ratio. Keep
+    it unchanged for Rubin until R200 cluster residency is characterized;
+    the ``num_sms`` argument makes the architecture-policy seam explicit.
+    """
+    return batch_size <= min(_CLUSTER8_MAX_BATCH, num_sms)
+
+
+def route(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = DEFAULT_NUM_SMS,
+) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
-    wide = b <= 148
+    if num_sms < 1:
+        raise RuntimeError(f"route requires num_sms >= 1, got {num_sms}")
+    wide = b <= num_sms
 
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    QC = 1024 if b > 148 else QUADC
-    CURE = not (n < 2 * k and b > 148)
+    QC = 1024 if b > num_sms else QUADC
+    CURE = not (n < 2 * k and b > num_sms)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
@@ -184,7 +208,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
 
     # ---- clustered register-resident path ----
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
-        av = 148 // (b if b > 0 else 1)  # truncating
+        av = num_sms // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
@@ -197,7 +221,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 c = 1  # 64-bit product in C
                 while c * BLKC * v < n4:
                     c <<= 1
-                if c == 8 and b > 15:  # the veto
+                if c == 8 and not _cluster8_is_supported(b, num_sms):
                     continue
                 if c <= amax:
                     vsel = v
@@ -222,7 +246,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     # ====================== streaming / collect path ========================
     R = 1
     if b <= 32:
-        r1 = 148 // b
+        r1 = num_sms // b
         if r1 < 1:
             r1 = 1
         r2 = ((n >> 2) + 1023) // 1024
@@ -231,7 +255,8 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
         R = r1 if r1 < r2 else r2
         if R < 1:
             R = 1
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:  # shallow R=2 split
+    elif b <= min(num_sms // 2, MAX_SPLIT_ROWS) and (n >> 2) >= 16384 and k <= 1024:
+        # shallow R=2 split; MAXC limits split rows, not CTAs per row
         R = 2
 
     useclus = False
@@ -241,12 +266,12 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             p2 <<= 1
         # gvr_clus cs=8 hits the same GPC packing wall as the clustered
         # register path; same veto, same b > 15 threshold.
-        if p2 == 8 and b > 15:
+        if p2 == 8 and not _cluster8_is_supported(b, num_sms):
             p2 = 4
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    big = b * R <= num_sms
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -352,7 +377,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
             "ws": False,
         }
 
-    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 296) else 4) + (CMP + 1) * 8
+    smem_main = (SCAP + 4) * (8 if (R > 1 or b <= 2 * num_sms) else 4) + (CMP + 1) * 8
 
     def _main(BLK, MINB, U, SPLIT):
         # KPT ladder 1/2/4/8; grid = (R, b).
@@ -391,7 +416,7 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
         per = Q >> 10
         U = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, U, R > 1)  # SPLIT iff R>1
-    if b <= 296:
+    if b <= 2 * num_sms:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
@@ -425,13 +450,13 @@ if __name__ == "__main__":
 #   route_static(b, n, npad, k)  — everything that must be frozen per launch:
 #       family, compile tuple, grid, cluster, block, and the rt scalars that
 #       change only at discrete n-thresholds;
-#   route_dynamic(static, n)     — the n-continuous scalars a per-row kernel
+#   route_dynamic(static, n, num_sms=...) — the n-continuous scalars a per-row kernel
 #       recomputes from its own row length (the device code will mirror these
 #       formulas): n, CMP (reg families), the sampling ladder
 #       SMP/TGT/SS2/TGT2/Q (streaming families), and the reg-family smem
 #       footprint.
 # INVARIANT: merging route_dynamic back into route_static reproduces
-# route() EXACTLY for every n. The policy of which n to freeze the static
+# route() EXACTLY for every n and execution topology. The policy of which n to freeze the static
 # half at (e.g. max_seq_len) is a perf-only choice — the factorization
 # itself is lossless.
 
@@ -445,11 +470,17 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_static(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = DEFAULT_NUM_SMS,
+) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
-    reconstructible from (static, n) by route_dynamic."""
-    plan = route(b, n, npad, k)
+    reconstructible from (static, n, num_sms) by route_dynamic."""
+    plan = route(b, n, npad, k, num_sms=num_sms)
     st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
     for f in _DYN_RT[st["kernel"]]:
         st["rt"].pop(f)
@@ -458,8 +489,17 @@ def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
     return st
 
 
-def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object], int]:
-    """Recompute the redacted n-continuous scalars from (static, n).
+def route_dynamic(
+    static: dict[str, object],
+    n: int,
+    *,
+    num_sms: int,
+) -> tuple[dict[str, object], int]:
+    """Recompute redacted scalars from ``(static, n, num_sms)``.
+
+    ``num_sms`` is required because the static plan cannot in general reveal
+    which execution-domain topology produced it.
+
     Returns (rt_updates, smem). Must stay equivalent to route(); the
     device-side per-row engine mirrors exactly these formulas."""
     fam = static["kernel"]
@@ -485,7 +525,7 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     else:
         R = static["rt"]["R"]
         scap = static["rt"]["SCAP_"]
-    big = b * R <= 148
+    big = b * R <= num_sms
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
@@ -535,11 +575,17 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     )
 
 
-def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_split(
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    num_sms: int = DEFAULT_NUM_SMS,
+) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
-    st = route_static(b, n, npad, k)
-    dyn, smem = route_dynamic(st, n)
+    st = route_static(b, n, npad, k, num_sms=num_sms)
+    dyn, smem = route_dynamic(st, n, num_sms=num_sms)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
     plan["smem"] = smem
@@ -547,7 +593,12 @@ def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
 
 
 def route_streaming(
-    b: int, n: int, npad: int, k: int, force_main: bool = False
+    b: int,
+    n: int,
+    npad: int,
+    k: int,
+    force_main: bool = False,
+    num_sms: int = DEFAULT_NUM_SMS,
 ) -> dict[str, object]:
     """route() restricted to its STREAMING half (main / clus) — the varlen
     capture policy: per-row kernels must be picked from the families that are
@@ -558,23 +609,25 @@ def route_streaming(
     min(r1, r2) R matches the CUDA else-branch exactly."""
     if b < 1:
         raise RuntimeError(f"route_streaming requires b >= 1, got {b}")
+    if num_sms < 1:
+        raise RuntimeError(f"route_streaming requires num_sms >= 1, got {num_sms}")
     R = 1
     if b <= 32:
-        r1 = max(148 // b, 1)
+        r1 = max(num_sms // b, 1)
         r2 = max(((n >> 2) + 1023) // 1024, 1)
         R = max(min(r1, r2), 1)
-    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:
+    elif b <= min(num_sms // 2, MAX_SPLIT_ROWS) and (n >> 2) >= 16384 and k <= 1024:
         R = 2
     useclus = False
     if not force_main and 2 <= R <= 8 and k <= 1024:
         p2 = 1
         while (p2 << 1) <= R:
             p2 <<= 1
-        if p2 == 8 and b > 15:
+        if p2 == 8 and not _cluster8_is_supported(b, num_sms):
             p2 = 4
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = b * R <= num_sms
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -639,7 +692,7 @@ def route_streaming(
             "smem": smc,
             "ws": False,
         }
-    smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
+    smem_main = (scap + 4) * (8 if (R > 1 or b <= 2 * num_sms) else 4) + (cmp_ + 1) * 8
 
     def _main(blk_, minb_, u_, split_):
         kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
@@ -671,12 +724,83 @@ def route_streaming(
         per = q_ >> 10
         u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
         return _main(1024, 1, u_, R > 1)
-    if b <= 296:
+    if b <= 2 * num_sms:
         return _main(512, 2, 8, False)
     return _main(256, 4, 8, False)
 
 
 _VARLEN_CACHE = {}
+_DEVICE_COMPUTE_INFO = {}
+
+
+def _current_locality_domain() -> int | None:
+    """Return the thread-local locality domain without importing it eagerly."""
+    from tensorrt_llm._torch.locality_domain_utils import get_current_locality_domain
+
+    return get_current_locality_domain()
+
+
+def _locality_domain_topology() -> tuple[tuple[int, int], ...]:
+    """Return the initialized public CUDA locality-domain compute split."""
+    from tensorrt_llm._torch.locality_domain.runtime import LocalityDomainRuntime
+
+    return LocalityDomainRuntime().topology_identity()
+
+
+def _device_ordinal(device: torch.device | int) -> int:
+    """Normalize an explicit/current CUDA device to its integer ordinal."""
+    if isinstance(device, int):
+        return device
+    cuda_device = torch.device(device)
+    if cuda_device.type != "cuda":
+        raise RuntimeError(f"expected a CUDA device, got {device}")
+    return cuda_device.index if cuda_device.index is not None else torch.cuda.current_device()
+
+
+def _execution_domain(device: torch.device | int) -> tuple[int, int | None]:
+    """Return available SMs and the current locality-domain cache identity."""
+    device_index = _device_ordinal(device)
+    compute_info = _DEVICE_COMPUTE_INFO.get(device_index)
+    if compute_info is None:
+        properties = torch.cuda.get_device_properties(device_index)
+        sm_version = int(properties.major) * 10 + int(properties.minor)
+        compute_info = (sm_version, int(properties.multi_processor_count))
+        _DEVICE_COMPUTE_INFO[device_index] = compute_info
+    sm_version, full_device_num_sms = compute_info
+
+    # B200/GB200 has no locality-domain execution. Avoid importing or
+    # querying that runtime on its hot path.
+    if sm_version != 107:
+        return full_device_num_sms, None
+
+    locality_domain_id = _current_locality_domain()
+    if locality_domain_id is not None:
+        # The low-level topology cache is keyed by torch's current device.
+        # Query it under the tensor's device rather than the caller's ambient
+        # device, which may differ in multi-GPU serving processes.
+        with torch.cuda.device(device_index):
+            topology = _locality_domain_topology()
+        if not 0 <= locality_domain_id < len(topology):
+            raise RuntimeError(f"invalid current locality domain {locality_domain_id}")
+        partition_num_sms, total_num_sms = topology[locality_domain_id]
+        if not 0 < partition_num_sms <= total_num_sms:
+            raise RuntimeError(
+                "locality-domain compute topology is unavailable or invalid: "
+                f"domain={locality_domain_id}, counts={(partition_num_sms, total_num_sms)}"
+            )
+        if total_num_sms != full_device_num_sms:
+            raise RuntimeError(
+                "locality-domain topology does not match the target device: "
+                f"device={device_index}, topology_total={total_num_sms}, "
+                f"device_total={full_device_num_sms}"
+            )
+        return partition_num_sms, locality_domain_id
+    return full_device_num_sms, None
+
+
+def _available_num_sms(device: torch.device | int) -> int:
+    """Return SMs available to launches in the current execution domain."""
+    return _execution_domain(device)[0]
 
 
 def _varlen_launcher(
@@ -686,12 +810,14 @@ def _varlen_launcher(
     n_env: int,
     next_n: int,
     cr: int,
+    num_sms: int = DEFAULT_NUM_SMS,
+    locality_domain_id: int | None = None,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr)
+    key = (num_rows, npad, k, n_env, next_n, cr, num_sms, locality_domain_id)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -703,7 +829,7 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_eff, npad, k)
+    plan_free = route(num_rows, n_eff, npad, k, num_sms=num_sms)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -755,6 +881,7 @@ def _varlen_launcher(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=True,
+            num_sms=num_sms,
         )
         lc = (
             "clus",
@@ -763,7 +890,14 @@ def _varlen_launcher(
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
+    plan = route_streaming(
+        num_rows,
+        n_eff,
+        npad,
+        k,
+        force_main=True,
+        num_sms=num_sms,
+    )
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
@@ -771,7 +905,7 @@ def _varlen_launcher(
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=True)
-    big = num_rows * r_const <= 148
+    big = num_rows * r_const <= num_sms
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
@@ -797,7 +931,12 @@ def _varlen_launcher(
 
 
 def route_bands(
-    b: int, npad: int, k: int, n_lo: int | None = None, n_hi: int | None = None
+    b: int,
+    npad: int,
+    k: int,
+    n_lo: int | None = None,
+    n_hi: int | None = None,
+    num_sms: int = DEFAULT_NUM_SMS,
 ) -> list[tuple[int, int, dict[str, object]]]:
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
@@ -808,7 +947,7 @@ def route_bands(
     bands = []
     cur_key, cur_lo, cur_plan = None, lo, None
     for n in range(lo, hi + 1):
-        st = route_static(b, n, npad, k)
+        st = route_static(b, n, npad, k, num_sms=num_sms)
         key = repr(st)
         if key != cur_key:
             if cur_key is not None:
@@ -822,11 +961,11 @@ def route_bands(
 # ===========================================================================
 # ==== workspace ============================================================
 # ===========================================================================
-"""Per-device workspace slab for the multi-CTA SPLIT path.
+"""Per-execution-domain workspace slab for the multi-CTA SPLIT path.
 
 Semantics:
-  * ONE zero-initialised slab workspace per device, lazily allocated through
-    the torch caching allocator;
+  * ONE zero-initialised slab workspace per full device or locality domain,
+    lazily allocated through the matching torch caching allocator/mempool;
   * keep-alive store: module dict `_ws_keep` (tensor refcount = keep-alive);
   * double-checked locking: lock-free hot-path load (a GIL-atomic dict get
     plays an acquire load), slow path re-checks under a mutex;
@@ -835,8 +974,9 @@ Semantics:
     input checks, so a CPU logits tensor dies here with "device index out of
     range: -1").
 
-Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
-must pass their own workspace via run_ws().
+Concurrent STREAMS on one device or in the same locality domain that may
+both take the multi-CTA SPLIT path must pass distinct, zero-initialised
+workspaces via run_ws() / run_varlen(workspace=...).
 
 Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
     = 2048 + 160*16384*8 = 20,973,568 B.
@@ -852,14 +992,30 @@ the tensor's byte offset.
 
 # workspace geometry constants -- must match the device kernels
 GVR_MAX_DEV = 64
-_MAXC = 160
+_MAXC = MAX_SPLIT_ROWS
 _GCAP = 16384
 _GVR_WS_BUF_OFF = 2048
 WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568
 assert WS_BYTES == 20_973_568
 
 _mu = threading.Lock()  # slow-path mutex
-_ws_keep = {}  # device index -> keep-alive int32 view
+_ws_keep = {}  # device or (device, locality domain) -> keep-alive int32 view
+
+
+def _workspace_cache_key(
+    device_index: int, locality_domain_id: int | None
+) -> int | tuple[int, int]:
+    """Return the workspace identity for the current execution domain."""
+    if locality_domain_id is None:
+        return device_index
+    return device_index, locality_domain_id
+
+
+def _optional_locality_domain_mem_pool():
+    """Return the current locality-domain allocation context lazily."""
+    from tensorrt_llm._torch.locality_domain_utils import optional_locality_domain_mem_pool
+
+    return optional_locality_domain_mem_pool()
 
 
 def workspace_bytes() -> int:
@@ -867,7 +1023,10 @@ def workspace_bytes() -> int:
     return WS_BYTES
 
 
-def default_workspace(ref: torch.Tensor) -> torch.Tensor:
+def _default_workspace(
+    ref: torch.Tensor,
+    locality_domain_id: int | None,
+) -> torch.Tensor:
     """Per-device cached workspace slab.
 
     Returns the kernel-facing 1-D int32 view (zero-initialised on first use;
@@ -876,19 +1035,30 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
     d = ref.get_device()
     if not (0 <= d < GVR_MAX_DEV):
         raise RuntimeError(f"device index out of range: {d}")
-    ws = _ws_keep.get(d)  # hot path: one (GIL-atomic) load
+    workspace_key = _workspace_cache_key(d, locality_domain_id)
+    ws = _ws_keep.get(workspace_key)  # hot path: one (GIL-atomic) load
     if ws is not None:
         return ws
     with _mu:  # slow path: double-checked
-        ws = _ws_keep.get(d)
+        ws = _ws_keep.get(workspace_key)
         if ws is not None:
             return ws
-        # lazy zeros via the torch caching allocator, viewed int32 for the
-        # DSL launch signature.
-        buf = torch.zeros(WS_BYTES, dtype=torch.uint8, device=ref.device)
+        if locality_domain_id is None:
+            buf = torch.zeros(WS_BYTES, dtype=torch.uint8, device=ref.device)
+        else:
+            # Route first touch to the current domain's localized mempool.
+            with torch.cuda.device(d):
+                with _optional_locality_domain_mem_pool():
+                    buf = torch.zeros(WS_BYTES, dtype=torch.uint8, device=ref.device)
         ws = buf.view(torch.int32)
-        _ws_keep[d] = ws  # keep-alive (ws_keep[d] = tensor)
+        _ws_keep[workspace_key] = ws
         return ws
+
+
+def default_workspace(ref: torch.Tensor) -> torch.Tensor:
+    """Return the default workspace for the current execution domain."""
+    _, locality_domain_id = _execution_domain(ref.get_device())
+    return _default_workspace(ref, locality_domain_id)
 
 
 def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
@@ -930,10 +1100,40 @@ def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _workspace_for_varlen_launch(
+    logits: torch.Tensor,
+    workspace: torch.Tensor | None,
+    locality_domain_id: int | None,
+) -> torch.Tensor:
+    """Resolve a varlen workspace after its launcher is capture-ready.
+
+    The caller must resolve the domain-specific launcher first. During CUDA
+    graph capture a cold default workspace cannot be allocated safely: an
+    aborted capture could otherwise publish a slab whose one-time zeroing
+    only existed in the discarded graph.
+    """
+    if workspace is not None:
+        validate_run_ws(workspace, logits)
+        return kernel_view(workspace)
+
+    device_index = logits.get_device()
+    workspace_key = _workspace_cache_key(device_index, locality_domain_id)
+    ws = _ws_hot.get(workspace_key)
+    if ws is not None:
+        return ws
+    if _is_capturing():
+        raise RuntimeError(
+            "default workspace is not initialized for this execution domain "
+            "— warm up before CUDA graph capture"
+        )
+    return _default_workspace(logits, locality_domain_id)
+
+
 def _reset_for_tests() -> None:
     """Drop cached slabs (tests only; NOT part of the C contract)."""
     with _mu:
         _ws_keep.clear()
+        _DEVICE_COMPUTE_INFO.clear()
 
 
 # ===========================================================================
@@ -1004,8 +1204,8 @@ _GVR_MAX_DEV = GVR_MAX_DEV
 # ---------------------------------------------------------------------------
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
-def _build_launcher(b, n, npad, k):
-    rd = route(b, n, npad, k)
+def _build_launcher(b, n, npad, k, num_sms=DEFAULT_NUM_SMS):
+    rd = route(b, n, npad, k, num_sms=num_sms)
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
@@ -1053,7 +1253,12 @@ def _build_launcher(b, n, npad, k):
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
         #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
         # varlen slot in batch-uniform mode (cached dummy tensor)
-        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        fn = dev.get_compiled__clus(
+            tpl,
+            scap=rt["SCAP"],
+            cmp_=rt["CMP"],
+            num_sms=num_sms,
+        )
         args = (
             rt["n"],
             rt["npad"],
@@ -1090,7 +1295,16 @@ def _build_launcher(b, n, npad, k):
 # ---------------------------------------------------------------------------
 # shared implementation of the batch-uniform entries
 # ---------------------------------------------------------------------------
-def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
+def _run_impl(
+    logits,
+    pre_idx,
+    n_valid,
+    indices,
+    ws,
+    values=None,
+    num_sms=DEFAULT_NUM_SMS,
+    locality_domain_id=None,
+):
     if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
     if logits.dtype is not _F32:
@@ -1183,10 +1397,10 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    key = (b, n, npad, k)
+    key = (b, n, npad, k, num_sms, locality_domain_id)
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
-        lc = _build_launcher(b, n, npad, k)
+        lc = _build_launcher(b, n, npad, k, num_sms=num_sms)
         _LAUNCH_CACHE[key] = lc
     fn, args, needs_ws = lc
     try:
@@ -1227,10 +1441,21 @@ def run(
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:  # checked on EVERY call
         raise RuntimeError(f"device index out of range: {d}")
-    ws = _ws_hot.get(d)
+    num_sms, locality_domain_id = _execution_domain(d)
+    workspace_key = _workspace_cache_key(d, locality_domain_id)
+    ws = _ws_hot.get(workspace_key)
     if ws is None:
-        ws = default_workspace(logits)
-    _run_impl(logits, pre_idx, n_valid, indices, ws, values)
+        ws = _default_workspace(logits, locality_domain_id)
+    _run_impl(
+        logits,
+        pre_idx,
+        n_valid,
+        indices,
+        ws,
+        values,
+        num_sms=num_sms,
+        locality_domain_id=locality_domain_id,
+    )
 
 
 def run_ws(
@@ -1245,7 +1470,17 @@ def run_ws(
 
     Explicit-workspace form for multi-stream callers."""
     validate_run_ws(workspace, logits)
-    _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
+    num_sms, locality_domain_id = _execution_domain(logits.get_device())
+    _run_impl(
+        logits,
+        pre_idx,
+        n_valid,
+        indices,
+        kernel_view(workspace),
+        values,
+        num_sms=num_sms,
+        locality_domain_id=locality_domain_id,
+    )
 
 
 def run_varlen(
@@ -1287,6 +1522,10 @@ def run_varlen(
     implementation-specifically). Finite inputs — including +/-inf and
     denormals — are tie-aware exact.
 
+    ``workspace``, when supplied, must be zero-initialised before its first
+    launch and owned by this in-flight invocation; concurrent launches in the
+    same locality domain must not share it.
+
     CONTRACT: correct and dispatched for any ``num_rows``
     (BS 1..1024+ x next_n) and any envelope up to 1M kv tokens.  Family
     selection (streaming main / clustered register-resident) is a pure
@@ -1322,15 +1561,7 @@ def run_varlen(
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
-    if workspace is not None:
-        # multi-stream escape hatch (run_ws parity): concurrent varlen
-        # launches on one device must not share the SPLIT publish slab
-        validate_run_ws(workspace, logits)
-        ws = kernel_view(workspace)
-    else:
-        ws = _ws_hot.get(d)
-        if ws is None:
-            ws = default_workspace(logits)
+    num_sms, locality_domain_id = _execution_domain(d)
 
     # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
     # Full validation battery (the engine bypasses _run_impl — every
@@ -1395,14 +1626,27 @@ def run_varlen(
         # R increment (bounded plans, bounded _VARLEN_CACHE)
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
-    key = (num_rows, npad, k, n_env, nn, cr)
+    key = (num_rows, npad, k, n_env, nn, cr, num_sms, locality_domain_id)
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
             raise RuntimeError(
                 "varlen launcher not compiled for this shape — warm up before CUDA graph capture"
             )
-        lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
+        lc = _varlen_launcher(
+            num_rows,
+            npad,
+            k,
+            n_env,
+            nn,
+            cr,
+            num_sms=num_sms,
+            locality_domain_id=locality_domain_id,
+        )
+    # Resolve the launcher before touching a cold domain workspace. If a
+    # capture reaches this point, both the launcher and the default slab
+    # must already have been warmed in this exact execution domain.
+    ws = _workspace_for_varlen_launch(logits, workspace, locality_domain_id)
     idx = indices
     if idx.shape[1] != k:
         idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -1484,6 +1728,7 @@ def warmup_varlen(
 
     """
     dev = torch.cuda.current_device()
+    num_sms, locality_domain_id = _execution_domain(dev)
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
     req_rows = sorted({max(int(r) - int(r) % nn, nn) for r in num_rows_list})
@@ -1502,7 +1747,13 @@ def warmup_varlen(
     r = nn
     r_max = req_rows[-1]
     while r <= r_max:
-        plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
+        plan_free = route(
+            r,
+            max(min(n_env_c, npad_c), int(top_k) + 1),
+            npad_c,
+            int(top_k),
+            num_sms=num_sms,
+        )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
         elif plan_free["kernel"] in ("reg", "regimg"):
@@ -1514,6 +1765,7 @@ def warmup_varlen(
                 npad_c,
                 int(top_k),
                 force_main=True,
+                num_sms=num_sms,
             )
             ekey = ("main", tuple(p["tpl"][:6]), p["rt"]["R"])
         if ekey not in seen_keys:
@@ -1537,8 +1789,11 @@ def warmup_varlen(
         int(max_seq_len),
         int(compress_ratio),
         nn,
+        tuple(req_rows),
         tuple(rows_list),
         npad,
+        num_sms,
+        locality_domain_id,
     )
     with _VARLEN_WARMUP_LOCK:
         if key in _VARLEN_WARMUP_DONE:
@@ -1567,6 +1822,15 @@ def warmup_varlen(
     # CUDA-graph capture at any requested geometry finds its key immediately.
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
-        _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
+        _varlen_launcher(
+            r,
+            npad,
+            int(top_k),
+            n_env_l,
+            nn,
+            int(compress_ratio),
+            num_sms=num_sms,
+            locality_domain_id=locality_domain_id,
+        )
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)

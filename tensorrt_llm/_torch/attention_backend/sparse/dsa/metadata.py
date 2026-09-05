@@ -14,7 +14,10 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
@@ -31,7 +34,7 @@ from .indexer import (
     _pick_dsl_expand,
     _select_indexer_compress_ratio,
 )
-from .params import DSAMetadataParams, use_self_sampling_gvr
+from .params import DSAMetadataParams, is_gvr_cute_dsl_supported, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -218,12 +221,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             compress_ratio=self._indexer_compress_ratio,
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
             sm_version=get_sm_version(),
+            is_cute_dsl_rubin_available=IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+        )
+        gvr_cute_dsl_supported = is_gvr_cute_dsl_supported(
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            is_cute_dsl_rubin_available=IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+            sm_version=get_sm_version(),
+            use_self_sampling_topk=self.use_self_sampling_topk,
         )
         self.needs_gvr_prior = (
-            self.enable_gvr_topk
-            and IS_CUTLASS_DSL_AVAILABLE
-            and get_sm_version() in (100, 103)
-            and not self.use_self_sampling_topk
+            self.enable_gvr_topk and gvr_cute_dsl_supported and not self.use_self_sampling_topk
         )
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
@@ -410,7 +417,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         # same two-level dispatch and hardware gates as the indexer __init__:
         # never compile these kernels on unsupported stacks during warmup
-        if not IS_CUTLASS_DSL_AVAILABLE or get_sm_version() not in (100, 103):
+        if not is_gvr_cute_dsl_supported(
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            is_cute_dsl_rubin_available=IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+            sm_version=get_sm_version(),
+            use_self_sampling_topk=True,
+        ):
             return
         if not self.enable_gvr_topk or self.kv_cache_manager is None:
             return
