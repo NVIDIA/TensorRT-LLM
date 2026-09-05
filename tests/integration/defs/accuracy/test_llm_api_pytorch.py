@@ -51,7 +51,8 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length)
+                            LongBenchV1, LongBenchV2, assert_acceptance_length,
+                            compute_acceptance_length)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -103,23 +104,6 @@ def _latest_kv_cache_stats(llm):
     ]
     assert entries, "No kvCacheStats reported; is enable_iter_perf_stats set?"
     return entries[-1]
-
-
-def _compute_acceptance_length(llm) -> float:
-    """Mean acceptance length over speculative iterations.
-
-    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
-    """
-    stats = llm.get_stats(timeout=2)
-    spec_iters = [
-        stat['specDecodingStats'] for stat in stats
-        if stat.get('specDecodingStats')
-        and stat['specDecodingStats']['numDraftTokens'] > 0
-    ]
-    assert spec_iters, "No iterations with speculative decoding stats"
-    accepted = sum(s['numAcceptedTokens'] for s in spec_iters)
-    reqs = sum(s['numRequestsWithDraftTokens'] for s in spec_iters)
-    return (accepted + reqs) / reqs
 
 
 def _assert_non_greedy_cuda_graph_matches_eager(build_llm_kwargs,
@@ -500,7 +484,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -624,7 +608,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_pard acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_pard",
                                      acceptance_length)
@@ -758,7 +742,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_dflash",
@@ -825,7 +809,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_ngram acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_ngram",
@@ -860,7 +844,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_suffix_automaton enable_global_pool={enable_global_pool} "
                 f"acceptance_length = {acceptance_length:.3f}")
@@ -966,7 +950,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_draft_target_dynamic_draft_len "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -1613,7 +1597,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             if mtp_nextn > 0:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print(f"[AL] test_bfloat16 mtp_nextn={mtp_nextn} "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(
@@ -4254,7 +4238,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_gsm8k_dep8_megamoe_deepgemm "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -4641,107 +4625,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(10800)
-class TestKimiK3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K3"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(16)
-    # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only:
-    # on 2-node 180-190 GiB parts (B200/GB200, InfiniBand between nodes) the
-    # EP16 MoE-comm bring-up hangs and the KV-budget assumptions do not hold,
-    # so gate on GB300-class device memory. B300 clears this memory gate but
-    # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
-    # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
-    @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
-    def test_w4a16_mxfp4(self, mode: str,
-                         monkeypatch: pytest.MonkeyPatch) -> None:
-        """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
-
-        No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
-        multinode pipeline (qualified on 4x4 GB300 nodes). Each mode mirrors
-        the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
-        - keep them in sync when editing either. The `sa` leg additionally
-        records spec-dec acceptance: AL/AR lines in the eval log (via
-        TLLM_EVAL_SPEC_STATS) and an iteration-stats AL asserted against
-        references/acceptance_length.yaml.
-        """
-        kv_cache_kwargs = dict(
-            enable_block_reuse=False,
-            free_gpu_memory_fraction=0.25,
-            # tokens_per_block=64 keeps the MLA generation path on the
-            # flashinfer trtllm-gen kernel (K3 has 96 query heads).
-            tokens_per_block=64,
-        )
-        llm_kwargs = dict(
-            tensor_parallel_size=16,
-            moe_expert_parallel_size=16,
-            enable_attention_dp=True,
-            max_batch_size=32,
-            max_num_tokens=8192,
-            max_seq_len=8192,
-            trust_remote_code=True,
-            enable_chunked_prefill=True,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True,
-                                              max_batch_size=32),
-            moe_config=MoeConfig(max_num_tokens=33024,
-                                 use_low_precision_moe_combine=True),
-        )
-        if mode == "reuse":
-            kv_cache_kwargs["enable_block_reuse"] = True
-            # Hybrid models expose reusable prefixes only at KDA state
-            # snapshot boundaries; without a snapshot cadence, block reuse
-            # silently never engages.
-            kv_cache_kwargs["mamba_state_config"] = MambaStateConfig(
-                periodic_snapshot_interval=256)
-        elif mode == "sa":
-            llm_kwargs.update(
-                max_batch_size=8,
-                disable_overlap_scheduler=True,
-                enable_chunked_prefill=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-                speculative_config=SADecodingConfig(max_draft_len=2),
-                # AL capture needs per-iteration spec-decoding stats.
-                enable_iter_perf_stats=True,
-                max_stats_len=-1,
-            )
-            # Log corpus-aggregate AL and AR at eval end ("Spec-dec stats:"
-            # lines) — QA records acceptance from the test log (TRTLLM-15036).
-            monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=KvCacheConfig(**kv_cache_kwargs),
-                 **llm_kwargs) as llm:
-            # Reference-key contract: the K3 checkpoint carries its
-            # quantization as nested text_config.quantization_config
-            # (compressed-tensors MXFP4 experts), which the LLM-args layer
-            # does not surface — unlike modelopt-style hf_quant_config.json
-            # checkpoints — so the reference matcher sees quant_algo=None
-            # and the references/gsm8k.yaml entries carry no quant_algo key.
-            # If this fires, the args-level resolution changed: update the
-            # yaml keys together with this assert.
-            assert llm.args.quant_config.quant_algo is None
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            if mode == "sa":
-                acceptance_length = _compute_acceptance_length(llm)
-                print(f"[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
-                      f"acceptance_length = {acceptance_length:.3f}")
-                # ref_al/min_al live in references/acceptance_length.yaml.
-                # The reference was measured on the same workload but
-                # through the lm-eval-route estimator, whose weighting may
-                # not match this iteration-stats one exactly — so min_al is
-                # set as a loose acceptance-collapse tripwire rather than
-                # the populate-path default. Tighten both once this test's
-                # own runs establish a baseline.
-                assert_acceptance_length("TestKimiK3::test_w4a16_mxfp4",
-                                         acceptance_length)
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
@@ -4771,7 +4654,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle3 acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_4B::test_eagle3",
@@ -5006,7 +4889,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               apply_chat_template=True,
                               chat_template_kwargs={"enable_thinking": False},
                           ))
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
                   f"= {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_8B::test_dspark",
@@ -5999,7 +5882,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestGPTOSS::test_dflash",
@@ -6975,7 +6858,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_5_4B::test_dflash",
@@ -8312,7 +8195,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             if use_mtp:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print("[AL] test_nvfp4_4gpus_block_reuse "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(
