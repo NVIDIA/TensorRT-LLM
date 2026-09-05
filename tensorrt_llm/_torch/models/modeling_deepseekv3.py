@@ -1458,7 +1458,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 and hidden_states.is_contiguous() and residual.is_contiguous()
                 and not self.fusion_config.POST_MOE_FUSION
                 and spec_metadata is None
-                and self.next_layer_layernorm is not None
+                and self.next_layer_layernorm is not None and
+                self.next_layer_layernorm.weight.device == hidden_states.device
+                and self.next_layer_layernorm.weight.dtype == torch.bfloat16
+                and self.next_layer_layernorm.weight.shape == (7168, )
+                and self.next_layer_layernorm.weight.is_contiguous()
                 and self.next_layer_layernorm.nvfp4_scale is None
                 and not self.next_layer_layernorm.return_hp_output
                 and not self.next_layer_layernorm.use_gemma
