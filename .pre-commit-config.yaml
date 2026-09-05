@@ -1689,3 +1689,13 @@ repos:
         # the sampler source/test dirs.
         pass_filenames: false
         files: ^(tensorrt_llm/_torch/pyexecutor/sampler/|tests/unittest/_torch/sampler/)
+    -   id: copyright-header
+        name: NVIDIA copyright header check
+        # Inserts the header on new source files and bumps the copyright year
+        # on modified files (year check only applies to files with uncommitted
+        # changes, so --all-files runs on a clean checkout stay green).
+        # Pre-existing files without a header are grandfathered in
+        # scripts/copyright_header_baseline.txt.
+        entry: ./scripts/check_copyright_header.py --fix
+        language: script
+        files: \.(py|c|cc|cpp|cxx|h|hpp|cu|cuh)$

@@ -57,6 +57,34 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
   path_instructions:
+    - path: "**"
+      instructions: |
+        Copyright headers and copyright-year updates are enforced mechanically
+        by the `copyright-header` pre-commit hook
+        (scripts/check_copyright_header.py). If you notice a missing copyright
+        header or a stale copyright year, do NOT post a generic "add a
+        copyright header" comment. Instead:
+
+        1. Stay silent if the file is out of the hook's scope, i.e. any of:
+           - not a source file (only .py/.c/.cc/.cpp/.cxx/.h/.hpp/.cu/.cuh
+             are in scope) or an empty file;
+           - third-party/vendored/generated code matching a pattern in
+             scripts/copyright_header_excludes.txt (permanent exclusions —
+             these files must never get an NVIDIA header);
+           - a pre-existing file listed in
+             scripts/copyright_header_baseline.txt (grandfathered, pending
+             backfill);
+           - a file that already has a copyright header from a non-NVIDIA
+             author (DCO contributors keep their own copyright).
+
+        2. If a newly added in-scope source file has no copyright header at
+           all, or a modified in-scope file's NVIDIA copyright year was not
+           updated to the current year, the pre-commit hook evidently did not
+           run. Post ONE comment (not per-file) warning the author that their
+           pre-commit hooks appear not to be installed, and suggest:
+           `pip install pre-commit && pre-commit install`, then
+           `python3 scripts/check_copyright_header.py --fix --assume-modified
+           <files>` to repair the already-committed files.
     - path: "tests/**"
       instructions: |
         Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
