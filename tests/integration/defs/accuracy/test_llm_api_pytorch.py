@@ -50,8 +50,9 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_post_blackwell, skip_post_hopper, skip_pre_ada,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length)
+                            GSM8KInferenceMax, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
+                            assert_acceptance_length)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -9017,14 +9018,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa):
+    def test_nvfp4(self, use_msa, eval_mode):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
         # Triton path keeps the KV cache in BF16.
+        # eval_mode selects the accuracy protocol: "default" = completion-format
+        # MMLU + GSM8K; "inferencemax" = chat-format GSM8K matching the public
+        # InferenceMAX benchmark (needs a 16k context for thinking output).
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        inferencemax = eval_mode == "inferencemax"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
@@ -9032,16 +9038,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             implementation="msa" if use_msa else "triton",
             indexer_kv_dtype="fp8" if use_msa else "bf16")
         moe_config = MoeConfig(backend="CUTLASS")
+        # InferenceMAX evaluates a serving endpoint with client concurrency
+        # capped at 64 (EVAL_CONCURRENT_REQUESTS); match that batching regime.
+        batch_kwargs = {"max_batch_size": 64} if inferencemax else {}
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
-                 max_seq_len=4096,
+                 max_seq_len=16384 if inferencemax else 4096,
+                 **batch_kwargs,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
+            if inferencemax:
+                task = GSM8KInferenceMax(model_name)
+                task.evaluate(llm)
+            else:
+                task = MMLU(model_name)
+                task.evaluate(llm)
+                task = GSM8K(model_name)
+                task.evaluate(llm)
