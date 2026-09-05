@@ -552,3 +552,30 @@ def test_fused_indexer_topk_nospill_fp32_boundary_filtered(pattern, k_top, monke
     )
     torch.cuda.synchronize()
     _check_fp32_boundary(inp, indices, k_top)
+
+
+@skip_not_sm100
+def test_fused_indexer_topk_nospill_routing(monkeypatch):
+    # measured on B200 (148 SMs): clusters of 8/16 fit one wave only up to 64 CTAs, the
+    # GMEM split wins at every row length once 8 rows share the chip
+    if torch.cuda.get_device_properties(0).multi_processor_count != 148:
+        pytest.skip("routing table measured for 148 SMs")
+    monkeypatch.delenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", raising=False)
+    fused_indexer_topk_nospill._cfg.clear()
+    cases = {  # (batch, block-table width in 32-token pages) -> (cluster size, split)
+        (1, 256): (16, 0),
+        (4, 256): (16, 0),
+        (8, 256): (8, 0),
+        (8, 2048): (18, 1),
+        (16, 256): (9, 1),
+        (4, 2048): (16, 0),
+        (32, 256): (4, 0),
+        (64, 256): (2, 0),
+        (128, 256): (1, 0),
+        (1, 4096): (148, 1),
+        (4, 4096): (37, 1),
+        (32, 4096): (4, 0),
+    }
+    for (batch, maxb), (cs, gm) in cases.items():
+        key, _, _ = fused_indexer_topk_nospill._config(batch, maxb, 4096, 1024)
+        assert (key[6], key[12]) == (cs, gm), (batch, maxb, key[6], key[12])

@@ -1951,7 +1951,9 @@ def _config(B, MAXB, NPAGES, KTOP):
     # scores stay in each CTA's SMEM and the top-K is reduced through DSMEM.
     assert NCOMP % TOK == 0, f"block_table width {NCOMP} must be a multiple of {TOK}"
     CS = 1
-    while CS < 16 and (B * CS * 2) <= 148:
+    # cluster residency (measured): at most ~4 clusters of 16 or ~8 of 8 run in one wave,
+    # ~32 of 4 and ~64 of 2 do
+    while CS < 16 and (B * CS * 2) <= (64 if CS >= 4 else 128):
         CS *= 2
     while CS < 16 and (NCOMP // TOK + CS - 1) // CS > MAX_NLOC:
         CS *= 2
@@ -1963,10 +1965,11 @@ def _config(B, MAXB, NPAGES, KTOP):
     nsm = _sm_count()
     mode = os.environ.get("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "auto")
     S_gm = min(nsm // B, ntile) if 2 * B <= nsm else 1
-    # measured (real rows): the split pays only where the cluster path is GPC-capped or
-    # runs two waves, i.e. long rows at small batch; at >= 64 active SMs HBM is the limit
+    # measured (real rows): the split wins on long rows at any small batch, on rows of
+    # 512+ tiles once 8 rows share the chip and at 16+ rows regardless of length; 1-4 rows
+    # of up to 512 tiles and 8 rows of up to 256 tiles stay on one cluster each
     if S_gm >= 2 and mode != "0":
-        if mode == "1" or (ntile >= 1024 and S_gm >= 8):
+        if mode == "1" or (S_gm >= 8 and (ntile >= 1024 or (B >= 8 and ntile >= 512) or B >= 16)):
             GM = 1
             CS = S_gm
             NREP = 4 if CS >= 32 else (2 if CS >= 8 else 1)
