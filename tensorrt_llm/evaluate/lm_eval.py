@@ -818,6 +818,25 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         return results_text
 
 
+def _override_stop_strings(task_obj, stop_strings: List[str]) -> None:
+    """Replace a task's stop strings (``generation_kwargs["until"]``).
+
+    A task yaml's ``until`` list is otherwise unreachable from the CLI, and
+    some of its entries are few-shot delimiters rather than end-of-answer
+    markers: gsm8k stops on ``"Question:"``. A chat-templated 0-shot run of a
+    model that restates the question before answering then stops within the
+    first few generated tokens and scores zero, so the list has to be
+    overridable per run without editing the task yaml.
+
+    Other keys in ``generation_kwargs`` are preserved.
+    """
+    generation_kwargs = dict(task_obj.config.generation_kwargs or {})
+    generation_kwargs["until"] = list(stop_strings)
+    task_obj.set_config(key="generation_kwargs", value=generation_kwargs)
+    logger.info(
+        f"generation_kwargs['until'] overridden to {list(stop_strings)}")
+
+
 class LmEvalEvaluator(Evaluator):
 
     def __init__(self,
@@ -835,7 +854,8 @@ class LmEvalEvaluator(Evaluator):
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
                  preserve_caller_max_tokens: bool = False,
-                 num_fewshot: Optional[int] = None):
+                 num_fewshot: Optional[int] = None,
+                 stop_strings: Optional[List[str]] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -899,6 +919,9 @@ class LmEvalEvaluator(Evaluator):
                         task_obj.set_config(key="num_fewshot",
                                             value=num_fewshot)
                         logger.info(f"num_fewshot overridden to {num_fewshot}")
+                    # Caller override of the task yaml's stop strings.
+                    if stop_strings is not None:
+                        _override_stop_strings(task_obj, stop_strings)
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
@@ -1065,6 +1088,7 @@ class LmEvalEvaluator(Evaluator):
             apply_chat_template=kwargs.pop("apply_chat_template", False),
             fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn", False),
             num_fewshot=kwargs.pop("num_fewshot", None),
+            stop_strings=kwargs.pop("stop_strings", None),
             system_prompt=kwargs.pop("system_prompt", None),
             is_multimodal=kwargs.pop("is_multimodal", False),
             chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
@@ -1175,6 +1199,16 @@ class GSM8K(LmEvalEvaluator):
                   type=int,
                   default=None,
                   help="Random seed for generation sampling.")
+    @click.option(
+        "--stop_strings",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help='Replace the task yaml\'s stop strings, as a JSON list, e.g. '
+        '\'["</s>", "<|im_end|>"]\'. GSM8K\'s yaml stops on "Question:", a '
+        'few-shot delimiter; in a chat-templated 0-shot run a model that '
+        'restates the question before answering stops within the first few '
+        'tokens and scores zero.')
     @click.option("--log_samples",
                   is_flag=True,
                   default=False,

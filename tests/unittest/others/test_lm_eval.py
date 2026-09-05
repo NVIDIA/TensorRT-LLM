@@ -49,6 +49,7 @@ from tensorrt_llm.evaluate.lm_eval import (
     MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
     MultimodalLmEvalWrapper,
+    _override_stop_strings,
 )
 from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     is_equiv,
@@ -1772,3 +1773,74 @@ def test_k3_channel_extracting_to_nothing_falls_back_to_cascade():
     """
     out = _k3_output("Elimination shows the answer is (B).", "** **")
     assert extract_kimi_k3_mmmu_answer(out) == "B"
+
+
+# ===========================================================================
+# _override_stop_strings — CLI override of the task yaml's ``until`` list
+# ===========================================================================
+
+
+class _FakeTaskConfig:
+    """Minimal stand-in for lm-eval's ``TaskConfig``."""
+
+    def __init__(self, generation_kwargs):
+        self.generation_kwargs = generation_kwargs
+
+
+class _FakeTask:
+    """Minimal stand-in for lm-eval's ``ConfigurableTask``."""
+
+    def __init__(self, generation_kwargs=None):
+        self.config = _FakeTaskConfig(generation_kwargs)
+
+    def set_config(self, key, value):
+        setattr(self.config, key, value)
+
+
+def test_override_stop_strings_replaces_until():
+    """The yaml's ``until`` list is replaced, not appended to."""
+    task = _FakeTask({"until": ["Question:", "</s>"]})
+    _override_stop_strings(task, ["<|im_end|>"])
+    assert task.config.generation_kwargs["until"] == ["<|im_end|>"]
+
+
+def test_override_stop_strings_preserves_other_gen_kwargs():
+    """Only ``until`` changes; max_gen_toks / do_sample survive."""
+    task = _FakeTask({"until": ["Question:"], "max_gen_toks": 256, "do_sample": False})
+    _override_stop_strings(task, ["</s>"])
+    assert task.config.generation_kwargs == {
+        "until": ["</s>"],
+        "max_gen_toks": 256,
+        "do_sample": False,
+    }
+
+
+def test_override_stop_strings_on_task_without_generation_kwargs():
+    """A task yaml with no gen_kwargs at all still gets an ``until`` list."""
+    task = _FakeTask(None)
+    _override_stop_strings(task, ["</s>"])
+    assert task.config.generation_kwargs == {"until": ["</s>"]}
+
+
+def test_override_stop_strings_empty_list_disables_stopping():
+    """An explicit empty list is honored, i.e. generate to max_gen_toks."""
+    task = _FakeTask({"until": ["Question:"]})
+    _override_stop_strings(task, [])
+    assert task.config.generation_kwargs["until"] == []
+
+
+def test_override_stop_strings_does_not_alias_caller_list():
+    """The stored list is a copy; later caller mutation must not leak in."""
+    stop_strings = ["</s>"]
+    task = _FakeTask({"until": ["Question:"]})
+    _override_stop_strings(task, stop_strings)
+    stop_strings.append("<|im_end|>")
+    assert task.config.generation_kwargs["until"] == ["</s>"]
+
+
+def test_override_stop_strings_does_not_mutate_original_gen_kwargs():
+    """The task's original gen_kwargs dict object is left untouched."""
+    original = {"until": ["Question:"], "max_gen_toks": 256}
+    task = _FakeTask(original)
+    _override_stop_strings(task, ["</s>"])
+    assert original == {"until": ["Question:"], "max_gen_toks": 256}
