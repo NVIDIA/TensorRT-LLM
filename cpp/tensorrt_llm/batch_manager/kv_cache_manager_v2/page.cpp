@@ -41,16 +41,20 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
 
 Page::~Page()
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
-        "Page destroyed while still held or scheduled for eviction");
-    if (hasValidSlot())
-    {
-        Slot s;
-        s.setSlotId(slotId());
-        s.readyEvent = std::move(readyEvent);
-        resetSlot();
-        manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
-    }
+    KVCM2_ABORT_ON_EXCEPT(
+        [this]()
+        {
+            TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
+                "Page destroyed while still held or scheduled for eviction");
+            if (hasValidSlot())
+            {
+                Slot s;
+                s.setSlotId(slotId());
+                s.readyEvent = std::move(readyEvent);
+                resetSlot();
+                manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
+            }
+        });
 }
 
 PageStatus Page::status() const noexcept
@@ -112,14 +116,18 @@ CommittedPage::~CommittedPage()
         // the block pointer first. Pass `this` as the expected page: if a newer
         // page already replaced us in the slot (e.g. a larger SSM snapshot), the
         // slot is left alone and prev is nullptr — skip stale-block cleanup then.
-        Block* blk = block;
-        auto* prev = blk->unlinkPage(lifeCycle, this);
-        if (prev != nullptr)
-        {
-            TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
-            LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-            Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
-        }
+        KVCM2_ABORT_ON_EXCEPT(
+            [this]()
+            {
+                Block* blk = block;
+                auto* prev = blk->unlinkPage(lifeCycle, this);
+                if (prev != nullptr)
+                {
+                    TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
+                    LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
+                    Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
+                }
+            });
     }
     // Delegate slot release to Page::~Page().
 }
@@ -159,7 +167,7 @@ UncommittedPage::~UncommittedPage()
                 pageOk
                     = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
             }
-            TLLM_CHECK_WITH_INFO(
+            KVCM2_CHECK_FATAL_WITH_INFO(
                 blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
@@ -206,30 +214,34 @@ PageHolder::PageHolder(SharedPtr<Page> p)
 
 PageHolder::~PageHolder()
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
+    KVCM2_ABORT_ON_EXCEPT(
+        [this]()
+        {
+            TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
 
-    page->holder.reset(); // clear back-reference
-    auto const manager = page->manager;
+            page->holder.reset(); // clear back-reference
+            auto const manager = page->manager;
 
-    // If it's a committed page, schedule for eviction (if evictable).
-    if (page->isCommitted())
-    {
-        if (!page->scheduledForEviction())
-            manager->scheduleForEviction(*page);
+            // If it's a committed page, schedule for eviction (if evictable).
+            if (page->isCommitted())
+            {
+                if (!page->scheduledForEviction())
+                    manager->scheduleForEviction(*page);
 
-        // A page that no longer sits in its block's slot (orphaned block, or replaced by a
-        // page with a larger recorded token count) is unreachable for reuse, so keeping it
-        // in the eviction LRU would just pin a slot until memory pressure hits.
-        auto* cp = static_cast<CommittedPage*>(page.get());
-        if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
-            manager->excludeFromEviction(*page);
-    }
-    else
-    {
-        // Uncommitted page: if scheduled for eviction, remove it.
-        if (page->scheduledForEviction())
-            manager->excludeFromEviction(*page);
-    }
+                // A page that no longer sits in its block's slot (orphaned block, or replaced by a
+                // page with a larger recorded token count) is unreachable for reuse, so keeping it
+                // in the eviction LRU would just pin a slot until memory pressure hits.
+                auto* cp = static_cast<CommittedPage*>(page.get());
+                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+                    manager->excludeFromEviction(*page);
+            }
+            else
+            {
+                // Uncommitted page: if scheduled for eviction, remove it.
+                if (page->scheduledForEviction())
+                    manager->excludeFromEviction(*page);
+            }
+        });
 }
 
 SharedPageLock PageHolder::lock(
@@ -268,29 +280,33 @@ UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
 
 UniqPageLock::~UniqPageLock()
 {
-    Page& p = *page();
-    TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
-    // Set readyEvent to the merged finish events of all readers. For committed (read-only)
-    // pages, this means the next reader will wait for prior reads to complete, which is
-    // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
-    p.readyEvent = mergeEvents(finishEvents);
+    KVCM2_ABORT_ON_EXCEPT(
+        [this]
+        {
+            Page& p = *page();
+            TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+            // Set readyEvent to the merged finish events of all readers. For committed (read-only)
+            // pages, this means the next reader will wait for prior reads to complete, which is
+            // unnecessary but correct. See the CommittedPage comment in page.h for rationale.
+            p.readyEvent = mergeEvents(finishEvents);
 
-    // Clear the holder's lock reference.
-    TLLM_CHECK_DEBUG(holder);
-    holder->uniqLock.reset();
+            // Clear the holder's lock reference.
+            TLLM_CHECK_DEBUG(holder);
+            holder->uniqLock.reset();
 
-    // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
-    auto holderCopy = std::move(holder);
-    holder = nullptr;
+            // Optimized path (mirrors Python): set holder=nullptr, then check if still evictable.
+            auto holderCopy = std::move(holder);
+            holder = nullptr;
 
-    // If the page is not droppable (still held by someone else) and evictable,
-    // schedule for eviction.
-    if (p.status() != PageStatus::DROPPABLE)
-    {
-        auto const manager = p.manager;
-        if (manager->isEvictable(p))
-            manager->scheduleForEviction(p);
-    }
+            // If the page is not droppable (still held by someone else) and evictable,
+            // schedule for eviction.
+            if (p.status() != PageStatus::DROPPABLE)
+            {
+                auto const manager = p.manager;
+                if (manager->isEvictable(p))
+                    manager->scheduleForEviction(p);
+            }
+        });
 }
 
 void UniqPageLock::notifyFinish(CachedCudaEvent event)
@@ -335,7 +351,7 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
 SharedPageLock::~SharedPageLock()
 {
     if (mUniqLock)
-        unlock();
+        KVCM2_ABORT_ON_EXCEPT([this]() { unlock(); });
 }
 
 SharedPageLock::SharedPageLock(SharedPageLock&& other) noexcept
@@ -485,13 +501,7 @@ ScratchSlotLock::~ScratchSlotLock()
 {
     if (mSlot.hasValidSlot())
     {
-        try
-        {
-            unlock();
-        }
-        catch (...)
-        {
-        }
+        KVCM2_ABORT_ON_EXCEPT([this]() { unlock(); });
     }
 }
 

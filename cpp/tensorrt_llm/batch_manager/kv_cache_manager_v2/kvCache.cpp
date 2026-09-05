@@ -111,19 +111,16 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
 KvCache::~KvCache()
 {
-    try
-    {
-        // close() takes the exclusive API lock. When Python drops the last reference nanobind runs
-        // this from tp_dealloc with the GIL held, which deadlocks against a lock holder waiting on
-        // the GIL to run a Python callback. Drop the GIL first if we happen to hold it.
-        OptionalGilRelease const gilRelease;
-        close();
-    }
-    catch (...)
-    {
-        // Destructors must not propagate exceptions (implicitly noexcept in C++11).
-        // close() should not throw in normal usage; if it does, suppress and accept leak.
-    }
+    KVCM2_ABORT_ON_EXCEPT(
+        [this]()
+        {
+            // close() takes the exclusive API lock. When Python drops the last reference nanobind
+            // runs this from tp_dealloc with the GIL held, which deadlocks against a lock holder
+            // waiting on the GIL to run a Python callback. Drop the GIL first if we happen to
+            // hold it.
+            OptionalGilRelease const gilRelease;
+            close();
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1897,17 +1894,15 @@ PlannedDropHandle::~PlannedDropHandle()
     if (mPageRefs.has_value())
     {
         // Mirror Python's __del__: apply the plan if not already dropped.
-        // Destructors must not throw; swallow any error.
-        try
-        {
-            // drop() takes the exclusive API lock. The explicit drop() binding releases the GIL,
-            // but this path runs from tp_dealloc/GC with the GIL held, so release it here too.
-            OptionalGilRelease const gilRelease;
-            drop();
-        }
-        catch (...)
-        {
-        }
+        KVCM2_ABORT_ON_EXCEPT(
+            [this]()
+            {
+                // drop() takes the exclusive API lock. The explicit drop() binding releases the
+                // GIL, but this path runs from tp_dealloc/GC with the GIL held, so release it
+                // here too.
+                OptionalGilRelease const gilRelease;
+                drop();
+            });
     }
 }
 

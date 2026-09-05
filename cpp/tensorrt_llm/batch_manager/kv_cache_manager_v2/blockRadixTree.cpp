@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -365,12 +366,12 @@ void Block::releasePages()
 
 Block::~Block()
 {
-    releasePages();
+    KVCM2_ABORT_ON_EXCEPT([this]() { releasePages(); });
 }
 
 bool Block::isOrphan() const noexcept
 {
-    TLLM_CHECK_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
+    KVCM2_CHECK_FATAL_DEBUG(prev == nullptr || (prev->next.count(key) == 1 && prev->next.at(key).get() == this));
     return prev == nullptr;
 }
 

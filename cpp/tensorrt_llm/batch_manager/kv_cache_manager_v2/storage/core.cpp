@@ -52,13 +52,13 @@ SlotAllocator::~SlotAllocator()
     // Mirrors Python SlotAllocator.__del__ (assert_critical checks).
     if (TLLM_UNLIKELY(gDebug))
     {
-        TLLM_CHECK_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
+        KVCM2_CHECK_FATAL_WITH_INFO(slotCountToSizeT(mNumReadyRecycledSlots) == mRecycledSlots.size(),
             "SlotAllocator destroyed with unfinished events — did you call synchronize()?");
-        TLLM_CHECK_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
+        KVCM2_CHECK_FATAL_WITH_INFO(mTargetCapacity == mCapacity && mOverflowSlots.empty(),
             "SlotAllocator destroyed while resize is in progress");
-        TLLM_CHECK_WITH_INFO(
+        KVCM2_CHECK_FATAL_WITH_INFO(
             mOccupiedMask.numSetBits() == 0, "SlotAllocator destroyed with occupied slots still in use");
-        TLLM_CHECK_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
+        KVCM2_CHECK_FATAL_WITH_INFO(mRecycledSlots.size() == slotCountToSizeT(mNumActiveSlots),
             "SlotAllocator destroyed with some slots not recycled");
     }
 }
@@ -463,7 +463,7 @@ SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 
 PoolGroupBase::~PoolGroupBase()
 {
-    destroy();
+    KVCM2_ABORT_ON_EXCEPT([this]() { destroy(); });
 }
 
 SlotCount PoolGroupBase::numSlots() const noexcept

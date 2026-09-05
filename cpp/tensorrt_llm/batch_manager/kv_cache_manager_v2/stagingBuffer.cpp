@@ -157,8 +157,8 @@ StagingBufferManager::StagingBufferManager(size_t size, StagingBufferMemory memo
 
 StagingBufferManager::~StagingBufferManager() noexcept
 {
-    terminateOnException("Failed to destroy staging-buffer manager safely",
-        [&]()
+    KVCM2_LOG_ON_EXCEPT(
+        [&]
         {
             std::vector<CachedCudaEvent*> readyEvents;
             readyEvents.reserve(mRanges.size());

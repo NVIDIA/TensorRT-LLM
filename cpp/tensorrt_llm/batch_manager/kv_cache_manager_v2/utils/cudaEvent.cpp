@@ -74,7 +74,7 @@ CachedCudaEvent CachedCudaEvent::makeNull() noexcept
 
 CachedCudaEvent::CachedCudaEvent(CudaStream stream) noexcept
 {
-    terminateOnException("Failed to create or record a cached CUDA event",
+    KVCM2_ABORT_ON_EXCEPT(
         [&]()
         {
             mEvent = std::make_shared<PooledEvent>(CudaEventPool::instance().get());
