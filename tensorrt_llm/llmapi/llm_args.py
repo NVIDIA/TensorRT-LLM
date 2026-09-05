@@ -6134,7 +6134,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 "support pipeline parallelism. The PP executor's pipelined "
                 "microbatches do not provide the single-iteration host-input "
                 "lifetime boundary required by ragged verification staging. "
-                "Set pipeline_parallel_size=1 or disable confidence scheduling.")
+                "Set pipeline_parallel_size=1 or disable confidence scheduling."
+            )
         if self.guided_decoding_backend is not None:
             raise ValueError(
                 "speculative_config.enable_confidence_scheduling=True does not yet "

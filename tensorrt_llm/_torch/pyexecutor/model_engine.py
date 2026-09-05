@@ -3850,8 +3850,7 @@ class PyTorchModelEngine(ModelEngine):
         ragged_metadata_kwargs = {}
         if hasattr(metadata_cls, "enable_ragged_verification"):
             ragged_metadata_kwargs["enable_ragged_verification"] = (
-                self._dspark_confidence_enabled and not self.is_draft_model
-            )
+                self._dspark_confidence_enabled and not self.is_draft_model)
 
         if kv_cache_manager is None:
             # Cache the no-cache metadata.

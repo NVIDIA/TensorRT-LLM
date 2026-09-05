@@ -3643,11 +3643,8 @@ class PyExecutor:
             1 if planner.max_verify_len in getattr(
                 runner, "secondary_padding_dummy_requests", {}) else 0,
         ])
-        payloads = (
-            self.dist.tp_allgather_int64(local_payload).tolist()
-            if is_distributed
-            else [local_payload]
-        )
+        payloads = (self.dist.tp_allgather_int64(local_payload).tolist()
+                    if is_distributed else [local_payload])
 
         exact_payload_end = _DSPARK_EXACT_WIRE_PREFIX_LEN + len(exact_cells)
         expected_payload_len = exact_payload_end + _DSPARK_ADP_WIRE_TRAILER_LEN
