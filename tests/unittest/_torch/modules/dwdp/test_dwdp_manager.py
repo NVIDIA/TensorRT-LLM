@@ -88,6 +88,20 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     # Construction
     # ------------------------------------------------------------------
 
+    def test_init_rejects_existing_singleton_before_creating_comm(
+        self, mock_comm_world, _rank, _setup
+    ):
+        set_global_dwdp_manager(MagicMock())
+
+        with self.assertRaisesRegex(RuntimeError, "already registered globally"):
+            DwdpManager(
+                config=_make_config(),
+                dist=MagicMock(spec=MPIDist),
+                mapping=_make_mapping(),
+            )
+
+        mock_comm_world.Create_group.assert_not_called()
+
     def test_init_stores_fields(self, mock_comm_world, _rank, _setup):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
@@ -198,6 +212,53 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         mgr.cleanup()
         sub_comm.Free.assert_called_once()  # still only one Free
 
+    def test_exit_clears_global_even_when_cleanup_fails(self, mock_comm_world, _rank, _setup):
+        _configure_mock_comm_world(mock_comm_world)
+        mgr = DwdpManager(
+            config=_make_config(),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(),
+        )
+        mgr.__enter__()
+
+        with patch.object(mgr, "cleanup", side_effect=RuntimeError("cleanup failed")):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                mgr.__exit__(None, None, None)
+
+        self.assertIsNone(get_global_dwdp_manager())
+
+    def test_cleanup_frees_comm_when_weight_release_fails(self, mock_comm_world, _rank, _setup):
+        sub_comm = _configure_mock_comm_world(mock_comm_world)
+        mgr = DwdpManager(
+            config=_make_config(),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(),
+        )
+        mgr._weight_manager = MagicMock()
+        mgr._weight_manager.release.side_effect = RuntimeError("release failed")
+
+        with self.assertRaisesRegex(RuntimeError, "release failed"):
+            mgr.cleanup()
+
+        sub_comm.Free.assert_called_once_with()
+        self.assertIsNone(mgr.dwdp_group)
+
+    def test_cleanup_releases_weight_manager_once(self, mock_comm_world, _rank, _setup):
+        sub_comm = _configure_mock_comm_world(mock_comm_world)
+        mgr = DwdpManager(
+            config=_make_config(),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(),
+        )
+        weight_manager = MagicMock()
+        mgr._weight_manager = weight_manager
+
+        mgr.cleanup()
+        mgr.cleanup()
+
+        weight_manager.release.assert_called_once_with()
+        sub_comm.Free.assert_called_once_with()
+
     # ------------------------------------------------------------------
     # add_layer (SSOT)
     # ------------------------------------------------------------------
@@ -304,14 +365,14 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             ],
         )
 
-    def test_record_compute_and_prefetch_next_schedules_next(
+    def test_record_compute_and_prefetch_next_schedules_next_next(
         self, mock_comm_world, _rank, mock_setup
     ):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
         mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
-        fake_wm.next_moe_layer.return_value = 9
+        fake_wm.next_moe_layer.side_effect = lambda layer_idx: {7: 9, 9: 11}.get(layer_idx)
         mock_setup.return_value = fake_wm
         mgr = DwdpManager(
             config=_make_config(),
@@ -325,8 +386,12 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mgr.setup(MagicMock())
 
         mgr.record_compute_and_prefetch_next(7)
-        fake_wm.next_moe_layer.assert_called_once_with(7)
-        fake_wm.prefetch_layer.assert_called_once_with(9)
+        fake_wm.record_compute.assert_called_once_with(7)
+        self.assertEqual(
+            fake_wm.next_moe_layer.call_args_list,
+            [unittest.mock.call(7), unittest.mock.call(9)],
+        )
+        fake_wm.prefetch_layer.assert_called_once_with(11)
 
     def test_record_compute_and_prefetch_next_last_layer_is_noop(
         self, mock_comm_world, _rank, mock_setup
@@ -349,7 +414,46 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             mgr.setup(MagicMock())
 
         mgr.record_compute_and_prefetch_next(60)
+        fake_wm.record_compute.assert_called_once_with(60)
         fake_wm.prefetch_layer.assert_not_called()
+
+    def test_prefetch_pipeline_schedules_each_layer_once(self, mock_comm_world, _rank, mock_setup):
+        mock_comm_world.Create_group.return_value = MagicMock()
+        mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
+        fake_wm = MagicMock()
+        fake_wm.first_moe_layer.return_value = 3
+        fake_wm.next_moe_layer.side_effect = lambda layer_idx: {
+            3: 5,
+            5: 7,
+            7: 9,
+            9: None,
+        }.get(layer_idx)
+        mock_setup.return_value = fake_wm
+        mgr = DwdpManager(
+            config=_make_config(),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(),
+        )
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.dwdp.torch.cuda.current_device",
+            return_value=0,
+        ):
+            mgr.setup(MagicMock())
+
+        mgr.prefetch_first_layers()
+        for layer_idx in (3, 5, 7, 9):
+            mgr.record_compute_and_prefetch_next(layer_idx)
+
+        self.assertEqual(
+            fake_wm.prefetch_layer.call_args_list,
+            [
+                unittest.mock.call(3),
+                unittest.mock.call(5),
+                unittest.mock.call(7),
+                unittest.mock.call(9),
+            ],
+        )
 
     def test_wait_and_bind_forwards(self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()

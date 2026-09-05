@@ -88,6 +88,7 @@ class DWDPWeightManager:
         "_transport",
         "_use_batched_prefetch",
         "_batched_copy_plans",
+        "_released",
     )
 
     def __init__(
@@ -166,6 +167,7 @@ class DWDPWeightManager:
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
         self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
         self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        self._transport = None
 
         # Initialize consume_events as "already signaled" so the first prefetch
         # does not stall. We record them on the current (default) stream, which
@@ -181,6 +183,7 @@ class DWDPWeightManager:
         # every prefetch.
         self._use_batched_prefetch = contention_opt
         self._batched_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
+        self._released = False
 
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
@@ -446,33 +449,11 @@ class DWDPWeightManager:
             1. Wait for prefetch_events[buf_idx] (RAW — copy must finish before read).
             2. Bind each weight's full tensor (local zero-copy + remote P2P data)
                as the param.data of the backend module's corresponding attribute.
-            3. Record consume_events[other_buf] (WAR signal for the OTHER buffer
-               slot, telling copy_stream it is safe to overwrite that slot).
 
-        The WAR event is recorded for the OTHER buffer slot because by the time
-        this forward pass completes, the copy_stream may already be writing to
-        the alternate slot for the next-next layer's prefetch.
-
-        Design rationale — implicit compute-done signal via stream in-order semantics:
-            The IPC-era predecessor of this code carried per-layer compute_events
-            (O(N_moe), ~116 events for DSv3 with 58 MoE layers and ping-pong slots)
-            to signal "kernel(L) finished, slot is reusable". This implementation
-            replaces them with per-slot consume_events recorded inside this very
-            method (4 events total, independent of N_moe).
-
-            The simplification relies on CUDA stream in-order semantics: an event
-            recorded on a stream fires only after every prior enqueue on that
-            stream has completed. Because step 3 above (record consume_events[
-            other_buf]) is enqueued on compute_stream AFTER step 2's binding —
-            which is in turn ordered before the next kernel(L) launch on the same
-            stream — the consume event for slot S cannot fire until every kernel
-            that read slot S has finished. This gives the same WAR ordering as
-            an explicit per-layer compute_event would, with O(1) bookkeeping.
-
-            Implication for future work: if num_buffers ever grows beyond 2 (e.g.
-            to support cross-node prefetch with deeper pipelines), per-slot events
-            may need to become per-slot event LISTS, and the "next kernel is
-            enqueued on the same stream" invariant must be preserved.
+        The matching WAR signal is deliberately recorded by ``record_compute``
+        after the MoE kernel has been enqueued. Recording it here would place the
+        event before the kernel on the compute stream and could let the copy
+        stream overwrite a slot while that kernel is still reading it.
 
         Args:
             backend_module: The MoE backend module whose weight parameters will
@@ -490,8 +471,6 @@ class DWDPWeightManager:
             )
 
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        other_buf = 1 - buf_idx
-
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )
@@ -508,12 +487,52 @@ class DWDPWeightManager:
             param = getattr(backend_module, name)
             param.data = full_tensor
 
-        # WAR signal for the OTHER buffer slot: after this forward pass
-        # finishes consuming the current slot, the copy_stream is free to
-        # overwrite the other slot for the next-next layer's prefetch.
-        self._consume_events[other_buf].record(compute_stream)
+        logger.debug(f"[DWDPWeightManager] Bound weights: layer={layer_idx}, buf_slot={buf_idx}")
 
-        logger.debug(
-            f"[DWDPWeightManager] Bound weights: layer={layer_idx}, "
-            f"buf_slot={buf_idx}, signal_consume_slot={other_buf}"
+    def record_compute(self, layer_idx: int) -> None:
+        """Record that the current layer has finished consuming its buffer slot.
+
+        This method must be called after the layer's MoE kernel is enqueued on
+        the current compute stream. CUDA stream ordering then guarantees that
+        the consume event cannot complete until the kernel has stopped reading
+        the slot. The copy stream waits on this event before reusing the slot
+        for the layer two positions ahead in the MoE sequence.
+
+        Args:
+            layer_idx: MoE layer whose compute was just enqueued.
+        """
+        if layer_idx not in self._moe_layer_set:
+            raise KeyError(
+                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
+            )
+
+        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        compute_stream = torch.cuda.current_stream(
+            torch.device("cuda", self._weight_buffer.device_id)
         )
+        self._consume_events[buf_idx].record(compute_stream)
+        logger.debug(f"[DWDPWeightManager] Compute recorded: layer={layer_idx}, buf_slot={buf_idx}")
+
+    def release(self) -> None:
+        """Synchronize outstanding work and release all owned VMM resources."""
+        if self._released:
+            return
+
+        # Teardown is outside the inference hot path. A device synchronization
+        # makes both compute and copy-stream users of the composite VA quiescent
+        # before unmapping it.
+        torch.cuda.synchronize(self._weight_buffer.device_id)
+        self._peer_views.clear()
+        self._weight_buffer.release()
+        if self._transport is not None:
+            self._transport.release()
+            self._transport = None
+        self._batched_copy_plans.clear()
+        self._released = True
+
+    def __del__(self) -> None:
+        """Best-effort fallback for callers that miss explicit teardown."""
+        try:
+            self.release()
+        except Exception as exc:
+            logger.debug(f"[DWDPWeightManager] __del__ release failed: {exc!r}")

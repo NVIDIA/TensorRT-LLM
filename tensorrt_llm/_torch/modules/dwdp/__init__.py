@@ -30,7 +30,7 @@ Key design principles:
 """
 
 from .page_pool import PagePool, compute_slot_sizes
-from .setup import setup_dwdp
+from .setup import setup_dwdp, teardown_dwdp
 from .specs import (
     EdgeInfo,
     LayerWeightSpecs,
@@ -83,4 +83,5 @@ __all__ = [
     "DWDPWeightManager",
     # Setup orchestration
     "setup_dwdp",
+    "teardown_dwdp",
 ]
