@@ -71,6 +71,7 @@ from ..logger import logger
 from ..mapping import CpType, Mapping
 from ..models.modeling_utils import QuantAlgo, QuantConfig
 from ..sampling_params import BatchedLogitsProcessor
+from ..tokenizer import TOKENIZER_ALIASES  # also exported from here
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
 from .tokenizer import TokenizerBase, tokenizer_factory
@@ -1608,13 +1609,6 @@ class MoeConfig(StrictBaseModel):
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
-
-# Short aliases for built-in custom tokenizers.
-# Maps alias → full import path (module.ClassName).
-TOKENIZER_ALIASES = {
-    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
-}
 
 
 class Nvfp4GemmConfig(StrictBaseModel):
