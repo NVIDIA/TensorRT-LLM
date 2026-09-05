@@ -86,7 +86,7 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
 ```
 
 ```bash
-pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
+pip3 install --ignore-installed pip "setuptools<80" wheel && pip3 install tensorrt_llm
 ```
 
 #### Install a nightly release
@@ -150,7 +150,7 @@ There are some known limitations when you pip install the pre-built TensorRT LLM
    ```bash
    CURRENT_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
    echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
-   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
+   pip3 install --ignore-installed pip "setuptools<80" wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
    ```
 
 ## Option 3: Build from Source
