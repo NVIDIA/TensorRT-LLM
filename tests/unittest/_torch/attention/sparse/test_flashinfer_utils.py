@@ -8,23 +8,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.fmha import flashinfer_sparse_mla
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.fmha import flashinfer_sparse_mla
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     AttentionMetadata,
     MLAParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse import dsa_flashinfer, inline_scale_kv
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
+from tensorrt_llm._torch.attention.backends.sparse import dsa_flashinfer, inline_scale_kv
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-from tensorrt_llm._torch.attention_backend.sparse.flashinfer_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention.backends.sparse.flashinfer_utils import (
     allocate_sparse_mla_split_workspace,
 )
-from tensorrt_llm._torch.attention_backend.sparse.params import SparseRuntimeParams
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
@@ -61,7 +61,7 @@ def test_sm120_sm121_sparse_mla_requires_packed_cache_dtype(
 ) -> None:
     with (
         patch(
-            "tensorrt_llm._torch.attention_backend.trtllm.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
             return_value=sm,
         ),
         pytest.raises(

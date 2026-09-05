@@ -102,9 +102,9 @@ Mappings most often missed by adapters:
 | Concern | Module | Non-obvious wiring |
 |---------|--------|--------------------|
 | Linear | `_torch.modules.linear.Linear` | Pass `mapping=model_config.mapping`, `tensor_parallel_mode=TensorParallelMode.{COLUMN,ROW,NONE}`, `allreduce_strategy=model_config.allreduce_strategy`. Every quant scheme (FP8 / NVFP4 / W4A8 / AWQ / weight-only) is automatic — never substitute `nn.Linear`. |
-| Attention (text **and** vision) | `_torch.modules.attention.Attention` (variants: `qk_norm_attention.QKNormRoPEAttention` for QK-norm + YARN; `attention.MLA` for DeepSeek-style) | Same module runs the LLM and the multimodal encoder. For the encoder side, build an ad-hoc `attn_metadata` per forward and pass `predefined_attention_mask=PredefinedAttentionMask.FULL` (or windowed). Reference: `Qwen2_5_VLVisionAttention.prepare_attn_metadata`. |
+| Attention (text **and** vision) | `_torch.attention.attention.Attention` (variants: `qk_norm_attention.QKNormRoPEAttention` for QK-norm + YARN; `mla.MLA` for DeepSeek-style) | Same module runs the LLM and the multimodal encoder. For the encoder side, build an ad-hoc `attn_metadata` per forward and pass `predefined_attention_mask=PredefinedAttentionMask.FULL` (or windowed). Reference: `Qwen2_5_VisionModel.prepare_attn_metadata`. |
 | MLP / Gated MLP | `_torch.modules.mlp.MLP`, `_torch.modules.gated_mlp.GatedMLP`, `_torch.modules.swiglu.swiglu` | `GatedMLP` covers the SwiGLU pattern (gate + up + silu + down) with fused gate/up weights — don't roll it from two `Linear`s and `F.silu`. Plain `MLP` for non-gated cases. Both inherit the same TP / quant story as `Linear`. Reference: `Qwen2_5_VLMLP`. |
-| RoPE | `_torch.modules.rotary_embedding.{RotaryEmbedding, MRotaryEmbedding}` | `MRotaryEmbedding` (mRoPE) is for the **LLM** side of mRoPE-using VLMs (Qwen-VL family), with `mrope_section`-aware cos/sin slicing and 3D `position_ids`. The encoder's internal 2D RoPE uses plain `RotaryEmbedding`. |
+| RoPE | `_torch.attention.rotary_embedding.{RotaryEmbedding, MRotaryEmbedding}` | `MRotaryEmbedding` (mRoPE) is for the **LLM** side of mRoPE-using VLMs (Qwen-VL family), with `mrope_section`-aware cos/sin slicing and 3D `position_ids`. The encoder's internal 2D RoPE uses plain `RotaryEmbedding`. |
 
 ### LLM backbone — reuse via AutoModel
 
@@ -212,7 +212,7 @@ Create `tensorrt_llm/_torch/models/modeling_{name}.py`. The default pattern belo
 
 ```python
 class {Name}VisionModel(nn.Module):
-    """Multimodal encoder. Composes _torch.modules.{Attention,Linear,RMSNorm,GatedMLP,RotaryEmbedding}."""
+    """Multimodal encoder. Composes _torch.attention.{attention.Attention, rotary_embedding.RotaryEmbedding} and _torch.modules.{linear.Linear, rms_norm.RMSNorm, gated_mlp.GatedMLP}."""
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         # Concat pixel_values across all requests, build per-image attn_metadata

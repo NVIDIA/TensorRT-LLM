@@ -104,7 +104,7 @@ DOMAIN_PRIMING = """\
   implementation reference. Verify whether cited TensorRT-LLM classes/functions are
   real definitions, wrappers, import aliases, or bindings before relying on them.
 - For attention work, read
-  `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` and reason across
+  `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` and reason across
   module, backend, runtime contract, and KV-cache semantics.
 - For MoE work, read
   `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason

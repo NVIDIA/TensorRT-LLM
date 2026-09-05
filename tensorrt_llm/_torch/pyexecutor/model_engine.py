@@ -46,11 +46,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..attention_backend.interface import (AttentionMetadata,
-                                           AttentionRuntimeFeatures)
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
-from ..attention_backend.utils import get_attention_backend
-from ..attention_backend.vanilla import VanillaAttentionMetadata
+from ..attention.backends.interface import (AttentionMetadata,
+                                            AttentionRuntimeFeatures)
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.utils import get_attention_backend
+from ..attention.backends.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
@@ -1566,7 +1566,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+            from tensorrt_llm._torch.attention.backends.sparse.dsa import (
                 _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
         except ImportError:
             return
@@ -1638,7 +1638,7 @@ class PyTorchModelEngine(ModelEngine):
         No-op on non-DSA models. See nvbugs/6482566.
         """
         try:
-            from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+            from ..attention.backends.sparse.deepseek_v4.deepseek_v4 import \
                 DeepseekV4Indexer
         except ImportError:
             return
@@ -1691,7 +1691,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from ..attention_backend.sparse.dsa import \
+            from ..attention.backends.sparse.dsa import \
                 DSAtrtllmAttentionMetadata
         except ImportError:
             return

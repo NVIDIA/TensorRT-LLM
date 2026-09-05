@@ -5,8 +5,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import _INIT_SCORE, _LOCAL_SCORE
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    _INIT_SCORE,
+    _LOCAL_SCORE,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
     select_blocks_from_maxscore,
 )
 
@@ -191,7 +194,7 @@ def test_fused_selector_head_major_output_through_msa_q2k_consumer():
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 (Blackwell) required")
 
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
         msa_package_available,
     )
 

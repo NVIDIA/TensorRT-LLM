@@ -16,8 +16,8 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrai
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin

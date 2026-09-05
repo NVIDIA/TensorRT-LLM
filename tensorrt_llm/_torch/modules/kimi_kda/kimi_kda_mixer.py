@@ -26,7 +26,7 @@ import torch
 from fla.modules import ShortConvolution
 from torch import nn
 
-from ...attention_backend import AttentionMetadata
+from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph

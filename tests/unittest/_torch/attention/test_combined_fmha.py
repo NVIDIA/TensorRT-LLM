@@ -19,11 +19,16 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakePhasedFmha
 
-from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
-from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
-from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.triton_custom_mask import TritonCustomMaskFmha
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+    FlashInferTrtllmGenFmha,
+)
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import TritonCustomMaskFmha
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -135,7 +140,7 @@ def test_flashinfer_context_fallback_scope(
     is_fused_qkv: bool,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
         lambda: sm_version,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
@@ -220,7 +225,7 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     sm_version: int,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
         lambda: sm_version,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)

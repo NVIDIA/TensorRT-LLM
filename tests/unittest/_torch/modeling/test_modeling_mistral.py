@@ -20,7 +20,7 @@ import tensorrt_llm
 from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
-from tensorrt_llm._torch.attention_backend import utils as attention_utils
+from tensorrt_llm._torch.attention.backends import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
 from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
