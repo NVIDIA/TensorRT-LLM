@@ -28,6 +28,17 @@
 namespace tensorrt_llm::common
 {
 
+// How Q or K tokens are grouped into scales. See sagePartition.h.
+enum class SageScalePartition
+{
+    // tokenBlockSize consecutive tokens share a scale, one group per tile.
+    Contiguous = 0,
+    // 2 rows 8 apart share a scale; 32 groups per 64-row tile.
+    HopperQ,
+    // 16 strided keys share a scale; 16 groups per 256-key tile.
+    HopperK,
+};
+
 struct SageQuantParams
 {
     // Required arguments for SageQuantQk (Q or K):
@@ -35,7 +46,9 @@ struct SageQuantParams
     int batchSize{};
     int numHeads{};
     int headDim{};
+    // Only read when partition == Contiguous; the Hopper partitions fix their own group size.
     int tokenBlockSize{};
+    SageScalePartition partition{SageScalePartition::Contiguous};
     bool kSmooth{false};
     int const* ptrCuSeqLensQk{nullptr};
     void const* ptrQk{nullptr};
@@ -43,6 +56,9 @@ struct SageQuantParams
     kernels::Data_type inputType{kernels::DATA_TYPE_FP16};
     kernels::Data_type quantType{kernels::DATA_TYPE_E4M3};
     float* ptrQkScale{nullptr};
+    // Optional source and scratch mean used to perform K-smoothing.
+    // (See below) collected at vStage==0, applied at vStage==1.
+    void const* ptrKForMean{nullptr};
     float* ptrKMean{nullptr};
     // Optional arguments for SageQuantV:
     // vStage: 0: disabled, 1: collect scales, 2: quantize
@@ -52,11 +68,32 @@ struct SageQuantParams
     void const* ptrV{nullptr};
     void* ptrVQuant{nullptr};
     float* ptrVScale{nullptr};
-    // Hardware into. Required.
+    // Hardware info. Required.
     int smCount{};
     cudaStream_t stream{};
 };
 
 void invokeSageQuant(SageQuantParams const& params);
+
+// The scale grouping a consumer kernel expects. SM90 scales the tokens a single thread owns; the
+// other architectures scale contiguous token blocks.
+inline SageScalePartition getSageQPartition(bool perThread)
+{
+    return perThread ? SageScalePartition::HopperQ : SageScalePartition::Contiguous;
+}
+
+inline SageScalePartition getSageKPartition(bool perThread)
+{
+    return perThread ? SageScalePartition::HopperK : SageScalePartition::Contiguous;
+}
+
+// Scale-buffer geometry for a partition, so that callers can size the scale buffers and fill in
+// the max_nblock the consumer kernel reads. Returns 0 when the tensor is not sage-quantized
+// (tokenBlockSize 0), when the shape is empty, or when the (partition, tokenBlockSize) pair has no
+// kernel instantiation, so it is safe to call from noexcept sizing paths.
+
+// Scales per head, i.e. the head stride of the scale buffer. Grows with the batch size as well as
+// the token count, since every sequence reserves a spare tile.
+int getSageScaleHeadStride(SageScalePartition partition, int tokenBlockSize, int sumSeqLens, int batchSize);
 
 } // namespace tensorrt_llm::common

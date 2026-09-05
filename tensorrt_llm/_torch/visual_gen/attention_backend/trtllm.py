@@ -303,6 +303,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 sage_attn_num_elts_per_blk_k=quant_cfg.k_block_size,
                 sage_attn_num_elts_per_blk_v=quant_cfg.v_block_size,
                 sage_attn_qk_int8=(quant_cfg.qk_dtype == "int8"),
+                sage_attn_smooth_k=quant_cfg.smooth_k,
             )
         else:
             if k is None and v is None:

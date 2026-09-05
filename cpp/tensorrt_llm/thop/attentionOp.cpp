@@ -1175,13 +1175,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold)
+    bool sage_attn_qk_int8, bool sage_attn_smooth_k, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool trtllm_gen_jit_warmup, std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross,
+    std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
+    int64_t relative_attention_max_distance, std::optional<int64_t> spec_decoding_target_max_draft_tokens,
+    std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
+    bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
+    std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+    double skip_correction_threshold)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1314,6 +1315,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
     op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
     op->mSageAttnQkInt8 = sage_attn_qk_int8;
+    op->mSageAttnSmoothK = sage_attn_smooth_k;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
     op->mCrossAttention = is_cross;
