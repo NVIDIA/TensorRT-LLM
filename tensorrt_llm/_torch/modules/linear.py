@@ -29,10 +29,12 @@ from tensorrt_llm.quantization.functional import \
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
+    transform_k128_scales_to_cutedsl_mxfp8_layout,
     transform_sf_into_required_layout)
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
+from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import _MAX_M as _LOW_M_GEMM_MAX_M
@@ -119,6 +121,19 @@ def quant_config_has_nvfp4_activation_quantization(
     return (quant_config is not None
             and quant_config.layer_quant_mode.has_nvfp4()
             and quant_config.quant_algo != QuantAlgo.W4A16_NVFP4)
+
+
+def _fp8_per_tensor_uses_cute_dsl_sm107() -> bool:
+    # Opt-in until an LLM API option exists; SM107 only.
+    return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+            and os.environ.get("USE_CUTE_DSL_FP8_PER_TENSOR_MM", "0") == "1")
+
+
+def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
+    """SM107 runs the FP8 block-scale Linear through the CuTe DSL MXFP8 kernel
+    (UE8M0 K32 scales); apply() and transform_weights() must agree on it."""
+    return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE and
+            (module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm))
 
 
 def _uses_marlin_nvfp4_backend(module) -> bool:
@@ -761,8 +776,16 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
 
-        # This op does not support bias now.
-        if module.enable_cuda_core and qinput.shape[0] <= 8:
+        # These ops do not support bias.
+        if _fp8_per_tensor_uses_cute_dsl_sm107():
+            output = torch.ops.trtllm.cute_dsl_fp8_per_tensor_gemm_rubin(
+                qinput,
+                module.weight,
+                input_scale=cur_input_scale,
+                weight_scale=module.weight_scale,
+                output_dtype=module.dtype or input.dtype,
+            )
+        elif module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
                 qinput,
@@ -1230,11 +1253,20 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
+                if _fp8_block_scales_uses_cute_dsl_sm107(module):
+                    # transform_weights() re-laid weight_scale out as UE8M0
+                    # K32 R128c4; quantize the activation to match.
+                    act_input_fp8, act_input_sf = \
+                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+                    output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
+                else:
+                    act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                        input)
+                    output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
             else:
                 output = torch.ops.trtllm.fp8_swap_ab_gemm(
                     input,
@@ -1370,6 +1402,19 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
+        if _fp8_block_scales_uses_cute_dsl_sm107(module):
+            weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
+                                                        module.weight_scale)
+            transformed_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(
+                weight_scale, mn=weight.shape[0], k=weight.shape[1])
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(transformed_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            return
         use_deep_gemm_layout = (
             is_sm_100f()
             and not (module.use_cute_dsl_blockscaling_mm

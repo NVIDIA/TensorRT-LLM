@@ -5,7 +5,7 @@ import ast
 import functools
 import itertools
 import math
-from typing import List, Optional, Tuple, Type
+from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
 
@@ -27,7 +27,8 @@ from ..locality_domain_utils import (get_current_locality_domain,
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     is_gated_activation, last_positive_power_of_2,
+                     infer_output_m_shape, is_gated_activation,
+                     last_positive_power_of_2, mxfp8_scale_infer_shape,
                      next_positive_power_of_2)
 from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
@@ -10774,6 +10775,2304 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # Requires Rubin support in the public nvidia-cutlass-dsl package.
 
     if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        # SM107 dense GEMM / BMM custom ops
+        # ====================================================================
+        # Op-level wrappers for the SM107 dense kernels: FP8 blockwise GEMM /
+        # BMM, block-scaled (NVFP4 / MXFP8) GEMM, the DSv4 q_b fusion and the
+        # FP8 per-tensor GEMM. Every op raises unless get_sm_version() == 107.
+
+        from ..cute_dsl_kernels.rubin.blockwise_gemm import \
+            SM107BlockwiseGemmKernel
+        from ..cute_dsl_kernels.rubin.dense_blockscaled_gemm_persistent import (
+            Sm107BlockScaledPersistentDenseGemmKernel,
+            Sm107BlockScaledPersistentDenseGemmMixedClustersKernel)
+        from ..cute_dsl_kernels.rubin.dense_gemm_persistent import \
+            SM107PersistentDenseGemmKernel
+        from ..cute_dsl_kernels.rubin.dsv4_qb_fusion.kernel import \
+            compile as compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant
+
+        # SM107 FP8 blockwise GEMM
+        # ====================================================================
+        # Shared by GEMM and BMM
+        _SM107_FP8_BLOCKWISE_MMA_CANDIDATES = [
+            (False, (128, 128, 128), (128, 128, 64)),
+            (False, (256, 128, 128), (128, 128, 64)),
+            (True, (256, 128, 128), (256, 128, 64)),
+            (True, (512, 128, 128), (256, 128, 64)),
+        ]
+        _SM107_FP8_BLOCKWISE_CLUSTER_CANDIDATES = [
+            (1, 1),
+            (1, 2),
+            (1, 4),
+            (2, 1),
+            (2, 2),
+            (2, 4),
+            (4, 1),
+            (4, 2),
+            (4, 4),
+        ]
+
+        class CuteDSLFp8RubinGemmRunner(TunableRunner):
+            """FP8 1x128/128x128 blockwise GEMM runner for SM107."""
+
+            kernel_class = SM107BlockwiseGemmKernel
+            kernel_cache = dict()
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 1,
+                                                 fp8_scale_infer_shape), ),
+            )
+
+            def __init__(self,
+                         output_dtype: torch.dtype = torch.bfloat16,
+                         use_tvm_ffi: bool = True):
+                super().__init__()
+                if output_dtype != torch.bfloat16:
+                    raise ValueError(
+                        f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+                    )
+                self.output_dtype = output_dtype
+                self.use_tvm_ffi = use_tvm_ffi
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple]:
+                if (sm_version := get_sm_version()) != 107:
+                    logger.debug(
+                        f"CuteDSL: SM version {sm_version} is not supported. "
+                        "CuteDSL FP8 blockwise GEMM only supports SM107.")
+                    return []
+
+                m = inputs[0].shape[0]
+                n = inputs[1].shape[0]
+                k = inputs[0].shape[1]
+                batch_size = 1
+                a_major = "k"
+                b_major = "k"
+                c_major = "n"
+
+                return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                         cluster_shape_mn) for use_2cta_instrs, mma_tiler,
+                        mma_inst_shape in _SM107_FP8_BLOCKWISE_MMA_CANDIDATES
+                        for cluster_shape_mn in
+                        _SM107_FP8_BLOCKWISE_CLUSTER_CANDIDATES
+                        if self.__class__.kernel_class.can_implement(
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float32,
+                            cutlass.BFloat16,
+                            use_2cta_instrs,
+                            mma_tiler,
+                            mma_inst_shape,
+                            cluster_shape_mn,
+                            m,
+                            n,
+                            k,
+                            batch_size,
+                            a_major,
+                            b_major,
+                            c_major,
+                        )]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+            ) -> torch.Tensor:
+                if isinstance(tactic, tuple):
+                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn = tactic
+                else:
+                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn = [
+                        False,
+                        (128, 128, 128),
+                        (128, 128, 64),
+                        (1, 1),
+                    ]
+                a_tensor, b_tensor, a_sf_tensor, b_sf_tensor = inputs
+                m, k = a_tensor.shape
+                n = b_tensor.shape[0]
+                sf_m = m
+                sf_k = ceil_div(k, 128)
+                sf_n = ceil_div(n, 128)
+                c_tensor = torch.empty((m, n),
+                                       dtype=torch.bfloat16,
+                                       device=a_tensor.device)
+                c_tmp = c_tensor.view((1, m, n)).permute(1, 2, 0)
+
+                if not self.use_tvm_ffi:
+                    a_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                     a_tensor.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    b_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                     b_tensor.data_ptr(),
+                                     cute.AddressSpace.gmem,
+                                     assumed_align=16)
+                    a_sf_ptr = make_ptr(cutlass.Float32,
+                                        a_sf_tensor.data_ptr(),
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16)
+                    b_sf_ptr = make_ptr(cutlass.Float32,
+                                        b_sf_tensor.data_ptr(),
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16)
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
+
+                cache_key = (
+                    use_2cta_instrs,
+                    mma_tiler,
+                    mma_inst_shape,
+                    cluster_shape_mn,
+                    self.use_tvm_ffi,
+                )
+                if cache_key not in self.__class__.kernel_cache:
+                    if self.use_tvm_ffi:
+                        a_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                         a_tensor.data_ptr(),
+                                         cute.AddressSpace.gmem,
+                                         assumed_align=16)
+                        b_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                         b_tensor.data_ptr(),
+                                         cute.AddressSpace.gmem,
+                                         assumed_align=16)
+                        a_sf_ptr = make_ptr(cutlass.Float32,
+                                            a_sf_tensor.data_ptr(),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=16)
+                        b_sf_ptr = make_ptr(cutlass.Float32,
+                                            b_sf_tensor.data_ptr(),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=16)
+                        c_cute_tensor = cute.runtime.from_dlpack(
+                            c_tmp).mark_layout_dynamic(leading_dim=1)
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
+
+                    gemm = self.__class__.kernel_class(
+                        cutlass.Float32,
+                        use_2cta_instrs=use_2cta_instrs,
+                        mma_tiler=mma_tiler,
+                        mma_inst_shape=mma_inst_shape,
+                        cluster_shape_mn=cluster_shape_mn,
+                    )
+                    hardware_info = cutlass.utils.HardwareInfo()
+                    max_active_clusters = hardware_info.get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        1,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                if self.use_tvm_ffi:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        1,
+                        a_tensor.data_ptr(),
+                        b_tensor.data_ptr(),
+                        a_sf_tensor.data_ptr(),
+                        b_sf_tensor.data_ptr(),
+                        c_tmp,
+                    )
+                else:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        1,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                        stream=stream,
+                    )
+                return c_tensor
+
+        @torch.library.custom_op("trtllm::cute_dsl_fp8_gemm_rubin",
+                                 mutates_args=(),
+                                 device_types="cuda")
+        def cute_dsl_fp8_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
+                )
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    "CuteDSL FP8 blockwise GEMM only supports SM107.")
+            tuner = AutoTuner.get()
+            runner = CuteDSLFp8RubinGemmRunner(output_dtype=output_dtype,
+                                               use_tvm_ffi=use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale]
+            _, best_tactic = tuner.choose_one(
+                "trtllm::cute_dsl_fp8_gemm_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            return runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake("trtllm::cute_dsl_fp8_gemm_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            shape = list(mat_a.shape)
+            shape[-1] = mat_b.shape[-2]
+            return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        class CuteDSLFp8RubinBmmRunner(CuteDSLFp8BlackwellBmmRunner):
+            """FP8 1x128/128x128 blockwise BMM runner for SM107."""
+
+            kernel_class = SM107BlockwiseGemmKernel
+            kernel_cache = dict()
+
+            def __init__(
+                self,
+                output_dtype: torch.dtype = torch.bfloat16,
+                use_tvm_ffi: bool = True,
+                fp8_quantize_1x128: bool = False,
+            ):
+                super().__init__(output_dtype=torch.bfloat16,
+                                 use_tvm_ffi=use_tvm_ffi)
+                self.fp8_quantize_1x128 = fp8_quantize_1x128
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple]:
+                if get_sm_version() != 107:
+                    logger.debug("CuteDSL FP8 SM107 BMM only supports SM107. "
+                                 "Skipping all tactics.")
+                    return []
+
+                batch_size, m, k = inputs[0].shape
+                n = inputs[1].shape[1]
+
+                return [(use_2cta_instrs, mma_tiler, mma_inst_shape,
+                         cluster_shape_mn) for use_2cta_instrs, mma_tiler,
+                        mma_inst_shape in _SM107_FP8_BLOCKWISE_MMA_CANDIDATES
+                        for cluster_shape_mn in
+                        _SM107_FP8_BLOCKWISE_CLUSTER_CANDIDATES
+                        if (not self.fp8_quantize_1x128 or mma_tiler[0] //
+                            (2 if use_2cta_instrs else 1) == 128)
+                        and self.__class__.kernel_class.can_implement(
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float8E4M3FN,
+                            cutlass.Float32,
+                            (cutlass.Float8E4M3FN if self.
+                             fp8_quantize_1x128 else cutlass.BFloat16),
+                            use_2cta_instrs,
+                            mma_tiler,
+                            mma_inst_shape,
+                            cluster_shape_mn,
+                            m,
+                            n,
+                            k,
+                            batch_size,
+                            "k",
+                            "k",
+                            "n",
+                        )]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                """Run FP8 block-scaled BMM with TRT-LLM tensor layouts."""
+                if isinstance(tactic, tuple):
+                    (use_2cta_instrs, mma_tiler, mma_inst_shape,
+                     cluster_shape_mn) = tactic
+                else:
+                    use_2cta_instrs = False
+                    mma_tiler = (128, 128, 128)
+                    mma_inst_shape = (128, 128, 64)
+                    cluster_shape_mn = (1, 1)
+
+                if self.fp8_quantize_1x128:
+                    (
+                        a_tensor,
+                        b_tensor,
+                        a_sf_tensor,
+                        b_sf_tensor,
+                        c_tensor,
+                        scale_tensor,
+                    ) = inputs
+                else:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor = inputs
+                    scale_tensor = None
+                c_tmp = c_tensor.permute(1, 2, 0)
+
+                batch_size, m, k = a_tensor.shape
+                n = b_tensor.shape[1]
+                sf_m = pad_up(m, 4)
+                sf_k = ceil_div(k, 128)
+                sf_n = ceil_div(n, 128)
+
+                scale_cute = None
+                if self.fp8_quantize_1x128:
+                    expected_scale_numel = pad_up(m, 128) * pad_up(
+                        ceil_div(batch_size * n, 32), 4)
+                    if (c_tensor.dtype != torch.float8_e4m3fn
+                            or scale_tensor.dtype != torch.uint8
+                            or not scale_tensor.is_contiguous()
+                            or scale_tensor.numel() != expected_scale_numel):
+                        raise ValueError(
+                            "Fused FP8 BMM output requires E4M3 output and a "
+                            "flat contiguous uint8 R128c4 scale tensor with "
+                            f"{expected_scale_numel} elements.")
+                    scale_cute = cute.runtime.from_dlpack(
+                        scale_tensor).mark_layout_dynamic(leading_dim=0)
+
+                if not self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    a_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_sf_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_sf_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
+
+                cache_key = (
+                    use_2cta_instrs,
+                    mma_tiler,
+                    mma_inst_shape,
+                    cluster_shape_mn,
+                    self.use_tvm_ffi,
+                    self.fp8_quantize_1x128,
+                )
+                if cache_key not in self.__class__.kernel_cache:
+                    if self.use_tvm_ffi:
+                        a_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            a_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        b_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            b_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        a_sf_ptr = make_ptr(
+                            cutlass.Float32,
+                            a_sf_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        b_sf_ptr = make_ptr(
+                            cutlass.Float32,
+                            b_sf_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        c_cute_tensor = cute.runtime.from_dlpack(
+                            c_tmp).mark_layout_dynamic(leading_dim=1)
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
+
+                    gemm = self.__class__.kernel_class(
+                        cutlass.Float32,
+                        use_2cta_instrs=use_2cta_instrs,
+                        mma_tiler=mma_tiler,
+                        mma_inst_shape=mma_inst_shape,
+                        cluster_shape_mn=cluster_shape_mn,
+                        fp8_quantize_1x128=self.fp8_quantize_1x128,
+                    )
+                    hardware_info = cutlass.utils.HardwareInfo()
+                    max_active_clusters = hardware_info.get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm = cute.compile(
+                            gemm.wrapper_fp8_quantized,
+                            m,
+                            n,
+                            k,
+                            sf_m,
+                            sf_n,
+                            sf_k,
+                            batch_size,
+                            a_ptr,
+                            b_ptr,
+                            a_sf_ptr,
+                            b_sf_ptr,
+                            c_cute_tensor,
+                            scale_cute,
+                            max_active_clusters=max_active_clusters,
+                            stream=stream,
+                            options="--opt-level 2 --enable-tvm-ffi"
+                            if self.use_tvm_ffi else "--opt-level 2",
+                        )
+                    else:
+                        compiled_gemm = cute.compile(
+                            gemm.wrapper,
+                            m,
+                            n,
+                            k,
+                            sf_m,
+                            sf_n,
+                            sf_k,
+                            batch_size,
+                            a_ptr,
+                            b_ptr,
+                            a_sf_ptr,
+                            b_sf_ptr,
+                            c_cute_tensor,
+                            max_active_clusters=max_active_clusters,
+                            stream=stream,
+                            options="--opt-level 2 --enable-tvm-ffi"
+                            if self.use_tvm_ffi else "--opt-level 2",
+                        )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                if self.use_tvm_ffi:
+                    runtime_args = (
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_tensor.data_ptr(),
+                        b_tensor.data_ptr(),
+                        a_sf_tensor.data_ptr(),
+                        b_sf_tensor.data_ptr(),
+                        c_tmp,
+                    )
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm(*runtime_args, scale_tensor)
+                    else:
+                        compiled_gemm(*runtime_args)
+                else:
+                    runtime_args = (
+                        m,
+                        n,
+                        k,
+                        sf_m,
+                        sf_n,
+                        sf_k,
+                        batch_size,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_cute_tensor,
+                    )
+                    if self.fp8_quantize_1x128:
+                        compiled_gemm(*runtime_args, scale_cute, stream=stream)
+                    else:
+                        compiled_gemm(*runtime_args, stream=stream)
+
+        class CuteDSLFp8RubinBmmQuantRunner(CuteDSLFp8RubinBmmRunner):
+            """SM107 FP8 BMM runner with dynamic packed output scales."""
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 1, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(
+                    ConstraintSpec(2, 2, fp8_scale_infer_shape),
+                    ConstraintSpec(4, 1,
+                                   lambda input_shapes: input_shapes[0][1]),
+                    ConstraintSpec(
+                        5,
+                        0,
+                        lambda input_shapes: pad_up(input_shapes[0][1], 128) *
+                        pad_up(
+                            ceil_div(input_shapes[0][0] * input_shapes[1][1], 32
+                                     ), 4),
+                    ),
+                ),
+            )
+
+            def __init__(self, use_tvm_ffi: bool = True):
+                super().__init__(
+                    use_tvm_ffi=use_tvm_ffi,
+                    fp8_quantize_1x128=True,
+                )
+
+        @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_rubin",
+                                 mutates_args=("output", ),
+                                 device_types="cuda")
+        def cute_dsl_fp8_bmm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    "CuteDSL FP8 SM107 BMM only supports bfloat16 output, "
+                    f"got {output_dtype}")
+            if get_sm_version() != 107:
+                raise ValueError(
+                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
+                    "CuteDSL FP8 SM107 BMM only supports SM107.")
+
+            runner = CuteDSLFp8RubinBmmRunner(output_dtype=output_dtype,
+                                              use_tvm_ffi=use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale, output]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_fp8_bmm_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            batch_size, m, _ = mat_a.shape
+            n = mat_b.shape[1]
+            assert output.dtype == torch.bfloat16, \
+                "CuTe DSL FP8 SM107 BMM output dtype must be BF16"
+            assert output.shape == (batch_size, m, n), \
+                "CuTe DSL FP8 SM107 BMM output shape is incorrect"
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_fp8_bmm_quantize_rubin_out",
+            mutates_args=("output", "packed_scale"),
+            device_types="cuda",
+        )
+        def cute_dsl_fp8_bmm_quantize_rubin_out(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            packed_scale: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            if get_sm_version() != 107:
+                raise ValueError(
+                    "CuTe DSL FP8 BMM quantization requires SM107.")
+            batch_size, m, _ = input.shape
+            n = weight.shape[1]
+            if n % 128 != 0:
+                raise ValueError(
+                    "Fused FP8 BMM quantization requires N divisible by 128, "
+                    f"got {n}.")
+            expected_scale_numel = pad_up(m, 128) * pad_up(
+                ceil_div(batch_size * n, 32), 4)
+            if output.shape != (batch_size, m, n):
+                raise ValueError(
+                    "Fused FP8 BMM output must have shape "
+                    f"{(batch_size, m, n)}, got {tuple(output.shape)}.")
+            if (output.dtype != torch.float8_e4m3fn
+                    or packed_scale.dtype != torch.uint8
+                    or not packed_scale.is_contiguous()
+                    or packed_scale.shape != (expected_scale_numel, )):
+                raise ValueError(
+                    "Fused FP8 BMM requires E4M3 output and a flat contiguous "
+                    f"uint8 R128c4 scale tensor with {expected_scale_numel} elements."
+                )
+
+            runner = CuteDSLFp8RubinBmmQuantRunner(use_tvm_ffi=use_tvm_ffi)
+            inputs = [
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                output,
+                packed_scale,
+            ]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_fp8_bmm_quantize_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_fp8_bmm_quantize_rubin_out")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output: torch.Tensor,
+            packed_scale: torch.Tensor,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            del input_scale, weight_scale, use_tvm_ffi
+            batch_size, m, _ = input.shape
+            n = weight.shape[1]
+            assert output.dtype == torch.float8_e4m3fn
+            assert output.shape == (batch_size, m, n)
+            expected_scale_numel = pad_up(m, 128) * pad_up(
+                ceil_div(batch_size * n, 32), 4)
+            assert packed_scale.dtype == torch.uint8
+            assert packed_scale.shape == (expected_scale_numel, )
+            assert packed_scale.is_contiguous()
+
+        class CuteDSLBlockScaledRubinLinear(TunableRunner):
+            """Datatype-agnostic block-scaled Linear runner for SM107.
+
+            Concrete datatypes provide their element types, scale-factor
+            geometry, K alignment, MMA shape, and tuning constraints.
+            """
+            kernel_class = Sm107BlockScaledPersistentDenseGemmKernel
+            kernel_cache: ClassVar[dict]
+            gemm_name: ClassVar[str]
+            a_dtype: ClassVar[type]
+            b_dtype: ClassVar[type]
+            sf_dtype: ClassVar[type]
+            sf_vec_size: ClassVar[int]
+            packed_k_multiplier: ClassVar[int]
+            k_alignment: ClassVar[int]
+            ab_assumed_align: ClassVar[int]
+            sf_assumed_align: ClassVar[int]
+            mma_tiler_k: ClassVar[int]
+            mma_inst_shape_k: ClassVar[int]
+            allow_unswapped_small_m_fallback: ClassVar[bool]
+            raster_order_candidates: ClassVar[Tuple[str, ...]] = ("m", )
+            scheduler_mode_candidates: ClassVar[Tuple[str,
+                                                      ...]] = ("static",
+                                                               "clc_dynamic")
+            mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
+                                                            ...]] = ("static", )
+            split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            tuning_config: ClassVar[TuningConfig]
+
+            def __init__(self,
+                         output_dtype: torch.dtype,
+                         to_userbuffers: bool = False,
+                         use_tvm_ffi: bool = True):
+                super().__init__()
+
+                if output_dtype != torch.bfloat16:
+                    raise ValueError(
+                        f"CuteDSL {self.gemm_name} only supports bfloat16 output, "
+                        f"got {output_dtype}")
+                self.output_dtype = output_dtype
+                self.to_userbuffers = to_userbuffers
+                self.use_tvm_ffi = use_tvm_ffi
+
+            def unique_id(self):
+                return (self.output_dtype, self.to_userbuffers,
+                        self.use_tvm_ffi)
+
+            def __hash__(self):
+                return hash(
+                    (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi))
+
+            def __eq__(self, other):
+                if not isinstance(other, self.__class__):
+                    return False
+                return self.output_dtype == other.output_dtype and self.to_userbuffers == other.to_userbuffers and self.use_tvm_ffi == other.use_tvm_ffi
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple[int, int]]:
+                # SM107 dense block-scaled GEMM only.
+                if (sm_version := get_sm_version()) != 107:
+                    logger.debug(
+                        f"CuteDSL: SM version {sm_version} is not supported. "
+                        f"CuteDSL {self.gemm_name} SM107 runner. "
+                        f"Skipping all tactics.")
+                    return []
+
+                assert inputs[0].dim() == 2
+                assert inputs[1].dim() == 2
+
+                m = inputs[0].shape[0]
+                n = inputs[1].shape[0]
+                k = inputs[0].shape[1]
+                real_k = k * self.packed_k_multiplier
+                batch_size = 1
+                sf_vec_size = self.sf_vec_size
+
+                # A and B are always K-major.
+                a_major = "k"
+                b_major = "k"
+
+                # Early exit: Check K dimension alignment
+                if real_k % self.k_alignment != 0:
+                    logger.debug(
+                        f"CuteDSL: K={real_k} does not meet 16-byte alignment requirement "
+                        f"(K%{self.k_alignment}={real_k % self.k_alignment}, "
+                        f"expected 0). Skipping all tactics.")
+                    return []
+
+                # Both swap orientations use the original N as C's physical
+                # contiguous dimension and require 16-byte BF16 alignment.
+                output_aligned = (n % 8 == 0)
+                if not output_aligned:
+                    logger.debug(
+                        f"CuteDSL: Output N={n} does not meet the 16-byte "
+                        f"alignment requirement (N%8={n%8}). Skipping all tactics."
+                    )
+                    return []
+
+                # In locality domain mode, the second partition's output slice starts at N
+                # columns, so it has the same output-alignment requirement.
+                base_swap_ab_candidates = _get_cute_dsl_swap_ab_candidates(
+                    m, output_aligned)
+                mixed_swap_ab_candidates = _get_cute_dsl_swap_ab_candidates(
+                    m, output_aligned, include_alternative=True)
+                if not base_swap_ab_candidates:
+                    logger.debug(
+                        f"CuteDSL: No valid C layout for M={m}, N={n}. "
+                        "Skipping all tactics.")
+                    return []
+
+                logger.debug(
+                    f"CuteDSL: M={m}, N={n}(aligned={output_aligned}), K={real_k}(aligned=True). "
+                    f"Using base swap_ab={base_swap_ab_candidates}, "
+                    f"mixed-cluster swap_ab={mixed_swap_ab_candidates}")
+
+                # SM107 dense block-scaled tile sizes.
+                # b-reuse is enabled when mma_tiler_m = 2 * mma_inst_shape_m
+                mma_tiler_k = self.mma_tiler_k
+                mma_inst_shape_k = self.mma_inst_shape_k
+
+                # Valid (mma_tiler_m, mma_inst_shape_m) combinations:
+                # Without b-reuse: mma_tiler_m == mma_inst_shape_m
+                #   - (128, 128): no b-reuse
+                #   - (256, 256): no b-reuse, 2CTA mode
+                # With b-reuse: mma_tiler_m == 2 * mma_inst_shape_m
+                #   - (256, 128): b-reuse
+                #   - (512, 256): b-reuse, 2CTA mode
+                mma_m_candidates = [
+                    (128, 128),  # no b-reuse, 1CTA
+                    (256, 256),  # no b-reuse, 2CTA
+                    (256, 128),  # b-reuse, 1CTA
+                    (512, 256),  # b-reuse, 2CTA
+                ]
+                mma_n_candidates = [64, 128, 192, 256]
+
+                # Cluster shapes - must be divisible by 2 for 2CTA mode (mma_inst_m=256)
+                cluster_shape_mn_candidates = [
+                    (1, 1),
+                    (1, 2),
+                    (2, 1),
+                    (2, 2),
+                    (4, 2),
+                ]
+                raster_order_candidates = self.raster_order_candidates
+                use_prefetch_candidates = [True, False]
+
+                valid_tactics = []
+                for (
+                        mma_tiler_m, mma_inst_m
+                ), mma_n, cluster_shape_mn, raster_order, swap_ab, use_prefetch in itertools.product(
+                        mma_m_candidates, mma_n_candidates,
+                        cluster_shape_mn_candidates, raster_order_candidates,
+                        base_swap_ab_candidates, use_prefetch_candidates):
+
+                    # Check 2CTA cluster constraint: cluster_m must be divisible by 2
+                    if mma_inst_m == 256 and cluster_shape_mn[0] % 2 != 0:
+                        continue
+
+                    mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
+
+                    if swap_ab:
+                        c_major = "m"
+                        kernel_m = n
+                        kernel_n = m
+                    else:
+                        c_major = "n"
+                        kernel_m = m
+                        kernel_n = n
+
+                    for split_k in self.split_k_candidates:
+                        if self.__class__.kernel_class.can_implement(
+                            (kernel_m, kernel_n, real_k, batch_size),
+                                self.a_dtype,
+                                self.b_dtype,
+                                self.sf_dtype,
+                                cutlass.BFloat16,
+                                a_major,
+                                b_major,
+                                c_major,
+                                sf_vec_size,
+                                mma_tiler_mnk,
+                                mma_inst_shape,
+                                cluster_shape_mn,
+                                split_k,
+                        ):
+                            for scheduler_mode in self.scheduler_mode_candidates:
+                                valid_tactics.append(
+                                    ("base", mma_tiler_mnk, mma_inst_shape,
+                                     cluster_shape_mn, swap_ab, use_prefetch,
+                                     scheduler_mode, raster_order, split_k))
+
+                preferred_cluster_shape_mn = (4, 2)
+                fallback_cluster_shape_mn = (2, 1)
+                for (
+                        mma_tiler_m, mma_inst_m
+                ), mma_n, raster_order, swap_ab, use_prefetch in itertools.product(
+                        mma_m_candidates, mma_n_candidates,
+                        raster_order_candidates, mixed_swap_ab_candidates,
+                        use_prefetch_candidates):
+                    mma_tiler_mnk = (mma_tiler_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_inst_m, mma_n, mma_inst_shape_k)
+
+                    if swap_ab:
+                        c_major = "m"
+                        kernel_m = n
+                        kernel_n = m
+                    else:
+                        c_major = "n"
+                        kernel_m = m
+                        kernel_n = n
+
+                    if Sm107BlockScaledPersistentDenseGemmMixedClustersKernel.can_implement(
+                        (kernel_m, kernel_n, real_k, batch_size),
+                            self.a_dtype,
+                            self.b_dtype,
+                            self.sf_dtype,
+                            cutlass.BFloat16,
+                            a_major,
+                            b_major,
+                            c_major,
+                            sf_vec_size,
+                            mma_tiler_mnk,
+                            mma_inst_shape,
+                            preferred_cluster_shape_mn,
+                            fallback_cluster_shape_mn,
+                    ):
+                        if self.mixed_scheduler_mode_candidates == ("static", ):
+                            # Preserve the existing raster-only tactic schema
+                            # for runners that do not profile mixed-cluster
+                            # schedulers (currently NVFP4).
+                            valid_tactics.append(
+                                ("mixed_clusters", mma_tiler_mnk,
+                                 mma_inst_shape, preferred_cluster_shape_mn,
+                                 fallback_cluster_shape_mn, swap_ab,
+                                 use_prefetch, raster_order))
+                        else:
+                            for scheduler_mode in self.mixed_scheduler_mode_candidates:
+                                # CUTLASS DSL 4.5 loses flexible-CGA x/y
+                                # offsets in its z-linearized CLC path. Keep
+                                # dynamic mixed clusters on the direct-grid
+                                # raster-M path; static mixed clusters can
+                                # still profile both raster orders.
+                                if (scheduler_mode == "clc_dynamic"
+                                        and raster_order != "m"):
+                                    continue
+                                valid_tactics.append(
+                                    ("mixed_clusters", mma_tiler_mnk,
+                                     mma_inst_shape, preferred_cluster_shape_mn,
+                                     fallback_cluster_shape_mn, swap_ab,
+                                     use_prefetch, scheduler_mode,
+                                     raster_order))
+
+                valid_tactics = list(dict.fromkeys(valid_tactics))
+
+                logger.debug(
+                    f"CuteDSL SM107: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
+                )
+                return valid_tactics
+
+            def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
+                                             assumed_align: int):
+                return make_ptr(
+                    dtype,
+                    tensor.data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=assumed_align,
+                )
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+                bias: Optional[torch.Tensor] = None,
+                **kwargs,
+            ) -> torch.Tensor:
+                """
+                Performs a dense block-scaled GEMM using CuTe DSL on SM107.
+
+                Args:
+                    inputs (List[torch.Tensor]):
+                        inputs[0]: Input tensor of shape (m, k).
+                        inputs[1]: Weight tensor of shape (n, k).
+                        inputs[2]: Input scale tensor in R128c4 layout.
+                        inputs[3]: Weight scale tensor in R128c4 layout.
+                        inputs[4]: Alpha scaling factor. dtype: float32.
+                    tactic: Tiling and cluster strategy:
+                        base: ("base", mma_tiler_mnk, mma_inst_shape,
+                        cluster_shape, swap_ab, use_prefetch, scheduler_mode,
+                        raster_order, split_k)
+                        mixed: ("mixed_clusters", mma_tiler_mnk,
+                        mma_inst_shape, preferred_cluster_shape,
+                        fallback_cluster_shape, swap_ab, use_prefetch,
+                        scheduler_mode, raster_order)
+                    bias: Optional per-N bias [N]. Added post-GEMM for the
+                        non-inplace path.
+
+                Returns:
+                    torch.Tensor: Output tensor of shape (m, n), dtype: bf16.
+                """
+                sf_vec_size = self.sf_vec_size
+                split_k = 1
+
+                if (isinstance(tactic, tuple) and len(tactic) > 0
+                        and isinstance(tactic[0], str)):
+                    kernel_variant = tactic[0]
+                    if kernel_variant == "mixed_clusters":
+                        if len(tactic) not in {7, 8, 9}:
+                            raise ValueError(
+                                "CuteDSL SM107 mixed-cluster tactics must use "
+                                "Boolean use_prefetch with optional scheduler "
+                                "mode and raster order")
+                        (_, mma_tiler_mnk, mma_inst_shape,
+                         preferred_cluster_shape_mn, cluster_shape_mn, swap_ab,
+                         use_prefetch, *tuning_options) = tactic
+                        scheduler_mode = "static"
+                        if len(tuning_options) == 0:
+                            raster_order = "m"
+                        elif len(tuning_options) == 1:
+                            # Accept both prior length-8 schemas: raster-only
+                            # and scheduler-only.
+                            if tuning_options[
+                                    0] in self.mixed_scheduler_mode_candidates:
+                                scheduler_mode = tuning_options[0]
+                                raster_order = "m"
+                            else:
+                                raster_order = tuning_options[0]
+                        else:
+                            scheduler_mode, raster_order = tuning_options
+                    else:
+                        if len(tactic) not in {6, 7, 8, 9}:
+                            raise ValueError(
+                                "CuteDSL SM107 base tactics must use Boolean "
+                                "use_prefetch with an optional scheduler mode "
+                                "and raster order, followed by split_k")
+                        (_, mma_tiler_mnk, mma_inst_shape, cluster_shape_mn,
+                         swap_ab, use_prefetch, *tuning_options) = tactic
+                        preferred_cluster_shape_mn = None
+                        scheduler_mode = "static"
+                        raster_order = "m"
+                        if len(tuning_options) >= 1:
+                            scheduler_mode = tuning_options[0]
+                        if len(tuning_options) >= 2:
+                            raster_order = tuning_options[1]
+                        if len(tuning_options) == 3:
+                            split_k = tuning_options[2]
+                elif isinstance(tactic, tuple) and len(tactic) == 5:
+                    kernel_variant = "base"
+                    (mma_tiler_mnk, mma_inst_shape, cluster_shape_mn, swap_ab,
+                     use_prefetch) = tactic
+                    raster_order = "m"
+                    scheduler_mode = "static"
+                    preferred_cluster_shape_mn = None
+                else:
+                    # fallback to default tactic
+                    kernel_variant = "base"
+                    mma_tiler_mnk = (128, 128, self.mma_tiler_k)
+                    mma_inst_shape = (128, 128, self.mma_inst_shape_k)
+                    cluster_shape_mn = (1, 1)
+                    swap_ab = False
+                    use_prefetch = False
+                    raster_order = "m"
+                    scheduler_mode = "static"
+                    preferred_cluster_shape_mn = None
+
+                if not isinstance(use_prefetch, bool):
+                    raise ValueError(
+                        "CuteDSL SM107 use_prefetch must be Boolean")
+                if (not isinstance(split_k, int) or isinstance(split_k, bool)
+                        or split_k < 1):
+                    raise ValueError(
+                        f"CuteDSL SM107 split_k must be a positive integer, got {split_k!r}"
+                    )
+                if raster_order not in {"m", "n"}:
+                    raise ValueError("CuteDSL SM107 raster_order must be 'm' "
+                                     f"or 'n', got {raster_order!r}")
+                if (kernel_variant == "mixed_clusters" and scheduler_mode
+                        not in self.mixed_scheduler_mode_candidates):
+                    raise ValueError(
+                        "Unsupported CuteDSL SM107 mixed-cluster scheduler "
+                        f"mode {scheduler_mode!r}")
+                if (kernel_variant == "mixed_clusters"
+                        and scheduler_mode == "clc_dynamic"
+                        and raster_order != "m"):
+                    raise ValueError(
+                        "CuteDSL SM107 mixed-cluster CLC scheduling only "
+                        "supports raster_order='m'")
+                if scheduler_mode not in {"static", "clc_dynamic"}:
+                    raise ValueError("Unsupported CuteDSL SM107 scheduler mode "
+                                     f"{scheduler_mode!r}")
+
+                assert len(inputs) == 5 or len(inputs) == 6
+                if len(inputs) == 5:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
+                    output_tensor = None
+                else:
+                    a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor, output_tensor = inputs
+
+                m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[
+                    0]
+
+                partition_id = kwargs.get("partition_id", -1)
+                locality_domain_half_gemm = output_tensor is not None
+                if locality_domain_half_gemm:
+                    if partition_id < 0 or partition_id >= 2:
+                        raise ValueError(
+                            "partition_id must be 0 or 1 when output_tensor is provided."
+                        )
+                    assert output_tensor is not None
+                    assert output_tensor.dim() == 2
+                    assert output_tensor.dtype == self.output_dtype
+                    assert output_tensor.shape[0] == m and output_tensor.shape[1] == n * 2, \
+                        f"[locality domain] output_tensor.shape={output_tensor.shape}, m={m}, n={n}"
+                    # Point c directly into shared buffer at column offset.
+                    # Kernel writes with strided layout (row stride = full width).
+                    c_tensor = output_tensor[:, partition_id *
+                                             n:(partition_id + 1) * n]
+                else:
+                    # Allocate output tensor from UserBuffers or regular CUDA memory
+                    if self.to_userbuffers:
+                        c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
+                            [m, n], self.output_dtype)
+                    else:
+                        c_tensor = torch.empty(*(m, n),
+                                               dtype=self.output_dtype,
+                                               device="cuda")
+
+                if swap_ab:
+                    c_tensor = c_tensor.permute(1, 0)
+                if split_k > 1:
+                    # Split-K uses TMA reduce-add stores, so every invocation
+                    # and CUDA-graph replay must begin from a zeroed output.
+                    c_tensor.zero_()
+
+                real_k = k * self.packed_k_multiplier
+                sf_m = pad_up(m, 128)
+                sf_k = pad_up(real_k // sf_vec_size, 4)
+                sf_n = pad_up(n, 128)
+
+                # Scale factors already use CuTe DSL's physical R128c4 layout.
+                # Only flatten their storage here; no memory copy is required.
+                expected_a_sf_size = sf_m * sf_k
+                expected_b_sf_size = sf_n * sf_k
+
+                if a_sf_tensor.numel() != expected_a_sf_size:
+                    raise ValueError(
+                        f"CuteDSL: act scale factor size mismatch. "
+                        f"Expected {expected_a_sf_size} (sf_m={sf_m} * sf_k={sf_k}), "
+                        f"got {a_sf_tensor.numel()} for shape M={m}, K={real_k}"
+                    )
+                if b_sf_tensor.numel() != expected_b_sf_size:
+                    raise ValueError(
+                        f"CuteDSL: weight scale factor size mismatch. "
+                        f"Expected {expected_b_sf_size} (sf_n={sf_n} * sf_k={sf_k}), "
+                        f"got {b_sf_tensor.numel()} for shape N={n}, K={real_k}"
+                    )
+                if alpha_tensor.numel() != 1:
+                    raise ValueError(f"CuteDSL: alpha size mismatch. "
+                                     f"Expected 1, got {alpha_tensor.numel()}")
+
+                # Reshape to CuteDSL's expected format (just a view, no copy)
+                a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
+                b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
+
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, self.a_dtype, self.ab_assumed_align)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, self.b_dtype, self.ab_assumed_align)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.BFloat16, 16)
+
+                # get stream
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                # c_ld is the C leading dimension. locality domain writes into a half-width
+                # view of a full-width output buffer, so both ROW_MAJOR and
+                # COL_MAJOR layouts need the full output width as their stride.
+                c_ld_key = output_tensor.shape[
+                    1] if locality_domain_half_gemm else 0
+                c_ld_val = cutlass.Int64(c_ld_key)
+
+                if swap_ab:
+                    kernel_m = n
+                    kernel_n = m
+                    kernel_sf_m = sf_n
+                    kernel_sf_n = sf_m
+
+                    kernel_a_tensor = b_tensor
+                    kernel_a_sf_tensor = b_sf_tensor
+                    kernel_b_tensor = a_tensor
+                    kernel_b_sf_tensor = a_sf_tensor
+                    kernel_a_ptr = b_ptr
+                    kernel_a_sf_ptr = b_sf_ptr
+                    kernel_b_ptr = a_ptr
+                    kernel_b_sf_ptr = a_sf_ptr
+                else:
+                    kernel_m = m
+                    kernel_n = n
+                    kernel_sf_m = sf_m
+                    kernel_sf_n = sf_n
+
+                    kernel_a_tensor = a_tensor
+                    kernel_a_sf_tensor = a_sf_tensor
+                    kernel_b_tensor = b_tensor
+                    kernel_b_sf_tensor = b_sf_tensor
+                    kernel_a_ptr = a_ptr
+                    kernel_a_sf_ptr = a_sf_ptr
+                    kernel_b_ptr = b_ptr
+                    kernel_b_sf_ptr = b_sf_ptr
+
+                # The wrapper entry points declare m/n/k, all scale-tile
+                # counts (sf_m/sf_n/sf_k) and c_ld as dynamic cutlass.Int64
+                # runtime arguments, so the compiled artifact is independent
+                # of ALL problem shapes: cache tactic-only, matching the
+                # Blackwell NVFP4 and SM107 BF16 runners. Keying on
+                # sf_m // 128 previously caused one spurious ~1.3s
+                # cute.compile per NEW ceil(M/128) bucket per GEMM family at
+                # serving time (multi-second iteration stalls with variable
+                # ISL, amplified across attention-DP ranks via MoE A2A
+                # spin-waits); keying on n/k/sf_n/sf_k/c_ld multiplied cold
+                # autotuning compiles across weight families sharing a
+                # tactic. Per-shape tactic validity is still enforced by
+                # can_implement at tactic-selection time.
+                max_active_clusters = get_max_activate_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                max_active_preferred_clusters = None
+                if kernel_variant == "mixed_clusters":
+                    max_active_preferred_clusters = get_max_activate_clusters(
+                        preferred_cluster_shape_mn[0] *
+                        preferred_cluster_shape_mn[1])
+                cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
+                             mma_inst_shape, preferred_cluster_shape_mn,
+                             cluster_shape_mn, swap_ab, use_prefetch,
+                             raster_order, scheduler_mode, split_k,
+                             locality_domain_half_gemm, self.use_tvm_ffi,
+                             max_active_preferred_clusters, max_active_clusters)
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+
+                # get stream
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                if cache_key not in self.__class__.kernel_cache:
+                    if self.use_tvm_ffi:
+                        a_ptr = self.make_cute_dsl_global_pointer(
+                            a_tensor, self.a_dtype, self.ab_assumed_align)
+                        b_ptr = self.make_cute_dsl_global_pointer(
+                            b_tensor, self.b_dtype, self.ab_assumed_align)
+                        a_sf_ptr = self.make_cute_dsl_global_pointer(
+                            a_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                        b_sf_ptr = self.make_cute_dsl_global_pointer(
+                            b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
+                        c_ptr = self.make_cute_dsl_global_pointer(
+                            c_tensor, cutlass.BFloat16, 16)
+                        alpha_cute_tensor = cute.runtime.from_dlpack(
+                            alpha_tensor)
+                        # make faked stream
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
+
+                        if swap_ab:
+                            kernel_a_ptr = b_ptr
+                            kernel_a_sf_ptr = b_sf_ptr
+                            kernel_b_ptr = a_ptr
+                            kernel_b_sf_ptr = a_sf_ptr
+                        else:
+                            kernel_a_ptr = a_ptr
+                            kernel_a_sf_ptr = a_sf_ptr
+                            kernel_b_ptr = b_ptr
+                            kernel_b_sf_ptr = b_sf_ptr
+
+                    scheduler_types = {
+                        "static":
+                        cutlass.utils.StaticPersistentTileScheduler,
+                        "clc_dynamic":
+                        cutlass.utils.ClcDynamicPersistentTileScheduler,
+                    }
+                    scheduler_type = scheduler_types[scheduler_mode]
+
+                    # The SM107 kernels take mma_inst_shape and mma_tiler as 3-tuples.
+                    if kernel_variant == "mixed_clusters":
+                        gemm = Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
+                            sf_vec_size,
+                            mma_inst_shape,
+                            mma_tiler_mnk,
+                            preferred_cluster_shape_mn,
+                            cluster_shape_mn,
+                            None if use_prefetch else 0,
+                            raster_order=raster_order,
+                            scheduler_type=scheduler_type,
+                        )
+                    else:
+                        gemm = self.__class__.kernel_class(
+                            sf_vec_size,
+                            mma_inst_shape,
+                            mma_tiler_mnk,
+                            cluster_shape_mn,
+                            None if use_prefetch else 0,
+                            raster_order=raster_order,
+                            scheduler_type=scheduler_type,
+                            split_k=split_k,
+                        )
+                    # Note: when tvm_ffi fake stream is used, at least one parameter should be tensor type,
+                    # so we make alpha as the cute.Tensor type in the jit func.
+                    compile_args = [
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        kernel_sf_m // 128,
+                        kernel_sf_n // 128,
+                        sf_k // 4,
+                        1,  # batch
+                        kernel_a_ptr,
+                        kernel_b_ptr,
+                        kernel_a_sf_ptr,
+                        kernel_b_sf_ptr,
+                        c_ptr,
+                        alpha_cute_tensor,
+                    ]
+                    if kernel_variant == "mixed_clusters":
+                        compile_args.extend([
+                            c_ld_val, max_active_preferred_clusters,
+                            max_active_clusters
+                        ])
+                    else:
+                        compile_args.extend([c_ld_val, max_active_clusters])
+                    compile_args.extend([stream, swap_ab])
+
+                    compile_kwargs = {
+                        "options":
+                        "--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    }
+
+                    compiled_gemm = cute.compile(gemm.wrapper, *compile_args,
+                                                 **compile_kwargs)
+
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                # Launch gemm kernel via wrapper interface
+                if self.use_tvm_ffi:
+                    launch_args = [
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        kernel_sf_m // 128,
+                        kernel_sf_n // 128,
+                        sf_k // 4,
+                        kernel_a_tensor.data_ptr(),
+                        kernel_b_tensor.data_ptr(),
+                        kernel_a_sf_tensor.data_ptr(),
+                        kernel_b_sf_tensor.data_ptr(),
+                        c_tensor.data_ptr(),
+                        alpha_tensor,
+                        c_ld_key,
+                    ]
+                    compiled_gemm(*launch_args)
+                else:
+                    launch_args = [
+                        kernel_m,
+                        kernel_n,
+                        real_k,
+                        kernel_sf_m // 128,
+                        kernel_sf_n // 128,
+                        sf_k // 4,
+                        kernel_a_ptr,
+                        kernel_b_ptr,
+                        kernel_a_sf_ptr,
+                        kernel_b_sf_ptr,
+                        c_ptr,
+                        alpha_cute_tensor,
+                        c_ld_val,
+                    ]
+                    launch_args.append(stream)
+                    compiled_gemm(*launch_args)
+
+                if swap_ab:
+                    c_tensor = c_tensor.permute(1, 0)
+
+                if output_tensor is None:
+                    if bias is not None:
+                        if bias.ndim != 1 or bias.shape[0] != c_tensor.shape[-1]:
+                            raise ValueError(
+                                f"bias must be a 1-D tensor of shape [N]={c_tensor.shape[-1]}, "
+                                f"got shape {tuple(bias.shape)}")
+                        c_tensor = c_tensor + bias
+                    return c_tensor
+                elif locality_domain_half_gemm:
+                    # c already written via stride — no copy needed
+                    return
+                else:
+                    return
+
+        class CuteDSLNVFP4RubinLinear(CuteDSLBlockScaledRubinLinear):
+            """SM107 NVFP4 runner backed by the persistent dense kernel."""
+
+            kernel_cache = dict()
+            gemm_name = "NVFP4"
+            a_dtype = cutlass.Float4E2M1FN
+            b_dtype = cutlass.Float4E2M1FN
+            sf_dtype = cutlass.Float8E4M3FN
+            sf_vec_size = 16
+            packed_k_multiplier = 2
+            k_alignment = 32
+            ab_assumed_align = 32
+            sf_assumed_align = 16
+            mma_tiler_k = 256
+            mma_inst_shape_k = 128
+            allow_unswapped_small_m_fallback = False
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0,
+                                                 fp4_scale_infer_shape), ),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
+        class CuteDSLMXFP8RubinLinear(CuteDSLBlockScaledRubinLinear):
+            """SM107 MXFP8 runner backed by the persistent dense kernel."""
+
+            kernel_cache = dict()
+            gemm_name = "MXFP8"
+            a_dtype = cutlass.Float8E4M3FN
+            b_dtype = cutlass.Float8E4M3FN
+            sf_dtype = cutlass.Float8E8M0FNU
+            sf_vec_size = 32
+            packed_k_multiplier = 1
+            k_alignment = 16
+            ab_assumed_align = 16
+            sf_assumed_align = 16
+            mma_tiler_k = 128
+            mma_inst_shape_k = 64
+            allow_unswapped_small_m_fallback = True
+            raster_order_candidates = ("m", "n")
+            mixed_scheduler_mode_candidates = ("static", "clc_dynamic")
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0,
+                                                 mxfp8_scale_infer_shape), ),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
+        class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
+            kernel_cache = dict()
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                                  ConstraintSpec(5, 0, infer_output_m_shape)),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
+        @torch.library.custom_op("trtllm::cute_dsl_mxfp8_gemm_rubin",
+                                 mutates_args=(),
+                                 device_types="cuda")
+        def cute_dsl_mxfp8_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales."""
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
+                    f"{output_dtype}")
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL MXFP8 SM107 GEMM requires SM107, got SM{sm_version}."
+                )
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "CuteDSL MXFP8 input and weight must be FP8 E4M3")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
+
+            alpha = torch.ones((), dtype=torch.float32, device=input.device)
+            runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
+                                             use_tvm_ffi=use_tvm_ffi)
+            inputs = [input, weight, input_scale, weight_scale, alpha]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_mxfp8_gemm_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            return runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake("trtllm::cute_dsl_mxfp8_gemm_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            shape = list(mat_a.shape)
+            shape[-1] = mat_b.shape[-2]
+            return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
+            mutates_args=(),
+            device_types="cuda",
+        )
+        def cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            cu_q_seqlens: torch.Tensor,
+            kv_cache_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            quant_scale_qkv: torch.Tensor,
+            eps: float,
+        ) -> torch.Tensor:
+            """Run the SM107 DSv4 q_b GEMM + RMSNorm + RoPE + FP8 fusion."""
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"DSv4 q_b GEMM fusion requires SM107, got SM{sm_version}.")
+            if input.dim() != 2 or weight.dim() != 2:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects 2D input and weight")
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects FP8 E4M3 input and weight")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects UE8M0 uint8 scales")
+            if input.shape[1] != weight.shape[1] or input.shape[1] % 128 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion requires matching K dimensions divisible by 128"
+                )
+            if weight.shape[0] % 512 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion requires N divisible by 512")
+            if not input.is_contiguous() or not weight.is_contiguous():
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects contiguous input and weight")
+            if not input_scale.is_contiguous(
+            ) or not weight_scale.is_contiguous():
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects contiguous scale buffers")
+            if cos_sin_cache.dtype != torch.float32 or cos_sin_cache.numel(
+            ) % 128 != 0:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects an FP32 cos/sin cache with 128 floats per position"
+                )
+            if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects int32 sequence metadata")
+            if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+                raise ValueError(
+                    "cu_q_seqlens must contain batch_size + 1 entries")
+            if kv_cache_lengths.numel() > 128:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion supports at most 128 sequences")
+            if position_ids.dtype != torch.int32 or position_ids.numel(
+            ) != input.shape[0]:
+                raise ValueError(
+                    "DSv4 q_b GEMM fusion expects one int32 position per token")
+            if quant_scale_qkv.dtype != torch.float32 or quant_scale_qkv.numel(
+            ) < 1:
+                raise ValueError(
+                    "quant_scale_qkv must be a non-empty FP32 tensor")
+
+            output = input.new_empty((input.shape[0], weight.shape[0]),
+                                     dtype=torch.float8_e4m3fn)
+            compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+                mma_inst_tile=(256, 256),
+                cluster_shape_mn=(4, 2),
+                fallback_cluster_shape_mn=(2, 1),
+                store_mode="stg256",
+                swizzle_size=1,
+                raster_along_m=True,
+                with_quant_scale=True,
+            )
+
+            from cutlass.cute.runtime import from_dlpack
+
+            def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
+                return from_dlpack(tensor,
+                                   assumed_align=alignment,
+                                   enable_tvm_ffi=True)
+
+            compiled(
+                _from_dlpack(input),
+                _from_dlpack(
+                    input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                _from_dlpack(weight),
+                _from_dlpack(
+                    weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                _from_dlpack(output, 32),
+                _from_dlpack(cos_sin_cache.reshape(1, -1)),
+                _from_dlpack(cu_q_seqlens, 4),
+                _from_dlpack(kv_cache_lengths, 4),
+                _from_dlpack(position_ids.reshape(-1), 4),
+                _from_dlpack(quant_scale_qkv.reshape(-1), 4),
+                eps,
+                cuda.CUstream(
+                    torch.cuda.current_stream(input.device).cuda_stream),
+            )
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            cu_q_seqlens: torch.Tensor,
+            kv_cache_lengths: torch.Tensor,
+            position_ids: torch.Tensor,
+            quant_scale_qkv: torch.Tensor,
+            eps: float,
+        ) -> torch.Tensor:
+            return input.new_empty((input.shape[0], weight.shape[0]),
+                                   dtype=torch.float8_e4m3fn)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_gemm_inplace_rubin",
+            mutates_args=("output_tensor", ),
+            device_types="cuda",
+            schema=
+            "(Tensor input, Tensor weight, Tensor input_scale, Tensor weight_scale, Tensor alpha, "
+            "ScalarType output_dtype, bool to_userbuffers, bool use_tvm_ffi, "
+            "Tensor(a!) output_tensor, SymInt partition_id, str? precomputed_tactic=None) -> ()"
+        )
+        def cute_dsl_nvfp4_gemm_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            to_userbuffers: bool,
+            use_tvm_ffi: bool,
+            output_tensor: torch.Tensor,
+            partition_id: int,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            """SM107 NVFP4 GEMM variant that writes into output_tensor."""
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL NVFP4 SM107 backend requires SM107, but got SM{sm_version}."
+                )
+            if partition_id < 0 or partition_id >= 2:
+                raise ValueError(
+                    "partition_id must be 0 or 1 when output_tensor is provided."
+                )
+
+            runner = CuteDSLNVFP4InplaceRubinLinear(output_dtype,
+                                                    to_userbuffers, use_tvm_ffi)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output_tensor
+            ]
+            if precomputed_tactic is None:
+                _, best_tactic = AutoTuner.get().choose_one(
+                    "trtllm::cute_dsl_nvfp4_inplace_gemm_rubin",
+                    [runner],
+                    runner.__class__.tuning_config,
+                    inputs,
+                    partition_id=partition_id,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+            runner(inputs, tactic=best_tactic, partition_id=partition_id)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_gemm_inplace_rubin")
+        def _(
+            mat_a: torch.Tensor,
+            mat_b: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            to_userbuffers: bool,
+            use_tvm_ffi: bool,
+            output_tensor: torch.Tensor,
+            partition_id: int,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            return None
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin",
+            mutates_args=("output_tensor", ),
+            device_types="cuda",
+            schema=
+            "(Tensor input, Tensor weight_0, Tensor weight_1, Tensor input_scale, "
+            "Tensor weight_scale_0, Tensor weight_scale_1, Tensor alpha, "
+            "ScalarType output_dtype, bool to_userbuffers, bool use_tvm_ffi, "
+            "Tensor(a!) output_tensor) -> ()")
+        @_with_input_cuda_device
+        def cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            to_userbuffers: bool,
+            use_tvm_ffi: bool,
+            output_tensor: torch.Tensor,
+        ) -> None:
+            """Tune and launch both locality domain NVFP4 GEMM partitions on SM107."""
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL NVFP4 SM107 backend requires SM107, but got SM{sm_version}."
+                )
+            if input.dim() != 2 or weight_0.dim() != 2 or weight_1.dim() != 2:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM input and weight shards must be 2-D."
+                )
+            expected_dtypes = (
+                ("input", input, (torch.uint8, )),
+                ("weight_0", weight_0, (torch.uint8, )),
+                ("weight_1", weight_1, (torch.uint8, )),
+                ("input_scale", input_scale, (torch.uint8,
+                                              torch.float8_e4m3fn)),
+                ("weight_scale_0", weight_scale_0, (torch.uint8,
+                                                    torch.float8_e4m3fn)),
+                ("weight_scale_1", weight_scale_1, (torch.uint8,
+                                                    torch.float8_e4m3fn)),
+                ("alpha", alpha, (torch.float32, )),
+                ("output_tensor", output_tensor, (torch.bfloat16, )),
+            )
+            for tensor_name, tensor, allowed_dtypes in expected_dtypes:
+                if tensor.dtype not in allowed_dtypes:
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM {tensor_name} must have dtype "
+                        f"in {allowed_dtypes}, got {tensor.dtype}.")
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM output_dtype must be bfloat16, got "
+                    f"{output_dtype}.")
+            if weight_0.shape != weight_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM weight shards must have identical shapes, "
+                    f"got {tuple(weight_0.shape)} and {tuple(weight_1.shape)}.")
+            if weight_0.dtype != weight_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM weight shards must have identical dtypes, "
+                    f"got {weight_0.dtype} and {weight_1.dtype}.")
+            if weight_scale_0.shape != weight_scale_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM weight-scale shards must have identical "
+                    f"shapes, got {tuple(weight_scale_0.shape)} and "
+                    f"{tuple(weight_scale_1.shape)}.")
+            if weight_scale_0.dtype != weight_scale_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM weight-scale shards must have identical "
+                    f"dtypes, got {weight_scale_0.dtype} and "
+                    f"{weight_scale_1.dtype}.")
+            if input.shape[1] != weight_0.shape[1]:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM input and weight shards must have the same "
+                    f"packed K dimension, got {input.shape[1]} and "
+                    f"{weight_0.shape[1]}.")
+            packed_k = input.shape[1]
+            real_k = packed_k * 2
+            if real_k % 32 != 0:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM K must be a multiple of 32 elements for "
+                    f"16-byte alignment, got K={real_k}.")
+            shard_n = weight_0.shape[0]
+            if shard_n % 8 != 0:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM per-shard N must be a multiple of 8 "
+                    f"elements for 16-byte output alignment, got N={shard_n}.")
+            expected_output_shape = (input.shape[0],
+                                     weight_0.shape[0] + weight_1.shape[0])
+            if output_tensor.shape != expected_output_shape:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM output shape must be [M, N0 + N1], "
+                    f"expected {expected_output_shape}, got "
+                    f"{tuple(output_tensor.shape)}.")
+            if output_tensor.dtype != output_dtype:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM output tensor dtype must match output_dtype, "
+                    f"got {output_tensor.dtype} and {output_dtype}.")
+            tensors = tuple(tensor for _, tensor, _ in expected_dtypes)
+            if any(tensor.device != input.device for tensor in tensors[1:]):
+                raise ValueError(
+                    "locality domain NVFP4 GEMM operands must be on the input device, got "
+                    f"{[tensor.device for tensor in tensors]}.")
+            for tensor_name, tensor, required_alignment in (
+                ("input", input, 32),
+                ("weight_0", weight_0, 32),
+                ("weight_1", weight_1, 32),
+                ("output_tensor", output_tensor, 16),
+            ):
+                if not tensor.is_contiguous():
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM {tensor_name} must be contiguous, got "
+                        f"shape={tuple(tensor.shape)} and "
+                        f"stride={tuple(tensor.stride())}.")
+                if tensor.data_ptr() % required_alignment != 0:
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM {tensor_name} data pointer must be "
+                        f"{required_alignment}-byte aligned, got "
+                        f"data_ptr={tensor.data_ptr()}.")
+            for tensor_name, scale in (
+                ("input_scale", input_scale),
+                ("weight_scale_0", weight_scale_0),
+                ("weight_scale_1", weight_scale_1),
+            ):
+                # Validate the actual flat view used by the runner. reshape()
+                # may canonicalize a multi-dimensional view, but a strided
+                # one-dimensional view can remain non-contiguous.
+                flattened_scale = scale.reshape(-1)
+                if not flattened_scale.is_contiguous():
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM flattened {tensor_name} must be "
+                        "contiguous, got "
+                        f"shape={tuple(flattened_scale.shape)} and "
+                        f"stride={tuple(flattened_scale.stride())}.")
+                if flattened_scale.data_ptr() % 16 != 0:
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM {tensor_name} data pointer must be "
+                        "16-byte aligned after flattening, got "
+                        f"data_ptr={flattened_scale.data_ptr()}.")
+
+            sf_k = pad_up(real_k // 16, 4)
+            expected_input_scale_numel = pad_up(input.shape[0], 128) * sf_k
+            expected_weight_scale_numel = pad_up(shard_n, 128) * sf_k
+            if input_scale.numel() != expected_input_scale_numel:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM input scale size mismatch: expected "
+                    f"{expected_input_scale_numel}, got {input_scale.numel()}.")
+            for tensor_name, weight_scale in (
+                ("weight_scale_0", weight_scale_0),
+                ("weight_scale_1", weight_scale_1),
+            ):
+                if weight_scale.numel() != expected_weight_scale_numel:
+                    raise ValueError(
+                        f"locality domain NVFP4 GEMM {tensor_name} size mismatch: expected "
+                        f"{expected_weight_scale_numel}, got "
+                        f"{weight_scale.numel()}.")
+            if alpha.numel() != 1:
+                raise ValueError(
+                    "locality domain NVFP4 GEMM alpha must contain one element, got "
+                    f"{alpha.numel()}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            op_runner = CuteDSLNVFP4InplaceRubinLinear(output_dtype,
+                                                       to_userbuffers,
+                                                       use_tvm_ffi)
+            inputs = [
+                input,
+                weight_0,
+                input_scale,
+                weight_scale_0,
+                alpha,
+                output_tensor,
+            ]
+
+            def launch_partition(partition_id: int,
+                                 partition_inputs: List[torch.Tensor],
+                                 tactic) -> None:
+                if partition_id == 0:
+                    weight = weight_0
+                    weight_scale = weight_scale_0
+                else:
+                    weight = weight_1
+                    weight_scale = weight_scale_1
+                torch.ops.trtllm.cute_dsl_nvfp4_gemm_inplace_rubin(
+                    partition_inputs[0],
+                    weight,
+                    partition_inputs[2],
+                    weight_scale,
+                    partition_inputs[4],
+                    output_dtype,
+                    to_userbuffers,
+                    use_tvm_ffi,
+                    partition_inputs[5],
+                    partition_id,
+                    repr(tactic),
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                "trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin",
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.__class__.tuning_config,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            output_dtype: torch.dtype,
+            to_userbuffers: bool,
+            use_tvm_ffi: bool,
+            output_tensor: torch.Tensor,
+        ) -> None:
+            return None
+
+        class CuteDSLFp8RubinPerTensorGemmRunner(TunableRunner):
+            kernel_class = SM107PersistentDenseGemmKernel
+            kernel_cache = dict()
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 1, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                use_cold_l2_cache=True,
+            )
+
+            def __init__(self,
+                         output_dtype: torch.dtype = torch.bfloat16,
+                         use_tvm_ffi: bool = True):
+                super().__init__()
+                if output_dtype not in [torch.bfloat16, torch.float16]:
+                    raise ValueError(
+                        f"CuteDSL FP8 Per Tensor GEMM only supports float16/bfloat16 output, got {output_dtype}"
+                    )
+                self.output_dtype = output_dtype
+                self.use_tvm_ffi = use_tvm_ffi
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[int]:
+
+                if (sm_version := get_sm_version()) != 107:
+                    logger.debug(
+                        f"CuteDSL: SM version {sm_version} is not supported. "
+                        f"CuteDSL FP8 Per Tensor GEMM only supports SM 107. Skipping all tactics."
+                    )
+                    return []
+                # [m, k]
+                m, k, n = inputs[0].shape[0], inputs[0].shape[1], inputs[
+                    1].shape[0]
+                # m,k
+                a_major = "k"
+                # n, k
+                b_major = "k"
+                # m, n
+                c_major = "n"
+
+                use_2cta_instrs_candi = [False, True]
+                # mnk
+                mma_tiler_m_candi = [128, 256, 512]
+                mma_tiler_n_candi = [
+                    128, 256
+                ]  # recommended tile sizes for case without blockscaling
+                mma_tiler_k_candi = [128]  # for 2xfp8
+                mma_tiler_candi = list(
+                    itertools.product(mma_tiler_m_candi, mma_tiler_n_candi,
+                                      mma_tiler_k_candi))
+                # mnk
+                mma_inst_shape_m_candi = [128, 256, 512]
+                mma_inst_shape_n_candi = [
+                    128, 256
+                ]  # recommended tile sizes for case without blockscaling
+                mma_inst_shape_k_candi = [64]  # for 2xfp8
+                mma_inst_shape_candi = list(
+                    itertools.product(mma_inst_shape_m_candi,
+                                      mma_inst_shape_n_candi,
+                                      mma_inst_shape_k_candi))
+                cluster_shape_mn_candi = [
+                    (1, 1),
+                    (1, 2),
+                    (1, 4),
+                    (2, 1),
+                    (2, 2),
+                    (2, 4),
+                    (4, 1),
+                    (4, 2),
+                    (4, 4),
+                ]
+                use_tma_store_candi = [True, False]
+                raster_along_candi = ["m", "n"]
+                valid_tactics = []
+                for use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn, use_tma_store, raster_along in itertools.product(
+                        use_2cta_instrs_candi, mma_tiler_candi,
+                        mma_inst_shape_candi, cluster_shape_mn_candi,
+                        use_tma_store_candi, raster_along_candi):
+                    gemm = self.__class__.kernel_class(
+                        cutlass.Float32,  # acc_dtype
+                        use_2cta_instrs,  # use_2cta_instrs
+                        mma_tiler,  # mma_tiler
+                        mma_inst_shape,  # mma_insta_shape
+                        cluster_shape_mn,  # cluster_shape_mn
+                        use_tma_store,  # use_tma_store
+                        1,  # swizzle_size
+                        raster_along,  # raster_along
+                    )
+                    can_implement = gemm.can_implement(
+                        (m, n, k, 1),
+                        cutlass.Float8E4M3FN,  # a_dtype,
+                        cutlass.Float8E4M3FN,  # b_dtype,
+                        cutlass.BFloat16 if self.output_dtype == torch.bfloat16
+                        else cutlass.Float16,  # c_dtype,
+                        a_major,
+                        b_major,
+                        c_major,
+                    )
+                    if can_implement:
+                        valid_tactics.append(
+                            (use_2cta_instrs, mma_tiler, mma_inst_shape,
+                             cluster_shape_mn, use_tma_store, raster_along))
+                return valid_tactics
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+            ) -> torch.Tensor:
+                """
+                Performs fp8 per-tensor gemm operation using CuTe DSL.
+
+                Args:
+                    inputs (List[torch.Tensor]):
+                        inputs[0]: Input tensor of shape (m, k), dtype: fp8.
+                        inputs[1]: Weight tensor of shape (n, k), dtype: fp8.
+                        inputs[2]: Input scalar scale, dtype: fp32.
+                        inputs[3]: Weight scalar scale, dtype: fp32.
+                    tactic: Tiling and cluster strategy, typically a tuple (use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn, use_tma_store, raster_along).
+
+                Returns:
+                    torch.Tensor: Output tensor of shape (m, n), dtype: bf16/f16.
+                """
+                if isinstance(tactic, tuple):
+                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn, use_tma_store, raster_along = tactic
+                else:
+                    # fallback to default tactic
+                    use_2cta_instrs, mma_tiler, mma_inst_shape, cluster_shape_mn, use_tma_store, raster_along = [
+                        True,
+                        (512, 256, 128),
+                        (256, 256, 64),
+                        (2, 1),
+                        True,
+                        "m",
+                    ]
+
+                a_tensor, b_tensor, a_scale_tensor, b_scale_tensor = inputs
+
+                if a_scale_tensor.numel() != 1:
+                    raise ValueError(
+                        f"CuteDSL: input scale size mismatch. "
+                        f"Expected 1, got {a_scale_tensor.numel()}")
+                if b_scale_tensor.numel() != 1:
+                    raise ValueError(
+                        f"CuteDSL: weight scale size mismatch. "
+                        f"Expected 1, got {b_scale_tensor.numel()}")
+
+                m, n, k = a_tensor.shape[0], b_tensor.shape[0], a_tensor.shape[
+                    1]
+
+                c_tensor = torch.empty(*(m, n),
+                                       dtype=self.output_dtype,
+                                       device="cuda")
+                c_tmp = c_tensor.view((1, m, n))
+                c_tmp = c_tmp.permute(1, 2, 0)
+
+                if not self.use_tvm_ffi:
+                    a_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        a_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    b_ptr = make_ptr(
+                        cutlass.Float8E4M3FN,
+                        b_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    c_cute_tensor = cute.runtime.from_dlpack(
+                        c_tmp).mark_layout_dynamic(leading_dim=1)
+                    a_scale_ptr = make_ptr(
+                        cutlass.Float32,
+                        a_scale_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                    )
+                    b_scale_ptr = make_ptr(
+                        cutlass.Float32,
+                        b_scale_tensor.data_ptr(),
+                        cute.AddressSpace.gmem,
+                    )
+                    # get stream
+                    stream = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream)
+
+                cache_key = (
+                    use_2cta_instrs,
+                    mma_tiler,
+                    mma_inst_shape,
+                    cluster_shape_mn,
+                    use_tma_store,
+                    raster_along,
+                    self.use_tvm_ffi,
+                    self.output_dtype,
+                )
+                if cache_key not in self.__class__.kernel_cache:
+                    if self.use_tvm_ffi:
+                        a_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            a_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        b_ptr = make_ptr(
+                            cutlass.Float8E4M3FN,
+                            b_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        c_cute_tensor = cute.runtime.from_dlpack(
+                            c_tmp).mark_layout_dynamic(leading_dim=1)
+                        a_scale_ptr = make_ptr(
+                            cutlass.Float32,
+                            a_scale_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                        )
+                        b_scale_ptr = make_ptr(
+                            cutlass.Float32,
+                            b_scale_tensor.data_ptr(),
+                            cute.AddressSpace.gmem,
+                        )
+                        # make faked stream for TVM FFI
+                        stream = cute.runtime.make_fake_stream(
+                            use_tvm_ffi_env_stream=True)
+
+                    gemm = self.__class__.kernel_class(
+                        cutlass.Float32,  # acc_dtype
+                        use_2cta_instrs,  # use_2cta_instrs
+                        mma_tiler,  # mma_tiler
+                        mma_inst_shape,  # mma_insta_shape
+                        cluster_shape_mn,  # cluster_shape_mn
+                        use_tma_store,  # use_tma_store
+                        1,  # swizzle_size
+                        raster_along,  # raster_along
+                    )
+                    # Compute max active clusters on current device
+                    hardware_info = cutlass.utils.HardwareInfo()
+                    max_active_clusters = hardware_info.get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1])
+
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        m,
+                        n,
+                        k,
+                        a_ptr,
+                        b_ptr,
+                        a_scale_ptr,
+                        b_scale_ptr,
+                        c_cute_tensor,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        options="--opt-level 2 --enable-tvm-ffi"
+                        if self.use_tvm_ffi else "--opt-level 2",
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                # launch gemm kernel
+                if self.use_tvm_ffi:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        a_tensor.data_ptr(),
+                        b_tensor.data_ptr(),
+                        a_scale_tensor.data_ptr(),
+                        b_scale_tensor.data_ptr(),
+                        c_tmp,
+                    )
+                else:
+                    compiled_gemm(
+                        m,
+                        n,
+                        k,
+                        a_ptr,
+                        b_ptr,
+                        a_scale_ptr,
+                        b_scale_ptr,
+                        c_cute_tensor,
+                        stream=stream,
+                    )
+                return c_tensor
+
+        @torch.library.custom_op("trtllm::cute_dsl_fp8_per_tensor_gemm_rubin",
+                                 mutates_args=(),
+                                 device_types="cuda")
+        def cute_dsl_fp8_per_tensor_gemm_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            if output_dtype not in [torch.bfloat16, torch.float16]:
+                raise ValueError(
+                    f"CuteDSL fp8 per-tensor gemm only supports bfloat16/float16 output, got {output_dtype}"
+                )
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL fp8 per-tensor gemm only supports SM107.")
+
+            tuner = AutoTuner.get()
+
+            runner = CuteDSLFp8RubinPerTensorGemmRunner(
+                output_dtype=output_dtype, use_tvm_ffi=use_tvm_ffi)
+
+            inputs = [input, weight, input_scale, weight_scale]
+
+            _, best_tactic = tuner.choose_one(
+                "trtllm::cute_dsl_fp8_per_tensor_gemm_rubin::gemm",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            output = runner(inputs, tactic=best_tactic)
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_fp8_per_tensor_gemm_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> torch.Tensor:
+            # input: [m, k]
+            shape = list(input.shape)
+            # weight: [n, k]
+            shape[-1] = weight.shape[-2]
+            ret = input.new_empty(shape, dtype=output_dtype)
+            return ret
+
         # Rubin (SM107) MOE Grouped GEMM Support
         # ====================================================================
         # The following code provides CuteDSL NVFP4 grouped GEMM kernels for
