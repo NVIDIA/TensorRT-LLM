@@ -28,8 +28,12 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.modules.mlp import (
+    MLP,
+    fused_nvfp4_gemm_gelu,
+    is_nvfp4_gemm_gelu_fusion_eligible,
+)
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh, maybe_compile
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
@@ -37,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmb
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # HF checkpoint key → our module attribute name
@@ -324,7 +329,7 @@ class FluxTransformerBlock(nn.Module):
             hidden_size=dim,
             intermediate_size=int(dim * 4.0),
             bias=True,
-            activation=_gelu_tanh_eager,
+            activation=gelu_tanh,
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
@@ -334,7 +339,7 @@ class FluxTransformerBlock(nn.Module):
             hidden_size=dim,
             intermediate_size=int(dim * 4.0),
             bias=True,
-            activation=_gelu_tanh_eager,
+            activation=gelu_tanh,
             dtype=dtype,
             config=config,
             layer_idx=layer_idx,
@@ -466,6 +471,8 @@ class FluxSingleTransformerBlock(nn.Module):
             reduce_output=False,
         )
         self.act_mlp = _gelu_tanh_eager
+        self._use_fused_mlp_gelu = False
+        self._share_nvfp4_quantize = False
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
         self.attn = FluxJointAttention(
@@ -494,6 +501,47 @@ class FluxSingleTransformerBlock(nn.Module):
             # need explicit shard because we are aligned on head boundaries
             attn_shard=(self.attn.local_q_dim_start, self.attn.local_q_dim_end),
         )
+
+    def configure_fused_mlp_gelu(self) -> bool:
+        """Enable the fused NVFP4 MLP projection and GELU path after loading."""
+        self._use_fused_mlp_gelu = bool(
+            is_nvfp4_gemm_gelu_fusion_eligible(self.proj_mlp)
+            and hasattr(getattr(self.proj_mlp, "quant_method", None), "_input_prepare")
+        )
+        return self._use_fused_mlp_gelu
+
+    def _project_mlp(
+        self, projection_input: Union[torch.Tensor, Fp4QuantizedTensor]
+    ) -> torch.Tensor:
+        if self._use_fused_mlp_gelu:
+            output = fused_nvfp4_gemm_gelu(self.proj_mlp, projection_input)
+            assert isinstance(output, torch.Tensor)
+            return output
+        return self.act_mlp(self.proj_mlp(projection_input))
+
+    def configure_shared_nvfp4_quantize(self) -> bool:
+        """Enable one activation quantization for MLP and fused QKV projections.
+
+        This runs once after weight loading so scale comparisons never enter
+        the compiled forward path. Sharing is safe only for static NVFP4
+        projections with identical input scales and no pre-quant scaling.
+        """
+        qkv_proj = getattr(self.attn, "qkv_proj", None)
+        projections = (self.proj_mlp, qkv_proj)
+        self._share_nvfp4_quantize = bool(
+            self.attn.fuse_qk_norm_rope
+            and qkv_proj is not None
+            and all(
+                getattr(projection, "has_nvfp4_activation_quantization", False)
+                and projection.input_scale is not None
+                and projection.pre_quant_scale is None
+                and not projection.force_dynamic_quantization
+                for projection in projections
+            )
+            and self.proj_mlp.scaling_vector_size == qkv_proj.scaling_vector_size
+            and torch.equal(self.proj_mlp.input_scale, qkv_proj.input_scale)
+        )
+        return self._share_nvfp4_quantize
 
     def forward(
         self,
@@ -525,13 +573,29 @@ class FluxSingleTransformerBlock(nn.Module):
         # AdaLN
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
 
+        projection_input = norm_hidden_states
+        if self._share_nvfp4_quantize:
+            input_shape = norm_hidden_states.shape
+            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+                norm_hidden_states.reshape(-1, input_shape[-1]),
+                self.proj_mlp.input_scale,
+                self.proj_mlp.scaling_vector_size,
+                False,
+            )
+            projection_input = Fp4QuantizedTensor(
+                fp4.reshape(*input_shape[:-1], fp4.shape[-1]),
+                sf,
+                is_sf_swizzled=False,
+            )
+
         # MLP branch
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+        mlp_hidden_states = self._project_mlp(projection_input)
 
         # Attention branch
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
+            qkv_hidden_states=(projection_input if self._share_nvfp4_quantize else None),
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
@@ -594,7 +658,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         num_attention_heads = getattr(pretrained_config, "num_attention_heads", 24)
         attention_head_dim = getattr(pretrained_config, "attention_head_dim", 128)
         in_channels = getattr(pretrained_config, "in_channels", 64)
-        out_channels = getattr(pretrained_config, "out_channels", in_channels)
+        out_channels = getattr(pretrained_config, "out_channels", None) or in_channels
         num_layers = getattr(pretrained_config, "num_layers", 19)
         num_single_layers = getattr(pretrained_config, "num_single_layers", 38)
         joint_attention_dim = getattr(pretrained_config, "joint_attention_dim", 4096)
@@ -873,6 +937,36 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         # Remap HF checkpoint keys to our module attribute names
         weights = _remap_checkpoint_keys(weights)
 
+        static_e4m3_attention_layers = 0
+        for module_name, module in self.named_modules():
+            if not isinstance(module, FluxJointAttention):
+                continue
+            if not module.requires_static_e4m3_attention:
+                continue
+
+            scale_keys = {
+                operand_name: f"{module_name}.{operand_name}_bmm_quantizer._amax"
+                for operand_name in ("q", "k", "v")
+            }
+            missing = [key for key in scale_keys.values() if key not in weights]
+            if missing:
+                raise ValueError(
+                    "Static CUTEDSL FP8 attention requires ModelOpt --quantize-mha "
+                    f"Q/K/V scales for {module_name}; missing keys: {missing}."
+                )
+            module.load_static_e4m3_attention_scales(
+                weights[scale_keys["q"]],
+                weights[scale_keys["k"]],
+                weights[scale_keys["v"]],
+            )
+            static_e4m3_attention_layers += 1
+
+        if static_e4m3_attention_layers:
+            logger.info(
+                "Loaded calibrated static E4M3 Q/K/V attention scales for "
+                f"{static_e4m3_attention_layers} FLUX layers"
+            )
+
         # Map fused QKV layer names to original HF checkpoint names
         # HF checkpoint has separate to_q, to_k, to_v / add_q_proj, add_k_proj, add_v_proj
         # We fuse them into qkv_proj / add_qkv_proj for better performance
@@ -937,3 +1031,21 @@ class FluxTransformer2DModel(BaseDiffusionModel):
         for _, module in self.named_modules():
             if isinstance(module, Linear):
                 module.post_load_weights()
+
+        fused_mlp_gelu_blocks = sum(
+            block.configure_fused_mlp_gelu() for block in self.single_transformer_blocks
+        )
+        if fused_mlp_gelu_blocks:
+            logger.info(
+                "Fusing NVFP4 MLP projection and GELU in "
+                f"{fused_mlp_gelu_blocks} FLUX single-stream blocks"
+            )
+
+        shared_quantize_blocks = sum(
+            block.configure_shared_nvfp4_quantize() for block in self.single_transformer_blocks
+        )
+        if shared_quantize_blocks:
+            logger.info(
+                "Sharing MLP/QKV NVFP4 activation quantization in "
+                f"{shared_quantize_blocks} FLUX single-stream blocks"
+            )

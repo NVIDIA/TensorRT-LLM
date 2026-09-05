@@ -100,6 +100,30 @@ FLUX_FEATURE_PROFILES = (
     ),
 )
 
+FLUX_STATIC_QUANT_ACCURACY_CASES = (
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
+        golden_file="flux1_nvfp4_static_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static-mha-quantize",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
+        golden_file="flux1_nvfp4_static_mha_quantize_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+            mha_quantize=True,
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+)
+
 
 def _build_flux_accuracy_cases():
     cases = []
@@ -123,6 +147,9 @@ def _build_flux_accuracy_cases():
                     id=case_id,
                 )
             )
+    for case in FLUX_STATIC_QUANT_ACCURACY_CASES:
+        _validate_single_feature_config(case.features, FLUX_SUPPORTED_FEATURES, "FLUX")
+        cases.append(pytest.param(case, id=case.id))
     return cases
 
 

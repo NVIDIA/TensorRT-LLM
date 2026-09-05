@@ -27,7 +27,7 @@ import yaml
 from pydantic import model_validator
 
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.llmapi.llm_args import Field
+from tensorrt_llm.llmapi.llm_args import Field, Nvfp4GemmConfig
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -133,6 +133,7 @@ class AttentionConfig(StrictBaseModel):
         }
         CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("fp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 0)),
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
@@ -675,6 +676,11 @@ class VisualGenArgs(StrictBaseModel):
             "'dynamic': True}``). Dict-form parsing happens lazily in "
             "DiffusionPipelineConfig.from_pretrained."
         ),
+    )
+    nvfp4_gemm_config: Nvfp4GemmConfig = Field(
+        default_factory=Nvfp4GemmConfig,
+        status="prototype",
+        description="NVFP4 GEMM backend configuration.",
     )
     compilation_config: CompilationConfig = Field(
         default_factory=CompilationConfig,

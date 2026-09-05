@@ -18,13 +18,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     _COMPILE_CACHE,
+    CuTeDSLAttention,
     _quantize_blockscaled_one,
     _quantize_fp8_v,
     clear_cute_dsl_fmha_cache,
     cute_dsl_fmha_fwd,
 )
+from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 
 def _require_supported_gpu_arch() -> str:
@@ -443,3 +446,84 @@ def test_cute_dsl_fmha_blockscaled_forward_skip_softmax(
         out_skip.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
     ).item()
     assert cos_sim > 0.95, f"Cosine similarity {cos_sim:.6f} below threshold"
+
+
+def test_cute_dsl_static_fp8_qkv_forward() -> None:
+    """Dense E4M3 Q/K/V uses calibrated scales without dynamic reductions."""
+    _require_supported_gpu_arch()
+
+    device = torch.device("cuda:0")
+    batch_size, seq_len, num_heads, head_dim = 1, 256, 4, 128
+    scale_values = {"q": 0.01, "k": 0.0125, "v": 0.02}
+    scale_tensors = {
+        name: torch.tensor(value, dtype=torch.float32, device=device)
+        for name, value in scale_values.items()
+    }
+    backend = CuTeDSLAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="fp8",
+            v_dtype="fp8",
+            q_block_size=0,
+            k_block_size=0,
+            v_block_size=0,
+        ),
+    )
+
+    torch.manual_seed(321)
+    packed_qkv = torch.randn(
+        batch_size,
+        seq_len,
+        num_heads,
+        3 * head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    q, k, v = packed_qkv.split(head_dim, dim=-1)
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+
+    q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        q.contiguous(), scale_tensors["q"]
+    )
+    k_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        k.contiguous(), scale_tensors["k"]
+    )
+    v_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        v.contiguous(), scale_tensors["v"]
+    )
+    out_ref = _sdpa_ref(
+        q_fp8.float().mul(scale_values["q"]).to(torch.bfloat16),
+        k_fp8.float().mul(scale_values["k"]).to(torch.bfloat16),
+        v_fp8.float().mul(scale_values["v"]).to(torch.bfloat16),
+        False,
+        head_dim**-0.5,
+    )
+
+    out = backend(
+        q,
+        k,
+        v,
+        attention_mask=PredefinedAttentionMask.FULL,
+        static_q_scale=scale_tensors["q"],
+        static_k_scale=scale_tensors["k"],
+        static_v_scale=scale_tensors["v"],
+        scale_q=scale_values["q"],
+        scale_k=scale_values["k"],
+        scale_v=scale_values["v"],
+    )
+    out_prequantized = backend(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        attention_mask=PredefinedAttentionMask.FULL,
+        scale_q=scale_values["q"],
+        scale_k=scale_values["k"],
+        scale_v=scale_values["v"],
+    )
+
+    assert torch.isfinite(out).all(), "Static FP8 FMHA produced NaN / Inf"
+    assert out_prequantized.dtype == torch.bfloat16
+    torch.testing.assert_close(out, out_ref, atol=8e-2, rtol=8e-2)
+    torch.testing.assert_close(out_prequantized, out, atol=0, rtol=0)
