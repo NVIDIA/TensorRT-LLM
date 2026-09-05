@@ -21,7 +21,7 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,6 +54,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    MoEActivation,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -90,16 +91,20 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    NVFP4CuteDslFusedMoEMethod,
+    NVFP4CutlassFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
+from tensorrt_llm.logger import logger as trtllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -560,8 +565,14 @@ def _make_trtllm_gen_moe(
     top_k: int = 2,
     hidden_size: int = 512,
     intermediate_size: int = 256,
+    bias: bool = False,
+    activation: Optional[MoEActivation] = None,
 ) -> TRTLLMGenFusedMoE:
-    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override."""
+    """A single-rank TRTLLM-Gen MoE, with or without the SiTu override.
+
+    `activation`, when given, replaces the SiTu-or-plain-SwiGLU choice that
+    `situ` makes.
+    """
     pretrained_config = PretrainedConfig()
     pretrained_config.num_experts = num_experts
     pretrained_config.hidden_size = hidden_size
@@ -573,6 +584,14 @@ def _make_trtllm_gen_moe(
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         moe_backend="TRTLLM",
     )
+    if activation is None:
+        # The soft-caps go out as scalars; the backend's declared
+        # PER_EXPERT_TENSOR shape is what broadcasts them per slot.
+        activation = (
+            SiTuActivation(gate_softcap=_SITU_GATE_ALPHA, linear_softcap=_SITU_LINEAR_BETA)
+            if situ
+            else DEFAULT_MOE_ACTIVATION
+        )
     return TRTLLMGenFusedMoE(
         routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
         num_experts=num_experts,
@@ -583,49 +602,73 @@ def _make_trtllm_gen_moe(
         model_config=model_config,
         init_load_balancer=False,
         weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-        # The soft-caps go out as scalars; the backend's declared
-        # PER_EXPERT_TENSOR shape is what broadcasts them per slot.
-        activation=(
-            SiTuActivation(
-                gate_softcap=_SITU_GATE_ALPHA,
-                linear_softcap=_SITU_LINEAR_BETA,
-            )
-            if situ
-            else DEFAULT_MOE_ACTIVATION
-        ),
+        bias=bias,
+        activation=activation,
     )
 
 
-def _make_loaded_nvfp4_trtllm_gen_moe(situ: bool) -> TRTLLMGenFusedMoE:
-    """The same MoE with NVFP4 weights and quant scales actually loaded.
+# (num_experts, hidden_size, intermediate_size) of the loaded NVFP4 test layer.
+_NVFP4_TRTLLM_GEN_SHAPE = (8, 512, 256)
 
-    The scale contracts below are written by ``load_quant_scales``, so they
-    only exist after a real load; the stock quantize utils supply the weights.
+
+def _make_nvfp4_trtllm_gen_test_weights(
+    *, bias: bool = False
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], QuantConfig]:
+    """Stock NVFP4 expert weights and scales for the test layer.
+
+    Returns the activation the input scales were derived from, the
+    checkpoint-style weight dict (`{expert}.{w1,w2,w3}.{weight, weight_scale,
+    weight_scale_2, input_scale}`, plus `{expert}.{w1,w2,w3}.bias` with `bias`)
+    and the matching quant config.
     """
-    num_experts, hidden_size, intermediate_size = 8, 512, 256
+    num_experts, hidden_size, intermediate_size = _NVFP4_TRTLLM_GEN_SHAPE
     torch.manual_seed(0)
     x = torch.randn((8, hidden_size), dtype=torch.bfloat16, device="cuda") * 0.5
     util_cls, quant_config, quant_kwargs = get_test_quant_params(QuantAlgo.NVFP4, x, "TRTLLM")
-    quant_kwargs.pop("ref_cls", None)
     quantize_util = util_cls(
         num_experts=num_experts,
         dtype=torch.bfloat16,
         intermediate_size=intermediate_size,
         hidden_size=hidden_size,
         quant_config=quant_config,
-        bias=False,
+        bias=bias,
         activation_type=ActivationType.Swiglu,
     )
+    return x, quantize_util.create_weights(**quant_kwargs), quant_config
+
+
+def _load_nvfp4_trtllm_gen_moe(
+    weights: Dict[str, torch.Tensor],
+    quant_config: QuantConfig,
+    *,
+    situ: bool,
+    bias: bool = False,
+    activation: Optional[MoEActivation] = None,
+) -> TRTLLMGenFusedMoE:
+    """A single-rank TRTLLM-Gen MoE with `weights` loaded and finalized."""
+    num_experts, hidden_size, intermediate_size = _NVFP4_TRTLLM_GEN_SHAPE
     backend = _make_trtllm_gen_moe(
         quant_config=quant_config,
         situ=situ,
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        bias=bias,
+        activation=activation,
     )
-    backend.load_weights([quantize_util.create_weights(**quant_kwargs)])
+    backend.load_weights([weights])
     backend.post_load_weights()
     return backend.cuda()
+
+
+def _make_loaded_nvfp4_trtllm_gen_moe(situ: bool) -> TRTLLMGenFusedMoE:
+    """The same MoE with NVFP4 weights and quant scales actually loaded.
+
+    The scale contracts below are written by `load_quant_scales`, so they
+    only exist after a real load; the stock quantize utils supply the weights.
+    """
+    _, weights, quant_config = _make_nvfp4_trtllm_gen_test_weights()
+    return _load_nvfp4_trtllm_gen_moe(weights, quant_config, situ=situ)
 
 
 @_situ_supported
@@ -752,6 +795,448 @@ def test_nvfp4_trtllm_gen_class_alignment_would_admit_bad_shards() -> None:
     resolved, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(1536, 192)
     assert 192 % NVFP4TRTLLMGenFusedMoEMethod.weight_alignment == 0
     assert 192 % resolved != 0
+
+
+# ============================================================================
+# TRTLLM-Gen NVFP4: separate gate/up global weight scales
+# ============================================================================
+# An NVFP4 checkpoint may store a different global weight scale
+# (`weight_scale_2`) for the gate (w1) and up (w3) halves of an expert. The
+# trtllm-gen FC1 epilogue takes the two dequant factors as separate scalars:
+# `output1_scale_gate_scalar` (`fc31_alpha`) multiplies the gate half before
+# the activation, `output1_scale_scalar` (`fc31_scale_c`) multiplies the
+# linear half together with the GEMM2-input quant scale. Such a checkpoint is
+# therefore reproduced exactly instead of being max-reconciled, which is what
+# single-alpha kernels (Cutlass) still have to do. Two kinds of layer stay on
+# the reconciled path even on trtllm-gen: SiTu, whose cubin folds one dequant
+# into both halves, and any layer with a finite activation clamp, which is one
+# pre-dequant limit for both halves. These tests pin that rule, the
+# per-expert scales it produces (including the per-half bias / beta
+# division), and that the kernel really consumes them as (gate, up).
+
+_trtllm_gen_nvfp4_supported = pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="TRTLLM-Gen NVFP4 MoE cubins are sm_100f: the SM100 family only",
+)
+
+# The split-scale capability is a property of the kernel a method class feeds:
+# the TRTLLM-Gen NVFP4 family (the plain, the padded and the W4A8 NVFP4-FP8
+# methods, whose runners share the `output1_scales_{gate_,}scalar` contract)
+# declares it, single-alpha methods must not.
+_SPLIT_SCALE_METHODS = pytest.mark.parametrize(
+    "method_cls,splits",
+    [
+        pytest.param(NVFP4TRTLLMGenFusedMoEBaseMethod, True, id="trtllm_gen"),
+        pytest.param(NVFP4TRTLLMGenFusedMoEMethod, True, id="trtllm_gen_padded"),
+        pytest.param(W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, True, id="trtllm_gen_w4a8"),
+        pytest.param(NVFP4CutlassFusedMoEMethod, False, id="cutlass"),
+        pytest.param(NVFP4CuteDslFusedMoEMethod, False, id="cutedsl"),
+    ],
+)
+
+
+def _nvfp4_alpha_stand_in(
+    *, is_situ_activation: bool = False, act_clamp: Optional[torch.Tensor] = None
+) -> SimpleNamespace:
+    """A stand-in for a loaded layer, as far as `_reconcile_and_compute_alphas` reads it.
+
+    Carries the finalized input scales the alphas divide by (`fc31_input_scale`
+    is the reciprocal of the checkpoint's input scale, so
+    `alpha = weight_scale_2 / fc31_input_scale`) and the activation attributes
+    the split-scale rule consults. Plain SwiGLU without a clamp unless told
+    otherwise.
+    """
+    return SimpleNamespace(
+        fc31_input_scale=SimpleNamespace(data=torch.tensor(4.0)),
+        fc2_input_scale=SimpleNamespace(data=torch.tensor(8.0)),
+        activation_type=ActivationType.Swiglu,
+        is_situ_activation=is_situ_activation,
+        act_clamp=act_clamp,
+    )
+
+
+# Two experts' raw `weight_scale_2`: the first with unequal gate/up scales, the
+# second with equal ones. With `fc31_input_scale = 4`: gate 0.5 -> 0.125, up
+# 0.125 -> 0.03125, and reconciling lifts the up column to the gate's 0.5.
+_STAND_IN_WEIGHT_SCALE_2 = {
+    0: {"w1": torch.tensor(0.5), "w3": torch.tensor(0.125), "w2": torch.tensor(0.25)},
+    1: {"w1": torch.tensor(0.0625), "w3": torch.tensor(0.0625), "w2": torch.tensor(2.0)},
+}
+_STAND_IN_GATE_ALPHAS = torch.tensor([0.5 / 4.0, 0.0625 / 4.0])
+_STAND_IN_UP_ALPHAS = torch.tensor([0.125 / 4.0, 0.0625 / 4.0])
+_STAND_IN_FC2_ALPHAS = torch.tensor([0.25 / 8.0, 2.0 / 8.0])
+
+
+# The message `_resolve_gate_up_weight_scale_2` logs when it reconciles.
+_RECONCILE_WARNING = "selecting the larger value"
+
+
+def _capture_reconcile_warnings(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    """Collect the `weight_scale_2` reconciliation warnings a test triggers.
+
+    Only that message is kept: building a layer logs unrelated warnings
+    (about the bare test model config, for one), which must not count.
+    """
+    warnings: List[str] = []
+
+    def record(*msg: object) -> None:
+        text = " ".join(map(str, msg))
+        if _RECONCILE_WARNING in text:
+            warnings.append(text)
+
+    monkeypatch.setattr(trtllm_logger, "warning", record)
+    return warnings
+
+
+@_SPLIT_SCALE_METHODS
+def test_nvfp4_gate_up_weight_scale_2_resolution(
+    method_cls: type[NVFP4FusedMoEMethod], splits: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unequal w1/w3 `weight_scale_2` stay separate only on split-scale kernels.
+
+    Host-side contract, no kernel involved. The TRTLLM-Gen methods declare
+    `supports_split_gate_up_weight_scale_2` and, on a plain SwiGLU layer, keep
+    an unequal pair untouched; the Cutlass-family methods feed one alpha to
+    their kernel, so they must still reconcile to the larger value and warn
+    about it. Equal scales pass through everywhere without a warning.
+    """
+    warnings = _capture_reconcile_warnings(monkeypatch)
+    method = method_cls()
+    assert method.supports_split_gate_up_weight_scale_2 is splits
+    split = method._splits_gate_up_weight_scale_2(_nvfp4_alpha_stand_in())
+    assert split is splits
+
+    equal = torch.tensor(0.5, dtype=torch.float32)
+    gate, up = method._resolve_gate_up_weight_scale_2(equal, equal.clone(), split)
+    assert gate.item() == up.item() == 0.5
+    assert not warnings
+
+    larger = torch.tensor(0.5, dtype=torch.float32)
+    smaller = torch.tensor(0.125, dtype=torch.float32)
+    for w1_ws2, w3_ws2 in ((larger, smaller), (smaller, larger)):
+        warnings.clear()
+        gate, up = method._resolve_gate_up_weight_scale_2(w1_ws2, w3_ws2, split)
+        if split:
+            assert (gate.item(), up.item()) == (w1_ws2.item(), w3_ws2.item())
+            assert not warnings
+        else:
+            assert gate.item() == up.item() == 0.5
+            assert len(warnings) == 1
+
+
+@_SPLIT_SCALE_METHODS
+def test_nvfp4_reconcile_and_compute_alphas_split_gate_up(
+    method_cls: type[NVFP4FusedMoEMethod], splits: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_reconcile_and_compute_alphas` derives each half's alpha from its own column.
+
+    Drives the shared helper with host tensors and a plain-SwiGLU stand-in
+    module. On a split-scale method the gate and up alphas come from their own
+    columns; a reconciling method lifts the up column to the gate's larger
+    value first, so both alphas agree.
+    """
+    monkeypatch.setattr(trtllm_logger, "warning", lambda *msg: None)
+    fc31_alpha, fc2_alpha, fc31_up_alpha = (torch.empty(2) for _ in range(3))
+
+    method_cls()._reconcile_and_compute_alphas(
+        _nvfp4_alpha_stand_in(),
+        _STAND_IN_WEIGHT_SCALE_2,
+        fc31_alpha,
+        fc2_alpha,
+        dst_fc31_up_alpha=fc31_up_alpha,
+    )
+
+    torch.testing.assert_close(fc2_alpha, _STAND_IN_FC2_ALPHAS)
+    torch.testing.assert_close(fc31_alpha, _STAND_IN_GATE_ALPHAS)
+    torch.testing.assert_close(fc31_up_alpha, _STAND_IN_UP_ALPHAS if splits else fc31_alpha)
+
+
+@pytest.mark.parametrize(
+    "stand_in_kwargs",
+    [
+        pytest.param(dict(is_situ_activation=True), id="situ"),
+        pytest.param(dict(act_clamp=torch.full((2,), 7.0)), id="finite_clamp"),
+    ],
+)
+def test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_fallback(
+    stand_in_kwargs: Dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Layers the cubins cannot dequantize per half keep reconciling.
+
+    The kernel takes two scalars, but SiTu folds one dequant (scaleGate) into
+    both FC1 halves (`_fc31_scale_c_omits_dequant`), and a finite clamp is one
+    pre-dequant limit `limit / dequantAb` for both halves, exact only when they
+    share a dequant. On such layers the TRTLLM-Gen method must fall back to the
+    pre-existing max-reconciliation, warning included, so the up-half alpha
+    equals the gate alpha. Control: an all-inf clamp is no clamp and keeps the
+    split.
+    """
+    warnings = _capture_reconcile_warnings(monkeypatch)
+    # The padded method is the one SiTu and gpt-oss style layers select.
+    method = NVFP4TRTLLMGenFusedMoEMethod()
+    assert method.supports_split_gate_up_weight_scale_2
+    module = _nvfp4_alpha_stand_in(**stand_in_kwargs)
+    assert not method._splits_gate_up_weight_scale_2(module)
+    fc31_alpha, fc2_alpha, fc31_up_alpha = (torch.empty(2) for _ in range(3))
+
+    method._reconcile_and_compute_alphas(
+        module, _STAND_IN_WEIGHT_SCALE_2, fc31_alpha, fc2_alpha, dst_fc31_up_alpha=fc31_up_alpha
+    )
+
+    torch.testing.assert_close(fc31_alpha, _STAND_IN_GATE_ALPHAS)
+    torch.testing.assert_close(fc31_up_alpha, fc31_alpha)
+    torch.testing.assert_close(fc2_alpha, _STAND_IN_FC2_ALPHAS)
+    assert len(warnings) == 1
+
+    unclamped = _nvfp4_alpha_stand_in(act_clamp=torch.full((2,), float("inf")))
+    assert method._splits_gate_up_weight_scale_2(unclamped)
+
+
+# Per-expert factors applied to `w3.weight_scale_2`; powers of two so the FP4
+# payload and E4M3 block scales of the test weights stay exactly valid.
+_SPLIT_UP_SCALE_FACTORS = (2.0, 4.0, 8.0)
+# Headroom applied to `w2.input_scale` in the forward test (see there).
+_FC2_INPUT_SCALE_HEADROOM = 16.0
+# gpt-oss style SwigluBias constants (gate sigmoid scale, linear offset, clamp)
+# of the layers loaded with an FC1 bias. Such a layer selects the padded
+# method, which is also where every checkpoint with these constants lands.
+_SWIGLU_BIAS_GATE_SCALE = 1.702
+_SWIGLU_BIAS_LINEAR_OFFSET = 1.0
+_SWIGLU_BIAS_CLAMP = 7.0
+# One constant per FC1 bias half, so the halves stay apart under any row order.
+_UP_BIAS, _GATE_BIAS = 1.0, -2.0
+
+
+def _split_up_weight_scale_2(weights: Dict[str, torch.Tensor], num_experts: int) -> None:
+    """Scale every expert's `w3.weight_scale_2` by its `_SPLIT_UP_SCALE_FACTORS` entry."""
+    for expert_id in range(num_experts):
+        factor = _SPLIT_UP_SCALE_FACTORS[expert_id % len(_SPLIT_UP_SCALE_FACTORS)]
+        weights[f"{expert_id}.w3.weight_scale_2"] = (
+            weights[f"{expert_id}.w3.weight_scale_2"] * factor
+        )
+
+
+def _weight_scale_2_column(
+    weights: Dict[str, torch.Tensor], proj: str, num_experts: int, device: torch.device
+) -> torch.Tensor:
+    """The per-expert `weight_scale_2` of one projection as a float vector."""
+    scales = [weights[f"{e}.{proj}.weight_scale_2"].float().reshape(()) for e in range(num_experts)]
+    return torch.stack(scales).to(device)
+
+
+@_trtllm_gen_nvfp4_supported
+@pytest.mark.parametrize(
+    "bias,activation,split",
+    [
+        pytest.param(False, DEFAULT_MOE_ACTIVATION, True, id="swiglu"),
+        pytest.param(
+            True,
+            SwigluBiasActivation(
+                gate_sigmoid_scale=_SWIGLU_BIAS_GATE_SCALE, linear_offset=_SWIGLU_BIAS_LINEAR_OFFSET
+            ),
+            True,
+            id="swiglu_bias",
+        ),
+        pytest.param(
+            True,
+            SwigluBiasActivation(
+                gate_sigmoid_scale=_SWIGLU_BIAS_GATE_SCALE,
+                linear_offset=_SWIGLU_BIAS_LINEAR_OFFSET,
+                clamp=_SWIGLU_BIAS_CLAMP,
+            ),
+            False,
+            id="swiglu_bias_clamped",
+        ),
+    ],
+)
+def test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_alphas(
+    bias: bool, activation: MoEActivation, split: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`fc31_alpha` follows the gate (w1) scale, `fc31_scale_c` the up (w3) scale.
+
+    Loads the stock NVFP4 test layer after multiplying every expert's
+    `w3.weight_scale_2` by a per-expert power of two, then checks the
+    per-expert kernel inputs against the formulas the loader implements.
+    `fc31_input_scale` / `fc2_input_scale` are the reciprocals of the
+    checkpoint's (uniform) input scales, so `alpha = weight_scale_2 /
+    fc31_input_scale` is a half's dequant scale: `fc31_alpha` carries the gate
+    half's, and `fc31_scale_c = fc2_input_scale * up_alpha` folds the linear
+    half's with the GEMM2-input quant scale. The constants the cubin takes in
+    the pre-dequant domain are divided by the dequant of the half they belong
+    to: the w3 rows of the FC1 bias and the SwigluBias linear offset
+    (`act_beta`) by the up alpha, the w1 rows by the gate alpha. With a finite
+    clamp the split is off, so both alphas come from the larger scale and the
+    pre-existing warning fires, exactly as before. A max-reconciling loader
+    would put the (larger) up scale into both alphas on the split cases too.
+    """
+    warnings = _capture_reconcile_warnings(monkeypatch)
+    num_experts, _, intermediate_size = _NVFP4_TRTLLM_GEN_SHAPE
+    _, weights, quant_config = _make_nvfp4_trtllm_gen_test_weights(bias=bias)
+    _split_up_weight_scale_2(weights, num_experts)
+    if bias:
+        for expert_id in range(num_experts):
+            weights[f"{expert_id}.w3.bias"].fill_(_UP_BIAS)
+            weights[f"{expert_id}.w1.bias"].fill_(_GATE_BIAS)
+    moe = _load_nvfp4_trtllm_gen_moe(
+        weights, quant_config, situ=False, bias=bias, activation=activation
+    )
+
+    device = moe.fc31_alpha.device
+    w1_ws2 = _weight_scale_2_column(weights, "w1", num_experts, device)
+    w3_ws2 = _weight_scale_2_column(weights, "w3", num_experts, device)
+    # Not vacuous: the two columns differ for every expert.
+    assert not torch.isclose(w1_ws2, w3_ws2).any()
+    fc31_input_scale = moe.fc31_input_scale.data.float()
+    fc2_input_scale = moe.fc2_input_scale.data.float()
+    if split:
+        gate_alpha, up_alpha = w1_ws2 / fc31_input_scale, w3_ws2 / fc31_input_scale
+        assert not warnings
+    else:
+        gate_alpha = up_alpha = torch.maximum(w1_ws2, w3_ws2) / fc31_input_scale
+        assert len(warnings) == num_experts
+
+    # The alphas are O(1e-7) here, so compare relatively: assert_close's
+    # default atol would accept a 2x-wrong value.
+    tight = dict(rtol=1e-5, atol=0.0)
+    torch.testing.assert_close(
+        moe.fc31_alpha.data.float(),
+        gate_alpha,
+        **tight,
+        msg="fc31_alpha must carry the gate (w1) global weight scale",
+    )
+    torch.testing.assert_close(
+        moe.fc31_scale_c.data.float(),
+        fc2_input_scale * up_alpha,
+        **tight,
+        msg="fc31_scale_c must carry the up (w3) global weight scale",
+    )
+    # The derived up-half alpha is load-time scratch, not module state.
+    assert not hasattr(moe, "fc31_up_alpha")
+    if not bias:
+        assert moe.act_beta is None and moe.act_clamp is None
+        return
+
+    # `_shuffle_all_experts` has permuted the bias rows, so compare each
+    # expert's rows as a multiset: `intermediate_size` rows at
+    # `_UP_BIAS / up_alpha` and as many at `_GATE_BIAS / gate_alpha`, which
+    # sort as the (negative) gate rows followed by the (positive) up rows.
+    fc31_bias = moe.w3_w1_bias.data.float()
+    assert fc31_bias.shape == (num_experts, 2 * intermediate_size)
+    expected_rows = torch.cat(
+        [
+            (_GATE_BIAS / gate_alpha).view(-1, 1).expand(-1, intermediate_size),
+            (_UP_BIAS / up_alpha).view(-1, 1).expand(-1, intermediate_size),
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(
+        fc31_bias.sort(dim=1).values,
+        expected_rows,
+        **tight,
+        msg="each FC1 bias half must be divided by its own half's alpha",
+    )
+    torch.testing.assert_close(
+        moe.act_beta.data.float(),
+        _SWIGLU_BIAS_LINEAR_OFFSET / up_alpha,
+        **tight,
+        msg="the linear offset must be divided by the up (w3) alpha",
+    )
+    if split:
+        assert moe.act_clamp is None
+    else:
+        torch.testing.assert_close(
+            moe.act_clamp.data.float(), _SWIGLU_BIAS_CLAMP / gate_alpha, **tight
+        )
+
+
+# Linear offset of the SwigluBias layer in the forward test.
+_FORWARD_LINEAR_OFFSET = 0.5
+
+
+@_trtllm_gen_nvfp4_supported
+@pytest.mark.parametrize("bias", [False, True], ids=["swiglu", "swiglu_bias"])
+def test_trtllm_gen_nvfp4_split_gate_up_weight_scale_2_forward(bias: bool) -> None:
+    """The kernel applies the up scale to the linear half only.
+
+    Doubling every expert's `w3.weight_scale_2` (and nothing else) describes
+    a checkpoint whose up projection is exactly twice as large, so the MoE
+    output must double: SwiGLU is linear in the up half and GEMM2 is linear in
+    its input. A power of two keeps the intermediate NVFP4 requantization
+    exact (the E4M3 block scales double, the FP4 mantissas are unchanged), so
+    the comparison is tight. A loader that max-reconciles the two scales
+    dequantizes the gate half 2x too large as well, turning `silu(g) * 2u`
+    into `silu(2g) * 2u` and missing by tens of percent.
+
+    With `bias` the layer is a gpt-oss style SwigluBias with FC1/FC2 biases
+    and a linear offset (its gate sigmoid scale is 1, i.e. plain SiLU). The
+    doubled layer then also doubles the w3 bias, the linear offset and the FC2
+    bias, so `silu(g) * (2u + 2b + 2beta)` and `W2 (2h) + 2 b2` are still
+    exactly twice the reference. That holds only if the loader divides the w3
+    bias rows and the offset by the up alpha: divided by the gate alpha, both
+    would reach the kernel 2x too large in the doubled layer.
+    """
+    num_experts = _NVFP4_TRTLLM_GEN_SHAPE[0]
+    x, weights, quant_config = _make_nvfp4_trtllm_gen_test_weights(bias=bias)
+    # The stock weights reuse the MoE input's global scale as the GEMM2 input
+    # scale, and the SwiGLU intermediate of these random weights reaches that
+    # range's E4M3 block-scale ceiling. A saturated block breaks the exact 2x
+    # relation below, so give the GEMM2 input range the headroom a calibrated
+    # checkpoint has. Both layers get it, so it cancels out of the comparison.
+    for expert_id in range(num_experts):
+        key = f"{expert_id}.w2.input_scale"
+        weights[key] = weights[key] * _FC2_INPUT_SCALE_HEADROOM
+    doubled_up_weights = {name: value.clone() for name, value in weights.items()}
+    doubled_suffixes = ["w3.weight_scale_2"] + (["w3.bias", "w2.bias"] if bias else [])
+    for expert_id in range(num_experts):
+        for suffix in doubled_suffixes:
+            key = f"{expert_id}.{suffix}"
+            doubled_up_weights[key] = doubled_up_weights[key] * 2.0
+
+    def activation(linear_offset: float) -> MoEActivation:
+        if not bias:
+            return DEFAULT_MOE_ACTIVATION
+        return SwigluBiasActivation(gate_sigmoid_scale=1.0, linear_offset=linear_offset)
+
+    reference = _load_nvfp4_trtllm_gen_moe(
+        weights,
+        quant_config,
+        situ=False,
+        bias=bias,
+        activation=activation(_FORWARD_LINEAR_OFFSET),
+    )
+    doubled_up = _load_nvfp4_trtllm_gen_moe(
+        doubled_up_weights,
+        quant_config,
+        situ=False,
+        bias=bias,
+        activation=activation(2.0 * _FORWARD_LINEAR_OFFSET),
+    )
+
+    torch.manual_seed(1)
+    router_logits = torch.randn((x.shape[0], num_experts), dtype=torch.bfloat16, device="cuda")
+
+    def run(moe: TRTLLMGenFusedMoE) -> torch.Tensor:
+        token_selected_experts, token_final_scales = moe.routing_method.apply(router_logits)
+        x_quantized, x_sf = moe.quantize_input(x, post_quant_comm=False)
+        return run_backend_moe(
+            moe,
+            MoeBackendType.TRTLLM,
+            x_quantized,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            torch.bfloat16,
+            router_logits=router_logits,
+            trtllm_use_router_logits=False,
+        ).float()
+
+    with torch.inference_mode():
+        expected = 2.0 * run(reference)
+        output = run(doubled_up)
+
+    assert torch.isfinite(output).all()
+    assert expected.abs().max() > 0
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-3)
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
