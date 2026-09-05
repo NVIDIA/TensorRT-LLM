@@ -2158,6 +2158,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             Since Cosmos3 embeds text internally, we pass token IDs via extra_tensors
             rather than through encoder_hidden_states.
             """
+            # Activation precision for this step. A pure function of step_index,
+            # so the conditional and unconditional CFG branches of one step
+            # always select the same path even though each calls this
+            # separately. No-op unless the checkpoint is static FP8.
+            self.transformer.set_denoising_step(
+                step_index=step_index, num_steps=len(self.scheduler.timesteps)
+            )
+
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
             current_action = extra_stream_latents.get("action") if extra_stream_latents else None
 
@@ -2251,26 +2259,33 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             extra_streams = {"audio": (audio_latents, self.audio_scheduler)}
         # FUTURE(action+audio): merge both keys; extend forward_fn return dict and post_step_fn.
         should_pin_condition_latents = condition_latents is not None and velocity_mask is not None
-        denoise_result = self.denoise(
-            latents=latents,
-            scheduler=self.scheduler,
-            prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
-            neg_prompt_embeds=uncond_ids,
-            guidance_scale=guidance_scale,
-            forward_fn=forward_fn,
-            extra_cfg_tensors=extra_cfg_tensors,
-            extra_streams=extra_streams,
-            guidance_interval=guidance_interval,
-            # V2V and action pin the conditioning latents; distilled I2V
-            # re-anchors the conditioning frame. A request carries an image or
-            # a video, never both, so at most one of these applies.
-            post_step_fn=(
-                post_step_fn
-                if (do_action or should_pin_condition_latents)
-                else self._conditioning_anchor_post_step(image_latent)
-            ),
-            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
-        )
+        try:
+            denoise_result = self.denoise(
+                latents=latents,
+                scheduler=self.scheduler,
+                prompt_embeds=cond_ids,  # placeholder — actual conditioning via extra_cfg_tensors
+                neg_prompt_embeds=uncond_ids,
+                guidance_scale=guidance_scale,
+                forward_fn=forward_fn,
+                extra_cfg_tensors=extra_cfg_tensors,
+                extra_streams=extra_streams,
+                guidance_interval=guidance_interval,
+                # V2V and action pin the conditioning latents; distilled I2V
+                # re-anchors the conditioning frame. A request carries an image or
+                # a video, never both, so at most one of these applies.
+                post_step_fn=(
+                    post_step_fn
+                    if (do_action or should_pin_condition_latents)
+                    else self._conditioning_anchor_post_step(image_latent)
+                ),
+                scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            )
+        finally:
+            # In a finally because a failed request must not leave the selection
+            # latched. The transfer path runs the transformer without selecting
+            # a step, so it would inherit whatever the failed request left
+            # behind and run every call in 16-bit with nothing to indicate it.
+            self.transformer.reset_denoising_step()
 
         if extra_streams is not None:
             latents, extra_latents = denoise_result

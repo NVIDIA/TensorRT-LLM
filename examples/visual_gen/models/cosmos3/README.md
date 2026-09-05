@@ -20,6 +20,28 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone supporting **T2I / T2V / I2V only**: no audio tower, and the checkpoint's action weights are not supported by this pipeline yet. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 
+### Static FP8 checkpoints
+
+Statically quantized (ModelOpt) FP8 builds of Nano and Super run on this path.
+Quantization is detected from the checkpoint's own metadata — pass the directory
+to `--model` exactly as you would a BF16 one, with no extra flag:
+
+```bash
+python cosmos3.py --model /path/to/Cosmos3-Nano-FP8 \
+    --prompt_file prompts/t2v.json \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+```
+
+There are no FP8 Hub IDs yet, so use a local path. T2V, T2I, I2V and V2V are
+validated on a **single GPU**; every multi-GPU configuration is refused with an
+explicit error, so use BF16 there.
+
+These checkpoints ship the audio tower (`sound_gen: true`), so T2AV/TI2AV run
+rather than being refused — audio is quantized and generated like any other
+supported task. It simply has not been exercised as thoroughly as the four
+video/image tasks above, and no FP8 audio quality claim is made. FP8 output
+quality in general has not been benchmarked against BF16.
+
 ## Guardrails
 
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:

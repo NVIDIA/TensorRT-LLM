@@ -44,7 +44,7 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
 from ..modules.multi_stream_utils import do_multi_stream
-from ..modules.swiglu import silu_and_mul_kernel
+from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
@@ -2244,6 +2244,109 @@ def _(
 
     o_dtype = dtype or x.dtype
     return x.new_empty((b, d), dtype=o_dtype)
+
+
+# Launch parameters for silu_and_mul_2in_kernel, keyed on SM version, as
+# (block_elements, num_warps) per output dtype. ``block_elements`` is how many
+# elements one Triton program handles -- Triton's BLOCK_SIZE -- not a thread
+# count; threads are num_warps * 32.
+#
+# The output dtype sets the read/write balance: an FP8 output writes one byte
+# per element where BF16 writes two, leaving the FP8 case more read-dominated
+# and better served by more elements in flight. From a sweep over block_elements
+# {1024..8192} x num_warps {2, 4, 8} at the Cosmos3 shapes on sm_100, FP8 output
+# was ~5% faster at 4096 than at 2048, while the BF16 candidates tied within
+# 0.6%. An sm_103 sweep landed within 0.4% of the same configuration, so it
+# shares the row rather than carrying a copy.
+_SILU_AND_MUL_2IN_LAUNCH_PARAMS = {
+    100: {
+        torch.float8_e4m3fn: (4096, 4),
+        None: (2048, 4)
+    },
+}
+_SILU_AND_MUL_2IN_LAUNCH_PARAMS[103] = _SILU_AND_MUL_2IN_LAUNCH_PARAMS[100]
+# Untuned SM versions borrow this row. They are not rejected and no performance
+# claim is made for them; tune one by adding its own entry above.
+_SILU_AND_MUL_2IN_FALLBACK_SM = 100
+
+
+@lru_cache(maxsize=None)
+def _silu_and_mul_2in_launch_params(sm_version: int,
+                                    out_dtype: torch.dtype) -> Tuple[int, int]:
+    row = _SILU_AND_MUL_2IN_LAUNCH_PARAMS.get(
+        sm_version,
+        _SILU_AND_MUL_2IN_LAUNCH_PARAMS[_SILU_AND_MUL_2IN_FALLBACK_SM])
+    return row.get(out_dtype, row[None])
+
+
+@torch.library.custom_op("trtllm::silu_and_mul_2in", mutates_args=())
+def silu_and_mul_2in(gate: torch.Tensor,
+                     up: torch.Tensor,
+                     scale: Optional[torch.Tensor] = None,
+                     dtype: Optional[torch.dtype] = None,
+                     swiglu_limit: Optional[float] = None,
+                     swiglu_alpha: Optional[float] = None,
+                     swiglu_beta: Optional[float] = None) -> torch.Tensor:
+    """silu_and_mul for gate and up held in separate tensors.
+
+    Equivalent to silu_and_mul(cat([gate, up], -1), ...) with no concatenation.
+    """
+    # Rank-agnostic: the kernel walks a flat run of numel() elements, so any
+    # matching contiguous shape works. Models carry rank-3 [batch, seq, hidden]
+    # activations, and requiring rank 2 here would force callers to reshape.
+    assert gate.shape == up.shape, (
+        f"gate and up must have the same shape, got {tuple(gate.shape)} and "
+        f"{tuple(up.shape)}")
+    assert gate.dtype == up.dtype, (
+        f"gate and up must have the same dtype, got {gate.dtype} and {up.dtype}"
+    )
+    assert gate.device == up.device, (
+        f"gate and up must be on the same device, got {gate.device} and "
+        f"{up.device}")
+    # The kernel indexes both operands as flat contiguous runs, so a strided
+    # view would read the wrong addresses and silently return garbage. Linear
+    # outputs are contiguous; reject anything else rather than copying.
+    assert gate.is_contiguous() and up.is_contiguous(), (
+        f"gate and up must be contiguous, got strides {gate.stride()} and "
+        f"{up.stride()} for shape {tuple(gate.shape)}")
+
+    o_dtype = dtype or gate.dtype
+    o = torch.empty(gate.shape, dtype=o_dtype, device=gate.device)
+
+    block_elements, num_warps = _silu_and_mul_2in_launch_params(
+        get_sm_version(), o_dtype)
+    n_elements = gate.numel()
+
+    silu_and_mul_2in_kernel[(triton.cdiv(n_elements, block_elements), )](
+        o_ptr=o,
+        o_scale_ptr=scale,
+        gate_ptr=gate,
+        up_ptr=up,
+        n_elements=n_elements,
+        swiglu_limit=swiglu_limit or 0.0,
+        swiglu_alpha=swiglu_alpha if swiglu_alpha is not None else 1.0,
+        swiglu_beta=swiglu_beta if swiglu_beta is not None else 0.0,
+        BLOCK_SIZE=block_elements,
+        HAS_O_SCALE=scale is not None,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
+        num_warps=num_warps,
+    )
+
+    return o
+
+
+@silu_and_mul_2in.register_fake
+def _(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = None,
+    swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+) -> torch.Tensor:
+    o_dtype = dtype or gate.dtype
+    return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
 class AllReduceRunner(TunableRunner):

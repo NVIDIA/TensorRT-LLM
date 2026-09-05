@@ -100,7 +100,6 @@ COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
 # golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json.
 COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
 
-
 COSMOS3_FEATURE_LPIPS_THRESHOLD = 0.05
 COSMOS3_QUANTIZATION_IGNORE = [
     "language_model.*",
@@ -152,13 +151,33 @@ def _build_cosmos3_accuracy_cases():
 COSMOS3_ACCURACY_CASES = _build_cosmos3_accuracy_cases()
 
 
-def _run_cosmos3_lpips_pipeline(num_frames, video=None):
-    """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
+def _run_cosmos3_lpips_pipeline(
+    num_frames,
+    video=None,
+    image=None,
+    model_subpath=(COSMOS3_NANO_MODEL_SUBPATH,),
+    label="Cosmos3-Nano checkpoint",
+    height=COSMOS3_LPIPS_HEIGHT,
+    width=COSMOS3_LPIPS_WIDTH,
+    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+    output_type="video",
+):
+    """Run a Cosmos3 pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
-    or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path; passing ``video`` (encoded MP4 bytes,
-    decoded on the worker's NVDEC) yields the video-to-video path.
+    or ``None`` if generation produced no video. Passing ``video`` (encoded MP4
+    bytes, decoded on the worker's NVDEC) yields the video-to-video path;
+    passing ``image`` yields the image-to-video path.
+
+    ``output_type="image"`` selects the real text-to-image path and returns
+    ``(B, H, W, C)`` instead. It is not the same as ``num_frames=1``: the
+    pipeline keys T2I off ``output_type``, which also swaps in
+    ``COSMOS3_T2I_PARAMS``, the T2I system prompt and the image resolution
+    template, so a one-frame video run exercises none of that.
+
+    ``model_subpath`` selects the checkpoint under ``LLM_MODELS_ROOT`` and is a
+    tuple of path components, so nested checkpoints (the FP8 builds ship inside
+    a dated subdirectory) address the same way as top-level ones.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -173,8 +192,8 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
             VisualGenArgs,
         )
 
-        model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
-        _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
+        model_path = _lpips_model_path(*model_subpath)
+        _skip_if_missing(model_path, label, is_dir=True)
         _disable_inductor_compile_worker_quiesce()
         args = VisualGenArgs(
             model=model_path,
@@ -193,18 +212,24 @@ def _run_cosmos3_lpips_pipeline(num_frames, video=None):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    height=COSMOS3_LPIPS_HEIGHT,
-                    width=COSMOS3_LPIPS_WIDTH,
+                    height=height,
+                    width=width,
                     num_frames=num_frames,
-                    num_inference_steps=COSMOS3_LPIPS_NUM_INFERENCE_STEPS,
+                    num_inference_steps=num_inference_steps,
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
                     video=video,
+                    image=image,
+                    output_type=output_type,
                 )
-            if result is None or result.video is None:
+            if result is None:
                 return None
-            return result.video.detach().cpu()
+            # T2I returns image (B, H, W, C) and leaves video unset.
+            produced = result.image if output_type == "image" else result.video
+            if produced is None:
+                return None
+            return produced.detach().cpu()
         finally:
             del pipeline
             _cleanup_cuda()

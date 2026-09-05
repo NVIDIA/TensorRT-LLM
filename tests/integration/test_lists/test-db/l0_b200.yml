@@ -158,6 +158,8 @@ l0_b200:
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/test_swiglu_2in.py
+  - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
@@ -311,8 +313,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_fp8.py
+  - unittest/_torch/visual_gen/test_cosmos3_step_precision_component.py
   - unittest/_torch/visual_gen/test_cosmos3_transfer.py
   - unittest/_torch/visual_gen/test_control_kernels.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
