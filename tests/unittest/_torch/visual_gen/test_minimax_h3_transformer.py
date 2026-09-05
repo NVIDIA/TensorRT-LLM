@@ -24,7 +24,10 @@ import torch.nn.functional as F
 
 pytest.importorskip("diffusers")
 
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -37,6 +40,13 @@ try:
     )
 except ImportError:
     HFMiniMaxH3Transformer3DModel = None
+
+try:
+    from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
+
+    FA4_AVAILABLE = _flash_attn_fwd is not None
+except ImportError:
+    FA4_AVAILABLE = False
 
 
 # The transformer's forward pass runs TRT-LLM modules that dispatch to CUDA-only
@@ -98,6 +108,50 @@ def _make_dynamic_fp8_model_config(**overrides: object) -> DiffusionModelConfig:
         dynamic_weight_quant=True,
         **overrides,
     )
+
+
+# NVFP4 packs a scale per 16 input elements, so every quantized Linear needs an
+# in_features that is a multiple of 16.  The released checkpoint satisfies this
+# (96, 32, 5120, 5376, 7168, 14336, 2688), but _TINY_CONFIG does not, so widen
+# the dimensions that feed a Linear.
+_NVFP4_SHAPES: dict[str, object] = {
+    "num_attention_heads": 2,
+    "attention_head_dim": 16,
+    "hidden_size": 32,
+    "ffn_dim": 32,
+    "in_channels": 16,
+    "audio_in_channels": 16,
+    "text_dim": 16,
+    "time_embed_hidden_dim": 32,
+    "time_embed_dim": 32,
+    "rope_freq_dim": 2,
+}
+
+
+def _make_dynamic_nvfp4_model_config(**overrides: object) -> DiffusionModelConfig:
+    return _make_model_config(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+        **(_NVFP4_SHAPES | overrides),
+    )
+
+
+def test_nvfp4_requires_forced_dynamic_activation_quantization() -> None:
+    """Without it NVFP4LinearMethod reads an uninitialized input_scale.
+
+    Measured on B200 for an uncalibrated checkpoint: ~105% relative error
+    versus ~15% with the flag set, and it fails silently.
+    """
+    with pytest.raises(NotImplementedError, match="force_dynamic_quantization"):
+        h3.MiniMaxH3Transformer3DModel(
+            _make_model_config(
+                quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+                dynamic_weight_quant=True,
+                force_dynamic_quantization=False,
+                **_NVFP4_SHAPES,
+            )
+        )
 
 
 @pytest.mark.parametrize("required_field", tuple(_TINY_CONFIG))
@@ -168,20 +222,46 @@ def test_adaln_modulation_keeps_dynamic_fp8_input_high_precision() -> None:
     [
         (QuantAlgo.FP8, False),
         (QuantAlgo.FP8_BLOCK_SCALES, True),
-        (QuantAlgo.NVFP4, True),
+        (QuantAlgo.NVFP4, False),
+        (QuantAlgo.W4A8_AWQ, True),
     ],
 )
 def test_transformer_rejects_unvalidated_quantization_modes(
     quant_algo: QuantAlgo,
     dynamic_weight_quant: bool,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="dynamic per-tensor FP8"):
+    with pytest.raises(NotImplementedError, match="FP8 / NVFP4"):
         h3.MiniMaxH3Transformer3DModel(
             _make_model_config(
                 quant_config=QuantConfig(quant_algo=quant_algo),
                 dynamic_weight_quant=dynamic_weight_quant,
             )
         )
+
+
+def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
+    model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_nvfp4_model_config())
+
+    assert model.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
+    assert model.model_config.dynamic_weight_quant
+
+
+def test_post_load_quantizes_nvfp4_projections_like_fp8() -> None:
+    """NVFP4 gets the same FP32-projection treatment as FP8: they are quantized."""
+    model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_nvfp4_model_config())
+
+    model.post_load_weights()
+
+    for projection in (
+        model.proj_in,
+        model.audio_proj_in,
+        model.proj_out,
+        model.audio_proj_out,
+    ):
+        assert projection.has_any_quant
+        assert projection.weight.dtype != torch.float32
+    # time_embedder is a plain nn.Linear, so it stays FP32 under either algorithm.
+    assert model.time_embedder.linear_1.weight.dtype == torch.float32
 
 
 def test_post_load_preserves_dynamic_fp8_projection_weights() -> None:
@@ -739,6 +819,46 @@ def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
     model._attn_backend = "TRTLLM"
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         model(**inputs)
+
+
+def _sm_at_least(major: int) -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= major
+
+
+@requires_cuda
+@pytest.mark.parametrize("backend", ["FA4", "TRTLLM", "CUTEDSL"])
+def test_attention_backends_match_vanilla(backend: str) -> None:
+    """Every supported backend must reproduce VANILLA bit-for-bit.
+
+    Measured on B200 (sm_100): FA4, TRTLLM and CUTEDSL all match exactly. The
+    same comparison on sm_89 shows TRTLLM diverging by >100%, so this is only
+    meaningful on hardware the build actually targets.
+    """
+    if backend == "FA4" and not FA4_AVAILABLE:
+        pytest.skip("FA4 kernel not available")
+    if backend == "CUTEDSL" and not _sm_at_least(10):
+        pytest.skip("CUTEDSL requires sm_100a or newer")
+
+    # _model_inputs draws unseeded randoms, so build one set and share it.
+    inputs = _model_inputs("cuda")
+    outputs = {}
+    for name in ("VANILLA", backend):
+        # FA4 kernels are specialised per head dim; use the released
+        # checkpoint's 128 rather than _TINY_CONFIG's 8.
+        config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
+        config.attention = AttentionConfig(backend=name)
+        if name == "TRTLLM":
+            config.attention_metadata_state = create_attention_metadata_state()
+        model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
+        _initialize_weights(model, scale=0.1)
+        model.requires_grad_(False)
+        with torch.inference_mode():
+            outputs[name] = model(**inputs)
+
+    torch.testing.assert_close(outputs[backend].sample, outputs["VANILLA"].sample, rtol=0, atol=0)
+    torch.testing.assert_close(
+        outputs[backend].audio_sample, outputs["VANILLA"].audio_sample, rtol=0, atol=0
+    )
 
 
 def test_released_checkpoint_mixed_dtype_contract() -> None:

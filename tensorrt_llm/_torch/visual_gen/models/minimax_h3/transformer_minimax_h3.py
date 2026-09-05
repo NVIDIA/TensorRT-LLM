@@ -403,6 +403,23 @@ class MiniMaxH3TransformerBlock(nn.Module):
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
+# Weight quantization is only wired for the load-time (dynamic) path, where
+# DynamicLinearWeightLoader quantizes the released BF16 checkpoint.  NVFP4 uses
+# the loader's fused-QKV path so the packed QKV projection shares one scale.
+# Both algorithms treat the checkpoint's FP32 projections identically: they are
+# quantized like every other Linear (see ``post_load_weights``).
+_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.FP8, QuantAlgo.NVFP4})
+
+# NVFP4 additionally needs runtime activation quantization.  The loader only
+# writes ``weight_scale`` / ``weight_scale_2``, so ``Linear.input_scale`` stays
+# uninitialized; NVFP4LinearMethod only derives it from the activations when
+# ``force_dynamic_quantization`` is set, and otherwise reads that uninitialized
+# scale.  Measured on B200 with an uncalibrated checkpoint, that is the
+# difference between ~15% and ~105% relative error, and it fails silently, so
+# require the flag rather than let it through.
+_FORCE_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.NVFP4})
+
+
 # Only the vanilla and FA4 attention backends honour ``key_padding_mask``.  The
 # TRTLLM and CUTEDSL backends accept it through ``**kwargs`` and silently drop
 # it, which would corrupt results rather than fail, so padded packed sequences
@@ -429,10 +446,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self._supports_key_padding_mask = self._attn_backend in _KEY_PADDING_MASK_BACKENDS
         quant_algo = model_config.quant_config.quant_algo
         if quant_algo is not None and not (
-            quant_algo == QuantAlgo.FP8 and model_config.dynamic_weight_quant
+            quant_algo in _DYNAMIC_QUANT_ALGOS and model_config.dynamic_weight_quant
         ):
             raise NotImplementedError(
-                "MiniMax-H3 initial support allows BF16 or dynamic per-tensor FP8 weights only."
+                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / NVFP4 weights only."
+            )
+        if quant_algo in _FORCE_DYNAMIC_QUANT_ALGOS and not model_config.force_dynamic_quantization:
+            raise NotImplementedError(
+                f"MiniMax-H3 {quant_algo.name} requires force_dynamic_quantization=True; "
+                "the dynamic loader does not calibrate Linear.input_scale, so the "
+                "static activation-scale path would read an uninitialized scale."
             )
 
         cfg = model_config.pretrained_config
