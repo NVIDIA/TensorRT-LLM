@@ -1130,3 +1130,76 @@ class MLAParams:
     predicted_tokens_per_seq: int = 1
     chunked_prefill_buffer_batch_size: int = 1
     hidden_size: int = 0
+
+
+def _describe_int_tensor(name: str, tensor: Optional[torch.Tensor]) -> str:
+    """Summarize a 1-D length tensor as count/min/max."""
+    if tensor is None:
+        return f"{name}=None"
+    try:
+        values = tensor.detach().flatten().tolist()
+    except Exception as exc:  # pragma: no cover - diagnostics must never mask the original error
+        return f"{name}=<unreadable: {exc}>"
+    if not values:
+        return f"{name}=[]"
+    return f"{name}(n={len(values)}, min={min(values)}, max={max(values)})"
+
+
+def log_attention_failure_context(backend_name: str, layer_idx: Optional[int],
+                                  metadata: "AttentionMetadata",
+                                  attention_window_size: Optional[int],
+                                  exc: BaseException) -> None:
+    """Log the attention metadata that explains a kernel-level failure.
+
+    Kernel failures reach Python as opaque CUDA/cuBLAS errors ("illegal memory
+    access", "CUBLAS_STATUS_EXECUTION_FAILED") with nothing identifying the
+    batch, the sequence lengths, or the sliding window in effect, which is
+    exactly what is needed to tell a kernel bug from a sequence that just grew
+    past its attention window. Callers log this and then re-raise the original
+    exception unchanged.
+
+    Only reached on the failure path, so the tensor reads below cost nothing in
+    a healthy run.
+    """
+    try:
+        parts = [
+            f"backend={backend_name}",
+            f"layer_idx={layer_idx}",
+            f"attention_window_size={attention_window_size}",
+            f"num_contexts={getattr(metadata, 'num_contexts', None)}",
+            f"num_generations={getattr(metadata, 'num_generations', None)}",
+            f"num_tokens={getattr(metadata, 'num_tokens', None)}",
+            f"max_seq_len={getattr(metadata, 'max_seq_len', None)}",
+            _describe_int_tensor("seq_lens", getattr(metadata, "seq_lens",
+                                                     None)),
+            _describe_int_tensor("seq_lens_kv",
+                                 getattr(metadata, "seq_lens_kv", None)),
+            _describe_int_tensor("kv_lens",
+                                 getattr(metadata, "kv_lens_runtime", None)),
+            f"request_ids={getattr(metadata, 'request_ids', None)}",
+        ]
+
+        block_offsets = getattr(metadata, "kv_cache_block_offsets", None)
+        if block_offsets is not None:
+            parts.append(
+                f"kv_cache_block_offsets_shape={tuple(block_offsets.shape)}")
+        workspace = getattr(metadata, "workspace", None)
+        if workspace is not None:
+            parts.append(f"workspace_numel={workspace.numel()}, "
+                         f"workspace_dtype={workspace.dtype}")
+        kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+        if kv_cache_manager is not None:
+            parts.append(
+                "max_attention_window_vec="
+                f"{getattr(kv_cache_manager, 'max_attention_window_vec', None)}"
+            )
+            parts.append(
+                f"tokens_per_block={getattr(kv_cache_manager, 'tokens_per_block', None)}"
+            )
+
+        logger.error(f"Attention kernel failed ({type(exc).__name__}): " +
+                     ", ".join(parts))
+    except Exception:  # pragma: no cover - never let diagnostics mask the failure
+        logger.error(
+            f"Attention kernel failed ({type(exc).__name__}); "
+            f"could not collect diagnostic context for backend {backend_name}")
