@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import hashlib
 import math
 import os
 import sys
@@ -39,7 +38,10 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
+from tensorrt_llm.runtime.kv_cache_hash import (
+    get_cache_salt_id,
+    get_effective_kv_cache_event_hash_algo,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
     BAD_PAGE_INDEX,
@@ -4180,14 +4182,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """Derive ``ReuseScope.salt`` (int|None) from the ``cache_salt`` string.
 
         Deterministic so the same string yields the same reuse namespace across
-        processes (matches C++ blockKey hashing on cacheSalt). Shared by cache
-        creation, prefetch, and the cache-aware router probe so they all hit the
-        same radix-tree namespace.
+        processes. Delegates to ``kv_cache_hash.get_cache_salt_id`` -- the single
+        source of truth shared with the serve-layer KV-cache-aware router -- so
+        cache creation, prefetch, the cache-aware router probe, and the router's
+        recomputed event hashes all key the same radix-tree namespace. (The C++
+        V1 ``BlockKeyHasher`` is separate: it mixes
+        ``std::hash<std::string>(cacheSalt)`` directly, not this id.)
         """
         if cache_salt is None:
             return None
-        digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "little")
+        return get_cache_salt_id(cache_salt)
 
     def _create_kv_cache(
         self,
