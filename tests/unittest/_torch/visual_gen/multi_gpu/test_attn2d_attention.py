@@ -104,8 +104,15 @@ class _LSEVanillaAttention(nn.Module):
         k_t = k.transpose(1, 2).float()
         v_t = v.transpose(1, 2).float()
         k_t, v_t = self._expand_kv_heads(k_t, v_t)
+        key_padding_mask = kwargs.get("key_padding_mask")
+        attn_mask = key_padding_mask[:, None, None, :] if key_padding_mask is not None else None
         out = F.scaled_dot_product_attention(
-            q_t, k_t, v_t, scale=self.scale, enable_gqa=self.num_heads != self.num_kv_heads
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=attn_mask,
+            scale=self.scale,
+            enable_gqa=self.num_heads != self.num_kv_heads,
         )
         return out.to(q.dtype).transpose(1, 2).contiguous()
 
@@ -116,6 +123,9 @@ class _LSEVanillaAttention(nn.Module):
         v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         k_t, v_t = self._expand_kv_heads(k_t, v_t)
         scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
+        key_padding_mask = kwargs.get("key_padding_mask")
+        if key_padding_mask is not None:
+            scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
         lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v_t)  # [B, H, S_q, D]
@@ -277,6 +287,81 @@ def _logic_attn2d_vs_standard(rank, world_size):
         atol=1e-3,
         msg=f"Rank {rank}: Attention2D output differs from standard attention",
     )
+
+
+def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
+    """A 1x2 mesh partitions replicated context and excludes both padding tails."""
+    row_size, col_size = 1, 2
+    batch, num_heads, head_dim = 2, 4, 16
+    generated_len = 5
+    seq_per_rank = 3
+    generated_padded_len = seq_per_rank * world_size
+    context_len = 5
+    context_lengths = [2, context_len]
+    device = torch.device(f"cuda:{rank}")
+
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+    inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    context_k = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+    context_v = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+
+    start = rank * seq_per_rank
+    end = start + seq_per_rank
+    output = attn(
+        q_full[:, start:end].contiguous(),
+        k_full[:, start:end].contiguous(),
+        v_full[:, start:end].contiguous(),
+        attention_mask=PredefinedAttentionMask.FULL,
+        replicated_k=context_k,
+        replicated_v=context_v,
+        replicated_k_lengths=context_lengths,
+        global_generated_seq_len=generated_len,
+    )
+
+    reference = []
+    for batch_idx, text_len in enumerate(context_lengths):
+        k_valid = torch.cat(
+            [
+                k_full[batch_idx : batch_idx + 1, :generated_len],
+                context_k[batch_idx : batch_idx + 1, :text_len],
+            ],
+            dim=1,
+        )
+        v_valid = torch.cat(
+            [
+                v_full[batch_idx : batch_idx + 1, :generated_len],
+                context_v[batch_idx : batch_idx + 1, :text_len],
+            ],
+            dim=1,
+        )
+        reference.append(
+            F.scaled_dot_product_attention(
+                q_full[batch_idx : batch_idx + 1, :generated_len].transpose(1, 2),
+                k_valid.transpose(1, 2),
+                v_valid.transpose(1, 2),
+                scale=1.0 / math.sqrt(head_dim),
+            ).transpose(1, 2)
+        )
+    reference = torch.cat(reference, dim=0)
+
+    valid_in_shard = max(0, min(end, generated_len) - start)
+    if valid_in_shard > 0:
+        torch.testing.assert_close(
+            output[:, :valid_in_shard],
+            reference[:, start : start + valid_in_shard],
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"Rank {rank}: replicated K/V padding changed Attention2D output",
+        )
 
 
 def _logic_attn2d_invalid_mask(rank, world_size):
@@ -510,6 +595,14 @@ class TestAttn2DAttention:
     def test_attn2d_vs_standard_attention(self):
         """Attention2DAttention output matches standard full-sequence SDPA (2x2 mesh)."""
         run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_vs_standard, use_cuda=True)
+
+    def test_attn2d_replicated_kv_unequal_lengths(self):
+        """A 1x2 mesh matches full attention with unequal context lengths."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_attn2d_replicated_kv_unequal_lengths,
+            use_cuda=True,
+        )
 
     def test_attn2d_invalid_mask_raises(self):
         """CAUSAL mask raises ValueError (only FULL is supported)."""

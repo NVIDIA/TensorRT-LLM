@@ -32,7 +32,10 @@ try:
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
         COSMOS3_EDGE_BACKBONE_TYPE,
+        QWEN3_RECIPE,
+        Cosmos3CrossAttention,
         Cosmos3VFMTransformer,
+        _resolve_cosmos3_cross_attention_backend,
     )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -164,6 +167,67 @@ SEED_UNCOND_TEXT = 123
 
 RTOL = 1e-2
 ATOL = 1e-2
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+@pytest.mark.parametrize(
+    ("backend", "mapping", "expected"),
+    [
+        ("TRTLLM", None, "VANILLA"),
+        ("CUTEDSL", None, "CUTEDSL"),
+        (
+            "CUTEDSL",
+            SimpleNamespace(ulysses_size=1, attn2d_row_size=1, attn2d_col_size=1),
+            "CUTEDSL",
+        ),
+        (
+            "CUTEDSL",
+            SimpleNamespace(ulysses_size=2, attn2d_row_size=1, attn2d_col_size=1),
+            "VANILLA",
+        ),
+        (
+            "FA4",
+            SimpleNamespace(ulysses_size=2, attn2d_row_size=2, attn2d_col_size=2),
+            "FA4",
+        ),
+    ],
+)
+def test_cosmos3_cross_attention_backend_resolution(backend, mapping, expected):
+    assert _resolve_cosmos3_cross_attention_backend(backend, mapping) == expected
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+@pytest.mark.parametrize("ulysses_size", [1, 2])
+def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size):
+    mapping = SimpleNamespace(
+        ulysses_size=ulysses_size,
+        attn2d_row_size=2,
+        attn2d_col_size=2,
+    )
+    with pytest.raises(ValueError, match="Use attention backend FA4"):
+        _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping)
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+def test_cute_dsl_ulysses_backend_fallback(monkeypatch):
+    config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        ulysses_size=2,
+        backend="CUTEDSL",
+    )
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+
+    cross_attention = Cosmos3CrossAttention(
+        hidden_size=_COSMOS3_TEST_CONFIG["hidden_size"],
+        num_attention_heads=_COSMOS3_TEST_CONFIG["num_attention_heads"],
+        num_key_value_heads=_COSMOS3_TEST_CONFIG["num_key_value_heads"],
+        head_dim=_COSMOS3_TEST_CONFIG["head_dim"],
+        model_config=config,
+        recipe=QWEN3_RECIPE,
+    )
+
+    assert cross_attention.attn_backend == "VANILLA"
+    assert config.attention.backend == "CUTEDSL"
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -437,6 +501,29 @@ def _forward(
         ).video
 
 
+def _forward_with_unequal_text_lengths(
+    model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
+) -> torch.Tensor:
+    channels = _COSMOS3_TEST_CONFIG["latent_channel"]
+    hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+        device, channels=channels, text_seed=text_seed, batch=2
+    )
+    text_mask.zero_()
+    text_mask[0, :2] = 1
+    text_mask[1, :_TEXT_LEN] = 1
+    model.reset_cache()
+    with torch.inference_mode():
+        return model(
+            hidden_states=hs,
+            timestep=ts / _NUM_TRAIN_TIMESTEPS,
+            raw_timestep=ts,
+            text_ids=text_ids,
+            text_mask=text_mask,
+            video_shape=video_shape,
+            fps=_FPS,
+        ).video
+
+
 def _forward_with_audio(
     model: Cosmos3VFMTransformer, device: torch.device, text_seed: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -626,6 +713,39 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
         ulysses_out,
         ref_out,
         msg=f"Rank {rank}: Ulysses output differs from single-GPU reference",
+    )
+
+
+def _logic_cosmos3_ulysses_unequal_text_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+    ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+
+    # The sequence-parallel cache must remain a full, trimmed text prefix on
+    # every rank. Ulysses shards its heads only after the generated-token A2A.
+    assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
+    if rank == 0:
+        diff = (ulysses_out.float() - ref_out.float()).abs()
+        print(
+            f"[ulysses={world_size},text_lens=2/{_TEXT_LEN}] "
+            f"max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: unequal-length Ulysses output differs from single-GPU reference",
+    )
+    torch.testing.assert_close(
+        ulysses_out.float(),
+        ref_out.float(),
+        rtol=1e-4,
+        atol=1e-5,
+        msg=f"Rank {rank}: unequal-length Ulysses regression exceeded tight tolerance",
     )
 
 
@@ -833,6 +953,14 @@ class TestCosmos3TransformerParallel:
     def test_ulysses2_vs_single_gpu(self):
         self._skip_if_unavailable()
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_ulysses_vs_single_gpu)
+
+    def test_ulysses2_unequal_text_lengths_vs_single_gpu(self):
+        """CFG-in-one-batch text padding is excluded from sequence-parallel K/V."""
+        self._skip_if_unavailable()
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_ulysses_unequal_text_vs_single_gpu,
+        )
 
     def test_edge_tp2_vs_single_gpu(self):
         """Edge's non-gated relu² MLP shards without the gate_up fusion the

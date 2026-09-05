@@ -16,7 +16,7 @@
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional, Tuple, TypeVar
+from typing import Any, Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,28 @@ def apply_pretrained_config_compat_defaults(
         if getattr(pretrained_config, key, None) is None:
             setattr(pretrained_config, key, value)
     return pretrained_config
+
+
+def _resolve_cosmos3_cross_attention_backend(
+    backend: str,
+    visual_gen_mapping: Optional[Any],
+) -> str:
+    """Select a backend that preserves padded cross-attention semantics."""
+    if backend == "TRTLLM":
+        return "VANILLA"
+    if backend != "CUTEDSL" or visual_gen_mapping is None:
+        return backend
+
+    attn2d_size = visual_gen_mapping.attn2d_row_size * visual_gen_mapping.attn2d_col_size
+    if attn2d_size > 1:
+        raise ValueError(
+            "Cosmos3 cross-attention with Attention2D does not support the "
+            "CUTEDSL backend: unequal text lengths require a key-padding mask, "
+            "which CUTEDSL does not consume. Use attention backend FA4."
+        )
+    if visual_gen_mapping.ulysses_size > 1:
+        return "VANILLA"
+    return backend
 
 
 def _noop_offload_context(_tower_name: str) -> ContextManager:
@@ -616,32 +638,46 @@ class Cosmos3CrossAttention(Attention):
         module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
-        if model_config.attention.backend == "TRTLLM":
-            # TRTLLM backend is not supported for Cosmos3CrossAttention
-            model_config.attention.backend = "VANILLA"
+        resolved_backend = _resolve_cosmos3_cross_attention_backend(
+            original_backend,
+            model_config.visual_gen_mapping,
+        )
+        if resolved_backend != original_backend:
+            model_config.attention.backend = resolved_backend
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
+            if original_backend == "CUTEDSL":
+                reason = (
+                    "does not support the key-padding mask required by Cosmos3 "
+                    "Ulysses cross-attention"
+                )
+            else:
+                reason = "is not supported for Cosmos3 cross-attention"
             logger.warning_once(
-                f"{type(self).__name__}: requested attention backend {original_backend} is not "
-                f"supported for Cosmos3 cross-attention; falling back to VANILLA.",
-                key=(type(self).__name__, original_backend, "VANILLA"),
+                f"{type(self).__name__}: requested attention backend {original_backend} "
+                f"{reason}; falling back to {resolved_backend}.",
+                key=(type(self).__name__, original_backend, resolved_backend),
             )
 
-        super().__init__(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=False,
-            qk_norm_mode="per_head",
-            bias=False,
-            config=model_config,
-            layer_idx=layer_idx,
-            module_name=module_name,
-            enable_sequence_parallel=True,
-        )
-        model_config.attention.backend = original_backend
+        try:
+            super().__init__(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                qkv_mode=QKVMode.FUSE_QKV,
+                qk_norm=False,
+                qk_norm_mode="per_head",
+                bias=False,
+                config=model_config,
+                layer_idx=layer_idx,
+                module_name=module_name,
+                enable_sequence_parallel=True,
+            )
+        finally:
+            model_config.attention.backend = original_backend
+        vgm = model_config.visual_gen_mapping
+        self._sequence_parallel = vgm is not None and vgm.seq_size > 1
 
         # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
         # fp32-weight-multiply in both recipes.
@@ -662,6 +698,7 @@ class Cosmos3CrossAttention(Attention):
         freqs_sin: torch.Tensor,
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -685,7 +722,24 @@ class Cosmos3CrossAttention(Attention):
         q, k = self.apply_qk_norm(q, k)
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
-        if real_text_lens is not None and batch_size > 1:
+        if self._sequence_parallel:
+            if real_text_lens is None or global_generated_seq_len is None:
+                raise ValueError(
+                    "Sequence-parallel Cosmos3 cross-attention requires text and generated "
+                    "sequence lengths."
+                )
+            out = self._attn_impl(
+                q,
+                k,
+                v,
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+                replicated_k=k_und,
+                replicated_v=v_und,
+                replicated_k_lengths=real_text_lens,
+                global_generated_seq_len=global_generated_seq_len,
+            )
+        elif real_text_lens is not None and batch_size > 1:
             outs = []
             for b in range(batch_size):
                 Lb = int(real_text_lens[b])
@@ -853,6 +907,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -866,6 +921,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=sin,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            global_generated_seq_len=global_generated_seq_len,
         )
         hidden_states = residual + hidden_states
 
@@ -1583,21 +1639,17 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
-                # Round max_real_len up to next multiple of sharder.size.
-                # At most size-1 extra positions, negligible softmax dilution.
-                val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
-                S_text_shard_total = int(max_real_len) + val
-
-                self.cached_kv = []
-                for k, v in cached_kv_full:
-                    k = k[:, :S_text_shard_total].clone()
-                    v = v[:, :S_text_shard_total].clone()
-                    if val > 0:
-                        k[:, int(max_real_len) :] = 0
-                        v[:, int(max_real_len) :] = 0
-                    self.cached_kv.append(
-                        (self.sharder.shard(k, dim=1), self.sharder.shard(v, dim=1))
+                # Keep text K/V replicated. Ulysses shards their heads after
+                # its all-to-all; Attention2D partitions their sequence across
+                # partial-attention columns. This preserves a valid-prefix
+                # layout for unequal prompt lengths without padded keys.
+                self.cached_kv = [
+                    (
+                        k[:, : int(max_real_len)].contiguous(),
+                        v[:, : int(max_real_len)].contiguous(),
                     )
+                    for k, v in cached_kv_full
+                ]
             else:
                 self.cached_kv = cached_kv_full
 
@@ -1743,6 +1795,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         v_und,
                         freqs_gen,
                         timestep=timestep,
+                        real_text_lens=real_text_lens,
+                        global_generated_seq_len=S_gen,
                     )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
