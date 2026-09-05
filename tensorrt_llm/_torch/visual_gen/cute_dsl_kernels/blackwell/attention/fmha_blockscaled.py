@@ -621,11 +621,9 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                 (dv, ((h_r, h_k), b)),
                 stride=(1, ((0, dv), 0)),
             )
-            m_scale_v_channels = cute.make_tensor(
-                scale_v_channels.iterator, scale_v_channels_layout
-            )
+            mScaleV_channels = cute.make_tensor(scale_v_channels.iterator, scale_v_channels_layout)
         else:
-            m_scale_v_channels = None
+            mScaleV_channels = None
 
         self.tile_sched_params, grid = fmha_utils.compute_grid(
             cute.shape((s_q_max, d, ((h_r, h_k), b))),
@@ -898,7 +896,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             scale_softmax_log2,
             scale_softmax,
             scale_output,
-            m_scale_v_channels,
+            mScaleV_channels,
             skip_softmax_threshold_log2,
             window_size_left,
             window_size_right,
@@ -947,7 +945,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
-        m_scale_v_channels: Optional[cute.Tensor],
+        mScaleV_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -2063,7 +2061,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                     sO[None, None, 0],
                                     mLSE,
                                     mSink,
-                                    m_scale_v_channels,
+                                    mScaleV_channels,
                                 ),
                                 (
                                     s0_corr_consumer,
@@ -2086,7 +2084,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                     sO[None, None, 1],
                                     mLSE,
                                     mSink,
-                                    m_scale_v_channels,
+                                    mScaleV_channels,
                                 ),
                                 (
                                     s1_corr_consumer,
@@ -2128,7 +2126,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                 gO0,
                                 mLSE,
                                 mSink,
-                                m_scale_v_channels,
+                                mScaleV_channels,
                             ),
                             (s0_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -2145,7 +2143,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                                 gO1,
                                 mLSE,
                                 mSink,
-                                m_scale_v_channels,
+                                mScaleV_channels,
                             ),
                             (s1_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -3533,7 +3531,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             dest_O,
             mLSE,
             mSink,
-            m_scale_v_channels,
+            mScaleV_channels,
         ) = tensor_args
         row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output = value_args
 
@@ -3600,8 +3598,8 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             row_sum = row_sum + sink_exp
         scale = scale_output / row_sum
 
-        if cutlass.const_expr(m_scale_v_channels is not None):
-            scale_v_ch_h = m_scale_v_channels[None, blk_coord[2]]
+        if cutlass.const_expr(mScaleV_channels is not None):
+            scaleV_ch_h = mScaleV_channels[None, blk_coord[2]]
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADdO_i = tTMEM_LOADdO[None, 0, 0, i]
@@ -3613,13 +3611,13 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
-            if cutlass.const_expr(m_scale_v_channels is not None):
+            if cutlass.const_expr(mScaleV_channels is not None):
                 for j in range(0, cute.size(tTMrO), 2):
                     _, n0 = tTMEM_LOADoO_i[j]
                     _, n1 = tTMEM_LOADoO_i[j + 1]
                     tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                         (tTMrO[j], tTMrO[j + 1]),
-                        (scale_v_ch_h[n0], scale_v_ch_h[n1]),
+                        (scaleV_ch_h[n0], scaleV_ch_h[n1]),
                     )
             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()

@@ -298,8 +298,6 @@ def cute_dsl_fmha_fwd(
             raise ValueError("Block-scaled path (qk_sf_vec != 0) requires q_sf and k_sf tensors.")
         if not q_sf.is_contiguous() or not k_sf.is_contiguous():
             raise ValueError("q_sf and k_sf must be contiguous.")
-    elif scale_v_channels is not None:
-        raise ValueError("scale_v_channels is only supported by MXFP8 and NVFP4 kernels.")
 
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("Q, K, and V must be contiguous before the CuTe DSL launch boundary.")
@@ -399,15 +397,15 @@ def cute_dsl_fmha_fwd(
         sf_dtype = cutlass.Float8E8M0FNU if qk_sf_vec == 32 else cutlass.Float8E4M3FN
         q_sf_cute = _to_cute_tensor(q_sf, leading_dim=0, cutlass_element_type=sf_dtype)
         k_sf_cute = _to_cute_tensor(k_sf, leading_dim=0, cutlass_element_type=sf_dtype)
-        scale_v_channels_cute = (
-            _to_cute_tensor(scale_v_channels.view(-1), leading_dim=0)
-            if scale_v_channels is not None
-            else None
-        )
     else:
         q_sf_cute = None
         k_sf_cute = None
-        scale_v_channels_cute = None
+    # Per-channel V dequant scales. Supported by both the block-scaled and the dense kernel;
+    scale_v_channels_cute = (
+        _to_cute_tensor(scale_v_channels.view(-1), leading_dim=0)
+        if scale_v_channels is not None
+        else None
+    )
     # lse_4d is (B, S_q, h_kv, h_r) contiguous → h_r is the stride-1 inner dim (index 3).
     lse_cute = (
         from_dlpack(lse_4d, assumed_align=16).mark_layout_dynamic(leading_dim=3)
@@ -501,6 +499,7 @@ def cute_dsl_fmha_fwd(
             cute_typing.Float32(scale_softmax_log2),
             cute_typing.Float32(scale_softmax),
             cute_typing.Float32(scale_output),
+            scale_v_channels_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -528,11 +527,11 @@ def _quantize_fp8_v(
 ) -> Tuple[torch.Tensor, float | torch.Tensor, torch.Tensor | None]:
     """Quantize V to FP8 with either one tensor scale or an (H, D) scale tensor."""
     if per_head_channel:
-        v_qscale = _FP8_E4M3_MAX / v_bshd.float().abs().amax(dim=(0, 1)).clamp(min=1e-3)
+        v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax(dim=(0, 1)).float().clamp(min=1e-3)
         v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
         return v_quantized, 1.0, v_qscale.reciprocal().contiguous()
 
-    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().clamp(min=1e-3)
+    v_qscale = _FP8_E4M3_MAX / v_bshd.abs().amax().float().clamp(min=1e-3)
     v_quantized = (v_bshd * v_qscale).to(torch.float8_e4m3fn)
     return v_quantized, v_qscale.reciprocal(), None
 
@@ -636,6 +635,12 @@ class CuTeDSLAttention(AttentionBackend):
         self.num_kv_heads = num_kv_heads or num_heads
         self.dtype = dtype
         self.quant_attention_config = quant_attention_config
+        if quant_attention_config is not None and quant_attention_config.v_block_size not in (0, 1):
+            raise NotImplementedError(
+                "CuTeDSLAttention supports v_block_size == 0 for per-tensor quantization; "
+                "and v_block_size == 1 for per-channel quantization. "
+                f"Found unsupported value: {quant_attention_config.v_block_size}."
+            )
         if skip_softmax_threshold_scale is not None and sparse_params is not None:
             raise ValueError("Set either skip_softmax_threshold_scale or sparse_params, not both.")
         self.skip_softmax_threshold_scale = skip_softmax_threshold_scale
@@ -727,7 +732,8 @@ class CuTeDSLAttention(AttentionBackend):
             device=q.device,
         )
 
-        # V is tensor-scaled by default. MXFP8/NVFP4 with v_block_size=1 use an (H, D) scale.
+        # Set v_block_size=1 use an (H, D) scale for V (recommended);
+        # Set v_block_size=0 to per-tensor quantize V (introduces extra device-host sync);
         scale_v = kwargs.get("scale_v", 1.0)
         scale_q = kwargs.get("scale_q", 1.0)
         scale_k = kwargs.get("scale_k", 1.0)
@@ -744,7 +750,7 @@ class CuTeDSLAttention(AttentionBackend):
                 scale_k = scale_k * gs_k
                 qk_cutlass_dtype = cutlass.Float4E2M1FN if qk_sf_vec == 16 else cutlass.Float8E4M3FN
             v, v_dequant_scale, scale_v_channels = _quantize_fp8_v(
-                v, per_head_channel=qk_sf_vec != 0 and qac.v_block_size == 1
+                v, per_head_channel=qac.v_block_size == 1
             )
             scale_v = scale_v * v_dequant_scale
 
