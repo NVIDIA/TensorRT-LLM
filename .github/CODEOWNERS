@@ -205,7 +205,6 @@
 /tests/scripts/perf-sanity @NVIDIA/trt-llm-perf-devs
 
 # ===== KV CACHE MANAGER =====
-/cpp/include/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -213,7 +212,6 @@
 /cpp/include/tensorrt_llm/batch_manager/reorderPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/stringSetTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/templatedTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -433,7 +431,6 @@
 /cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs

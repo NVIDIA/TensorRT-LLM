@@ -19,8 +19,6 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # keep this list sorted alphabetically
 set(SRCS
-    allocateKvCache.cpp
-    assignReqSeqSlots.cpp
     baseTransBuffer.cpp
     blockKey.cpp
     cacheFormatter.cpp
@@ -38,13 +36,10 @@ set(SRCS
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
     microBatchScheduler.cpp
-    pauseRequests.cpp
     peftCacheManager.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    sequenceSlotManager.cpp
-    utils/inflightBatchingUtils.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
