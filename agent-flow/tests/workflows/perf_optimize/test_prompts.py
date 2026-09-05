@@ -1443,3 +1443,61 @@ def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
     assert "often not fixable in-campaign" in prompt
     # Bounded by the measured share, not the raw spread.
     assert "bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread" in prompt
+
+
+# ------------------------------------------------------- container setup block
+
+
+def _server_roles(bundle):
+    """The roles that open a Slurm step, i.e. the ones the prelude must reach."""
+    return ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa")
+
+
+def test_container_setup_reaches_every_role_that_opens_a_slurm_step():
+    """The prelude has to land wherever a container is started, and nowhere else.
+
+    A role that launches a server without it sees the unprepared image; a role
+    that never opens a step (projector, reporter) would just be carrying dead
+    instructions in a prompt that is already long.
+    """
+    bundle = build_perf_optimize_prompts(
+        include_slurm_environment=True,
+        container_setup="source /repo/.venv-3.12/bin/activate",
+    )
+    for role in _server_roles(bundle):
+        assert "## Container setup" in getattr(bundle, role), role
+        assert "source /repo/.venv-3.12/bin/activate" in getattr(bundle, role), role
+    for role in ("projector", "reporter"):
+        assert "## Container setup" not in getattr(bundle, role), role
+
+
+def test_container_setup_is_inert_when_the_task_does_not_set_it():
+    """Unset must leave the prompts byte-identical to before the field existed."""
+    without = build_perf_optimize_prompts(include_slurm_environment=True)
+    explicit_empty = build_perf_optimize_prompts(
+        include_slurm_environment=True, container_setup="   "
+    )
+    for role in _server_roles(without):
+        assert getattr(without, role) == getattr(explicit_empty, role), role
+        assert "Container setup" not in getattr(without, role), role
+
+
+def test_container_setup_needs_the_slurm_block_to_appear():
+    """Local runs start no container, so there is nothing to prepare."""
+    bundle = build_perf_optimize_prompts(container_setup="source /repo/.venv/bin/activate")
+    for role in _server_roles(bundle):
+        assert "Container setup" not in getattr(bundle, role), role
+
+
+def test_container_setup_tells_the_agent_to_repeat_it_every_step():
+    """Each Slurm step gets a fresh container, so 'already did it' is a trap.
+
+    The failure this guards is subtle: the benchmarker prepares its container,
+    the evaluator opens a NEW step, skips the prelude because the transcript
+    says it ran, and measures against an unprepared image.
+    """
+    text = build_perf_optimize_prompts(
+        include_slurm_environment=True, container_setup="source /x/activate"
+    ).evaluator
+    assert "every new Slurm step" in text
+    assert "fresh container" in text

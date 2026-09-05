@@ -139,6 +139,12 @@ than inventing values:
   is what bounds the items a campaign can attempt — 15 with the defaults.
   `optimize.item_execution` defaults to `parallel`; set it to `serial`
   to apply approved items directly in order from the latest campaign state.
+  In `parallel` mode the batch runs on the shared `agent_flow.orchestration`
+  DAG scheduler, and `optimize.max_parallel_items` caps how many items run at
+  once (default: `max_items_per_round`). Each concurrent item launches its own
+  `trtllm-serve` and benchmark, so on a single node without a
+  `slurm-environment` block tell the user to set it to `1` — otherwise the
+  concurrent servers contend for the same GPUs and port.
   Two things worth telling the user when sizing a run:
   - **Rounds are not equally expensive.** A round pays for a profile
     after an accept, after a reverted code attempt may have changed

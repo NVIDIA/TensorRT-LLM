@@ -286,10 +286,18 @@ def append_workflow_event(
     round_no: int,
     summary: str,
     item_ids: list[str],
+    agent: str = "optimizer_evaluator",
 ) -> dict[str, Any]:
-    """Append a main-thread batch lifecycle event to global progress."""
+    """Append a main-thread lifecycle event to global progress.
+
+    ``agent`` names whose story the event belongs to. It defaults to the batch
+    pseudo-role that owns ``batch_started`` / ``batch_completed``, but the
+    orchestrator also has to record things it decided ABOUT a real role — an
+    integrator verdict it declined to apply, say — and filing those under the
+    batch would hide them from a reader following that role.
+    """
     entry = {
-        "agent": "optimizer_evaluator",
+        "agent": agent,
         "round": round_no,
         "timestamp": _now_iso(),
         "event": event,
@@ -297,7 +305,7 @@ def append_workflow_event(
         "summary": summary,
     }
     stored = _append(path, entry, lock=lock, allocate_step=True)
-    _log_progress_write("optimizer_evaluator", stored)
+    _log_progress_write(agent, stored)
     return stored
 
 

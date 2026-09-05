@@ -65,6 +65,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     TaskSchemaError,
     cluster_ssh,
     concurrency_points,
+    container_setup,
     dump_task_yaml,
     has_slurm_environment,
     is_curve_mode,
@@ -143,7 +144,16 @@ VALID_METRICS: frozenset[str] = frozenset(
 # The perf-optimize half of the key census the base schema documents. Same
 # contract: this is what a lint may call real, not what the validator rejects.
 KNOWN_OPTIMIZE_KEYS: frozenset[str] = frozenset(
-    set(OPTIMIZE_DEFAULTS) | {"target_improvement_pct", "focus_concurrencies", "max_regression_pct"}
+    set(OPTIMIZE_DEFAULTS)
+    | {
+        "target_improvement_pct",
+        "focus_concurrencies",
+        "max_regression_pct",
+        # Deliberately absent from OPTIMIZE_DEFAULTS: unset means "follow
+        # max_items_per_round", which is not a value the merged block can
+        # carry without freezing the coupling it exists to break.
+        "max_parallel_items",
+    }
 )
 KNOWN_ACCURACY_KEYS: frozenset[str] = frozenset({"command", "baseline_score", "max_drop_pct"})
 KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "coverage_target_pct"})
@@ -184,6 +194,7 @@ def _validate_optimize_block(optimize: Mapping[str, Any], errors: list[str]) -> 
         "max_rounds",
         "max_attempts_per_item",
         "max_items_per_round",
+        "max_parallel_items",
     ):
         if field in optimize and optimize[field] is not None:
             value = optimize[field]
@@ -546,6 +557,7 @@ __all__ = [
     "focus_concurrencies",
     "has_accuracy_check",
     "cluster_ssh",
+    "container_setup",
     "has_slurm_environment",
     "is_curve_mode",
     "kernel_coverage",

@@ -11,6 +11,7 @@ from .prompts import build_perf_optimize_prompts
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
+    container_setup,
     has_slurm_environment,
     kernel_coverage,
     load_and_validate_task_yaml,
@@ -139,6 +140,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        container_setup=container_setup(task_data),
     )
     with PerfOptimizeWorkflow(
         workspace=args.workspace,
