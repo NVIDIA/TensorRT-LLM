@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import torch
 
-from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm._torch.tensor_lru_cache import CacheAcquireResult, TensorLRUCache
 
 
 def test_rejects_non_positive_capacity() -> None:
@@ -52,6 +52,22 @@ def test_put_get_pop_and_clear_update_byte_accounting() -> None:
     assert len(cache) == 0
     assert cache.current_bytes == 0
     assert cache.get("a") is None
+
+
+def test_clear_rejects_live_references_and_reservations() -> None:
+    cache = TensorLRUCache[str](max_bytes=32)
+
+    assert cache.acquire("key", 8) is CacheAcquireResult.NEW_RESERVATION
+    with pytest.raises(RuntimeError, match="live references or reservations"):
+        cache.clear()
+
+    cache.commit("key", torch.ones(2, dtype=torch.float32))
+    with pytest.raises(RuntimeError, match="live references or reservations"):
+        cache.clear()
+
+    assert cache.release("key") is None
+    cache.clear()
+    assert len(cache) == 0
 
 
 def test_stats_track_hits_misses_insertions_and_replacements() -> None:
@@ -180,6 +196,82 @@ def test_parallel_operations_keep_cache_metadata_consistent() -> None:
         hit = cache.get(index)
         if hit is not None:
             assert hit.numel() * hit.element_size() == 8
+
+
+def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    value = torch.ones(2, dtype=torch.float32)
+
+    assert cache.acquire("key", 8) is CacheAcquireResult.NEW_RESERVATION
+    assert cache.acquire("key", 8) is CacheAcquireResult.RESERVATION_HIT
+    assert cache.current_bytes == 0
+    assert cache.stats().reserved_bytes == 8
+    assert cache.stats().in_use_bytes == 0
+
+    cache.ensure_capacity(8)
+    cache.commit("key", value)
+    assert cache.current_bytes == 8
+    assert cache.stats().reserved_bytes == 0
+    assert cache.stats().in_use_bytes == 8
+    cached = cache.get("key", record_stats=False)
+    assert cached is not None
+    torch.testing.assert_close(cached, value)
+
+    assert cache.release("key") is None
+    assert cache.release("key") is None
+    assert cache.stats().in_use_bytes == 0
+    assert cache.current_bytes == 8
+    assert cache.acquire("key", 8) is CacheAcquireResult.READY_HIT
+    assert cache.release("key") is None
+
+    stats = cache.stats()
+    assert stats.hits == 1
+    assert stats.misses == 1
+    assert stats.producer_misses == 1
+    assert stats.inflight_deduplications == 1
+
+
+def test_non_retained_entries_are_removed_on_their_final_release() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+
+    assert (
+        cache.acquire("reserved", 8, retain_after_release=False)
+        is CacheAcquireResult.NEW_RESERVATION
+    )
+    assert cache.release("reserved") is None
+    assert len(cache) == 0
+    assert cache.stats().reserved_bytes == 0
+
+    assert (
+        cache.acquire("ready", 8, retain_after_release=False) is CacheAcquireResult.NEW_RESERVATION
+    )
+    cache.commit("ready", torch.ones(2, dtype=torch.float32))
+    assert cache.release("ready") is None
+    assert len(cache) == 0
+    assert cache.current_bytes == 0
+    assert cache.stats().in_use_bytes == 0
+
+
+def test_reservation_limit_and_output_space_are_checked_separately() -> None:
+    cache = TensorLRUCache[str](max_bytes=16)
+    assert cache.put("old-1", torch.ones(2, dtype=torch.float32))
+    assert cache.put("old-2", torch.ones(2, dtype=torch.float32))
+
+    assert cache.acquire("new-1", 8) is CacheAcquireResult.NEW_RESERVATION
+    assert cache.acquire("new-2", 8) is CacheAcquireResult.NEW_RESERVATION
+    assert not cache.put("legacy", torch.ones(2, dtype=torch.float32))
+    assert len(cache) == 4
+    assert cache.current_bytes == 16
+    assert cache.stats().reserved_bytes == 16
+    assert cache.acquire("old-1", 8) is None
+
+    cache.ensure_capacity(16)
+    assert cache.get("old-1", record_stats=False) is None
+    assert cache.get("old-2", record_stats=False) is None
+    assert cache.current_bytes == 0
+    cache.commit("new-1", torch.ones(2, dtype=torch.float32))
+    cache.commit("new-2", torch.ones(2, dtype=torch.float32))
+    assert cache.current_bytes == 16
 
 
 def test_stream_aware_mode_leaves_cpu_cache_behavior_unchanged() -> None:

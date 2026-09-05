@@ -11,8 +11,8 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple, Type,
-                    Union)
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
+                    Tuple, Type, Union)
 
 import torch
 import torch._dynamo.config
@@ -76,6 +76,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
@@ -556,6 +557,17 @@ class PyTorchModelEngine(ModelEngine):
             # Absent, not None, when item scheduling is off: external readers
             # rely on the `getattr` default.
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
+        if isinstance(self.model,
+                      MultimodalModelMixin) and mapping.is_first_pp_rank():
+            multimodal_config = self.model.model_config.multimodal_config
+            reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
+                                    if self.model.encoder_cache_active else 0)
+            cache_capacity_bytes = max(
+                self.mm_encoder_output_budget_bytes or 0,
+                reuse_capacity_bytes,
+            )
+            self.model._initialize_multimodal_encoder_cache(
+                cache_capacity_bytes)
         setup_mm_encoder_attn_metadata(
             self.model, self.input_processor, self.encoder_max_num_tokens,
             mm_item_scheduler.attention_metadata_capacity
@@ -3562,13 +3574,42 @@ class PyTorchModelEngine(ModelEngine):
         requests: List[LlmRequest],
         scheduled_items: Dict[int, List[int]],
     ) -> None:
-        """Forward selected MM encoder items and commit request-local outputs."""
+        """Forward selected MM encoder items into the unified output cache."""
         if not scheduled_items:
             return
         if self._mm_item_scheduler is None:
             raise TypeError(
                 "Item-level MM scheduling requires MultimodalModelMixin")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
+
+    @property
+    def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
+        """Return the model-owned encoder-output cache used by this engine."""
+        if not isinstance(self.model, MultimodalModelMixin):
+            return None
+        if self._mm_item_scheduler is None and not self.model.encoder_cache_active:
+            return None
+        return self.model._multimodal_encoder_cache
+
+    def get_mm_encoder_item_cache_keys(
+            self, request: LlmRequest) -> Optional[List[Hashable]]:
+        """Return stable cache keys for an item-scheduled request, when available."""
+        if self._mm_item_scheduler is None:
+            return None
+        return self._mm_item_scheduler.item_cache_keys(request)
+
+    def invalidate_multimodal_encoder_cache(self) -> None:
+        """Clear cached MM encoder outputs when no request is using them."""
+        encoder_cache = self.mm_encoder_cache
+        if encoder_cache is not None:
+            encoder_cache.clear()
+
+    def _build_multimodal_data_for_llm(
+            self, request: LlmRequest) -> Optional[Dict[str, Any]]:
+        """Attach cached item outputs when item scheduling owns the request."""
+        if self._mm_item_scheduler is None:
+            return request.py_multimodal_data
+        return self._mm_item_scheduler.build_multimodal_data_for_llm(request)
 
     def _set_up_spec_metadata(
             self,
@@ -5483,7 +5524,7 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_input=_build_request_multimodal_input(
                     request, self._mm_encoder_cache_enabled),
-                multimodal_data=request.py_multimodal_data,
+                multimodal_data=self._build_multimodal_data_for_llm(request),
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx)
@@ -6626,7 +6667,8 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params = MultimodalParams(
                     multimodal_input=_build_request_multimodal_input(
                         request, self._mm_encoder_cache_enabled),
-                    multimodal_data=request.py_multimodal_data,
+                    multimodal_data=self._build_multimodal_data_for_llm(
+                        request),
                     mm_item_order=getattr(request, "py_mm_item_order", None),
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",

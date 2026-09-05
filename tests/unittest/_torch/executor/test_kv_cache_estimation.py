@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
@@ -66,6 +67,7 @@ class _EncoderCacheMultimodalModel(_MultimodalModel):
 class _ModelEngine:
     model: _TextModel | _MultimodalModel
     mm_encoder_output_budget_bytes: int | None = None
+    mm_encoder_cache: TensorLRUCache | None = None
 
 
 def _make_reserve_creator(
@@ -83,9 +85,18 @@ def _make_reserve_creator(
     # Match ModelLoader: the model receives the effective, normalized config
     # from TorchLlmArgs rather than retaining the caller's input object.
     model.model_config.multimodal_config = llm_args.multimodal_config
+    cache_bytes = 0
+    if isinstance(model, MultimodalModelMixin):
+        cache_bytes = mm_encoder_output_budget_bytes or 0
+        if model.encoder_cache_active:
+            cache_bytes = max(
+                cache_bytes,
+                model.model_config.multimodal_config.encoder_cache_max_bytes,
+            )
     model_engine = _ModelEngine(
         model=model,
         mm_encoder_output_budget_bytes=mm_encoder_output_budget_bytes,
+        mm_encoder_cache=TensorLRUCache(cache_bytes) if cache_bytes else None,
     )
     return KvCacheCreator(
         model_engine=model_engine,
@@ -385,6 +396,13 @@ def test_reserve_adds_only_unprofiled_output_capacity():
         mm_encoder_output_budget_bytes=512,
     )
     assert creator._get_multimodal_encoder_memory_reserve(profiled_output_bytes=400) == 112
+
+
+def test_downstream_pp_rank_without_encoder_store_reserves_no_memory() -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(mm_encoder_cache=None)
+
+    assert creator._get_multimodal_encoder_memory_reserve() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -947,6 +965,7 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     # A bare Mock would auto-create the attribute; real engines set it to
     # None unless the model opted into MM item scheduling.
     model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(
