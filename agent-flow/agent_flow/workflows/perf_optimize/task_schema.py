@@ -71,6 +71,8 @@ from agent_flow.workflows.perf_analyze.task_schema import (
 from agent_flow.workflows.perf_analyze.task_schema import (
     load_and_validate_task_yaml as _base_load_and_validate,
 )
+from agent_flow.workflows.perf_optimize.bench_cli import BenchCliError
+from agent_flow.workflows.perf_optimize.bench_cli import plan as sweep_plan
 from agent_flow.workflows.perf_optimize.disagg import (
     DISAGG_CONFIG_KEY,
     DISAGG_FIELD,
@@ -82,6 +84,26 @@ from agent_flow.workflows.perf_optimize.disagg import (
     user_set_benchmark_keys,
 )
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
+from agent_flow.workflows.perf_optimize.sol_track import (
+    CTX_JSON_KEY,
+    SOL_TRACK_FIELD,
+    SWEEP_KEY,
+    TRACK_KEY,
+    TRACK_METRICS,
+    TRACKS,
+    WORKSPACE_KEY,
+    SolTrackError,
+    apply_plan,
+    ctx_json_path,
+    has_sol_track,
+    load_sweep,
+    require_build_source,
+    sol_track_block,
+    sweep_accept_rate,
+    sweep_path,
+    track_name,
+    workspace_name,
+)
 
 # Defaults merged under the user's values. ``target_improvement_pct`` is
 # deliberately absent: when the user does not set it, there is no
@@ -134,6 +156,14 @@ VALID_METRICS: frozenset[str] = frozenset(
         for stat in ("mean", "median", "p90", "p99")
         for kind in ("ttft", "tpot", "itl", "e2el")
     }
+    # A SOL track's metric is as real a result key as any above: it is what
+    # `sol_track.collect` writes into the result JSON every later stage
+    # reads. Absent from here the two importers refuse it -- the service
+    # adapter raises and the lint errors -- so a campaign that runs
+    # perfectly from the CLI cannot be submitted through the dashboard,
+    # and the message it gets says the key is not a benchmark result key,
+    # which is the one thing it certainly is.
+    | set(TRACK_METRICS.values())
 )
 
 # The perf-optimize half of the key census the base schema documents. Same
@@ -393,6 +423,128 @@ def _validate_disagg_block(data: dict[str, Any], errors: list[str]) -> dict[str,
         return None
 
 
+def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[str, Any] | None:
+    """Validate the ``sol_track`` block and ask the CLI what its sweep expands to.
+
+    Same boundary and same reason as :func:`_validate_disagg_block`: a
+    sweep that cannot be read, or that plans none of the cases this
+    campaign says it optimizes, must abort before any agent is
+    constructed rather than an hour into an allocation.
+
+    Returns the ``sweep plan`` envelope's data block — the authority for
+    the operating points and sequence lengths — or ``None`` when the
+    block is absent or unusable. ``sweep plan`` is read-only and queues
+    nothing, which is what makes it usable from here.
+    """
+    if not has_sol_track(data):
+        return None
+    block = sol_track_block(data)
+    if block is None:
+        errors.append(
+            f"'{SOL_TRACK_FIELD}' must be a mapping carrying '{TRACK_KEY}' "
+            f"({' | '.join(TRACKS)}), '{SWEEP_KEY}' and '{WORKSPACE_KEY}', got "
+            f"{type(data.get(SOL_TRACK_FIELD)).__name__}"
+        )
+        return None
+    if has_disagg(data):
+        # One campaign measures one thing. A sol_track campaign optimizes
+        # one half in isolation; a disagg campaign measures the whole
+        # cluster. Both reconcile `benchmark` from a different file, so
+        # combining them means one of the two silently loses.
+        errors.append(
+            f"'{SOL_TRACK_FIELD}' cannot be combined with '{DISAGG_FIELD}': a sol_track "
+            f"campaign optimizes one role in isolation against its own sweep, while a "
+            f"disagg campaign measures the end-to-end deployment. Run them as separate "
+            f"campaigns."
+        )
+        return None
+    if data.get(EXTRA_LLM_API_OPTIONS_FIELD) is not None:
+        # Same shape as the disagg refusal, and for the same reason: two
+        # seeds for one live tuning file. A SOL track seeds it from the
+        # sweep stage's own overlay key, so a named extra_llm_api_options
+        # would be dropped on the floor -- `workflow.py` reaches the
+        # `has_sol_track` branch before the `elif extra` one. "My setting
+        # did nothing" is the failure this codebase refuses to ship.
+        errors.append(
+            f"'{EXTRA_LLM_API_OPTIONS_FIELD}' cannot be combined with "
+            f"'{SOL_TRACK_FIELD}': the live tuning config is seeded from the sweep "
+            f"stage's own '{{ctx,gen}}_extra_llm_api' overlay, so this file would "
+            f"never be read. Put its contents in the sweep stage config instead."
+        )
+        return None
+    track = track_name(data)
+    if track not in TRACKS:
+        errors.append(
+            f"'{SOL_TRACK_FIELD}.{TRACK_KEY}' must be one of {list(TRACKS)}, got "
+            f"{block.get(TRACK_KEY)!r}"
+        )
+        return None
+    workspace = workspace_name(data)
+    if workspace is None:
+        errors.append(
+            f"'{SOL_TRACK_FIELD}.{WORKSPACE_KEY}' is required and must be a non-empty "
+            f"string: the bench-disagg workspace this campaign measures into. It fixes "
+            f"one workload on one cluster, and an image or code change appends to it "
+            f"rather than forking it — which is what lets an attempt be compared "
+            f"case-by-case against the baseline it must beat."
+        )
+        return None
+    path = sweep_path(data)
+    if path is None:
+        errors.append(
+            f"'{SOL_TRACK_FIELD}.{SWEEP_KEY}' is required and must be a non-empty "
+            f"string: the orchestration sweep.yaml naming the stage configs and the "
+            f"cluster server.config"
+        )
+        return None
+    if not path.is_file():
+        errors.append(f"'{SOL_TRACK_FIELD}.{SWEEP_KEY}' is not a file: {path}")
+        return None
+    try:
+        sweep = load_sweep(path)
+    except SolTrackError as exc:
+        errors.append(str(exc))
+        return None
+    # `frontier build` requires it on every build and refuses to infer
+    # one, so a sweep without it produces a campaign that measures fine
+    # and cannot be turned into a curve. Cheaper to say so now.
+    if sweep_accept_rate(sweep) is None:
+        errors.append(
+            f"{path} sets no 'options.accept_rate'. Every `frontier build` requires it "
+            f"and none is inferred: the acceptance length scales both the numerator and "
+            f"the ctx term of the frontier metric, so a wrong one tilts the whole curve "
+            f"with no symptom. Freeze the measured value in the sweep's options."
+        )
+        return None
+    if track == "gen":
+        # `frontier build` rate-matches the whole curve, so it needs the
+        # context request rate even though the gate's metric is purely
+        # generation-side. Without a source it raises ANCHOR_MISSING --
+        # after the gen jobs have run and the cluster time is spent.
+        anchor = ctx_json_path(data)
+        stages = sweep.get("stages") or {}
+        ctx_stage = stages.get("ctx") if isinstance(stages, Mapping) else None
+        ctx_enabled = isinstance(ctx_stage, Mapping) and ctx_stage.get("enabled", False)
+        if not ctx_enabled and anchor is None:
+            errors.append(
+                f"a gen track needs a CTX anchor: enable the 'ctx' stage in {path} so "
+                f"the campaign measures its own, or set "
+                f"'{SOL_TRACK_FIELD}.{CTX_JSON_KEY}' to an existing ctx.json. "
+                f"`frontier build` rate-matches the whole curve and refuses without "
+                f"one, which would strand every gen measurement this campaign paid for."
+            )
+            return None
+        if anchor is not None and not anchor.is_file():
+            errors.append(f"'{SOL_TRACK_FIELD}.{CTX_JSON_KEY}' is not a file: {anchor}")
+            return None
+    try:
+        return sweep_plan(path, workspace)
+    except BenchCliError as exc:
+        code = f" [{exc.code}]" if exc.code else ""
+        errors.append(f"`bench-disagg sweep plan` failed{code}: {exc}")
+        return None
+
+
 def load_and_validate_task_yaml(
     path: str | Path, *, max_rounds_override: int | None = None
 ) -> dict[str, Any]:
@@ -423,8 +575,34 @@ def load_and_validate_task_yaml(
             }
         except DisaggConfigError as exc:
             errors.append(str(exc))
+    # Same slot and the same reason for a sol_track campaign: its sweep
+    # config owns the operating points, and `optimize.target_metric`
+    # defaults to what the track's post-processor emits — both have to
+    # land before the blocks validated against them, and before the
+    # OPTIMIZE_DEFAULTS merge below.
+    sol_track_cfg = _validate_sol_track_block(data, errors)
+    if sol_track_cfg is not None:
+        try:
+            data[SOL_TRACK_FIELD] = {
+                **data[SOL_TRACK_FIELD],
+                "filled_from_sweep_plan": apply_plan(
+                    data, sol_track_cfg, user_set_benchmark_keys(path)
+                ),
+            }
+        except SolTrackError as exc:
+            errors.append(str(exc))
     optimize = _mapping_block(data, "optimize", errors)
     _validate_optimize_block(optimize, errors)
+    if sol_track_cfg is not None and isinstance(optimize, Mapping):
+        # After the optimize block, because it is what names the
+        # approaches -- and before any agent, because the failure it
+        # prevents costs a full allocation and reads as a real result.
+        try:
+            require_build_source(
+                data, optimize.get("approaches") or OPTIMIZE_DEFAULTS["approaches"]
+            )
+        except SolTrackError as exc:
+            errors.append(str(exc))
     # An explicitly-null value means "not set" everywhere in this
     # validator (every check above skips ``None``), so drop those keys
     # before the defaults merge too — otherwise a bare ``max_rounds:``
