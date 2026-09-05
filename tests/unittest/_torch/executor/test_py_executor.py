@@ -1804,6 +1804,7 @@ class _StubADPExecutor:
         enable_scheduler_aware_adp_dummy=None,
         enable_non_overlap_adp_forward_intent=None,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
+        exclude_retiring_requests=True,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1836,6 +1837,12 @@ class _StubADPExecutor:
         self.dist.tp_size = 1
         self.dist.tp_allgather.side_effect = lambda value: [value]
         self.dist.tp_allreduce.side_effect = lambda value, op: max(value, int(peer_forward_intent))
+        # The pad path reads the router's gate rather than re-deriving it, so
+        # the two views of "which requests are routable load" cannot drift.
+        # Default True models a non-PP attention-DP executor; under pipeline
+        # parallelism the router leaves retiring requests in the load vector
+        # and the pad path must not subtract them (nvbug-6627795).
+        self.adp_router = Mock(exclude_retiring_requests=exclude_retiring_requests)
 
         self.scheduler = Mock()
         self.scheduler.scheduling_state_range = (
@@ -2137,6 +2144,43 @@ def test_decoder_context_waiting_for_encoder_output_is_not_counted():
 
     assert len(stub.add_dummy_calls) == 1
     assert len(stub.active_requests) == 2
+
+
+def test_pad_does_not_warn_when_surplus_is_only_retiring_requests():
+    # The router now excludes retiring requests from the per-rank loads that
+    # floor `expected` (nvbug-6627795), so `expected` can legitimately sit
+    # below len(active_requests). Measuring the surplus against the raw len()
+    # would log a warning on every iteration of a hot loop.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=1),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=2),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=3),
+    ]
+    # What the router would have reported: 3 resident, 1 routable.
+    stub.expected_num_active_requests = 1
+
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+        _run_pad(stub)
+
+    assert mock_logger.warning.call_count == 0
+    # One routable request means the rank has real work; no dummy needed.
+    assert stub.add_dummy_calls == []
+
+
+def test_pad_still_warns_on_a_genuine_routable_surplus():
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=1),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2),
+    ]
+    stub.expected_num_active_requests = 1
+
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock_logger:
+        _run_pad(stub)
+
+    assert mock_logger.warning.call_count == 1
+    assert "exceeds expected_num_active_requests" in mock_logger.warning.call_args[0][0]
 
 
 def test_generic_disagg_adp_mixed_rank_states_stay_queueable():

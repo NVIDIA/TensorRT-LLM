@@ -757,13 +757,12 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
                 guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_disagg_adp_overlap_headroom", False)
-                                        else max_batch_size)
+                    model_engine, "_enable_adp_overlap_seq_slot_headroom",
+                    False) else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The disaggregated attention-DP overlap path follows the
-                    # expanded slot pool. Other configurations retain
-                    # max_batch_size.
+                    # The attention-DP overlap path follows the expanded slot
+                    # pool. Other configurations retain max_batch_size.
                     "max_num_sequences": guided_decoder_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
