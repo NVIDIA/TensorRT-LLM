@@ -25,6 +25,12 @@ def _make_gate_case() -> tuple[SimpleNamespace, SimpleNamespace, SimpleNamespace
     )
     residual = SimpleNamespace(**vars(hidden_states))
     norm = SimpleNamespace(
+        weight=SimpleNamespace(
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+            shape=torch.Size((7168,)),
+            is_contiguous=lambda: True,
+        ),
         nvfp4_scale=None,
         return_hp_output=False,
         use_gemma=False,
@@ -135,6 +141,10 @@ def test_wideep_flashinfer_add_add_rmsnorm_falls_back_for_missing_shared_output(
         "not_contiguous",
         "residual_not_contiguous",
         "post_moe_fusion",
+        "weight_device_mismatch",
+        "weight_shape_mismatch",
+        "weight_not_bf16",
+        "weight_not_contiguous",
         "nvfp4_quant",
         "high_precision_output",
         "gemma",
@@ -180,6 +190,14 @@ def test_wideep_flashinfer_add_add_rmsnorm_fails_closed(
         residual.is_contiguous = lambda: False
     elif rejection == "post_moe_fusion":
         layer.fusion_config.POST_MOE_FUSION = True
+    elif rejection == "weight_device_mismatch":
+        norm.weight.device = torch.device("cuda:1")
+    elif rejection == "weight_shape_mismatch":
+        norm.weight.shape = torch.Size((7169,))
+    elif rejection == "weight_not_bf16":
+        norm.weight.dtype = torch.float16
+    elif rejection == "weight_not_contiguous":
+        norm.weight.is_contiguous = lambda: False
     elif rejection == "nvfp4_quant":
         norm.nvfp4_scale = object()
     elif rejection == "high_precision_output":
