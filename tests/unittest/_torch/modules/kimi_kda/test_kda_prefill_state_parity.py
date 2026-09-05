@@ -25,12 +25,13 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kda_prefill_test_utils import (  # noqa: E402
+from kda_prefill_test_utils import (  # noqa: E402
     assert_kda_close,
     run_fla_prefill,
     run_indexed_prefill,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
 
 NUM_HEADS = 96
 HEAD_DIM = 128

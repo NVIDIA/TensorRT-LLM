@@ -11,12 +11,13 @@ from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
+from kimi_kda_test_utils import (  # noqa: E402
     KimiKDAReference,
     KimiKDATestCachedState,
     get_production_decode_kernel_path,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
 
 # 73: deliberately odd and > 64 to cover non-power-of-two batched decode.
 BATCH_SIZE = 73
@@ -155,7 +156,7 @@ def _run_production_decode(
         if include_metadata
         else None
     )
-    output = attention.forward_decode(
+    core = attention.forward_decode(
         hidden_states.squeeze(1),
         conv_pool,
         state_pool,
@@ -163,6 +164,7 @@ def _run_production_decode(
         metadata,
         ssm_state_indices=ssm_state_indices,
     )
+    output = attention._project_output(core)
     selected_conv = conv_pool.index_select(0, slot_indices)
     return output.unsqueeze(1), KimiKDATestCachedState(
         conv_state_q=torch.cat(

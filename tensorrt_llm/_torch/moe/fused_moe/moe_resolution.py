@@ -284,6 +284,7 @@ def build_moe_deployment(
     if num_slots is None:
         num_slots = num_experts if num_experts is not None else 0
     lora_config = getattr(model_config, "lora_config", None)
+    locality_domain_policy = getattr(model_config, "locality_domain_policy", None)
     return MoEDeployment(
         ep_size=mapping.moe_ep_size,
         tp_size=mapping.moe_tp_size,
@@ -297,6 +298,14 @@ def build_moe_deployment(
         eplb_enabled=eplb_enabled,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
+        # Same expression the impls use to set ``use_fused_finalize``; any
+        # LoRA counts, not just routed-expert LoRA.
+        fused_finalize_enabled=(
+            not getattr(model_config, "moe_disable_finalize_fusion", False) and lora_config is None
+        ),
+        locality_domain_requested=bool(
+            locality_domain_policy is not None and locality_domain_policy.enabled
+        ),
     )
 
 
@@ -501,7 +510,17 @@ def resolve_moe_impl(
 def impl_class_for(report: MoEResolutionReport) -> MoEImplClass:
     """The class a report's winner names, or raise with the whole trail."""
     if report.winner is None:
-        raise ValueError(f"no MoE implementation can serve this layer. {report.describe()}")
+        # describe() prints reason codes only. With nothing left to run, the
+        # operator needs the details too -- that is all the error can offer.
+        details = "; ".join(
+            f"{rejection.legacy_backend}: {rejection.detail}"
+            for rejection in report.rejected
+            if rejection.detail
+        )
+        raise ValueError(
+            f"no MoE implementation can serve this layer. {report.describe()}"
+            + (f" Details: {details}" if details else "")
+        )
     for candidate in IMPL_PRIORITY:
         if _legacy_backend_name(candidate) == report.winner:
             return candidate

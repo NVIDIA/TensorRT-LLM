@@ -28,7 +28,6 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,

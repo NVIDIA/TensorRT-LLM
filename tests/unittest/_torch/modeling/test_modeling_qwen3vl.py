@@ -1090,7 +1090,7 @@ def test_qwen3vl_vision_block_forward_end_to_end():
     error in `apply_rope`."""
     from transformers import Qwen3VLConfig
 
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionBlock
 

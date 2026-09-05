@@ -286,13 +286,31 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+- `image_reference`, `video_reference`, `audio_reference`: reference image(s) for I2V/TI2V, video(s) for V2V, audio(s). In JSON each takes a `{content, format, role}` object or a list of them; a multipart file upload needs no `format`.
+  - `format` declares how to read `content`: `"path"` (a file readable by the server, or a `file://` URI), `"url"` (`http(s)`), or `"base64"` (or a `data:` URI). It is required in JSON, where `"bytes"` is rejected — upload the file instead.
+
+    ```json
+    {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
+    ```
+
+  - `"path"` reads a file on the *server*, so it is only meaningful for a co-located client; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject it (the same switch also disables `response_format="path"`). `"url"` is fetched through the SSRF-guarded loader (private-address block, redirect re-validation, timeout, size cap).
+  - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
+  - `role` disambiguates a model that accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame. Roles and lists need a JSON body; a multipart upload is a single file with no role.
+
+    ```json
+    {"image_reference": [
+      {"content": "<base64>", "format": "base64", "role": "first_frame"},
+      {"content": "<base64>", "format": "base64", "role": "last_frame"}
+    ]}
+    ```
+
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
+- `input_reference` (deprecated): a single image or video reference, routed by content signature to I2V or V2V. A JSON request carries base64 bytes and a multipart request uploads the file; it is ignored when `image_reference` / `video_reference` is also given. Prefer the typed fields.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
 
-> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
 
 #### Tensor-format consumer contract
 
@@ -384,7 +402,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
 ```bash
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=She turns around and smiles" \
-  -F "input_reference=@./media/woman_skyline_original_720p.jpeg" \
+  -F "image_reference=@./media/woman_skyline_original_720p.jpeg" \
   -F "seconds=4.0" \
   -F "fps=24" \
   -F "size=256x256" \
@@ -393,11 +411,11 @@ curl -X POST "http://localhost:8000/v1/videos" \
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash
-# The reference is classified by content: image -> I2V, video -> V2V.
+# Modality comes from the field name: image_reference -> I2V, video_reference -> V2V.
 # V2V conditioning knobs ride in extra_params (values below are the defaults).
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
-  -F "input_reference=@./media/reference.mp4" \
+  -F "video_reference=@./media/reference.mp4" \
   -F "num_frames=189" \
   -F "fps=24" \
   -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'

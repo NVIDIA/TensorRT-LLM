@@ -94,7 +94,7 @@ measured: []
 - **Prior art:** PRs #8882, #9255, #12236, #14268, #12385, #15381. Files:
   `cpp/tensorrt_llm/kernels/indexerTopK.cu`, `heuristic_topk.cuh`, `IndexerTopK.h`,
   `cpp/tensorrt_llm/thop/IndexerTopKOp.cpp`,
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/indexer.py`,
   `.../custom_ops/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py`.
   Owning specialists: **kernel-cuda-specialist**, **kernel-cute-writing**. Related:
   the [MoE routing-kernel case](fuse-moe-routing-kernel.md) (same "collapse a

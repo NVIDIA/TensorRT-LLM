@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
-SamplingConfig = tensorrt_llm.bindings.SamplingConfig
+SamplingConfig = tllm_executor.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
 '''
@@ -39,7 +39,6 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
-ExecutorSamplingConfig = tllm_executor.SamplingConfig
 FinishReason = tllm_executor.FinishReason
 
 REQUEST_TYPE_MAPPING = {
@@ -913,6 +912,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        # Owned entirely on the Python side: the TorchSampler is the only
+        # consumer, so the C++ request no longer carries a copy.
+        self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
+            "embedding_bias", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -946,16 +949,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         if llm_request is not None:
             super().__init__(llm_request)
         else:
-            super().__init__(
-                *args,
-                client_id=client_id,
-                return_log_probs=return_log_probs,
-                return_context_logits=False,
-                return_generation_logits=False,
-                return_perf_metrics=return_perf_metrics,
-                stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
-                if stop_words_list else None,
-                **kwargs)
+            super().__init__(*args,
+                             client_id=client_id,
+                             return_log_probs=return_log_probs,
+                             return_context_logits=False,
+                             return_generation_logits=False,
+                             return_perf_metrics=return_perf_metrics,
+                             **kwargs)
         if encoder_output_len is not None and not hasattr(
                 self, "encoder_output_len"):
             self.encoder_output_len = int(encoder_output_len)
@@ -969,7 +969,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_end_id = self.end_id
-        self.py_min_length = self.sampling_config.min_length
+        self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
         # Manager-owned helix decode-step counter; see
         # KVCacheManagerV2._set_helix_rank_fields.
@@ -1064,14 +1064,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
-        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
-            # Pre-squeeze to 1D if needed (remove batch dimension)
-            if self.embedding_bias.dim() > 1:
-                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
-            else:
-                self._py_embedding_bias_1d = self.embedding_bias
-
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         """Beam width of the current (or next) decoding step.
 
@@ -1090,14 +1082,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
         pins the agreement.
 
-        An empty array (``[]`` or ``[[]]``) falls through to the base
-        implementation rather than indexing it, matching the two emptiness
-        guards the C++ side checks before reading element 0.
+        An empty array falls through to the base implementation rather than
+        indexing it, matching the emptiness guard the C++ side checks before
+        reading element 0.
         """
         beam_width_array = self.sampling_config.beam_width_array
-        if beam_width_array:
-            if isinstance(beam_width_array[0], (list, tuple)):
-                beam_width_array = beam_width_array[0]
         if beam_width_array:
             iteration = self.decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
@@ -1312,46 +1301,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         assert py_request.is_child
         assert py_request.request_id == child.request_id
         assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.random_seed != self.sampling_config.random_seed
+        assert py_request.sampling_config.seed != self.sampling_config.seed
 
         self.child_requests.append(py_request)
-
-
-def convert_wordlist(word_list) -> List[List[int]]:
-    """Converts a wordlist from format:
-
-    [[word_0 token_0, word_0 token_1, ...], [word_1 token_0, ...], ...]]
-
-    into the TRTLLM word list format. The TRTLLM format expects a list of tokens,
-    and an inclusive prefix sum. A word_list (either bad_words or stop_words) is
-    a list that encodes the list of words that have to be banned / trigger the stop from generated sequences.
-    Its shape is [2, badWordsLength], as explained below, or [batchSize, 2, badWordsLength]
-    when there is a different list for each sequence in the batch.
-
-    The badWordsList and stopWordsList tensors have the same shape [2, length]. Let's consider an example with three words to describe the
-    representation of those lists.  The first word contains tokens [5, 7, 3], the
-    second one contains [9, 2] and the third one is composed of tokens [6, 2, 4, 1]. In total, there are 9 tokens. That's the length. The shape of the tensor
-    is [2, 9].  The first row of the tensor must contain the 9 token IDs and the
-    second row must store the inclusive prefix-sum of the word lengths as shown on the following diagram:
-
-        0           3       5              9
-        |           |       |              |
-        V           V       V              V
-    [  5,  7,  3,  9,  2,  6,  2,  4,  1]
-    [  3,  5,  9, -1, -1, -1, -1, -1, -1]
-    """
-    if not word_list:
-        return []
-    tokens = []
-    offsets = []
-    current_offset = 0
-    for word_tokens in word_list:
-        tokens.extend(word_tokens)
-        current_offset += len(word_tokens)
-        offsets.append(current_offset)
-    if len(tokens) > len(offsets):
-        offsets.extend([-1] * (len(tokens) - len(offsets)))
-    return [tokens, offsets]
 
 
 def _validate_optional_int_list(values: Any,
@@ -1519,14 +1471,16 @@ def executor_request_to_llm_request(
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
-    executor_sampling_config = executor_request.sampling_config
-    sampling_config = SamplingConfig(executor_sampling_config)
+    sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
-    stop_words_list = convert_wordlist(
-        executor_request.stop_words) if executor_request.stop_words else None
+    # Kept in its native list[list[int]] form, like py_bad_words. The
+    # [tokens, prefix_sum] layout convert_wordlist produced was the input format
+    # of the removed C++ stop-words kernel; every reader here just undid it.
+    stop_words_list = [list(word) for word in executor_request.stop_words
+                       ] if executor_request.stop_words else None
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
@@ -1591,9 +1545,6 @@ def executor_request_to_llm_request(
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
-        bad_words_list=torch.tensor(
-            convert_wordlist(executor_request.bad_words), dtype=torch.int32)
-        if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config

@@ -22,12 +22,15 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
+    _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -83,19 +86,27 @@ def _make_cache_config_for_test(
     max_num_tokens: int | None = None,
     max_draft_len: int = 0,
     num_extra_kv_tokens: int = 0,
+    max_attention_window_vec: list[int | None] | None = None,
+    pp_layers: list[int] | None = None,
 ) -> KVCacheManagerConfig:
+    if max_attention_window_vec is None:
+        max_attention_window_vec = [None]
+    if pp_layers is None:
+        pp_layers = list(range(len(max_attention_window_vec)))
+    assert len(max_attention_window_vec) == len(pp_layers)
+
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.kv_cache_type = CacheType.SELFKONLY
     cache_manager.dtype = DataType.HALF
-    cache_manager.head_dim_per_layer = [128]
+    cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
     cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_config.policy)
     cache_manager.is_draft = is_draft
-    cache_manager.num_local_layers = 1
-    cache_manager.pp_layers = [0]
-    cache_manager.max_attention_window_vec = [None]
+    cache_manager.num_local_layers = len(pp_layers)
+    cache_manager.pp_layers = pp_layers
+    cache_manager.max_attention_window_vec = max_attention_window_vec
     cache_manager.max_seq_len = max_seq_len
     cache_manager.max_batch_size = max_batch_size
     cache_manager.max_num_tokens = max_num_tokens
@@ -225,6 +236,117 @@ def _multi_rank_host_fallback_consensus_worker() -> tuple[int, int, int, bool]:
             for tier in manager.kv_cache_manager_py_config.cache_tiers
         ),
     )
+
+
+def test_base_config_uses_local_attention_window_order() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(),
+        max_attention_window_vec=[128, None],
+        pp_layers=[3, 4],
+    )
+
+    assert [layer.sliding_window_size for layer in config.layers] == [
+        128,
+        None,
+    ]
+
+
+def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = SimpleNamespace(
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_num_accepted_draft_tokens=1,
+        py_num_accepted_draft_tokens_indices=[0],
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests = [request]
+
+    accepted_offsets = object()
+    accepted_indices = object()
+    rewind_adjustments = object()
+
+    def locate_accepted_draft_tokens(
+        requests: list[object],
+    ) -> tuple[object, object, object]:
+        del requests
+        return accepted_offsets, accepted_indices, rewind_adjustments
+
+    monkeypatch.setattr(
+        kv_cache_v2_module,
+        "_locate_accepted_draft_tokens",
+        locate_accepted_draft_tokens,
+    )
+
+    local_pool_pointers = object()
+    local_block_offsets = object()
+    cache_manager = SimpleNamespace(
+        num_layers=8,
+        num_local_layers=2,
+        num_kv_heads_per_layer=[8, 8],
+        head_dim=128,
+        max_attention_window_vec=[None, None],
+        max_seq_len=8192,
+        max_total_draft_tokens=31,
+        max_blocks_per_seq=256,
+        tokens_per_block=32,
+        kv_cache_pool_mapping=[[0, 0], [0, 1]],
+        kv_cache_pool_pointers=[local_pool_pointers],
+    )
+    attention_metadata = SimpleNamespace(
+        kv_lens_cuda=torch.tensor([128], dtype=torch.int32),
+        kv_cache_block_offsets=[local_block_offsets],
+        host_kv_cache_pool_pointers=object(),
+        host_kv_cache_pool_mapping=object(),
+    )
+    update_op = Mock()
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "update_kv_cache_draft_token_location",
+        update_op,
+        raising=False,
+    )
+
+    _update_kv_cache_draft_token_location(
+        cache_manager,
+        batch,
+        attention_metadata,
+        kv_cache_dtype_byte_size=2,
+    )
+
+    update_op.assert_called_once()
+    (
+        actual_accepted_offsets,
+        actual_accepted_indices,
+        past_key_value_lengths,
+        use_paged_kv_cache,
+        layer_count,
+        num_kv_heads,
+        head_size_in_bytes,
+        rewind_draft_token_count,
+        max_kv_cache_len,
+        actual_rewind_adjustments,
+        past_key_value_list,
+        pool_pointers,
+        block_offsets,
+        max_blocks_per_seq,
+        tokens_per_block,
+        stream,
+    ) = update_op.call_args.args
+    assert actual_accepted_offsets is accepted_offsets
+    assert actual_accepted_indices is accepted_indices
+    assert torch.equal(past_key_value_lengths, attention_metadata.kv_lens_cuda)
+    assert use_paged_kv_cache is True
+    assert layer_count == cache_manager.num_local_layers
+    assert num_kv_heads == 8
+    assert head_size_in_bytes == 256
+    assert rewind_draft_token_count == cache_manager.max_total_draft_tokens
+    assert max_kv_cache_len == cache_manager.max_seq_len
+    assert actual_rewind_adjustments is rewind_adjustments
+    assert past_key_value_list is None
+    assert pool_pointers is local_pool_pointers
+    assert block_offsets is local_block_offsets
+    assert max_blocks_per_seq == cache_manager.max_blocks_per_seq
+    assert tokens_per_block == cache_manager.tokens_per_block
+    assert stream is None
 
 
 @pytest.mark.parametrize(

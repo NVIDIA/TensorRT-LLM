@@ -26,6 +26,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import yaml
 from pydantic import model_validator
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -148,7 +149,14 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe not in SAGE_RECIPES:
+            if recipe in SAGE_RECIPES:
+                # int8 Q/K SAGE has a compiled cubin only on SM100.
+                if q_config.qk_dtype == "int8" and get_sm_version() != 100:
+                    raise ValueError(
+                        f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
+                        f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
+                    )
+            else:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
                     f"for backend='TRTLLM'. Supported SAGE recipes "

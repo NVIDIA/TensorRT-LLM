@@ -423,20 +423,20 @@ def _materialize_out_scale(gm: GraphModule, input_scale: Node, attn_node: Node) 
         return gm.graph.call_function(torch.ops.aten.reciprocal.default, args=(input_scale,))
 
 
-# Mirrors tensorrt_llm/_torch/attention_backend/trtllm.py::TrtllmAttention.is_sm_version_trtllm_gen_kernel
+# Mirrors tensorrt_llm/_torch/attention/backends/trtllm.py::TrtllmAttention.is_sm_version_trtllm_gen_kernel
 def _is_blackwell_trtllm_gen_kernel(sm: int) -> bool:
     """Whether thop.attention routes through the trtllm-Gen FMHA kernel on this SM."""
     return not (sm < 100 or sm in (120, 121))
 
 
-# Adapted from tensorrt_llm/_torch/attention_backend/trtllm.py::generate_spec_decoding_position_offsets
+# Adapted from tensorrt_llm/_torch/attention/backends/trtllm.py::generate_spec_decoding_position_offsets
 def _generate_spec_decoding_position_offsets(max_num_requests: int, draft_len: int) -> torch.Tensor:
     width = draft_len + 1
     row = torch.arange(width, dtype=torch.int, device="cuda")
     return row.unsqueeze(0).expand(max_num_requests, -1).contiguous()
 
 
-# Adapted from tensorrt_llm/_torch/attention_backend/trtllm.py::generate_spec_decoding_packed_mask
+# Adapted from tensorrt_llm/_torch/attention/backends/trtllm.py::generate_spec_decoding_packed_mask
 def _generate_spec_decoding_packed_mask(max_num_requests: int, draft_len: int) -> torch.Tensor:
     """Build the packed int32 causal mask expected by TRT-LLM spec-decoding.
 

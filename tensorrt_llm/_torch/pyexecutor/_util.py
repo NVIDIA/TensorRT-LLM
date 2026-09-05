@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -41,7 +41,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -49,9 +49,10 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -156,8 +157,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -291,8 +296,17 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
+        if sparse_attn_algorithm == "qsa":
+            # The QSA manager extends the hybrid manager because it must retain
+            # both paged attention data and recurrent GDN state.
+            raise ValueError(
+                "QSA sparse attention currently requires a hybrid Mamba / "
+                "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
@@ -304,15 +318,15 @@ def get_kv_cache_manager_cls(
 # KVCacheManager.get_cache_size_per_token may return either an ``int``
 # (legacy proportional model ``bytes = slope * tokens``) or an affine
 # ``(slope, intercept)`` tuple (CppMambaHybridCacheManager, where mamba
-# state introduces a per-batch fixed cost).  KVCacheManagerV2 reports
-# sliding-window attention fixed cost in the tuple intercept.  CacheCost
-# normalizes the combined shape so the rest of the file does plain attribute
-# access and method calls instead of branching on type.
+# state introduces a per-batch fixed cost). CacheCost normalizes the combined
+# shape so the rest of the file does plain attribute access and method calls
+# instead of branching on type. Managers are responsible for including any
+# pool-specific alignment or capacity headroom in the returned cost.
 
 
 @dataclasses.dataclass(frozen=True)
 class CacheCost:
-    """Affine KV cache cost: ``bytes = slope * tokens + intercept``.
+    """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
     """
@@ -363,7 +377,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
     workspace is reserved and no admission cap is installed for it. See ``ATTENTION_DEVELOPER_GUIDE.md``
     §2.3.
     """
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     # Resolved without ``sparse_params``: those are per-layer, while this workspace is one buffer shared
     # across every attention layer, so the declaration is a whole-model question. The sparse backends all
@@ -373,16 +387,29 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
             model_config, mapping)
 
 
-def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
-                                         max_num_tokens, max_seq_len,
-                                         enable_chunked_prefill):
-    """Max summed attended-KV length (tokens) per forward step the fp8 context-MLA workspace is reserved
-    -- and the scheduler admits -- for, or ``None`` when no reservation is needed.
+def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
+    """Whether chunked prefill bounds the selected backend's runtime workspace."""
+    from ..attention.backends.utils import get_attention_backend
 
-    Returns ``None`` unless KV-cache reuse can grow the workspace past the floor the profiling forward
-    measures: with block reuse off the summed attended KV is bounded by ``max_num_tokens`` (already
-    profiled), and with chunked prefill each attention launch is independently bounded by its chunk buffer.
-    In both cases reserving would only double-count and needlessly shrink the KV pool, so no cap is returned.
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
+            model_config)
+
+
+def get_mla_context_workspace_kv_len_cap(
+        kv_cache_config,
+        max_batch_size,
+        max_num_tokens,
+        max_seq_len,
+        enable_chunked_prefill,
+        workspace_is_chunked_prefill_bounded=True):
+    """Max summed attended-KV length covered by the context-MLA workspace reserve.
+
+    KV-cache reuse can grow this workspace beyond the fresh-prefill profiling
+    floor. Chunked prefill normally prevents that by staging one bounded KV
+    chunk per launch. An implementation that consumes the complete attended
+    prefix sets ``workspace_is_chunked_prefill_bounded=False`` and receives the
+    same reservation and scheduler admission protection as cache reuse.
 
     Otherwise the default (no override) is the never-stall worst case ``min(max_batch_size, max_num_tokens)
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
@@ -390,7 +417,10 @@ def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
     reserves less workspace (freeing KV pool) and lets the scheduler defer over-cap requests; it is floored
     at ``max_seq_len`` (one request must always fit) and capped at the worst case.
     """
-    if not kv_cache_config.enable_block_reuse or enable_chunked_prefill:
+    workspace_can_exceed_profile = (
+        kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
+            enable_chunked_prefill and not workspace_is_chunked_prefill_bounded)
+    if not workspace_can_exceed_profile:
         return None
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
     override = kv_cache_config.fp8_context_mla_kv_len_cap
@@ -506,6 +536,25 @@ def draft_config_defines_attention_layout(
         getattr(draft_pretrained_config, "use_sliding_window", None) is not None
         or getattr(draft_pretrained_config, "sliding_window", None) is not None
         or bool(getattr(draft_pretrained_config, "layer_types", None)))
+
+
+def _expand_attention_window_pattern_to_global_layers(
+    max_attention_window: Optional[Sequence[int]],
+    layer_mask: Sequence[bool],
+) -> Optional[List[int]]:
+    """Expand an enabled-layer pattern into physical global-layer order."""
+    if max_attention_window is None:
+        return None
+
+    pattern = list(max_attention_window)
+    global_windows = [pattern[0]] * len(layer_mask)
+    enabled_layer_offset = 0
+    for layer_idx, enabled in enumerate(layer_mask):
+        if enabled:
+            global_windows[layer_idx] = pattern[enabled_layer_offset %
+                                                len(pattern)]
+            enabled_layer_offset += 1
+    return global_windows
 
 
 def _derive_draft_max_attention_window(
@@ -696,6 +745,8 @@ class KvCacheCreator:
                                 manager_cls,
                                 model_config,
                                 kv_cache_config: Optional[KvCacheConfig] = None,
+                                *,
+                                is_draft: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -706,8 +757,10 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block,
                 max_seq_len=self._max_seq_len,
                 max_batch_size=self._max_batch_size,
+                max_num_tokens=self._max_num_tokens if is_draft else 0,
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
+                is_draft=is_draft,
                 **extra_kwargs))
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
@@ -765,8 +818,10 @@ class KvCacheCreator:
                     draft_kv_cache_config,
                     is_disagg=self._is_disagg)
                 total += self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls, effective_draft_config,
-                    draft_kv_cache_config)
+                    draft_kv_cache_manager_cls,
+                    effective_draft_config,
+                    draft_kv_cache_config,
+                    is_draft=True)
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 total += self._per_manager_cache_cost(
@@ -1263,13 +1318,11 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
-        # Reserve headroom for the attention workspace the selected backend declares (today: fp8
-        # context-MLA), which the profiling forward under-measures (fresh-prefill dummies never exercise
-        # KV reuse). This is only needed when KV-cache reuse can push summed attended KV past the profiled
-        # floor: get_mla_context_workspace_kv_len_cap returns None (no reservation) with reuse off -- the
-        # workspace is then bounded by max_num_tokens -- or with chunked prefill -- each attention launch is
-        # then bounded by its chunk buffer -- since reserving in those cases would double-count and
-        # needlessly shrink the KV pool (up to ~37% for Kimi-K2 attention-DP). When it does apply,
+        # Reserve headroom for attention workspace the selected backend declares and the profiling forward
+        # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill
+        # usually bounds each attention launch by its chunk buffer, except for implementations such as the
+        # NVFP4 DSA context gather that consume the complete attended prefix. The backend declares that
+        # distinction through runtime_workspace_is_chunked_prefill_bounded. When a reserve applies,
         # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
         # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
         # so a memory-constrained node shares the budget at a common token count instead of starving the
@@ -1279,9 +1332,15 @@ class KvCacheCreator:
         # overstates). No cap or w == 0 -> no-op.
         w_bytes_per_token = get_attention_workspace_bytes_per_token(
             self._model_engine.model.model_config, self._mapping)
+        workspace_is_chunked_prefill_bounded = True
+        if w_bytes_per_token > 0:
+            workspace_is_chunked_prefill_bounded = (
+                get_attention_workspace_is_chunked_prefill_bounded(
+                    self._model_engine.model.model_config))
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
             self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
-            self._max_seq_len, self._llm_args.enable_chunked_prefill)
+            self._max_seq_len, self._llm_args.enable_chunked_prefill,
+            workspace_is_chunked_prefill_bounded)
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
@@ -1292,7 +1351,7 @@ class KvCacheCreator:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(
-                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the fp8 context-MLA attention "
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the context-MLA attention "
                     f"workspace (w={w_bytes_per_token} B/token, admitting up to "
                     f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
@@ -1534,6 +1593,11 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
+        draft_kv_config.max_attention_window = (
+            _expand_attention_window_pattern_to_global_layers(
+                draft_kv_config.max_attention_window,
+                spec_dec_layer_mask,
+            ))
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
@@ -1605,11 +1669,11 @@ class KvCacheCreator:
             self._model_engine.model.model_config,
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
-        # The draft contribution is whatever the aggregate has on top of the
-        # target. Both pieces are CacheCost; subtraction is component-wise.
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
                              intercept=total_kv.intercept - target_kv.intercept)
-        if target_kv.slope <= 0 or draft_kv.slope <= 0:
+        costs = (target_kv, draft_kv)
+        if any(cost.slope < 0 or cost.intercept < 0 or (
+                cost.slope == 0 and cost.intercept == 0) for cost in costs):
             return None
         return target_kv, draft_kv
 
@@ -1622,14 +1686,21 @@ class KvCacheCreator:
         """Split *total_budget* into (target_budget, draft_budget) byte shares."""
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
-        if slope_budget <= 0:
+        slope_total = target_kv.slope + draft_kv.slope
+        if slope_budget < 0:
             logger.warning(
                 f"KV cache budget {total_budget} is smaller than the fixed "
-                f"mamba state cost {intercept_total}; cannot split between "
+                f"cache cost {intercept_total}; cannot split between "
                 f"target and draft.")
             return None
-        slope_total = target_kv.slope + draft_kv.slope
-        draft_slope_share = int(slope_budget * draft_kv.slope / slope_total)
+        if slope_budget == 0 and slope_total > 0:
+            logger.warning(
+                f"KV cache budget {total_budget} leaves no capacity beyond "
+                f"the fixed cache cost {intercept_total}; cannot split "
+                f"between target and draft with a per-token cache cost.")
+            return None
+        draft_slope_share = (slope_budget * draft_kv.slope //
+                             slope_total if slope_total > 0 else 0)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
@@ -1658,8 +1729,8 @@ class KvCacheCreator:
         GPU-resident state never occupies) the intercept is dropped so the split
         stays proportional to the per-token cost.
 
-        When the split is *infeasible* (the combined fixed cost meets or exceeds
-        the budget — only possible for ``max_gpu_total_bytes`` after the above)
+        When the split is *infeasible* (the combined fixed cost exhausts the
+        budget while either manager has a per-token cost, or exceeds it)
         the shortfall is fatal: both managers need their fixed state resident in
         GPU memory, so the run would OOM. It raises ``ValueError`` rather than
         silently producing an unusable config. A defensive degrade-to-zero path
@@ -1691,7 +1762,7 @@ class KvCacheCreator:
         shares = self._compute_draft_budget_shares(total_budget, target_kv,
                                                    draft_kv)
         if shares is None:
-            # The split is infeasible (combined fixed cost >= total budget).
+            # The split cannot provide each manager with usable GPU capacity.
             intercept_total = target_kv.intercept + draft_kv.intercept
             if budget_attr == "max_gpu_total_bytes":
                 # A GPU budget that cannot even fit the combined fixed cost is
@@ -1700,7 +1771,7 @@ class KvCacheCreator:
                 # guidance rather than producing an unusable zero-budget draft.
                 raise ValueError(
                     f"KV cache GPU budget ({total_budget / GB:.2f} GiB) is "
-                    f"smaller than the combined fixed cost "
+                    f"insufficient after the combined fixed cost "
                     f"({intercept_total / GB:.2f} GiB, e.g. mamba SSM state) "
                     f"for target+draft. Increase free_gpu_memory_fraction or "
                     f"max_gpu_total_bytes, or reduce max_batch_size (the fixed "
@@ -2216,6 +2287,29 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # Unified one-model caches append attention-only MTP layers.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2611,7 +2705,7 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2687,6 +2781,23 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
+            # Resolve the side-cache shape from the same checkpoint geometry
+            # used to construct the QSA index projection.
+            mamba_manager_extra_kwargs.update(
+                sparse_attention_config=sparse_attention_config,
+                pretrained_config=config,
+            )
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

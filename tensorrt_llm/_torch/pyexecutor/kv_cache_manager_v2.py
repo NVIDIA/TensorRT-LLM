@@ -92,22 +92,23 @@ from .kv_cache_stats import (
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
-    KVCacheManager,
     ModelConfigCpp,
     ModelConfigPython,
+    _clamp_max_attention_window_vec,
     _populate_dummy_mrope_config,
+    _project_max_attention_window_vec,
     get_pp_layers,
     request_context,
 )
 from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -327,6 +328,7 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
+    generation_capacity_headroom: Optional[int] = None,
 ) -> tuple[int, int]:
     tokens_per_block = int(tokens_per_block)
     size_per_token = 0
@@ -334,7 +336,16 @@ def _estimate_swa_cache_size(
     scratch_keys = set()
     for layer_size, window_size in zip(layer_sizes, attention_windows):
         if window_size is not None and window_size > 0:
-            window_tokens = math.ceil(window_size / tokens_per_block) * tokens_per_block
+            if generation_capacity_headroom is None:
+                window_blocks = math.ceil(window_size / tokens_per_block)
+            else:
+                # Match DFlash's retained boundary page and capacity reserved
+                # ahead of committed history for the next draft step.
+                window_blocks = (
+                    math.ceil((window_size + generation_capacity_headroom - 1) / tokens_per_block)
+                    + 1
+                )
+            window_tokens = window_blocks * tokens_per_block
             if not context:
                 size_per_request += window_tokens * layer_size
             elif not scratch:
@@ -349,15 +360,53 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
+def _get_dflash_generation_kv_capacity_headroom(spec_config) -> Optional[int]:
+    """DFlash KV capacity reserved ahead of committed history."""
+    from ..speculative.interface import SpeculativeDecodingMode
+
+    if spec_config is None or spec_config.spec_dec_mode != SpeculativeDecodingMode.DFLASH:
+        return None
+
+    from ..speculative import get_num_extra_kv_tokens
+
+    return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step
+
+
+def _get_single_swa_pool_slot_bytes(
+    layer_sizes: Sequence[int],
+    attention_windows: Sequence[Optional[int]],
+    tokens_per_block: int,
+) -> Optional[int]:
+    """Return the slot size when all local layers share one SWA pool."""
+    windows = set(attention_windows)
+    if not layer_sizes or len(windows) != 1:
+        return None
+    window = next(iter(windows))
+    if window is None or window <= 0:
+        return None
+    return sum(layer_sizes) * int(tokens_per_block)
+
+
+def _resolve_v2_max_attention_window_vec(
+    max_attention_window_vec: Optional[Sequence[int]],
+    max_seq_len: int,
+    pp_layers: Sequence[int],
+) -> List[Optional[int]]:
+    """Resolve a V2 window pattern into exact cache-local layer order."""
+    clamped_window_pattern = _clamp_max_attention_window_vec(max_attention_window_vec, max_seq_len)
+    local_windows = _project_max_attention_window_vec(clamped_window_pattern, pp_layers)
+    return [None if window == max_seq_len else window for window in local_windows]
+
+
 def _get_static_cache_size_layer_components(
     model_config: ModelConfigPython,
     mapping: Mapping,
     num_layers: Optional[int] = None,
-    **kwargs,
+    *,
+    max_seq_len: Optional[int] = None,
+    kv_cache_config: Optional[KvCacheConfig] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
-    max_seq_len = kwargs.get("max_seq_len")
-    kv_cache_config = kwargs.get("kv_cache_config")
 
     num_key_value_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
     if isinstance(num_key_value_heads, Iterable):
@@ -387,24 +436,38 @@ def _get_static_cache_size_layer_components(
         )
         layer_size = cache_size_per_token * 2
 
-    num_attention_layers = KVCacheManager._resolve_num_attention_layers(
-        model_config, mapping, num_layers
-    )
+    if num_layers is None:
+        total_attention_layers = model_config.get_num_attention_layers()
+        local_layer_ids, _ = get_pp_layers(total_attention_layers, mapping)
+    else:
+        local_layer_ids = list(range(max(num_layers, 1)))
+    num_attention_layers = len(local_layer_ids)
     layer_sizes = [layer_size] * num_attention_layers
     window_pattern = kv_cache_config.max_attention_window if kv_cache_config is not None else None
 
-    def get_window_size(layer_idx: int) -> Optional[int]:
-        if window_pattern is None or not isinstance(window_pattern, (list, tuple)):
-            return None
-        window_size = window_pattern[layer_idx % len(window_pattern)]
+    # Static estimation accepts an unknown max_seq_len and treats recurrent-state
+    # sentinels as full-attention cost. Runtime resolution must preserve those
+    # sentinels for layer construction, so it cannot be reused here directly.
+    def normalize_window_size(window_size: Optional[int]) -> Optional[int]:
         if window_size is None or window_size <= 0:
             return None
         window_size = int(window_size)
+        if max_seq_len is not None:
+            window_size = min(window_size, int(max_seq_len))
         if max_seq_len is not None and window_size == int(max_seq_len):
             return None
         return window_size
 
-    attention_windows = [get_window_size(layer_idx) for layer_idx in range(num_attention_layers)]
+    if window_pattern is None or not isinstance(window_pattern, (list, tuple)):
+        attention_windows = [None] * num_attention_layers
+    else:
+        local_window_pattern = _project_max_attention_window_vec(
+            window_pattern,
+            local_layer_ids,
+        )
+        attention_windows = [
+            normalize_window_size(window_size) for window_size in local_window_pattern
+        ]
     return layer_sizes, attention_windows
 
 
@@ -703,31 +766,43 @@ def _update_kv_cache_draft_token_location(
     else:
         use_paged_kv_cache = False
     assert use_paged_kv_cache, "Only paged kv cache is supported"
-    assert len(cache_manager.max_attention_window_vec) == 1, (
+    assert len(set(cache_manager.max_attention_window_vec)) == 1, (
         "Currently, only one max attention window size is supported."
     )
+    max_attention_window = cache_manager.max_attention_window_vec[0]
+    if max_attention_window is None:
+        max_attention_window = cache_manager.max_seq_len
 
     if use_paged_kv_cache:
         assert len(set(cache_manager.num_kv_heads_per_layer)) == 1, (
             "update_kv_cache_draft_token_location requires uniform num_kv_heads across all layers, "
             f"but got {cache_manager.num_kv_heads_per_layer}"
         )
+        local_pool_ids = {
+            int(cache_manager.kv_cache_pool_mapping[layer_idx][0])
+            for layer_idx in range(cache_manager.num_local_layers)
+        }
+        assert len(local_pool_ids) == 1, (
+            "update_kv_cache_draft_token_location requires all local layers "
+            f"in one KV pool, got pools {sorted(local_pool_ids)}"
+        )
+        pool_idx = local_pool_ids.pop()
         torch.ops.tensorrt_llm.update_kv_cache_draft_token_location(
             accepted_draft_token_offsets,
             packed_accepted_draft_tokens_indices,
             past_key_value_lengths,
             True,
-            cache_manager.num_layers,
+            cache_manager.num_local_layers,
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
             # total so the C++ kernel computes correct strides and grid dims.
             cache_manager.num_kv_heads_per_layer[0],
             int(cache_manager.head_dim * kv_cache_dtype_byte_size),
             cache_manager.max_total_draft_tokens,
-            cache_manager.max_attention_window_vec[0],
+            max_attention_window,
             rewind_draft_token_separate_adjustments,
             None,
-            cache_manager.kv_cache_pool_pointers,
-            attn_metadata.kv_cache_block_offsets,
+            cache_manager.kv_cache_pool_pointers[pool_idx],
+            attn_metadata.kv_cache_block_offsets[pool_idx],
             cache_manager.max_blocks_per_seq,
             cache_manager.tokens_per_block,
             None,
@@ -929,24 +1004,13 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
 
-        # Determine max_attention_window_vec
-        if kv_cache_config.max_attention_window is not None:
-            self.max_attention_window_vec = (
-                kv_cache_config.max_attention_window.copy()
-            )  # Make a copy to avoid modifying original
-            # Clamp all window sizes to max_seq_len before calculating the
-            # number of KV cache blocks. This prevents the KV cache pool from
-            # being skewed by the largest window values.
-            self.max_attention_window_vec = [
-                min(max_seq_len, w) for w in self.max_attention_window_vec
-            ]
-
-            self.max_attention_window_vec = [
-                None if w == max_seq_len else w for w in self.max_attention_window_vec
-            ]
-
-        else:
-            self.max_attention_window_vec = [None]
+        # Materialize an exact per-local-layer vector for cache and attention consumers.
+        self.max_attention_window_vec = _resolve_v2_max_attention_window_vec(
+            kv_cache_config.max_attention_window,
+            max_seq_len,
+            self.pp_layers,
+        )
+        assert len(self.max_attention_window_vec) == self.num_local_layers
 
         event_window_size = max(
             self.max_seq_len if window_size is None else int(window_size)
@@ -1567,14 +1631,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_runtime_cache_size_layer_components(self) -> tuple[List[int], List[Optional[int]]]:
         layer_sizes = []
         attention_windows = []
-        pattern_len = len(self.max_attention_window_vec)
         for local_layer_idx in range(self.num_local_layers):
             layer_sizes.append(
                 self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx, data_role=Role.ALL)
             )
-            attention_windows.append(
-                self.max_attention_window_vec[self.pp_layers[local_layer_idx] % pattern_len]
-            )
+            attention_windows.append(self.max_attention_window_vec[local_layer_idx])
         return layer_sizes, attention_windows
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
@@ -2046,9 +2107,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 AttentionLayerConfig(
                     layer_id=layer_id,
                     buffers=buffers,
-                    sliding_window_size=self.max_attention_window_vec[
-                        self.pp_layers[layer_id] % len(self.max_attention_window_vec)
-                    ],
+                    sliding_window_size=self.max_attention_window_vec[layer_id],
                     num_sink_tokens=None,
                 )
             )
@@ -2111,7 +2170,8 @@ class KVCacheManagerV2(BaseResourceManager):
         ``_extra_buffers_per_layer``. Model-specific managers may declare
         logical layouts without requiring the shared extractor to inspect
         private attributes or role names. MiniMax M3, for example, maps
-        ordinary K/V to ``NHD`` and keeps index-key ``REPLICATED``.
+        ordinary K/V to ``HND`` for its MSA backend and ``NHD`` for its
+        Triton backend, while keeping index-key ``REPLICATED``.
 
         This declaration does not influence storage pooling: V2 storage
         coalesces buffers purely by ``(life_cycle, buffer size)``, so roles
@@ -3526,7 +3586,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 request_id=req_id,
                 max_new_tokens=1,
                 input_tokens=input_tokens,
-                sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                sampling_config=sampling_params._get_sampling_config(),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
                 encoder_output_len=encoder_output_len,
@@ -3930,25 +3990,60 @@ class KVCacheManagerV2(BaseResourceManager):
         model_config: ModelConfigPython,
         mapping: Mapping,
         num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        max_seq_len: Optional[int] = None,
+        max_batch_size: int = 0,
+        max_num_tokens: int = 0,
+        spec_config=None,
+        is_draft: bool = False,
         **kwargs,
     ):
         layer_sizes, attention_windows = _get_static_cache_size_layer_components(
-            model_config, mapping, num_layers=num_layers, **kwargs
+            model_config,
+            mapping,
+            num_layers=num_layers,
+            max_seq_len=max_seq_len,
+            kv_cache_config=kv_cache_config,
         )
         full_attn_size_per_token = _estimate_full_attn_size_per_token(
             layer_sizes, attention_windows
         )
+        dflash_headroom = _get_dflash_generation_kv_capacity_headroom(spec_config)
+        is_dflash_draft = is_draft and dflash_headroom is not None
+        generation_capacity_headroom = dflash_headroom if is_dflash_draft else None
         swa_size_per_token, swa_size_per_request = _estimate_swa_cache_size(
             layer_sizes,
             attention_windows,
-            kwargs["tokens_per_block"],
+            tokens_per_block,
             context=False,
             scratch=False,
+            generation_capacity_headroom=generation_capacity_headroom,
         )
-        max_batch_size = int(kwargs.get("max_batch_size") or 0)
+        context_swa_size_per_token = 0
+        if is_dflash_draft:
+            context_swa_size_per_token, _ = _estimate_swa_cache_size(
+                layer_sizes,
+                attention_windows,
+                tokens_per_block,
+                context=True,
+                scratch=False,
+            )
+        fixed_cost = (
+            swa_size_per_request * max_batch_size + context_swa_size_per_token * max_num_tokens
+        )
+        cache_size_per_token = full_attn_size_per_token + swa_size_per_token
+        bytes_per_slot = _get_single_swa_pool_slot_bytes(
+            layer_sizes, attention_windows, tokens_per_block
+        )
+        if is_dflash_draft and bytes_per_slot is not None:
+            required_slots = math.ceil(fixed_cost / bytes_per_slot)
+            resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
+            fixed_cost = math.ceil(required_slots / resume_util) * bytes_per_slot
         return (
-            full_attn_size_per_token + swa_size_per_token,
-            swa_size_per_request * max_batch_size,
+            cache_size_per_token,
+            fixed_cost,
         )
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):

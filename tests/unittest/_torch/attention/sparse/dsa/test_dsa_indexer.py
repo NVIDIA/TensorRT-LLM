@@ -24,23 +24,20 @@ This file tests:
 
 import builtins
 import random
-import sys
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     PositionalEmbeddingParams,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
     DSABackendForwardArgs,
     DSACacheManager,
     DSACacheManagerV2,
@@ -53,14 +50,14 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa import backend as dsa_backend
-from tensorrt_llm._torch.attention_backend.sparse.dsa.cache_manager import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend
+from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
     _resolve_fp8_ds_mla_head_dim,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa.indexer import (
+from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
@@ -82,6 +79,10 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
+
+__extra_import_path__ = ["..", "~/tests/unittest"]
+
+from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 
 def has_deep_gemm():
@@ -144,7 +145,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
     metadata.create_buffers_for_indexer = Mock()
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
     ):
         DSAtrtllmAttentionMetadata.__post_init__(metadata)
 
@@ -187,7 +188,7 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
 
     with (
         patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_sm_version",
             return_value=sm_version,
         ),
         patch(
@@ -349,7 +350,7 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.create_expanded_buffers = Mock()
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.prefer_pinned",
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.prefer_pinned",
         return_value=False,
     ):
         metadata.create_buffers_for_indexer()
@@ -392,7 +393,7 @@ def test_shared_topk_lifecycle(monkeypatch):
         )[0]
 
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.backend."
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.backend."
         "transform_local_topk_and_prepare_pool_view",
         side_effect=lambda topk, *_: (topk.clone(), None),
     ):
@@ -463,11 +464,11 @@ def test_indexer_configures_one_top_k_module(
 
     with (
         patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
             True,
         ),
         patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
             return_value=100,
         ),
     ):
@@ -476,6 +477,43 @@ def test_indexer_configures_one_top_k_module(
     assert isinstance(indexer.top_k, TopK)
     assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert indexer.top_k.decode_implementation == expected_decode
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize(
+    "flag_value,expected_dtype",
+    [
+        (None, torch.float32),
+        ("0", torch.float32),
+        ("1", torch.bfloat16),
+    ],
+)
+def test_indexer_projection_dtype_follows_bf16_flag(monkeypatch, flag_value, expected_dtype):
+    """wk/weights_proj dtype follows TRTLLM_DSA_INDEXER_BF16.
+
+    Unset or "0" keeps the projection in fp32 (default); "1" runs it in the
+    model dtype. create_indexer builds the Indexer with dtype=torch.bfloat16.
+    """
+    if flag_value is None:
+        monkeypatch.delenv("TRTLLM_DSA_INDEXER_BF16", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DSA_INDEXER_BF16", flag_value)
+
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=128,
+    )
+
+    with patch(
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.get_sm_version",
+        return_value=100,
+    ):
+        indexer = create_indexer(sparse_config)
+
+    assert indexer._indexer_bf16 is (flag_value == "1")
+    assert indexer.wk.dtype == expected_dtype
+    assert indexer.weights_proj.dtype == expected_dtype
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -489,9 +527,6 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    sparse_test_dir = Path(__file__).resolve().parents[1]
-    if str(sparse_test_dir) not in sys.path:
-        sys.path.insert(0, str(sparse_test_dir))
     from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4
@@ -1065,7 +1100,7 @@ def create_indexer(sparse_attn_config, layer_idx=0):
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
     with patch(
-        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.RotaryEmbedding"
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer.RotaryEmbedding"
     ) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
@@ -1742,7 +1777,7 @@ def test_indexer_k_cache_scatter_custom_op():
         indexer_head_dim=head_dim,
     )
 
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import Indexer
 
     Indexer.prepare(metadata)
 
@@ -2282,7 +2317,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
     # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
     cast_back_from_fp4 = _load_cast_back_from_fp4()
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import _pick_dsl_expand
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
     use_dsl = backend == "dsl"
@@ -4107,7 +4142,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
     print("\n=== Check: Large windows must have 2048 valid ===")
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import (
         compute_cu_seqlen_kv_bounds_with_cache,
     )
 
@@ -4263,7 +4298,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
                 side_effect=is_attn_metadata,
             ),
             patch(
-                "tensorrt_llm._torch.attention_backend.sparse.dsa.metadata.torch.cuda.is_current_stream_capturing",
+                "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.torch.cuda.is_current_stream_capturing",
                 return_value=True,
             ),
         ):

@@ -42,6 +42,7 @@ from tensorrt_llm._torch.locality_domain.autotune import (
 )
 from tensorrt_llm._torch.locality_domain.runtime import LocalityDomainRuntime
 from tensorrt_llm._torch.locality_domain_utils import (
+    _copy_to_new_cuda_allocation,
     get_locality_domain_compute_sm_counts,
     get_locality_domain_mempool,
     get_locality_domain_stream,
@@ -843,9 +844,18 @@ class TestLocalityDomainIntegration:
 class TestLocalityDomainMempoolAllocation:
     """Tests for LOCALITY_DOMAIN memory pool allocation and deallocation."""
 
-    # TODO: restore test_copy_to_new_cuda_allocation_does_not_alias_contiguous_input
-    # alongside the Linear/MoE wire-up. It covers _copy_to_new_cuda_allocation, which
-    # lives in modules/linear.py and lands with those call sites rather than here.
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_copy_to_new_cuda_allocation_does_not_alias_contiguous_input(self):
+        source_storage = torch.arange(32, device="cuda")
+        source = source_storage[:16]
+        assert source.is_contiguous()
+        assert source.untyped_storage().data_ptr() == source_storage.untyped_storage().data_ptr()
+
+        copied = _copy_to_new_cuda_allocation(source)
+
+        assert copied.is_contiguous()
+        assert copied.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+        torch.testing.assert_close(copied, source)
 
     def test_allocate_tensor_with_mempool(self, check_locality_domain_support):
         """Test allocating a tensor using LOCALITY_DOMAIN mempool."""

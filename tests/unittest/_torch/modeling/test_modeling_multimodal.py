@@ -16,8 +16,8 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrai
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
@@ -211,7 +211,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     module.post_load_weights()
 
         # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
-        # load via `_set_up_multimodal_encoder_attn_metadata`. These standalone
+        # load via `setup_mm_encoder_attn_metadata`. These standalone
         # model tests don't go through the engine, so mirror that walk here --
         # otherwise the encoder forward raises on an uninitialized attn_metadata.
         for module in model.modules():
