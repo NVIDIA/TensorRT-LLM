@@ -1446,10 +1446,20 @@ class KVCacheManagerV2(BaseResourceManager):
         # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
-        # Off unless the environment variable is set; unset, nothing here
-        # changes any allocation, any page content or any reported count.
+        # Both diagnostics below are off unless their environment variable is
+        # set; with neither set nothing here changes any allocation, any page
+        # content or any reported count.
         self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
         self._guard_page_by_layer: dict[int, int] = {}
+        self._fresh_page_fill = _parse_kv_fill_value(
+            os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
+            "TRTLLM_KV_FRESH_PAGE_FILL",
+        )
+        # request id -> pool id -> (base page indices already filled, last seen
+        # page list). The second half is the early-out: an unchanged list means
+        # nothing was handed out since the previous step.
+        self._fresh_pages_filled: Dict[int, Dict[int, tuple]] = {}
+        self._fresh_fill_announced = False
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
@@ -1559,6 +1569,93 @@ class KVCacheManagerV2(BaseResourceManager):
         about a whole pool's page ids need all of them.
         """
         return frozenset(self._guard_page_by_layer.values())
+
+    def _fill_fresh_kv_pages(self, request_id: int) -> None:
+        """Diagnostic: write a known pattern into pages as they are handed out.
+
+        A page freed by one request and handed to another still carries the
+        previous owner's keys and values, so a decode that reads past what its
+        own request wrote reads live data from a stranger. Filling on
+        assignment makes such a read produce the pattern instead, for the whole
+        run rather than only for the requests served before the first page was
+        recycled.
+
+        Only pages the request has not yet been given are written, and only
+        beyond ``num_committed_tokens`` -- the leading pages hold the prefix
+        this request matched in the reuse tree (or committed itself), and
+        writing over those would corrupt a correct answer rather than diagnose
+        anything. The boundary rounds up, so a partially reused block stays
+        protected.
+
+        ``TRTLLM_KV_FRESH_PAGE_FILL=zero`` gives a fresh page zeros; ``nan``
+        poisons it, which turns any read of a slot the owner has not written
+        yet into an immediate failure instead of a plausible number. Unset --
+        the default -- returns immediately and touches nothing.
+
+        This runs on every generation step of every request, so the common case
+        -- no new page since the last call -- has to be cheap: the page list is
+        compared per pool against the host copy the cache already maintains,
+        and the per-layer work only happens when that comparison differs.
+        """
+        if self._fresh_page_fill is None:
+            return
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            return
+        committed = int(getattr(kv_cache, "num_committed_tokens", 0) or 0)
+        protected = (committed + self.tokens_per_block - 1) // self.tokens_per_block
+        num_blocks = int(kv_cache.num_blocks)
+        state = self._fresh_pages_filled.setdefault(request_id, {})
+        filled = 0
+        for pool_id in range(self.num_pools):
+            base = np.frombuffer(
+                kv_cache.get_base_page_indices(pool_id), dtype=np.int32, count=num_blocks
+            )
+            seen, previous = state.setdefault(pool_id, (set(), None))
+            if (
+                previous is not None
+                and previous.size == base.size
+                and np.array_equal(previous, base)
+            ):
+                continue
+            state[pool_id] = (seen, base.copy())
+            fresh = [
+                int(page)
+                for ordinal, page in enumerate(base)
+                if ordinal >= protected and page != BAD_PAGE_INDEX and int(page) not in seen
+            ]
+            if not fresh:
+                continue
+            seen.update(fresh)
+            for layer_idx in self.pp_layers:
+                if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
+                    continue
+                buffer = self.get_buffers(layer_idx)
+                if buffer is None:
+                    continue
+                # Same conversion the attention backends index the buffer
+                # with: layers in one pool can carry different scales.
+                scale = self.get_layer_page_index_scale(layer_idx)
+                pages = [page * scale // self.kv_factor for page in fresh]
+                pages = [page for page in pages if 0 <= page < buffer.shape[0]]
+                if pages:
+                    _fill_kv_pages(buffer, pages, self._fresh_page_fill)
+                    filled += len(pages)
+        if filled:
+            # The forward pass reads these pages in the same iteration, so the
+            # fill has to be complete before it starts. A stream-ordered write
+            # would be enough on one stream; the synchronise makes it true
+            # whichever stream the manager and the model are using.
+            torch.cuda.synchronize()
+            if not self._fresh_fill_announced:
+                # Once per process, at warning level, for the same reason the
+                # guard page announces itself: a run needs proof from its own
+                # log that the switch did something, not just that it was set.
+                self._fresh_fill_announced = True
+                logger.warning(
+                    f"KVCacheManagerV2: TRTLLM_KV_FRESH_PAGE_FILL={self._fresh_page_fill} "
+                    f"first fill covered {filled} pages for request {request_id}"
+                )
 
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         """Return the roles represented by the two page-table index lanes.
@@ -2664,6 +2761,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._set_helix_rank_fields(req)
         if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
             return False
+        self._fill_fresh_kv_pages(req.py_request_id)
         if is_helix_req:
             # Commit only on success so a same-pass retry recomputes the
             # same step instead of skipping one.
@@ -2865,6 +2963,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        self._fill_fresh_kv_pages(req.py_request_id)
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
@@ -2897,6 +2996,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
+        self._fill_fresh_kv_pages(req.py_request_id)
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
 
@@ -3876,6 +3976,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
+        # The next owner of these pages fills them again; keeping the set would
+        # both leak and let a recycled page skip its fill.
+        self._fresh_pages_filled.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
