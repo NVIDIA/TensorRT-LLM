@@ -951,3 +951,60 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
         ref_v = torch.topk(row, k).values.sort().values
         got = row[out[r].long()].sort().values
         assert torch.equal(got, ref_v), f"row {r}: value multiset mismatch (n={n_r})"
+
+
+def test_selfsampling_varlen_narrow_logits_clamps_envelope_to_row_width() -> None:
+    """Logits narrower than k + 1 with kv lengths beyond k: the launch
+    envelope must be the physical row width, so every row takes the in-kernel
+    short path (identity + -1 tail) instead of reading k + 1 elements across
+    the row stride (DKG issue #60, item 1)."""
+    rows, n, k = 2, 256, 512
+    lg = torch.randn(rows, n, dtype=torch.float32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    lc = ss_host._varlen_launcher(rows, n, k, n, 1, 1)
+    if lc[0] != "main":  # main derives the envelope from npad in-kernel
+        env = lc[2] if not isinstance(lc[2], tuple) else lc[2][0]
+        assert env == n, (lc[0], env)
+    want = torch.full((rows, k), -1, dtype=torch.int32, device=_DEV)
+    want[:, :n] = torch.arange(n, dtype=torch.int32, device=_DEV)
+    for kv_len in (100000, n):  # kv far beyond the row width, and exactly the row width
+        kv = torch.full((rows,), kv_len, dtype=torch.int32, device=_DEV)
+        out.fill_(-7)
+        ss_host.run_varlen(lg, kv, out, max_seq_len=n)
+        torch.cuda.synchronize()
+        assert torch.equal(out, want), kv_len
+
+
+def test_selfsampling_warmup_incremental_rows_populate_exact_launchers() -> None:
+    """A later warmup_varlen call whose new row count falls inside an already
+    warmed engine band must still create that row count's launcher entry, so a
+    CUDA-graph capture at it finds its key (DKG issue #60, item 2)."""
+    k, msl, cr, nn = 512, 8192, 1, 1
+    npad = (msl + 63) // 64 * 64
+    ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(64,))
+    key63 = (63, npad, k, min(msl, npad), nn, cr)
+    ss_host._VARLEN_CACHE.pop(key63, None)  # independent of earlier tests in this process
+    ss_host.warmup_varlen(k, msl, compress_ratio=cr, next_n=nn, num_rows_list=(63, 64))
+    assert key63 in ss_host._VARLEN_CACHE
+    lg = torch.randn(63, npad, dtype=torch.float32, device=_DEV)
+    kv = torch.full((63,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(63, k, dtype=torch.int32, device=_DEV)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ss_host.run_varlen(lg[:, :msl], kv, out, max_seq_len=msl)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = torch.topk(lg[:, :msl], k, dim=1).values.sort(dim=1).values
+    got = lg.gather(1, out.long().clamp_min(0)).sort(dim=1).values
+    assert torch.equal(ref, got)
+
+
+def test_validate_run_ws_requires_16_byte_alignment() -> None:
+    """The workspace fake declares 16-byte alignment; the host check matches
+    it so an 8-but-not-16-byte workspace fails here instead of at DSL
+    conversion (DKG issue #60, item 3)."""
+    logits = torch.zeros(1, 64, dtype=torch.float32, device=_DEV)
+    base = torch.zeros(ss_host.WS_BYTES // 4 + 4, dtype=torch.int32, device=_DEV)
+    ss_host.validate_run_ws(base[4:], logits)  # +16 B
+    with pytest.raises(RuntimeError, match="16-byte"):
+        ss_host.validate_run_ws(base[2:], logits)  # +8 B
