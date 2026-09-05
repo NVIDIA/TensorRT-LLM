@@ -447,6 +447,58 @@ def test_thinking_budget_logits_processor_continues_end_sequence_on_stale_view()
     assert torch.equal(_run(processor, stale), torch.zeros(1, 1, 8))
 
 
+def test_thinking_budget_logits_processor_does_not_restart_partial_end_sequence():
+    """Regression: an end sequence the model began must not be restarted.
+
+    End tokens the model emitted itself are not reasoning content. Counting them
+    against the budget makes the processor force the first end token a second
+    time, so a two-token `</think>` reaches the stream as `</` `</` `think>` and
+    the reasoning parser never sees a clean end tag.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=3,
+        reasoning_start_token_ids=[1],
+        reasoning_end_token_ids=[2, 3],
+    )
+
+    # Content is 5, 6 -- under budget. The trailing 2 only opens the end tag.
+    assert torch.equal(_run(processor, [[1, 5, 6, 2]]), torch.zeros(1, 1, 8))
+
+    # Greedy decode on from there: the model finishes the tag it started, and no
+    # second 2 is spliced in front of it.
+    stream = [1, 5, 6, 2]
+    for model_token in (3, 7, 7):
+        logits = torch.full((1, 1, 8), -100.0)
+        logits[0, 0, model_token] = 100.0
+        processor(0, logits, [list(stream)], None, None)
+        stream.append(int(logits[0, 0].argmax()))
+    assert stream == [1, 5, 6, 2, 3, 7, 7]
+
+
+def test_thinking_budget_logits_processor_matches_end_inside_reasoning_block():
+    """Regression: the partial end match must not reach across the reasoning start.
+
+    _longest_suffix_prefix_len guarantees token_ids[-L:] == end[:L], but scanning the
+    whole view can satisfy that using tokens from before the block opened. With start
+    [1, 2] and end [2, 3, 4] the shared 2 makes [1, 2, 3] look like two end tokens
+    already emitted, so the sequence resumes at end[1] and the stream never carries a
+    complete end tag.
+    """
+    processor = ThinkingBudgetLogitsProcessor(
+        thinking_token_budget=0,
+        reasoning_start_token_ids=[1, 2],
+        reasoning_end_token_ids=[2, 3, 4],
+    )
+
+    stream = [1, 2, 3]
+    for _ in range(3):
+        logits = _run(processor, [list(stream)])
+        stream.append(int(logits[0, 0].argmax()))
+
+    # The end sequence is forced from its first token, in order.
+    assert stream == [1, 2, 3, 2, 3, 4]
+
+
 def test_add_thinking_budget_logits_processor_uses_reasoning_parser_tokens():
     class FakeTokenizer:
         def encode(self, text, add_special_tokens=False):
