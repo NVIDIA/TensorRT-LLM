@@ -8,7 +8,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager

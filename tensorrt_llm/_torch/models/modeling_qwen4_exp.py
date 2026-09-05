@@ -30,9 +30,9 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.sparse.qsa.indexer import QSAIndexer
-from ..attention_backend.sparse.qsa.params import QSASparseParams
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.sparse.qsa.indexer import QSAIndexer
+from ..attention.backends.sparse.qsa.params import QSASparseParams
 from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer

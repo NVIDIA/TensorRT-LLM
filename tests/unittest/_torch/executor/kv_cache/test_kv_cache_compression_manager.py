@@ -551,9 +551,9 @@ class TestCanonicalImports:
         assert hasattr(_util, "create_kv_cache_compression_manager")
 
     def test_names_not_in_sparse_module(self):
-        # The framework moved out of attention_backend/sparse/ (it is not a
+        # The framework moved out of attention/backends/sparse/ (it is not a
         # sparse-attention backend); the sparse package no longer exports it.
-        from tensorrt_llm._torch.attention_backend import sparse
+        from tensorrt_llm._torch.attention.backends import sparse
 
         assert not hasattr(sparse, "KVCacheCompressionManager")
         assert not hasattr(sparse, "create_kv_cache_compression_manager")

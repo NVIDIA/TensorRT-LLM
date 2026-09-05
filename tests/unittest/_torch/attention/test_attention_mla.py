@@ -7,10 +7,11 @@ import pytest
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType, MLAParams, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.trtllm import \
+    TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
@@ -396,7 +397,7 @@ accuracy_dict = {
 @pytest.mark.cpu_only
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
-    import tensorrt_llm._torch.modules.mla as mla_module
+    import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
 

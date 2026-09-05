@@ -1,11 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.utils import (compute_swizzled_sf_shape, reswizzle_sf,
+from tensorrt_llm._torch.utils import (compute_swizzled_sf_shape,
+                                       fp4_scale_infer_shape,
+                                       fp4_unswizzled_scale_infer_shape,
+                                       mxfp8_scale_infer_shape, reswizzle_sf,
                                        swizzle_sf, unswizzle_sf)
 from tensorrt_llm.math_utils import ceil_div
+
+
+@pytest.mark.parametrize("real_shape", ([1, 2112], [234, 1024]))
+def test_fp4_scale_infer_shape_unpacks_k_before_padding(real_shape):
+    packed_fp4_shape = [*real_shape[:-1], real_shape[-1] // 2]
+    _, expected_swizzled = fp4_utils.get_fp4_shape(real_shape, 16)
+    _, expected_unswizzled = fp4_utils.get_fp4_shape(real_shape,
+                                                     16,
+                                                     is_swizzled_layout=False)
+
+    assert fp4_scale_infer_shape([packed_fp4_shape]) == expected_swizzled
+    assert (fp4_unswizzled_scale_infer_shape([packed_fp4_shape
+                                              ]) == expected_unswizzled)
+
+
+@pytest.mark.parametrize(
+    ("real_shape", "expected_scale_size"),
+    (([1, 2112], 128 * 68), ([234, 1024], 256 * 32),
+     ([2, 117, 1024], 256 * 32)),
+)
+def test_mxfp8_scale_infer_shape_keeps_real_k(real_shape, expected_scale_size):
+    assert mxfp8_scale_infer_shape([real_shape]) == expected_scale_size
 
 
 # Reference PyTorch implementations (original)

@@ -20,11 +20,11 @@ from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
-from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ...attention.backends import TrtllmAttention, TrtllmAttentionMetadata
+from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ...attention.mla import MLA
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
-from ..mla import MLA
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 _KIMI_K3_MLA_GEN_BACKENDS = ("cute-dsl", "trtllm-gen")

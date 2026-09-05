@@ -23,7 +23,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
 from .eagle3 import Eagle3OneModelWorker
 

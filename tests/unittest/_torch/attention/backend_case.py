@@ -21,14 +21,14 @@ from backend_capability import BACKEND_CAPS, unsupported_reason
 from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
-from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2

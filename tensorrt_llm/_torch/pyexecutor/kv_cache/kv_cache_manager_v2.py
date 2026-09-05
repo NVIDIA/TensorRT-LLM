@@ -111,7 +111,7 @@ from ..resource_manager import (
 from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+    from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
