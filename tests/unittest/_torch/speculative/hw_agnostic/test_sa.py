@@ -263,6 +263,7 @@ class _FakeSARequest:
         assert beam == 0
         return list(self._tokens)
 
+    @property
     def is_generation_only_request(self) -> bool:
         return self._generation_only
 

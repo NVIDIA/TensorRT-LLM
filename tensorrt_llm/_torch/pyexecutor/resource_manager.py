@@ -1198,8 +1198,8 @@ class KVCacheManager(BaseResourceManager):
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
 
-    def publish_connector_scheduler_output(
-            self, scheduled_batch: ScheduledRequests) -> None:
+    def report_batch_to_connector(self,
+                                  scheduled_batch: ScheduledRequests) -> None:
         """Report the batch to the KV connector.
 
         Driven by ``ResourceManager.prepare_resources`` *after* the token-budget
@@ -3066,11 +3066,11 @@ class ResourceManager:
         self.maybe_fit_token_budget(scheduled_batch)
         # Strictly after the trim: the connector is told how many tokens the
         # forward pass will compute, which is only settled once the trim has
-        # run. See KVCacheManager.publish_connector_scheduler_output.
+        # run. See KVCacheManager.report_batch_to_connector.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
-            kv_cache_manager.publish_connector_scheduler_output(scheduled_batch)
+        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+            kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")
     def update_resources(

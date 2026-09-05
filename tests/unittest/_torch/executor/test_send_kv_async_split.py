@@ -159,7 +159,7 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
 
     PyExecutor._save_kv_to_connector_async(executor, [current_req])
 
-    executor.kv_connector_manager.request_finished.assert_called_once_with(prev_req, [7])
+    executor.kv_connector_manager.request_finished.assert_called_once_with(prev_req, [7], None)
     executor.async_transfer_manager.start_transfer.assert_called_once_with(prev_req)
 
 
@@ -171,7 +171,7 @@ def test_connector_save_uses_scheduled_batch_without_overlap_scheduler() -> None
 
     PyExecutor._save_kv_to_connector_async(executor, [finished, running])
 
-    executor.kv_connector_manager.request_finished.assert_called_once_with(finished, [7])
+    executor.kv_connector_manager.request_finished.assert_called_once_with(finished, [7], None)
     executor.async_transfer_manager.start_transfer.assert_called_once_with(finished)
 
 
