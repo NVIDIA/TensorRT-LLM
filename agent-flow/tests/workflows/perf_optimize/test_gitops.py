@@ -161,6 +161,28 @@ def test_worktree_reset_and_fast_forward(repo, tmp_path):
     assert not item_worktree.exists()
 
 
+def test_delete_branch_frees_an_integrated_candidate(repo, tmp_path):
+    """``delete_branch`` removes a candidate branch the integrator has consumed."""
+    base = gitops.rev_parse_head(repo)
+    worktree = tmp_path / "item-worktree"
+    gitops.create_worktree(repo, worktree, "perf-optimize/c-round-1-item_1_opt-001", base)
+    (worktree / "src.py").write_text("x = 2\n", encoding="utf-8")
+    gitops.commit_all(worktree, "candidate")
+    gitops.remove_worktree(repo, worktree)
+
+    gitops.delete_branch(repo, "perf-optimize/c-round-1-item_1_opt-001")
+    assert "perf-optimize/c-round-1-item_1_opt-001" not in _git(repo, "branch", "--list")
+
+
+def test_delete_branch_tolerates_a_branch_that_is_already_gone(repo):
+    """A second delete must not abort a round that already produced measurements.
+
+    Branch cleanup runs after integration, so by the time it fails the round's
+    real output is already recorded. Losing a plumbing ref is not worth raising.
+    """
+    gitops.delete_branch(repo, "perf-optimize/never-existed")
+
+
 def test_git_errors_raise_with_context(repo):
     with pytest.raises(gitops.GitOpsError, match="checkout"):
         gitops.checkout(repo, "no-such-branch")

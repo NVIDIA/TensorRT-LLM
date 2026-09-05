@@ -8,6 +8,7 @@ from ._common import (
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_REPORTER_GUIDANCE,
+    build_container_setup_block,
 )
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
@@ -94,6 +95,7 @@ def build_perf_analyze_prompts(
     sol_methodology: str = "full",
     remote_execution: Mapping[str, Any] | None = None,
     campaign_name: str = "perf-analyze",
+    container_setup: str = "",
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, optionally augmented.
 
@@ -123,9 +125,16 @@ def build_perf_analyze_prompts(
     if sol_methodology != "full":
         bundle = dataclasses.replace(bundle, projector=build_projector_prompt(sol_methodology))
     if include_slurm_environment:
+        # The container prelude is appended after the bootstrap so it reads as
+        # a refinement of it: the bootstrap says "work inside the container",
+        # this says "and here is what that container needs first".
+        slurm_block = EXECUTION_SLURM_BOOTSTRAP
+        setup_block = build_container_setup_block(container_setup)
+        if setup_block:
+            slurm_block = f"{slurm_block}\n\n{setup_block}"
         bundle = bundle.with_extensions(
-            benchmarker=EXECUTION_SLURM_BOOTSTRAP,
-            analyzer=EXECUTION_SLURM_BOOTSTRAP,
+            benchmarker=slurm_block,
+            analyzer=slurm_block,
         )
     if include_sol:
         bundle = bundle.with_extensions(
@@ -143,6 +152,7 @@ def build_perf_analyze_prompts(
 
 
 __all__ = [
+    "build_container_setup_block",
     "ANALYZER_SYSTEM_PROMPT",
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",

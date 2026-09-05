@@ -1681,3 +1681,59 @@ def profile_ranks_note(ranks: Sequence[int]) -> str:
         f"(a spawn-launched `trtllm-serve` cannot), capture what you can, "
         f"record the reason under *Caveats*, and make no imbalance claim."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Container setup prelude (appended after EXECUTION_SLURM_BOOTSTRAP)
+# --------------------------------------------------------------------------- #
+
+
+def build_container_setup_block(setup: str) -> str:
+    """Render the ``slurm-environment.container_setup`` prelude, or ``""``.
+
+    ``EXECUTION_SLURM_BOOTSTRAP`` tells the agent to run its work inside a
+    container and assumes ``trtllm-serve`` is on the PATH there. That holds for
+    a release image and not for a CI *build* image, which carries the toolchain
+    but not the runtime dependencies — and the usual local remedy, a virtualenv
+    on the shared filesystem, cannot be handed in from outside because pyxis
+    resets ``PATH`` when it starts a container. This block is where a task says
+    what to run first so that assumption becomes true.
+
+    Rendered only when the task sets the field; otherwise the agents' prompts
+    are byte-identical to what they were before it existed.
+
+    Args:
+        setup: Shell to run, verbatim, inside every containerized step.
+
+    Returns:
+        A markdown section to append to a server-launching role's prompt, or
+        ``""`` when ``setup`` is empty.
+    """
+    setup = (setup or "").strip()
+    if not setup:
+        return ""
+    return f"""\
+## Container setup (run this FIRST, inside every container)
+
+`task.yaml`'s `slurm-environment.container_setup` says this environment's
+container needs a prelude before anything else will work — typically because
+the image ships the toolchain but not the runtime dependencies, so a bare
+`trtllm-serve` or `import tensorrt_llm` fails until it runs.
+
+**Inside the container, before any other command in the step** — before the
+readiness poll, before `trtllm-serve`, before the benchmark, before any
+`python`, and again in every new Slurm step you open:
+
+```bash
+{setup}
+```
+
+Run it verbatim. Do not paraphrase it, reorder it, or skip it because a
+previous step already ran it: each Slurm step gets a fresh container, so a
+step that skips the prelude sees the unprepared image.
+
+If a command still fails afterwards with a missing module or a
+`command not found` that this prelude was clearly meant to fix, that is a
+blocker to report — not something to route around by installing packages
+yourself or by falling back to a different launcher.
+"""
