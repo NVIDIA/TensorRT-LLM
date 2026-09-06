@@ -325,9 +325,7 @@ class TRTLLMGenFusedMoE(MoEImplBase):
 
         # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
         # ``can_implement``. Keep only the provider selection for the op.
-        self.use_flashinfer = self._check_flashinfer_backend_support()
-        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
-        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
+        self._select_op_provider()
 
         self._weights_created = False
         self.num_fused_shared_expert = 0
@@ -458,6 +456,24 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         if not (self.use_flashinfer and self._is_unquantized_path()):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+
+    def _select_op_provider(self) -> None:
+        """Pick the op provider (native TRTLLM-Gen or FlashInfer) for the
+        quant config currently installed.
+
+        Called twice: once in ``__init__``, and again from ``create_weights``.
+        The second call is what makes layerwise quantization work. A checkpoint
+        can leave individual MoE layers unquantized while the model-level config
+        says NVFP4; ``ConfigurableMoE.create_weights`` only installs that final
+        per-layer config on the backend just before calling ``create_weights``,
+        so at ``__init__`` time such a layer still looks quantized. Since only
+        FlashInfer implements the BF16 kernels, re-resolving here is what keeps
+        the provider and ``_get_quant_method`` in agreement; otherwise the layer
+        keeps the native provider and dies in ``run_bf16_moe`` at warmup.
+        """
+        self.use_flashinfer = self._check_flashinfer_backend_support()
+        backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
+        self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
     def _check_flashinfer_backend_support(self) -> bool:
         # SiTu is provided by the native TRTLLM-Gen cubin and is not part of
@@ -624,6 +640,11 @@ class TRTLLMGenFusedMoE(MoEImplBase):
     def create_weights(self):
         if self._weights_created:
             return
+
+        # The final per-layer quant config is in place only now (see
+        # ``_select_op_provider``), so re-resolve the provider before the quant
+        # method is chosen from the same config.
+        self._select_op_provider()
 
         self.quant_method = self._get_quant_method()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
