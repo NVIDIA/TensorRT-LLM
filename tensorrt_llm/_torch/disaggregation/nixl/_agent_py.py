@@ -97,7 +97,7 @@ class NixlTransferAgent(BaseTransferAgent):
         Initialize NixlTransferAgent.
         :param name: Name of the agent.
         :param use_prog_thread: Whether to enable the progress thread, if available.
-        :param num_workers: Specify number of threads for the supported multi-threaded backends.
+        :param num_threads: Specify number of threads for the supported multi-threaded backends.
         :param rank: Process rank, used only to keep the shared agent interface consistent.
         :param world_size: Process count, used only to keep the shared agent interface consistent.
         """

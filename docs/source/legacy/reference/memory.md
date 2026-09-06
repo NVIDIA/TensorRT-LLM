@@ -124,7 +124,7 @@ When FP8 GEMM is used, the activation memory might be larger than the theoretica
 
 2. Why is the memory size large even though a small batch size and sequence length are used in the runtime?
 
-   As explained above, the activation memory size is computed based on the max tensor shapes at TensorRT engine building time, try to reduce the engine building time parameters like `max_num_token`, see [Activation size](#activation-size) for details.
+   As explained above, the activation memory size is computed based on the max tensor shapes at TensorRT engine building time, try to reduce the engine building time parameters like `max_num_token`, see [Activation size](#2-activation-size) for details.
 
 
 3. Why can the engine be generated, but the inference will run out of memory (OOM) at runtime?
