@@ -1453,6 +1453,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # set; with neither set nothing here changes any allocation, any page
         # content or any reported count.
         self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
+        self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
         self._guard_page_by_layer: dict[int, int] = {}
         self._fresh_page_fill = _parse_kv_fill_value(
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
@@ -1470,7 +1471,7 @@ class KVCacheManagerV2(BaseResourceManager):
         index_mapper_capacity = (
             max_num_sequences * (2 if is_disagg else 1)
             + num_reserved_index_slots
-            + (1 if self._guard_page_fill else 0)
+            + (1 if self._guard_page_value is not None else 0)
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
@@ -1511,13 +1512,20 @@ class KVCacheManagerV2(BaseResourceManager):
         and one index slot.
         """
         setting = self._guard_page_fill
-        value = _parse_kv_fill_value(setting, "TRTLLM_KV_GUARD_PAGE")
+        value = self._guard_page_value
         if value is None:
             self._guard_page_fill = ""
             return
         kv_cache = self._create_kv_cache(_GUARD_PAGE_REQUEST_ID, None, [1], is_dummy=True)
-        if kv_cache is None or not kv_cache.resume(self._stream.cuda_stream):
+        if kv_cache is None:
             logger.warning("KVCacheManagerV2: could not reserve a guard page")
+            self._guard_page_fill = ""
+            return
+        if not kv_cache.resume(self._stream.cuda_stream):
+            logger.warning("KVCacheManagerV2: could not reserve a guard page")
+            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+            kv_cache.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Never committed, so the reuse tree can never hand this page to a
@@ -1543,6 +1551,9 @@ class KVCacheManagerV2(BaseResourceManager):
         torch.cuda.synchronize()
         if not self._guard_page_by_layer:
             logger.warning("KVCacheManagerV2: guard page reserved but no layer resolved it")
+            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+            kv_cache.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Warning, not info: this is the only proof a run has that the switch
