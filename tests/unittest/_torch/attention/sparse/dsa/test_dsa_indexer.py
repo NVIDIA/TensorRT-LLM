@@ -426,6 +426,28 @@ def test_shared_topk_lifecycle(monkeypatch):
     assert metadata.shared_topk_indices is buffer
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kv_len_update_refreshes_ragged_rows_only_when_enabled(enabled):
+    metadata = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = None
+    metadata._num_tokens = 0
+    metadata._num_generations = 0
+    metadata.enable_ragged_verification = enabled
+    metadata._invalidate_pool_view_cache = Mock()
+    metadata.refresh_ragged_row_kv_lens = Mock()
+    metadata.refresh_token_major_gen_rows = Mock()
+
+    with patch.object(TrtllmAttentionMetadata, "on_update_kv_lens"), patch(
+        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata._fused_dsa_meta_enabled",
+        return_value=False,
+    ):
+        metadata.on_update_kv_lens()
+
+    expected_calls = int(enabled)
+    assert metadata.refresh_ragged_row_kv_lens.call_count == expected_calls
+    assert metadata.refresh_token_major_gen_rows.call_count == expected_calls
+
+
 def test_indexer_post_load_weights_caches_fused_weight():
     indexer = Indexer.__new__(Indexer)
     torch.nn.Module.__init__(indexer)
