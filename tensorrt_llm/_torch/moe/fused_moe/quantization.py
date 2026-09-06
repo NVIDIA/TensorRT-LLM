@@ -2987,7 +2987,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         if self.supports_split_gate_up_weight_scale_2:
             # Derived, not checkpoint state: consumed by the backend's
             # fc31_scale_c computation later in this load and then dropped.
-            fc31_up_alpha = torch.empty_like(module.fc31_alpha.data)
+            fc31_up_alpha = module.fc31_alpha.data.clone()
             module.fc31_up_alpha = fc31_up_alpha
         self._reconcile_and_compute_alphas(
             module,
