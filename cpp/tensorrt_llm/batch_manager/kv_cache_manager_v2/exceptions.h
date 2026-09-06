@@ -32,9 +32,11 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-// The diagnostic is written to native stderr. pytest's default capture mode (--capture=fd)
-// redirects that file descriptor and discards the buffer when the process aborts, so a failure
-// under pytest is visible only when the suite runs with --capture=tee-sys or --capture=no.
+// The diagnostic goes through the TRT-LLM logger, which writes to a native stream. Under pytest
+// it is discarded: tests/unittest/conftest.py has an autouse fixture that requests `capfd`, which
+// redirects fds 1 and 2 per test and drops what it captured when the process aborts. `-s` and
+// `--capture=tee-sys` set the global capture mode and do not disable that fixture, so neither
+// makes the message visible.
 template <typename F>
 void abortOnExcept(char const* context, F&& func) noexcept
 {
