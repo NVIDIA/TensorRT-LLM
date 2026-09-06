@@ -166,6 +166,9 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         self.block_size = self._llm_args.kv_cache_config.tokens_per_block
         self.pending_loads = {}
+        # Prompt position the first entry of each request's pending_loads
+        # covers, so that cancel_load can map a position back to an entry.
+        self.load_bases = {}
 
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,
                                            "./connector_cache")
@@ -218,6 +221,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
                     metadata.save.append((file_path, slot))
 
         self.pending_loads = {}
+        self.load_bases = {}
 
         return metadata
 
@@ -239,6 +243,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             self, request: LlmRequest,
             num_computed_tokens: int) -> tuple[int, bool]:
         self.pending_loads[request.request_id] = []
+        self.load_bases[request.request_id] = num_computed_tokens
 
         # Don't bother with sequences with partial matches.
         if (num_computed_tokens % self.block_size) != 0:
@@ -283,6 +288,32 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
                                  block_ids: list[int]):
         pass
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int):
+        # Drop the loads planned for [start, end); the runtime will not use
+        # them. This connector reads from disk during the forward pass and takes
+        # no remote ownership when it answers, so forgetting the file list is
+        # the whole release. A connector that pins or leases remote blocks
+        # releases them here instead.
+        #
+        # Only reached under kv_connector_config.aggressive_prefix_budgeting.
+        pending = self.pending_loads.get(request.request_id)
+        if pending is None:
+            return
+        # One entry per whole block from the num_computed_tokens the query was
+        # asked with, so a prompt position maps to an index by subtracting that
+        # base. The runtime cancels a prefix or a suffix of the offer, never a
+        # hole in the middle.
+        base = self.load_bases[request.request_id]
+        first = max(0, (start - base) // self.block_size)
+        last = min(len(pending), (end - base) // self.block_size)
+        if last <= first:
+            return
+        if first == 0:
+            del pending[:last]
+            self.load_bases[request.request_id] = base + last * self.block_size
+        else:
+            del pending[first:]
+
 
 @click.command()
 @click.argument("model", type=str)
@@ -299,6 +330,11 @@ def main(model: str):
         connector_module=this_module,
         connector_scheduler_class="PersistentKvCacheConnectorLeader",
         connector_worker_class="PersistentKvCacheConnectorWorker",
+        # Set aggressive_prefix_budgeting=True, alongside
+        # kv_cache_config.use_kv_cache_manager_v2=True, to have a served prefix
+        # free scheduler token budget for other requests rather than only
+        # shrinking this one's forward pass. That mode requires the cancel_load
+        # implemented above.
     )
 
     connector_cache_dir = TemporaryDirectory()

@@ -55,6 +55,10 @@ These methods run on the leader process and drive the connector's behavior.
 
     Both example connectors walk `new_requests` only, so neither one demonstrates this.
 
+* **`cancel_load(self, request: LlmRequest, start: int, end: int)`**
+  * **Description**: Release the ownership `get_num_new_matched_tokens` took for prompt tokens `[start, end)`, which the runtime will not consume. Offsets are absolute prompt positions, on the same scale as `num_computed_tokens`.
+  * **When it is called**: only under `aggressive_prefix_budgeting`, where the query runs early enough that it is no longer binding. Not implementing it makes that mode fail at start-up rather than at runtime; every other configuration never reaches it. See [Contributing the prefix to the scheduler's budget](#contributing-the-prefix-to-the-schedulers-budget).
+
 * **`update_state_after_alloc_by_layer_group(self, request: LlmRequest, block_ids_by_layer_group: list[list[int]])`**
 * **`request_finished_by_layer_group(self, request: LlmRequest, cache_block_ids_by_layer_group: list[list[int]]) -> bool`**
   * **Description**: the per-layer-group forms of the two callbacks above, indexed by layer group id. Entry `[g][i]` is the page slot of block ordinal `i` in layer group `g`.
@@ -216,18 +220,43 @@ A connector written against the V1 manager runs on `KVCacheManagerV2` unchanged 
 
 Variable sliding-window attention is the case where that stops working, because the cache then allocates one pool per window size and a page index is scoped to a layer group. See [Running under VSWA](#running-under-vswa).
 
-Both managers ask `get_num_new_matched_tokens` at the same point in the iteration: once the batch for the upcoming forward pass is final. On V1 that is inside `addSequence`, called from `KVCacheManager.prepare_resources`; on V2 it is `KVCacheManagerV2.prepare_resources` directly. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in `request_finished`.
+By default both managers ask `get_num_new_matched_tokens` at the same point in the iteration: once the batch for the upcoming forward pass is final. On V1 that is inside `addSequence`, called from `KVCacheManager.prepare_resources`; on V2 it is `KVCacheManagerV2.prepare_resources` directly. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in `request_finished`. `KVCacheManagerV2` can also ask earlier, which changes that guarantee; see [Contributing the prefix to the scheduler's budget](#contributing-the-prefix-to-the-schedulers-budget).
 
 Two differences are worth knowing when tuning a deployment.
 
 * **The runtime may honour less than you offer.** V1 allocates KV for the whole prompt when the request's first chunk is scheduled, so an offer always fits. V2 allocates per context chunk, which is what lets chunked prefill bound its memory, so an offer reaching past the current chunk requires the runtime to grow the allocation and that can fail under pressure. The runtime then serves the part it can cover and computes the rest locally. The amount actually served is what `RequestData.computed_position` reflects; the unserved remainder needs no action from the connector beyond its usual `request_finished` cleanup.
-* **The query is not part of the scheduler's budget.** The V2 scheduler sizes a request's chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration.
+* **The query is not part of the scheduler's budget by default.** The V2 scheduler sizes a request's chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration. `aggressive_prefix_budgeting` changes that.
 
 Specify `enable_block_reuse=True` alongside the connector for any of this to run on `KVCacheManagerV2`; see [Block reuse alongside the connector](#block-reuse-alongside-the-connector).
 
 `get_num_new_matched_tokens` is called **at most once per KV allocation**. This is the precise form of the "once per request" rule, and it holds on both managers: if a request's KV cache is destroyed and the request is replayed -- which `MAX_UTILIZATION` does under memory pressure -- the replay asks again, because the pages the first answer described are gone.
 
 **Deployment note.** Under V2 with a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
+
+##### Contributing the prefix to the scheduler's budget
+
+```python
+KvCacheConnectorConfig(connector="my-connector", aggressive_prefix_budgeting=True)
+```
+
+With this set, `KVCacheManagerV2` asks the connector inside the scheduling pass rather than once the batch is final. The scheduler skips the request past the served range before it checks the token budget, so a served prefix frees budget for another request in the same iteration instead of only shrinking this one's forward pass. On a workload with a high remote hit rate, that is the difference between a served prefix improving latency and it improving throughput.
+
+The mode requires `use_kv_cache_manager_v2=True` and `scheduler_config.enable_prefix_aware_scheduling=True`. It is refused at start-up otherwise, and refused if the connector's scheduler does not implement `cancel_load`.
+
+**What the connector has to implement.** The query is no longer binding. Every stage between scheduling and the forward pass can still drop the request, the local cache can overtake the offer while the request waits for a slot, and the pages may not cover it. `cancel_load(request, start, end)` is how the runtime hands an offer back, and it is called in four situations:
+
+| Situation | Range handed back |
+| --- | --- |
+| The offer runs past `prompt_len - 1`, or past the last whole block below it | the trimmed tail |
+| No pages could cover the offer this iteration | the whole offer |
+| The local cache committed part of the range while the request waited | the overlapping prefix |
+| The request was cancelled, timed out, or failed before the offer was delivered | the whole undelivered offer |
+
+Release whatever ownership `get_num_new_matched_tokens` took for that range. For a synchronous offer nothing has transferred yet, so the release is exact; for one reported as asynchronous the transfer has already started and cancelling is lossy.
+
+An offer is trimmed to a whole block before it is recorded, because the scheduler sizes the following chunk from the served end. A connector offering fewer tokens than one block therefore serves nothing, and gets the whole offer back through `cancel_load`.
+
+**One query per allocation still holds.** A request refuted after scheduling keeps its recorded offer and delivers it in a later iteration rather than asking again. A request whose KV cache is destroyed has its offer handed back and asks again on replay, which is the same rule as the default mode.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
