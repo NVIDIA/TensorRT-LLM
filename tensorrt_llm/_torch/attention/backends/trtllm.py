@@ -1915,7 +1915,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+            from ...pyexecutor.kv_cache.mamba_cache_manager import \
+                BaseMambaCacheManager
 
             # Hybrid (mamba/masked-layer) KV managers take the graph-safe
             # append; the same predicate interface.py uses to detect hybrid

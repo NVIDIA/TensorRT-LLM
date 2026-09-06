@@ -25,7 +25,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiver_module
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only

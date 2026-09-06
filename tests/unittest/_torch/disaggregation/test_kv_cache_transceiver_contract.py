@@ -17,7 +17,7 @@ from unittest.mock import Mock
 import pytest
 from fake_kv_cache_transceiver import FakeKvCacheTransceiver
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     BindKvCacheTransceiver,
     CtxTransferStatus,
     GenTransferStatus,

@@ -22,8 +22,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.pyexecutor import kv_cache_manager_v2 as kv_cache_v2_module
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
     _KVCacheManagerInitStatus,
@@ -170,7 +170,7 @@ def _make_manager_for_cache_tier_test(
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
 
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
         patch(f"{module}.CuError", _CacheTierInitError),
         patch(f"{module}.IndexMapper"),
@@ -521,7 +521,7 @@ def test_world_ranks_converge_on_hostless_fallback() -> None:
 
 
 def test_local_fallback_failure_is_shared_before_raising() -> None:
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
 
     with (
         patch(
@@ -553,7 +553,7 @@ def test_local_fallback_failure_is_shared_before_raising() -> None:
 def test_peer_fallback_failure_discards_local_candidate() -> None:
     initial_impl = Mock()
     fallback_impl = Mock()
-    module = "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2"
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
 
     with (
         patch(
@@ -934,7 +934,7 @@ def test_per_conversation_policy_releases_cancelled_request(
 
         batch_b = _prepare_context_resources(manager, request_b)
         with patch(
-            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
         ) as mock_warning:
             assert manager.prepare_context(request_b)
             mock_warning.assert_not_called()
@@ -1025,7 +1025,7 @@ def test_per_conversation_policy_ignores_overlapping_request(
 
         batch_b = _prepare_context_resources(manager, request_b)
         with patch(
-            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.logger.warning"
         ) as mock_warning:
             assert manager.prepare_context(request_b)
             mock_warning.assert_called_once_with(
@@ -1128,7 +1128,7 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
 
 def test_disagg_role_mapper_kinds_default_to_indexed():
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 
     manager = object.__new__(KVCacheManagerV2)
 

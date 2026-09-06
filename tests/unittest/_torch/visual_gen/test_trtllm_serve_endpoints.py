@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """trtllm-serve visual_gen endpoints tests.
 
 Tests all endpoints registered for the VISUAL_GEN server role
@@ -181,6 +184,7 @@ class MockVisualGen:
         image_output: Optional[torch.Tensor] = None,
         video_output: Optional[torch.Tensor] = None,
         audio_output: Optional[torch.Tensor] = None,
+        action_output: Optional[torch.Tensor] = None,
         should_fail: bool = False,
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
@@ -197,6 +201,7 @@ class MockVisualGen:
         self._image = image_output
         self._video = video_output
         self._audio = audio_output
+        self._action = action_output
         self._should_fail = should_fail
         self._batch_aware = batch_aware
         self._validation_error = validation_error
@@ -292,6 +297,7 @@ class MockVisualGen:
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
+            action=self._maybe_batch(self._action, n),
             should_fail=self._should_fail,
             generate_error=self._generate_error,
         )
@@ -307,7 +313,12 @@ class MockVisualGen:
         seeds request params from this, so it must return a fresh instance."""
         from tensorrt_llm.visual_gen import VisualGenParams
 
-        return VisualGenParams(**self.executor.default_generation_params)
+        kwargs = dict(self.executor.default_generation_params)
+        if self.extra_param_specs:
+            kwargs["extra_params"] = {
+                key: spec.default for key, spec in self.extra_param_specs.items()
+            }
+        return VisualGenParams(**kwargs)
 
     @property
     def extra_param_specs(self):
@@ -346,6 +357,7 @@ class MockVisualGenResult:
         image: Optional[torch.Tensor] = None,
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
+        action: Optional[torch.Tensor] = None,
         should_fail: bool = False,
         generate_error: Optional[BaseException] = None,
     ):
@@ -353,6 +365,7 @@ class MockVisualGenResult:
         self._image = image
         self._video = video
         self._audio = audio
+        self._action = action
         self._should_fail = should_fail
         # Engine-side failure surfaced through the result (capacity/client),
         # distinct from a coordinator preflight rejection.
@@ -368,6 +381,7 @@ class MockVisualGenResult:
             image=self._image,
             video=self._video,
             audio=self._audio,
+            action=self._action,
             metrics=_make_dummy_metrics(),
         )
 
@@ -516,17 +530,33 @@ def action_video_client(tmp_path):
     """
     from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
-    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
     specs = {
         "action_mode": ExtraParamSchema(type="str", default=None, requires_tensor_output=True),
     }
-    gen.executor.extra_param_specs = specs
-    type(gen).extra_param_specs = property(lambda self: specs)
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor(), extra_param_specs=specs)
     os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
     client = _create_server(gen)
     yield client
     os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
-    del type(gen).extra_param_specs
+
+
+@pytest.fixture()
+def checkpoint_policy_video_client(tmp_path):
+    """Video client modeling a checkpoint that selects Policy internally."""
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+    specs = dict(COSMOS3_EXTRA_SPECS)
+    specs["action_mode"] = specs["action_mode"].model_copy(update={"default": "policy"})
+    gen = MockVisualGen(
+        video_output=_make_dummy_video_tensor(),
+        action_output=torch.zeros((32, 8), dtype=torch.float32),
+        extra_param_specs=specs,
+        model="nvidia/Cosmos3-Edge-Policy-DROID",
+    )
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_server(gen, model_name="nvidia/Cosmos3-Edge-Policy-DROID")
+    yield client
+    os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
 
 @pytest.fixture()
@@ -2024,6 +2054,24 @@ class TestVideoGenerationAsync:
         assert data["status"] == "queued"
         assert data["id"].startswith("video_")
 
+    def test_async_video_accepts_deprecated_cosmos3_view_point(
+        self, checkpoint_policy_video_client
+    ):
+        resp = checkpoint_policy_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "Pick up the block",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "extra_params": {"view_point": "ego_view"},
+            },
+            headers={"content-type": "application/json"},
+        )
+
+        assert resp.status_code == 202
+        assert resp.json()["status"] == "queued"
+
 
 # =========================================================================
 # GET /v1/videos  (list)
@@ -3158,6 +3206,44 @@ class TestTensorOnlyFormatResolution:
         resp = self._post(action_video_client)
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("video/")
+
+    def test_checkpoint_policy_default_uses_tensor_request_contract(
+        self, checkpoint_policy_video_client
+    ):
+        prompt = json.dumps(
+            {
+                "cinematography": {"framing": "DROID concatenated observation"},
+                "actions": [{"description": "pick up the block"}],
+            }
+        )
+        state = [0.0] * 8
+        resp = self._post(
+            checkpoint_policy_video_client,
+            prompt=prompt,
+            image_reference={
+                "content": _b64_white_png_1x1(),
+                "format": "base64",
+                "role": "first_frame",
+            },
+            extra_params={"action": state},
+        )
+
+        assert resp.status_code == 200
+        assert resp.headers["content-disposition"].endswith('.safetensors"')
+        from safetensors.torch import load as load_safetensors
+
+        tensors = load_safetensors(resp.content)
+        assert tensors["video"].shape == (4, 64, 64, 3)
+        assert tensors["action"].shape == (32, 8)
+        assert checkpoint_policy_video_client.mock_gen.last_inputs == prompt
+        image_ref = checkpoint_policy_video_client.mock_gen.last_params.image_reference[0]
+        assert image_ref.format == "bytes"
+        assert image_ref.content == base64.b64decode(_b64_white_png_1x1())
+        assert checkpoint_policy_video_client.mock_gen.last_params.extra_params["action"] == state
+        assert (
+            checkpoint_policy_video_client.mock_gen.last_params.extra_params["action_mode"]
+            == "policy"
+        )
 
 
 class TestTensorOnlyFormatRule:

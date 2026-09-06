@@ -209,7 +209,7 @@ def make_scheduler(
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     with patch(
-        "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.KVCacheManagerV2",
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.KVCacheManagerV2",
         new=type(kv_cache_manager),
     ):
         kwargs = {}
@@ -1288,7 +1288,7 @@ class TestEncoder:
         mgr = make_kv_cache_manager()
         # Build a scheduler with ENCODER_INIT gating but no cross manager.
         with patch(
-            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.KVCacheManagerV2",
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.KVCacheManagerV2",
             new=type(mgr),
         ):
             sched = KVCacheV2Scheduler(

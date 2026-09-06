@@ -27,11 +27,16 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
+    binding_to_torch_dtype,
     convert_to_torch_tensor,
     get_size_in_bytes,
+    mpi_rank,
+    nvtx_range,
     prefer_pinned,
+    str_dtype_to_torch,
 )
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
@@ -39,6 +44,8 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS,
@@ -79,21 +86,17 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to_torch
-from ...logger import logger
-from ...mapping import Mapping
-from ..utils import maybe_compile
-from .config_utils import uses_vswa_kv_cache_layout
-from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .kv_cache_stats import (
+from ..config_utils import uses_vswa_kv_cache_layout
+from ..connectors.kv_cache_connector import KvCacheConnectorManager
+from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
     KVCacheV2PoolGroupIterationStats,
     KVCacheV2SsmLifeCycleIterationStats,
     KVCacheV2SsmSnapshotIterationStats,
 )
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .resource_manager import (
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
@@ -105,7 +108,7 @@ from .resource_manager import (
     get_pp_layers,
     request_context,
 )
-from .scheduler import ScheduledRequests
+from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -362,12 +365,12 @@ def _estimate_swa_cache_size(
 
 def _get_dflash_generation_kv_capacity_headroom(spec_config) -> Optional[int]:
     """DFlash KV capacity reserved ahead of committed history."""
-    from ..speculative.interface import SpeculativeDecodingMode
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
     if spec_config is None or spec_config.spec_dec_mode != SpeculativeDecodingMode.DFLASH:
         return None
 
-    from ..speculative import get_num_extra_kv_tokens
+    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 
     return get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step
 
@@ -971,7 +974,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
-        from ..speculative import get_num_extra_kv_tokens
+        from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         # Mirror V1: expose max_draft_len so the native disagg AuxBuffer

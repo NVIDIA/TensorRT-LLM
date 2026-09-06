@@ -15,8 +15,8 @@ from tensorrt_llm.mapping import Mapping
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..model_config import ModelConfig
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,

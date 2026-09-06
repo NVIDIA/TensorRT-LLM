@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode

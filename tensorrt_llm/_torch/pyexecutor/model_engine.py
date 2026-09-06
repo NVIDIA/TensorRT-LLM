@@ -90,11 +90,12 @@ from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
 from .guided_decoder import CapturableGuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
+                                           MambaHybridCacheManager)
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,

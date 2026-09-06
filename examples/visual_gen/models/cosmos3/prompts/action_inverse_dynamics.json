@@ -1,4 +1,21 @@
 {
     "model_mode": "image2video",
-    "prompt": "Recover the robot action trajectory from this clip of the arm picking up a pear and placing it into the bag."
+    "prompt": {
+        "cinematography": {
+            "framing": "This video is captured from a first-person perspective looking at the scene."
+        },
+        "actions": [
+            {
+                "time": "0:00-0:03",
+                "description": "Recover the robot action trajectory from this clip of the arm picking up a pear and placing it into the bag."
+            }
+        ],
+        "duration": "3s",
+        "fps": 5.0,
+        "resolution": {
+            "H": 480,
+            "W": 832
+        },
+        "aspect_ratio": "16,9"
+    }
 }

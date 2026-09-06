@@ -33,7 +33,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     load_pretrained_config,
     unwrap_kimi_text_config,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
     _construct_checkpoint_loader,
