@@ -346,8 +346,8 @@ if(ENABLE_MULTI_DEVICE)
   add_definitions("-DOMPI_SKIP_MPICXX")
 endif()
 
-# C++17
-set(CMAKE_CXX_STANDARD 17)
+# C++20 is required by the PyTorch headers starting with torch 2.14.
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD ${CMAKE_CXX_STANDARD})
