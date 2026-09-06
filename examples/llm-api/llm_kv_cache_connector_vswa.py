@@ -151,6 +151,9 @@ class VswaKvCacheConnectorLeader(KvCacheConnectorScheduler):
         # request_id -> list of per-group file paths, one entry per matched block
         # ordinal, in ordinal order starting at the first locally uncomputed one.
         self.pending_loads: Dict[int, List[List[str]]] = {}
+        # request_id -> prompt position the first pending_loads entry covers, so
+        # that cancel_load can map a position back to an entry.
+        self.load_bases: Dict[int, int] = {}
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY, "./connector_cache")
         os.makedirs(self.cache_folder, exist_ok=True)
 
@@ -167,6 +170,7 @@ class VswaKvCacheConnectorLeader(KvCacheConnectorScheduler):
         self, request: LlmRequest, num_computed_tokens: int
     ) -> Tuple[int, bool]:
         self.pending_loads[request.request_id] = []
+        self.load_bases[request.request_id] = num_computed_tokens
 
         # Partial blocks are not stored, so a partial local match has nothing
         # to append to.
@@ -205,6 +209,31 @@ class VswaKvCacheConnectorLeader(KvCacheConnectorScheduler):
         # VSWA (2): the flat `update_state_after_alloc` is never called here.
         pass
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        # Drop the loads planned for [start, end); the runtime will not use
+        # them. This connector reads from disk during the forward pass and takes
+        # no remote ownership when it answers, so forgetting the file lists is
+        # the whole release.
+        #
+        # Only reached under kv_connector_config.aggressive_prefix_budgeting.
+        pending = self.pending_loads.get(request.request_id)
+        if pending is None:
+            return
+        # One entry per whole block from the num_computed_tokens the query was
+        # asked with, so a prompt position maps to an index by subtracting that
+        # base. The runtime cancels a prefix or a suffix of the offer, never a
+        # hole in the middle.
+        base = self.load_bases[request.request_id]
+        first = max(0, (start - base) // self.block_size)
+        last = min(len(pending), (end - base) // self.block_size)
+        if last <= first:
+            return
+        if first == 0:
+            del pending[:last]
+            self.load_bases[request.request_id] = base + last * self.block_size
+        else:
+            del pending[first:]
+
     def build_connector_meta(self, scheduler_output: SchedulerOutput):
         # NOTE: This is a simplified implementation, and does not work with
         # chunked prefill. A request appears in `new_requests` once, carrying
@@ -218,6 +247,7 @@ class VswaKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         for req in scheduler_output.new_requests:
             pending_load = self.pending_loads.pop(req.request_id, [])
+            self.load_bases.pop(req.request_id, None)
             by_group = req.new_block_ids_by_layer_group
             # VSWA (2): the flat list is empty with several groups.
             if len(by_group) != self.num_layer_groups:
@@ -265,6 +295,7 @@ class VswaKvCacheConnectorLeader(KvCacheConnectorScheduler):
         # VSWA (2) and (4): per group, and a sliding group's list covers its live
         # window only -- everything older is -1 and holds no readable KV.
         self.pending_loads.pop(request.request_id, None)
+        self.load_bases.pop(request.request_id, None)
         return False
 
 
