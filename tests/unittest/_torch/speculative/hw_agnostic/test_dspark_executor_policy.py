@@ -229,6 +229,66 @@ def test_can_queue_reuses_policy_agreement_without_another_collective(peer_sizes
     assert executor._can_queue(batch) == expected
 
 
+def _draft_len_executor(*, confidence_enabled):
+    spec_mode = SimpleNamespace(
+        support_dynamic_draft_len=lambda: False,
+        is_pard=lambda: False,
+    )
+    spec_config = SimpleNamespace(
+        draft_len_schedule=None,
+        spec_dec_mode=spec_mode,
+        enable_confidence_scheduling=confidence_enabled,
+        use_rejection_sampling=False,
+        is_linear_tree=True,
+    )
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.model_engine = SimpleNamespace(
+        max_draft_len=5,
+        max_total_draft_tokens=5,
+        runtime_draft_len=None,
+        spec_config=spec_config,
+        cuda_graph_runner=SimpleNamespace(adp_shape_agreement=None),
+    )
+    executor.speculation_permanently_disabled = False
+    executor.iter_counter = 9
+    return executor
+
+
+def test_fixed_draft_len_keeps_static_path_without_dynamic_signature():
+    executor = _draft_len_executor(confidence_enabled=False)
+    batch = _Batch([object()])
+
+    executor._handle_dynamic_draft_len(batch)
+    executor._handle_dynamic_draft_len(batch)
+
+    assert executor.model_engine.runtime_draft_len == 5
+    assert not hasattr(executor, "_dspark_dynamic_handled_signature")
+
+
+def test_confidence_draft_len_runs_only_once_per_iteration():
+    executor = _draft_len_executor(confidence_enabled=True)
+    request = SimpleNamespace(
+        py_draft_tokens=[1, 2, 3, 4, 5],
+        py_needs_onehot_draft_probs=False,
+    )
+    batch = _Batch([request])
+    calls = 0
+
+    def select_draft_len(_batch):
+        nonlocal calls
+        calls += 1
+        return 3
+
+    executor._dspark_confidence_draft_len = select_draft_len
+    executor._handle_dynamic_draft_len(batch)
+    executor._handle_dynamic_draft_len(batch)
+
+    assert calls == 1
+    assert executor.model_engine.runtime_draft_len == 3
+    assert request.py_draft_tokens == [1, 2, 3]
+    assert executor._dspark_dynamic_handled_signature == (9, id(batch), 1, 0, 1)
+
+
 def test_rebalance_suspends_both_dummy_variants_and_releases_the_pair_once():
     low = SimpleNamespace(py_request_id=10)
     high = SimpleNamespace(py_request_id=11)

@@ -3914,17 +3914,6 @@ class PyExecutor:
         When dynamic draft length is not enabled, runtime_draft_len is simply
         set to max_draft_len (the static maximum).
         """
-        signature = (
-            int(self.iter_counter),
-            id(scheduled_batch),
-            int(scheduled_batch.batch_size),
-            int(scheduled_batch.num_context_requests),
-            int(scheduled_batch.num_generation_requests),
-        )
-        if getattr(self, "_dspark_dynamic_handled_signature",
-                   None) == signature:
-            return
-
         if not hasattr(self.model_engine, 'max_draft_len'):
             return
 
@@ -3944,6 +3933,17 @@ class PyExecutor:
             and getattr(spec_config, "enable_confidence_scheduling", False))
 
         if schedule_driven or confidence_driven:
+            # Only variable-window modes need the once-per-iteration guard.
+            # Fixed K keeps the original static path below.
+            signature = (
+                int(self.iter_counter),
+                id(scheduled_batch),
+                int(scheduled_batch.batch_size),
+                int(scheduled_batch.num_context_requests),
+                int(scheduled_batch.num_generation_requests),
+            )
+            if getattr(self, "_dspark_dynamic_handled_signature", None) == signature:
+                return
             from tensorrt_llm._torch.speculative.utils import \
                 get_draft_len_for_batch_size
 
@@ -4006,6 +4006,7 @@ class PyExecutor:
                                                                           runtime_draft_len]
 
             self.model_engine.runtime_draft_len = runtime_draft_len
+            self._dspark_dynamic_handled_signature = signature
         else:
             # Linear-tree modes (incl. PARD) use logical K; tree decoding
             # (e.g. EAGLE3 dynamic tree) uses total tree tokens. Same
@@ -4015,7 +4016,6 @@ class PyExecutor:
                 self.model_engine.max_draft_len
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
-        self._dspark_dynamic_handled_signature = signature
 
     def _dspark_adp_shape_cache_enabled(self) -> bool:
         runner = getattr(self.model_engine, "cuda_graph_runner", None)

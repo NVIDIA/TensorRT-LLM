@@ -74,6 +74,10 @@ class SampleStateSpec(SampleState):
     # The overlap scheduler can stamp the next step on the live request before
     # this state is consumed, so rewind accounting must use this snapshot.
     verify_lens_snapshot: Optional[dict[int, int]] = None
+    # True only for DSpark confidence scheduling. The native static path keeps
+    # the original uniform rewind arithmetic without inspecting per-request
+    # window state.
+    uses_verify_window_protocol: bool = False
 
 
 class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
@@ -403,11 +407,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # replaces py_draft_tokens with the next step's buffer, so its
             # length must not be used as the denominator (0 for the request's
             # prefill step, where nothing was verified).
-            verified_len = self._verified_len(
-                req,
-                runtime_draft_len,
-                state.verify_lens_snapshot,
-                ridden_verify_lens,
+            verified_len = (
+                self._verified_len(
+                    req,
+                    runtime_draft_len,
+                    state.verify_lens_snapshot,
+                    ridden_verify_lens,
+                )
+                if state.uses_verify_window_protocol
+                else runtime_draft_len
             )
             drafted_len = state.draft_lens[req_idx] if state.draft_lens is not None else 0
             req.py_num_draft_tokens_verified = min(drafted_len, verified_len)
@@ -528,11 +536,22 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
 
-        verify_lens_snapshot = self._snapshot_policy_windows_for_step(
-            sampling_requests,
-            native_uniform=outputs.get(NATIVE_UNIFORM_VERIFY_OUTPUT, False),
-            host_snapshot_required=outputs.get(HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT, False),
-            device_verify_lens_available=o_verify_lens is not None,
+        uses_verify_window_protocol = (
+            o_verify_lens is not None
+            or NATIVE_UNIFORM_VERIFY_OUTPUT in outputs
+            or HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT in outputs
+        )
+        verify_lens_snapshot = (
+            self._snapshot_policy_windows_for_step(
+                sampling_requests,
+                native_uniform=outputs.get(NATIVE_UNIFORM_VERIFY_OUTPUT, False),
+                host_snapshot_required=outputs.get(
+                    HOST_POLICY_WINDOWS_SNAPSHOT_OUTPUT, False
+                ),
+                device_verify_lens_available=o_verify_lens is not None,
+            )
+            if uses_verify_window_protocol
+            else None
         )
 
         return SampleStateSpec(
@@ -543,4 +562,5 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             runtime_draft_len=runtime_draft_len,
             draft_lens=draft_lens,
             verify_lens_snapshot=verify_lens_snapshot,
+            uses_verify_window_protocol=uses_verify_window_protocol,
         )

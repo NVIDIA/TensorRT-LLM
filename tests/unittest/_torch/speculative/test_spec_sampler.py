@@ -22,7 +22,11 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler import penalties as penalty_ops
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
-from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
+from tensorrt_llm._torch.speculative.spec_sampler_base import (
+    SampleStateSpec,
+    SampleStateTensorsSpec,
+    SpecSampler,
+)
 
 
 class _StubSpecWorker(SpecWorkerBase):
@@ -281,6 +285,52 @@ def test_dspark_forward_publishes_windows_only_for_confidence(return_confidence)
     )
 
     assert (NATIVE_UNIFORM_VERIFY_OUTPUT in outputs) is return_confidence
+
+
+@pytest.mark.parametrize(
+    ("uses_verify_window_protocol", "expected_rewind"),
+    [(False, 4), (True, 1)],
+)
+def test_sampler_uses_uniform_or_confidence_window_for_rewind(
+    monkeypatch, uses_verify_window_protocol, expected_rewind
+):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.spec_sampler_base.add_token",
+        lambda *_args, **_kwargs: 11,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.spec_sampler_base.handle_stop_criteria",
+        lambda *_args, **_kwargs: False,
+    )
+    request = types.SimpleNamespace(
+        state=object(),
+        py_seq_slot=0,
+        py_request_id=7,
+        py_verify_len=2,
+    )
+    tensors = SampleStateTensorsSpec(
+        new_tokens=torch.tensor([[11, 12]]),
+        new_tokens_lens=torch.tensor([2]),
+        next_draft_tokens=torch.tensor([[13, 14, 15, 16, 17]]),
+    )
+    state = SampleStateSpec(
+        requests=[request],
+        device=tensors,
+        host=tensors,
+        sampler_event=types.SimpleNamespace(synchronize=lambda: None),
+        runtime_draft_len=5,
+        verify_lens_snapshot={7: 2} if uses_verify_window_protocol else None,
+        uses_verify_window_protocol=uses_verify_window_protocol,
+    )
+    sampler = SpecSampler.__new__(SpecSampler)
+    sampler.max_accepted_path_len = 6
+    sampler.max_seq_len = 32
+    sampler._request_common_handling = lambda *_args: None
+
+    sampler.update_requests(state)
+
+    assert request.py_num_accepted_draft_tokens == 1
+    assert request.py_rewind_len == expected_rewind
 
 
 @pytest.mark.parametrize(
