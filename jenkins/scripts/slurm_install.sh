@@ -74,20 +74,20 @@ slurm_install_setup() {
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
-            mambaArch=$(uname -m)
-            retry_command --timeout 2700 pip3 install --retries 10 --no-deps \
-                "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl" \
-                "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl"
-            # These are prebuilt against one torch ABI, and upstream publishes no
-            # build for every base image we run on, so on a mismatch the extension
-            # loads with an undefined c10 symbol. Leaving a broken install behind is
-            # worse than having none: transformers gates its causal_conv1d import on
-            # a package-metadata probe, which a broken install still passes, so the
-            # import blows up and takes the whole module -- and every test collected
-            # from it -- down with it. Uninstalled, the gate says no and the model
-            # falls back to its Python path.
-            python3 -c "import causal_conv1d, mamba_ssm" 2>/dev/null \
-                || pip3 uninstall -y causal_conv1d mamba_ssm
+            # TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once upstream
+            # publishes wheels built against this base image's torch. They used to be
+            # installed here, from
+            #   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
+            #   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
+            # but the newest builds upstream offers target torch 26.07 and 26.04, so
+            # on DLFW 26.08 the extension loads with an undefined c10 symbol,
+            # materialize_cow_storage(StorageImpl&). A broken install is worse than
+            # none: transformers gates its causal_conv1d import on a package-metadata
+            # probe, which a broken install still passes, so modeling_qwen3_5_moe
+            # raises at import and every test collected from a module that imports it
+            # dies as a collection error. Absent, the gate says no and the model falls
+            # back to its Python path -- slower, and it OOMs on Nemotron-H, which is
+            # why test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
         fi
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
