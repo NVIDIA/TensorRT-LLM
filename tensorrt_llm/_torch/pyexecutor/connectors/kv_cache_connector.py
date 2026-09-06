@@ -807,7 +807,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """
         if self.scheduler is None:
             return False
-        return type(self.scheduler).cancel_load is not KvCacheConnectorScheduler.cancel_load
+        # Read off the type, not the instance: a bound method never compares
+        # equal to the function it came from. The default covers a scheduler
+        # whose type does not carry the attribute at all -- a mock -- which
+        # answers the call and so does support it.
+        override = getattr(type(self.scheduler), "cancel_load", None)
+        return override is not KvCacheConnectorScheduler.cancel_load
 
     def reset_request_state(self, request: LlmRequest) -> None:
         """Tell the connector bookkeeping that this request's allocation died.

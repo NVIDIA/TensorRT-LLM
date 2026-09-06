@@ -209,6 +209,9 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_uniform_sliding_window[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_sliding_window_prefix_is_backed_by_real_pages[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_prefix_frees_scheduler_budget[kv_cache_manager_v2-default_budgeting]
+  - llmapi/test_llm_api_connector.py::test_connector_prefix_frees_scheduler_budget[kv_cache_manager_v2-aggressive_budgeting]
+  - llmapi/test_llm_api_connector.py::test_aggressive_prefix_budgeting_still_asks_once_and_shrinks_the_prefill[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_multi_pool_e2e_persistent_cache
   - llmapi/test_llm_api_connector.py::test_connector_vswa_e2e_gemma3
   - llmapi/test_llm_api_connector.py::test_connector_vswa_out_of_window_blocks_reach_the_connector

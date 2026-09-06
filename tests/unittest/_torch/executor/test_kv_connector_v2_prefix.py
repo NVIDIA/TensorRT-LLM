@@ -112,6 +112,9 @@ class FakeRequest:
         self.is_disagg_generation_init_state = False
         self.py_num_connector_matched_tokens = 0
         self.py_connector_allocation_reported = False
+        self.py_connector_prefix_start = None
+        self.py_connector_prefix_end = None
+        self.py_connector_load_async = False
         self.py_ctx_pre_resize_cap = None
         self.py_draft_tokens = []
         self._context_chunk_size = prompt_len
@@ -162,15 +165,17 @@ class FakeRequest:
 class FakeConnectorManager:
     """Records the calls the prefix path makes, in order."""
 
-    def __init__(self, num_matched=0, load_async=False, add_sequence=True):
+    def __init__(self, num_matched=0, load_async=False, add_sequence=True, aggressive=False):
         self.num_matched = num_matched
         self.load_async = load_async
         self.add_sequence = add_sequence
+        self.aggressive_prefix_budgeting = aggressive
         self.queries = []
         self.commits = []
         self.allocs = []
         self.alloc_by_group = []
         self.forgotten = []
+        self.cancels = []
 
     def query_num_new_matched_tokens(self, request, num_computed_tokens):
         self.queries.append((request.request_id, num_computed_tokens))
@@ -189,6 +194,13 @@ class FakeConnectorManager:
     def update_state_after_alloc(self, request, page_indices, by_layer_group=None):
         self.allocs.append((request.request_id, tuple(page_indices)))
         self.alloc_by_group.append(by_layer_group)
+
+    def cancel_load(self, request, start, end):
+        # The real manager drops empty ranges before the connector sees them,
+        # so a test asserting on this list is asserting on what a connector
+        # would actually be told.
+        if end > start:
+            self.cancels.append((request.request_id, start, end))
 
     def build_scheduler_output(self, scheduled_batch, kv_cache_manager):
         pass
@@ -235,6 +247,16 @@ def serve(manager, req, kv_cache):
     req.context_current_position = kv_cache.num_committed_tokens
     req.set_prepopulated_prompt_len(kv_cache.num_committed_tokens, TOKENS_PER_BLOCK)
     return manager._apply_connector_matched_prefix(req)
+
+
+def prepare(manager, req, kv_cache):
+    """Drive the real ``_prepare_context_impl``: one scheduling pass.
+
+    This is where ``aggressive_prefix_budgeting`` asks and reserves, so it is
+    also where the scheduler would read ``context_remaining_length`` back.
+    """
+    manager.kv_cache_map[req.py_request_id] = kv_cache
+    return manager._prepare_context_impl(req)
 
 
 class TestAskTiming:
@@ -745,3 +767,366 @@ class TestSwaScratchReuse:
         assert manager._prepare_context_impl(req)
 
         assert kv_cache.enable_swa_scratch_reuse is True
+
+
+# ---------------------------------------------------------------------------
+# aggressive_prefix_budgeting.
+#
+# The query moves into `prepare_context`, which is inside the scheduling pass
+# and ahead of the budget check, so the served range is subtracted from what
+# the request asks the budget for. Everything below either pins that saving or
+# pins the cancellation that pays for it: the query is no longer binding, so
+# every range the runtime declines has to reach `cancel_load`.
+# ---------------------------------------------------------------------------
+
+
+def budgeting(num_matched, **kwargs):
+    return FakeConnectorManager(num_matched=num_matched, aggressive=True, **kwargs)
+
+
+class TestBudgetedAskTiming:
+    """One query per allocation, asked from the scheduling pass."""
+
+    def test_the_scheduling_pass_asks(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        assert prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert connector.queries == [(0, 0)]
+
+    def test_the_query_is_anchored_at_the_local_match(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=128, capacity=PROMPT_LEN))
+
+        assert connector.queries == [(0, 128)]
+
+    def test_a_repeated_scheduling_pass_does_not_ask_again(self):
+        """A request refuted after scheduling comes back through here. The
+        offer it already holds is re-reserved, not re-negotiated."""
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        prepare(manager, req, kv_cache)
+        # The block reuse branch resets the position on every first-chunk pass,
+        # so the second pass has to re-advance it from the recorded offer.
+        prepare(manager, req, kv_cache)
+
+        assert len(connector.queries) == 1
+        assert req.context_current_position == 64
+
+    def test_a_completed_async_load_is_not_asked(self):
+        connector = budgeting(64, add_sequence=False)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert connector.queries == []
+        assert req.py_connector_prefix_end is None
+
+    @pytest.mark.parametrize(
+        "attribute",
+        ["is_dummy", "is_generation_only_request", "is_disagg_generation_init_state"],
+    )
+    def test_request_kinds_that_are_never_asked(self, attribute):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        setattr(req, attribute, True)
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert connector.queries == []
+
+    def test_the_draft_manager_never_asks(self):
+        connector = budgeting(64)
+        manager = make_manager(connector, is_draft=True)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert connector.queries == []
+
+
+class TestBudgetedSaving:
+    """What the whole mode exists for: the scheduler sees less to compute."""
+
+    def test_the_served_prefix_leaves_the_scheduler_less_to_budget(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        # `context_remaining_length` is what both context paths budget against
+        # once `prepare_context` has run.
+        assert req.context_current_position == 64
+        assert req.context_remaining_length == PROMPT_LEN - 64
+
+    def test_the_default_mode_leaves_the_scheduler_the_whole_prompt(self):
+        """The same connector, the same offer, without the opt-in. This is the
+        pair that says the saving comes from the placement and not from the
+        connector answering differently."""
+        connector = FakeConnectorManager(num_matched=64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert connector.queries == []
+        assert req.context_remaining_length == PROMPT_LEN
+
+    def test_the_saving_stacks_on_top_of_the_local_match(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=128, capacity=PROMPT_LEN))
+
+        assert req.context_current_position == 192
+        assert req.context_remaining_length == PROMPT_LEN - 192
+
+    def test_the_reserve_leaves_the_revert_target_alone(self):
+        """``resize_context`` owns ``py_ctx_pre_resize_cap``. Recording the
+        pre-offer capacity here would put the revert target below
+        ``history_length``, where ``revert_allocate_context`` frees the whole
+        cache -- so every refuted request would drop its prefix and re-ask."""
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=0))
+
+        assert req.py_ctx_pre_resize_cap is None
+
+
+class TestBudgetedTrims:
+    """Both trims applied when the offer is recorded, and what they hand back."""
+
+    def test_the_last_prompt_token_stays_local(self):
+        """The first generation step consumes it, so the offer is capped below
+        the prompt and then floored to a block."""
+        connector = budgeting(PROMPT_LEN)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert req.context_current_position == PROMPT_LEN - TOKENS_PER_BLOCK
+        assert connector.cancels == [(0, PROMPT_LEN - TOKENS_PER_BLOCK, PROMPT_LEN)]
+
+    def test_a_partial_block_tail_is_handed_back(self):
+        connector = budgeting(48)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert req.context_current_position == TOKENS_PER_BLOCK
+        assert connector.cancels == [(0, TOKENS_PER_BLOCK, 48)]
+
+    def test_an_offer_smaller_than_a_block_serves_nothing(self):
+        """The scheduler sizes the following chunk from the served end, so a
+        sub-block offer has no whole block to move it to."""
+        connector = budgeting(16)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert req.context_current_position == 0
+        assert req.context_remaining_length == PROMPT_LEN
+        assert connector.cancels == [(0, 0, 16)]
+
+    def test_an_empty_offer_touches_nothing(self):
+        connector = budgeting(0)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+
+        prepare(manager, req, kv_cache)
+
+        assert connector.cancels == []
+        assert kv_cache.resize_calls == []
+        assert req.context_current_position == 0
+
+    @pytest.mark.parametrize("offer", [1, 31, 32, 33, 64, 100, 129, PROMPT_LEN - 1])
+    def test_the_served_end_is_always_block_aligned(self, offer):
+        """A served end inside a block would put every later chunk boundary
+        inside one too, because the scheduler sizes chunks in whole blocks from
+        wherever this leaves the position."""
+        connector = budgeting(offer)
+        manager = make_manager(connector)
+        req = FakeRequest()
+
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        assert req.context_current_position % TOKENS_PER_BLOCK == 0
+
+
+class TestBudgetedCancellation:
+    """Every range the runtime declines reaches the connector."""
+
+    def test_a_reserve_without_pages_hands_the_whole_offer_back(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=0, grow_ok=False)
+
+        prepare(manager, req, kv_cache)
+
+        assert connector.cancels == [(0, 0, 64)]
+        assert req.context_current_position == 0
+        assert req.context_remaining_length == PROMPT_LEN
+        assert req.py_connector_prefix_end == 0
+
+    def test_a_failed_reserve_commits_nothing(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=0, grow_ok=False)
+        prepare(manager, req, kv_cache)
+
+        manager._deliver_connector_prefix(req)
+
+        assert connector.commits == [(0, 0, False)]
+
+    def test_a_local_match_that_overtook_the_offer_is_handed_back(self):
+        """The offer was recorded against a match that has since grown, so
+        every page it described is now locally owned."""
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        prepare(manager, req, kv_cache)
+        connector.cancels.clear()
+
+        kv_cache.num_committed_tokens = 96
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert connector.cancels == [(0, 0, 64)]
+        assert connector.commits == [(0, 0, False)]
+
+    def test_a_partial_overtake_hands_back_only_the_overlap(self):
+        connector = budgeting(128)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        kv_cache = FakeKvCache(committed=0, capacity=PROMPT_LEN)
+        prepare(manager, req, kv_cache)
+        connector.cancels.clear()
+
+        kv_cache.num_committed_tokens = 32
+        prepare(manager, req, kv_cache)
+        manager._deliver_connector_prefix(req)
+
+        assert connector.cancels == [(0, 0, 32)]
+        assert connector.commits == [(0, 96, False)]
+
+    def test_an_undelivered_offer_is_handed_back(self):
+        """A request can be asked and then cancelled, time out, or fail before
+        it reaches a batch."""
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        connector.cancels.clear()
+
+        manager._release_undelivered_connector_prefix(req)
+
+        assert connector.cancels == [(0, 0, 64)]
+        assert req.py_connector_prefix_end is None
+
+    def test_a_delivered_offer_is_not_handed_back(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        connector.cancels.clear()
+        req.py_connector_allocation_reported = True
+
+        manager._release_undelivered_connector_prefix(req)
+
+        assert connector.cancels == []
+        # Cleared either way, so a replay asks again.
+        assert req.py_connector_prefix_end is None
+
+
+class TestBudgetedDelivery:
+    """``prepare_resources`` still owns the commit and the page report."""
+
+    def test_the_commit_is_the_served_amount(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.commits == [(0, 64, False)]
+        assert len(connector.allocs) == 1
+        assert req.py_connector_allocation_reported
+
+    def test_the_commit_is_the_served_amount_not_the_offer(self):
+        connector = budgeting(48)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.commits == [(0, TOKENS_PER_BLOCK, False)]
+
+    def test_the_async_flag_reaches_the_commit(self):
+        connector = budgeting(64, load_async=True)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.commits == [(0, 64, True)]
+
+    def test_the_async_flag_survives_a_trimmed_offer(self):
+        """The connector started the transfer inside its answer, whether or not
+        the runtime kept the whole range."""
+        connector = budgeting(48, load_async=True)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert connector.commits == [(0, TOKENS_PER_BLOCK, True)]
+
+    def test_a_second_pass_delivers_once(self):
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+
+        manager._run_kv_connector_hooks(scheduled(req))
+        manager._run_kv_connector_hooks(scheduled(req))
+
+        assert len(connector.commits) == 1
+        assert len(connector.allocs) == 1
+
+    def test_the_batch_split_is_left_alone(self):
+        """The chunk moved in ``prepare_context``, before the scheduler built
+        the chunking / last-chunk split, so there is nothing to rebuild."""
+        connector = budgeting(64)
+        manager = make_manager(connector)
+        req = FakeRequest()
+        prepare(manager, req, FakeKvCache(committed=0, capacity=PROMPT_LEN))
+        batch = scheduled(req)
+
+        manager._run_kv_connector_hooks(batch)
+
+        assert batch.reset_calls == 0

@@ -51,7 +51,7 @@ OFFER_TOKENS = 32
 class FakeConnectorManager:
     """Records what the prefix path tells the connector, in order."""
 
-    def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
+    def __init__(self, num_matched=OFFER_TOKENS, load_async=False, aggressive=False):
         self.num_matched = num_matched
         self.load_async = load_async
         self.queries = []
@@ -59,6 +59,8 @@ class FakeConnectorManager:
         self.allocs = []
         self.allocs_by_group = []
         self.forgotten = []
+        self.cancels = []
+        self.aggressive_prefix_budgeting = aggressive
 
     def query_num_new_matched_tokens(self, request, num_computed_tokens):
         self.queries.append((request.py_request_id, num_computed_tokens))
@@ -82,6 +84,11 @@ class FakeConnectorManager:
                 None if by_layer_group is None else [list(g) for g in by_layer_group],
             )
         )
+
+    def cancel_load(self, request, start, end):
+        # The real manager drops empty ranges before the connector sees them.
+        if end > start:
+            self.cancels.append((request.py_request_id, start, end))
 
     def build_scheduler_output(self, scheduled_batch, kv_cache_manager):
         pass
@@ -453,3 +460,138 @@ def test_a_single_window_still_reports_the_flat_list(connector):
         del mgr
         gc.collect()
         torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# aggressive_prefix_budgeting, against real pools.
+#
+# The stub suite pins the arithmetic and the cancellation sites exhaustively.
+# What it cannot show is that the earlier placement still lands the prefix on
+# real pages: `resize` runs before `resize_context` here, on a cache that was
+# resumed a line earlier, and `history_length` has to move without the grow
+# that the later placement relied on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def budgeting_connector():
+    return FakeConnectorManager(aggressive=True)
+
+
+@pytest.fixture
+def budgeting_manager(budgeting_connector):
+    torch.cuda.init()
+    gc.collect()
+    torch.cuda.empty_cache()
+    mgr = make_manager(budgeting_connector)
+    yield mgr
+    mgr.shutdown()
+    del mgr
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_the_scheduling_pass_shrinks_what_the_budget_sees(budgeting_manager, budgeting_connector):
+    """The whole mode in one assertion.
+
+    ``context_remaining_length`` read after ``prepare_context`` is what both
+    context paths budget against, so a served prefix taken off it here is
+    budget another request in this iteration can use. The default placement
+    leaves the same request asking for the whole prompt --
+    ``test_a_request_dropped_before_the_batch_is_never_asked`` is that pair.
+    """
+    request = make_request()
+
+    assert budgeting_manager.prepare_context(request)
+
+    assert budgeting_connector.queries == [(request.py_request_id, 0)]
+    assert request.context_current_position == OFFER_TOKENS
+    assert request.context_remaining_length == PROMPT_LEN - OFFER_TOKENS
+
+
+def test_the_prefix_is_resident_before_the_budget_check(budgeting_manager, budgeting_connector):
+    """The pages are taken in the scheduling pass, so the saving the budget is
+    told about is one the cache can actually back."""
+    request = make_request()
+
+    assert budgeting_manager.prepare_context(request)
+
+    kv_cache = budgeting_manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.is_active
+    assert kv_cache.history_length == OFFER_TOKENS
+    assert kv_cache.capacity >= OFFER_TOKENS
+
+
+def test_the_commit_still_waits_for_the_final_batch(budgeting_manager, budgeting_connector):
+    """Only the query and the reservation move. ``commit_new_matched_tokens``
+    registers an asynchronous load and is consumed by ``build_scheduler_output``,
+    so it has to stay on the batch that runs."""
+    request = make_request()
+    assert schedule(budgeting_manager, request)
+
+    assert budgeting_connector.commits == []
+
+    run(budgeting_manager, request)
+
+    assert budgeting_connector.commits == [(request.py_request_id, OFFER_TOKENS, False)]
+    assert len(budgeting_connector.allocs) == 1
+
+
+def test_a_request_refuted_after_scheduling_keeps_its_offer(budgeting_manager, budgeting_connector):
+    """``revert_allocate_context`` rolls back the chunk growth, not the prefix.
+
+    The revert target is the capacity ``resize_context`` found, which is above
+    ``history_length``, so the cache shrinks and suspends rather than being
+    freed. The offer survives and is delivered on the pass that sticks.
+    """
+    request = make_request()
+    assert schedule(budgeting_manager, request)
+
+    budgeting_manager.revert_allocate_context(request)
+
+    assert request.py_request_id in budgeting_manager.kv_cache_map
+    assert budgeting_connector.cancels == []
+
+    assert schedule(budgeting_manager, request)
+    run(budgeting_manager, request)
+
+    assert len(budgeting_connector.queries) == 1
+    assert budgeting_connector.commits == [(request.py_request_id, OFFER_TOKENS, False)]
+
+
+def test_an_offer_whose_request_dies_is_handed_back(budgeting_manager, budgeting_connector):
+    """The query is speculative, so a request can be asked and then cancelled,
+    time out, or fail before it ever reaches a batch."""
+    request = make_request()
+    assert schedule(budgeting_manager, request)
+
+    budgeting_manager.free_resources(request)
+
+    assert budgeting_connector.cancels == [(request.py_request_id, 0, OFFER_TOKENS)]
+    assert request.py_connector_prefix_end is None
+
+
+def test_a_delivered_offer_is_not_handed_back(budgeting_manager, budgeting_connector):
+    request = make_request()
+    assert schedule(budgeting_manager, request)
+    run(budgeting_manager, request)
+
+    budgeting_manager.free_resources(request)
+
+    assert budgeting_connector.cancels == []
+
+
+def test_a_freed_allocation_is_asked_again(budgeting_manager, budgeting_connector):
+    """One query per allocation, not per request -- the same rule as the
+    default placement, and what makes handing the offer back at ``free`` the
+    right pairing."""
+    request = make_request()
+    assert schedule(budgeting_manager, request)
+    run(budgeting_manager, request)
+    budgeting_manager.free_resources(request)
+
+    request.reset_for_recompute(PROMPT_LEN)
+    assert schedule(budgeting_manager, request)
+    run(budgeting_manager, request)
+
+    assert len(budgeting_connector.queries) == 2

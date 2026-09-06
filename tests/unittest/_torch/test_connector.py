@@ -535,3 +535,68 @@ def test_a_connector_implementing_neither_form_still_fails_at_construction():
 
     with pytest.raises(TypeError, match="request_finished"):
         NeitherScheduler(llm_args=None)
+
+
+# ---------------------------------------------------------------------------
+# cancel_load.
+#
+# `aggressive_prefix_budgeting` asks the connector before the batch is final,
+# so an answered query no longer implies the request runs. This is the callback
+# that closes the gap, and the check that refuses to start without it.
+# ---------------------------------------------------------------------------
+
+
+class _CancellingScheduler(_FlatOnlyScheduler):
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled = []
+
+    def cancel_load(self, request, start, end):
+        self.cancelled.append((request.request_id, start, end))
+
+
+def test_cancel_load_reaches_the_connector():
+    scheduler = _CancellingScheduler()
+    manager = KvCacheConnectorManager(MagicMock(), scheduler)
+    req = MagicMock()
+    req.request_id = 7
+
+    manager.cancel_load(req, 0, 64)
+
+    assert scheduler.cancelled == [(7, 0, 64)]
+
+
+@pytest.mark.parametrize("start,end", [(64, 64), (64, 0)])
+def test_an_empty_cancellation_never_reaches_the_connector(start, end):
+    """Call sites hand back whatever the runtime declined, which is routinely
+    nothing. Dropping those here keeps every site free of the same guard."""
+    scheduler = _CancellingScheduler()
+    manager = KvCacheConnectorManager(MagicMock(), scheduler)
+    req = MagicMock()
+    req.request_id = 7
+
+    manager.cancel_load(req, start, end)
+
+    assert scheduler.cancelled == []
+
+
+def test_a_connector_without_cancel_load_is_detected():
+    """The failure this catches -- a connector holding remote blocks it was
+    told to release -- has no runtime symptom, so it is caught at bring-up."""
+    manager = KvCacheConnectorManager(MagicMock(), _FlatOnlyScheduler())
+
+    assert manager.supports_load_cancellation() is False
+
+
+def test_a_connector_with_cancel_load_is_detected():
+    manager = KvCacheConnectorManager(MagicMock(), _CancellingScheduler())
+
+    assert manager.supports_load_cancellation() is True
+
+
+def test_the_default_cancel_load_refuses_by_name():
+    scheduler = _FlatOnlyScheduler()
+
+    with pytest.raises(NotImplementedError, match="_FlatOnlyScheduler"):
+        scheduler.cancel_load(MagicMock(), 0, 64)

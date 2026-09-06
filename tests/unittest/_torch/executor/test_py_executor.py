@@ -3332,3 +3332,63 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+
+# ---------------------------------------------------------------------------
+# aggressive_prefix_budgeting bring-up.
+#
+# Each of the three requirements fails silently rather than loudly if it is not
+# checked: the V1 manager would ignore the setting, a connector without
+# cancel_load would leak every declined offer, and prefix-aware scheduling off
+# would budget against the length captured before the query ran.
+# ---------------------------------------------------------------------------
+
+
+def _connector_executor(aggressive=True, can_cancel=True, prefix_aware=True):
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = types.SimpleNamespace(
+        aggressive_prefix_budgeting=aggressive,
+        supports_load_cancellation=lambda: can_cancel,
+        scheduler=types.SimpleNamespace(),
+    )
+    executor.llm_args = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(enable_prefix_aware_scheduling=prefix_aware)
+    )
+    return executor
+
+
+def test_aggressive_prefix_budgeting_accepts_a_supported_configuration():
+    PyExecutor._check_aggressive_prefix_budgeting(
+        _connector_executor(), is_kv_cache_manager_v2=True
+    )
+
+
+def test_aggressive_prefix_budgeting_is_refused_on_the_v1_manager():
+    with pytest.raises(NotImplementedError, match="use_kv_cache_manager_v2"):
+        PyExecutor._check_aggressive_prefix_budgeting(
+            _connector_executor(), is_kv_cache_manager_v2=False
+        )
+
+
+def test_aggressive_prefix_budgeting_is_refused_without_cancel_load():
+    with pytest.raises(NotImplementedError, match="cancel_load"):
+        PyExecutor._check_aggressive_prefix_budgeting(
+            _connector_executor(can_cancel=False), is_kv_cache_manager_v2=True
+        )
+
+
+def test_aggressive_prefix_budgeting_is_refused_without_prefix_aware_scheduling():
+    with pytest.raises(NotImplementedError, match="enable_prefix_aware_scheduling"):
+        PyExecutor._check_aggressive_prefix_budgeting(
+            _connector_executor(prefix_aware=False), is_kv_cache_manager_v2=True
+        )
+
+
+@pytest.mark.parametrize("is_v2", [True, False])
+def test_the_default_mode_checks_nothing(is_v2):
+    """Every requirement is unmet, and none of them applies: the connector is
+    only asked once the batch is final, where the query is binding."""
+    PyExecutor._check_aggressive_prefix_budgeting(
+        _connector_executor(aggressive=False, can_cancel=False, prefix_aware=False),
+        is_kv_cache_manager_v2=is_v2,
+    )
