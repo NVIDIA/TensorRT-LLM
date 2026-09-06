@@ -50,7 +50,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    EncodeCudaGraphConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -3392,3 +3396,57 @@ def test_the_default_mode_checks_nothing(is_v2):
         _connector_executor(aggressive=False, can_cancel=False, prefix_aware=False),
         is_kv_cache_manager_v2=is_v2,
     )
+
+
+def _policy_executor(policy):
+    executor = object.__new__(PyExecutor)
+    executor.llm_args = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(capacity_scheduler_policy=policy)
+    )
+    return executor
+
+
+def _warn_and_capture(executor, is_v2):
+    """Return the warnings the check emitted, as whole strings.
+
+    Patched rather than captured through `caplog`: the repository logger sets
+    `propagate = False`, so nothing it emits reaches the root handler pytest
+    installs. Reading `args[0]` also pins the message as preformatted, which
+    that logger requires -- it joins its arguments with spaces instead of
+    applying printf substitution.
+    """
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.logger") as mock:
+        PyExecutor._warn_on_unvalidated_capacity_policy(executor, is_kv_cache_manager_v2=is_v2)
+    return [call.args[0] for call in mock.warning.call_args_list]
+
+
+def test_a_connector_on_v1_warns_about_an_unvalidated_policy():
+    """`create_py_executor` cannot catch this: it sees the configured manager,
+    and "auto" does not resolve until model loading."""
+    warnings = _warn_and_capture(
+        _policy_executor(CapacitySchedulerPolicy.MAX_UTILIZATION), is_v2=False
+    )
+
+    assert len(warnings) == 1
+    assert "MAX_UTILIZATION" in warnings[0]
+    assert "use_kv_cache_manager_v2" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "policy,is_v2",
+    [
+        (CapacitySchedulerPolicy.GUARANTEED_NO_EVICT, False),
+        (CapacitySchedulerPolicy.MAX_UTILIZATION, True),
+        (CapacitySchedulerPolicy.GUARANTEED_NO_EVICT, True),
+    ],
+    ids=["v1_validated_policy", "v2_any_policy", "v2_validated_policy"],
+)
+def test_a_supported_policy_and_manager_pairing_is_quiet(policy, is_v2):
+    assert _warn_and_capture(_policy_executor(policy), is_v2=is_v2) == []
+
+
+def test_a_missing_scheduler_config_is_not_a_warning():
+    executor = object.__new__(PyExecutor)
+    executor.llm_args = types.SimpleNamespace()
+
+    assert _warn_and_capture(executor, is_v2=False) == []

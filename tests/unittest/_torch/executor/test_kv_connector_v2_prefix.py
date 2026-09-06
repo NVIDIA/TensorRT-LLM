@@ -44,6 +44,11 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
+# Nothing here touches a device: the manager is built with `object.__new__` and
+# the cache is a stub. Declaring that puts these on the GPU-less stage, which
+# collects only files carrying this marker.
+pytestmark = pytest.mark.cpu_only
+
 TOKENS_PER_BLOCK = 32
 PROMPT_LEN = 256
 

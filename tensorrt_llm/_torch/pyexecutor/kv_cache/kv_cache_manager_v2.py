@@ -3221,11 +3221,12 @@ class KVCacheManagerV2(BaseResourceManager):
             self._skip_context_past(req, end)
             return
 
+        # Preformatted: the repository logger joins its arguments with spaces
+        # rather than applying printf substitution, so placeholders left to it
+        # reach the log literally.
         logger.debug(
-            "req %s: no pages for a connector prefix through %d, running local-only from %d",
-            req.py_request_id,
-            end,
-            local_end,
+            f"req {req.py_request_id}: no pages for a connector prefix through "
+            f"{end}, running local-only from {local_end}"
         )
         self.kv_connector_manager.cancel_load(req, req.py_connector_prefix_start, end)
         req.py_connector_prefix_start = local_end

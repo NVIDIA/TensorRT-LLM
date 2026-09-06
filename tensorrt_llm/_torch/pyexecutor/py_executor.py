@@ -43,7 +43,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
-from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
@@ -1067,6 +1068,7 @@ class PyExecutor:
                     "transfer for those layers.")
 
             self._check_aggressive_prefix_budgeting(is_kv_cache_manager_v2)
+            self._warn_on_unvalidated_capacity_policy(is_kv_cache_manager_v2)
 
             if is_kv_cache_manager_v2:
                 # Registered regions are device addresses, so every page has
@@ -1092,6 +1094,41 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    def _warn_on_unvalidated_capacity_policy(
+            self, is_kv_cache_manager_v2: bool) -> None:
+        """Warn when a connector runs on the flat-tensor manager under a
+        capacity policy it has never been exercised against.
+
+        `GUARANTEED_NO_EVICT` is the only policy that manager's connector path
+        is validated for: it is the one under which a scheduled request keeps
+        its allocation, so the query answered when the sequence was added stays
+        binding. The others can pause and replay a live request.
+
+        `create_py_executor` refuses the same combination outright, but it can
+        only see the *configured* manager, and `use_kv_cache_manager_v2` is
+        tri-state -- under "auto" the choice is made during model loading and
+        can land on either. That leaves this the only place the real manager is
+        known. It warns rather than refuses because the two arms mean different
+        things: `use_kv_cache_manager_v2=False` is the user asserting a manager
+        the policy is wrong for, while "auto" is the runtime picking one, and
+        the combination is unvalidated rather than known-broken.
+        """
+        policy = getattr(getattr(self.llm_args, 'scheduler_config', None),
+                         'capacity_scheduler_policy', None)
+        if is_kv_cache_manager_v2 or policy is None:
+            return
+        if policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            return
+        # Preformatted: the repository logger joins its arguments with spaces
+        # rather than applying printf substitution.
+        logger.warning(
+            "KV connector is running on the V1 KV cache manager under "
+            f"capacity_scheduler_policy={policy.name}, which is not a validated "
+            "combination; only GUARANTEED_NO_EVICT is. The manager was chosen "
+            "by kv_cache_config.use_kv_cache_manager_v2='auto'. Set it to True "
+            "to get the V2 manager, which supports every policy, or set "
+            "scheduler_config.capacity_scheduler_policy=GUARANTEED_NO_EVICT.")
 
     def _check_aggressive_prefix_budgeting(
             self, is_kv_cache_manager_v2: bool) -> None:
