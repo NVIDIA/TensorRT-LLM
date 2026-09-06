@@ -508,6 +508,8 @@ def test_kv_len_update_refreshes_ragged_rows_only_when_enabled(enabled):
     metadata._num_generations = 0
     metadata.enable_ragged_verification = enabled
     metadata._invalidate_pool_view_cache = Mock()
+    metadata._compute_kv_lens_row_reorder = Mock()
+    metadata.prepare_dense_topk_indices = Mock()
     metadata.refresh_ragged_row_kv_lens = Mock()
     metadata.refresh_token_major_gen_rows = Mock()
 
