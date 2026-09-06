@@ -29,7 +29,12 @@ from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qw
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
@@ -67,6 +72,32 @@ def _component_skipped(
     component: PipelineComponent,
 ) -> bool:
     return component in skip_components or component.value in skip_components
+
+
+# Every one of these reproduces VANILLA bit-for-bit on the packed MiniMax-H3
+# layout (max |diff| = 0 on sm_100, the architecture this build targets); see
+# test_attention_backends_match_vanilla.  Measured on sm_89 the TRTLLM result
+# diverges, but that is an artifact of running outside the targeted
+# architectures rather than a property of the model.
+_VALIDATED_ATTENTION_BACKENDS = frozenset({"VANILLA", "FA4", "TRTLLM", "CUTEDSL"})
+
+
+def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
+    """Reject a denoising step that cannot produce a usable frame.
+
+    An all-zero or non-finite velocity yields an all-zero latent, which decodes
+    to a black frame (and silent audio) without raising anywhere.
+    """
+    if not torch.isfinite(velocity).all():
+        raise RuntimeError(
+            f"MiniMax-H3 {name} velocity is not finite at denoising step {step}; "
+            "refusing to emit a corrupt result."
+        )
+    if not velocity.any():
+        raise RuntimeError(
+            f"MiniMax-H3 {name} velocity is all zeros at denoising step {step}; "
+            "this decodes to a blank output, so the result is rejected."
+        )
 
 
 @register_pipeline(
@@ -110,9 +141,11 @@ class MiniMaxH3Pipeline(BasePipeline):
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
         if pipeline_config.mapping.world_size != 1:
             raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
-        if pipeline_config.attention.backend != "VANILLA":
+        if pipeline_config.attention.backend not in _VALIDATED_ATTENTION_BACKENDS:
             raise NotImplementedError(
-                "MiniMax-H3 initial support is quality-validated only with VANILLA attention."
+                f"MiniMax-H3 does not support the {pipeline_config.attention.backend} "
+                f"attention backend; validated backends are "
+                f"{', '.join(sorted(_VALIDATED_ATTENTION_BACKENDS))}."
             )
         if pipeline_config.cache is not None:
             raise NotImplementedError(
@@ -137,6 +170,18 @@ class MiniMaxH3Pipeline(BasePipeline):
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
             "num_inference_steps": 50,
+        }
+
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=0, max=1),
+                    RoleSpec(role="last_frame", min=0, max=1),
+                ],
+            ),
         }
 
     @property
@@ -256,32 +301,46 @@ class MiniMaxH3Pipeline(BasePipeline):
     ) -> tuple[list[Image.Image], tuple[str, ...]]:
         """Load first/last keyframes and preserve their temporal anchors."""
 
-        images = req.params.image
-        if images is None:
-            images = []
-        elif not isinstance(images, list):
-            images = [images]
-        if len(images) > 2:
+        refs = req.params.image_reference or []
+        if not isinstance(refs, list):
+            refs = [refs]
+        if len(refs) > 2:
             raise ValueError(
                 "MiniMax-H3 FL2VA accepts at most two images: first frame, then last frame."
             )
 
+        # ``role`` disambiguates the two keyframe slots.  It is optional on
+        # MediaRef, so an unroled reference keeps the positional reading:
+        # first reference is the first frame, second is the last frame.
+        first_image = None
+        last_image = None
+        for position, ref in enumerate(refs):
+            role = getattr(ref, "role", None) or ("last_frame" if position else "first_frame")
+            target = "first" if role == "first_frame" else "last"
+            if target == "first" and first_image is not None:
+                raise ValueError("MiniMax-H3 accepts a single first-frame image.")
+            if target == "last" and last_image is not None:
+                raise ValueError("MiniMax-H3 accepts a single last-frame image.")
+            if target == "first":
+                first_image = ref.content
+            else:
+                last_image = ref.content
+
         extra = req.params.extra_params or {}
-        last_image = extra.get("last_image")
-        if len(images) == 2 and last_image is not None:
+        extra_last_image = extra.get("last_image")
+        if last_image is not None and extra_last_image is not None:
             raise ValueError(
-                "Pass the last frame either as image[1] or extra_params.last_image, not both."
+                "Pass the last frame either as a last_frame image_reference or "
+                "extra_params.last_image, not both."
             )
+        last_image = last_image if last_image is not None else extra_last_image
 
         keyframes = []
         keyframe_anchors = []
-        if images:
-            keyframes.append(load_image(images[0], format="pil"))
+        if first_image is not None:
+            keyframes.append(load_image(first_image, format="pil"))
             keyframe_anchors.append("first")
-        if len(images) == 2:
-            keyframes.append(load_image(images[1], format="pil"))
-            keyframe_anchors.append("last")
-        elif last_image is not None:
+        if last_image is not None:
             keyframes.append(load_image(last_image, format="pil"))
             keyframe_anchors.append("last")
         return keyframes, tuple(keyframe_anchors)
@@ -706,6 +765,13 @@ class MiniMaxH3Pipeline(BasePipeline):
                 return_dict=False,
                 static_context=static_context,
             )
+            # A silent all-zero / non-finite velocity has been observed once in
+            # practice: the run completed, reported success, and wrote a black
+            # video with silent audio.  The cause was never reproduced, so fail
+            # loudly at the step that produced it instead of shipping the
+            # corruption downstream.
+            _check_denoise_step(video_velocity, "video", index)
+            _check_denoise_step(audio_velocity, "audio", index)
             condition_rows = layout.num_condition_video_rows
             latents[condition_rows:] = self.scheduler.step(
                 video_velocity[0, condition_rows:].float(),

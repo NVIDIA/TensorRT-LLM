@@ -69,7 +69,9 @@ class _FakeMiniMaxH3Transformer:
         assert static_context is not None
         self.forward_calls += 1
         self.inference_modes.append(torch.is_inference_mode_enabled())
-        return torch.zeros_like(hidden_states), torch.zeros_like(audio_hidden_states)
+        # Non-zero: an all-zero velocity is what _check_denoise_step treats
+        # as a corrupt step, so a fake must not emit one.
+        return torch.ones_like(hidden_states), torch.ones_like(audio_hidden_states)
 
 
 class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
@@ -323,7 +325,7 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
         params=SimpleNamespace(
             negative_prompt=None,
             num_images_per_prompt=1,
-            image=None,
+            image_reference=None,
             extra_params={"last_image": "/tmp/last.png"},
             seed=42,
             height=768,
@@ -355,7 +357,7 @@ def test_infer_unwraps_the_executor_single_prompt_list() -> None:
         params=SimpleNamespace(
             negative_prompt=None,
             num_images_per_prompt=1,
-            image=None,
+            image_reference=None,
             extra_params=None,
             seed=0,
             height=128,
@@ -383,7 +385,7 @@ def test_prepare_request_derives_default_canvas_from_last_only_keyframe(
     monkeypatch.setattr(h3_pipeline, "load_image", _return_last_frame)
     request = SimpleNamespace(
         params=SimpleNamespace(
-            image=None,
+            image_reference=None,
             height=None,
             width=None,
             extra_params={"last_image": "/tmp/portrait.png"},
@@ -402,7 +404,7 @@ def test_prepare_request_uses_default_t2va_canvas_and_preserves_explicit_size() 
     pipeline = _SyntheticMiniMaxH3Pipeline()
     default_request = SimpleNamespace(
         params=SimpleNamespace(
-            image=None,
+            image_reference=None,
             height=None,
             width=None,
             extra_params=None,
@@ -411,7 +413,7 @@ def test_prepare_request_uses_default_t2va_canvas_and_preserves_explicit_size() 
     )
     explicit_request = SimpleNamespace(
         params=SimpleNamespace(
-            image=None,
+            image_reference=None,
             height=512,
             width=768,
             extra_params=None,
@@ -434,7 +436,7 @@ def test_prepare_request_rejects_partial_canvas_override() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     request = SimpleNamespace(
         params=SimpleNamespace(
-            image=None,
+            image_reference=None,
             height=768,
             width=None,
             extra_params=None,
@@ -444,3 +446,21 @@ def test_prepare_request_rejects_partial_canvas_override() -> None:
 
     with pytest.raises(ValueError, match="height and width must be set together"):
         pipeline.prepare_request(request)
+
+
+@pytest.mark.parametrize(
+    ("velocity", "match"),
+    [
+        (torch.zeros(1, 4, 2), "all zeros"),
+        (torch.full((1, 4, 2), float("nan")), "not finite"),
+        (torch.full((1, 4, 2), float("inf")), "not finite"),
+    ],
+)
+def test_denoise_step_rejects_unusable_velocity(velocity: torch.Tensor, match: str) -> None:
+    """A blank or non-finite velocity must fail loudly, not decode to black."""
+    with pytest.raises(RuntimeError, match=match):
+        h3_pipeline._check_denoise_step(velocity, "video", 3)
+
+
+def test_denoise_step_accepts_a_normal_velocity() -> None:
+    h3_pipeline._check_denoise_step(torch.randn(1, 4, 2), "video", 3)

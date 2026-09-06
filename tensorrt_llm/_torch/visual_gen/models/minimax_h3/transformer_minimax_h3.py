@@ -451,6 +451,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             raise NotImplementedError(
                 "MiniMax-H3 supports BF16, or dynamically quantized FP8 / NVFP4 weights only."
             )
+        # The released checkpoint keeps proj_in / audio_proj_in / proj_out /
+        # audio_proj_out in FP32 and feeds them FP32 activations.  NVFP4
+        # quantizes them like every other Linear (see ``post_load_weights``),
+        # but ``fp4_quantize`` only accepts fp16/bf16/e4m3, so those FP32
+        # activations would be rejected at the kernel boundary.  Hand those
+        # projections the model dtype instead; FP8 has no such restriction and
+        # keeps its validated FP32 activations.
+        self._projection_act_dtype = (
+            model_config.torch_dtype if quant_algo == QuantAlgo.NVFP4 else torch.float32
+        )
         if quant_algo in _FORCE_DYNAMIC_QUANT_ALGOS and not model_config.force_dynamic_quantization:
             raise NotImplementedError(
                 f"MiniMax-H3 {quant_algo.name} requires force_dynamic_quantization=True; "
@@ -659,8 +669,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         if static_context.text_embeds.shape[1] != text_indices.numel():
             raise ValueError("text_indices must contain one entry for every cached text embedding.")
 
-        video_embeds = self.proj_in(hidden_states.to(self.proj_in.dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.dtype))
+        video_embeds = self.proj_in(hidden_states.to(self._projection_act_dtype))
+        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self._projection_act_dtype))
         text_embeds = static_context.text_embeds
         packed_hidden_states = text_embeds.new_zeros(
             (text_embeds.shape[0], sequence_length, text_embeds.shape[-1])
@@ -703,11 +713,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             temb,
             timestep_indices,
         )
-        video_output = self.proj_out(packed_hidden_states.to(self.proj_out.dtype)).index_select(
-            1, video_indices
-        )
+        video_output = self.proj_out(
+            packed_hidden_states.to(self._projection_act_dtype)
+        ).index_select(1, video_indices)
         audio_output = self.audio_proj_out(
-            packed_hidden_states.to(self.audio_proj_out.dtype)
+            packed_hidden_states.to(self._projection_act_dtype)
         ).index_select(1, audio_indices)
 
         if not return_dict:
