@@ -41,10 +41,13 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import click
 import pytest
+from click.testing import CliRunner
 
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
+    GSM8K,
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
     MAX_IN_FLIGHT_ENV_VAR,
     LmEvalWrapper,
@@ -1844,3 +1847,23 @@ def test_override_stop_strings_does_not_mutate_original_gen_kwargs():
     task = _FakeStopStringTask(original)
     _override_stop_strings(task, ["</s>"])
     assert original == {"until": ["Question:"], "max_gen_toks": 256}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param('"</s>"', id="json_string"),
+        pytest.param('{"until": ["</s>"]}', id="json_object"),
+        pytest.param('["</s>", 42]', id="list_with_non_string_member"),
+    ],
+)
+def test_stop_strings_cli_rejects_non_list_of_strings(value):
+    """``--stop_strings`` rejects valid JSON that is not a list of strings.
+
+    Command-level: the real ``gsm8k`` click command is invoked, and the
+    ``_parse_stop_strings`` callback must raise ``click.BadParameter``
+    during parameter processing, before the command body runs.
+    """
+    result = CliRunner().invoke(GSM8K.command, ["--stop_strings", value], standalone_mode=False)
+    assert isinstance(result.exception, click.BadParameter)
+    assert "JSON list of strings" in result.exception.message
