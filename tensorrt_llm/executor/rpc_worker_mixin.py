@@ -151,6 +151,43 @@ class RpcWorkerMixin:
         if self._postproc_pool is not None:
             self._postproc_pool.shutdown(wait=False)
             self._postproc_pool = None
+        if self._postproc_collector_thread is not None:
+            # A live PostprocWorker forwards the None sentinel to its push
+            # pipes (PostprocWorker._batched_put), which unblocks the
+            # collector's get(). If every child already died, nobody forwards
+            # it, so nudge the collector's PULL socket directly.
+            self._postproc_collector_thread.join(timeout=5)
+            if self._postproc_collector_thread.is_alive():
+                import zmq
+
+                from .ipc import IpcQueue
+
+                try:
+                    nudge = IpcQueue(
+                        self._postproc_collector.address,
+                        is_server=False,
+                        socket_type=zmq.PUSH,
+                        name="rpc_worker_postproc_collector_nudge",
+                    )
+                    nudge.put(None)
+                    nudge.close()
+                except Exception:
+                    pass
+                self._postproc_collector_thread.join(timeout=5)
+            self._postproc_collector_thread = None
+        if self._postproc_input_queues:
+            for q in self._postproc_input_queues:
+                try:
+                    q.close()
+                except Exception:
+                    pass
+            self._postproc_input_queues = None
+        if self._postproc_collector is not None:
+            try:
+                self._postproc_collector.close()
+            except Exception:
+                pass
+            self._postproc_collector = None
 
     def start_rpc_server(self):
         if self.rank == 0:
