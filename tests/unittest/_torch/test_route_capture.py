@@ -34,15 +34,17 @@ def _row(v: int) -> torch.Tensor:
     return torch.full((_L, _K), v, dtype=torch.int16)
 
 
-def test_assemble_contract_drops_final_position():
+def test_assemble_contract_keeps_every_captured_position():
     rc = RouteCapture(rank=0)
-    # positions [0, 3): assemble keeps [0, max_pos) == [0, 2) (drops the final).
+    # positions {0, 1, 2} are all complete, real captures -> assemble keeps
+    # all of them: [0, max_pos] inclusive == 3 rows.
     rc._store[7] = {0: _row(10), 1: _row(11), 2: _row(12)}
     out = rc.assemble(7)
-    assert out.shape == (2, _L, _K)
+    assert out.shape == (3, _L, _K)
     assert out.dtype == torch.int16
     assert torch.equal(out[0], _row(10))
     assert torch.equal(out[1], _row(11))
+    assert torch.equal(out[2], _row(12))
 
 
 def test_assemble_none_when_empty():

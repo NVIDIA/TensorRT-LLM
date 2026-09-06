@@ -502,15 +502,20 @@ class RouteCapture:
 
     # ---- assemble on completion (production output path calls this) ----
     def assemble(self, req_id: int) -> Optional[torch.Tensor]:
-        """This request's routes as [n-1, L, K] int16 (drop the final position
-        per the contract). None if nothing captured. Fail-closed on an internal
-        gap (a non-final position missing)."""
+        """This request's routes as [seq_len - 1, L, K] int16: every captured
+        position 0..max(pos_map) inclusive, since each stored position is a
+        complete routing decision (there is no forward for the very last
+        generated token, so its own position is never captured -- that is the
+        only "missing" row, and it is never present in ``pos_map`` to begin
+        with). None if nothing meaningful captured. Fail-closed on an internal
+        gap (a stored position below the max is missing)."""
         pos_map = self._store.get(req_id)
         if not pos_map:
             return None
-        keep = max(pos_map)  # positions [0, keep) = n-1 rows
-        if keep <= 0:
+        last = max(pos_map)
+        if last <= 0:
             return None
+        keep = last + 1  # inclusive: positions [0, last] -> `keep` rows
         sample = next(iter(pos_map.values()))
         L, K = int(sample.shape[0]), int(sample.shape[1])
         out = torch.full((keep, L, K), _MISSING, dtype=torch.int16)
