@@ -549,8 +549,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
             dtype = self._indexer_dtype
         elif footer_scale or (
-            attn_type == DeepseekV4AttentionType.COMPRESS
-            and self._use_nvfp4_compress
+            attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress
         ):
             dtype = DataType.UINT8
 

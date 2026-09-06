@@ -693,10 +693,10 @@ def create_py_executor(
                                            False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
-        nvfp4_sparse_cache_reuse = (
-            kv_cache_quant_algo == QuantAlgo.NVFP4
-            and getattr(sparse_attention_config, "algorithm", None)
-            in ("dsa", "deepseek_v4"))
+        nvfp4_sparse_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
+                                    and getattr(sparse_attention_config,
+                                                "algorithm", None)
+                                    in ("dsa", "deepseek_v4"))
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
