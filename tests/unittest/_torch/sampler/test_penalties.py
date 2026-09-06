@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -330,11 +331,11 @@ def _make_handler_request(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         sampling_config=SimpleNamespace(
-            repetition_penalty=[1.2],
-            presence_penalty=[0.4],
-            frequency_penalty=[0.3],
-            temperature=[1.0],
-            prompt_ignore_length=[prompt_ignore_length],
+            repetition_penalty=1.2,
+            presence_penalty=0.4,
+            frequency_penalty=0.3,
+            temperature=1.0,
+            prompt_ignore_length=prompt_ignore_length,
             beam_width=beam_width,
             beam_width_array=None,
         ),
@@ -380,6 +381,7 @@ def test_handler_tracks_overlap_and_commits_speculative_tail() -> None:
     slot = 2
     handler = PenaltyHandler(
         max_num_sequences=3,
+        max_beam_width=1,
         device="cuda",
     )
     history = [3]
@@ -458,6 +460,7 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
     vocab = 16
     handler = PenaltyHandler(
         max_num_sequences=1,
+        max_beam_width=1,
         device="cuda",
     )
     new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
@@ -486,30 +489,304 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_handler_ignores_occurrence_penalties_with_beam_search() -> None:
-    """Beam-search requests never become penalty-active.
+BEAM_PAD = -1
+BEAM_VOCAB = 11
+BEAM_SLOTS = 5
+BEAM_WIDTH = 4
 
-    ``PenaltyHandler.validate_request`` rejects this combination at admission, so the
-    handler should only ever see beam_width == 1 requests. It stays defensive anyway:
-    a beam-search request leaves its slot inactive, and ``apply`` is then a no-op.
+
+@dataclass(frozen=True)
+class _BeamStep:
+    """One decoding step of a scenario; every field carries one row per slot.
+
+    Rows are in ascending slot order, matching the ``seq_slots`` handed to the op.
     """
-    vocab = 16
-    handler = PenaltyHandler(max_num_sequences=1, device="cuda")
-    new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
 
-    request = _make_handler_request(slot=0, tokens=[3, 3], beam_width=2)
-    _admit(handler, request, 0)
+    predecessor_beams: list[list[int]]
+    """Parent beam of each beam, as the previous step's beam search would have written."""
+    sampled_tokens: list[list[int]]
+    """Token each beam sampled last step; ``BEAM_PAD`` where the parent had finished."""
+    armed: list[bool]
+    """Whether the slot sampled last step -- the ``has_previous_token`` latch."""
+    num_beams: list[int]
+    """Row-layout beam width; beams at or past it are re-parented but never folded.
 
-    logits = torch.linspace(-2.0, 2.0, steps=vocab, device="cuda").view(1, vocab)
+    The sampler passes the static admission width here, so in production this only
+    drops the beams of a narrower request sharing the engine; a beam left behind by a
+    growing ``beam_width_array`` is dropped by its ``BEAM_PAD`` instead. The op's
+    contract is the same either way, so the scenarios exercise both gates."""
+
+
+@dataclass(frozen=True)
+class _BeamCountScenario:
+    name: str
+    prompts: dict[int, list[int]]
+    """Prompt tokens per slot, seeded onto every beam of that slot."""
+    steps: list[_BeamStep]
+
+
+_BEAM_COUNT_SCENARIOS = [
+    # Every beam continues itself, so the histories just diverge.
+    _BeamCountScenario(
+        name="divergence",
+        prompts={1: [2, 2, 5], 3: [7]},
+        steps=[
+            _BeamStep(
+                predecessor_beams=[[0, 1, 2, 3], [0, 1, 2, 3]],
+                sampled_tokens=[[1, 2, 3, 4], [5, 6, 7, 8]],
+                armed=[True, True],
+                num_beams=[4, 4],
+            ),
+            _BeamStep(
+                predecessor_beams=[[0, 1, 2, 3], [0, 1, 2, 3]],
+                sampled_tokens=[[2, 2, 2, 2], [7, 7, 7, 7]],
+                armed=[True, True],
+                num_beams=[4, 4],
+            ),
+        ],
+    ),
+    # Several beams share one parent and another parent is dropped entirely -- the
+    # case a per-slot count row cannot represent.
+    _BeamCountScenario(
+        name="reconvergence",
+        prompts={0: [3]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, 3, 4]], [True], [4]),
+            _BeamStep([[2, 2, 0, 2]], [[5, 6, 7, 8]], [True], [4]),
+            _BeamStep([[1, 1, 1, 1]], [[9, 9, 9, 9]], [True], [4]),
+        ],
+    ),
+    # Beam width grows 1 -> BEAM_WIDTH: the context step is unarmed, then the first
+    # generation step re-parents every beam onto beam 0 and folds its own token.
+    _BeamCountScenario(
+        name="vbws-growth",
+        prompts={2: [4, 4]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[6, BEAM_PAD, BEAM_PAD, BEAM_PAD]], [False], [1]),
+            _BeamStep([[0, 0, 0, 0]], [[6, 7, 8, 9]], [True], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[1, 1, 1, 1]], [True], [4]),
+        ],
+    ),
+    # Intermediate growth 2 -> 4: the previous step's map holds two valid entries and two
+    # stale ones in the same slot, and the new beams inherit from beam 1, whose history
+    # differs from beam 0's -- so a stale row that was not re-parented is detectable.
+    _BeamCountScenario(
+        name="vbws-growth-partial",
+        prompts={0: [3]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, BEAM_PAD, BEAM_PAD]], [True], [2]),
+            _BeamStep([[0, 1, 1, 1]], [[5, 6, 7, 8]], [True], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[9, 9, 9, 9]], [True], [4]),
+        ],
+    ),
+    # A beam whose predecessor already finished emits BEAM_SEARCH_PAD_TOKEN.
+    _BeamCountScenario(
+        name="pad-token",
+        prompts={4: [0]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, BEAM_PAD, BEAM_PAD]], [True], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[BEAM_PAD, 3, BEAM_PAD, 4]], [True], [4]),
+        ],
+    ),
+    # A slot scheduled without sampling keeps a stale predecessor map; the
+    # has_previous_token latch must make the whole step a no-op.
+    _BeamCountScenario(
+        name="unarmed-identity",
+        prompts={1: [8, 8]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[1, 2, 3, 4]], [True], [4]),
+            _BeamStep([[3, 3, 3, 3]], [[5, 5, 5, 5]], [False], [4]),
+            _BeamStep([[0, 1, 2, 3]], [[6, 6, 6, 6]], [True], [4]),
+        ],
+    ),
+    # Beams at or past the request's layout width are re-parented but never folded --
+    # a narrower request sharing a wider engine.
+    _BeamCountScenario(
+        name="narrow-request",
+        prompts={0: [1]},
+        steps=[
+            _BeamStep([[0, 0, 0, 0]], [[2, 3, 4, 5]], [True], [4]),
+            _BeamStep([[1, 3, 0, 0]], [[6, 7, 0, 0]], [True], [2]),
+        ],
+    ),
+    # Multimodal placeholder ids land outside the vocab and must be dropped.
+    _BeamCountScenario(
+        name="out-of-range-token",
+        prompts={3: [2]},
+        steps=[_BeamStep([[0, 0, 0, 0]], [[BEAM_VOCAB, BEAM_VOCAB + 7, 1, -5]], [True], [4])],
+    ),
+]
+
+
+def _beam_counts_reference(scenario: _BeamCountScenario) -> torch.Tensor:
+    """Host replay of the per-beam occurrence counts.
+
+    Mirrors the op's contract: on an armed slot every beam first takes over the
+    history of ``predecessor_beams[beam]``, then the beams below the layout width
+    append the token they sampled. Unarmed slots are left alone.
+    """
+    slots = sorted(scenario.prompts)
+    history = {
+        (slot, beam): list(prompt)
+        for slot, prompt in scenario.prompts.items()
+        for beam in range(BEAM_WIDTH)
+    }
+    for step in scenario.steps:
+        advanced = dict(history)
+        for index, slot in enumerate(slots):
+            if not step.armed[index]:
+                continue
+            for beam in range(BEAM_WIDTH):
+                inherited = list(history[(slot, step.predecessor_beams[index][beam])])
+                token = step.sampled_tokens[index][beam]
+                if beam < step.num_beams[index] and 0 <= token < BEAM_VOCAB:
+                    inherited.append(token)
+                advanced[(slot, beam)] = inherited
+        history = advanced
+
+    expected = torch.zeros((BEAM_SLOTS * BEAM_WIDTH, BEAM_VOCAB), dtype=torch.int32, device="cuda")
+    for (slot, beam), tokens in history.items():
+        for token in tokens:
+            expected[slot * BEAM_WIDTH + beam, token] += 1
+    return expected
+
+
+@pytest.mark.parametrize(
+    "scenario", _BEAM_COUNT_SCENARIOS, ids=[s.name for s in _BEAM_COUNT_SCENARIOS]
+)
+def test_beam_occurrence_counts_follow_each_beam_history(scenario: _BeamCountScenario) -> None:
+    """``update_beam_occurrence_counts`` keeps one true history per beam.
+
+    Each beam inherits its parent's counts and appends its own token, the torch
+    counterpart of the C++ ``batchApplyPenalty`` workspace copy along ``parentIds``.
+    """
+    counts = torch.zeros((BEAM_SLOTS * BEAM_WIDTH, BEAM_VOCAB), dtype=torch.int32, device="cuda")
+    active = torch.zeros(BEAM_SLOTS, dtype=torch.bool, device="cuda")
+    has_previous_token = torch.zeros(BEAM_SLOTS, dtype=torch.bool, device="cuda")
+    predecessor_beams = torch.zeros((BEAM_SLOTS, BEAM_WIDTH), dtype=torch.int32, device="cuda")
+    new_tokens = torch.zeros(1, BEAM_SLOTS, BEAM_WIDTH, dtype=torch.int32, device="cuda")
+    slots = sorted(scenario.prompts)
+    seq_slots = torch.tensor(slots, dtype=torch.int64, device="cuda")
+
+    # Seed every beam from the prompt, as PenaltyHandler._initialize_workspace does.
+    for slot, prompt in scenario.prompts.items():
+        active[slot] = True
+        for beam in range(BEAM_WIDTH):
+            for token in prompt:
+                counts[slot * BEAM_WIDTH + beam, token] += 1
+
+    for step in scenario.steps:
+        for index, slot in enumerate(slots):
+            predecessor_beams[slot] = torch.tensor(
+                step.predecessor_beams[index], dtype=torch.int32, device="cuda"
+            )
+            new_tokens[0, slot] = torch.tensor(
+                step.sampled_tokens[index], dtype=torch.int32, device="cuda"
+            )
+            has_previous_token[slot] = step.armed[index]
+        Fusions.update_beam_occurrence_counts(
+            counts,
+            active,
+            has_previous_token,
+            torch.ones(BEAM_SLOTS, dtype=torch.bool, device="cuda"),
+            new_tokens,
+            predecessor_beams,
+            seq_slots,
+            torch.tensor(step.num_beams, dtype=torch.int32, device="cuda"),
+            BEAM_WIDTH,
+        )
+
+    torch.testing.assert_close(counts, _beam_counts_reference(scenario), rtol=0, atol=0)
+
+
+def test_single_beam_slot_sharing_a_beam_engine_is_routed_correctly() -> None:
+    """A width-1 request on a beam engine must not be treated as a beam request.
+
+    Beam width is per request, so once TRTLLM-14792 lifts the equal-width restriction a
+    batch can mix the two. The single-beam slot must never be re-parented -- nothing
+    writes its ``predecessor_beams`` row, so believing it would corrupt its history --
+    while both kinds are penalized by the same packed pass, each against its own row.
+    """
+    max_beam_width, vocab, num_slots = 4, 32, 2
+    beam_slot, plain_slot = 0, 1
+
+    counts = torch.zeros((num_slots * max_beam_width, vocab), dtype=torch.int32, device="cuda")
+    active = torch.ones(num_slots, dtype=torch.bool, device="cuda")
+    armed = torch.ones(num_slots, dtype=torch.bool, device="cuda")
+    is_beam = torch.tensor([True, False], dtype=torch.bool, device="cuda")
+    seq_slots = torch.tensor([beam_slot, plain_slot], dtype=torch.int64, device="cuda")
+
+    # Give the plain slot a hostile predecessor map: if it were believed, beam 0 would
+    # inherit beam 3's counts.
+    predecessor_beams = torch.zeros((num_slots, max_beam_width), dtype=torch.int32, device="cuda")
+    predecessor_beams[plain_slot, :] = 3
+    counts[plain_slot * max_beam_width + 3, 9] = 7  # poison beam 3 of the plain slot
+
+    new_tokens = torch.zeros(1, num_slots, max_beam_width, dtype=torch.int32, device="cuda")
+    new_tokens[0, beam_slot] = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda")
+    new_tokens[0, plain_slot] = torch.tensor([5, 6, 7, 8], dtype=torch.int32, device="cuda")
+
+    Fusions.update_beam_occurrence_counts(
+        counts,
+        active,
+        armed,
+        is_beam,
+        new_tokens,
+        predecessor_beams,
+        seq_slots,
+        torch.tensor([max_beam_width, 1], dtype=torch.int32, device="cuda"),
+        max_beam_width,
+    )
+
+    plain_base = plain_slot * max_beam_width
+    assert int(counts[plain_base, 9].item()) == 0, "plain slot must not inherit beam 3"
+    assert int(counts[plain_base, 5].item()) == 1, "plain slot folds only its own token"
+    for token in (6, 7, 8):
+        assert int(counts[plain_base, token].item()) == 0, "beams 1..3 must not fold"
+    # The beam slot still behaves as before: every beam folds its own token.
+    for beam, token in enumerate((1, 2, 3, 4)):
+        assert int(counts[beam_slot * max_beam_width + beam, token].item()) == 1
+
+    # The packed pass penalizes both kinds; the plain slot must read its beam-0 row and
+    # not, say, beam 3's poisoned counts.
+    rows = max_beam_width + 1  # beam slot: 4 rows; plain slot: 1
+    logits = torch.linspace(-2.0, 2.0, steps=rows * vocab, device="cuda").view(rows, vocab)
     original = logits.clone()
-    _apply_handler(handler, request, logits, 1, new_tokens)
+    rep = torch.full((num_slots,), 2.0, device="cuda")
+    zero = torch.zeros(num_slots, device="cuda")
+    apply_batched_occurrence_penalties(
+        logits,
+        counts,
+        None,
+        active,
+        armed,
+        new_tokens,
+        seq_slots,
+        torch.tensor([0, max_beam_width], dtype=torch.int32, device="cuda"),
+        torch.tensor([1, 1], dtype=torch.int32, device="cuda"),
+        rep,
+        zero,
+        zero,
+        torch.tensor([max_beam_width, 1], dtype=torch.int32, device="cuda"),
+        max_beam_width,
+        False,  # the fold already happened above
+    )
 
-    assert not bool(handler.store.active_cuda[0].item())
-    torch.testing.assert_close(logits, original, rtol=0, atol=0)
+    def penalized(x: torch.Tensor) -> torch.Tensor:
+        return torch.where(x < 0, x * 2.0, x / 2.0)
 
-
-def test_validate_request_rejects_penalties_with_beam_search() -> None:
-    """The admission-time check that keeps the combination above from arriving."""
-    PenaltyHandler.validate_request(_make_handler_request(slot=0, tokens=[3], beam_width=1))
-    with pytest.raises(ValueError, match="penalties with beam search"):
-        PenaltyHandler.validate_request(_make_handler_request(slot=0, tokens=[3], beam_width=2))
+    plain_row = max_beam_width
+    # Token 5 is the plain slot's only counted token -> repetition branch.
+    torch.testing.assert_close(
+        logits[plain_row, 5], penalized(original[plain_row, 5]), rtol=1e-5, atol=1e-5
+    )
+    # Token 9 is only in the poisoned beam-3 row, which the plain slot must not read.
+    torch.testing.assert_close(logits[plain_row, 9], original[plain_row, 9], rtol=0, atol=0)
+    # Each beam row of the beam slot is penalized against its own token.
+    for beam, token in enumerate((1, 2, 3, 4)):
+        torch.testing.assert_close(
+            logits[beam, token], penalized(original[beam, token]), rtol=1e-5, atol=1e-5
+        )
+        other = 1 + ((beam + 1) % 4)  # a token belonging to a different beam
+        if other != token:
+            torch.testing.assert_close(logits[beam, other], original[beam, other], rtol=0, atol=0)

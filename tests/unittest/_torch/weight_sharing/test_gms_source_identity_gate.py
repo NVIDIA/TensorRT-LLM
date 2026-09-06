@@ -29,6 +29,8 @@ from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import SourceIdentityMismatchError
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeCheckpointLoader:
     """Minimal checkpoint-loader stub exposing `checkpoint_format`."""

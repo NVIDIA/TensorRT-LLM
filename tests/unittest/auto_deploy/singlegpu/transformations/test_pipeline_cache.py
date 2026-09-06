@@ -96,6 +96,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
 )
 from tensorrt_llm._torch.auto_deploy.utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 
+pytestmark = pytest.mark.cpu_only
+
+
 _COUNTERS = {
     "build": 0,
     "boundary": 0,

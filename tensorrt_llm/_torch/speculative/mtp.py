@@ -1,4 +1,6 @@
-import sys
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -6,24 +8,16 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
-from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-
-if sys.version_info[:2] >= (3, 12):
-    from typing import override
-else:
-    from typing_extensions import override
-
-SampleStateMTP = SampleStateSpec
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -245,38 +239,6 @@ class MTPSpecMetadata(SpecMetadata):
                 sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
 
 
-class MTPSampler(SpecSamplerBase):
-    """
-    MTP sampler.
-
-    Inherits from SpecSamplerBase with overrides for tree-based speculation
-    using max_total_draft_tokens instead of draft_len.
-    """
-
-    SampleState = SampleStateMTP
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
-
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
-        pass
-
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        super().__init__(args, draft_len=nextn)
-
-    @override
-    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens + 1 for tree-based speculation."""
-        return args.max_total_draft_tokens + 1
-
-    @override
-    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args,
-                                       draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens for draft token storage."""
-        return args.max_total_draft_tokens
-
-
 class MTPWorker(SpecWorkerBase):
 
     def __init__(self,
@@ -296,6 +258,7 @@ class MTPWorker(SpecWorkerBase):
         self.mapping = mapping if mapping is not None else getattr(
             model_config, "mapping", None)
         self.is_thop = False
+        self._is_mamba_hybrid_cache = None
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
@@ -303,6 +266,30 @@ class MTPWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _commit_target_mamba_states(
+        self,
+        attn_metadata: AttentionMetadata,
+        num_accepted_tokens: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Promote the target state at each generation request's accepted depth.
+
+        Target verification writes intermediate GDN/Mamba states for every
+        candidate position. The next draft pass must start from the accepted
+        candidate, rather than the last (possibly rejected) position.
+        """
+        num_contexts = attn_metadata.num_contexts
+        num_gens = batch_size - num_contexts
+        if self._is_mamba_hybrid_cache is None:
+            self._is_mamba_hybrid_cache = isinstance(
+                attn_metadata.kv_cache_manager, MambaHybridCacheManager)
+        if num_gens > 0 and self._is_mamba_hybrid_cache:
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
     def _forward_impl(
         self,
@@ -431,6 +418,17 @@ class MTPWorker(SpecWorkerBase):
         # Sample and verify draft tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             input_ids, logits, spec_metadata, attn_metadata)
+
+        # Keep the state written for accepted draft tokens, undo the rest.
+        # Must run before the draft pass below, which reads that state back.
+        self._commit_target_mamba_states(attn_metadata, num_accepted_tokens,
+                                         batch_size)
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                attn_metadata.num_contexts,
+            )
 
         # Update MTP past hidden states
         self.update_mtp_hidden_states(input_ids=input_ids,

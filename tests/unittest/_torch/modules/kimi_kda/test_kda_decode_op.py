@@ -3,6 +3,7 @@
 """Parity tests for the optimized Kimi K3 KDA decode op."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,11 +11,13 @@ from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import _kda_decode  # noqa: E402
-from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import (  # noqa: E402
-    KimiKDACachedState,
-    KimiKDALinearAttention,
+from kimi_kda_test_utils import (  # noqa: E402
+    KimiKDAReference,
+    KimiKDATestCachedState,
+    get_production_decode_kernel_path,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention, _kda_decode  # noqa: E402
 
 # 73: deliberately odd and > 64 to cover non-power-of-two batched decode.
 BATCH_SIZE = 73
@@ -36,7 +39,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttention]:
+def _make_attention_pair(
+    *, finalize_decode_weights: bool = True
+) -> tuple[KimiKDALinearAttention, KimiKDAReference]:
     common = {
         "hidden_size": HIDDEN_SIZE,
         "num_heads": NUM_HEADS,
@@ -47,19 +52,32 @@ def _make_attention_pair() -> tuple[KimiKDALinearAttention, KimiKDALinearAttenti
         "rms_norm_eps": 1e-5,
         "dtype": torch.bfloat16,
     }
-    optimized = KimiKDALinearAttention(**common).to("cuda")
-    reference = KimiKDALinearAttention(**common, use_optimized_decode=False).to("cuda")
+    cfg = SimpleNamespace(
+        hidden_size=HIDDEN_SIZE,
+        rms_norm_eps=common["rms_norm_eps"],
+        linear_attn_config={
+            "num_heads": NUM_HEADS,
+            "head_dim": HEAD_DIM,
+            "short_conv_kernel_size": CONV_KERNEL_SIZE,
+            "use_full_rank_gate": common["use_full_rank_gate"],
+            "gate_lower_bound": common["gate_lower_bound"],
+        },
+    )
+    optimized = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
+    with torch.no_grad():
+        optimized.dt_bias.zero_()
+    reference = KimiKDAReference(**common).to("cuda")
     reference.load_state_dict(optimized.state_dict())
+    if finalize_decode_weights:
+        optimized.finalize_decode_weights()
 
-    assert optimized.decode_kernel_path == "optimized"
-    assert reference.decode_kernel_path == "fla"
-    assert reference.prefill_kernel_path == optimized.prefill_kernel_path
+    assert get_production_decode_kernel_path(optimized) == "optimized"
     return optimized, reference
 
 
-def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDACachedState:
+def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDATestCachedState:
     projection_size = NUM_HEADS * HEAD_DIM
-    return KimiKDACachedState(
+    return KimiKDATestCachedState(
         conv_state_q=(
             torch.randn(
                 batch_size,
@@ -104,6 +122,69 @@ def _make_cache(batch_size: int = BATCH_SIZE) -> KimiKDACachedState:
     )
 
 
+def _run_production_decode(
+    attention: KimiKDALinearAttention,
+    hidden_states: torch.Tensor,
+    initial_cache: KimiKDATestCachedState,
+    *,
+    conv_pool: torch.Tensor | None = None,
+    state_pool: torch.Tensor | None = None,
+    slot_indices: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    include_metadata: bool = True,
+) -> tuple[torch.Tensor, KimiKDATestCachedState]:
+    batch_size = hidden_states.shape[0]
+    projection_size = NUM_HEADS * HEAD_DIM
+    if slot_indices is None:
+        slot_indices = torch.arange(batch_size, device="cuda", dtype=torch.long)
+    if conv_pool is None:
+        conv_pool = torch.cat(
+            [
+                initial_cache.conv_state_q[:, :, 1:],
+                initial_cache.conv_state_k[:, :, 1:],
+                initial_cache.conv_state_v[:, :, 1:],
+            ],
+            dim=1,
+        ).clone()
+    if state_pool is None:
+        state_pool = initial_cache.recurrent_state.clone()
+
+    metadata = (
+        SimpleNamespace(
+            _arange_buffer=torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        )
+        if include_metadata
+        else None
+    )
+    core = attention.forward_decode(
+        hidden_states.squeeze(1),
+        conv_pool,
+        state_pool,
+        slot_indices,
+        metadata,
+        ssm_state_indices=ssm_state_indices,
+    )
+    output = attention._project_output(core)
+    selected_conv = conv_pool.index_select(0, slot_indices)
+    return output.unsqueeze(1), KimiKDATestCachedState(
+        conv_state_q=torch.cat(
+            [initial_cache.conv_state_q[:, :, 1:2], selected_conv[:, :projection_size]], dim=-1
+        ),
+        conv_state_k=torch.cat(
+            [
+                initial_cache.conv_state_k[:, :, 1:2],
+                selected_conv[:, projection_size : 2 * projection_size],
+            ],
+            dim=-1,
+        ),
+        conv_state_v=torch.cat(
+            [initial_cache.conv_state_v[:, :, 1:2], selected_conv[:, 2 * projection_size :]],
+            dim=-1,
+        ),
+        recurrent_state=state_pool.index_select(0, slot_indices),
+    )
+
+
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     actual_float = actual.float()
     expected_float = expected.float()
@@ -132,8 +213,8 @@ def test_optimized_decode_matches_fla_reference(batch_size: int) -> None:
     )
     initial_cache = _make_cache(batch_size)
 
-    actual_output, actual_cache = optimized.forward_decode(
-        hidden_states, copy.deepcopy(initial_cache)
+    actual_output, actual_cache = _run_production_decode(
+        optimized, hidden_states, copy.deepcopy(initial_cache)
     )
     expected_output, expected_cache = reference.forward_decode(
         hidden_states, copy.deepcopy(initial_cache)
@@ -144,7 +225,58 @@ def test_optimized_decode_matches_fla_reference(batch_size: int) -> None:
     _assert_close(actual_cache.conv_state_q, expected_cache.conv_state_q)
     _assert_close(actual_cache.conv_state_k, expected_cache.conv_state_k)
     _assert_close(actual_cache.conv_state_v, expected_cache.conv_state_v)
-    assert optimized.decode_kernel_source()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize(
+    ("fallback_case", "batch_size"),
+    (
+        ("unfused-projections", 1),
+        ("unfused-projections", BATCH_SIZE),
+        ("missing-metadata", 1),
+        ("capture-before-staging", 1),
+    ),
+    ids=(
+        "unfused-projections-b1",
+        "unfused-projections-odd-large-batch",
+        "missing-metadata",
+        "capture-before-staging",
+    ),
+)
+def test_decode_fallback_matches_fla_reference(monkeypatch, fallback_case, batch_size):
+    """Cover missing fused projections/metadata and capture-safe staging fallback."""
+    torch.manual_seed(2)
+    finalize_weights = fallback_case != "unfused-projections"
+    optimized, reference = _make_attention_pair(finalize_decode_weights=finalize_weights)
+    if fallback_case == "capture-before-staging":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    hidden_states = (
+        torch.randn(
+            batch_size,
+            1,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.05
+    )
+    initial_cache = _make_cache(batch_size)
+    actual_output, actual_cache = _run_production_decode(
+        optimized,
+        hidden_states,
+        copy.deepcopy(initial_cache),
+        include_metadata=fallback_case != "missing-metadata",
+    )
+    expected_output, expected_cache = reference.forward_decode(
+        hidden_states, copy.deepcopy(initial_cache)
+    )
+
+    _assert_close(actual_output, expected_output)
+    _assert_close(actual_cache.recurrent_state, expected_cache.recurrent_state)
+    _assert_close(actual_cache.conv_state_q, expected_cache.conv_state_q)
+    _assert_close(actual_cache.conv_state_k, expected_cache.conv_state_k)
+    _assert_close(actual_cache.conv_state_v, expected_cache.conv_state_v)
 
 
 @torch.no_grad()
@@ -171,8 +303,8 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     )
     initial_cache = _make_cache(batch_size)
 
-    local_output, local_cache = optimized.forward_decode(
-        hidden_states, copy.deepcopy(initial_cache)
+    local_output, local_cache = _run_production_decode(
+        optimized, hidden_states, copy.deepcopy(initial_cache)
     )
 
     slots = batch_size + 3
@@ -198,23 +330,39 @@ def test_optimized_decode_updates_indexed_recurrent_state_pool_in_place(
     state_pool.index_copy_(0, slot_indices.long(), initial_cache.recurrent_state)
     unselected_indices = torch.arange(3, device="cuda")
     unselected_before = state_pool.index_select(0, unselected_indices).clone()
-    indexed_cache = KimiKDACachedState(
-        conv_state_q=initial_cache.conv_state_q.clone(),
-        conv_state_k=initial_cache.conv_state_k.clone(),
-        conv_state_v=initial_cache.conv_state_v.clone(),
-        recurrent_state=state_pool,
+    conv_pool = torch.randn(
+        slots,
+        3 * NUM_HEADS * HEAD_DIM,
+        CONV_KERNEL_SIZE - 1,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    conv_pool.index_copy_(
+        0,
+        slot_indices.long(),
+        torch.cat(
+            [
+                initial_cache.conv_state_q[:, :, 1:],
+                initial_cache.conv_state_k[:, :, 1:],
+                initial_cache.conv_state_v[:, :, 1:],
+            ],
+            dim=1,
+        ),
     )
 
-    indexed_output, indexed_cache = optimized.forward_decode(
+    indexed_output, indexed_cache = _run_production_decode(
+        optimized,
         hidden_states,
-        indexed_cache,
+        initial_cache,
+        conv_pool=conv_pool,
+        state_pool=state_pool,
+        slot_indices=slot_indices.long(),
         ssm_state_indices=slot_indices,
     )
 
-    assert indexed_cache.recurrent_state is state_pool
     torch.testing.assert_close(indexed_output, local_output, rtol=0, atol=0)
     torch.testing.assert_close(
-        state_pool.index_select(0, slot_indices.long()),
+        indexed_cache.recurrent_state,
         local_cache.recurrent_state,
         rtol=0,
         atol=0,
@@ -320,6 +468,90 @@ def _make_direct_decode_args(
         "cu_seqlens": torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         "lower_bound": -5.0,
     }
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("num_heads", [2, 32], ids=["compact-heads", "many-heads"])
+def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
+    """Fused-projection views match packed inputs with direct W-1 updates."""
+    torch.manual_seed(2)
+    batch_size = 5
+    args = _make_direct_decode_args(batch_size, num_heads, indexed_state=True)
+    projection_size = num_heads * HEAD_DIM
+    slots = args["state"].shape[0]
+    initial_conv_pool = torch.randn(
+        slots,
+        3 * projection_size,
+        CONV_KERNEL_SIZE - 1,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    for name in ("g", "beta", "onorm_g"):
+        args[name].normal_(std=0.01)
+
+    def clone_args(conv_pool: torch.Tensor) -> dict:
+        cloned = {
+            name: value.clone() if isinstance(value, torch.Tensor) else value
+            for name, value in args.items()
+            if name not in ("cs_q", "cs_k", "cs_v")
+        }
+        cloned.update(
+            cs_q=conv_pool[:, :projection_size],
+            cs_k=conv_pool[:, projection_size : 2 * projection_size],
+            cs_v=conv_pool[:, 2 * projection_size :],
+            update_conv_cache=True,
+        )
+        return cloned
+
+    packed_conv_pool = initial_conv_pool.clone()
+    packed_args = clone_args(packed_conv_pool)
+    packed_output = _kda_decode.run_kda_decode_fusion_cuda(**packed_args)
+
+    # One wide row exercises every supported per-token row stride at once.
+    row_width = 5 * projection_size + num_heads
+    projection = torch.empty(
+        batch_size,
+        row_width,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    for section, name in enumerate(("x_q", "x_k", "x_v", "onorm_g", "g")):
+        projection[:, section * projection_size : (section + 1) * projection_size] = args[
+            name
+        ].view(batch_size, projection_size)
+    projection[:, 5 * projection_size :] = args["beta"].view(batch_size, num_heads)
+
+    qkvg = (
+        projection[:, : 4 * projection_size]
+        .unflatten(-1, (4, num_heads, HEAD_DIM))
+        .permute(1, 0, 2, 3)
+    )
+    strided_g = (
+        projection[:, 4 * projection_size : 5 * projection_size]
+        .unflatten(-1, (num_heads, HEAD_DIM))
+        .unsqueeze(0)
+    )
+    strided_beta = projection[:, 5 * projection_size :].unsqueeze(0)
+    assert not qkvg[0:1].is_contiguous()
+    assert not strided_g.is_contiguous()
+    assert not strided_beta.is_contiguous()
+
+    strided_conv_pool = initial_conv_pool.clone()
+    strided_args = clone_args(strided_conv_pool)
+    strided_args.update(
+        x_q=qkvg[0:1],
+        x_k=qkvg[1:2],
+        x_v=qkvg[2:3],
+        onorm_g=qkvg[3:4],
+        g=strided_g,
+        beta=strided_beta,
+    )
+    strided_output = _kda_decode.run_kda_decode_fusion_cuda(**strided_args)
+
+    torch.testing.assert_close(strided_output, packed_output, rtol=0, atol=0)
+    torch.testing.assert_close(strided_args["state"], packed_args["state"], rtol=0, atol=0)
+    torch.testing.assert_close(strided_conv_pool, packed_conv_pool, rtol=0, atol=0)
+    torch.testing.assert_close(strided_conv_pool[0], initial_conv_pool[0], rtol=0, atol=0)
 
 
 def _profile_decode_backend(kwargs: dict) -> str:

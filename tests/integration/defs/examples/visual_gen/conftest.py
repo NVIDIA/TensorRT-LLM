@@ -17,7 +17,6 @@
 import shutil
 
 import pytest
-from defs.examples.visual_gen.visual_gen_test_utils import _prepare_vbench_repo
 from defs.trt_test_alternative import check_call
 
 
@@ -40,9 +39,3 @@ def _visual_gen_lpips_scorer():
         yield scorer
     finally:
         scorer.close()
-
-
-@pytest.fixture(scope="session")
-def vbench_repo_root(llm_venv):
-    """Prepare the pinned VBench checkout and return its repository root."""
-    return _prepare_vbench_repo(llm_venv)

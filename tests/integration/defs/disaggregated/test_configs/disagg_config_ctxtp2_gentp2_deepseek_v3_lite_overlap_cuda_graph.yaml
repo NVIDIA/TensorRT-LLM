@@ -8,7 +8,8 @@ context_servers:
   pipeline_parallel_size: 1
   disable_overlap_scheduler: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 2
@@ -17,4 +18,5 @@ generation_servers:
     enable_padding: false
   disable_overlap_scheduler: false
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON

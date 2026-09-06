@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
+#include <type_traits>
 #include <vector>
 
 // non-persistent-cooperative GEMM
@@ -54,6 +55,10 @@ public:
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr)
         = 0;
+
+    virtual int64_t getActScaleLeadingDim() const = 0;
+
+    virtual bool isActivationPrequantized() const = 0;
 
     virtual void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a,
         int stride_a, __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n,
@@ -116,6 +121,16 @@ public:
     void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr) override;
+
+    int64_t getActScaleLeadingDim() const override
+    {
+        return max_shape_m_32_align_padded_;
+    }
+
+    bool isActivationPrequantized() const override
+    {
+        return std::is_same_v<ElementA, __nv_fp8_e4m3>;
+    }
 
     void strideBatchGemm(__nv_bfloat16* mat_d, int ld_d, int stride_d, __nv_fp8_e4m3* mat_a, int ld_a, int stride_a,
         __nv_fp8_e4m3* mat_b, int ld_b, int stride_b, int num_problems, int shape_m, int shape_n, int shape_k,

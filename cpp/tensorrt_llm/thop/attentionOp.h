@@ -95,7 +95,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> spec_decoding_target_max_draft_tokens = std::nullopt,
     std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt, bool enable_dsv4_epilogue_fusion = false,
-    bool const force_prepare_spec_dec_tree_mask = false);
+    bool const force_prepare_spec_dec_tree_mask = false, std::optional<int64_t> const max_num_sequences = std::nullopt,
+    std::optional<torch::Tensor> kv_norm_weight = std::nullopt, double kv_norm_eps = 1e-6,
+    double skip_correction_threshold = 0.0);
 
 struct KvCachePoolPointers
 {
@@ -215,11 +217,11 @@ public:
 
     static TrtllmGenContextWorkspaceLayout buildContextLayout(at::ScalarType qDtype, int64_t batchSize,
         int64_t numTokens, int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, bool separateQKvInput,
-        bool fp8ContextFmha);
+        bool fp8ContextFmha, bool skipFmhaWorkspace = false);
 
     static TrtllmGenGenerationWorkspaceLayout buildGenerationLayout(at::ScalarType qDtype, int64_t batchBeam,
         int64_t numTokens, int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, int64_t numKvHeads,
-        int64_t maxBlocksPerSequence, bool useSparseAttention);
+        int64_t maxBlocksPerSequence, bool useSparseAttention, bool skipFmhaWorkspace = false);
 
     static int64_t getContextWorkspaceSize(at::ScalarType qDtype, int64_t batchSize, int64_t numTokens,
         int64_t numHeads, int64_t headSize, int64_t rotaryEmbeddingDim, bool separateQKvInput, bool fp8ContextFmha);

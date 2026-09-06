@@ -16,10 +16,13 @@ import concurrent.futures
 import copy
 import json
 import os
+import sys
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from types import ModuleType
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Tuple)
 
 import click
 import numpy as np
@@ -69,6 +72,31 @@ MAX_IN_FLIGHT_ENV_VAR = "TLLM_EVAL_MAX_IN_FLIGHT"
 # this flag also opts requests into return_perf_metrics (see
 # _get_sampling_params).
 SPEC_STATS_ENV_VAR = "TLLM_EVAL_SPEC_STATS"
+
+
+@contextmanager
+def _replace_fuzzywuzzy_with_rapidfuzz() -> Iterator[None]:
+    """Provide RapidFuzz under the import name expected by LongBench.
+
+    lm-evaluation-harness and THUDM/LongBench import ``fuzzywuzzy.fuzz``
+    directly, although they only use its ``ratio`` function. Keep that import
+    working while loading their metrics without installing FuzzyWuzzy.
+    """
+    from rapidfuzz import fuzz
+
+    module_name = "fuzzywuzzy"
+    missing = object()
+    original_module = sys.modules.get(module_name, missing)
+    compatibility_module = ModuleType(module_name)
+    compatibility_module.fuzz = fuzz
+    sys.modules[module_name] = compatibility_module
+    try:
+        yield
+    finally:
+        if original_module is missing:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original_module
 
 
 class _RunningScoreTracker:
@@ -806,7 +834,8 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 num_fewshot: Optional[int] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -861,6 +890,15 @@ class LmEvalEvaluator(Evaluator):
                 else:
                     # NOTE: Few-shot random seed
                     task_obj.set_fewshot_seed(seed=random_seed)
+                    # Caller override of the task yaml's shot count, the same
+                    # call lm-eval's own simple_evaluate makes. Without it a
+                    # 0-shot chat evaluation of a task whose yaml pins 5 shots
+                    # is unreachable, which is the regime a chat-distilled
+                    # speculative drafter has to be measured in.
+                    if num_fewshot is not None:
+                        task_obj.set_config(key="num_fewshot",
+                                            value=num_fewshot)
+                        logger.info(f"num_fewshot overridden to {num_fewshot}")
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
@@ -1004,18 +1042,21 @@ class LmEvalEvaluator(Evaluator):
     def command_harness(cls, ctx, **kwargs):
         llm: PyTorchLLM = ctx.obj
 
-        # Resolve the post-processor: accept a callable (already-bound) or the
-        # string key "strip_thinking_mmmu" coming from CLI flags.
+        # Resolve the post-processor: accept a callable (already-bound) or a
+        # string key coming from CLI flags.
         post_process_fn = kwargs.pop("post_process_fn", None)
         if isinstance(post_process_fn, str):
             if post_process_fn == "strip_thinking_mmmu":
                 from .post_processing import \
                     strip_thinking_and_extract_mmmu_answer
                 post_process_fn = strip_thinking_and_extract_mmmu_answer
+            elif post_process_fn == "kimi_k3_mmmu":
+                from .post_processing import extract_kimi_k3_mmmu_answer
+                post_process_fn = extract_kimi_k3_mmmu_answer
             else:
                 raise click.BadParameter(
-                    f"Unknown --post_process_fn={post_process_fn!r}; expected 'strip_thinking_mmmu'."
-                )
+                    f"Unknown --post_process_fn={post_process_fn!r}; expected "
+                    "'strip_thinking_mmmu' or 'kimi_k3_mmmu'.")
 
         evaluator = cls(
             dataset_path=kwargs.pop("dataset_path", None),
@@ -1023,6 +1064,7 @@ class LmEvalEvaluator(Evaluator):
             random_seed=kwargs.pop("random_seed", 0),
             apply_chat_template=kwargs.pop("apply_chat_template", False),
             fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn", False),
+            num_fewshot=kwargs.pop("num_fewshot", None),
             system_prompt=kwargs.pop("system_prompt", None),
             is_multimodal=kwargs.pop("is_multimodal", False),
             chat_template_kwargs=kwargs.pop("chat_template_kwargs", None),
@@ -1098,6 +1140,12 @@ class GSM8K(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Apply fewshot as multiturn.")
+    @click.option("--num_fewshot",
+                  type=int,
+                  default=None,
+                  help="Override the task yaml's shot count. Use 0 with "
+                  "--apply_chat_template for a single-question chat "
+                  "evaluation.")
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -1614,12 +1662,16 @@ class MMMU(LmEvalEvaluator):
         "produce chain-of-thought before the answer).")
     @click.option(
         "--post_process_fn",
-        type=click.Choice(["strip_thinking_mmmu"]),
+        type=click.Choice(["strip_thinking_mmmu", "kimi_k3_mmmu"]),
         default=None,
         help="Per-sample post-processor. 'strip_thinking_mmmu' strips "
         "<think>...</think> and then runs the MMMU answer extractor — needed "
         "for thinking models (Kimi K2.5, Step3p7) whose CoT output the "
-        "default lm-eval regex cannot parse.")
+        "default lm-eval regex cannot parse. 'kimi_k3_mmmu' reads the answer "
+        "from Kimi K3's <|open|>response<|sep|>...<|close|>response channel "
+        "(its reasoning ends with <|close|>think<|sep|>, not </think>, so the "
+        "strip_thinking path cannot see the answer) and falls back to the "
+        "strip_thinking cascade when no channel is present.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -1643,7 +1695,8 @@ class LongBenchV1(LmEvalEvaluator):
     """
 
     def __init__(self, **kwargs):
-        super().__init__("longbench", **kwargs)
+        with _replace_fuzzywuzzy_with_rapidfuzz():
+            super().__init__("longbench", **kwargs)
 
     @staticmethod
     def _flatten_task_dict(task_dict: dict) -> List[str]:

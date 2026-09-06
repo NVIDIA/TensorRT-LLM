@@ -15,9 +15,31 @@
 # the License.
 #
 
+# Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
+# cubin/fmha_cubin.{h,cpp}). scripts/build_wheel.py points this at an
+# out-of-tree location when --out-of-tree is set; by default the generated files
+# live in this directory as before.
+set(TRTLLM_FMHA_GEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    CACHE PATH "Directory containing generated FMHA sources")
+
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 list(FILTER SRC_CU EXCLUDE REGEX "fmha_v2_cu/.*")
+# fmha_cubin.cpp is generated; always take it from TRTLLM_FMHA_GEN_DIR so an
+# out-of-tree copy is used when configured and a stale in-tree copy is never
+# compiled alongside it.
+list(FILTER SRC_CPP EXCLUDE REGEX "cubin/fmha_cubin\\.cpp$")
+if(EXISTS "${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp")
+  list(APPEND SRC_CPP "${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp")
+else()
+  message(
+    FATAL_ERROR
+      "Generated FMHA source ${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp is "
+      "missing. It is produced by the FMHA generation step "
+      "(scripts/build_wheel.py runs it before CMake); a missing file means "
+      "generation did not complete. Regenerate before configuring.")
+endif()
 # The skip_softmax sm_120/sm_121 warp-specialized FMHA is a hand-written TU that
 # only compiles for the sm_120 family; it is added explicitly to the sm_120 arch
 # target below, not to the all-arch source list.
@@ -31,6 +53,9 @@ filter_source_cuda_architectures(
   IMPLICIT_FAMILY)
 
 target_sources(context_attention_src PRIVATE ${SRC_CPP} ${SRC_CU})
+# For #include "cubin/fmha_cubin.h" when the generated header is out of tree.
+target_include_directories(context_attention_src
+                           PRIVATE "${TRTLLM_FMHA_GEN_DIR}")
 target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
                                                          GENERATE_CUBIN=1)
 set_target_properties(
@@ -68,7 +93,7 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
     continue()
   endif()
 
-  file(GLOB arch_files "fmha_v2_cu/*_sm${arch}.cu")
+  file(GLOB arch_files "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu/*_sm${arch}.cu")
   # Compile the hand-written skip_softmax warp-specialized FMHA into the sm_120
   # family target. It uses sm_120-only TMA + sync-MMA, so it must never be
   # compiled for other architectures.
@@ -94,12 +119,28 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
     set_target_properties(
       ${TARGET_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON
                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    # CMAKE_CURRENT_SOURCE_DIR resolves the generated kernels' #include
+    # "fused_multihead_attention_common.h" when they live out of tree (and is
+    # where includer-relative lookup lands in-tree).
     target_include_directories(
       ${TARGET_NAME}
-      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+              ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
               ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
     set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
     target_sources(context_attention_src
                    PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+  else()
+    # arch is enabled (disabled archs already `continue`d above) but the
+    # generation step produced no *_sm${arch}.cu kernels for it. Fail rather
+    # than silently building without this architecture's FMHA kernels, which
+    # would surface only as a missing-kernel failure at runtime. (arch 120
+    # always has the hand-written skip_softmax TU appended above, so this branch
+    # covers the generated-only architectures.)
+    message(
+      FATAL_ERROR
+        "No generated FMHA kernels (*_sm${arch}.cu) found in "
+        "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu for enabled architecture ${arch}. "
+        "The FMHA generation step did not produce sources for this arch.")
   endif()
 endforeach()

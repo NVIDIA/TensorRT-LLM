@@ -9,8 +9,8 @@ engine's logical ``position_ids`` instead.
 
 import torch
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheCompressionConfig,
     TriAttentionKvCacheCompressionConfig,
@@ -49,7 +49,7 @@ def test_physical_length_preserving_compression_keeps_fused_rope() -> None:
 def test_physical_kv_length_change_forces_unfused_rope() -> None:
     model_config = ModelConfig(
         kv_cache_compression_config=TriAttentionKvCacheCompressionConfig(
-            model_path="/models/test", calibration_path="/calib/test.pt"
+            calibration_path="/calib/test.pt"
         )
     )
     attn = _make_attention(model_config)

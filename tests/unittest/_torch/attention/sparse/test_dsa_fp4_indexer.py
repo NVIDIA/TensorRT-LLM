@@ -366,7 +366,7 @@ def test_indexer_k_cache_scatter_custom_op_fp4():
         num_tokens=num_tokens,
     )
 
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import Indexer
 
     Indexer.prepare(metadata)
 

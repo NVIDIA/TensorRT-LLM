@@ -22,8 +22,6 @@ from unittest.mock import patch
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
-from test_common.llm_data import hf_id_to_local_model_dir
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -41,6 +39,10 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     infer_draft_embedding_size,
     is_any_lin_op,
 )
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -176,6 +178,7 @@ def _build_small_draft_factory(
     )
 
 
+@pytest.mark.cpu_only
 def test_eagle_rmsnorm_keeps_fp32_weights():
     norm = EagleRMSNorm(hidden_size=16)
 

@@ -304,17 +304,28 @@ def autotune(tune_mode: bool = True,
     old_skip = autotuner.skip_dynamic_tuning_buckets
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
+    # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
+    from tensorrt_llm._torch.distributed.ops import \
+        set_allreduce_autotuner_tuning_mode
+    set_allreduce_autotuner_tuning_mode(tune_required)
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
         logger.info("[Autotuner] Autotuning process starts ...")
+
+    # Fine-grained sync kernels deadlock when profiled, so force them off for the duration via the
+    # C++ override rather than mutating os.environ. TODO: remove once autotuning handles them.
+    if autotune_enabled:
+        torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
     try:
         yield
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
+        set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
+            torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
             logger.info("[Autotuner] Autotuning process ends")
 
         try:
@@ -1146,7 +1157,13 @@ class AutoTuner:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
                     key=(custom_op, "warning_autotuning_cache_miss_fallback"))
-
+            if logger.level == 'debug':
+                fine_grained_on = os.environ.get("TLLM_USE_FINE_GRAINED_SYNC",
+                                                 "0") == "1"
+                logger.debug_once(
+                    f"[Autotuner] Inference dispatch: custom_op={custom_op}, runner={best_runner}, "
+                    f"tactic={best_tactic}, fine_grained={'ON' if fine_grained_on else 'OFF'}",
+                    key=(custom_op, "inference_dispatch_fine_grained"))
             return (best_runner, best_tactic)
 
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
@@ -1375,6 +1392,10 @@ class AutoTuner:
 
             self._debug_logger(
                 f"[Autotuner] Profiling runner={runners[best_runner_id]}, tactic={best_tactic} for cache_key={cache_key}."
+            )
+            logger.debug(
+                f"[Autotuner] Selected: custom_op={custom_op}, runner={runners[best_runner_id]}, "
+                f"tactic={best_tactic}, time={min_time:.3f}ms, fine_grained=OFF (disabled during tuning)"
             )
             # inspect call stack
             # TODO: use named tuple to make it more readable
@@ -1784,6 +1805,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
+            torch.ops.trtllm.clear_allreduce_tactic_cache()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

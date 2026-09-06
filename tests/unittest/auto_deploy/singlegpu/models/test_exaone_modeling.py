@@ -533,6 +533,7 @@ def test_exaone_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_exaone_config_attribute_map():
     """Test that config attribute_map correctly aliases EXAONE-specific names."""
     config = _create_small_config()
@@ -547,6 +548,7 @@ def test_exaone_config_attribute_map():
     assert config.layer_norm_epsilon == 1e-6
 
 
+@pytest.mark.cpu_only
 def test_exaone_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -557,6 +559,7 @@ def test_exaone_gqa_structure():
     assert attn.num_kv_heads == 2, f"Expected 2 KV heads, got {attn.num_kv_heads}"
 
 
+@pytest.mark.cpu_only
 def test_exaone_state_dict_keys():
     """Test that state_dict keys match expected EXAONE checkpoint format."""
     config = _create_small_config()
@@ -584,6 +587,7 @@ def test_exaone_state_dict_keys():
         )
 
 
+@pytest.mark.cpu_only
 def test_exaone_attention_block_wrapper():
     """Test that ExaoneAttentionBlock correctly wraps ExaoneAttention."""
     config = _create_small_config()

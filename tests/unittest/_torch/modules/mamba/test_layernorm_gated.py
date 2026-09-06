@@ -15,11 +15,11 @@
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, unswizzle_sf
 from tensorrt_llm.math_utils import ceil_div, pad_up
-from tests.unittest.utils.util import getSMVersion
 
 
 def fused_gated_rmsnorm_quant_available():
@@ -175,10 +175,58 @@ class TestRMSNormBasic:
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
+    @pytest.mark.parametrize("group_size", [None, 64])
+    @pytest.mark.parametrize("with_gate", [False, True])
+    def test_delta_weight_matches_explicit_offset(self, group_size, with_gate):
+        hidden_size = 128
+        device = "cuda"
+        dtype = torch.bfloat16
+
+        torch.manual_seed(4)
+        stored_weight = torch.randn(hidden_size, device=device, dtype=dtype) * 0.1
+        x = torch.randn(16, hidden_size, device=device, dtype=dtype)
+        z = torch.randn_like(x) if with_gate else None
+        plain = RMSNorm(
+            hidden_size,
+            eps=1e-6,
+            group_size=group_size,
+            weight_is_delta=False,
+        ).to(device=device, dtype=dtype)
+        delta = RMSNorm(
+            hidden_size,
+            eps=1e-6,
+            group_size=group_size,
+            weight_is_delta=True,
+        ).to(device=device, dtype=dtype)
+        plain.weight.data.copy_(stored_weight)
+        delta.weight.data.copy_(stored_weight)
+
+        plain_output = plain(x, z=z)
+        delta_output = delta(x, z=z)
+        plain_reference = reference_rmsnorm_gated(
+            x,
+            stored_weight,
+            z,
+            eps=1e-6,
+            group_size=group_size,
+        )
+        delta_reference = reference_rmsnorm_gated(
+            x,
+            stored_weight + 1,
+            z,
+            eps=1e-6,
+            group_size=group_size,
+        )
+
+        torch.testing.assert_close(plain_output, plain_reference, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(delta_output, delta_reference, rtol=1e-2, atol=1e-2)
+        assert not torch.allclose(plain_output, delta_output, rtol=1e-2, atol=1e-2)
+
     @pytest.mark.parametrize("scale", [32.0, 0.13])
     @pytest.mark.parametrize("num_tokens,heads,N", [(64, 8, 128), (33, 4, 512)])
+    @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
     def test_token_major_fp8_matches_separate_static_quantization(
-        self, scale, num_tokens, heads, N
+        self, scale, num_tokens, heads, N, gate_activation
     ):
         """Both the multi-row (N<=256) and generic-fallback (N>256) paths of
         rms_norm_gated_token_major must quantize identically to norm-then-
@@ -196,9 +244,18 @@ class TestRMSNormBasic:
         z = wide[:, 256:].view(num_tokens, heads, N)
         fp8_scale = torch.tensor(scale, device=device, dtype=torch.float32)
 
-        bf16_output = rms_norm_gated_token_major(x, z, weight, 1e-6)
+        bf16_output = rms_norm_gated_token_major(
+            x, z, weight, 1e-6, gate_activation=gate_activation
+        )
         expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(bf16_output, fp8_scale)
-        actual = rms_norm_gated_token_major(x, z, weight, 1e-6, fp8_scale=fp8_scale)
+        actual = rms_norm_gated_token_major(
+            x,
+            z,
+            weight,
+            1e-6,
+            fp8_scale=fp8_scale,
+            gate_activation=gate_activation,
+        )
 
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))

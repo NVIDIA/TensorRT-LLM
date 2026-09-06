@@ -137,8 +137,8 @@ struct ActivationParams
     explicit ActivationParams(ActivationType activation_type)
         : activation_type(activation_type)
     {
-        TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SwigluBias,
-            "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
+        TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SwigluBias && activation_type != ActivationType::SiTu,
+            "SwigluBias and SiTu are not supported in ActivationParams without alpha and beta");
     }
 
     ActivationParams(
@@ -148,6 +148,10 @@ struct ActivationParams
         , swiglu_beta(swiglu_beta)
         , swiglu_limit(swiglu_limit)
     {
+        TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SiTu || (swiglu_alpha && swiglu_beta),
+            "SiTu requires both alpha and beta activation parameters");
+        TLLM_CHECK_WITH_INFO(
+            activation_type != ActivationType::SiTu || !swiglu_limit, "SiTu does not support a clamp limit");
     }
 
     // TODO Port everything properly and get rid of these implicit conversions

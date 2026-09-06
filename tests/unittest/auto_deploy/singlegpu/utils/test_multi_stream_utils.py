@@ -45,6 +45,7 @@ class _CountingManager:
         raise AssertionError("cuda_stream_manager.get_event must not be called when disabled")
 
 
+@pytest.mark.cpu_only
 class TestDisableMultiStream:
     def test_default_state_is_enabled(self):
         assert msu.is_multi_stream_enabled() is True

@@ -41,7 +41,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
 from ...distributed.common import broadcast
 from ...shim.interface import CachedSequenceInterface
@@ -775,7 +775,7 @@ class EagleDrafterForCausalLM(PreTrainedModel):
 
 @dataclass
 class EagleWrapperOutput(ModelOutput):
-    """Output format compatible with Eagle3OneModelSampler/MTPSampler.
+    """Output format compatible with SpecSampler.
 
     This output format allows the one-model speculative decoding flow to bypass
     logits-based sampling in the sampler. The EagleWrapper performs all sampling

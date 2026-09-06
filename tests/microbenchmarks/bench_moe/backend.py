@@ -75,7 +75,7 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
     do not package CUTLASS DSL; keep that fallback local to the benchmark rather
     than weakening the production module.
     """
-    module_name = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl"
+    module_name = "tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl"
     if module_name in sys.modules:
         return
     try:
@@ -86,8 +86,15 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
 
     class CuteDslFusedMoE:
         @classmethod
-        def can_implement(cls, *_args, **_kwargs):
-            return False, f"CUTLASS DSL is unavailable: {import_error}"
+        def can_implement(cls, p, d):
+            from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+                MoEEligibility,
+                MoERejectReason,
+            )
+
+            return MoEEligibility.no(
+                MoERejectReason.DEP_MISSING, f"CUTLASS DSL is unavailable: {import_error}"
+            )
 
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError(f"CUTLASS DSL is unavailable: {import_error}")
@@ -100,31 +107,31 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
 def get_backend_class(backend_type: MoeBackendType):
     """Import and return the concrete backend class for ``backend_type`` lazily."""
     if backend_type == MoeBackendType.CUTLASS:
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 
         return CutlassFusedMoE
     if backend_type == MoeBackendType.TRTLLM:
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
         return TRTLLMGenFusedMoE
     if backend_type == MoeBackendType.CUTEDSL:
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 
         return CuteDslFusedMoE
     if backend_type == MoeBackendType.DEEPGEMM:
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 
         return DeepGemmFusedMoE
     if backend_type == MoeBackendType.DENSEGEMM:
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+        from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 
         return DenseGEMMFusedMoE
     if backend_type == MoeBackendType.MEGAMOE_DEEPGEMM:
-        from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+        from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoEDeepGemm
 
         return MegaMoEDeepGemm
     if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
-        from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl
+        from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl
 
         return MegaMoECuteDsl
     raise ValueError(f"unknown MoE backend {backend_type!r}")

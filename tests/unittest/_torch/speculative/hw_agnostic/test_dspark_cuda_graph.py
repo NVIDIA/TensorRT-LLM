@@ -27,7 +27,7 @@ graph-capturable.
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.dspark.attention import (
+from tensorrt_llm._torch.models.modeling_dspark import (
     apply_dspark_rotary,
     apply_dspark_rotary_batched,
     dspark_attention_forward,
@@ -193,6 +193,23 @@ def test_batched_topk_matches_scalar(start_positions):
         for m in range(block):
             valid = batched[i, m][batched[i, m] >= 0]
             torch.testing.assert_close(valid, scalar[m].to(valid.dtype))
+
+
+def test_batched_topk_respects_partial_window_valid_len():
+    """Only actually written circular slots are visible for partial seeds."""
+    window, block = 8, 3
+    start_pos = torch.tensor([3, 10, 20], dtype=torch.long)
+    valid_len = torch.tensor([0, 3, 8], dtype=torch.long)
+    batched = get_dspark_topk_idxs_batched(window, block, start_pos, valid_len)
+    assert tuple(batched.shape) == (3, block, window + block)
+
+    for i, (pos, count) in enumerate(zip(start_pos.tolist(), valid_len.tolist())):
+        expected_context = sorted((pos - age) % window for age in range(count))
+        row = batched[i, 0]
+        context = row[(row >= 0) & (row < window)].tolist()
+        assert context == expected_context
+        block_indices = row[row >= window].tolist()
+        assert block_indices == list(range(window, window + block))
 
 
 @pytest.mark.parametrize("ndim", [3, 4])

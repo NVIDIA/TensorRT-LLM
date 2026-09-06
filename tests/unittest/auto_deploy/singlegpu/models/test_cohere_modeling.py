@@ -675,6 +675,7 @@ def test_cohere2_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_cohere_config_registration():
     """Test that Cohere v1 config is properly recognized."""
     config = _create_small_cohere_config()
@@ -683,6 +684,7 @@ def test_cohere_config_registration():
     assert hasattr(config, "use_qk_norm")
 
 
+@pytest.mark.cpu_only
 def test_cohere2_config_registration():
     """Test that Cohere2 config is properly recognized."""
     config = _create_small_cohere2_config()
@@ -696,6 +698,7 @@ def test_cohere2_config_registration():
     assert config.layer_types[3] == "full_attention"
 
 
+@pytest.mark.cpu_only
 def test_cohere_parallel_attn_mlp_structure():
     """Test that Cohere decoder layers use parallel attn+MLP (no post_attn_layernorm)."""
     config = _create_small_cohere_config()
@@ -708,6 +711,7 @@ def test_cohere_parallel_attn_mlp_structure():
     )
 
 
+@pytest.mark.cpu_only
 def test_cohere_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_cohere_config()
@@ -718,6 +722,7 @@ def test_cohere_gqa_structure():
     assert attn.num_kv_heads == 2
 
 
+@pytest.mark.cpu_only
 def test_cohere2_conditional_rope():
     """Test that Cohere2 applies RoPE only on sliding window layers."""
     config = _create_small_cohere2_config()
@@ -731,6 +736,7 @@ def test_cohere2_conditional_rope():
     assert model.model.layers[3].self_attn.use_rope is False
 
 
+@pytest.mark.cpu_only
 def test_cohere_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_cohere_config()
@@ -755,6 +761,7 @@ def test_cohere_state_dict_keys():
         assert key in state_dict, f"Expected key '{key}' in state_dict"
 
 
+@pytest.mark.cpu_only
 def test_cohere_logit_scale():
     """Test that logit_scale is applied to output logits."""
     config = _create_small_cohere_config()

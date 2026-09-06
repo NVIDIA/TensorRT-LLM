@@ -32,7 +32,6 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     FASTWAN_LPIPS_PROMPT,
     FASTWAN_LPIPS_SEED,
     FASTWAN_LPIPS_WIDTH,
-    VISUAL_GEN_OUTPUT_VIDEO,
     WAN21_LPIPS_GUIDANCE_SCALE,
     WAN21_LPIPS_HEIGHT,
     WAN21_LPIPS_NEGATIVE_PROMPT,
@@ -70,7 +69,6 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _run_lpips_eval,
     _run_reusable_video_lpips_eval,
     _run_single_device_feature_generator,
-    _run_vbench_and_report,
     _save_lpips_video_mp4,
     _skip_if_missing,
     _validate_single_feature_config,
@@ -79,7 +77,6 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
-WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 FASTWAN_MODEL_SUBPATH = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
@@ -191,50 +188,6 @@ def _build_wan_accuracy_cases():
 
 
 WAN_ACCURACY_CASES = _build_wan_accuracy_cases()
-
-
-WAN_T2V_PROMPT = "A cute cat playing piano"
-WAN_T2V_HEIGHT = 480
-WAN_T2V_WIDTH = 832
-WAN_T2V_NUM_FRAMES = 165
-
-
-# Golden VBench scores from HF reference video (WAN 2.1 1.3B); TRT-LLM is compared against these.
-VBENCH_WAN_GOLDEN_SCORES = {
-    "subject_consistency": 0.8907,
-    "background_consistency": 0.9274,
-    "motion_smoothness": 0.9818,
-    "dynamic_degree": 1.0000,
-    "aesthetic_quality": 0.2928,
-    "imaging_quality": 0.3812,
-}
-
-
-# TODO: Reference scores from bf16 baseline runs
-VBENCH_WAN22_BF16_GOLDEN_SCORES = {
-    "subject_consistency": 0.9103,
-    "background_consistency": 0.9516,
-    "motion_smoothness": 0.9693,
-    "dynamic_degree": 0.0000,
-    "aesthetic_quality": 0.6821,
-    "imaging_quality": 0.3993,
-}
-VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES = {
-    "subject_consistency": 0.9173,
-    "background_consistency": 0.9717,
-    "motion_smoothness": 0.9865,
-    "dynamic_degree": 1.0000,
-    "aesthetic_quality": 0.5465,
-    "imaging_quality": 0.7142,
-}
-VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES = {
-    "subject_consistency": 0.9173,
-    "background_consistency": 0.9717,
-    "motion_smoothness": 0.9865,
-    "dynamic_degree": 1.0000,
-    "aesthetic_quality": 0.5465,
-    "imaging_quality": 0.7142,
-}
 
 
 @pytest.fixture(scope="session")
@@ -460,132 +413,6 @@ def test_wan_feature_accuracy_against_golden(
     _assert_lpips_below_threshold(score, case.lpips_threshold)
 
 
-def _generate_wan_video(llm_venv, model_subpath, output_subdir):
-    """Generate a WAN video for a given model checkpoint.
-
-    Returns the path to the generated .mp4, or calls pytest.skip if the model
-    is not found under LLM_MODELS_ROOT.
-    """
-    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
-
-    scratch_space = conftest.llm_models_root()
-    model_path = os.path.join(scratch_space, model_subpath)
-    if not os.path.isdir(model_path):
-        pytest.skip(
-            f"Model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {model_subpath} under scratch)"
-        )
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
-    if os.path.isfile(output_path):
-        return output_path
-
-    visual_gen_args = VisualGenArgs(
-        attention_config={"backend": "VANILLA"},
-        parallel_config={"cfg_size": 2 if torch.cuda.device_count() >= 2 else 1},
-        torch_compile_config={"enable": False},
-        compilation_config={"skip_warmup": True},
-    )
-    visual_gen = VisualGen(model=model_path, args=visual_gen_args)
-    try:
-        frame_rate = visual_gen.default_params.frame_rate
-        output = visual_gen.generate(
-            inputs=WAN_T2V_PROMPT,
-            params=VisualGenParams(
-                height=WAN_T2V_HEIGHT,
-                width=WAN_T2V_WIDTH,
-                seed=42,
-                num_frames=WAN_T2V_NUM_FRAMES,
-                frame_rate=frame_rate,
-            ),
-        )
-        assert output.error is None, f"unexpected error on WAN run: {output.error}"
-        assert output.video is not None
-        _save_lpips_video_mp4(output.video, output_path, frame_rate=frame_rate)
-    finally:
-        visual_gen.shutdown()
-
-    assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
-    return output_path
-
-
-@pytest.fixture(scope="session")
-def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv):
-    """Generate video with Wan 2.2 A14B FP8 checkpoint."""
-    return _generate_wan_video(llm_venv, WAN22_A14B_FP8_MODEL_SUBPATH, "wan22_fp8")
-
-
-@pytest.fixture(scope="session")
-def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv):
-    """Generate video with Wan 2.2 A14B NVFP4 checkpoint."""
-    return _generate_wan_video(llm_venv, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
-
-
-def test_vbench_dimension_score_wan(vbench_repo_root, wan21_bf16_video_path, llm_venv):
-    """Run VBench on WAN 2.1 BF16 video generated with the LPIPS config."""
-    videos_dir = os.path.dirname(wan21_bf16_video_path)
-    assert os.path.isfile(wan21_bf16_video_path), "WAN 2.1 BF16 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="WAN 2.1 BF16",
-        golden_scores=VBENCH_WAN_GOLDEN_SCORES,
-        max_score_diff=0.05,
-    )
-
-
-def test_vbench_dimension_score_wan22_bf16(vbench_repo_root, wan22_bf16_video_path, llm_venv):
-    """VBench accuracy for Wan 2.2 A14B BF16 generated with the LPIPS config."""
-    videos_dir = os.path.dirname(wan22_bf16_video_path)
-    assert os.path.isfile(wan22_bf16_video_path), "WAN 2.2 BF16 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="WAN 2.2 A14B BF16",
-        golden_scores=VBENCH_WAN22_BF16_GOLDEN_SCORES,
-        max_score_diff=0.05,
-    )
-
-
-def test_vbench_dimension_score_wan22_a14b_fp8(
-    vbench_repo_root, wan22_a14b_fp8_video_path, llm_venv
-):
-    """VBench accuracy for Wan 2.2 A14B FP8 — full generate + evaluate."""
-    videos_dir = os.path.dirname(wan22_a14b_fp8_video_path)
-    assert os.path.isfile(wan22_a14b_fp8_video_path), "FP8 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="WAN 2.2 A14B FP8",
-        golden_scores=VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES,
-        max_score_diff=0.06,
-    )
-
-
-def test_vbench_dimension_score_wan22_a14b_nvfp4(
-    vbench_repo_root, wan22_a14b_nvfp4_video_path, llm_venv
-):
-    """VBench accuracy for Wan 2.2 A14B NVFP4 — full generate + evaluate."""
-    videos_dir = os.path.dirname(wan22_a14b_nvfp4_video_path)
-    assert os.path.isfile(wan22_a14b_nvfp4_video_path), "NVFP4 video must exist"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        videos_dir,
-        VISUAL_GEN_OUTPUT_VIDEO,
-        llm_venv,
-        title="WAN 2.2 A14B NVFP4",
-        golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
-        max_score_diff=0.05,
-    )
-
-
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
     scratch_space = conftest.llm_models_root()
@@ -642,10 +469,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     This is a core example test: it validates that the per-model example script
     and the shared YAML config work together as documented in the README.
     Uses the pre-quantized Wan 2.2 T2V A14B NVFP4 checkpoint and the shared
-    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant). The closest
-    overlapping test is ``test_vbench_dimension_score_wan22_a14b_nvfp4``,
-    which runs the same script but with a no-quant YAML synthesized at
-    runtime and additionally evaluates VBench scores.
+    ``configs/wan2.2-t2v-fp4-1gpu.yaml`` (NVFP4 dynamic quant).
     """
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)

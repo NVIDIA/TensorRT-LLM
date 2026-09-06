@@ -19,6 +19,9 @@ import pytest
 
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 
+pytestmark = pytest.mark.cpu_only
+
+
 try:
     from tensorrt_llm.mapping import Mapping
 

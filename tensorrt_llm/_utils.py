@@ -63,7 +63,8 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, LayerType
+from tensorrt_llm.bindings import (DataType, LayerType, global_steady_clock_now,
+                                   steady_clock_now)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -107,6 +108,53 @@ def numpy_to_torch(x):
         return torch.from_numpy(x.view(np.int8)).view(torch.float8_e4m3fn)
     else:
         return torch.from_numpy(x)
+
+
+def get_steady_clock_now_in_seconds() -> float:
+    """Time from the C++ runtime's steady clock, in seconds.
+
+    Use this raw clock for elapsed durations. For absolute metrics timestamps
+    and rank-adjusted clock calibration, use AdjustedSteadyClock or
+    get_global_steady_clock_now_in_seconds.
+    """
+    return steady_clock_now().total_seconds()
+
+
+def get_global_steady_clock_now_in_seconds() -> float:
+    """Time from the runtime's rank-adjusted steady clock, in seconds."""
+    return global_steady_clock_now().total_seconds()
+
+
+class AdjustedSteadyClock:
+    """Steady clock mapped into a shared reference clock domain.
+
+    The C++ runtime first aligns every rank to its rank-0 steady clock. The
+    reference offset then maps that process-wide clock into the frontend or
+    disaggregated-server domain used to combine request metrics.
+    """
+
+    def __init__(
+        self,
+        reference_offset: float = 0,
+        time_source: Callable[[],
+                              float] = get_global_steady_clock_now_in_seconds,
+    ) -> None:
+        self._time_source = time_source
+        self.set_reference_offset(reference_offset)
+
+    def set_reference_offset(self, reference_offset: float) -> None:
+        reference_offset = float(reference_offset)
+        if not math.isfinite(reference_offset):
+            raise ValueError("reference_offset must be finite")
+        self._reference_offset = reference_offset
+
+    def now(self) -> float:
+        """Return current time in the configured reference clock domain."""
+        return self.to_reference_time(self._time_source())
+
+    def to_reference_time(self, timestamp: float) -> float:
+        """Map a rank-adjusted steady-clock timestamp to the reference domain."""
+        return float(timestamp) + self._reference_offset
 
 
 def CUASSERT(cuda_ret):
@@ -683,7 +731,7 @@ else:
 def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version == 100 or sm_version == 103
+    return sm_version >= 100 and sm_version < 110
 
 
 @lru_cache(maxsize=1)
@@ -1171,18 +1219,22 @@ def set_prometheus_multiproc_dir() -> object:
         f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
-def confidential_compute_enabled() -> bool:
-    """
-    Query NVML for the confidential compute state
+@lru_cache(maxsize=1)
+def get_cc_and_nvle_status() -> tuple[bool, bool]:
+    """Query NVML for the confidential compute and NVLink encryption state.
+
+    Returns:
+        A tuple of ``(cc_enabled, nvle_enabled)``.
     """
 
     try:
         import pynvml
     except ImportError:
-        logger.error("pynvml not available; assuming CC=off")
-        return False
+        logger.error("pynvml not available; assuming CC and NVLE are off")
+        return False, False
 
     cc_enabled = False
+    nvle_enabled = False
 
     try:
         pynvml.nvmlInit()
@@ -1192,29 +1244,37 @@ def confidential_compute_enabled() -> bool:
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
         ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
         pynvml._nvmlCheckReturn(ret)
-        cc_enabled = (
-            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-            or cc_settings.multiGpuMode
-            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        # PPCIE implies CC, but NVLE does not necessarily
+        cc_enabled = (cc_settings.ccFeature
+                      == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+                      or cc_settings.multiGpuMode
+                      == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE)
+        nvle_enabled = (
+            cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
             cc_state = pynvml.nvmlSystemGetConfComputeState()
             cc_enabled = (
                 cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED)
-        except Exception as e:
-            logger.error(f"Error querying confidential compute state: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error querying confidential compute state: {str(e)}")
+        except pynvml.NVMLError as error:
+            logger.error(f"Error querying CC and NVLE state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.error(f"Error querying CC and NVLE state: {error!s}")
     finally:
         # Shutdown
         try:
             pynvml.nvmlShutdown()
-        except:
+        except pynvml.NVMLError:
             # Ignore shutdown errors
             pass
 
+    return cc_enabled, nvle_enabled
+
+
+def confidential_compute_enabled() -> bool:
+    """Return whether confidential compute restrictions are enabled."""
+    cc_enabled, _ = get_cc_and_nvle_status()
     return cc_enabled
 
 

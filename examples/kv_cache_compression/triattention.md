@@ -69,7 +69,6 @@ compression_config = TriAttentionKvCacheCompressionConfig(
     beta=64,               # eviction period, in confirmed generation tokens
     eviction_mode="union",
     calibration_path="/path/to/qwen3-8b-calibration.pt",  # official tool's output
-    model_path="<path_to_model>",                # used to derive the RoPE tables
 )
 
 # 2. TriAttention needs the V2 KV-cache manager and supports block reuse.
@@ -100,7 +99,6 @@ kv_cache_compression_config:
   beta: 64
   eviction_mode: union
   calibration_path: /path/to/qwen3-8b-calibration.pt
-  model_path: <path_to_model>
 kv_cache_config:
   enable_block_reuse: true
   use_kv_cache_manager_v2: true
@@ -121,5 +119,4 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
     * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
 * **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). `union` eviction always z-normalizes: `False` is overridden to `True` with a warning.
-* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT-LLM does not compute calibration.
-* **`model_path`** (str): Checkpoint path, used to derive the model's RoPE tables when converting the official calibration file and to classify kernel-masked sliding-window (SWA) layers from the model config.
+* **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT-LLM does not compute calibration. The RoPE tables needed for the conversion are derived from the model TensorRT-LLM is loading; no extra model path is required.

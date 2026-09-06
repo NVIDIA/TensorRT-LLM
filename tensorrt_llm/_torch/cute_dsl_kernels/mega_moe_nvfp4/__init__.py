@@ -4,7 +4,7 @@
 
 Hosts the MegaMoE fused dispatch + FC1 + activation + FC2 + combine CuteDSL
 kernel. The package is loaded
-lazily by :mod:`tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl`
+lazily by :mod:`tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl`
 through :func:`import_kernel` so environments without a CUDA 13 Cutlass DSL
 runtime can still import the backend file for capability probing.
 

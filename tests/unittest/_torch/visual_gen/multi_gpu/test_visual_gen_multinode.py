@@ -15,6 +15,9 @@ from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _detect_external_launch
 
+pytestmark = pytest.mark.cpu_only
+
+
 # =============================================================================
 # _detect_external_launch()
 # =============================================================================

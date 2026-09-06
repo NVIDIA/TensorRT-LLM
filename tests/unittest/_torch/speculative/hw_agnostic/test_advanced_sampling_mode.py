@@ -84,11 +84,13 @@ def test_resolve_advanced_sampling_filters(mode, expect_top_k_none, expect_top_p
 @pytest.mark.parametrize("top_p_val", [1.0, 0.9])
 def test_no_topk_matches_full(top_p_val):
     """With top_k disabled, NO_TOPK skips the top_k mask kernel (a no-op at k=vocab)
-    and yields the same sampling distribution as FULL. We compare the resulting
-    probability distributions rather than the sampled tokens: the flashinfer top_k mask
-    at k=vocab injects ~1e-8 fp noise that leaves the distribution unchanged but can flip
-    an individual sampled token across GPU archs, so exact-token equality is not portable.
-    A real (non-no-op) filter would move mass by orders of magnitude, far above atol."""
+    and yields the same sampling distribution as FULL. The k=vocab mask is a bit-exact
+    identity, so both modes feed the top-p renorm identical inputs; but that kernel is
+    not run-to-run reproducible right at the nucleus cutoff, so a boundary token can
+    flip between calls. We therefore bound the per-row total probability-mass
+    difference rather than compare pointwise: a boundary flip costs at most one
+    token's mass, while a real (non-no-op) filter moves O(0.1) of mass -- orders of
+    magnitude apart."""
     dev = "cuda"
     torch.manual_seed(0)
     batch, vocab = 64, 32000
@@ -105,7 +107,8 @@ def test_no_topk_matches_full(top_p_val):
     )
     probs_full = su.compute_probs_from_logits(logits.clone(), temperatures, ek_full, ep_full)
     probs_no_topk = su.compute_probs_from_logits(logits.clone(), temperatures, ek_nt, ep_nt)
-    assert torch.allclose(probs_full, probs_no_topk, atol=1e-5, rtol=0)
+    l1_diff = (probs_full - probs_no_topk).abs().sum(-1)
+    assert l1_diff.max().item() < 1e-3
 
 
 @pytest.mark.skipif(

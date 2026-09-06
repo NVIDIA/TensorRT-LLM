@@ -125,6 +125,67 @@ Evaluated {self.metric_name}: {accuracy:.3f}
             assert accuracy <= self.threshold, err_msg
 
 
+def assert_acceptance_length(test_key: str, al_value: float) -> None:
+    """Assert acceptance length meets the registered minimum.
+
+    Reads ``references/acceptance_length.yaml`` and checks
+    ``al_value >= entry["min_al"]``.
+
+    Args:
+        test_key: Key in acceptance_length.yaml identifying the test variant,
+            e.g. ``"TestLlama3_1_8BInstruct::test_dflash"``.
+        al_value: Observed mean acceptance length to check.
+
+    Population:
+        Set ``TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1`` to write the observed
+        value as ``ref_al`` and set ``min_al`` to 95% of it. The YAML key
+        must already exist; add a ``ref_al: null`` / ``min_al: null`` stub
+        when introducing a new test baseline.
+
+    Raises:
+        KeyError: If test_key is absent from the YAML.
+        ValueError: If the YAML entry has ``min_al: null`` (not yet populated).
+        AssertionError: If al_value < min_al.
+    """
+    populate = os.getenv("TRTLLM_POPULATE_ACCEPTANCE_LENGTH") == "1"
+    if os.getenv("TRTLLM_ACCURACY_NO_REFERENCE") == "1" and not populate:
+        return
+
+    _ref_dir = f"{os.path.dirname(__file__)}/references"
+    yaml_path = f"{_ref_dir}/acceptance_length.yaml"
+    with open(yaml_path) as _f:
+        baselines: dict = yaml.safe_load(_f)
+
+    entry = baselines.get(test_key)
+    if entry is None:
+        raise KeyError(f"No acceptance-length baseline for '{test_key}'. "
+                       f"Add an entry to {yaml_path} after a GPU run.")
+
+    if populate:
+        entry["ref_al"] = al_value
+        entry["min_al"] = al_value * 0.95
+
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(baselines, f, sort_keys=False)
+
+        print(f"[AL] populated {test_key}: "
+              f"ref_al={entry['ref_al']:.6f}, min_al={entry['min_al']:.6f}")
+        return
+    min_al = entry.get("min_al")
+    if min_al is None:
+        raise ValueError(
+            f"Acceptance-length baseline for '{test_key}' has min_al=null. "
+            "Populate min_al after a GPU run, or set "
+            "TRTLLM_ACCURACY_NO_REFERENCE=1 to skip the check.")
+
+    ref_al = entry.get("ref_al")
+    ref_str = f"{ref_al:.3f}" if isinstance(ref_al, (int, float)) else "null"
+    assert al_value >= min_al, (
+        f"[AL] Regression: {test_key}: "
+        f"acceptance_length={al_value:.3f} < min_al={min_al:.3f} "
+        f"(ref_al={ref_str})")
+
+
 class AccuracyTask:
     REFERENCE_DIR = f"{os.path.dirname(__file__)}/references"
 

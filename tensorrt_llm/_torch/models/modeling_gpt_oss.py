@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Any, Dict, Literal, Optional
 
 import torch
@@ -9,21 +12,21 @@ from transformers import GptOssConfig
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from ..modules.fused_moe import (MoE, MoEWeightLoadingMode,
-                                 RenormalizeMoeRoutingMethod, TritonFusedMoE,
-                                 create_moe)
+from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
+                             SwigluBiasActivation, TritonFusedMoE, create_moe,
+                             is_moe_weight_owner)
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -170,15 +173,12 @@ class MLPBlock(torch.nn.Module):
             output_dtype=torch.bfloat16
             if config.moe_backend.upper() == "TRTLLM" else torch.float32)
 
-        self.swiglu_alpha = torch.tensor(
-            [1.702] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_beta = torch.tensor(
-            [1.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
-        self.swiglu_limit = torch.tensor(
-            [7.0] * (self.num_slots // config.mapping.moe_ep_size),
-            dtype=torch.float32).cuda()
+        # gpt-oss constants are uniform across experts; the backend broadcasts
+        # them to whatever per-expert shape its kernels index, sized by the
+        # local slot count it resolved.
+        self.moe_activation = SwigluBiasActivation(gate_sigmoid_scale=1.702,
+                                                   linear_offset=1.0,
+                                                   clamp=7.0)
         # Prepare MoE creation parameters
         moe_params = {
             'routing_method': self.routing_method,
@@ -190,9 +190,7 @@ class MLPBlock(torch.nn.Module):
             'model_config': config,
             'weight_loading_mode': MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             'bias': True,
-            'swiglu_alpha': self.swiglu_alpha,
-            'swiglu_beta': self.swiglu_beta,
-            'swiglu_limit': self.swiglu_limit,
+            'activation': self.moe_activation,
             'layer_idx': self.layer_idx,
         }
 
@@ -553,6 +551,27 @@ class Transformer(DecoderModel):
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the model's VSWA layout.
+
+        GPT-OSS applies a sliding window to every other layer
+        (see ``AttentionBlock.__init__``), so the KV cache is VSWA: two
+        distinct attention window sizes. V2 groups layers by lifecycle and
+        coalesces buffers within each pool group, which sizes the
+        sliding-window and full-attention pools independently instead of
+        statically dividing memory between them.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Two-model
+        speculative decoding demotes it to V1 because V2 sizes both the target
+        and draft KV cache managers from the full budget; an explicit ``True``
+        is rejected by ``llm_utils._resolve_kv_cache_manager_v2_auto``.
+        """
+        return "V2"
+
+    @classmethod
     def get_preferred_transceiver_runtime(
         cls,
         pretrained_config: Any = None,
@@ -673,13 +692,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 try:
                     # For BF16 ckpt.
                     # Deinterleave for gate and up.
@@ -802,13 +821,13 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                 name = name.replace(k, v)
 
             names = name.split('.')
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 # Backend is under experts module (ConfigurableMoE wrapper)
                 name = '.'.join(names[:-1])
 
             module_weights = filter_weights(name, weights)
 
-            if isinstance(module, MoE):
+            if is_moe_weight_owner(module):
                 assert getattr(module, "quant_config", None) is not None and \
                    module.quant_config.quant_mode.has_nvfp4()
                 gate_up = module_weights.get('gate_up_proj', None)

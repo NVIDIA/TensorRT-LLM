@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import torch
+from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 from tensorrt_llm.llmapi import CudaGraphConfig, NGramDecodingConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
@@ -122,7 +125,6 @@ def _create_torch_llm(
         trust_remote_code=True,
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(),
-        sampler_type="TorchSampler",
         kv_cache_config=TRT_KvCacheConfig(enable_block_reuse=False),
         max_num_tokens=128,
         enable_iter_perf_stats=enable_iter_perf_stats,
@@ -327,3 +329,115 @@ def test_torch_sampler_speculative_penalty_e2e(model_path: Path) -> None:
     )
     for completion in speculative_outputs[0].outputs:
         _assert_completion_penalty_logprobs(case, completion, speculative_prompt_token_ids)
+
+
+# --- Beam search + occurrence penalties ------------------------------------------
+# DummyModel (test_beam_search_util) has analytically predictable logits that depend
+# only on the current input token, so the whole beam search can be replayed on the
+# host and compared token for token. That is what makes this an actual correctness
+# check of the wiring -- the per-request num_beams and the predecessor map the
+# re-parenting reads -- rather than a smoke test.
+
+_E2E_VOCAB = 1000  # DummyConfig.vocab_size
+_E2E_BEAM_WIDTH = 2
+_E2E_MAX_TOKENS = 4
+# Ends with 3, so the candidates are 3/4/5/6 scoring 0.3/0.6/0.9/1.2. Token 6 is in
+# the prompt, so a repetition penalty demotes the otherwise-winning candidate and the
+# selected beams change outright -- see the != assertion at the end of the test.
+_E2E_PROMPT = [6, 1, 2, 3]
+_E2E_REPETITION_PENALTY = 3.0
+
+
+def _dummy_model_logits(token: int) -> torch.Tensor:
+    """DummyModel.forward's logits for one input token (see test_beam_search_util)."""
+    logits = torch.zeros(_E2E_VOCAB, dtype=torch.float32)
+    for offset in range(4):
+        logits[(token + offset) % _E2E_VOCAB] += 0.1 * (offset + 1) * token
+    return logits
+
+
+def _replay_beam_search(repetition_penalty: float) -> list[list[int]]:
+    """Independent host replay of beam search under a repetition penalty.
+
+    Mirrors the pipeline order the sampler uses: penalize the raw logits, then
+    log_softmax, then add the running cumulative log-prob, then take the top
+    ``beam_width`` over the flattened (beam, vocab) scores. Each surviving beam
+    inherits its parent's occurrence counts and appends its own token, which is
+    exactly what ``update_beam_occurrence_counts`` does on the device.
+    """
+    # (generated tokens, cumulative log-prob, occurrence counts). The prompt seeds the
+    # counts, and the first step expands the single context beam into beam_width beams.
+    beams: list[tuple[list[int], float, Counter]] = [([], 0.0, Counter(_E2E_PROMPT))]
+    last_tokens = [_E2E_PROMPT[-1]]
+
+    for _ in range(_E2E_MAX_TOKENS):
+        scores = []
+        for (_, cum_log_prob, counts), last_token in zip(beams, last_tokens):
+            logits = _dummy_model_logits(last_token)
+            for token, count in counts.items():
+                if count > 0 and token < _E2E_VOCAB:
+                    value = logits[token].item()
+                    logits[token] = (
+                        value * repetition_penalty if value < 0 else value / repetition_penalty
+                    )
+            scores.append(torch.log_softmax(logits, dim=-1) + cum_log_prob)
+
+        flat = torch.stack(scores).reshape(-1)
+        top = torch.topk(flat, _E2E_BEAM_WIDTH)
+        advanced, advanced_last = [], []
+        for rank in range(_E2E_BEAM_WIDTH):
+            parent, token = divmod(int(top.indices[rank].item()), _E2E_VOCAB)
+            parent_tokens, _, parent_counts = beams[parent]
+            counts = parent_counts.copy()
+            counts[token] += 1
+            advanced.append((parent_tokens + [token], float(top.values[rank].item()), counts))
+            advanced_last.append(token)
+        beams, last_tokens = advanced, advanced_last
+
+    return [tokens for tokens, _, _ in beams]
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["no_overlap", "overlap"])
+def test_beam_search_penalties_e2e(overlap: bool) -> None:
+    """The full pipeline must reproduce an independent replay of the algorithm.
+
+    This is the only coverage of ``TorchSampler`` actually handing the penalty handler
+    the per-request beam widths and the beam store's predecessor map, and of that
+    happening before the step's sampling overwrites the latter.
+    """
+    llm = LLM(
+        model=Path("dummy_path"),
+        checkpoint_loader=HfCheckpointLoader(
+            weight_loader=DummyWeightLoader(),
+            config_loader=DummyConfigLoader(),
+        ),
+        max_batch_size=_E2E_BEAM_WIDTH,
+        kv_cache_config=TRT_KvCacheConfig(max_tokens=10000),
+        max_seq_len=32,
+        max_beam_width=_E2E_BEAM_WIDTH,
+        disable_overlap_scheduler=not overlap,
+        cuda_graph_config=None,
+    )
+    with llm:
+        sampling_params = SamplingParams(
+            max_tokens=_E2E_MAX_TOKENS,
+            use_beam_search=True,
+            best_of=_E2E_BEAM_WIDTH,
+            n=_E2E_BEAM_WIDTH,
+            temperature=1.0,
+            repetition_penalty=_E2E_REPETITION_PENALTY,
+            # The dummy checkpoint has no tokenizer to derive an end id from, and no
+            # token must terminate generation early: the replay assumes all max_tokens.
+            end_id=-1,
+        )
+        outputs = llm.generate([_E2E_PROMPT], sampling_params=sampling_params)
+
+    got = [list(beam.token_ids) for beam in outputs[0].outputs]
+    expected = _replay_beam_search(_E2E_REPETITION_PENALTY)
+    assert got == expected, f"penalized beams {got} != replay {expected}"
+
+    # The penalty must actually have changed the outcome, otherwise the comparison
+    # above would pass just as well with the penalty never applied.
+    assert expected != _replay_beam_search(1.0), (
+        "test setup no longer distinguishes penalized from unpenalized beams"
+    )

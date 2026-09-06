@@ -28,8 +28,6 @@ example_images = [
     str(test_data_root / "61.jpg"),
 ]
 
-_LLAVA_DIR = llm_models_root() / "multimodals" / "llava-v1.6-mistral-7b-hf"
-_QWEN_2_5_VL_DIR = llm_models_root() / "Qwen2.5-VL-3B-Instruct"
 _QWEN_3_VL_DIR = llm_models_root() / "Qwen3" / "Qwen3-VL-2B-Instruct"
 _QWEN_3_VL_30B_A3B_FP8_DIR = llm_models_root(
 ) / "Qwen3" / "Qwen3-VL-30B-A3B-Instruct-FP8"
@@ -121,10 +119,9 @@ def _create_mm_disagg_llm(
 
 
 def _get_encoder_max_batch_size(model_dir: Path) -> int:
-    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
+    # Qwen3-VL vision encoders output different embeddings based on this value.
     # The test only passes with this set to 1.
-    if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR, _LLAVA_DIR]
-            or _is_fake_checkpoint(model_dir)):
+    if (model_dir in [_QWEN_3_VL_DIR] or _is_fake_checkpoint(model_dir)):
         return 1
     return 3
 
@@ -210,7 +207,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
        - Same media + same prompts: full reuse (0 duplicate offsets)
        - Same media + different prompts: partial reuse (prefix blocks reused)
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -262,9 +259,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
 @pytest.fixture(
     scope="module",
     params=[
-        pytest.param(_LLAVA_DIR, id="llava_7b"),
-        pytest.param(_QWEN_2_5_VL_DIR, id="qwen2.5_3b"),
-        pytest.param(_QWEN_3_VL_DIR, id="qwen3_2b"),
+        pytest.param(_QWEN_3_VL_DIR, id="qwen3_vl_2b"),
         pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
                      id="qwen3_30b_a3b_fp8"),
     ],
@@ -294,7 +289,7 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
     The UUID feature allows users to provide stable identifiers for multimodal
     items, which are returned in KV cache events for external cache management.
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -392,7 +387,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
     2. Other items fall back to content-based hashing
     3. KV cache events correctly return UUID or hex hash based on input
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -473,7 +468,7 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
     2. Different UUIDs are preserved for different prompts
     3. KV cache events correctly associate UUIDs with their respective blocks
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -542,7 +537,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
     2. No truncation or corruption occurs for long UUID strings
     3. The full UUID is returned in KV cache events
     """
-    encoder_model_dir = _LLAVA_DIR
+    encoder_model_dir = _QWEN_3_VL_DIR
 
     max_tokens = 16
     free_gpu_memory_fraction = 0.2
@@ -947,17 +942,9 @@ def test_pd_disagg_with_image_input(
 @pytest.mark.parametrize(
     "model_dir,use_mm_embeddings,pass_embeddings_through_loader",
     [
-        # Reference path: raw multimodal inputs go through the standard pipeline.
-        pytest.param(_LLAVA_DIR, False, False, id="llava_7b-raw_inputs"),
-        # Encoder produces embeddings; LLM consumes them via multi_modal_embeddings.
-        pytest.param(_LLAVA_DIR, True, False, id="llava_7b-encoder_embeddings"),
-        # Encoder embeddings routed back through default_multimodal_input_loader.
-        pytest.param(_LLAVA_DIR, True, True, id="llava_7b-loader_embeddings"),
         # Keep Qwen rows on the raw path here; Qwen image-embedding attach is
         # covered by dedicated input-processor and OpenAI image_embeds tests.
-        pytest.param(_QWEN_2_5_VL_DIR, False, False,
-                     id="qwen2.5_3b-raw_inputs"),
-        pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_2b-raw_inputs"),
+        pytest.param(_QWEN_3_VL_DIR, False, False, id="qwen3_vl_2b-raw_inputs"),
         pytest.param(_FAKE_QWEN3_VL_30B_A3B_FP8_SENTINEL,
                      False,
                      False,

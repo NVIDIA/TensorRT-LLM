@@ -42,8 +42,6 @@ from .remove_copy_pass import remove_copy_for_mutates_args
 
 class Backend:
 
-    _graph_pool_handle: tuple[int, int] = None
-
     # Following classes are used to let weakref ref the stream and eventlist objects.
     class Streams(list):
         pass
@@ -77,9 +75,6 @@ class Backend:
         self.num_streams = max_num_streams
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
-
-        if Backend._graph_pool_handle is None:
-            Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
 
         self.match_count = []
         self.match_count_by_pass = OrderedDict()
@@ -179,7 +174,6 @@ class Backend:
                 self.enable_inductor,
                 self.input_num_tokens,
                 self.capture_num_tokens,
-                self._graph_pool_handle,
                 self.num_streams,
             )
             self._piecewise_runners.update(runners)

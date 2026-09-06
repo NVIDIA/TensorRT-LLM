@@ -450,6 +450,7 @@ def test_granite_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_granite_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -464,6 +465,7 @@ def test_granite_config_registration():
     assert hasattr(config, "logits_scaling")
 
 
+@pytest.mark.cpu_only
 def test_granite_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -476,6 +478,7 @@ def test_granite_gqa_structure():
     assert attn.scaling == config.attention_multiplier
 
 
+@pytest.mark.cpu_only
 def test_granite_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()
@@ -503,6 +506,7 @@ def test_granite_state_dict_keys():
         )
 
 
+@pytest.mark.cpu_only
 def test_granite_scaling_factors():
     """Test that Granite-specific scaling factors are applied correctly."""
     config = _create_small_config()

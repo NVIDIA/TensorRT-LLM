@@ -48,6 +48,66 @@ llm = LLM(model=<local_path_to_model>)
 
 > **Note:** Some models require accepting specific [license agreements](https://ai.meta.com/resources/models-and-libraries/llama-downloads/). Make sure you have agreed to the terms and authenticated with Hugging Face before downloading.
 
+## Startup Metrics
+
+For the PyTorch backend, the beta `LLM.startup_metrics` property reports weight-loading timings from
+worker rank 0. Values are wall-clock seconds. The property returns an empty dictionary when the
+backend does not provide startup metrics.
+
+```python
+llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+print(llm.startup_metrics)
+```
+
+A typical result has the following structure:
+
+```json
+{
+  "model_loader": {
+    "total_model_loading_seconds":  1.971,
+    "checkpoint_preparation_seconds": 1.177,
+    "weight_population_seconds": 0.598,
+    "checkpoint_finalization_seconds": 0.031,
+    "post_load_processing_seconds": 0.005
+  }
+}
+```
+
+The `model_loader` object contains timings for the main LLM weights. If a draft
+model is used, the additional fields `draft_checkpoint_preparation_seconds`,
+`draft_weight_population_seconds`, and `draft_checkpoint_finalization_seconds`
+appear. A `draft_model_loader` object can also appear in the deprecated
+two-model MTP configuration.
+
+| Metric | Description |
+|--------|-------------|
+| `total_model_loading_seconds` | Overall model construction and loading interval measured after checkpoint configuration validation. It includes the named phases below. |
+| `checkpoint_preparation_seconds` | Time spent warming up, parsing and preparing checkpoint tensors for the model. Some checkpoint formats can populate model storage directly during this phase. |
+| `weight_population_seconds` | Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase. |
+| `checkpoint_finalization_seconds` | Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup; rank-striped read-ahead includes waiting for peer ranks and stopping background readers. |
+| `draft_checkpoint_preparation_seconds` | Checkpoint preparation time for draft weights loaded as part of the model loader. |
+| `draft_weight_population_seconds` | Weight population time for draft weights loaded as part of the model loader. |
+| `draft_checkpoint_finalization_seconds` | Checkpoint finalization time for draft weights loaded as part of the model loader. |
+| `post_load_processing_seconds` | Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup. |
+
+`trtllm-serve` exposes the same rank-0 payload in the `startup_metrics` field of the
+`GET /server_info` response:
+
+```console
+curl http://localhost:8000/server_info
+```
+
+```json
+{
+  "startup_metrics": {
+    "model_loader": {
+      "total_model_loading_seconds": 1.971,
+      ...
+    }
+  }
+}
+```
+
 
 ## Tips and Troubleshooting
 
@@ -70,6 +130,29 @@ The following tips typically assist new LLM API users who are familiar with othe
   Because the LLM API relies on the `mpi4py` library, put the LLM class in a function and protect the main entrypoint to the program under the `__main__` namespace to avoid a [recursive spawn](https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor) process in `mpi4py`.
 
   This limitation is applicable for multi-GPU inference only.
+
+### FlashInfer JIT workspaces for MPI workers
+
+`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
+isolate FlashInfer JIT source-generation workspaces by default. Each process
+normally claims a locked, persistent cache slot under
+`~/.cache/tensorrt_llm/flashinfer`, while downloaded cubins remain in
+FlashInfer's shared cache. This prevents concurrent MPI processes from writing
+the same generated source files without forcing a cold JIT compilation on
+every launch. Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking
+the launcher or creating the LLM instance to disable this behavior.
+
+Persistent slots are not pruned automatically, so their count can grow with
+peak job concurrency. When no TensorRT-LLM processes are using the cache, the
+slots may be deleted safely; subsequent launches rebuild the removed JIT
+artifacts.
+
+If persistent workspace setup is unavailable, each process falls back to a
+process-unique temporary workspace that is removed when the process exits.
+Persistent cache reuse is not available for this fallback.
+
+An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
+launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved.
 
 ### Cannot quit after generation
 

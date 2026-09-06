@@ -27,11 +27,31 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..llm_request import LlmRequest, get_draft_token_length
-from .ops.vanilla import Fusions
-from .sampler_common import _request_get_sampling_params
-from .sampler_strategy import TopPDecayMetadata, top_p_decay_active
+from .ops.vanilla import Fusions, StrategyMetadata
+from .sampler_common import _request_get_sampling_params, top_p_decay_active
 
 __all__ = ["TopPDecayHandler", "TopPDecayStore"]
+
+
+@dataclass(kw_only=True)
+class TopPDecayMetadata(StrategyMetadata):
+    """Per-group runtime top-p override for Top-P Decay (attached to the
+    top-p-carrying groups -- top_p, top_k_top_p and min_p -- via the
+    ``StrategyMetadata`` mechanism).
+
+    ``slots`` maps each per-step group row to its sequence slot; the decayed
+    per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
+    store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
+    Consumed by the TopP*/TopKTopP*/MinP* strategy impls in ``sample()``. See
+    ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
+    """
+
+    slots: torch.Tensor
+    """Per-step group rows' sequence slots (int64, device)."""
+    runtime_top_p: torch.Tensor
+    """Per-slot runtime (decayed) top-p store (float32, device)."""
+    is_decay_slot: torch.Tensor
+    """Per-slot decay-active gate (bool, device)."""
 
 
 @dataclass(kw_only=True)
@@ -153,7 +173,7 @@ class TopPDecayHandler:
         # tokens and produces multiple tokens per step (req_num_steps =
         # 1 + draft_token_length). One-model speculation (vanilla MTP, one-model
         # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
-        # SpecSamplerBase-derived sampler and never reaches TorchSampler; the
+        # SpecSampler and never reaches TorchSampler; the
         # drafter-based modes that DO flow draft tokens through TorchSampler
         # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
         # MTP-Eagle) are what can make this length non-zero. top-p decay does not

@@ -994,10 +994,6 @@ protected:
             }
             else if (isNixl)
             {
-                constexpr auto port = 22345;
-
-                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
-
                 std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
                     bufferManagers.begin(), bufferManagers.end());
                 mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
@@ -1119,7 +1115,7 @@ protected:
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
 
-        tr::SamplingConfig samplingConfig{1};
+        tensorrt_llm::executor::SamplingConfig samplingConfig{1};
         auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
         auto llmRequestPtr = std::make_shared<LlmRequest>(
             mRequestId++, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
@@ -1154,7 +1150,7 @@ protected:
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
 
-        tr::SamplingConfig samplingConfig{1};
+        tensorrt_llm::executor::SamplingConfig samplingConfig{1};
         auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
         auto llmRequestPtr
             = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);

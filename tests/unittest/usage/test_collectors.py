@@ -17,7 +17,12 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.usage import schema, usage_lib
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # System info tests
@@ -113,8 +118,8 @@ class TestModelInfo:
     def test_extract_architecture_multiple(self):
         """Extracts first architecture when list has multiple entries."""
         mock = MagicMock()
-        mock.architectures = ["Qwen2ForCausalLM", "GPT2LMHeadModel"]
-        assert usage_lib._extract_architecture_class_name(mock) == "Qwen2ForCausalLM"
+        mock.architectures = ["Qwen3ForCausalLM", "GPT2LMHeadModel"]
+        assert usage_lib._extract_architecture_class_name(mock) == "Qwen3ForCausalLM"
 
     def test_extract_architecture_none_config(self):
         """Returns None when config is None."""

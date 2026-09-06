@@ -19,21 +19,13 @@ set(SRCS
     utils/numpyUtils.cpp
     utils/runtimeUtils.cpp
     utils/debugUtils.cu
-    utils/speculativeChoicesUtils.cpp
+    locality_domain/locality_domain_utils.cpp
     bufferManager.cpp
     cudaMemPool.cpp
-    decodingLayerWorkspace.cpp
-    eagleBuffers.cpp
-    explicitDraftTokensBuffers.cpp
-    lookaheadBuffers.cpp
     loraManager.cpp
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    decodingOutput.cpp
-    decoderState.cpp
-    gptDecoder.cpp
-    gptDecoderBatched.cpp
     gptJsonConfig.cpp
     iBuffer.cpp
     iTensor.cpp
@@ -47,8 +39,6 @@ set(SRCS
     moeLoadBalancer/moeLoadBalancer.cpp
     moeLoadBalancer/topologyDetector.cpp
     ncclCommunicator.cpp
-    promptTuningParams.cpp
-    runtimeKernels.cu
     tllmBuffers.cpp
     workerPool.cpp
     worldConfig.cpp

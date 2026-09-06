@@ -16,7 +16,7 @@
 
 py_draft_tokens is not a valid acceptance-rate denominator at response time:
 it is padded to the static max for CUDA graphs (two-model flow), and in the
-one-model flow SpecSamplerBase.update_requests replaces it with the NEXT
+one-model flow SpecSampler.update_requests replaces it with the NEXT
 step's buffer before responses are handled. The samplers therefore write
 py_num_draft_tokens_verified — the real proposal count of the same step the
 acceptance numerator describes — and PyExecutor._accumulate_spec_dec_stats
@@ -39,7 +39,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.speculative.spec_sampler_base import (
     SampleStateSpec,
     SampleStateTensorsSpec,
-    SpecSamplerBase,
+    SpecSampler,
 )
 
 # GPU-free logic, but importing py_executor is unproven on the CPU-only CI
@@ -127,11 +127,14 @@ def _make_llm_request(request_id, seq_slot):
 
 
 def _run_spec_sampler_update(request, *, draft_lens, new_tokens_lens, next_draft_tokens):
-    sampler = SpecSamplerBase.__new__(SpecSamplerBase)
+    sampler = SpecSampler.__new__(SpecSampler)
     sampler.max_seq_len = 2048
     sampler.draft_len = len(next_draft_tokens[0])
 
     runtime_draft_len = len(next_draft_tokens[0])
+    # update_requests asserts against this bound; new_tokens below is built
+    # with runtime_draft_len + 1 rows, so that is the bound here.
+    sampler.max_accepted_path_len = runtime_draft_len + 1
     # new_tokens: [max_new_tokens, seq_slots, beam]
     new_tokens = torch.arange(100, 100 + runtime_draft_len + 1, dtype=torch.int).reshape(
         runtime_draft_len + 1, 1, 1
@@ -152,7 +155,7 @@ def _run_spec_sampler_update(request, *, draft_lens, new_tokens_lens, next_draft
     sampler.update_requests(state)
 
 
-class TestSpecSamplerBasePairing:
+class TestSpecSamplerPairing:
     """One-model flow: pair acceptance counts with the completed step.
 
     update_requests must pair the acceptance count with the draft count of

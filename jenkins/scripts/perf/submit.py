@@ -137,10 +137,51 @@ def _test_nodeid(test_line):
         The pytest node ID from the entry.
     """
     return re.split(
-        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?:\s|$)",
+        r"\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)",
         test_line,
         maxsplit=1,
     )[0]
+
+
+def _test_marker(test_line):
+    """Return a test-list execution marker, or ``None`` when absent."""
+    line = test_line.partition("#")[0].strip()
+    match = re.search(r"\s+(XFAIL|SKIP|UNSTABLE|TIMEOUT)(?=[\s(]|$)", line)
+    return match.group(1) if match else None
+
+
+def selected_test_is_skip_waived(selected_test_line, waives_file, test_prefix=None):
+    """Whether pytest will skip the selected case before executing its body.
+
+    The CI pipeline merges remote waives into the repository waives file
+    before invoking this launcher. Mirror the exact-nodeid SKIP decision here
+    so a skipped test does not run an otherwise unrelated precheck first.
+    """
+    if _test_marker(selected_test_line) == "SKIP":
+        return True
+
+    selected_nodeid = _test_nodeid(selected_test_line).strip()
+    try:
+        waive_lines = _read_test_list_lines(waives_file)
+    except (FileNotFoundError, ValueError):
+        return False
+
+    for line in waive_lines:
+        if _test_marker(line) != "SKIP":
+            continue
+        waived_nodeid = _test_nodeid(line).strip()
+        if waived_nodeid.startswith("full:"):
+            scope, separator, waived_nodeid = waived_nodeid[5:].partition("/")
+            if not separator or not test_prefix:
+                continue
+            # Match the platform-prefix handling in test_list_parser. SM
+            # waives require runtime GPU discovery and remain pytest-owned.
+            platform_prefix = test_prefix.split("-", 1)[0]
+            if scope.startswith("sm") or platform_prefix not in scope:
+                continue
+        if waived_nodeid == selected_nodeid:
+            return True
+    return False
 
 
 def _load_pytest_split_durations(tokens, llm_src):
@@ -649,6 +690,57 @@ def get_test_output_dir(script_prefix_lines, test_case_name):
     return os.path.join(output_dir, test_case_name) if test_case_name else output_dir
 
 
+class _PytestCommandEnvMissing(ValueError):
+    """A valid pytestCommand does not provide the requested leading variable."""
+
+
+def extract_pytest_command_env(script_prefix_lines, name):
+    """Read a leading environment assignment from the exported pytest command."""
+    line = next((ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None)
+    if line is None:
+        raise ValueError("launch prefix does not export pytestCommand")
+    try:
+        outer_tokens = shlex.split(line)
+    except ValueError as e:
+        raise ValueError(f"cannot parse exported pytestCommand: {e}") from e
+    command_assignment = next(
+        (token for token in outer_tokens if token.startswith("pytestCommand=")), None
+    )
+    if command_assignment is None:
+        raise ValueError("launch prefix has a malformed pytestCommand export")
+    command = command_assignment.partition("=")[2]
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError as e:
+        raise ValueError(f"cannot parse pytestCommand payload: {e}") from e
+    for token in command_tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            break
+        key, value = token.split("=", 1)
+        if key == name:
+            return value
+    raise _PytestCommandEnvMissing(
+        f"pytestCommand does not set leading environment variable {name}"
+    )
+
+
+def _resolve_llm_models_root(script_prefix_lines):
+    """Resolve the precheck model root from pytestCommand or the submitter env."""
+    try:
+        return extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+    except _PytestCommandEnvMissing as e:
+        fallback = os.environ.get("LLM_MODELS_ROOT")
+        if fallback:
+            return fallback
+        # Fail closed when the precheck is enabled: without the model root it
+        # cannot reproduce serving's KV shape and model-specific defaults, so
+        # disabling the gate here would silently run an unvalidated workload.
+        raise ValueError(
+            f"{e}; LLM_MODELS_ROOT is also absent from the submitter environment "
+            "(pytestCommand is assembled by getPytestBaseCommandLine in L0_Test.groovy)"
+        ) from e
+
+
 def remove_whitespace_lines(lines):
     return [line.strip() for line in lines if line.strip()]
 
@@ -708,6 +800,14 @@ def main():
         script_prefix_lines,
         args.split_group,
     )
+    pytest_tokens = _pytest_command_tokens(script_prefix_lines)
+    selected_test_skipped = selected_test_is_skip_waived(
+        selected_test_line,
+        os.path.join(args.llm_src, "tests", "integration", "test_lists", "waives.txt"),
+        test_prefix=_pytest_option(pytest_tokens, "--test-prefix"),
+    )
+    if selected_test_skipped:
+        print("Selected test is SKIP-waived; cache-transceiver precheck will not run")
     config_yaml, server_name, benchmark_mode, runtime_mode = parse_test_case_name(
         args.llm_src,
         selected_test_line,
@@ -796,9 +896,8 @@ def main():
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
-            ctx_worker_env_vars = (
-                f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
-            )
+            # GEN worker only: the same flag on the CTX worker has been seen to
+            # hang gen_only runs with KV blocks never released.
             gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
@@ -852,6 +951,23 @@ def main():
         # Enable/kill-switch policy and timeouts live in precheck_config
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
+        precheck_will_run = precheck_enabled and not selected_test_skipped
+        # The model root is only consumed by the precheck (auto KV-cache-manager
+        # resolution needs the model config). Fail fast only when the precheck
+        # will actually run; otherwise degrade to a warning so stages whose
+        # pytestCommand does not carry LLM_MODELS_ROOT inline keep submitting.
+        llm_models_root = None
+        if precheck_enabled:
+            try:
+                llm_models_root = _resolve_llm_models_root(script_prefix_lines)
+            except ValueError as e:
+                if precheck_will_run:
+                    raise
+                print(
+                    f"WARNING: {e}; "
+                    "cache-transceiver precheck is skipped for this config so continuing"
+                )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -863,14 +979,15 @@ def main():
                     hardware_config["gpus_per_gen_server"],
                 ),
                 stage_name=args.stage_name,
+                llm_models_root=llm_models_root,
+                skip_precheck=selected_test_skipped,
             )
         )
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)

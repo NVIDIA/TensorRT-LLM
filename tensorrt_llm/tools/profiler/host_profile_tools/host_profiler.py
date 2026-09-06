@@ -159,7 +159,7 @@ _DEFAULT_PROFILE_CONFIG: Dict[str, Dict[Optional[str], List[str]]] = {
             "update_requests",
             "_process_requests",
             "_write_finish_reasons",
-            "_prepare_beam_search",
+            "prepare_beam_search",
             "_select_generated_logits",
             "_sample_batched_by_strategy",
         ],

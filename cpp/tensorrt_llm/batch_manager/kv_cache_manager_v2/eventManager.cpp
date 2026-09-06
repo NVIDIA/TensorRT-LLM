@@ -537,7 +537,7 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
 {
-    CacheLevel cacheLevel = kGpuLevel;
+    CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)
@@ -564,17 +564,16 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     tokens.reserve(block.tokens.size());
     for (auto const& token : block.tokens)
     {
-        if (auto const* tokenId = std::get_if<TokenId>(&token))
+        if (!token.isDigest())
         {
             UniqueToken uniqueToken;
-            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, *tokenId};
+            uniqueToken.tokenId = EventTokenId{std::in_place_index<0>, token.tokenId()};
             tokens.push_back(std::move(uniqueToken));
         }
         else
         {
             UniqueToken uniqueToken;
-            uniqueToken.tokenId
-                = EventTokenId{std::in_place_index<1>, digestToHex(std::get<DigestToken>(token).digest())};
+            uniqueToken.tokenId = EventTokenId{std::in_place_index<1>, digestToHex(token.digest())};
             tokens.push_back(std::move(uniqueToken));
         }
     }
@@ -645,13 +644,12 @@ uint64_t EventManager::v1HashFromBlock(Block const& block)
         {
             for (auto const& token : currentBlock.tokens)
             {
-                auto const* tokenId = std::get_if<TokenId>(&token);
-                if (tokenId == nullptr)
+                if (token.isDigest())
                 {
                     parentIsV1Compatible = false;
                     break;
                 }
-                textTokens.push_back(*tokenId);
+                textTokens.push_back(token.tokenId());
             }
         }
         if (parentIsV1Compatible)

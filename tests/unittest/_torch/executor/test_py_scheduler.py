@@ -2417,6 +2417,7 @@ class TestSimpleUnifiedScheduler:
         assert hasattr(output, "paused_requests")
         assert hasattr(output, "fitting_disagg_gen_init_requests")
         assert hasattr(output, "num_fitting_requests")
+        assert len(output.recompute_paused_requests) == 0
         assert len(output.context_requests) == 1
         assert len(output.generation_requests) == 1
         assert len(output.encoder_requests) == 0
@@ -3076,6 +3077,148 @@ class TestPyCapacitySchedulerKVCacheReuse:
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # No reuse: both scheduled together
         assert len(fitting) == 2
+
+
+class PausingMockKVCacheManager(MockKVCacheManager):
+    """Mock whose scheduling free-block pool grows when a sequence is paused.
+
+    The base mock's ``scheduling_remove_sequence`` is a no-op, so the
+    MaxUtilization pause-then-retry path never actually frees capacity there.
+    This mirrors ``WindowBlockManager::schedulingReleaseBlocks``, which returns
+    the victim's blocks to the scheduling free count.
+    """
+
+    def __init__(self, *args, blocks_released_on_pause: int = 5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._blocks_released_on_pause = blocks_released_on_pause
+        self.paused_request_ids: list[int] = []
+
+    def scheduling_remove_sequence(self, req_id: int):
+        self.paused_request_ids.append(req_id)
+        self._num_free_blocks += self._blocks_released_on_pause
+
+
+class PerRequestMockPeftCacheManager(MockPeftCacheManager):
+    """Peft mock whose page demand varies per request id.
+
+    ``PeftCacheManager::determineNumPages`` resolves the LoRA task id against
+    the host cache and falls back to the request's own ``LoraConfig``, so two
+    requests carrying the same task id can report different page counts.
+    """
+
+    def __init__(self, max_pages: int, pages_by_request_id: dict):
+        super().__init__(max_pages=max_pages)
+        self._pages_by_request_id = pages_by_request_id
+
+    def determine_num_pages(self, req) -> int:
+        return self._pages_by_request_id[req.py_request_id]
+
+
+class TestPyCapacitySchedulerContributionRegistration:
+    """
+    A request must not be deferred on behalf of a contributor that was not
+    scheduled in the same iteration.
+
+    ``_beneficial_to_skip`` used to register the checked request's own
+    ``first_new_block`` before any budget check had run, so a contribution could
+    be recorded for a request that never got admitted.
+
+    C++ ref: capacitySchedulerTest.cpp
+    ``MaxUtilizationPauseRetryDoesNotSelfSkip`` /
+    ``GuaranteedNoEvictUnscheduledRequestDoesNotDeferDuplicate``.
+    """
+
+    def test_beneficial_to_skip_does_not_mutate_contribution_sets(self):
+        """The check is pure; only ``_register_contributed_blocks`` may write."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=3,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        req = _make_request(0, prompt_len=21, input_tokens=list(range(21)))
+        ctx_blocks: set = set()
+        cross_blocks: set = set()
+
+        assert scheduler._beneficial_to_skip(req, ctx_blocks, cross_blocks) is False
+        assert ctx_blocks == set()
+        assert cross_blocks == set()
+
+        scheduler._register_contributed_blocks(req, ctx_blocks, cross_blocks)
+        assert len(ctx_blocks) == 1
+        # Now that the contributor is registered, a duplicate defers to it.
+        dup = _make_request(1, prompt_len=21, input_tokens=list(range(21)))
+        assert scheduler._beneficial_to_skip(dup, ctx_blocks, cross_blocks) is True
+
+    def test_max_utilization_retry_after_pause_does_not_self_skip(self):
+        """MaxUtilization: the request a pause made room for must be admitted.
+
+        On a failed admission the loop pauses a started request and retries the
+        *same* request without advancing ``req_it``. If the first attempt had
+        already registered that request's ``first_new_block``, the retry saw its
+        own key in the set and skipped itself — evicting a running request for
+        nobody.
+        """
+        # Block budget, chosen so that *both* assertions below discriminate:
+        #   free on entry            3 blocks
+        #   every request needs      5 blocks (blocks_per_request)
+        #   the pause releases      10 blocks -> 13 free
+        # a's first attempt fails (5 > 3) and forces the pause; after it a fits (5) and b would fit
+        # too (5 + 5 = 10 <= 13). b is therefore absent from `fitting` only because it deferred to
+        # a's contribution -- not because it ran out of blocks.
+        kv = PausingMockKVCacheManager(
+            num_free_blocks=3,
+            blocks_per_request=5,
+            enable_block_reuse=True,
+            blocks_released_on_pause=10,
+        )
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        tokens = list(range(21))
+        # a and b are duplicates; g is started and sits *after* them, so it is
+        # the only eviction victim the reverse search over [req_it, req_it_end)
+        # can find.
+        a = _make_request(0, prompt_len=21, input_tokens=tokens)
+        b = _make_request(1, prompt_len=21, input_tokens=tokens)
+        g = make_generation_request(2)
+
+        fitting, disagg, paused = scheduler.schedule_request([a, b, g])
+
+        # Before the fix: paused == [2], fitting == [] -- the pause bought nothing.
+        assert [r.request_id for r in paused] == [2], "g should be paused to make room for a"
+        # a is admitted on the retry; b correctly defers to a's contribution. The post-pause budget
+        # leaves room for b (see above), so its absence is the beneficial-to-skip decision and
+        # nothing else -- drop the skip check and this becomes [0, 1].
+        assert [r.request_id for r in fitting] == [0]
+        assert len(disagg) == 0
+
+    def test_guaranteed_no_evict_peft_shortage_does_not_defer_duplicate(self):
+        """GUARANTEED_NO_EVICT: a PEFT-page shortage is the one failure that
+        neither breaks the loop nor is caught by the block-shortage branch, so
+        a contribution registered at check time outlived the request that
+        failed. A later request sharing that block must still be admitted."""
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=3, enable_block_reuse=True)
+        peft = PerRequestMockPeftCacheManager(max_pages=10, pages_by_request_id={0: 20, 1: 5})
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            peft_cache_manager=peft,
+            scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        )
+        tokens = list(range(21))
+        # Same prompt and same LoRA task id => same block key, so r1 is a
+        # duplicate of r0. r0 demands more PEFT pages than are available.
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens, lora_task_id=7)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens, lora_task_id=7)
+
+        fitting, disagg, paused = scheduler.schedule_request([r0, r1])
+
+        assert [r.request_id for r in fitting] == [1]
+        assert len(disagg) == 0
+        assert len(paused) == 0
 
 
 class TestPyCapacitySchedulerDisaggAdvanced:

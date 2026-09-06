@@ -1,0 +1,23 @@
+{
+  "video": "hunyuan_t2v_lpips_golden_video.mp4",
+  "model": "HunyuanVideo-1.5-Diffusers-480p_t2v",
+  "source": "TensorRT-LLM VisualGen",
+  "prompt": "A cat sitting on a windowsill",
+  "negative_prompt": "",
+  "height": 256,
+  "width": 256,
+  "num_frames": 9,
+  "num_inference_steps": 4,
+  "seed": 42,
+  "frame_rate": 24.0,
+  "attention_backend": "VANILLA",
+  "torch_compile": false,
+  "deterministic_algorithms": true,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05,
+  "diffusers_version": "0.39.0",
+  "torch_version": "2.12.0a0+5aff3928d8.nv26.05",
+  "tensorrt_llm_version": "1.3.0rc24",
+  "tensorrt_llm_commit": "ad2cece816939ef0b9e8bab5dfba013d9ddf9288",
+  "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-26.05-py3-x86_64-ubuntu24.04-skip-tritondevel-202607271403-16694"
+}

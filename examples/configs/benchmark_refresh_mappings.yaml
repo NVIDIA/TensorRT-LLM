@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Models refreshed from the latest validated benchmark data.
+#
+# Adding a model:
+# 1. Add one models entry for each source model and precision combination.
+# 2. Set target.model to the public model name used by TensorRT-LLM lookup.yaml.
+# 3. Set target.arch to the TensorRT-LLM model class recorded in lookup.yaml.
+# 4. List the public TensorRT-LLM GPU names to update under gpus.
+#
+# Target fields control where generated recipe YAML files are stored in TensorRT-LLM.
+# The defaults below are:
+# - config_dir_template: Directory where recipe files are written. {model} is
+#   target.model, {gpu} is the public GPU name, and {gpu_directory} is the directory
+#   from the matching accelerators entry. The default produces:
+#     examples/configs/database/<target.model>/<accelerator.directory>
+# - filename_template: Filename for each generated recipe. {isl_short} and
+#   {osl_short} are abbreviated sequence lengths, {num_gpus} is the GPU count,
+#   {concurrency} is the benchmark concurrency, and {profile_suffix} is empty unless
+#   latency/balanced/throughput variants are needed.
+# A models entry may override either variable under target when it requires a
+# different directory layout or filename convention.
+#
+# Adding a GPU:
+# 1. Add it to accelerators once. The key is TensorRT-LLM's public GPU name,
+#    source_name is the benchmark service's name, and directory is its config folder.
+# 2. Add that key to the appropriate models entries' gpus lists.
+#
+# Artifact logs are discovered automatically using the runtime dimensions in each
+# Pareto record. If more than one valid log still matches, the record is skipped as
+# ambiguous. Only in that case, artifact_log.match_tokens may be added to a models
+# entry as a list of exact, case-insensitive filename fragments that disambiguate it.
+#
+# Removing a model or GPU stops future refreshes but does not delete existing recipe
+# files or lookup.yaml entries. Delete a models entry to stop updating that model and
+# precision, or remove a GPU from gpus to stop updating only that combination.
+version: 2
+
+defaults:
+  target:
+    config_dir_template: "examples/configs/database/{model}/{gpu_directory}"
+    filename_template: "{isl_short}{osl_short}_tp{num_gpus}_conc{concurrency}{profile_suffix}.yaml"
+
+accelerators:
+  B200_NVL:
+    source_name: NVIDIA B200
+    directory: B200
+  H200_SXM:
+    source_name: NVIDIA H200
+    directory: H200
+
+models:
+  - source:
+      model: deepseek-r1
+      precision: FP4
+    target:
+      model: nvidia/DeepSeek-R1-0528-FP4-v2
+      arch: DeepseekV3ForCausalLM
+    gpus:
+      - B200_NVL
+  - source:
+      model: deepseek-r1
+      precision: FP8
+    target:
+      model: deepseek-ai/DeepSeek-R1-0528
+      arch: DeepseekV3ForCausalLM
+    gpus:
+      - B200_NVL
+      - H200_SXM
+  - source:
+      model: gpt-oss-120b
+      precision: FP4
+    target:
+      model: openai/gpt-oss-120b
+      arch: GptOssForCausalLM
+    gpus:
+      - B200_NVL
+      - H200_SXM

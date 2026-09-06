@@ -168,13 +168,23 @@ def test_missing_layer_idx_is_a_noop():
 
 
 class _StopBlockInit(Exception):
-    """Raised after the test captures the arguments passed to ``create_moe``."""
+    """Raised once the resolved MoE class is captured, to abort the build."""
 
 
-def _build_moe_block(moe_backend, exclude_modules, layer_idx, quant_config_dict=None):
-    """Run sparse-MoE initialization through its ``create_moe`` call."""
+def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_config_dict=None):
+    """Run sparse-MoE initialization through its ``create_moe`` call.
+
+    ``sm`` is declared, not probed. Which implementation wins is a function of
+    the machine, so pinning an expected class while the environment comes from
+    whatever GPU CI happens to hand out asserts a property of the runner rather
+    than of the code. Declaring it keeps the assertions about selection
+    strategy and lets these cases run on any device. An empty dependency set
+    goes with it, so an installed flashinfer cannot change the outcome either.
+    """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextSparseMoeBlock
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import override_moe_environment
 
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
@@ -200,23 +210,29 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, quant_config_dict=
     )
     captured = {}
 
-    def _capture(*args, **kwargs):
-        from tensorrt_llm._torch.modules.fused_moe.create_moe import resolve_moe_cls
+    # ``fused_moe/__init__`` re-exports create_moe as a function, which shadows
+    # the submodule of the same name, so ``import ...create_moe as m`` binds the
+    # function. Both forms below resolve the submodule through sys.modules.
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import resolve_moe_cls as real_resolve_moe_cls
 
-        captured["moe_backend"] = kwargs["model_config"].moe_backend
-        captured["override"] = kwargs["override_quant_config"]
-        captured["moe_cls"] = resolve_moe_cls(
-            kwargs["model_config"],
-            kwargs["routing_method"],
-            kwargs["dtype"],
-            kwargs["override_quant_config"],
-            kwargs["layer_idx"],
-        ).__name__
+    # Observe the resolution create_moe actually performs instead of
+    # reproducing its argument list here: a copy drifts, and a copy that omits
+    # e.g. swiglu_gptoss_style resolves to a different class than the layer
+    # will be built with, which the assertions below would not catch.
+    def _capture(model_config, **kwargs):
+        captured["moe_backend"] = model_config.moe_backend
+        captured["override"] = kwargs.get("override_quant_config")
+        captured["moe_cls"] = real_resolve_moe_cls(model_config, **kwargs).__name__
         raise _StopBlockInit
 
-    import tensorrt_llm._torch.models.modeling_qwen3_next as qwen3_next
-
-    with patch.object(qwen3_next, "create_moe", _capture), pytest.raises(_StopBlockInit):
+    with (
+        override_moe_environment(MoEEnvironment(sm=sm)),
+        patch(
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
+            _capture,
+        ),
+        pytest.raises(_StopBlockInit),
+    ):
         Qwen3NextSparseMoeBlock(model_config, aux_stream=None, layer_idx=layer_idx)
     return captured
 
@@ -225,10 +241,14 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, quant_config_dict=
 @pytest.mark.parametrize("layer_idx", [5, MTP_LAYER_IDX])
 def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     per_layer_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    # The exclusion rewrites the request to CUTLASS and strips the quantization,
+    # and unquantized Cutlass covers SM80+, so the declared SM only has to be a
+    # real one -- this case is about the rewrite, not about hardware.
     captured = _build_moe_block(
         backend,
         [f"model.layers.{layer_idx}*"],
         layer_idx,
+        sm=100,
         quant_config_dict={
             f"model.layers.{layer_idx}.mlp.experts": per_layer_quant_config,
         },
@@ -241,26 +261,40 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     assert captured["override"].kv_cache_quant_algo == QuantAlgo.FP8
 
 
-_UNEXCLUDED_EXPECTED_MOE_CLS = {
-    "CUTLASS": "CutlassFusedMoE",
-    "TRTLLM": "TRTLLMGenFusedMoE",
-    "DEEPGEMM": "DeepGemmFusedMoE",
-    "CUTEDSL": "CuteDslFusedMoE",
-}
-
-
-@pytest.mark.parametrize("backend", sorted(_UNEXCLUDED_EXPECTED_MOE_CLS))
-def test_unexcluded_layer_keeps_configured_backend_and_layer_quant_config(backend):
-    per_layer_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+# "Requested backend wins" only holds where that backend can actually serve the
+# layer, so each row pairs the request with an environment and an algorithm that
+# make its family eligible. A single (algorithm, SM) shared by all four does not
+# exist: FP8 block scales is Cutlass on SM90 and DeepGemm / TRTLLM-Gen on SM100,
+# and CuteDSL only claims NVFP4.
+@pytest.mark.parametrize(
+    "backend,sm,quant_algo,expected_moe_cls",
+    [
+        ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "CutlassFusedMoE"),
+        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TRTLLMGenFusedMoE"),
+        ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepGemmFusedMoE"),
+        ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),
+    ],
+    ids=[
+        "cutlass_sm90_fp8_block",
+        "trtllm_sm100_fp8_block",
+        "deepgemm_sm100_fp8_block",
+        "cutedsl_sm100_nvfp4",
+    ],
+)
+def test_unexcluded_layer_keeps_configured_backend_and_layer_quant_config(
+    backend, sm, quant_algo, expected_moe_cls
+):
+    per_layer_quant_config = QuantConfig(quant_algo=quant_algo)
     captured = _build_moe_block(
         backend,
         ["model.layers.7*"],
         5,
+        sm=sm,
         quant_config_dict={
             "model.layers.5.mlp.experts": per_layer_quant_config,
         },
     )
 
     assert captured["moe_backend"] == backend
-    assert captured["moe_cls"] == _UNEXCLUDED_EXPECTED_MOE_CLS[backend]
+    assert captured["moe_cls"] == expected_moe_cls
     assert captured["override"] is per_layer_quant_config

@@ -12,7 +12,7 @@ from torch.fx.passes.split_module import split_module
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
 from ..utils import (get_model_extra_attrs,
-                     get_per_request_piecewise_cuda_graph_flag,
+                     get_per_request_prefill_cuda_graph_flag,
                      get_piecewise_cuda_graph_flag, make_weak_ref,
                      set_piecewise_running)
 from .multi_stream.auto_multi_stream import multi_stream_schedule
@@ -202,7 +202,7 @@ class PiecewiseRunner(object):
         if (runtime_num_of_token is None
                 or runtime_num_of_token not in self.entries
                 or not get_piecewise_cuda_graph_flag()
-                or not get_per_request_piecewise_cuda_graph_flag()):
+                or not get_per_request_prefill_cuda_graph_flag()):
             return self.default_callable(*args)
 
         if self.is_first_runner or self.is_last_runner:
@@ -275,7 +275,6 @@ def piecewise_optimizer(
     enable_inductor: bool,
     input_num_tokens: Union[int | torch.SymInt],
     capture_num_tokens: Sequence[int],
-    graph_pool_handle: tuple[int, int],
     max_num_streams: int = 1,
 ) -> tuple[GraphModule, int, List[PiecewiseRunner]]:
     graph_pool_handle = torch.cuda.graph_pool_handle()

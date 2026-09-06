@@ -693,7 +693,7 @@ class QwenImagePipeline(BasePipeline):
                 stats = cache_acc.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         if "hit_rate" in stats:
                             logger.info(

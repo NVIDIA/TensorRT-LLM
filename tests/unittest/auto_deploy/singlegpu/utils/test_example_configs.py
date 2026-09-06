@@ -27,6 +27,9 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
+pytestmark = pytest.mark.cpu_only
+
+
 # Root directory for the example configs
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"

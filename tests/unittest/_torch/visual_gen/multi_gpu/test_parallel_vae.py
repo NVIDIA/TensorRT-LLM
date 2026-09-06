@@ -22,9 +22,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    import sys
-    from pathlib import Path
-
     from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
     from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
@@ -33,11 +30,6 @@ try:
     )
     from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
     from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -85,6 +77,10 @@ def _run(world_size: int, test_fn: Callable):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
@@ -473,12 +469,27 @@ def _logic_trtllm_encode_height(rank, world_size):
     assert max_diff < 0.01, f"Rank {rank}: trtllm encode height max_diff={max_diff:.6f}"
 
 
+def _logic_cosmos3_config_delegation(rank: int, world_size: int) -> None:
+    """The native wrapper preserves attributes used by the Cosmos3 pipeline."""
+    device = f"cuda:{rank}"
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "width")
+
+    assert parallel.config is vae.config
+    assert parallel.dtype == vae.dtype
+
+
 class TestParallelVAETrtllmDecode:
     def test_decode_width_2gpu(self):
         _run(2, _logic_trtllm_decode_width)
 
     def test_decode_height_2gpu(self):
         _run(2, _logic_trtllm_decode_height)
+
+    def test_cosmos3_config_delegation_2gpu(self) -> None:
+        _run(2, _logic_cosmos3_config_delegation)
 
 
 class TestParallelVAETrtllmEncode:

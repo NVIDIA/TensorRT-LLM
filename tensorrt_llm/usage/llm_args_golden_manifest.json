@@ -108,8 +108,7 @@
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
-        "FLASHINFER",
-        "FLASHINFER_STAR_ATTENTION"
+        "FLASHINFER"
       ],
       "annotation": "<class 'str'>",
       "converter": "allowlist",
@@ -161,6 +160,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.enable_pipelined_transfer"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
@@ -206,6 +212,17 @@
       "path": "cache_transceiver_config.transceiver_runtime"
     },
     {
+      "allowed_values": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "annotation": "Literal['auto', 'native', 'rank_striped_read_ahead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "checkpoint_io_policy"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -213,23 +230,8 @@
       "path": "context_parallel_size"
     },
     {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.block_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "cp_config.cp_anchor_size"
-    },
-    {
       "allowed_values": [
         "ULYSSES",
-        "STAR",
         "RING",
         "HELIX"
       ],
@@ -412,6 +414,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_encoder_decoder_mixed_cuda_graph"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_energy_metrics"
     },
     {
@@ -468,6 +477,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_mla_skip_correction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_resource_governor"
     },
     {
@@ -483,6 +499,64 @@
       "converter": "",
       "kind": "value",
       "path": "encode_only"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.batch_sizes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.enable_padding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_num_token"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.max_seq_len"
+    },
+    {
+      "allowed_values": [
+        "encode"
+      ],
+      "annotation": "Literal['encode']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.num_tokens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[Annotated[int, Gt(gt=0)]]]",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_cuda_graph_config.seq_lens"
     },
     {
       "allowed_values": [],
@@ -566,10 +640,11 @@
     },
     {
       "allowed_values": [
+        "quantization_for_cold_page",
         "triattention"
       ],
       "annotation": "Literal['triattention']",
-      "converter": "",
+      "converter": "allowlist",
       "kind": "categorical",
       "path": "kv_cache_compression_config.algorithm"
     },
@@ -604,6 +679,15 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [
+        "nvfp4"
+      ],
+      "annotation": "Literal['nvfp4']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.quant"
     },
     {
       "allowed_values": [],
@@ -672,6 +756,7 @@
         "bfloat16",
         "float32",
         "fp8",
+        "fp8_ds_mla",
         "nvfp4"
       ],
       "annotation": "<class 'str'>",
@@ -779,6 +864,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
     },
     {
       "allowed_values": [],
@@ -901,6 +993,13 @@
       "path": "load_format"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.cuda_graph_specialize_lora"
+    },
+    {
       "allowed_values": [
         "hf",
         "nemo"
@@ -930,6 +1029,13 @@
       "converter": "",
       "kind": "value",
       "path": "lora_config.max_loras"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "lora_config.overlap_lora_and_base"
     },
     {
       "allowed_values": [],
@@ -982,6 +1088,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'float'>",
+      "converter": "",
+      "kind": "value",
+      "path": "mla_skip_correction_threshold"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -999,7 +1112,6 @@
         "AUTO",
         "CUTLASS",
         "CUTEDSL",
-        "WIDEEP",
         "TRTLLM",
         "DEEPGEMM",
         "DENSEGEMM",
@@ -1009,7 +1121,7 @@
         "MEGAMOE_DEEPGEMM",
         "MEGAMOE_CUTEDSL"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -1055,6 +1167,17 @@
       "converter": "",
       "kind": "value",
       "path": "multimodal_config.encoder_cache_max_bytes"
+    },
+    {
+      "allowed_values": [
+        "DISABLED",
+        "DEFAULT",
+        "EAGER"
+      ],
+      "annotation": "<enum 'MultimodalEncoderSchedulingPolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "multimodal_config.encoder_scheduling_policy"
     },
     {
       "allowed_values": [],
@@ -1223,6 +1346,24 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prefill_capture_num_tokens"
+    },
+    {
+      "allowed_values": [
+        "disabled",
+        "piecewise",
+        "breakable"
+      ],
+      "annotation": "<enum 'PrefillCudaGraphBackend'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "prefill_cuda_graph_backend"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -1302,6 +1443,7 @@
       "allowed_values": [
         "auto",
         "deepseek-r1",
+        "poolside_v1",
         "laguna",
         "qwen3",
         "qwen3_5",
@@ -1360,17 +1502,6 @@
       "converter": "",
       "kind": "value",
       "path": "sampler_force_async_worker"
-    },
-    {
-      "allowed_values": [
-        "TRTLLMSampler",
-        "TorchSampler",
-        "auto"
-      ],
-      "annotation": "Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]",
-      "converter": "allowlist",
-      "kind": "categorical",
-      "path": "sampler_type"
     },
     {
       "allowed_values": [
@@ -1451,6 +1582,7 @@
         "dsa",
         "deepseek_v4",
         "minimax_m3",
+        "qsa",
         "rocket",
         "skip_softmax"
       ],
@@ -1520,6 +1652,16 @@
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.indexer_k_dtype"
+    },
+    {
+      "allowed_values": [
+        "bf16",
+        "fp8"
+      ],
+      "annotation": "Literal['bf16', 'fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_kv_dtype"
     },
     {
       "allowed_values": [],
@@ -1728,6 +1870,16 @@
       "path": "speculative_config.allow_advanced_sampling"
     },
     {
+      "allowed_values": [
+        "VANILLA",
+        "TRTLLM"
+      ],
+      "annotation": "Literal['VANILLA', 'TRTLLM']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.attention_backend"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -1749,9 +1901,7 @@
         "Draft_Target",
         "Eagle3",
         "Eagle",
-        "Lookahead",
         "MTP",
-        "Medusa",
         "NGram",
         "PARD",
         "SA",
@@ -1807,6 +1957,13 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.enable_global_pool"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.enable_penalty"
     },
     {
       "allowed_values": [],
@@ -1898,13 +2055,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_ngram_size"
-    },
-    {
-      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -1919,27 +2069,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_verification_set_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.max_window_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[List[List[int]]]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.medusa_choices"
-    },
-    {
-      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -1951,13 +2080,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.num_eagle_layers"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[int]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.num_medusa_heads"
     },
     {
       "allowed_values": [],
@@ -2063,7 +2185,8 @@
         "llm_class",
         "cli_serve",
         "cli_bench",
-        "cli_eval"
+        "cli_eval",
+        "disaggregated"
       ],
       "annotation": "<enum 'UsageContext'>",
       "converter": "",
@@ -2163,6 +2286,13 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "use_fine_grained_sync"
     }
   ]
 }
