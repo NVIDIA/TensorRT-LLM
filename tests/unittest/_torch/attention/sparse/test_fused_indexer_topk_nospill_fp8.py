@@ -269,3 +269,19 @@ def test_fused_indexer_topk_nospill_fp8_patterns(pattern, batch, monkeypatch):
     indices, values = _run(inp, 2048)
     _check(inp, indices, values, 2048)
     _check_fp32_boundary(inp, indices, 2048)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch", [4, 16])
+@pytest.mark.parametrize("split", ["auto", "1"])
+def test_fused_indexer_topk_nospill_fp8_mixed_lengths(batch, split, monkeypatch):
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", split)
+    device = torch.device("cuda")
+    inp = _build_inputs(batch, 65536, 1024, "signed", seed=2718, device=device)
+    inp["context_lens"] = torch.tensor(
+        [max(1024, 65536 >> (i % 4)) - 37 * i for i in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    indices, values = _run(inp, 1024)
+    _check(inp, indices, values, 1024)

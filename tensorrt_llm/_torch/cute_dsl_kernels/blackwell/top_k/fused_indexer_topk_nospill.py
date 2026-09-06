@@ -382,6 +382,7 @@ def _filter_window(sWin, woff, sSPos, sSKey, sCtl, tidx, wl, lmaskw, crk, L, ntl
     thread): count survivors per warp first, reserve the slots with ONE atomic
     per warp, then place (position, key). Keeps the rendezvous short."""
     NIT = (CHUNK * TOK) // C_THREADS
+    lim0 = L - (crk + (ntl - 1) * CS) * TOK
     keeps = [cutlass.Boolean(False) for _ in range(NIT)]
     nks = [I32(0) for _ in range(NIT)]
     masks = [I32(0) for _ in range(NIT)]
@@ -390,8 +391,7 @@ def _filter_window(sWin, woff, sSPos, sSKey, sCtl, tidx, wl, lmaskw, crk, L, ntl
         w = r * C_THREADS + tidx
         k = I32(sWin[woff + w])
         tl = tile0 + w // TOK
-        tok = (crk + (ntl - 1 - tl) * CS) * TOK + (w % TOK)
-        kp = (tl < ntl) and (tok < L) and ((k >> 5) >= sCtl[4])
+        kp = (tl < ntl) and ((tl > 0) or ((w % TOK) < lim0)) and ((k >> 5) >= sCtl[4])
         mk = cute.arch.vote_ballot_sync(kp)
         keeps[r] = kp
         masks[r] = mk
@@ -443,6 +443,7 @@ def _dsv4_kernel(
     LAY: cutlass.Constexpr,
     SWZ: cutlass.Constexpr,
     NCOMP: cutlass.Constexpr,
+    B: cutlass.Constexpr,
     KTOP: cutlass.Constexpr,
     MAXB: cutlass.Constexpr,
     STAGES: cutlass.Constexpr,
@@ -561,6 +562,93 @@ def _dsv4_kernel(
 
     b = bidx // CS
     crk = bidx % CS
+    CSd = I32(CS)
+    if cutlass.const_expr(GM == 1):
+        # balanced split: the grid's CTAs go to rows in proportion to their tile counts (each
+        # row keeps at least ceil(tiles / NLOC)); equal rows keep the uniform mapping. Warp 0
+        # plans in registers (rows lane, lane+32, ...), the plan goes out through sCand.
+        RPL = (B + 31) // 32
+        if warp_idx == 0:
+            gcl = cute.make_tensor(clen_ptr, cute.make_layout(1 << 20))
+            tb = [I32(0)] * RPL
+            tot = I32(0)
+            mx = I32(0)
+            mn = I32(1 << 30)
+            for r in cutlass.range_constexpr(RPL):
+                row = r * 32 + tidx
+                t = I32(0)
+                if row < B:
+                    t = (gcl[row] + TOK - 1) // TOK
+                    if t > mx:
+                        mx = t
+                    if t < mn:
+                        mn = t
+                tb[r] = t
+                tot = tot + t
+                if row < B:
+                    sCand[2 * B + row] = gcl[row]
+            tot = cute.arch.warp_redux_sync(tot, "add")
+            mx = cute.arch.warp_redux_sync(mx, "max")
+            mn = cute.arch.warp_redux_sync(mn, "min")
+            summin = I32(0)
+            mnb = [I32(0)] * RPL
+            for r in cutlass.range_constexpr(RPL):
+                m = I32(0)
+                if r * 32 + tidx < B:
+                    m = (tb[r] + NLOC - 1) // NLOC
+                    if m < 1:
+                        m = I32(1)
+                mnb[r] = m
+                summin = summin + m
+            summin = cute.arch.warp_redux_sync(summin, "add")
+            uni = I32(0)
+            if mx == mn:
+                uni = I32(1)
+            if summin > I32(B * CS):
+                uni = I32(1)
+            if tidx == 0:
+                sCtl[22] = uni
+            if uni == 0:
+                remc = I32(B * CS) - summin
+                sumex = I32(0)
+                exb = [I32(0)] * RPL
+                for r in cutlass.range_constexpr(RPL):
+                    e = I32(0)
+                    if r * 32 + tidx < B:
+                        e = (remc * tb[r]) // tot
+                    exb[r] = e
+                    sumex = sumex + e
+                sumex = cute.arch.warp_redux_sync(sumex, "add")
+                rleft = remc - sumex
+                base = I32(0)
+                for r in cutlass.range_constexpr(RPL):
+                    row = r * 32 + tidx
+                    sv = I32(0)
+                    if row < B:
+                        sv = mnb[r] + exb[r]
+                        if row < rleft:
+                            sv = sv + 1
+                    incl = sv
+                    for d in cutlass.range_constexpr(5):
+                        oth = cute.arch.shuffle_sync_up(incl, 1 << d, mask_and_clamp=0)
+                        if tidx >= (1 << d):
+                            incl = incl + oth
+                    if row < B:
+                        sCand[row] = sv
+                        sCand[B + row] = base + incl - sv
+                    base = base + cute.arch.shuffle_sync(incl, 31)
+        cute.arch.barrier()
+        Lb = sCand[2 * B + b]
+        if sCtl[22] == 0:
+            if tidx < B:
+                if (sCand[B + tidx] <= bidx) and (bidx < sCand[B + tidx] + sCand[tidx]):
+                    sCtl[25] = tidx
+            cute.arch.barrier()
+            # the plan is read back through SMEM: keep row, rank and split in uniform registers
+            b = cute.arch.make_warp_uniform(sCtl[25])
+            CSd = cute.arch.make_warp_uniform(sCand[b])
+            crk = cute.arch.make_warp_uniform(bidx - sCand[B + b])
+            Lb = sCand[2 * B + b]
     # cluster-free row split: this row's GMEM workspace (zero at launch, re-zeroed by the last arriver)
     wrow_i = cutlass.Int64(0)
     gRow = cute.make_tensor(ws_ptr, cute.make_layout(WS_ROWW_OF(NREP)))
@@ -570,11 +658,13 @@ def _dsv4_kernel(
             ws_ptr + cutlass.Int64(b) * WS_ROWW_OF(NREP), cute.make_layout(WS_ROWW_OF(NREP))
         )
     L = cute.make_tensor(clen_ptr, cute.make_layout(1 << 20))[b]
+    if cutlass.const_expr(GM == 1):
+        L = Lb
     ntile = (L + TOK - 1) // TOK
     # this CTA owns the interleaved tile subsequence crk, crk+CS, crk+2CS, ...
     ntl = 0
     if ntile > crk:
-        ntl = (ntile - crk + CS - 1) // CS
+        ntl = (ntile - crk + CSd - 1) // CSd
 
     # Only the pages of this CTA's own tiles (crk, crk+CS, ...) are staged,
     # so the SMEM page table stays NLOC*4 entries however long the row is.
@@ -582,7 +672,7 @@ def _dsv4_kernel(
     if tidx >= 128:
         ii = tidx - 128
         for jj in cutlass.range(ii, RBT * 4, NTHREADS - 128, unroll=1):
-            gi = (crk + (ntl - 1 - (jj >> 2)) * CS) * 4 + (jj & 3)
+            gi = (crk + (ntl - 1 - (jj >> 2)) * CSd) * 4 + (jj & 3)
             if ((jj >> 2) < ntl) and (gi < MAXB):
                 sBT[jj] = gBT[gi]
 
@@ -659,7 +749,7 @@ def _dsv4_kernel(
         # 16-lane-per-page decomposition and all 64 per-thread arrivals.
         pgw = 2 * (warp_idx - 12)
         for j in cutlass.range(ntl, unroll=1):
-            i = crk + (ntl - 1 - j) * CS
+            i = crk + (ntl - 1 - j) * CSd
             s = j % STAGES
             if j >= STAGES:
                 cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
@@ -671,7 +761,7 @@ def _dsv4_kernel(
                     for r in cutlass.range_constexpr(8):
                         e = lt * 8 + r
                         jj = j + 64 + (e >> 2)
-                        gi = (crk + (ntl - 1 - jj) * CS) * 4 + (e & 3)
+                        gi = (crk + (ntl - 1 - jj) * CSd) * 4 + (e & 3)
                         if (jj < ntl) and (gi < MAXB):
                             sBT[(jj & (RBT - 1)) * 4 + (e & 3)] = gBT[gi]
                     cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
@@ -807,6 +897,7 @@ def _dsv4_kernel(
             wslot = ((NDENSE + NACC - 1) // NACC) * NACC + gwg - NDENSE
             if wslot >= NACC:
                 wslot = wslot - NACC
+        lim0 = L - (crk + (ntl - 1) * CSd) * TOK
         for i in cutlass.range(gwg, ntl_pad, NACC, unroll=1):
             if cutlass.const_expr(NLOC > NDENSE):
                 # chunk rendezvous (consumers only): all 3 groups aligned, the
@@ -836,7 +927,7 @@ def _dsv4_kernel(
                             nsv,
                             KTOP,
                             SCAP,
-                            CS,
+                            CSd,
                         )
                     if rc >= 1:
                         _filter_window(
@@ -852,7 +943,7 @@ def _dsv4_kernel(
                             L,
                             ntl,
                             NDENSE + (rc - 1) * CHUNK,
-                            CS,
+                            CSd,
                         )
             if i < ntl:
                 cute.arch.mbarrier_wait(acc_full + gwg, (i // NACC) & 1)
@@ -899,16 +990,15 @@ def _dsv4_kernel(
                 ki = ui ^ (0x8000 + ((ui >> 15) & 1) * 0x7FFF)
                 hv = U16(ki).bitcast(F16)
                 pos = i * TOK + lane
-                tok = (crk + (ntl - 1 - i) * CS) * TOK + lane
                 if cutlass.const_expr(NLOC > NDENSE):
                     if i < NDENSE:
                         sVal[pos] = hv
-                        if tok < L:
+                        if (i > 0) or (lane < lim0):
                             cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
                     else:
                         # filtered tile: histogram stays complete; the key parks in
                         # the chunk window and is filtered at the next rendezvous
-                        if tok < L:
+                        if (i > 0) or (lane < lim0):
                             cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
                         sWin[wslot * TOK + lane] = U16(ki & 0xFFFF)
                         wslot = wslot + NACC
@@ -916,7 +1006,7 @@ def _dsv4_kernel(
                             wslot = wslot - 2 * CHUNK
                 else:
                     sVal[pos] = hv
-                    if tok < L:
+                    if (i > 0) or (lane < lim0):
                         cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
                 if cutlass.const_expr(NLOC > NDENSE):
                     # safe line: coarse bin of the K-th key seen so far (a lower
@@ -958,7 +1048,7 @@ def _dsv4_kernel(
                         nsv2,
                         KTOP,
                         SCAP,
-                        CS,
+                        CSd,
                     )
                 _filter_window(
                     sWin,
@@ -973,7 +1063,7 @@ def _dsv4_kernel(
                     L,
                     ntl,
                     NDENSE + (nch - 1) * CHUNK,
-                    CS,
+                    CSd,
                 )
 
     # Each warp signals cluster arrival as soon as its own scan work is done;
@@ -1036,7 +1126,7 @@ def _dsv4_kernel(
         cute.arch.fence_acq_rel_gpu()
         cute.arch.barrier()
         if tidx == 0:
-            _gm_barrier(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR1) * 4), I32(CS))
+            _gm_barrier(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR1) * 4), CSd)
         cute.arch.barrier()
         # plain loads after the acquire (L1 is cold for this row): independent per replica,
         # so the compiler can keep NREP * unroll requests in flight
@@ -1090,7 +1180,7 @@ def _dsv4_kernel(
         kv0 = U16(xi & 0xFFFF)
         kv1 = U16((xi >> 16) & 0xFFFF)
         # local slot -> global kv position
-        t0 = (crk + (ntl - 1 - (p0 >> 7)) * CS) * TOK + (p0 & (TOK - 1))
+        t0 = (crk + (ntl - 1 - (p0 >> 7)) * CSd) * TOK + (p0 & (TOK - 1))
         t1 = t0 + 1
         n0 = I32(kv0) >> 5
         n1 = I32(kv1) >> 5
@@ -1199,7 +1289,7 @@ def _dsv4_kernel(
                             pl = sSPos[es - NDENSE * TOK]
                     else:
                         kk = I32(sKey[es])
-                t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
+                t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
                 take = live and (t < L) and ((kk >> 5) == b1)
                 if ncl <= CAP:
                     take = live
@@ -1243,7 +1333,7 @@ def _dsv4_kernel(
             if tidx == 0:
                 ctr2 = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4)
                 v2 = _ld_acquire_gpu(ctr2)
-                while v2 < I32(CS):
+                while v2 < CSd:
                     v2 = _ld_acquire_gpu(ctr2)
                 cute.arch.fence_acq_rel_gpu()
             cute.arch.barrier()
@@ -1315,7 +1405,7 @@ def _dsv4_kernel(
                             pl = sSPos[es - NDENSE * TOK]
                     else:
                         kk = I32(sKey[es])
-                t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
+                t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
                 take = live and (t < L) and ((kk >> 5) == b1)
                 if ncand <= CAP:
                     take = live
@@ -1361,7 +1451,7 @@ def _dsv4_kernel(
                     pl = sSPos[es - NDENSE * TOK]
             else:
                 kk = I32(sKey[es])
-            t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
+            t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
             take = t < L
             if ncand <= CAP:
                 take = True
@@ -1409,7 +1499,7 @@ def _dsv4_kernel(
             )
             cute.arch.fence_acq_rel_gpu()
         cute.arch.barrier()
-        last = sCtl[17] == I32(CS - 1)
+        last = sCtl[17] == CSd - 1
         ntg = I32(0)
         nall = I32(0)
         if last:
@@ -1849,6 +1939,7 @@ def _launch(
         LAY,
         SWZ,
         NCOMP,
+        B,
         KTOP,
         MAXB,
         STAGES,

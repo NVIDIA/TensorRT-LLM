@@ -586,3 +586,42 @@ def test_fused_indexer_topk_nospill_routing(monkeypatch):
     for (batch, maxb), (cs, gm) in cases.items():
         key, _, _ = fused_indexer_topk_nospill._config(batch, maxb, 4096, 1024)
         assert (key[6], key[12]) == (cs, gm), (batch, maxb, key[6], key[12])
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch", [4, 8, 16])
+@pytest.mark.parametrize("split", ["auto", "1"])
+def test_fused_indexer_topk_nospill_mixed_lengths(batch, split, monkeypatch):
+    # rows of very different lengths in one launch: the split shares the CTAs out by length
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", split)
+    device = torch.device("cuda")
+    n_comp, k_top = 65536, 1024
+    inp = _build_inputs(batch, n_comp, k_top, "signed", seed=2718, device=device)
+    lens = torch.tensor(
+        [max(k_top, n_comp >> (i % 4)) - 37 * i for i in range(batch)],
+        dtype=torch.int32,
+        device=device,
+    )
+    inp["context_lens"] = lens
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    ref_vals = _reference(inp, k_top)
+    for i in range(batch):
+        row = indices[i]
+        assert int(row.min()) >= 0 and int(row.max()) < int(lens[i])
+        assert row.unique().numel() == k_top
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(ref_vals[i], descending=True)
+        assert bool(((got - want).abs() <= 1e-2 + 1e-3 * want.abs()).all()), f"row {i}"
