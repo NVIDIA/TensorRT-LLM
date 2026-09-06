@@ -599,8 +599,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # The overlap correction may have changed request KV lengths after
         # prepare(); rebuild each ragged row's causal extent on device.
-        self.refresh_ragged_row_kv_lens()
-        self.refresh_token_major_gen_rows()
+        if self.enable_ragged_verification:
+            self.refresh_ragged_row_kv_lens()
+            self.refresh_token_major_gen_rows()
 
         if self.kv_cache_manager is not None and self.num_tokens > 0 and not fused_eligible:
             seq_lens = self.seq_lens_cuda[: self.num_seqs]
