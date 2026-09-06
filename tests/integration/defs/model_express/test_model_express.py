@@ -369,9 +369,15 @@ def _worker_environment(gpu_ids: tuple[str, ...], transfer_log_dir: Path) -> dic
             # from loading the container UCX stack into the same process.
             # Exclusion rather than a component name for osc: pt2pt is gone in
             # Open MPI 5, and naming a survivor would break the same way again.
+            # btl names components because the point is to keep btl/uct out, and
+            # it has to say sm, not the vader this used to name: Open MPI 5 kept
+            # the btl_vader_* parameters as synonyms but dropped the component,
+            # and an unknown name in an include list is dropped without a word,
+            # so vader silently left shared memory out and sent intra-node
+            # traffic over tcp.
             "OMPI_MCA_pml": "ob1",
             "OMPI_MCA_osc": "^ucx",
-            "OMPI_MCA_btl": "self,vader,tcp",
+            "OMPI_MCA_btl": "self,sm,tcp",
             "OMPI_MCA_coll": "^hcoll,ucc",
             "PYTHONUNBUFFERED": "1",
             "TLLM_LOG_LEVEL": "INFO",
