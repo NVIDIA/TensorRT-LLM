@@ -564,13 +564,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
 
-        Deliberately connector-blind: the connector is asked later, in
-        ``KVCacheManagerV2.prepare_resources``, so the budget here assumes it
-        serves nothing. That is safe because honouring an offer only ever
-        removes tokens from the forward pass, and it costs only that a served
-        prefix frees no budget for another request in the same iteration.
+        A KV connector reaches the budget only through
+        ``context_remaining_length``. ``prepare_context`` asks it and skips the
+        request past what it offers, so the length read after that call already
+        excludes the served prefix; without ``aggressive_prefix_budgeting`` the
+        query runs after this pass instead and the length is the full one. Both
+        arms are safe -- honouring an offer only ever removes tokens from the
+        forward pass -- so nothing here branches on the mode. What differs is
+        whether the saving frees budget for another request in this iteration.
+        This is also why ``enable_prefix_aware_scheduling`` must be on for that
+        mode: with it off, both context paths budget against the length
+        captured before ``prepare_context`` ran.
 
-        ``should_add_sequence`` must not gate scheduling either: it stays false
+        ``should_add_sequence`` must not gate scheduling: it stays false
         from the moment an asynchronous load completes until
         ``request_finished``, so a request gated on it would be skipped forever
         and never run the prefill the load was for. A loading request is kept
@@ -1279,7 +1285,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         TODO: V2's try-and-see model lacks a free-blocks query API.
         Implementing this requires exposing storage statistics from the
         V2 runtime (e.g., free GPU slots per pool group). For now,
-        always returns True — PP is not yet supported (asserted in
-        KVCacheManagerV2 constructor via kv_connector_manager=None).
+        always returns True.
         """
         return True

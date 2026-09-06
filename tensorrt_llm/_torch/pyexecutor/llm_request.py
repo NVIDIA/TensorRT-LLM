@@ -1056,6 +1056,17 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # `free_resources` -- the one place an allocation dies.
         self.py_connector_allocation_reported = False
 
+        # The prompt range `[start, end)` the connector offered to serve, in
+        # absolute positions. Only populated under
+        # `aggressive_prefix_budgeting`, where the query runs in the scheduling
+        # pass and its answer has to outlive that pass: the offer is delivered,
+        # or handed back with `cancel_load`, in a later stage of the same
+        # iteration or a later one. `end is None` means the allocation has not
+        # been asked about yet.
+        self.py_connector_prefix_start: Optional[int] = None
+        self.py_connector_prefix_end: Optional[int] = None
+        self.py_connector_load_async = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
