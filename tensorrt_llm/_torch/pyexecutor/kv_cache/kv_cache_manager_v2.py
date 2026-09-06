@@ -1459,9 +1459,9 @@ class KVCacheManagerV2(BaseResourceManager):
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
             "TRTLLM_KV_FRESH_PAGE_FILL",
         )
-        # request id -> pool id -> (base page indices already filled, last seen
-        # page list). The second half is the early-out: an unchanged list means
-        # nothing was handed out since the previous step.
+        # request id -> pool id -> (currently assigned page indices already
+        # filled, last seen page list). The second half is the early-out: an
+        # unchanged list means nothing was handed out since the previous step.
         self._fresh_pages_filled: Dict[int, Dict[int, tuple]] = {}
         self._fresh_fill_announced = False
         # The guard page is held by a permanent sequence, so it needs an index
@@ -1633,6 +1633,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ):
                 continue
             state[pool_id] = (seen, base.copy())
+            # ``seen`` tracks the request's current pages, not its lifetime
+            # history: a page released by a shrink can be recycled by another
+            # request and handed back later, and by then it carries that
+            # request's data, so it has to count as fresh again.
+            seen.intersection_update(int(page) for page in base if page != BAD_PAGE_INDEX)
             fresh = [
                 int(page)
                 for ordinal, page in enumerate(base)

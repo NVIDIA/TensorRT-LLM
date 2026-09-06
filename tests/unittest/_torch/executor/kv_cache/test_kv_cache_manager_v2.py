@@ -39,6 +39,7 @@ from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
     DEFAULT_BEAM_INDEX,
     BatchDesc,
     DiskCacheTierConfig,
@@ -1204,3 +1205,226 @@ def test_guard_page_accessors_report_reserved_pages():
     assert KVCacheManagerV2.guard_page_index(manager, 1) == 14
     assert KVCacheManagerV2.guard_page_index(manager, 9) is None
     assert KVCacheManagerV2.guard_page_indices(manager) == frozenset({7, 14})
+
+
+class _FreshFillKVCache:
+    """Just enough of a KV cache for ``_fill_fresh_kv_pages``: a mutable page
+    list standing in for the pool's base page indices."""
+
+    def __init__(self, pages: list[int], num_committed_tokens: int = 0) -> None:
+        self.pages = list(pages)
+        self.num_committed_tokens = num_committed_tokens
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.pages)
+
+    def get_base_page_indices(self, pool_id: int) -> np.ndarray:
+        del pool_id
+        return np.asarray(self.pages, dtype=np.int32)
+
+
+_FRESH_FILL = 3.0
+
+
+def _make_fresh_fill_manager(
+    buffer: torch.Tensor,
+    kv_cache: _FreshFillKVCache,
+    monkeypatch: pytest.MonkeyPatch,
+    fill_value: float | None = _FRESH_FILL,
+) -> KVCacheManagerV2:
+    # The production path synchronises so the fill lands before the forward
+    # pass; these tests run on CPU tensors.
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    manager = object.__new__(KVCacheManagerV2)
+    manager._fresh_page_fill = fill_value
+    manager._fresh_pages_filled = {}
+    manager._fresh_fill_announced = True
+    manager.kv_cache_map = {1: kv_cache}
+    manager.tokens_per_block = TOKENS_PER_BLOCK
+    manager.num_pools = 1
+    manager.pp_layers = [0]
+    manager.layer_offsets = {0: 0}
+    manager.layer_to_pool_mapping_dict = {0: 0}
+    manager.kv_factor = 1
+    manager.get_buffers = lambda layer_idx: buffer
+    manager.get_layer_page_index_scale = lambda layer_idx: 1
+    return manager
+
+
+def test_fresh_fill_covers_pages_on_allocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Newly handed-out pages get the pattern; pages the request keeps do not."""
+    buffer = torch.zeros(8, 2)
+    kv_cache = _FreshFillKVCache([2, 5])
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[2], torch.full((2,), _FRESH_FILL))
+    assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
+    assert torch.equal(buffer[0], torch.zeros(2))
+
+    # The owner writes its KV into page 2; growing by one page must fill only
+    # the new page, not rewrite what the owner already stored.
+    buffer[2] = 1.5
+    kv_cache.pages = [2, 5, 6]
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[6], torch.full((2,), _FRESH_FILL))
+    assert torch.equal(buffer[2], torch.full((2,), 1.5))
+
+
+def test_fresh_fill_skips_committed_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pages holding the reused prefix carry a correct answer; writing the
+    pattern over them would corrupt it rather than diagnose anything."""
+    buffer = torch.zeros(8, 2)
+    kv_cache = _FreshFillKVCache([2, 5], num_committed_tokens=TOKENS_PER_BLOCK)
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[2], torch.zeros(2))
+    assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
+
+
+def test_fresh_fill_disabled_or_unknown_request_is_a_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = torch.zeros(4, 2)
+    kv_cache = _FreshFillKVCache([1])
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch, fill_value=None)
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer, torch.zeros(4, 2))
+    assert manager._fresh_pages_filled == {}
+
+    manager._fresh_page_fill = _FRESH_FILL
+    manager._fill_fresh_kv_pages(99)
+    assert torch.equal(buffer, torch.zeros(4, 2))
+
+
+def test_fresh_fill_refills_page_reassigned_after_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shrink, reuse by another request, regrow: the page must be refilled.
+
+    Tracking every page the request was ever given would skip the refill here
+    and leave the other request's KV readable through this request's page
+    table -- the exact leak the fill exists to catch.
+    """
+    buffer = torch.zeros(8, 2)
+    kv_cache = _FreshFillKVCache([2, 5])
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+    manager._fill_fresh_kv_pages(1)
+    buffer[2] = 1.5  # the owner's own KV, must survive to the end
+
+    # A resize releases page 5...
+    kv_cache.pages = [2]
+    manager._fill_fresh_kv_pages(1)
+    # ...another request gets it and writes its KV...
+    buffer[5] = 7.0
+    # ...and it later comes back to this request.
+    kv_cache.pages = [2, 5]
+    manager._fill_fresh_kv_pages(1)
+
+    assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
+    assert torch.equal(buffer[2], torch.full((2,), 1.5))
+
+
+class _GuardKVCache:
+    """Scriptable stand-in for the guard sequence's KV cache."""
+
+    def __init__(self, resume_ok: bool = True, resize_ok: bool = True) -> None:
+        self.resume_ok = resume_ok
+        self.resize_ok = resize_ok
+        self.closed = False
+        self.committing_stopped = False
+
+    def resume(self, stream: object) -> bool:
+        del stream
+        return self.resume_ok
+
+    def stop_committing(self) -> None:
+        self.committing_stopped = True
+
+    def resize(self, num_tokens: int) -> bool:
+        del num_tokens
+        return self.resize_ok
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _make_guard_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_cache: _GuardKVCache | None,
+    buffer: torch.Tensor | None,
+    page: int,
+) -> KVCacheManagerV2:
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    manager = object.__new__(KVCacheManagerV2)
+    manager._guard_page_fill = "nan"
+    manager._guard_page_value = float("nan")
+    manager._guard_page_by_layer = {}
+    manager.num_extra_kv_tokens = 0
+    manager.pp_layers = [0]
+    manager._stream = SimpleNamespace(cuda_stream=None)
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+
+    def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
+        del args, kwargs
+        if kv_cache is not None:
+            manager.kv_cache_map[request_id] = kv_cache
+        return kv_cache
+
+    manager._create_kv_cache = create_kv_cache
+    manager.get_buffers = lambda layer_idx: buffer
+    manager.get_batch_cache_indices = lambda request_ids, layer_idx: [[page]]
+    return manager
+
+
+def test_reserve_guard_page_fills_and_publishes_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffer = torch.zeros(8, 2)
+    kv_cache = _GuardKVCache()
+    manager = _make_guard_manager(monkeypatch, kv_cache, buffer, page=3)
+
+    manager._reserve_guard_page()
+
+    assert manager._guard_page_by_layer == {0: 3}
+    assert manager.guard_page_indices() == frozenset({3})
+    assert torch.isnan(buffer[3]).all()
+    assert torch.equal(buffer[2], torch.zeros(2))
+    # Never committed: the reuse tree must never hand this page to a request.
+    assert kv_cache.committing_stopped
+    assert not kv_cache.closed
+
+
+@pytest.mark.parametrize("failure", ["create", "resume", "resize", "no_layer"])
+def test_reserve_guard_page_failure_releases_the_reservation(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Every bail-out path stands the diagnostic down and frees what it took,
+    so the page and the index slot can be reassigned to real requests."""
+    buffer = torch.zeros(8, 2)
+    kv_cache = (
+        None
+        if failure == "create"
+        else _GuardKVCache(
+            resume_ok=failure != "resume",
+            resize_ok=failure != "resize",
+        )
+    )
+    page = BAD_PAGE_INDEX if failure == "no_layer" else 3
+    manager = _make_guard_manager(monkeypatch, kv_cache, buffer, page=page)
+
+    manager._reserve_guard_page()
+
+    assert manager._guard_page_fill == ""
+    assert manager._guard_page_by_layer == {}
+    assert manager.guard_page_indices() == frozenset()
+    assert manager.kv_cache_map == {}
+    assert torch.equal(buffer, torch.zeros(8, 2))
+    if kv_cache is not None:
+        assert kv_cache.closed
+        manager.index_mapper.remove_sequence.assert_called_once_with(
+            kv_cache_v2_module._GUARD_PAGE_REQUEST_ID
+        )
