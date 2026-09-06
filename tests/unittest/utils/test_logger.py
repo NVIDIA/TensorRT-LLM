@@ -274,6 +274,7 @@ class TestIsDebugEnabled:
         """A module raised to debug logs even when the global level is info."""
         singleton = Logger()
         previous = singleton._min_severity
+        previous_module_levels = singleton._module_levels
         singleton._min_severity = "info"
         singleton._module_levels = {"serve": 10}  # debug
         try:
@@ -286,13 +287,14 @@ class TestIsDebugEnabled:
             exec(code, fake_globals)
             assert fake_globals["result"] is True
         finally:
-            singleton._module_levels = {}
+            singleton._module_levels = previous_module_levels
             singleton._min_severity = previous
 
     def test_module_override_can_disable_above_the_global_level(self):
         """A module pinned to info stays quiet even when the global level is debug."""
         singleton = Logger()
         previous = singleton._min_severity
+        previous_module_levels = singleton._module_levels
         singleton._min_severity = "debug"
         singleton._module_levels = {"serve": 20}  # info
         try:
@@ -305,7 +307,7 @@ class TestIsDebugEnabled:
             exec(code, fake_globals)
             assert fake_globals["result"] is False
         finally:
-            singleton._module_levels = {}
+            singleton._module_levels = previous_module_levels
             singleton._min_severity = previous
 
 
