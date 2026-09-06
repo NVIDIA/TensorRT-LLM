@@ -127,6 +127,30 @@ def test_last_page_len_out_of_range(kv_lens, description):
     assert f"last_page_len outside [1, {PAGE_SIZE}] on rows [1]" in problems[0]
 
 
+@pytest.mark.parametrize(
+    "field,value,expected",
+    [
+        ("num_blocks", [2], "num_blocks has 1, logical_num_blocks has 2, kv_lens has 2"),
+        ("num_blocks", [2, 3, 1], "num_blocks has 3, logical_num_blocks has 2, kv_lens has 2"),
+        ("logical_num_blocks", [2], "num_blocks has 2, logical_num_blocks has 1, kv_lens has 2"),
+        (
+            "logical_num_blocks",
+            [2, 3, 1],
+            "num_blocks has 2, logical_num_blocks has 3, kv_lens has 2",
+        ),
+        ("kv_lens", [8], "num_blocks has 2, logical_num_blocks has 2, kv_lens has 1"),
+        ("kv_lens", [8, 10, 4], "num_blocks has 2, logical_num_blocks has 2, kv_lens has 3"),
+    ],
+)
+def test_row_count_mismatch_is_reported(field, value, expected):
+    args = _sound_table()
+    args[field] = value
+    problems = check_page_table(**args)
+    mismatch = [p for p in problems if p.startswith("row counts disagree")]
+    assert len(mismatch) == 1
+    assert expected in mismatch[0]
+
+
 def test_multiple_pools_are_all_checked():
     args = _sound_table()
     args["pool_indices"] = {
