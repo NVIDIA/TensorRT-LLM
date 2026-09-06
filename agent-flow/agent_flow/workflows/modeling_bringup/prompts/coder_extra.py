@@ -208,3 +208,45 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
 STAGE_GOAL_EXTENSION = _STAGE_GOAL_CODER_PROTOCOL
+
+_CONCURRENT_CODER_PROTOCOL = """\
+## Concurrent node protocol — working one assigned node per turn
+
+In concurrent mode the orchestrator schedules the plan's
+`## Execution Graph` as a DAG and runs many nodes in parallel. You are
+assigned **exactly ONE node this turn** — its `id` and scope are given in
+your turn prompt. Everything you do is confined to that node.
+
+- **Work only that node's scope.** Implement, debug, and test only the
+  module or integration work the assigned node's `plan.md` Goal / Stage
+  describes and its `## <node-id>` acceptance subsection requires. Work
+  that belongs to another node — a sibling Goal, a downstream node, a
+  different Stage — is out of bounds this turn.
+- **Edit code under your worktree.** Your node runs in its own workspace
+  (an isolated git worktree unless the node declares `isolation:
+  shared`). Make all source and test edits there; never reach into a
+  sibling node's worktree.
+- **Record progress / status to YOUR private files.** Write your per-turn
+  progress and status to your own node-scoped files (the ones your turn
+  prompt points at). They describe only this node's work.
+- **Do NOT read or maintain a shared stage/goal status table.**
+  Concurrent mode has no shared status table for you to open, rewrite, or
+  keep in sync — the orchestrator holds the run-state.
+- **Do NOT promote Goals and never emit a stage-closed marker.** You
+  never flip node state, never promote the next Goal, never mark a Stage
+  or node closed. The orchestrator owns graph state, scheduling, and
+  every node transition — it decides when your node is done and drives
+  the next ready node from the DAG's `depends_on` edges.
+
+The bring-up engineering rules above (Python-first kernels, tier order,
+CUDA-graph hard-path evidence, backend selection, no `auto_deploy/`) apply
+in full to the node you are assigned — concurrent mode changes only *what
+you own this turn* (one node, no shared table), not *how* you validate the
+work.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode).
+CONCURRENT_EXTENSION = _CONCURRENT_CODER_PROTOCOL

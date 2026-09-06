@@ -301,7 +301,46 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
     ]
 )
 
+
 # Stage/Goal control flow is only wired when the workflow runs with
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
 STAGE_GOAL_EXTENSION = _STAGE_GOAL_STATE_MACHINE
+
+_CONCURRENT_REVIEWER_PROTOCOL = """\
+## Concurrent node protocol — reviewing one assigned node per turn
+
+In concurrent mode the orchestrator schedules the plan's
+`## Execution Graph` as a DAG and runs many nodes in parallel. You review
+**exactly ONE node this turn** — its `id` and scope are given in your turn
+prompt. Everything you review is confined to that node.
+
+- **Review only that node's scope.** Judge only the module or integration
+  work the assigned node's `plan.md` Goal / Stage describes and its
+  `## <node-id>` acceptance subsection requires. Do not review or fault
+  work owned by a different node — a sibling Goal, a downstream node, a
+  different Stage.
+- **The code under review is under the node's worktree.** Build, run, and
+  inspect the change in the node's own workspace (an isolated git worktree
+  unless the node declares `isolation: shared`); never reach into a
+  sibling node's worktree.
+- **Record your verdict / status to YOUR private files.** Write your
+  per-turn review notes to your own node-scoped files. They describe only
+  this node.
+- **Do NOT read or maintain a shared stage/goal status table**, do NOT
+  promote the next Goal, and never emit a stage-closed marker. You do not
+  flip node state or decide what runs next.
+  The orchestrator owns graph state, scheduling, and every node
+  transition, driving the next ready node from the DAG's `depends_on`
+  edges once your node reaches a terminal verdict.
+
+Every bring-up REJECT trigger and evidence rule above still applies to the
+node you are reviewing — concurrent mode changes only *what you own this
+turn* (one node, no shared table), not the review standard.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode).
+CONCURRENT_EXTENSION = _CONCURRENT_REVIEWER_PROTOCOL
