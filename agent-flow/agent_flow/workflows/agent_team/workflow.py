@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+
+import anyio
 
 from agent_flow import (
     CLAUDE_CODE_DEFAULT_MODEL,
@@ -14,7 +18,17 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.orchestration import (
+    ExecutionGraph,
+    GraphResult,
+    GraphState,
+    IsolationProvider,
+    NodeScheduler,
+    NodeState,
+    NoOpIsolation,
+)
 
+from .node_workspace import NODES_DIRNAME, node_dir_slug
 from .progress import (
     BUILD_STAGE,
     PLAN_STAGE,
@@ -72,17 +86,53 @@ def _make_agent(
     model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
     human_input_enabled: bool = False,
+    cwd: str | Path | None = None,
 ) -> AgentLayer:
     hooks = _compose_required_tools_hooks(required_tools or [])
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
-            backend=BackendConfig(kind=backend_kind, model=model, tools=tools, hooks=hooks),
+            backend=BackendConfig(
+                kind=backend_kind,
+                model=model,
+                tools=tools,
+                hooks=hooks,
+                # ``None`` keeps the process CWD, which is what the linear path
+                # has always used. The concurrent path passes each node's
+                # worktree so the model edits code there, not in the shared
+                # checkout.
+                cwd=Path(cwd) if cwd is not None else None,
+            ),
             session=SessionConfig(mode=session_mode),
             human_input_enabled=human_input_enabled,
         )
     )
+
+
+@dataclass(frozen=True)
+class _DefaultNodePolicy:
+    """Workflow-agnostic default gate policy for the ``--concurrent`` path.
+
+    agent_team assigns no meaning to a node's opaque ``type``, so its default
+    treats every type the same: a ``coder ⇄ reviewer`` node that runs no QA and
+    is not a replan unit. It structurally satisfies node_runner's ``_NodePolicy``
+    Protocol (``runs_qa`` / ``is_replan_unit``) without importing any concrete
+    workflow's policy table — modeling_bringup injects its own stage/goal policy.
+    """
+
+    node_type: str
+    runs_qa: bool = False
+    is_replan_unit: bool = False
+
+
+def _default_policy_for_type(node_type: str) -> _DefaultNodePolicy:
+    """Return the workflow-agnostic default policy for ``node_type``.
+
+    Every type maps to the same "coder ⇄ reviewer, no QA, not a replan unit"
+    policy; the concrete meaning of a type is a wrapping workflow's concern.
+    """
+    return _DefaultNodePolicy(node_type=node_type)
 
 
 class AgentTeamWorkflow:
@@ -107,6 +157,11 @@ class AgentTeamWorkflow:
         acceptance_criteria: str | Path | None = None,
         feedback: str | Path | None = None,
         prompts: PromptBundle | None = None,
+        concurrent: bool = False,
+        isolation: IsolationProvider | None = None,
+        policy_for_type: Callable[[str], object] | None = None,
+        max_parallel: int = 8,
+        max_replan_rounds: int = 3,
     ) -> None:
         self.workspace = workspace
         self.prompts = prompts or DEFAULT_PROMPTS
@@ -116,6 +171,8 @@ class AgentTeamWorkflow:
         self.progress_path = workspace / "progress.yaml"
         self.status_path = workspace / "status.md"
         self.state_path = workspace / STATE_FILENAME
+        # Concurrent-mode scheduler checkpoint (written by ``_run_concurrent_build``).
+        self.graph_state_path = workspace / ".graph_state.json"
         self.num_iterations = num_iterations
         self.coder_context_reset_interval = coder_context_reset_interval
         self.reviewer_context_reset_interval = reviewer_context_reset_interval
@@ -151,6 +208,37 @@ class AgentTeamWorkflow:
         # with another ``--feedback`` adds another entry.
         self.pending_feedback = feedback
 
+        # The backend every role agent runs on. Mirrors ``_make_agent``'s
+        # defaults so the ``--concurrent`` path builds its per-node agents on
+        # the same backend/model the linear role agents use; keep these in sync
+        # with ``_make_agent`` if the workflow's backend ever changes.
+        self.backend_kind = "claude-code"
+        self.model = CLAUDE_CODE_DEFAULT_MODEL
+
+        # Opt-in concurrent DAG execution (Task 13). When enabled, the build
+        # loop is replaced by ``_run_concurrent_build``: the plan's
+        # ``## Execution Graph`` is run through the ``NodeScheduler`` with a
+        # ``make_run_node`` per-node loop and an injected isolation provider.
+        # Defaults are supplied only in this mode so the linear path stays
+        # entirely inert: a git-free ``NoOpIsolation`` rooted at the workspace,
+        # and a workflow-agnostic policy that runs every node type through the
+        # ``coder ⇄ reviewer`` loop with no QA. A wrapping workflow
+        # (modeling_bringup) injects its own isolation/policy instead.
+        self.concurrent = concurrent
+        self.max_parallel = max_parallel
+        # Bound on concurrent-mode replan rounds: after a scheduler pass ends with
+        # FAILED nodes (and --replan-on-qa), the PlanDrafter may replan the failed
+        # subtree and the graph re-runs, at most this many times, so a repeatedly-
+        # failing subtree cannot loop forever.
+        self.max_replan_rounds = max_replan_rounds
+        self._isolation = isolation
+        self._policy_for_type = policy_for_type
+        if self.concurrent:
+            if self._isolation is None:
+                self._isolation = NoOpIsolation(base_cwd=self.workspace)
+            if self._policy_for_type is None:
+                self._policy_for_type = _default_policy_for_type
+
         self.workspace.mkdir(parents=True, exist_ok=True)
         if clean:
             # Wipe the workflow's managed files so the constructor
@@ -162,8 +250,19 @@ class AgentTeamWorkflow:
                 self.acceptance_criteria_path,
                 self.progress_path,
                 self.status_path,
+                # Concurrent-mode derived state: the NodeScheduler checkpoint.
+                # Without this a ``--clean --concurrent`` rerun would silently
+                # resume the prior (possibly crashed) graph instead of starting
+                # over from the plan phase.
+                self.graph_state_path,
             ):
                 path.unlink(missing_ok=True)
+            # Concurrent-mode per-node sub-workspaces (``<workspace>/nodes/``)
+            # are workflow-managed derived state too — remove them so a rerun
+            # re-plans from scratch rather than reading a prior run's per-node
+            # progress/contexts. (Git worktrees + ``node/*`` branches are the
+            # isolation provider's state and are NOT torn down here.)
+            shutil.rmtree(self.workspace / NODES_DIRNAME, ignore_errors=True)
 
         # Resume is auto-detected from the checkpoint's presence;
         # ``--clean`` has just wiped it if the user wanted to start over.
@@ -327,6 +426,15 @@ class AgentTeamWorkflow:
             if state.stage in _PLAN_STAGES:
                 self._run_plan_phase(state, log)
 
+            # ----- CONCURRENT BUILD PHASE (opt-in) -----
+            # When ``--concurrent`` is set, the plan's ``## Execution Graph`` is
+            # run through the DAG scheduler INSTEAD of the linear single-cursor
+            # build loop below. The linear loop stays byte-for-byte unchanged;
+            # this branch is purely additive.
+            if self.concurrent:
+                self._run_concurrent_build(state)
+                return
+
             # ----- BUILD PHASE -----
             for i in range(state.next_iteration_index, self.num_iterations):
                 iteration = i + 1
@@ -430,6 +538,187 @@ class AgentTeamWorkflow:
                 log,
             )
             raise
+
+    def _run_concurrent_build(self, state: WorkflowState) -> None:
+        """Run the plan's Execution Graph through the DAG scheduler.
+
+        The ``--concurrent`` replacement for the linear build loop. Reads
+        ``plan.md``, extracts its ``## Execution Graph`` block, and drives every
+        node through :func:`~agent_flow.workflows.agent_team.node_runner.make_run_node`
+        under a :class:`~agent_flow.orchestration.NodeScheduler`, isolated by the
+        injected :class:`~agent_flow.orchestration.IsolationProvider`. Nodes whose
+        dependencies are all ``DONE`` run in parallel (up to ``max_parallel``);
+        the scheduler checkpoints to ``<workspace>/.graph_state.json`` so a crash
+        resumes without re-running finished nodes.
+
+        After the run, the orchestrator renders the DERIVED global observation
+        window — the whole-DAG ``status.md`` rollup and the node-tagged
+        ``progress.yaml`` timeline — from the final node states plus each node's
+        private files (single-writer aggregation, Task 14).
+
+        Raises:
+            ValueError: If ``plan.md`` has no ``## Execution Graph`` block — the
+                concurrent path requires the planner to declare the DAG.
+        """
+        # Imported lazily: ``node_runner`` imports ``_make_agent`` from this
+        # module, so a top-level import here would be circular.
+        from .aggregation import render_global_progress, render_global_status
+        from .execution_graph import extract_execution_graph
+        from .node_runner import make_run_node
+
+        log = get_logger().console
+
+        # ``run_node`` is graph-independent, so build it once and reuse it across
+        # replan rounds; the graph itself is re-extracted each round because a
+        # replan may have revised ``plan.md`` (and its ``## Execution Graph``).
+        run_node = make_run_node(
+            workspace=self.workspace,
+            prompts=self.prompts,
+            policy_for_type=self._policy_for_type,
+            num_iterations=self.num_iterations,
+            backend_kind=self.backend_kind,
+            model=self.model,
+        )
+
+        # Pre-scheduler feedback replan. A ``--feedback`` concurrent resume folds
+        # the new feedback into ``plan.md`` BEFORE the first scheduler pass, so a
+        # stage the drafter adds dispatches in the SAME pass — in parallel with a
+        # node that was in flight when the run was stopped (``RUNNING`` → ``PENDING``
+        # on resume). The old behavior only replanned AFTER a scheduler pass drained,
+        # folding feedback into a *failed* subtree; that could not run added work
+        # concurrently with an in-flight node, and silently dropped the feedback when
+        # the pass finished with no failure. This mirrors the linear path's
+        # ``STAGE_REPLAN`` re-entry (feedback re-plans, then builds). Additive only:
+        # DONE nodes stay DONE via the checkpoint and no subtree is reset here — the
+        # post-scheduler loop below still handles genuine QA failures.
+        if state.feedback_replan:
+            print_rule(
+                "[bold cyan]Replan (pending --feedback, before scheduler)[/bold cyan]",
+                log,
+            )
+            self._run_plan_drafter(
+                iteration=0,
+                mode="replan",
+                feedback_triggered=True,
+            )
+            state.feedback_replan = False
+            self._checkpoint(state)
+
+        # Bounded replan loop. Each round: re-extract the (possibly revised) graph,
+        # run the scheduler (resuming from .graph_state.json), and — when it ends
+        # with FAILED nodes under ``--replan-on-qa`` — let the PlanDrafter replan the
+        # failed subtree, reset that subtree (:meth:`_reconcile_failed_subtree`), and
+        # re-run. Without ``--replan-on-qa`` (or with no failures) it is a single pass,
+        # exactly the prior behavior. ``max_replan_rounds`` caps the loop so a
+        # repeatedly-failing subtree cannot spin forever.
+        for replan_round in range(self.max_replan_rounds + 1):
+            plan_text = self.plan_path.read_text(encoding="utf-8")
+            graph = extract_execution_graph(plan_text)
+            if graph is None:
+                raise ValueError(
+                    '--concurrent requires an "## Execution Graph" block in plan.md '
+                    "(none found). Provide a plan whose graph the scheduler can run, "
+                    "or drop --concurrent to use the linear build loop."
+                )
+            scheduler = NodeScheduler(
+                graph,
+                run_node,
+                self._isolation,
+                max_parallel=self.max_parallel,
+                checkpoint_path=self.graph_state_path,
+            )
+
+            print_rule("[bold cyan]Concurrent build (Execution Graph)[/bold cyan]", log)
+            result = anyio.run(scheduler.run)
+
+            # Render the orchestrator-owned global observation window: a whole-DAG
+            # rollup + a node-tagged timeline derived from the final node states and
+            # each node's private files. The orchestrator is the only writer of the
+            # top-level status.md / progress.yaml on the concurrent path.
+            node_ids = list(result.states.keys())
+            render_global_status(
+                workspace=self.workspace,
+                node_states=result.states,
+                node_ids=node_ids,
+            )
+            render_global_progress(workspace=self.workspace, node_ids=node_ids)
+
+            for node_id, node_state in result.states.items():
+                print_message(f"[bold]• node {node_id}: {node_state.value}[/bold]", log)
+            if result.succeeded:
+                print_message("[bold green]✔ all graph nodes DONE[/bold green]", log)
+                break
+            print_message(
+                "[bold yellow]⚠ graph finished with non-DONE nodes: "
+                f"failed={list(result.failed_ids)} blocked={list(result.blocked_ids)}"
+                "[/bold yellow]",
+                log,
+            )
+
+            # No replan requested, or nothing actually FAILED (only BLOCKED with no
+            # FAILED root) → stop, exactly the prior single-pass behavior.
+            if not self.replan_on_qa or not result.failed_ids:
+                break
+            if replan_round == self.max_replan_rounds:
+                print_message(
+                    "[bold yellow]⚠ replan budget (--max-replan-rounds) exhausted — "
+                    "stopping with non-DONE nodes[/bold yellow]",
+                    log,
+                )
+                break
+
+            # Subtree-scoped replan: the PlanDrafter revises the failed subtree's
+            # plan (findings come from the aggregated node records), and is the
+            # terminator — a ``DONE`` decision accepts the outcome and ends the loop.
+            print_rule("[bold cyan]Replan (failed subtree)[/bold cyan]", log)
+            self._run_plan_drafter(
+                iteration=replan_round + 1,
+                mode="replan",
+                feedback_triggered=state.feedback_replan,
+            )
+            state.feedback_replan = False
+            if self._latest_plan_drafter_decision() == "DONE":
+                print_message(
+                    "[bold green]✔ plan_drafter DONE — accepting the failed outcome[/bold green]",
+                    log,
+                )
+                break
+            self._reconcile_failed_subtree(result, graph)
+
+        # The loop exits either all-DONE, on PlanDrafter DONE, or on budget/flag —
+        # mark the run done so a bare rerun does not auto-resume into it.
+        state.done = True
+        self._checkpoint(state)
+
+    def _reconcile_failed_subtree(self, result: GraphResult, graph: ExecutionGraph) -> None:
+        """Reset a scheduler pass's FAILED + BLOCKED nodes so they re-run.
+
+        Subtree-scoped replan reconciliation: every FAILED or BLOCKED node has its
+        persisted checkpoint state set back to ``PENDING`` and its durable output
+        cleared — the ``node/<id>`` branch via :meth:`IsolationProvider.reclaim`, its
+        ``nodes/<id>/`` sub-workspace via ``rmtree`` — so the next scheduler pass
+        re-runs it from scratch under the revised plan. DONE nodes are never touched:
+        this is the structural guarantee that a replan cannot corrupt healthy work,
+        regardless of what the PlanDrafter wrote outside the failed subtree.
+        """
+        reset_ids = set(result.failed_ids) | set(result.blocked_ids)
+        if not reset_ids:
+            return
+
+        graph_state = GraphState.load(self.graph_state_path)
+        for node_id in reset_ids:
+            graph_state.states[node_id] = NodeState.PENDING
+            graph_state.worktrees.pop(node_id, None)
+        graph_state.save(self.graph_state_path)
+
+        for node_id in reset_ids:
+            shutil.rmtree(
+                self.workspace / NODES_DIRNAME / node_dir_slug(node_id),
+                ignore_errors=True,
+            )
+            node = graph.by_id.get(node_id)
+            if node is not None:
+                anyio.run(self._isolation.reclaim, node)
 
     def _run_plan_phase(self, state: WorkflowState, log) -> None:
         """Drive the plan phase to completion.
@@ -763,6 +1052,27 @@ class AgentTeamWorkflow:
                 )
                 state.done = False
                 state.stage = STAGE_REPLAN
+                state.feedback_replan = True
+                self._checkpoint(state)
+            # Concurrent --feedback resume: the concurrent build has no linear
+            # STAGE_REPLAN; the flag is consumed by ``_run_concurrent_build``, which
+            # replans the pending feedback into ``plan.md`` BEFORE its first scheduler
+            # pass (so an added stage runs in parallel with any resumed in-flight
+            # node, not after). So a --feedback resume on the concurrent path just
+            # flags it (no separate --trigger-replan-with-feedback needed). Requires
+            # --replan-on-qa (the build loop's gate), past the plan phase.
+            elif (
+                self.concurrent
+                and self.replan_on_qa
+                and self.pending_feedback is not None
+                and state.stage not in _PLAN_STAGES
+            ):
+                print_message(
+                    "[bold cyan]→ --feedback on a concurrent resume: replanning it "
+                    "into plan.md before the next scheduler pass.[/bold cyan]",
+                    log,
+                )
+                state.done = False
                 state.feedback_replan = True
                 self._checkpoint(state)
             if self.preset_plan is not None or self.preset_acceptance_criteria is not None:

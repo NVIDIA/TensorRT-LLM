@@ -301,13 +301,16 @@ def test_modeling_bringup_cli_module_imports():
 def test_modeling_bringup_cli_forwards_argv_verbatim():
     """Regression: the wrapper must forward ``argv`` to the generic agent-team ``main`` unchanged.
 
-    Only a task-scoped prompt bundle is injected. A prior bug parsed each flag manually and
-    dropped ``--feedback`` from the rebuilt constructor call, silently discarding user-supplied
-    guidance. Delegating with raw ``argv`` keeps every flag (current and future) forwarded by
-    construction.
+    A prior bug parsed each flag manually and dropped ``--feedback`` from the rebuilt constructor
+    call, silently discarding user-supplied guidance. Delegating with raw ``argv`` keeps every flag
+    (current and future) forwarded by construction.
 
-    Inspect the wrapper's source AST: the only call must be
-    ``_team_main(argv, prompts=prompts)``.
+    Inspect the wrapper's source AST: the sole ``_team_main`` call must forward
+    ``argv`` as the single positional argument and statically inject only the
+    task-scoped ``prompts=prompts`` bundle. The concurrent-DAG dependencies (isolation,
+    policy_for_type) ride in via a ``**`` splat that is empty on the linear path,
+    so the linear delegation stays byte-for-byte ``_team_main(argv, prompts=...)``
+    and never displaces the raw ``argv`` forwarding that guards the past bug class.
     """
     import ast
     import inspect
@@ -333,14 +336,79 @@ def test_modeling_bringup_cli_forwards_argv_verbatim():
         "in the previous bug class"
     )
 
-    # Prompts injection is the only kwarg.
-    kw_names = sorted(kw.arg for kw in call.keywords)
-    assert kw_names == ["prompts"], f"wrapper must only inject prompts=..., got keywords {kw_names}"
-    prompts_kw = call.keywords[0]
+    # The only *statically named* kwarg is prompts; the concurrent-DAG
+    # dependencies arrive via a ``**splat`` (empty on the linear path).
+    static_kwargs = {kw.arg: kw for kw in call.keywords if kw.arg is not None}
+    assert set(static_kwargs) == {"prompts"}, (
+        f"the only statically-injected kwarg must be prompts=...; the "
+        f"concurrent-DAG dependencies must ride in via a **splat that is empty "
+        f"on the linear path, got static kwargs {sorted(static_kwargs)}"
+    )
+    prompts_kw = static_kwargs["prompts"]
     assert isinstance(prompts_kw.value, ast.Name) and prompts_kw.value.id == "prompts", (
         "prompts kwarg must pass the task-scoped prompt bundle, "
         "not a reconstructed argv list or a static Slurm bundle"
     )
+
+
+def _stub_modeling_bringup_cli(monkeypatch, task_data, captured):
+    """Stub the modeling-bringup CLI's task/prompt plumbing and capture the delegate call.
+
+    Replaces ``load_and_validate_task_yaml`` (return the supplied ``task_data``),
+    the prompt builders (no live skill probe), and ``_team_main`` (record its
+    keyword args into ``captured``) so a test can drive ``main`` end-to-end and
+    inspect exactly what the wrapper injects.
+    """
+    module = _load_modeling_bringup_cli_module()
+    monkeypatch.setattr(module, "load_and_validate_task_yaml", lambda _path: task_data)
+    monkeypatch.setattr(module, "build_modeling_bringup_prompts", lambda **_kw: "PROMPTS")
+
+    def _fake_team_main(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "_team_main", _fake_team_main)
+    return module
+
+
+def test_modeling_bringup_concurrent_injects_git_worktree_isolation(tmp_path, monkeypatch):
+    """Under --concurrent the wrapper injects GitWorktreeIsolation + the stage/goal policy."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+    from agent_flow.workflows.modeling_bringup.node_policy import policy_for_type
+
+    repo = tmp_path / "trtllm"
+    repo.mkdir()
+    workspace = tmp_path / "ws"
+    task_data = {"trtllm_repo_path": str(repo)}
+
+    captured: dict = {}
+    module = _stub_modeling_bringup_cli(monkeypatch, task_data, captured)
+
+    module.main(["--task", "t.yaml", "--workspace", str(workspace), "--concurrent"])
+
+    isolation = captured["isolation"]
+    assert isinstance(isolation, GitWorktreeIsolation)
+    assert isolation.repo_path == repo
+    assert isolation.worktrees_root == workspace / "worktrees"
+    assert captured["policy_for_type"] is policy_for_type
+    assert captured["prompts"] == "PROMPTS"
+
+
+def test_modeling_bringup_linear_injects_no_isolation(tmp_path, monkeypatch):
+    """Without --concurrent the wrapper injects no isolation/policy (linear path unchanged)."""
+    repo = tmp_path / "trtllm"
+    repo.mkdir()
+    task_data = {"trtllm_repo_path": str(repo)}
+
+    captured: dict = {}
+    module = _stub_modeling_bringup_cli(monkeypatch, task_data, captured)
+
+    module.main(["--task", "t.yaml", "--workspace", str(tmp_path / "ws")])
+
+    # The linear delegation stays byte-for-byte ``_team_main(argv, prompts=...)``:
+    # no concurrent-DAG dependencies are injected at all.
+    assert "isolation" not in captured
+    assert "policy_for_type" not in captured
 
 
 def test_persistent_deviation_handling_in_modeling_bringup_reviewer():
