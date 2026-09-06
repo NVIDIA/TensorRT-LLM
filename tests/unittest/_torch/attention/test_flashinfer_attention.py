@@ -1440,6 +1440,15 @@ class TestSplitKVScratchReset(unittest.TestCase):
         plan_info[flashinfer_backend._FI_PLAN_SPLIT_KV] = int(split_kv)
         return plan_info
 
+    def _decode_plan_info(self, split_kv: bool = True) -> List[int]:
+        plan_info = [0] * flashinfer_backend._FI_DECODE_PLAN_INFO_LEN
+        plan_info[flashinfer_backend.
+                  _FI_DECODE_PLAN_PADDED_BATCH_SIZE] = self.PADDED_BATCH_SIZE
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_V_OFFSET] = self.V_OFFSET
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_S_OFFSET] = self.S_OFFSET
+        plan_info[flashinfer_backend._FI_DECODE_PLAN_SPLIT_KV] = int(split_kv)
+        return plan_info
+
     def _reset(self, workspace: torch.Tensor, wrapper) -> None:
         # Unbound call: the method needs nothing from the metadata but the
         # workspace buffer, and constructing one requires a GPU.
@@ -1447,13 +1456,9 @@ class TestSplitKVScratchReset(unittest.TestCase):
             SimpleNamespace(workspace_buffer=workspace), wrapper,
             self.NUM_QO_HEADS, self.HEAD_DIM)
 
-    def test_resets_exactly_the_planned_extent(self):
-        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
-        self._reset(workspace, SimpleNamespace(_plan_info=self._plan_info()))
-
-        num_tiles = self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS
-        v_bytes = num_tiles * self.HEAD_DIM * flashinfer_backend._FI_SIZEOF_FLOAT
-        s_bytes = num_tiles * flashinfer_backend._FI_SIZEOF_FLOAT
+    def _assert_reset_extent(self, workspace: torch.Tensor, num_rows: int):
+        v_bytes = num_rows * self.HEAD_DIM * flashinfer_backend._FI_SIZEOF_FLOAT
+        s_bytes = num_rows * flashinfer_backend._FI_SIZEOF_FLOAT
 
         # tmp_v is zeroed; tmp_s holds the neutral log-sum-exp, which must be
         # finite so the merge cannot produce NaN from -inf minus -inf.
@@ -1469,12 +1474,33 @@ class TestSplitKVScratchReset(unittest.TestCase):
                          self.S_OFFSET - 1, self.S_OFFSET + s_bytes):
             self.assertEqual(int(workspace[boundary]), self.FILL)
 
-    def test_no_op_without_a_split_kv_prefill_plan(self):
+    def test_resets_exactly_the_planned_prefill_extent(self):
+        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
+        self._reset(workspace, SimpleNamespace(_plan_info=self._plan_info()))
+        # The prefill plan sizes the scratch per query tile:
+        # padded_batch_size * cta_tile_q * num_qo_heads rows.
+        self._assert_reset_extent(
+            workspace,
+            self.PADDED_BATCH_SIZE * self.CTA_TILE_Q * self.NUM_QO_HEADS)
+
+    def test_resets_exactly_the_planned_decode_extent(self):
+        workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
+        self._reset(workspace,
+                    SimpleNamespace(_plan_info=self._decode_plan_info()))
+        # The decode plan has one query row per request, so there is no
+        # cta_tile_q factor: padded_batch_size * num_qo_heads rows.
+        self._assert_reset_extent(workspace,
+                                  self.PADDED_BATCH_SIZE * self.NUM_QO_HEADS)
+
+    def test_no_op_without_a_split_kv_plan(self):
         untouched = torch.full((1 << 16, ), self.FILL, dtype=torch.uint8)
         for wrapper in (
                 SimpleNamespace(_plan_info=self._plan_info(split_kv=False)),
-                # A batch-decode plan returns 10 entries in a different order.
-                SimpleNamespace(_plan_info=[0] * 10),
+                SimpleNamespace(_plan_info=self._decode_plan_info(
+                    split_kv=False)),
+                # An unrecognized plan layout (e.g. the 9-entry SM90 prefill
+                # plan) must be left alone.
+                SimpleNamespace(_plan_info=[1] * 9),
                 SimpleNamespace(_plan_info=None),
                 SimpleNamespace(),
         ):

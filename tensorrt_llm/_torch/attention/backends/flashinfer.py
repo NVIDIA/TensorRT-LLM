@@ -278,14 +278,20 @@ class FlashInferWrappers:
 
 # Field order of the plan-info vector returned by FlashInfer's FA2
 # batch-prefill plan (``PrefillPlanInfo::ToVector``,
-# include/flashinfer/attention/scheduler.cuh). The decode plan returns a
-# 10-entry vector with a different order, so the length identifies the layout.
+# include/flashinfer/attention/scheduler.cuh). The batch-decode plan
+# (``DecodePlanInfo::ToVector``, same file) returns a 10-entry vector with a
+# different order, so the length identifies the layout.
 _FI_PREFILL_PLAN_INFO_LEN = 15
 _FI_PLAN_PADDED_BATCH_SIZE = 0
 _FI_PLAN_CTA_TILE_Q = 3
 _FI_PLAN_V_OFFSET = 10
 _FI_PLAN_S_OFFSET = 11
 _FI_PLAN_SPLIT_KV = 14
+_FI_DECODE_PLAN_INFO_LEN = 10
+_FI_DECODE_PLAN_PADDED_BATCH_SIZE = 0
+_FI_DECODE_PLAN_V_OFFSET = 1
+_FI_DECODE_PLAN_S_OFFSET = 2
+_FI_DECODE_PLAN_SPLIT_KV = 9
 _FI_SIZEOF_FLOAT = 4
 
 # The value a split-KV partial's log-sum-exp must hold for the merge to ignore
@@ -1569,17 +1575,31 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         plan_info = list(plan_info)
         # The FA2 batch-prefill plan returns 15 entries; the batch-decode plan
         # returns 10 in a different order, so the length picks out the layout.
-        if len(plan_info) != _FI_PREFILL_PLAN_INFO_LEN:
+        # The extents mirror the plans' allocations: prefill sizes tmp_v as
+        # padded_batch_size * cta_tile_q * num_qo_heads * head_dim rows of
+        # float, decode as padded_batch_size * num_qo_heads * head_dim (one
+        # query row per request, no query tiling); tmp_s is the same without
+        # the head_dim factor.
+        if len(plan_info) == _FI_PREFILL_PLAN_INFO_LEN:
+            if not plan_info[_FI_PLAN_SPLIT_KV]:
+                # No split, no partials and no merge.
+                return
+            num_rows = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
+                        plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
+            v_offset = plan_info[_FI_PLAN_V_OFFSET]
+            s_offset = plan_info[_FI_PLAN_S_OFFSET]
+        elif len(plan_info) == _FI_DECODE_PLAN_INFO_LEN:
+            if not plan_info[_FI_DECODE_PLAN_SPLIT_KV]:
+                return
+            num_rows = (plan_info[_FI_DECODE_PLAN_PADDED_BATCH_SIZE] *
+                        num_qo_heads)
+            v_offset = plan_info[_FI_DECODE_PLAN_V_OFFSET]
+            s_offset = plan_info[_FI_DECODE_PLAN_S_OFFSET]
+        else:
+            # Some other wrapper's plan layout; leave it alone.
             return
-        if not plan_info[_FI_PLAN_SPLIT_KV]:
-            # No split, no partials and no merge.
-            return
-        num_tiles = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
-                     plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
-        v_offset = plan_info[_FI_PLAN_V_OFFSET]
-        s_offset = plan_info[_FI_PLAN_S_OFFSET]
-        v_bytes = num_tiles * head_dim_vo * _FI_SIZEOF_FLOAT
-        s_bytes = num_tiles * _FI_SIZEOF_FLOAT
+        v_bytes = num_rows * head_dim_vo * _FI_SIZEOF_FLOAT
+        s_bytes = num_rows * _FI_SIZEOF_FLOAT
         # workspace_buffer is uint8, so these are byte ranges. Both offsets are
         # 16-byte aligned by FlashInfer's allocator, so the float view is safe.
         # tmp_v is a partial output and contributes nothing once its weight is
