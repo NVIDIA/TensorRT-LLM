@@ -326,7 +326,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         }
 
         // Separate deferred vs scratch slots, and collect scratch ready events.
-        std::vector<CachedCudaEvent const*> scratchReadyEvents;
+        std::vector<CUevent> scratchReadyEvents;
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (!tmpSlots[lc].empty())
@@ -346,7 +346,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
                 {
                     scratchSlots.emplace_back(std::move(slot), *this, lc,
                         /*skipWait=*/true);
-                    scratchReadyEvents.push_back(&scratchSlots.back().slot().readyEvent);
+                    scratchReadyEvents.push_back(scratchSlots.back().slot().readyEvent.handle());
                 }
             }
         }
@@ -354,7 +354,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         // Wait only for newly-added scratch slots (mirrors Python's
         // stream_wait_events for scratch_slots_to_add).
         if (!scratchReadyEvents.empty())
-            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), scratchReadyEvents);
+            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(scratchReadyEvents));
     }
 
     try
@@ -386,13 +386,13 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
         // Wait for all new slots to be ready (deduplicated).
         {
-            std::vector<CachedCudaEvent const*> slotEvents;
+            std::vector<CUevent> slotEvents;
             for (auto& optSlot : deferredSlots)
             {
                 if (optSlot.has_value())
-                    slotEvents.push_back(&optSlot->readyEvent);
+                    slotEvents.push_back(optSlot->readyEvent.handle());
             }
-            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
+            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), std::move(slotEvents));
         }
 
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
@@ -1176,12 +1176,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
         // Wait on newly allocated slots.
         {
-            std::vector<CachedCudaEvent const*> readyEvents;
+            std::vector<CUevent> readyEvents;
             for (auto const& lcSlots : newSlots)
                 for (auto const& slot : lcSlots)
-                    readyEvents.push_back(&slot.readyEvent);
+                    readyEvents.push_back(slot.readyEvent.handle());
             if (!readyEvents.empty())
-                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), readyEvents);
+                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(readyEvents));
         }
 
         // Combine: new slots + excess scratch detached slots.
@@ -1236,12 +1236,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         // Wait for all slots that will back new pages. This includes detached excess scratch slots,
         // which are not covered by the earlier wait on newly allocated slots.
         {
-            std::vector<CachedCudaEvent const*> readyEvents;
+            std::vector<CUevent> readyEvents;
             for (auto const& lcSlots : slots)
                 for (auto const& slot : lcSlots)
-                    readyEvents.push_back(&slot.readyEvent);
+                    readyEvents.push_back(slot.readyEvent.handle());
             if (!readyEvents.empty())
-                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), readyEvents);
+                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(readyEvents));
         }
 
         // Scratch and stale blocks do not consume per-request KV pages, so exclude them from allocation stats.

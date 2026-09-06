@@ -224,14 +224,10 @@ bool SlotAllocator::finishShrink()
             }
             TLLM_CHECK_WITH_INFO(ids.size() == mOverflowSlots.size(), "Duplicate slot IDs in overflow slots");
         }
-        // Synchronize overflow events (deduplicated — slots often share events).
-        {
-            std::vector<CachedCudaEvent*> overflowEvents;
-            overflowEvents.reserve(mOverflowSlots.size());
-            for (auto& s : mOverflowSlots)
-                overflowEvents.push_back(&s.readyEvent);
-            synchronizeAll(overflowEvents);
-        }
+        // Synchronize overflow events. Slots often share an event; synchronize() closes it, so
+        // later slots holding the same event return immediately.
+        for (auto& s : mOverflowSlots)
+            s.readyEvent.synchronize();
         for (auto& s : mOverflowSlots)
             s.resetSlot();
         mOverflowSlots.clear();
