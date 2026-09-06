@@ -1157,15 +1157,15 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
 
-        std::vector<CachedCudaEvent const*> priorEvents;
+        std::vector<CUevent> priorEvents;
         priorEvents.reserve(2 * srcPages.size());
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
-            priorEvents.push_back(&srcPages.at(i)->readyEvent);
-            priorEvents.push_back(&dstSlots.at(i).readyEvent);
+            priorEvents.push_back(srcPages.at(i)->readyEvent.handle());
+            priorEvents.push_back(dstSlots.at(i).readyEvent.handle());
         }
 
-        TemporaryCudaStream tempStream(priorEvents);
+        TemporaryCudaStream tempStream(std::move(priorEvents));
         auto updateReadyEvents = FuncGuard(
             [&]()
             {

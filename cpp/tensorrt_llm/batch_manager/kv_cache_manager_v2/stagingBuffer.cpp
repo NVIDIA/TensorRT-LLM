@@ -160,14 +160,11 @@ StagingBufferManager::~StagingBufferManager() noexcept
     KVCM2_LOG_ON_EXCEPT(
         [&]
         {
-            std::vector<CachedCudaEvent*> readyEvents;
-            readyEvents.reserve(mRanges.size());
             for (auto& range : mRanges)
             {
                 TLLM_CHECK_WITH_INFO(range.retired, "Destroying a staging-buffer manager with a live buffer");
-                readyEvents.push_back(&range.readyEvent);
+                range.readyEvent.synchronize();
             }
-            synchronizeAll(readyEvents);
         });
 }
 
@@ -280,26 +277,24 @@ StagingBufferRange* StagingBufferManager::reserve(
                 auto payloadBegin = splitRange(runBegin, dataBegin);
                 auto payloadEnd = splitRange(payloadBegin, end);
 
-                auto collectEvents = [&](auto& readyEvents)
+                if (stream.has_value())
                 {
+                    std::vector<CUevent> readyEvents;
                     readyEvents.reserve(numRunRanges);
                     for (auto range = payloadBegin; range != payloadEnd; ++range)
                     {
                         TLLM_CHECK_DEBUG(range->retired);
-                        readyEvents.push_back(&range->readyEvent);
+                        readyEvents.push_back(range->readyEvent.handle());
                     }
-                };
-                if (stream.has_value())
-                {
-                    std::vector<CachedCudaEvent const*> readyEvents;
-                    collectEvents(readyEvents);
-                    streamWaitEvents(reinterpret_cast<CudaStream>(*stream), readyEvents);
+                    streamWaitEvents(reinterpret_cast<CudaStream>(*stream), std::move(readyEvents));
                 }
                 else
                 {
-                    std::vector<CachedCudaEvent*> readyEvents;
-                    collectEvents(readyEvents);
-                    synchronizeAll(readyEvents);
+                    for (auto range = payloadBegin; range != payloadEnd; ++range)
+                    {
+                        TLLM_CHECK_DEBUG(range->retired);
+                        range->readyEvent.synchronize();
+                    }
                 }
 
                 mRanges.erase(payloadBegin, payloadEnd);
