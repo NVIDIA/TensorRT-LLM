@@ -4670,13 +4670,12 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
         "coalesces a request's scattered per-block KV for a single multi-rail "
         "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
-        "the per-block path, >0 enables bounce at that capacity. With the "
-        "default Python implementation it is per-region (one buffer for send, "
-        "one for recv); with agent_bounce_buffer_enable it is one shared "
-        "buffer whose usable capacity rounds down to a power of two (e.g. "
-        "384 -> 256), so prefer 256/512/1024. Requires the Python (v2) "
-        "transceiver (transceiver_runtime); the C++ transceiver does not "
-        "support bounce and ignores this field.")
+        "the per-block path, >0 enables bounce at that capacity. By default "
+        "two buffers of this size are allocated (one for send, one for recv); "
+        "with agent_bounce_buffer_enable a single shared buffer is allocated "
+        "instead and the size should be a power of two (256/512/1024). "
+        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
+        "transceiver does not support bounce and ignores this field.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4693,23 +4692,15 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     agent_bounce_buffer_enable: bool = Field(
         default=False,
         description=
-        "Use the C++ transfer-agent bounce implementation instead of the "
-        "Python one. kv_cache_bounce_size_mb is then a single buffer shared by "
-        "send and recv (about half the memory footprint of the Python "
-        "per-region pair for the same number). Configure the context and "
-        "generation instances consistently. Requires the Python (v2) "
-        "transceiver (transceiver_runtime); the C++ transceiver does not "
-        "support bounce and ignores this field. Bounce engages per request "
-        "only when a KV write has at least 1024 descriptors averaging at most "
-        "16 KiB; head-matched layouts (MLA, symmetric TP) produce one ~1-2 MiB "
-        "descriptor per block and stay on standard NIXL unless "
-        "agent_bounce_params raises max_average_descriptor_size (e.g. '4MB'; "
-        "max_average_descriptor_size=0 routes every write to standard NIXL, a "
-        "kill switch) and lowers min_descriptor_count (0 = no minimum). "
-        "request_timeout_ms and max_chunk_size (its effective, arena-clamped "
-        "value) in agent_bounce_params must match between context and "
-        "generation; a mismatched pair falls back to standard NIXL with a "
-        "WARNING when the peer is loaded (transfers are then routed silently).")
+        "Run the KV-cache bounce inside the C++ transfer agent (the NIXL "
+        "transport layer) instead of in the Python transceiver. It uses one "
+        "kv_cache_bounce_size_mb buffer shared by send and recv (about half "
+        "the memory of the Python bounce); make that size a power of two "
+        "(256/512/1024). Set it identically on context and generation. Only "
+        "writes with many small descriptors (>= 1024, <= 16 KiB average) take "
+        "the bounce path; others stay on standard NIXL. Thresholds and other "
+        "expert knobs live in agent_bounce_params. Requires the Python (v2) "
+        "transceiver; the C++ transceiver ignores this field.")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
@@ -4718,7 +4709,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
         "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
         "Precedence: this dict > environment variable > built-in default. "
-        "Requires agent_bounce_buffer_enable.")
+        "Requires agent_bounce_buffer_enable. request_timeout_ms and "
+        "max_chunk_size must match between context and generation.")
 
     @field_validator('agent_bounce_params', mode='before')
     @classmethod
