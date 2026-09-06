@@ -19,7 +19,7 @@ same mistake fails in seconds on one GPU.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata
 
 
 class _StubCacheManager:
