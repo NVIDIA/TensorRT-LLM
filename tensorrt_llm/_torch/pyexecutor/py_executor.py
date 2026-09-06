@@ -1066,6 +1066,8 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
+            self._check_aggressive_prefix_budgeting(is_kv_cache_manager_v2)
+
             if is_kv_cache_manager_v2:
                 # Registered regions are device addresses, so every page has
                 # to stay pinned to GPU for as long as the connector holds
@@ -1090,6 +1092,58 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    def _check_aggressive_prefix_budgeting(
+            self, is_kv_cache_manager_v2: bool) -> None:
+        """Reject a configuration that cannot support the speculative prefix query.
+
+        Three requirements, each of which fails silently rather than loudly if
+        it is not checked here.
+
+        The flat-tensor manager asks inside ``addSequence``, once the batch is
+        final, and has no way to unask; there is nowhere for the query to move
+        to.
+
+        ``cancel_load`` is what makes the query safe to ask early. A connector
+        that does not implement it leaks ownership of every offer the runtime
+        declines, and nothing at runtime reports that.
+
+        Prefix-aware scheduling is what carries the saving into the budget: with
+        it off, both context paths size the request against the remaining length
+        captured before the query ran, so the mode costs a cancellation path and
+        buys nothing.
+        """
+        if not self.kv_connector_manager.aggressive_prefix_budgeting:
+            return
+
+        if not is_kv_cache_manager_v2:
+            raise NotImplementedError(
+                "kv_connector_config.aggressive_prefix_budgeting requires the "
+                "V2 KV cache manager, which allocates during scheduling and can "
+                "suspend a request whose allocation is refuted. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True, or unset "
+                "aggressive_prefix_budgeting.")
+
+        if not self.kv_connector_manager.supports_load_cancellation():
+            scheduler = self.kv_connector_manager.scheduler
+            raise NotImplementedError(
+                f"{type(scheduler).__name__} does not implement cancel_load, "
+                "which kv_connector_config.aggressive_prefix_budgeting "
+                "requires. Asking during the scheduling pass makes the query "
+                "speculative: an offer can be clamped, outrun by the local "
+                "cache, left uncovered by pages, or dropped with the request, "
+                "and cancel_load is the only way the connector is told to "
+                "release it.")
+
+        scheduler_config = getattr(self.llm_args, 'scheduler_config', None)
+        if scheduler_config is not None and \
+                not scheduler_config.enable_prefix_aware_scheduling:
+            raise NotImplementedError(
+                "kv_connector_config.aggressive_prefix_budgeting requires "
+                "scheduler_config.enable_prefix_aware_scheduling=True. Without "
+                "it the scheduler budgets a context request against the length "
+                "it had before the connector was asked, so a served prefix "
+                "frees no budget and the mode has no effect.")
 
     @staticmethod
     def _reject_connector_prefix_without_block_reuse(kv_cache_manager) -> None:

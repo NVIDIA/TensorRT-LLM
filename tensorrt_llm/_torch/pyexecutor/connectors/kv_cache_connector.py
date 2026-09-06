@@ -419,6 +419,38 @@ class KvCacheConnectorScheduler(ABC):
             )
         self.update_state_after_alloc(request, block_ids_by_layer_group[0])
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        """
+        Release ownership taken in ``get_num_new_matched_tokens`` for prompt
+        tokens ``[start, end)``, which the runtime will not consume after all.
+
+        Offsets are absolute prompt positions, on the same scale as
+        ``num_computed_tokens``. The range is always a suffix of what was
+        offered, or the whole offer.
+
+        Only called when ``KvCacheConnectorConfig.aggressive_prefix_budgeting``
+        is set. That is the mode in which the runtime asks during its scheduling
+        pass, so an answered query no longer guarantees the request runs: the
+        offer can be clamped, outrun by the local cache while the request waits,
+        left uncovered by pages, or dropped when the request is cancelled or
+        fails. Without this the connector would hold those remote blocks for the
+        life of the process, which is why the mode refuses to start unless this
+        is overridden.
+
+        Best-effort. For a synchronous load nothing has transferred yet, so the
+        release is exact. For an asynchronous load the transfer began inside
+        ``get_num_new_matched_tokens``, so it may already be in flight.
+
+        Args:
+            request: The request whose offer is being handed back.
+            start: First prompt position that will not be consumed.
+            end: One past the last prompt position that will not be consumed.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement cancel_load, which "
+            "aggressive_prefix_budgeting requires."
+        )
+
     def wait_for_initialization(self):
         """
         Some connectors need to wait for some resources to be initialized.
@@ -645,7 +677,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     """
 
     def __init__(
-        self, worker: KvCacheConnectorWorker, scheduler: Optional[KvCacheConnectorScheduler]
+        self,
+        worker: KvCacheConnectorWorker,
+        scheduler: Optional[KvCacheConnectorScheduler],
+        aggressive_prefix_budgeting: bool = False,
     ):
         assert (scheduler is not None) == (mpi_rank() == 0), (
             "The scheduler may only exist on rank 0!"
@@ -655,6 +690,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker = worker
         self.scheduler = scheduler
+        # Read by the KV cache manager to decide whether the prefix query runs
+        # in the scheduling pass or once the batch is final. Carried here rather
+        # than read from llm_args so the cache manager needs only this object.
+        self.aggressive_prefix_budgeting = aggressive_prefix_budgeting
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -747,6 +786,28 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)
         self.commit_new_matched_tokens(request, num_tokens, load_kv_async)
         return num_tokens
+
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        """Hand back ``[start, end)`` of an offer the runtime will not consume.
+
+        Runs on the leader like the query it undoes, so a rank without a
+        scheduler has nothing to release. Empty ranges are dropped here rather
+        than at each call site.
+        """
+        if end <= start:
+            return
+        self._run_on_leader(lambda: self.scheduler.cancel_load(request, start, end))
+
+    def supports_load_cancellation(self) -> bool:
+        """Whether the connector's scheduler overrides ``cancel_load``.
+
+        False on a rank with no scheduler, which never calls it. Checked at
+        bring-up because the failure it prevents -- a connector holding remote
+        blocks it was told to release -- has no runtime symptom.
+        """
+        if self.scheduler is None:
+            return False
+        return type(self.scheduler).cancel_load is not KvCacheConnectorScheduler.cancel_load
 
     def reset_request_state(self, request: LlmRequest) -> None:
         """Tell the connector bookkeeping that this request's allocation died.
