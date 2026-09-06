@@ -766,8 +766,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
         self.previous_request_ids = []
         # Per-request verify windows seen by the last full _prepare_tp_inputs
-        # pass; all None without ragged verification.
-        self.previous_verify_lens = []
+        # pass; absent entirely without ragged verification.
+        self.previous_verify_lens = [] if self._dspark_trims_submitted_tokens else None
         self.has_previous_device_draft = False
 
 
@@ -6634,8 +6634,9 @@ class PyTorchModelEngine(ModelEngine):
         # BEFORE the refresh decision below: it asks the metadata whether this
         # step is ragged, and asking before this step's windows are on it
         # reads the previous step's answer.
-        self._publish_gen_token_layout(attn_metadata,
-                                       scheduled_requests.generation_requests)
+        if self._dspark_trims_submitted_tokens:
+            self._publish_gen_token_layout(
+                attn_metadata, scheduled_requests.generation_requests)
 
         refresh_seq_lens = not attn_metadata.is_cuda_graph
         if (not refresh_seq_lens
@@ -6828,9 +6829,10 @@ class PyTorchModelEngine(ModelEngine):
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(
                     context_prompt_lookahead)
-            self._attach_ragged_verify_layout(
-                spec_metadata, attn_metadata,
-                scheduled_requests.generation_requests)
+            if self._dspark_trims_submitted_tokens:
+                self._attach_ragged_verify_layout(
+                    spec_metadata, attn_metadata,
+                    scheduled_requests.generation_requests)
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
@@ -6872,10 +6874,11 @@ class PyTorchModelEngine(ModelEngine):
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
-            self.previous_verify_lens = [
-                getattr(request, "py_verify_len", None)
-                for request in scheduled_requests.generation_requests
-            ]
+            if self._dspark_trims_submitted_tokens:
+                self.previous_verify_lens = [
+                    getattr(request, "py_verify_len", None)
+                    for request in scheduled_requests.generation_requests
+                ]
             self.has_previous_device_draft = next_draft_tokens_device is not None
 
         if not is_dummy:
