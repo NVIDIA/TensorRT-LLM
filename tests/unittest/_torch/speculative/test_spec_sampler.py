@@ -323,6 +323,7 @@ def test_sampler_uses_uniform_or_confidence_window_for_rewind(
         uses_verify_window_protocol=uses_verify_window_protocol,
     )
     sampler = SpecSampler.__new__(SpecSampler)
+    sampler.draft_len = 5
     sampler.max_accepted_path_len = 6
     sampler.max_seq_len = 32
     sampler._request_common_handling = lambda *_args: None
