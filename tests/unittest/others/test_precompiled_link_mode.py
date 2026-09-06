@@ -63,11 +63,15 @@ PACKAGE_DATA = ["libs/*.so"]
 
 
 def _run(extract, source, workspace, link):
+    previous = os.environ.get("TRTLLM_PRECOMPILED_LINK")
     os.environ["TRTLLM_PRECOMPILED_LINK"] = "1" if link else "0"
     try:
         extract(str(source), PACKAGE_DATA, str(workspace))
     finally:
-        del os.environ["TRTLLM_PRECOMPILED_LINK"]
+        if previous is None:
+            os.environ.pop("TRTLLM_PRECOMPILED_LINK", None)
+        else:
+            os.environ["TRTLLM_PRECOMPILED_LINK"] = previous
 
 
 def test_link_mode_symlinks_the_artifacts(extract_from_precompiled, build_tree, tmp_path):
