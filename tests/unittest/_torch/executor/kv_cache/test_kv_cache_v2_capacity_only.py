@@ -8,9 +8,9 @@ import pytest
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor._util import _get_num_reserved_index_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor._util import _get_num_reserved_index_slots
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
 DataType = tensorrt_llm.bindings.DataType
