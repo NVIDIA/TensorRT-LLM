@@ -903,10 +903,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.is_disagg = is_disagg
+        self.kv_connector_manager = kv_connector_manager
+        # Filled on first use; the layer grouping does not change after init.
+        self._connector_window_by_group: Optional[List[Optional[int]]] = None
 
-        assert kv_connector_manager is None, (
-            "kv_connector_manager is not supported for KVCacheManagerV2"
-        )
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
 
         self.kv_cache_type = kv_cache_type
@@ -1133,7 +1133,18 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
+        if kv_connector_manager is not None and kv_cache_config.host_cache_size is None:
+            # A connector holds device addresses for its pages, and evicting a
+            # page to another tier reassigns its GPU slot underneath it. The
+            # automatic host tier only exists to give MAX_UTILIZATION somewhere
+            # to spill to, which a connector run never uses, so drop it here; an
+            # explicitly configured host_cache_size is rejected at bring-up.
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: a KV connector is attached "
+                "and registers GPU page addresses that tier migration would invalidate."
+            )
+        elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
@@ -2669,12 +2680,37 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
+                # The chunk is position-relative, so re-deriving the position
+                # without it leaves the pair describing two different ranges --
+                # a request re-entering after a narrowed chunk comes back with
+                # `position + chunk` short of `prompt_len`, silently chunked.
+                # Spanning to the end is the right floor: the chunked scheduler
+                # overwrites it immediately below, and the non-chunked path
+                # wants exactly this value.
+                req.context_chunk_size = req.context_remaining_length
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
                 kv_cache.enable_swa_scratch_reuse = False
-            return self._resume_and_restore(req.py_request_id, kv_cache)
+            elif self._connector_may_serve(req):
+                # Same reason: a connector writes real cache content into these
+                # blocks. The flag has to be off before `resize_context` can
+                # take scratch slots, which is ahead of the point either mode
+                # knows whether the connector will actually serve anything, so
+                # it is cleared for every servable request rather than only the
+                # served ones.
+                kv_cache.enable_swa_scratch_reuse = False
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
+                return False
+            if self._connector_budgets_prefix():
+                # `resize` asserts the cache is ACTIVE, so this cannot move
+                # above the resume. It runs on every first-chunk pass, not once:
+                # the block reuse branch above resets
+                # `context_current_position` to the local match each time.
+                self._query_connector_prefix(req, kv_cache)
+                self._reserve_connector_prefix_inline(req, kv_cache)
+            return True
         else:
             # Subsequent chunk: cache must exist from first chunk.
             # It may be suspended (e.g., evicted between chunks), so
@@ -2809,6 +2845,61 @@ class KVCacheManagerV2(BaseResourceManager):
 
     # ---- prepare_resources ----
 
+    def _window_size_by_layer_group(self) -> List[Optional[int]]:
+        """Sliding-window size per layer group, or None where attention is full.
+
+        Every layer in a group shares one window, which is how
+        ``impl.layer_grouping`` partitions layers, so the first layer's window
+        describes the group.
+        """
+        if self._connector_window_by_group is None:
+            layers = self.kv_cache_manager_py_config.layers
+            self._connector_window_by_group = [
+                getattr(layers[int(layer_ids[0])], "window_size", None)
+                for layer_ids in self.impl.layer_grouping
+            ]
+        return self._connector_window_by_group
+
+    def _stale_block_end(self, layer_group_id: int, history_length: int) -> int:
+        """Block ordinal where ``layer_group_id``'s live window starts.
+
+        Blocks below it are out of window and hold nothing attention will read.
+        The ``+ 1`` matches the cache's own stale-range arithmetic: attention
+        always runs for at least one in-flight token at ``history_length``, so
+        the live range is ``[history_length + 1 - window, history_length]``.
+        """
+        window = self._window_size_by_layer_group()[layer_group_id]
+        if window is None:
+            return 0
+        return max(0, (history_length + 1 - window) // self.tokens_per_block)
+
+    def get_page_indices_by_layer_group(self, request: LlmRequest) -> List[List[int]]:
+        """Page slot indices for ``request`` per layer group, by block ordinal.
+
+        Indexed by layer group id, which is dense. Out-of-window blocks and
+        blocks with no page both read back as ``BAD_PAGE_INDEX`` in place rather
+        than shortening the list, so ordinals stay aligned to token ranges and
+        an append-delta over successive calls stays valid.
+
+        The out-of-window entries are masked from ``history_length`` rather than
+        left to whatever page happens to still be attached, which the block
+        reuse policy would otherwise decide -- a connector must not be handed a
+        slot for a block the window has passed, and the sibling KV transfer path
+        drops the same range before sending.
+        """
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return []
+        history_length = kv_cache.history_length
+        by_group: List[List[int]] = []
+        for layer_group_id in range(len(self.impl.layer_grouping)):
+            indices = list(kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False))
+            stale_end = min(self._stale_block_end(layer_group_id, history_length), len(indices))
+            for ordinal in range(stale_end):
+                indices[ordinal] = BAD_PAGE_INDEX
+            by_group.append(indices)
+        return by_group
+
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         if self.is_draft:
@@ -2817,6 +2908,404 @@ class KVCacheManagerV2(BaseResourceManager):
             # know about the draft manager).
             self._prepare_draft_resources(scheduled_batch)
             return
+
+        # KV pages are allocated in `KVCacheV2Scheduler`, so by this point every
+        # scheduled request already has them and its page indices are readable.
+        # That is what makes this the place to drive the connector.
+        if self.kv_connector_manager is not None:
+            self._run_kv_connector_hooks(scheduled_batch)
+
+    def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
+        """Serve the connector prefix, then report the pages it may write into.
+
+        Runs on the batch the forward pass will actually execute, which is what
+        makes the page indices reported here the ones the connector may write
+        into. Under ``aggressive_prefix_budgeting`` the prefix was already
+        reserved in ``prepare_context``, so only the delivery is left.
+        """
+        served_any = False
+        for request in scheduled_batch.context_requests:
+            # An allocation is asked about and reported exactly once, and it
+            # takes all three guards. The first two describe a fresh allocation
+            # -- a request whose asynchronous load has completed re-enters on
+            # its first chunk with the same pages and nothing left to load.
+            # `should_add_sequence` only goes false once that load *completes*,
+            # so a batch dropped between here and the forward pass brings every
+            # context request back with both predicates still true; the memo is
+            # what stops `update_state_after_alloc` reporting the same pages
+            # twice.
+            if not request.is_first_context_chunk:
+                continue
+            if not self.kv_connector_manager.should_add_sequence(request):
+                continue
+            if request.py_connector_allocation_reported:
+                continue
+            if self._connector_budgets_prefix():
+                self._deliver_connector_prefix(request)
+            else:
+                served_any |= self._apply_connector_matched_prefix(request)
+            request.py_connector_allocation_reported = True
+            # Both forms are offered; the manager picks the one this connector
+            # implements. With several layer groups the flat list is empty,
+            # because a page index is scoped to a group.
+            by_group = self.get_page_indices_by_layer_group(request)
+            flat = by_group[0] if len(by_group) == 1 else []
+            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+
+        if served_any:
+            # A served prefix can carry a request past its last chunk boundary,
+            # moving it between `context_requests_chunking` and
+            # `context_requests_last_chunk`. `build_scheduler_output` walks
+            # those two lists, so the split has to be rebuilt before it runs.
+            scheduled_batch.reset_context_requests()
+
+    def report_batch_to_connector(self, scheduled_batch: ScheduledRequests) -> None:
+        """Report the batch to the KV connector.
+
+        ``RequestData.num_scheduled_tokens`` describes the upcoming forward
+        pass, so this may only run once every resource manager has. That is why
+        ``ResourceManager.prepare_resources`` drives it rather than
+        ``prepare_resources`` here, which also gives the disagg-generation-init
+        mini-batch the same hook.
+        """
+        if self.kv_connector_manager is not None and not self.is_draft:
+            self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
+
+    # ---- KV connector prefix ----
+    #
+    # Where the query runs is what `aggressive_prefix_budgeting` selects.
+    #
+    # By default it runs from `prepare_resources`, downstream of every stage
+    # that can still drop a request (`_can_queue`, batch waiting, attention-DP
+    # balancing, the mamba-hybrid filter, the fp8 context-MLA cap). An asked
+    # request is then always a request that runs, so it always reaches
+    # `request_finished` and no offer is ever left outstanding. The cost is that
+    # the scheduler has already sized the chunk, so a served prefix removes work
+    # from the forward pass without freeing budget for anyone else.
+    #
+    # Aggressively, it runs from `prepare_context`, inside the scheduling pass
+    # and ahead of the budget check, so the served range is subtracted from what
+    # the request asks for. The query is then speculative: every stage listed
+    # above can still drop the request, the local cache can overtake the offer
+    # while the request waits, and the pages may not cover it. The offer is
+    # recorded on the request and resolved later -- delivered from
+    # `prepare_resources`, or handed back with `cancel_load`. That callback is
+    # what the mode requires of a connector, and bring-up refuses to start
+    # without it.
+
+    def _connector_budgets_prefix(self) -> bool:
+        """Whether the connector is asked during the scheduling pass."""
+        return (
+            self.kv_connector_manager is not None
+            and self.kv_connector_manager.aggressive_prefix_budgeting
+        )
+
+    def _connector_may_serve(self, req: LlmRequest) -> bool:
+        """Whether the connector is allowed to serve a prefix for ``req``."""
+        if self.kv_connector_manager is None or self.is_draft:
+            return False
+        if req.is_dummy:
+            # A dummy request has no prompt to serve.
+            return False
+        if req.is_generation_only_request:
+            # The connector API rejects these outright; a disagg generation
+            # server gets its prompt KV from the context worker.
+            return False
+        return not req.is_disagg_generation_init_state
+
+    def _apply_connector_matched_prefix(self, req: LlmRequest) -> bool:
+        """Ask the connector for a prefix and skip the runtime past what it takes.
+
+        Returns whether the request's chunk was moved.
+
+        The offer is clamped twice: to ``prompt_len - 1``, because the first
+        generation step consumes the last prompt token's activations, and to
+        what this iteration's pages can cover. Only the honoured amount is
+        committed, so the connector is never told to write into a page that
+        does not exist.
+        """
+        if not self._connector_may_serve(req) or req.py_connector_allocation_reported:
+            return False
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None:
+            return False
+
+        local_end = kv_cache.num_committed_tokens
+        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+            req, local_end
+        )
+        offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+
+        position = local_end
+        if offered_end > local_end:
+            fitted = self._reserve_connector_prefix(req, kv_cache, local_end, offered_end)
+            if fitted is not None:
+                position, chunk_size = fitted
+                self._mark_connector_prefix_populated(req, position, chunk_size)
+
+        # The honoured amount, not `num_tokens`: `build_scheduler_output`
+        # reports `context_current_position - recorded` as the range computed
+        # locally, so over-reporting points the connector at an offset it has
+        # no page for.
+        self.kv_connector_manager.commit_new_matched_tokens(req, position - local_end, load_async)
+        return position > local_end
+
+    def _reserve_connector_prefix(
+        self, req: LlmRequest, kv_cache, local_end: int, offered_end: int
+    ) -> Optional[Tuple[int, int]]:
+        """Fit ``[local_end, offered_end)`` into this iteration's allocation.
+
+        Returns ``(position, chunk_size)``, or None when nothing can be honoured
+        while leaving the forward pass a token to compute. An offer inside the
+        chunk the scheduler already sized only moves the chunk's start, so it
+        allocates nothing and preserves the block alignment of a non-last
+        chunk's end; an offer past it shifts the whole window and grows the
+        allocation, which is why that arm needs a fallback.
+        """
+        tokens_per_block = self.tokens_per_block
+        prompt_len = req.prompt_len
+        scheduler_chunk = req.context_chunk_size
+        chunk_end = min(local_end + scheduler_chunk, prompt_len)
+
+        candidates = []
+        if offered_end < chunk_end:
+            candidates.append((offered_end, chunk_end))
+        else:
+            # `==` belongs here, not above: an offer that reaches the chunk end
+            # exactly leaves the forward pass nothing to compute unless the
+            # window moves.
+            shifted_end = min(offered_end + scheduler_chunk, prompt_len)
+            if shifted_end < prompt_len:
+                # A non-final chunk must end on a block boundary or the next
+                # chunk fragments the cache.
+                shifted_end = (shifted_end // tokens_per_block) * tokens_per_block
+            candidates.append((offered_end, shifted_end))
+            # Fall back to the largest whole-block prefix the pages that already
+            # exist can hold while still leaving a chunk to compute. Whole
+            # blocks because that is the granularity a connector transfers in.
+            capped = ((chunk_end - 1) // tokens_per_block) * tokens_per_block
+            candidates.append((capped, chunk_end))
+
+        for position, end in candidates:
+            if position <= local_end or end <= position:
+                continue
+            if self._resize_for_connector_prefix(req, kv_cache, position, end):
+                return position, end - position
+        return None
+
+    def _resize_for_connector_prefix(
+        self, req: LlmRequest, kv_cache, position: int, end: int
+    ) -> bool:
+        """Cover ``[0, end)`` and mark ``[0, position)`` as already valid.
+
+        ``position`` becomes the cache's ``history_length``, which is the sole
+        input to the sliding-window stale-range computation -- passing the
+        served end is what stops the prefix costing a page per block in a
+        sliding-window layer group. When the capacity is unchanged the call
+        cannot fail, since no new slot is requested.
+        """
+        target = end + self.num_extra_kv_tokens
+        if end >= req.prompt_len:
+            target += get_draft_token_length(req)
+        pre_cap = kv_cache.capacity
+        capacity = max(pre_cap, target)
+        if not kv_cache.resize(capacity, position):
+            logger.debug(
+                "req %s: could not cover a connector prefix through %d (capacity %d -> %d)",
+                req.py_request_id,
+                position,
+                pre_cap,
+                capacity,
+            )
+            return False
+        if capacity > pre_cap and req.py_ctx_pre_resize_cap is None:
+            # `resize_context` records the capacity to roll back to; when it
+            # grew nothing there is no record, and this growth would then
+            # survive a `revert_allocate_context`.
+            req.py_ctx_pre_resize_cap = pre_cap
+        return True
+
+    def _mark_connector_prefix_populated(
+        self, req: LlmRequest, position: int, chunk_size: int
+    ) -> None:
+        """Skip the request past ``position`` and give it ``chunk_size`` to compute.
+
+        ``set_prepopulated_prompt_len`` has to run: ``is_first_context_chunk``
+        is ``context_current_position == prepopulated_prompt_len`` and both must
+        move together. Its own chunk arithmetic assumes the whole prompt is
+        allocated and would push the chunk end past the reserved pages, so it is
+        handed a chunk spanning to the end of the prompt -- where its flooring
+        and block-alignment assertion are both skipped -- and the real chunk is
+        assigned afterwards.
+        """
+        # `set_prepopulated_prompt_len` only advances when the length is
+        # non-zero, and a served prefix always is: it is strictly above the
+        # local match, which is never negative.
+        assert position > 0, f"req {req.py_request_id}: served prefix ends at {position}"
+        req.context_chunk_size = req.prompt_len - req.context_current_position
+        req.set_prepopulated_prompt_len(position, self.tokens_per_block)
+        req.context_chunk_size = chunk_size
+
+    # ---- KV connector prefix, budgeted (aggressive_prefix_budgeting) ----
+
+    def _query_connector_prefix(self, req: LlmRequest, kv_cache) -> None:
+        """Ask the connector once per allocation and record what it offered.
+
+        The offer is trimmed twice before it is recorded. To ``prompt_len - 1``,
+        because the first generation step consumes the last prompt token's
+        activations. Then to a whole block, which is both the granularity a
+        connector transfers in and what keeps the context position block
+        aligned: the scheduler sizes the following chunk in whole blocks, so a
+        served end inside a block would put every later chunk boundary inside
+        one too.
+
+        The other placement needs neither trim, which is why they live here
+        rather than in the shared path: it moves only the start of a chunk the
+        scheduler already sized and block-aligned the end of.
+
+        What is trimmed away is handed back here and nowhere else. Both the
+        delivery and the release read the recorded range, so a tail left out of
+        it is a tail the connector is never told about.
+        """
+        if req.py_connector_prefix_end is not None:
+            return
+        if not self._connector_may_serve(req):
+            return
+        if not self.kv_connector_manager.should_add_sequence(req):
+            # An asynchronous load has completed against this allocation. The
+            # request is re-entering to prefill what was loaded, not to ask for
+            # more.
+            return
+
+        local_end = kv_cache.num_committed_tokens
+        num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+            req, local_end
+        )
+        offered_end = local_end + num_tokens
+        capped_end = min(offered_end, req.prompt_len - 1)
+        served_end = max(local_end, (capped_end // self.tokens_per_block) * self.tokens_per_block)
+
+        req.py_connector_prefix_start = local_end
+        req.py_connector_prefix_end = served_end
+        # Not conditioned on the trims: a connector that reported an
+        # asynchronous transfer has already started one, whether or not the
+        # runtime keeps the whole range.
+        req.py_connector_load_async = load_async
+        self.kv_connector_manager.cancel_load(req, served_end, offered_end)
+
+    def _reserve_connector_prefix_inline(self, req: LlmRequest, kv_cache) -> None:
+        """Cover the recorded offer with pages and skip the context position past it.
+
+        The offered end becomes the cache's ``history_length``, which is the
+        sole input to the sliding-window stale-range computation -- passing it
+        rather than the local match is what stops the prefix costing a page per
+        block in a sliding-window layer group.
+
+        ``py_ctx_pre_resize_cap`` is deliberately left alone. ``resize_context``
+        owns it and runs immediately after; recording the pre-offer capacity
+        here would put the revert target below ``history_length``, and
+        ``revert_allocate_context`` frees the whole cache in that case. Every
+        request refuted after scheduling would then drop its prefix and re-ask
+        the connector.
+        """
+        end = req.py_connector_prefix_end
+        if end is None:
+            return
+        local_end = kv_cache.num_committed_tokens
+        if end <= local_end:
+            # The local match overtook the offer while the request waited. The
+            # delivery hands the whole thing back.
+            return
+
+        if kv_cache.resize(max(kv_cache.capacity, end), end):
+            self._skip_context_past(req, end)
+            return
+
+        # Preformatted: the repository logger joins its arguments with spaces
+        # rather than applying printf substitution, so placeholders left to it
+        # reach the log literally.
+        logger.debug(
+            f"req {req.py_request_id}: no pages for a connector prefix through "
+            f"{end}, running local-only from {local_end}"
+        )
+        self.kv_connector_manager.cancel_load(req, req.py_connector_prefix_start, end)
+        req.py_connector_prefix_start = local_end
+        req.py_connector_prefix_end = local_end
+        req.py_connector_load_async = False
+
+    def _skip_context_past(self, req: LlmRequest, position: int) -> None:
+        """Advance the context position to ``position`` and re-span the chunk.
+
+        ``set_prepopulated_prompt_len`` is what moves the position, and it has
+        to run: ``is_first_context_chunk`` compares the two and they must stay
+        in step. It re-floors the chunk unless the chunk already spans to the
+        end of the prompt, so it is handed one that does; the chunk is then
+        re-spanned from the new position, for the scheduler to size against its
+        budget.
+
+        ``position`` must be block aligned, which the query guarantees. Nothing
+        checks it on the way through here -- the span handed in is what makes
+        the request its own last chunk, which is the case
+        ``set_prepopulated_prompt_len`` skips its alignment check for.
+        """
+        req.context_chunk_size = req.prompt_len - req.context_current_position
+        req.set_prepopulated_prompt_len(position, self.tokens_per_block)
+        req.context_chunk_size = req.context_remaining_length
+
+    def _deliver_connector_prefix(self, req: LlmRequest) -> None:
+        """Resolve the recorded offer against ownership as it stands now.
+
+        Anything below the commit boundary is locally owned -- shared
+        ``CommittedPage`` s this request is not the only writer to -- so it is
+        handed back rather than transferred, and only the remainder is reported
+        as an external load.
+
+        Reporting more than the position was advanced over would point the
+        connector at an offset it has no page for, silently:
+        ``build_scheduler_output`` sends ``context_current_position - recorded``
+        and nothing downstream validates it, so the assertion here is the only
+        thing that catches a reserve that did not honour what the query offered.
+        """
+        end = req.py_connector_prefix_end
+        if end is None:
+            return
+        start = req.py_connector_prefix_start
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        # Never past `end`: the offer bounds what there is to hand back.
+        committed = min(kv_cache.num_committed_tokens, end) if kv_cache is not None else end
+        self.kv_connector_manager.cancel_load(req, start, committed)
+
+        recorded = end - committed
+        assert 0 <= recorded <= req.context_current_position, (
+            f"req {req.py_request_id}: connector prefix [{start}, {end}) records "
+            f"{recorded} externally loaded tokens, but the context position is "
+            f"only {req.context_current_position} -- the reserve did not cover "
+            f"what the query offered"
+        )
+        self.kv_connector_manager.commit_new_matched_tokens(
+            req, recorded, req.py_connector_load_async
+        )
+
+    def _release_undelivered_connector_prefix(self, req: LlmRequest) -> None:
+        """Hand back an offer whose allocation died before it was delivered.
+
+        The query is speculative in this mode, so a request can be asked and
+        then cancelled, time out, or fail before it reaches a batch. The
+        connector took ownership of remote blocks in the query and would
+        otherwise hold them for the life of the process.
+
+        Clearing the recorded range is what lets a replay ask again, which is
+        the same rule the rest of the connector state follows: one query per
+        allocation, and this runs where an allocation dies.
+        """
+        end = req.py_connector_prefix_end
+        if end is None:
+            return
+        if not req.py_connector_allocation_reported:
+            self.kv_connector_manager.cancel_load(req, req.py_connector_prefix_start, end)
+        req.py_connector_prefix_start = None
+        req.py_connector_prefix_end = None
+        req.py_connector_load_async = False
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
@@ -3721,6 +4210,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        if self._connector_budgets_prefix() and not self.is_draft:
+            # Before the flag is cleared: it is what says whether the offer was
+            # already delivered.
+            self._release_undelivered_connector_prefix(request)
+        # The promise to the connector is one ask per allocation, not one per
+        # request, so a replay of this request after a destructive pause may be
+        # asked and reported again.
+        request.py_connector_allocation_reported = False
+        if self.kv_connector_manager is not None and not self.is_draft:
+            # The scheduler-output deltas are keyed to the allocation too. Left
+            # behind, the replay lands in `cached_requests` carrying a block-id
+            # delta against pages that no longer exist, and a connector that
+            # walks only `new_requests` issues no load at all.
+            self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)

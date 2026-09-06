@@ -807,15 +807,34 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
-        if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+        # GUARANTEED_NO_EVICT is what makes an answered prefix query binding on
+        # the flat-tensor manager: it allocates for the whole prompt and never
+        # destroys a live allocation, so a request it schedules is one it runs.
+        # `KVCacheV2Scheduler` suspends and replays instead, and coerces the
+        # policy to MAX_UTILIZATION whatever is configured. Same tri-state
+        # handling as the VSWA gate below.
+        if (scheduler_config.capacity_scheduler_policy
+                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                and kv_cache_config.use_kv_cache_manager_v2 is False):
             raise NotImplementedError(
-                "KV connector is only supported with guaranteed no evict scheduler policy."
-            )
+                "KV connector is only supported with guaranteed no evict scheduler "
+                "policy on the V1 KV cache manager. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=True to use "
+                f"{scheduler_config.capacity_scheduler_policy.name}.")
 
+        # VSWA allocates one pool per window size, which only
+        # `register_kv_cache_layout` can describe. `use_kv_cache_manager_v2` is
+        # tri-state and under "auto" the manager is not chosen until model
+        # loading, so reject here only when V2 is definitively off;
+        # `_maybe_init_kv_connector_manager` re-checks the manager actually
+        # built and rejects there if the selection landed on the flat-tensor
+        # path.
         max_attention_window = kv_cache_config.max_attention_window
-        if uses_vswa_kv_cache_layout(max_attention_window):
+        if (uses_vswa_kv_cache_layout(max_attention_window)
+                and kv_cache_config.use_kv_cache_manager_v2 is False):
             raise NotImplementedError(
-                "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
+                "KV connector is not supported with VSWA (Variable Sliding Window Attention) "
+                "on the V1 KV cache manager. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
         if mapping.enable_attention_dp:
@@ -854,7 +873,10 @@ def create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                aggressive_prefix_budgeting=kv_connector_config.
+                aggressive_prefix_budgeting)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")

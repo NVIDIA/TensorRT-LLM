@@ -93,6 +93,8 @@ import torch
 from tensorrt_llm import LLM, SamplingParams, logger
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import \
+    valid_page_slots
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig, TorchLlmArgs
 
@@ -113,6 +115,11 @@ class PersistentKvCacheConnectorWorker(KvCacheConnectorWorker):
         self.kv_cache_tensor = None
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
+        # This is the only registration hook this connector needs. A cache that
+        # describes itself as a layout instead still arrives here, through
+        # `register_kv_cache_layout`'s default, as long as one tensor can
+        # describe it. See llm_kv_cache_connector_vswa.py for the case where it
+        # cannot -- one attention window size per layer group.
         assert self.kv_cache_tensor is None, "KV cache tensor already registered"
         self.kv_cache_tensor = kv_cache_tensor
 
@@ -159,6 +166,9 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         self.block_size = self._llm_args.kv_cache_config.tokens_per_block
         self.pending_loads = {}
+        # Prompt position the first entry of each request's pending_loads
+        # covers, so that cancel_load can map a position back to an entry.
+        self.load_bases = {}
 
         self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,
                                            "./connector_cache")
@@ -180,9 +190,18 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
             pending_load = self.pending_loads[req.request_id]
 
+            # Ordinal -> page slot for the blocks that have a page. Blocks with
+            # none keep their ordinal in `block_ids` so that entry `i` always
+            # describes the same token range; they are dropped here so no
+            # transfer can be built against one.
+            slots = dict(valid_page_slots(block_ids))
+
             for file_path, block_pos in zip(
                     pending_load, range(num_computed_blocks, len(block_ids))):
-                metadata.load.append((file_path, block_ids[block_pos]))
+                slot = slots.get(block_pos)
+                if slot is None:
+                    continue
+                metadata.load.append((file_path, slot))
 
             # Break up the remainder of the token sequence into chunks.
             chunks = self._chunk_tokens(req.new_tokens)
@@ -190,15 +209,19 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             # For each chunk that isn't already on device, and isn't in our connector cache, we need to save it.
             for block_pos in range(num_computed_blocks + len(pending_load),
                                    len(block_ids)):
+                slot = slots.get(block_pos)
+                if slot is None:
+                    continue
                 if len(chunks[block_pos]) == self.block_size:
                     hashed_tokens = self._hash_tokens(chunks[block_pos],
                                                       req.cache_salt)
 
                     file_path = self._file_path(hashed_tokens)
 
-                    metadata.save.append((file_path, block_ids[block_pos]))
+                    metadata.save.append((file_path, slot))
 
         self.pending_loads = {}
+        self.load_bases = {}
 
         return metadata
 
@@ -220,6 +243,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
             self, request: LlmRequest,
             num_computed_tokens: int) -> tuple[int, bool]:
         self.pending_loads[request.request_id] = []
+        self.load_bases[request.request_id] = num_computed_tokens
 
         # Don't bother with sequences with partial matches.
         if (num_computed_tokens % self.block_size) != 0:
@@ -264,6 +288,32 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
                                  block_ids: list[int]):
         pass
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int):
+        # Drop the loads planned for [start, end); the runtime will not use
+        # them. This connector reads from disk during the forward pass and takes
+        # no remote ownership when it answers, so forgetting the file list is
+        # the whole release. A connector that pins or leases remote blocks
+        # releases them here instead.
+        #
+        # Only reached under kv_connector_config.aggressive_prefix_budgeting.
+        pending = self.pending_loads.get(request.request_id)
+        if pending is None:
+            return
+        # One entry per whole block from the num_computed_tokens the query was
+        # asked with, so a prompt position maps to an index by subtracting that
+        # base. The runtime cancels a prefix or a suffix of the offer, never a
+        # hole in the middle.
+        base = self.load_bases[request.request_id]
+        first = max(0, (start - base) // self.block_size)
+        last = min(len(pending), (end - base) // self.block_size)
+        if last <= first:
+            return
+        if first == 0:
+            del pending[:last]
+            self.load_bases[request.request_id] = base + last * self.block_size
+        else:
+            del pending[first:]
+
 
 @click.command()
 @click.argument("model", type=str)
@@ -280,6 +330,11 @@ def main(model: str):
         connector_module=this_module,
         connector_scheduler_class="PersistentKvCacheConnectorLeader",
         connector_worker_class="PersistentKvCacheConnectorWorker",
+        # Set aggressive_prefix_budgeting=True, alongside
+        # kv_cache_config.use_kv_cache_manager_v2=True, to have a served prefix
+        # free scheduler token budget for other requests rather than only
+        # shrinking this one's forward pass. That mode requires the cancel_load
+        # implemented above.
     )
 
     connector_cache_dir = TemporaryDirectory()

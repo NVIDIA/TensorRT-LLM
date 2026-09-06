@@ -1050,6 +1050,23 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
+        # Whether the KV connector has been asked about, and told about, this
+        # request's current KV allocation. The promise is at most once per
+        # allocation, not once per request, so this is cleared in
+        # `free_resources` -- the one place an allocation dies.
+        self.py_connector_allocation_reported = False
+
+        # The prompt range `[start, end)` the connector offered to serve, in
+        # absolute positions. Only populated under
+        # `aggressive_prefix_budgeting`, where the query runs in the scheduling
+        # pass and its answer has to outlive that pass: the offer is delivered,
+        # or handed back with `cancel_load`, in a later stage of the same
+        # iteration or a later one. `end is None` means the allocation has not
+        # been asked about yet.
+        self.py_connector_prefix_start: Optional[int] = None
+        self.py_connector_prefix_end: Optional[int] = None
+        self.py_connector_load_async = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
@@ -1168,7 +1185,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                          orig_prompt_len=self.prompt_len,
                                          clear_draft_tokens=True)
 
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base binds this with `def_prop_ro`
+        # (nanobind/batch_manager/bindings.cpp), so a plain method here shadows
+        # it with a bound method -- always truthy -- for every caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
     def create_response(self,

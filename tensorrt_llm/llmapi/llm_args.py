@@ -2217,6 +2217,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    aggressive_prefix_budgeting: bool = Field(
+        False,
+        description=
+        "Ask the connector for its prefix during the scheduling pass rather "
+        "than once the batch is final, so a served prefix frees token budget "
+        "for other requests in the same iteration. The ask becomes speculative, "
+        "so the connector scheduler must implement `cancel_load`. Requires the "
+        "KV cache manager V2 (kv_cache_config.use_kv_cache_manager_v2=True) and "
+        "scheduler_config.enable_prefix_aware_scheduling=True.",
+        status="prototype")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
