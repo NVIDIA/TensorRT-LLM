@@ -6024,8 +6024,8 @@ class PyTorchModelEngine(ModelEngine):
         is_ragged_gen = ragged_enabled and any(
             tokens != num_tokens_per_extend_request
             for tokens in tokens_per_extend_request)
-        total_num_tokens = (sum(tokens_per_extend_request) if ragged_enabled else
-                            num_extend_reqeust_wo_dummy *
+        total_num_tokens = (sum(tokens_per_extend_request)
+                            if ragged_enabled else num_extend_reqeust_wo_dummy *
                             num_tokens_per_extend_request)
 
         previous_slots = self.previous_batch_indices_cuda[:num_previous_batch]
@@ -6035,10 +6035,11 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = prompt_lengths.tolist()
         num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
 
-        previous_batch_draft_tokens = (
-            total_num_tokens - num_extend_reqeust_wo_dummy
-            if ragged_enabled else num_extend_reqeust_wo_dummy *
-            (num_tokens_per_extend_request - 1))
+        previous_batch_draft_tokens = (total_num_tokens -
+                                       num_extend_reqeust_wo_dummy
+                                       if ragged_enabled else
+                                       num_extend_reqeust_wo_dummy *
+                                       (num_tokens_per_extend_request - 1))
 
         self._update_target_input_tensors(
             num_accepted_tokens_device=num_accepted_tokens_device,
