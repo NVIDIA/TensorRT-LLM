@@ -158,14 +158,22 @@ UncommittedPage::~UncommittedPage()
         bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
         if (!isSsm)
         {
-            [[maybe_unused]] bool blockRemoved = kvCache->blocks().size() <= ordinal;
-            [[maybe_unused]] bool pageOk = true;
+            bool blockRemoved = kvCache->blocks().size() <= ordinal;
+            bool pageOk = true;
             if (!blockRemoved)
             {
                 auto const& bp = kvCache->blocks()[ordinal].pages[beamIndex][lifeCycle];
-                auto page = blockPageGetPage(bp);
-                pageOk
-                    = blockPageIsNull(bp) || page.get() == this || dynamicPointerCast<CommittedPage>(page) != nullptr;
+                // Raw pointers only: in the self-destruction case below the slot still
+                // holds a SharedPtr to `this` whose use count has already reached zero.
+                // Copying it (or dynamicPointerCast'ing it) would take the count 0 -> 1
+                // and back to 0, re-entering this destructor until the stack overflows.
+                //
+                // A null page covers both an empty slot and one whose SharedPageLock has
+                // already cleared mUniqLock: unlock() resets it before dropping the page
+                // reference that lands here, so the slot names no page by this point.
+                Page const* slotPage = blockPageGetPage(bp).get();
+                pageOk = slotPage == nullptr || slotPage == this
+                    || dynamic_cast<CommittedPage const*>(slotPage) != nullptr;
             }
             KVCM2_CHECK_FATAL_WITH_INFO(
                 blockRemoved || pageOk, "UncommittedPage destroyed but slot still holds a different uncommitted page");
