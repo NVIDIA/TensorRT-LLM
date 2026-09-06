@@ -33,7 +33,7 @@ def _from_fp8_bytes(u: torch.Tensor) -> torch.Tensor:
     return u.view(torch.float8_e4m3fn).float()
 
 
-def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device):
+def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="random"):
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     maxb = n_comp // PAGE
@@ -41,6 +41,24 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device):
     q = torch.randn((batch * 64, 128), generator=g, device=device)
     kv = torch.randn((nb_total * PAGE, 128), generator=g, device=device)
     scale = 0.5 + torch.rand((nb_total * PAGE,), generator=g, device=device)
+    if pattern != "random":
+        # adversarial score shapes for the safe-line filter: every key shares one direction
+        # u, so the score is a scalar function of the per-token magnitude c
+        u = torch.randn((128,), generator=g, device=device)
+        u = u / u.norm()
+        t = torch.arange(nb_total * PAGE, device=device, dtype=torch.float32)
+        if pattern == "monotone":  # scores grow along the row: every tile beats the line
+            c = 0.5 + 2.5 * (t % (n_comp * 1.0)) / n_comp
+        elif pattern == "allequal":  # one fp16 tie class over the whole row
+            c = torch.full_like(t, 2.0)
+        else:  # "giantbin": 70% of the row shares one high value
+            c = torch.where(
+                torch.rand(t.shape, generator=g, device=device) < 0.7,
+                torch.full_like(t, 3.0),
+                torch.rand(t.shape, generator=g, device=device),
+            )
+        kv = c.unsqueeze(1) * u.unsqueeze(0) * 4.0
+        scale = torch.ones_like(scale)
     flat = torch.empty((nb_total, PGB), device=device, dtype=torch.uint8)
     flat[:, : PAGE * ROWB] = _to_fp8_bytes(kv).view(nb_total, PAGE * ROWB)
     flat[:, PAGE * ROWB :] = (
@@ -94,6 +112,52 @@ def _reference(inp, k_top):
     return torch.stack(vals)
 
 
+def _reference_scores(inp):
+    kvf = inp["kv_cache"].reshape(inp["kv_cache"].shape[0], -1)
+    k = _from_fp8_bytes(kvf[:, : PAGE * ROWB].reshape(-1, ROWB)).reshape(-1, PAGE, 128)
+    scale = kvf[:, PAGE * ROWB :].contiguous().view(torch.float32).reshape(-1, PAGE)
+    batch = inp["q_fp8"].shape[0]
+    q = _from_fp8_bytes(inp["q_fp8"][:, 0].reshape(batch * 64, ROWB)).view(batch, 64, 128)
+    out = []
+    for i in range(batch):
+        length = int(inp["context_lens"][i])
+        nb = (length + PAGE - 1) // PAGE
+        pages = inp["block_table"][i, :nb].long()
+        kx = k[pages].reshape(nb * PAGE, 128)
+        sc = torch.relu(q[i] @ kx.t())
+        sc = (sc * inp["weights"][i].unsqueeze(1)).sum(dim=0) * scale[pages].reshape(-1)
+        sc[length:] = float("-inf")
+        out.append(sc)
+    return out
+
+
+def _check_fp32_boundary(inp, indices, k_top, tie_cap=2048):
+    scores = _reference_scores(inp)
+    for i in range(indices.shape[0]):
+        sc = scores[i]
+        ref = torch.topk(sc, k_top).indices
+        kth = sc[ref[-1]]
+        got = indices[i].long()
+        assert got.unique().numel() == k_top
+        if int((sc.half() == kth.half()).sum()) > tie_cap:
+            assert int((sc[got].half() < kth.half()).sum()) == 0, (
+                f"row {i}: token below the fp16 K-th value"
+            )
+            gh, _ = torch.sort(sc[got].half(), descending=True)
+            rh, _ = torch.sort(sc[ref].half(), descending=True)
+            assert bool((gh == rh).all()), f"row {i}: fp16 value multiset differs"
+            continue
+        tol = 1e-6 * kth.abs() + 1e-6
+        assert int((sc[got] < kth - tol).sum()) == 0, (
+            f"row {i}: selected token below the fp32 K-th value"
+        )
+        gs, _ = torch.sort(sc[got], descending=True)
+        rs, _ = torch.sort(sc[ref], descending=True)
+        assert bool(((gs - rs).abs() <= 1e-6 * rs.abs() + 1e-6).all()), (
+            f"row {i}: fp32 score multiset differs"
+        )
+
+
 def _run(inp, k_top):
     batch = inp["q_fp8"].shape[0]
     device = inp["q_fp8"].device
@@ -131,7 +195,7 @@ def _check(inp, indices, values, k_top):
 @skip_not_sm100
 @pytest.mark.parametrize("batch", [2, 16])
 @pytest.mark.parametrize("n_comp", [8192, 16384])
-@pytest.mark.parametrize("k_top", [512, 1024])
+@pytest.mark.parametrize("k_top", [1024, 2048])
 @pytest.mark.parametrize("weight_mode", ["signed", "nonneg", "allneg"])
 def test_fused_indexer_topk_nospill_fp8(batch, n_comp, k_top, weight_mode):
     inp = _build_inputs(batch, n_comp, k_top, weight_mode, seed=1234, device=torch.device("cuda"))
@@ -189,3 +253,19 @@ def test_fused_indexer_topk_nospill_fp8_cuda_graph():
         graph.replay()
         torch.cuda.synchronize()
         _check(inp, indices, values, k_top)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("pattern", ["random", "monotone", "allequal", "giantbin"])
+@pytest.mark.parametrize("batch", [2, 16, 80])
+def test_fused_indexer_topk_nospill_fp8_patterns(pattern, batch, monkeypatch):
+    # forced safe-line filter (8-tile dense prefix) under adversarial score shapes; batch 80
+    # runs one CTA per row so the local and final K-th bins coincide
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_NDENSE", "8")
+    weight_mode = "nonneg" if pattern != "random" else "signed"
+    inp = _build_inputs(
+        batch, 16384, 2048, weight_mode, seed=99, device=torch.device("cuda"), pattern=pattern
+    )
+    indices, values = _run(inp, 2048)
+    _check(inp, indices, values, 2048)
+    _check_fp32_boundary(inp, indices, 2048)
