@@ -152,7 +152,7 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
     )
     mamba_metadata.prepare(metadata)
     metadata.mamba_metadata = mamba_metadata
-    hidden_states = torch.empty(4, _Cfg.hidden_size, device="cuda")
+    hidden_states = torch.empty(4, _Cfg.hidden_size, dtype=torch.bfloat16, device="cuda")
     generation_slice = mamba_metadata.state_indices[1:]
     aligned_indices = mamba_metadata.generation_state_indices
 
