@@ -231,9 +231,9 @@ public:
     // Explicitly release the lock (called by destructor if not already released).
     SharedPtr<Page> unlock();
 
-    SharedPtr<Page> const& page() const;
+    [[nodiscard]] SharedPtr<Page> const& page() const;
 
-    bool isValid() const noexcept
+    [[nodiscard]] bool isValid() const noexcept
     {
         return mUniqLock != nullptr;
     }
