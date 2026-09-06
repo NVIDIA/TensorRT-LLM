@@ -24,7 +24,7 @@ def _function(class_node: ast.ClassDef, name: str) -> ast.FunctionDef:
 def test_mla_rope_generation_forwards_current_kernel_controls():
     """The token-major wrapper must not drop current-main MLA controls."""
     repo_root = Path(__file__).resolve().parents[5]
-    source = repo_root / "tensorrt_llm/_torch/attention_backend/trtllm.py"
+    source = repo_root / "tensorrt_llm/_torch/attention/backends/trtllm.py"
     module = ast.parse(source.read_text(encoding="utf-8"))
     class_node = next(
         node
