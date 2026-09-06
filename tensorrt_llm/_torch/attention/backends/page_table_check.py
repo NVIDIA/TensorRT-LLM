@@ -51,6 +51,8 @@ def check_page_table(
 
     And, across rows:
 
+    * ``num_blocks``, ``logical_num_blocks`` and ``kv_lens`` disagreeing on the
+      number of rows in the batch;
     * a ``last_page_len`` outside ``[1, page_size]``, derived from ``kv_lens``
       and the committed page count;
     Every input is already on the host when a plan is built, so this costs no
@@ -89,7 +91,13 @@ def check_page_table(
                     f"pool {pool_id} row {row}: repeated page id in a span of {span.size}"
                 )
 
-    if logical_arr.size == kv_lens_arr.size:
+    if not (num_blocks_arr.size == logical_arr.size == kv_lens_arr.size):
+        problems.append(
+            f"row counts disagree: num_blocks has {num_blocks_arr.size}, "
+            f"logical_num_blocks has {logical_arr.size}, "
+            f"kv_lens has {kv_lens_arr.size}"
+        )
+    else:
         last_page_len = kv_lens_arr - (logical_arr - 1) * page_size
         bad_len = np.flatnonzero((last_page_len < 1) | (last_page_len > page_size))
         if bad_len.size:
