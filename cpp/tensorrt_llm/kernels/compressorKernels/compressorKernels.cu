@@ -292,7 +292,7 @@ __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_
 }
 
 template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO, int NEXT_N,
-    int NUM_RED_WARPS = 1>
+    int NUM_RED_WARPS = 1, bool USE_RAGGED_TOKENS = false>
 __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
@@ -345,7 +345,11 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     // already guarded (Phase 1 by token_idx < kv_len, Phase 3 by
     // num_compressions). Keeping NEXT_N as the bound is what preserves the
     // full unroll on the uniform path.
-    int const nn = (new_tokens_per_seq != nullptr) ? new_tokens_per_seq[batch_idx] : NEXT_N;
+    int nn = NEXT_N;
+    if constexpr (USE_RAGGED_TOKENS)
+    {
+        nn = new_tokens_per_seq[batch_idx];
+    }
     int const sp = kv_len - nn;
     int const in_off = cu_seq_lens[batch_idx];
     int const out_off = cu_kv_comp[batch_idx];
@@ -676,9 +680,12 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 
 // Generate explicit template instantiations.
 #define INST_DECODE(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                  \
-    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const*, float const*, void*, \
-        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int,   \
-        int32_t const*);
+    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW, false>(void const*, float const*, \
+        void*, void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, \
+        int, int32_t const*);                                                                                          \
+    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW, true>(void const*, float const*,  \
+        void*, void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, \
+        int, int32_t const*);
 FOREACH_DECODE_CONFIG(INST_DECODE)
 #undef INST_DECODE
 
@@ -744,9 +751,18 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     if (head_dim == HD && kv_score_elem_bytes == KV_EB && state_elem_bytes == STATE_EB && compress_ratio == CR         \
         && next_n == NN && num_red_warps == NRW)                                                                       \
     {                                                                                                                  \
-        pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, \
-            paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
-            page_size, max_blocks, out_elem_bytes, new_tokens_per_seq);                                                \
+        if (new_tokens_per_seq == nullptr)                                                                             \
+        {                                                                                                              \
+            pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW, false><<<grid, nthreads, smem_bytes, stream>>>(    \
+                kv_score, ape, paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, \
+                cu_kv_comp, page_size, max_blocks, out_elem_bytes, nullptr);                                           \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW, true><<<grid, nthreads, smem_bytes, stream>>>(     \
+                kv_score, ape, paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, \
+                cu_kv_comp, page_size, max_blocks, out_elem_bytes, new_tokens_per_seq);                                \
+        }                                                                                                              \
         return;                                                                                                        \
     }
     FOREACH_DECODE_CONFIG(TRY_LAUNCH)

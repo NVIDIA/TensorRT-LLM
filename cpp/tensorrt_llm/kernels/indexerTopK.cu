@@ -650,7 +650,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-    typename InputT = float>
+    typename InputT = float, bool useRaggedKvLens = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
     int* outIndices, int stride0, int stride1, int numColumns, int const topK, int next_n, int compressRatio,
     float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr,
@@ -682,7 +682,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     // rows, so neither rowIdx / next_n nor rowIdx % next_n means anything. The
     // caller precomputes the extent per row -- it is the only quantity this
     // kernel ever derived from next_n, which is why one array is enough.
-    else if (rowKvLens != nullptr)
+    else if constexpr (useRaggedKvLens)
     {
         int const actualKvLen = rowKvLens[rowIdx];
         int const compressedKvLen = actualKvLen / compressRatio;
@@ -847,8 +847,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         // Single block per row. Below kSortingAlgorithmThreshold use insertion sort,
         // above use the histogram-radix path.
         bool const useRadixSort = numColumns >= kSortingAlgorithmThreshold;
-        auto* kernel_instance = useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true>
-                                             : &topKPerRowDecode<kNumThreadsPerBlock, false>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? (useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true, false, false, float, true>
+                            : &topKPerRowDecode<kNumThreadsPerBlock, false, false, false, float, true>)
+            : (useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true>
+                            : &topKPerRowDecode<kNumThreadsPerBlock, false>);
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -864,7 +867,9 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     else
     {
         // Split each row across `blocksPerRow` blocks, then merge with a second pass.
-        auto* kernel_instance_part1 = &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
+        auto* kernel_instance_part1 = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, true, true, false, float, true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
         cudaLaunchConfig_t config_part1;
         config_part1.gridDim = dim3(numRows, blocksPerRow);
         config_part1.blockDim = kNumThreadsPerBlock;
@@ -928,8 +933,11 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     if (numColumns < kSortingAlgorithmThreshold)
     {
         // Insertion sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT, /*useRaggedKvLens=*/true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -948,8 +956,11 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     else if (numColumns < effectiveSplitWorkThreshold)
     {
         // Radix sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT, /*useRaggedKvLens=*/true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
