@@ -806,66 +806,6 @@ def test_max_replan_rounds_default_and_custom(tmp_path):
     assert wf.max_replan_rounds == 5
 
 
-def test_reconcile_failed_subtree_resets_and_keeps_done(tmp_path):
-    """``_reconcile_failed_subtree`` resets FAILED+BLOCKED nodes, keeping DONE.
-
-    The reset covers each node's checkpoint state, sub-workspace, and branch.
-    """
-    module = _load_module()
-    from agent_flow.orchestration import ExecutionGraph, GraphResult, GraphState, Node, NodeState
-
-    ws = tmp_path
-    graph = ExecutionGraph(
-        nodes=(
-            Node(id="a", type="impl"),
-            Node(id="b", type="impl"),
-            Node(id="c", type="impl", depends_on=("b",)),
-        )
-    )
-    GraphState(
-        states={"a": NodeState.DONE, "b": NodeState.FAILED, "c": NodeState.BLOCKED},
-        worktrees={"b": "/x", "c": "/y"},
-    ).save(ws / ".graph_state.json")
-    (ws / "nodes" / "b").mkdir(parents=True)
-    (ws / "nodes" / "b" / "status.md").write_text("failed run")
-
-    reclaimed: list[str] = []
-
-    class _Iso:
-        async def acquire(self, node):
-            return ws
-
-        async def release(self, node):
-            return None
-
-        async def reclaim(self, node):
-            reclaimed.append(node.id)
-
-        async def prepare(self, node, dep_nodes, cwd):
-            return None
-
-        async def commit(self, node, cwd):
-            return None
-
-    wf = module.AgentTeamWorkflow(workspace=ws, concurrent=True, isolation=_Iso())
-    result = GraphResult(
-        states={"a": NodeState.DONE, "b": NodeState.FAILED, "c": NodeState.BLOCKED},
-        outcomes={},
-    )
-
-    wf._reconcile_failed_subtree(result, graph)
-
-    reloaded = GraphState.load(ws / ".graph_state.json")
-    assert reloaded.states == {
-        "a": NodeState.DONE,
-        "b": NodeState.PENDING,
-        "c": NodeState.PENDING,
-    }
-    assert not (ws / "nodes" / "b").exists()  # failed node's sub-workspace cleared
-    assert set(reclaimed) == {"b", "c"}  # failed + blocked branches torn down
-    assert "a" not in reclaimed  # DONE node untouched
-
-
 def test_max_replan_rounds_cli_flag_default_and_value():
     """``--max-replan-rounds`` parses to 3 by default and to the supplied int."""
     module = _load_cli_module()

@@ -17,16 +17,18 @@ from agent_flow import (
     require_tool_call_stop_hook,
 )
 from agent_flow.console import print_message, print_rule
+from agent_flow.jobs.kinds import KINDS
+from agent_flow.jobs.registry import JobRegistry
 from agent_flow.logger import get_logger
 from agent_flow.orchestration import (
     ExecutionGraph,
-    GraphResult,
     GraphState,
     IsolationProvider,
     NodeScheduler,
     NodeState,
     NoOpIsolation,
 )
+from agent_flow.orchestration.invalidation import invalidation_set
 
 from .node_workspace import NODES_DIRNAME, node_dir_slug
 from .progress import (
@@ -605,12 +607,15 @@ class AgentTeamWorkflow:
             self._checkpoint(state)
 
         # Bounded replan loop. Each round: re-extract the (possibly revised) graph,
-        # run the scheduler (resuming from .graph_state.json), and — when it ends
-        # with FAILED nodes under ``--replan-on-qa`` — let the PlanDrafter replan the
-        # failed subtree, reset that subtree (:meth:`_reconcile_failed_subtree`), and
-        # re-run. Without ``--replan-on-qa`` (or with no failures) it is a single pass,
-        # exactly the prior behavior. ``max_replan_rounds`` caps the loop so a
-        # repeatedly-failing subtree cannot spin forever.
+        # run the scheduler (resuming from .graph_state.json). Under ``--replan-on-qa``
+        # the scheduler PAUSES on the first failure (healthy in-flight nodes →
+        # INTERRUPTED); the PlanDrafter then replans, and only the invalidation
+        # frontier (failed ∪ changed ∪ their dependents) is reset via
+        # :meth:`_apply_invalidation` before the next round resumes from the checkpoint
+        # (DONE preserved, INTERRUPTED re-attached). Without ``--replan-on-qa`` (or with
+        # no failures/pause) it is a single pass, exactly the prior behavior.
+        # ``max_replan_rounds`` caps the loop so a repeatedly-failing subtree cannot
+        # spin forever.
         for replan_round in range(self.max_replan_rounds + 1):
             plan_text = self.plan_path.read_text(encoding="utf-8")
             graph = extract_execution_graph(plan_text)
@@ -626,6 +631,7 @@ class AgentTeamWorkflow:
                 self._isolation,
                 max_parallel=self.max_parallel,
                 checkpoint_path=self.graph_state_path,
+                pause_on_failure=self.replan_on_qa,
             )
 
             print_rule("[bold cyan]Concurrent build (Execution Graph)[/bold cyan]", log)
@@ -655,22 +661,20 @@ class AgentTeamWorkflow:
                 log,
             )
 
-            # No replan requested, or nothing actually FAILED (only BLOCKED with no
-            # FAILED root) → stop, exactly the prior single-pass behavior.
-            if not self.replan_on_qa or not result.failed_ids:
+            # Pause/failure with replan enabled: replan synchronously against the
+            # frozen snapshot, then reset only the invalidation frontier and resume
+            # (re-attach). No replan requested, or nothing FAILED/paused → stop.
+            if not self.replan_on_qa or not (result.failed_ids or result.paused):
                 break
             if replan_round == self.max_replan_rounds:
                 print_message(
-                    "[bold yellow]⚠ replan budget (--max-replan-rounds) exhausted — "
-                    "stopping with non-DONE nodes[/bold yellow]",
+                    "[bold yellow]⚠ replan budget (--max-replan-rounds) exhausted[/bold yellow]",
                     log,
                 )
                 break
 
-            # Subtree-scoped replan: the PlanDrafter revises the failed subtree's
-            # plan (findings come from the aggregated node records), and is the
-            # terminator — a ``DONE`` decision accepts the outcome and ends the loop.
-            print_rule("[bold cyan]Replan (failed subtree)[/bold cyan]", log)
+            print_rule("[bold cyan]Replan (pause → invalidate → resume)[/bold cyan]", log)
+            old_graph = graph
             self._run_plan_drafter(
                 iteration=replan_round + 1,
                 mode="replan",
@@ -679,39 +683,70 @@ class AgentTeamWorkflow:
             state.feedback_replan = False
             if self._latest_plan_drafter_decision() == "DONE":
                 print_message(
-                    "[bold green]✔ plan_drafter DONE — accepting the failed outcome[/bold green]",
+                    "[bold green]✔ plan_drafter DONE — accepting the outcome[/bold green]",
                     log,
                 )
                 break
-            self._reconcile_failed_subtree(result, graph)
+            new_graph = extract_execution_graph(self.plan_path.read_text(encoding="utf-8"))
+            if new_graph is None:
+                raise ValueError('replan produced no "## Execution Graph" block')
+            # A FAILED node is always a retry candidate (the replan revises it — and a
+            # prose-only revision is invisible to the structural invalidation_set), so
+            # it must always be in the frontier. invalidation_set ADDS the downstream
+            # consumers of any node whose graph definition (depends_on/kind/added)
+            # changed. A healthy INTERRUPTED node that was NOT changed stays OUT of the
+            # frontier → its nodes/<id>/ + jobs.json survive and re-attach on resume.
+            frontier = set(result.failed_ids) | invalidation_set(old_graph, new_graph)
+            print_message(f"[cyan]invalidation frontier: {sorted(frontier)}[/cyan]", log)
+            self._apply_invalidation(frontier, new_graph)
 
         # The loop exits either all-DONE, on PlanDrafter DONE, or on budget/flag —
         # mark the run done so a bare rerun does not auto-resume into it.
         state.done = True
         self._checkpoint(state)
 
-    def _reconcile_failed_subtree(self, result: GraphResult, graph: ExecutionGraph) -> None:
-        """Reset a scheduler pass's FAILED + BLOCKED nodes so they re-run.
+    def _cancel_node_jobs(self, node_id: str, *, kinds: dict | None = None) -> None:
+        """Best-effort ``scancel`` of every job a node recorded before resetting it.
 
-        Subtree-scoped replan reconciliation: every FAILED or BLOCKED node has its
-        persisted checkpoint state set back to ``PENDING`` and its durable output
-        cleared — the ``node/<id>`` branch via :meth:`IsolationProvider.reclaim`, its
-        ``nodes/<id>/`` sub-workspace via ``rmtree`` — so the next scheduler pass
-        re-runs it from scratch under the revised plan. DONE nodes are never touched:
-        this is the structural guarantee that a replan cannot corrupt healthy work,
-        regardless of what the PlanDrafter wrote outside the failed subtree.
+        An invalidated node's in-flight job would produce a stale result, so kill
+        it (rather than orphan it) before its ``nodes/<id>/`` — which holds
+        ``jobs.json`` — is removed. Missing file, unknown kind, or a cancel error
+        are all swallowed: a dead/absent job must never crash the replan. ``kinds``
+        defaults to the module-level ``KINDS`` registry, resolved at call time so a
+        test's monkeypatch of it is honored.
         """
-        reset_ids = set(result.failed_ids) | set(result.blocked_ids)
-        if not reset_ids:
+        if kinds is None:
+            kinds = KINDS
+        jobs_path = self.workspace / NODES_DIRNAME / node_dir_slug(node_id) / "jobs.json"
+        if not jobs_path.is_file():
             return
+        for entry in JobRegistry(jobs_path).all():
+            kind = kinds.get(entry.kind)
+            if kind is None:
+                continue
+            try:
+                kind.cancel(entry.handle)
+            except Exception:
+                continue
 
+    def _apply_invalidation(self, invalid_ids: set[str], graph: ExecutionGraph) -> None:
+        """Reset exactly the invalidation frontier: scancel jobs, drop state, rmtree, reclaim.
+
+        Unlike the old reset-all-failed path, this touches ONLY ``invalid_ids``
+        (changed nodes ∪ their transitive dependents), so a healthy paused
+        (INTERRUPTED) node keeps its ``nodes/<id>/`` + ``jobs.json`` and its
+        still-running job — a later resume re-attaches it. DONE nodes are never in
+        the frontier and never touched.
+        """
+        if not invalid_ids:
+            return
         graph_state = GraphState.load(self.graph_state_path)
-        for node_id in reset_ids:
+        for node_id in invalid_ids:
+            self._cancel_node_jobs(node_id)
             graph_state.states[node_id] = NodeState.PENDING
             graph_state.worktrees.pop(node_id, None)
         graph_state.save(self.graph_state_path)
-
-        for node_id in reset_ids:
+        for node_id in invalid_ids:
             shutil.rmtree(
                 self.workspace / NODES_DIRNAME / node_dir_slug(node_id),
                 ignore_errors=True,

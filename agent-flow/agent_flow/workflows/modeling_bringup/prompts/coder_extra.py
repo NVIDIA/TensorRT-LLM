@@ -74,6 +74,35 @@ _CODER_GUIDANCE = """\
   edit `auto_deploy/` or `tests/.../auto_deploy/`.
 """
 
+_DETACHED_JOBS_GUIDANCE = """\
+## Long-running commands — launch DETACHED, and re-attach yourself on resume
+
+For any command that runs longer than a few minutes (Slurm `sbatch`/`srun`, long
+builds, long evals), DO NOT block your turn on a synchronous command — your turn
+can be paused/cancelled mid-flight, and a blocking `srun` child dies with it.
+Launch it DETACHED via the framework wrapper, which records the job in a per-node
+`jobs.json` so it survives a pause:
+
+    python -m agent_flow.jobs.run_detached \\
+      --registry <workspace>/nodes/<node_id>/jobs.json \\
+      --handle <stable-logical-key e.g. mmmu-full-cg1ov1> \\
+      --kind slurm --name <node_id>-<handle> \\
+      -- sbatch <your job script and args>
+
+Use a STABLE `--handle` (describe WHAT the job computes; no timestamps).
+
+**Re-attach on resume — this is YOUR job, do it every turn before submitting.**
+Before launching, read your node's `jobs.json` (and your own status notes) for a
+job already recorded under this `--handle`. If one exists, check it yourself
+(`squeue -j <job_id>` for liveness, then `sacct -j <job_id> -o State,ExitCode`
+for a finished job's outcome) and act on the result:
+- still RUNNING/PENDING → keep polling that job; do NOT resubmit (resubmitting
+  duplicates the job and orphans the original, wasting the cluster);
+- finished (COMPLETED) → collect its output and move on;
+- gone / failed → resubmit fresh with `run_detached` (same `--handle`).
+
+Only run `run_detached` to submit when there is no live job for the handle."""
+
 _STAGE_GOAL_CODER_PROTOCOL = """\
 ## Stage/Goal protocol — working a single Goal per turn
 
@@ -201,6 +230,7 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
         GSM8K_REFERENCE_CONFIG_POLICY,
         ACCURACY_GAP_PARITY_POLICY,
         _CODER_GUIDANCE,
+        _DETACHED_JOBS_GUIDANCE,
     ]
 )
 
