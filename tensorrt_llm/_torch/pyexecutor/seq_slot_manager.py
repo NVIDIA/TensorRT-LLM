@@ -1,6 +1,7 @@
 from .llm_request import LlmRequest
 from .resource_manager import BaseResourceManager, SlotManager
 from .scheduler import ScheduledRequests
+from tensorrt_llm.logger import logger
 
 
 class SeqSlotManager(BaseResourceManager):
