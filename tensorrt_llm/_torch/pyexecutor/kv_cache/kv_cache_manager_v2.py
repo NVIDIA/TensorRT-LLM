@@ -1900,7 +1900,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._windowed_layer_group_sizes = {
                 group_id: window_size
                 for group_id, window_size in self._get_event_window_sizes_by_layer_group().items()
-                if window_size < self.max_seq_len
+                if 0 < window_size < self.max_seq_len
             }
         return self._windowed_layer_group_sizes
 
