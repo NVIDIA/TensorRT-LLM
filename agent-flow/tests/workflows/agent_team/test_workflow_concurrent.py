@@ -376,6 +376,70 @@ def test_concurrent_feedback_replan_runs_before_scheduler_pass(tmp_path, monkeyp
     assert _graph_states(tmp_path)["g1"] == "done"  # the resumed node still ran
 
 
+def test_apply_invalidation_resets_only_frontier(tmp_path, monkeypatch):
+    """``_apply_invalidation`` resets only the frontier; a healthy node is kept.
+
+    The invalidated node (``s2``) has its job scancelled, its checkpoint state
+    reset to PENDING, and its ``nodes/<slug>/`` removed; the healthy paused node
+    (``s1``, INTERRUPTED) keeps its sub-workspace + state so a resume re-attaches.
+    """
+    from agent_flow.jobs.registry import JobEntry, JobRegistry
+    from agent_flow.orchestration.graph import ExecutionGraph, Node, NodeState
+    from agent_flow.orchestration.scheduler import GraphState
+    from agent_flow.workflows.agent_team.node_workspace import node_dir_slug
+    from agent_flow.workflows.agent_team.workflow import NODES_DIRNAME, AgentTeamWorkflow
+
+    graph = ExecutionGraph(nodes=(Node(id="s1", type="s"), Node(id="s2", type="s")))
+    wf = AgentTeamWorkflow.__new__(AgentTeamWorkflow)
+    wf.workspace = tmp_path
+    wf.graph_state_path = tmp_path / ".graph_state.json"
+
+    class _Iso:
+        async def reclaim(self, node):
+            return None
+
+    wf._isolation = _Iso()
+
+    # both nodes have a nodes/<slug>/ with a jobs.json
+    for nid in ("s1", "s2"):
+        d = tmp_path / NODES_DIRNAME / node_dir_slug(nid)
+        d.mkdir(parents=True)
+        JobRegistry(d / "jobs.json").upsert(
+            JobEntry(
+                handle_key="k",
+                kind="slurm",
+                handle={"job_id": "1", "name": "n"},
+                state="RUNNING",
+            )
+        )
+    GraphState(states={"s1": NodeState.INTERRUPTED, "s2": NodeState.FAILED}).save(
+        wf.graph_state_path
+    )
+
+    cancelled = []
+    monkeypatch.setattr(
+        "agent_flow.workflows.agent_team.workflow.KINDS",
+        {
+            "slurm": type(
+                "K",
+                (),
+                {
+                    "cancel": lambda self, h: cancelled.append(h),
+                    "status": lambda self, h: None,
+                },
+            )()
+        },
+    )
+
+    wf._apply_invalidation({"s2"}, graph)
+
+    assert not (tmp_path / NODES_DIRNAME / node_dir_slug("s2")).exists()  # frontier reset
+    assert (tmp_path / NODES_DIRNAME / node_dir_slug("s1")).exists()  # healthy node kept
+    assert cancelled == [{"job_id": "1", "name": "n"}]  # s2's job scancelled
+    assert GraphState.load(wf.graph_state_path).states["s2"] == NodeState.PENDING
+    assert GraphState.load(wf.graph_state_path).states["s1"] == NodeState.INTERRUPTED
+
+
 def test_linear_path_is_unchanged_when_not_concurrent(tmp_path):
     """Regression: with ``concurrent=False`` the linear build loop runs unchanged.
 
