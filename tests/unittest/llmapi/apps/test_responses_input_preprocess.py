@@ -640,3 +640,74 @@ def test_a_request_without_the_item_is_untouched():
 
     assert request.input == "hello"
     assert request.tools == []
+
+
+def test_function_call_output_with_content_parts_is_translated():
+    """A tool result may carry parts rather than a string.
+
+    Assigning them to `content` untouched handed `input_text` to the
+    chat-completions parser, which knows only `text`, and the request failed
+    with "Unknown part type: input_text".
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": [{"type": "input_text", "text": "42"}],
+        }
+    )
+
+    assert msg == {
+        "role": "tool",
+        "content": [{"type": "text", "text": "42"}],
+        "tool_call_id": "call_1",
+    }
+
+
+def test_custom_tool_call_output_with_content_parts_is_translated():
+    """The custom-tool branch had the same assumption.
+
+    This is the one that fired in practice: a tool result arrives on every
+    turn after the model's first custom-tool call, so once an agent started
+    using tools nearly all of its traffic was rejected -- 483 of 490 requests
+    in one campaign round.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_2",
+            "output": [
+                {"type": "input_text", "text": "ok"},
+                {"type": "input_text", "text": " done"},
+            ],
+        }
+    )
+
+    assert msg["role"] == "tool"
+    assert msg["content"] == [{"type": "text", "text": "ok"}, {"type": "text", "text": " done"}]
+    assert msg["tool_call_id"] == "call_2"
+
+
+def test_a_string_tool_result_is_unchanged():
+    """The simple shape must not be reshaped into parts."""
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "function_call_output",
+            "call_id": "call_3",
+            "output": "plain text",
+        }
+    )
+
+    assert msg["content"] == "plain text"
+
+
+def test_a_missing_custom_tool_result_stays_empty():
+    """Absent output is still not a reason to fail the turn."""
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call_4",
+        }
+    )
+
+    assert msg["content"] == ""

@@ -784,6 +784,24 @@ def _chat_content_parts(content: list) -> list:
     return parts
 
 
+def _tool_output_content(output):
+    """A tool result's payload in the vocabulary the chat parser knows.
+
+    `output` is a string on the simple path and a list of Responses content
+    parts when the client structures it. Passing a list through untouched
+    hands `input_text` to a parser that knows only `text`, which fails the
+    whole request rather than the item -- and a tool result arrives on every
+    turn after the first tool call, so the conversation stops there.
+    """
+    if isinstance(output, list):
+        return _chat_content_parts(output)
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    return str(output)
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem]
 ) -> Optional[ChatCompletionMessageParam]:
@@ -875,7 +893,7 @@ def _response_output_item_to_chat_completion_message(
         case "function_call_output":
             return {
                 "role": "tool",
-                "content": item["output"],
+                "content": _tool_output_content(item["output"]),
                 "tool_call_id": item["call_id"],
             }
         case "custom_tool_call":
@@ -907,7 +925,7 @@ def _response_output_item_to_chat_completion_message(
             # turn that still renders, not a KeyError surfacing as a 500.
             return {
                 "role": "tool",
-                "content": item.get("output") or "",
+                "content": _tool_output_content(item.get("output")),
                 "tool_call_id": item.get("call_id") or "",
             }
         case "agent_message":
