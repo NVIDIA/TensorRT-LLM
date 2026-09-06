@@ -581,17 +581,40 @@ def test_a_delivered_offer_is_not_handed_back(budgeting_manager, budgeting_conne
     assert budgeting_connector.cancels == []
 
 
-def test_a_freed_allocation_is_asked_again(budgeting_manager, budgeting_connector):
-    """One query per allocation, not per request -- the same rule as the
-    default placement, and what makes handing the offer back at ``free`` the
-    right pairing."""
+def test_a_delivered_offer_is_re_asked_after_a_recompute_pause(
+    budgeting_manager, budgeting_connector
+):
+    """One query per allocation, not per request.
+
+    This is the sequence a recompute pause runs: the scheduler frees the
+    allocation (``_recompute_pause_request``) and the executor resets the
+    request for replay (``_pause_recompute_paused_requests``), in that order.
+
+    Delivery must not exempt the recorded offer from being cleared. Left
+    behind, the replay finds an offer it already used, skips the context
+    position over that range without asking the connector to load it again,
+    and prefills nothing into pages the forward pass then reads -- wrong KV,
+    with no error anywhere. Clearing is what makes the replay ask.
+    """
     request = make_request()
     assert schedule(budgeting_manager, request)
     run(budgeting_manager, request)
+    assert request.py_connector_allocation_reported
+
     budgeting_manager.free_resources(request)
+
+    # Cleared even though it was delivered; only the hand-back is skipped.
+    assert request.py_connector_prefix_end is None
+    assert not request.py_connector_allocation_reported
+    assert budgeting_connector.cancels == []
 
     request.reset_for_recompute(PROMPT_LEN)
     assert schedule(budgeting_manager, request)
     run(budgeting_manager, request)
 
     assert len(budgeting_connector.queries) == 2
+    # The replayed position came from the second query, not from the offer the
+    # first one left behind.
+    assert request.context_current_position == OFFER_TOKENS
+    assert len(budgeting_connector.commits) == 2
+    assert len(budgeting_connector.allocs) == 2
