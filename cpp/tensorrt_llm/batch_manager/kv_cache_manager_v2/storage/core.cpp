@@ -913,7 +913,9 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
             size_t minGrains = grainsForSlots(minSlotCount, sizeLists[pgIdx], granularity);
             auto [slots, used] = grainsToSlots(minGrains, sizeLists[pgIdx], granularity);
             slotCntList[pgIdx] = slots;
-            TLLM_CHECK_DEBUG(used <= remainingGrains);
+            // remainingGrains is unsigned, so an over-subtraction would wrap past the
+            // `remainingGrains == 0` guard below instead of reporting an exhausted budget.
+            TLLM_CHECK_WITH_INFO(used <= remainingGrains, "Insufficient quota to satisfy min_slots constraints");
             remainingGrains -= used;
         }
 
