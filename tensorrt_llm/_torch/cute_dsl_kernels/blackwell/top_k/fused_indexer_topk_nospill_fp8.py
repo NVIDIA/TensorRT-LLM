@@ -237,6 +237,15 @@ def _pick_warp(sH, lane, target):
 
 
 @cute.jit
+def _ntl_of(L, crk, CS):
+    ntile = (L + TOK - 1) // TOK
+    n = I32(0)
+    if ntile > crk:
+        n = (ntile - crk + CS - 1) // CS
+    return n
+
+
+@cute.jit
 def _compact(
     sHist,
     sKey32,
@@ -286,7 +295,7 @@ def _compact(
             k0 = x & 0xFFFF
             k1 = (x >> 16) & 0xFFFF
             p0 = 2 * w
-            t0 = (crk + (p0 >> 7) * CS) * TOK + (p0 & (TOK - 1))
+            t0 = (crk + (_ntl_of(L, crk, CS) - 1 - (p0 >> 7)) * CS) * TOK + (p0 & (TOK - 1))
             if (t0 < L) and ((k0 >> 5) == bs):
                 cute.arch.atomic_add(sFine.iterator + (k0 & (NFINE - 1)), I32(1), scope="cta")
             if (t0 + 1 < L) and ((k1 >> 5) == bs):
@@ -351,7 +360,7 @@ def _filter_window(sWin, woff, sSPos, sSKey, sCtl, tidx, wl, lmaskw, crk, L, ntl
         w = r * C_THREADS + tidx
         k = I32(sWin[woff + w])
         tl = tile0 + w // TOK
-        tok = (crk + tl * CS) * TOK + (w % TOK)
+        tok = (crk + (ntl - 1 - tl) * CS) * TOK + (w % TOK)
         kp = (tl < ntl) and (tok < L) and ((k >> 5) >= sCtl[4])
         mk = cute.arch.vote_ballot_sync(kp)
         keeps[r] = kp
@@ -525,8 +534,8 @@ def _fp8_kernel(
     if tidx >= 128:
         ii = tidx - 128
         for jj in cutlass.range(ii, RBT * 4, NTHREADS - 128, unroll=1):
-            gi = (crk + (jj >> 2) * CS) * 4 + (jj & 3)
-            if gi < MAXB:
+            gi = (crk + (ntl - 1 - (jj >> 2)) * CS) * 4 + (jj & 3)
+            if ((jj >> 2) < ntl) and (gi < MAXB):
                 sBT[jj] = gBT[gi]
 
     if tidx < 64:
@@ -573,7 +582,7 @@ def _fp8_kernel(
         # 16-lane-per-page decomposition and all 64 per-thread arrivals.
         pgw = 2 * (warp_idx - 12)
         for j in cutlass.range(ntl, unroll=1):
-            i = crk + j * CS
+            i = crk + (ntl - 1 - j) * CS
             s = j % STAGES
             if j >= STAGES:
                 cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
@@ -585,7 +594,7 @@ def _fp8_kernel(
                     for r in cutlass.range_constexpr(8):
                         e = lt * 8 + r
                         jj = j + 64 + (e >> 2)
-                        gi = (crk + jj * CS) * 4 + (e & 3)
+                        gi = (crk + (ntl - 1 - jj) * CS) * 4 + (e & 3)
                         if (jj < ntl) and (gi < MAXB):
                             sBT[(jj & (RBT - 1)) * 4 + (e & 3)] = gBT[gi]
                     cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
@@ -752,7 +761,7 @@ def _fp8_kernel(
                 cute.arch.mbarrier_wait(acc_full + gwg, (i // NACC) & 1)
                 # the token's fp32 scale lives behind its page's data plane; phantom tokens
                 # past the row end read page 0 so the address stays valid
-                tokc = (crk + i * CS) * TOK + lane
+                tokc = (crk + (ntl - 1 - i) * CS) * TOK + lane
                 pgv = I32(0)
                 if tokc < L:
                     pgv = sBT[(i & (RBT - 1)) * 4 + (lane >> 5)]
@@ -808,7 +817,7 @@ def _fp8_kernel(
                 ki = ui ^ (0x8000 + ((ui >> 15) & 1) * 0x7FFF)
                 hv = U16(ki).bitcast(F16)
                 pos = i * TOK + lane
-                tok = (crk + i * CS) * TOK + lane
+                tok = (crk + (ntl - 1 - i) * CS) * TOK + lane
                 if cutlass.const_expr(NLOC > NDENSE):
                     if i < NDENSE:
                         sVal[pos] = hv
@@ -999,7 +1008,7 @@ def _fp8_kernel(
         kv0 = U16(xi & 0xFFFF)
         kv1 = U16((xi >> 16) & 0xFFFF)
         # local slot -> global kv position
-        t0 = (crk + (p0 >> 7) * CS) * TOK + (p0 & (TOK - 1))
+        t0 = (crk + (ntl - 1 - (p0 >> 7)) * CS) * TOK + (p0 & (TOK - 1))
         t1 = t0 + 1
         n0 = I32(kv0) >> 5
         n1 = I32(kv1) >> 5
@@ -1108,7 +1117,7 @@ def _fp8_kernel(
                             pl = sSPos[es - NDENSE * TOK]
                     else:
                         kk = I32(sKey[es])
-                t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
+                t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
                 take = live and (t < L) and ((kk >> 5) == b1)
                 if ncl <= CAP:
                     take = live
@@ -1224,7 +1233,7 @@ def _fp8_kernel(
                             pl = sSPos[es - NDENSE * TOK]
                     else:
                         kk = I32(sKey[es])
-                t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
+                t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
                 take = live and (t < L) and ((kk >> 5) == b1)
                 if ncand <= CAP:
                     take = live
@@ -1270,7 +1279,7 @@ def _fp8_kernel(
                     pl = sSPos[es - NDENSE * TOK]
             else:
                 kk = I32(sKey[es])
-            t = (crk + (pl >> 7) * CS) * TOK + (pl & (TOK - 1))
+            t = (crk + (ntl - 1 - (pl >> 7)) * CS) * TOK + (pl & (TOK - 1))
             take = t < L
             if ncand <= CAP:
                 take = True
