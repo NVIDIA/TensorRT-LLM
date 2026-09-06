@@ -820,8 +820,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
         self.previous_request_ids = []
         # Per-request verify windows seen by the last full _prepare_tp_inputs
-        # pass; all None without ragged verification.
-        self.previous_verify_lens = []
+        # pass; absent entirely without ragged verification.
+        self.previous_verify_lens = [] if self._dspark_trims_submitted_tokens else None
         self.has_previous_device_draft = False
 
         self._encoder_decoder_host_buffer_pool: List[Dict[str, Any]] = []
@@ -4915,15 +4915,16 @@ class PyTorchModelEngine(ModelEngine):
         if self.previous_request_ids != request_ids:
             return False
 
-        # The incremental path is only valid while every request's sequence
-        # length is unchanged; ragged verification re-picks windows every
-        # step, so fall back to a full prepare whenever they moved.
-        verify_lens = [
-            getattr(request, "py_verify_len", None)
-            for request in scheduled_requests.generation_requests
-        ]
-        if self.previous_verify_lens != verify_lens:
-            return False
+        if self._dspark_trims_submitted_tokens:
+            # The incremental path is only valid while every request's sequence
+            # length is unchanged; ragged verification re-picks windows every
+            # step, so fall back to a full prepare whenever they moved.
+            verify_lens = [
+                getattr(request, "py_verify_len", None)
+                for request in scheduled_requests.generation_requests
+            ]
+            if self.previous_verify_lens != verify_lens:
+                return False
 
         has_current_device_draft = next_draft_tokens_device is not None
         return has_current_device_draft and self.has_previous_device_draft
@@ -5823,11 +5824,12 @@ class PyTorchModelEngine(ModelEngine):
         request_accepted_path = {}
         num_extend_dummy_requests = 0
         num_previous_batch = 0
-        # Per-request token counts, in previous-batch order. Stays all-equal to
-        # num_tokens_per_extend_request unless a ragged scheduler assigned each
-        # request its own verify window.
-        tokens_per_extend_request = []
-        previous_batch_slots = []
+        ragged_enabled = self._dspark_trims_submitted_tokens
+        # These lists exist only for confidence-scheduled ragged verification.
+        # Keeping them off the native static path avoids per-request allocation
+        # and bookkeeping when the feature is disabled.
+        tokens_per_extend_request = [] if ragged_enabled else None
+        previous_batch_slots = [] if ragged_enabled else None
 
         use_extend_ctx = (self.enable_spec_decode
                           and spec_config.spec_dec_mode.extend_ctx(
@@ -5842,10 +5844,10 @@ class PyTorchModelEngine(ModelEngine):
             # from this one per-request value; mixing it with the batch-wide
             # count desynchronizes the flat token layout from the KV-length
             # correction applied in _preprocess_inputs.
-            req_tokens_per_gen_step = (get_request_tokens_per_gen_step(
-                request, num_tokens_per_extend_request)
-                                       if self._dspark_trims_submitted_tokens
-                                       else num_tokens_per_extend_request)
+            req_tokens_per_gen_step = num_tokens_per_extend_request
+            if ragged_enabled:
+                req_tokens_per_gen_step = get_request_tokens_per_gen_step(
+                    request, num_tokens_per_extend_request)
 
             if use_extend_ctx:
                 # We're treating the prompt lengths as context requests here, so
@@ -5867,8 +5869,9 @@ class PyTorchModelEngine(ModelEngine):
                 previous_batch_indices[
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
-                previous_batch_slots.append(request.py_batch_idx)
-                tokens_per_extend_request.append(req_tokens_per_gen_step)
+                if ragged_enabled:
+                    previous_batch_slots.append(request.py_batch_idx)
+                    tokens_per_extend_request.append(req_tokens_per_gen_step)
 
                 request.cached_tokens = (base_past_seen +
                                          req_tokens_per_gen_step)
@@ -5879,10 +5882,12 @@ class PyTorchModelEngine(ModelEngine):
             request.py_batch_idx = request.py_seq_slot
 
         num_extend_reqeust_wo_dummy = num_extend_requests - num_extend_dummy_requests
-        is_ragged_gen = self._dspark_trims_submitted_tokens and any(
+        is_ragged_gen = ragged_enabled and any(
             tokens != num_tokens_per_extend_request
             for tokens in tokens_per_extend_request)
-        total_num_tokens = sum(tokens_per_extend_request)
+        total_num_tokens = (sum(tokens_per_extend_request) if ragged_enabled else
+                            num_extend_reqeust_wo_dummy *
+                            num_tokens_per_extend_request)
 
         previous_slots = self.previous_batch_indices_cuda[:num_previous_batch]
         previous_slots.copy_(previous_batch_indices[:num_previous_batch],
@@ -5891,8 +5896,10 @@ class PyTorchModelEngine(ModelEngine):
         prompt_lengths = prompt_lengths.tolist()
         num_cached_tokens_per_seq = num_cached_tokens_per_seq.tolist()
 
-        previous_batch_draft_tokens = (total_num_tokens -
-                                       num_extend_reqeust_wo_dummy)
+        previous_batch_draft_tokens = (
+            total_num_tokens - num_extend_reqeust_wo_dummy
+            if ragged_enabled else num_extend_reqeust_wo_dummy *
+            (num_tokens_per_extend_request - 1))
 
         self._update_target_input_tensors(
             num_accepted_tokens_device=num_accepted_tokens_device,
@@ -7306,8 +7313,9 @@ class PyTorchModelEngine(ModelEngine):
         # BEFORE the refresh decision below: it asks the metadata whether this
         # step is ragged, and asking before this step's windows are on it
         # reads the previous step's answer.
-        self._publish_gen_token_layout(attn_metadata,
-                                       scheduled_requests.generation_requests)
+        if self._dspark_trims_submitted_tokens:
+            self._publish_gen_token_layout(
+                attn_metadata, scheduled_requests.generation_requests)
 
         refresh_seq_lens = not attn_metadata.is_cuda_graph
         if (not refresh_seq_lens
@@ -7483,9 +7491,10 @@ class PyTorchModelEngine(ModelEngine):
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(
                     context_prompt_lookahead)
-            self._attach_ragged_verify_layout(
-                spec_metadata, attn_metadata,
-                scheduled_requests.generation_requests)
+            if self._dspark_trims_submitted_tokens:
+                self._attach_ragged_verify_layout(
+                    spec_metadata, attn_metadata,
+                    scheduled_requests.generation_requests)
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
             # No-op for non 1-model
@@ -7522,10 +7531,11 @@ class PyTorchModelEngine(ModelEngine):
 
         if not self.is_warmup:
             self.previous_request_ids = all_gen_request_ids
-            self.previous_verify_lens = [
-                getattr(request, "py_verify_len", None)
-                for request in scheduled_requests.generation_requests
-            ]
+            if self._dspark_trims_submitted_tokens:
+                self.previous_verify_lens = [
+                    getattr(request, "py_verify_len", None)
+                    for request in scheduled_requests.generation_requests
+                ]
             self.has_previous_device_draft = next_draft_tokens_device is not None
 
             # Record the steady-state generation cache when this pass handled
