@@ -534,6 +534,16 @@ def _derive_draft_max_attention_window(
     return None
 
 
+def _enable_cache_iteration_stats(llm_args) -> bool:
+    """Predicate gating per-iteration cache statistics on the KV and PEFT managers.
+
+    Both managers collect on the same switch so one /metrics row describes both
+    caches over the same window.
+    """
+    return (llm_args.enable_iter_perf_stats
+            or getattr(llm_args, "return_perf_metrics", False))
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -689,8 +699,7 @@ class KvCacheCreator:
         return kv_cache_manager_cls
 
     def _enable_kv_cache_stats(self) -> bool:
-        return (self._llm_args.enable_iter_perf_stats
-                or getattr(self._llm_args, "return_perf_metrics", False))
+        return _enable_cache_iteration_stats(self._llm_args)
 
     def _per_manager_cache_cost(self,
                                 manager_cls,
@@ -3131,6 +3140,9 @@ def create_py_executor_instance(
             execution_stream=execution_stream,
             lora_target_modules=target_modules,
             initial_data_type=initial_lora_data_type,
+            # Same predicate as the KV managers, so one /metrics row describes
+            # both caches over the same window.
+            enable_stats=_enable_cache_iteration_stats(llm_args),
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(

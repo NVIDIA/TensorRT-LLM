@@ -558,3 +558,101 @@ class TestStatsSerializer:
         assert [stats.available for stats in secondary_peak] == [4, 5]
         assert [stats.unavailable for stats in secondary_peak] == [1, 0]
         assert [stats.evictable for stats in secondary_peak] == [1, 0]
+
+
+def _make_mock_peft_iter_stats(**overrides):
+    """Stand-in for the nanobind PeftCacheIterationStats.
+
+    The real struct needs the compiled extension; the serializer only reads
+    attributes, so a namespace with the same field names exercises the same
+    code path.
+    """
+    fields = {
+        "requests_paused": 0,
+        "requests_resumed": 0,
+        "requests_terminated": 0,
+        "tasks_released_device": 0,
+        "tasks_released_host": 0,
+        "tasks_evicted_device": 0,
+        "pages_evicted_device": 0,
+        "tasks_evicted_host": 0,
+        "pages_evicted_host": 0,
+        "device_pages_total": 0,
+        "device_pages_available": 0,
+        "host_pages_total": 0,
+        "host_pages_available": 0,
+        "device_tasks_in_progress": 0,
+        "device_tasks_done": 0,
+        "active_tasks": 0,
+        "paused_tasks": 0,
+    }
+    unknown = set(overrides) - set(fields)
+    assert not unknown, f"unknown PeftCacheIterationStats field(s): {unknown}"
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestPeftCacheIterationStats:
+    """peftCacheIterationStats reaches the serialized stats dict."""
+
+    def test_serializer_emits_peft_cache_iteration_stats(self) -> None:
+        """The adapter-ownership transitions surface under one nested key.
+
+        requestsPaused/requestsResumed show a preempted LoRA request handing
+        its adapter back and taking it again on resume; tasksReleasedDevice
+        shows the adapter's last holder let go, and pagesEvictedDevice shows a
+        different adapter then claimed the freed pages.
+        """
+        iter_stats = _make_mock_iteration_stats()
+        peft_iter = _make_mock_peft_iter_stats(
+            requests_paused=2,
+            requests_resumed=1,
+            tasks_released_device=1,
+            tasks_evicted_device=1,
+            pages_evicted_device=6,
+            device_pages_total=16,
+            device_pages_available=4,
+            active_tasks=3,
+            paused_tasks=1,
+        )
+
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, None, None, peft_iter)
+        )
+        d = json.loads(result)
+
+        peft = d["peftCacheIterationStats"]
+        assert peft["requestsPaused"] == 2
+        assert peft["requestsResumed"] == 1
+        assert peft["tasksReleasedDevice"] == 1
+        assert peft["tasksEvictedDevice"] == 1
+        assert peft["pagesEvictedDevice"] == 6
+        assert peft["devicePagesTotal"] == 16
+        assert peft["devicePagesAvailable"] == 4
+        assert peft["activeTasks"] == 3
+        assert peft["pausedTasks"] == 1
+
+    def test_serializer_omits_key_without_peft_manager(self) -> None:
+        """No LoRA in the deployment leaves the key absent, not zero-filled.
+
+        A consumer must be able to tell "PEFT is not configured" from "PEFT is
+        configured and nothing happened this iteration".
+        """
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer((iter_stats, None, None))
+        d = json.loads(result)
+
+        assert "peftCacheIterationStats" not in d
+
+    def test_serializer_reads_legacy_tuple_without_peft_slot(self) -> None:
+        """An 8-tuple from before this slot existed still serializes."""
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, "overlap", 1.5)
+        )
+        d = json.loads(result)
+
+        assert d["schedulerMode"] == "overlap"
+        assert "peftCacheIterationStats" not in d

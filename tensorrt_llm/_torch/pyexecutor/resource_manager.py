@@ -3086,7 +3086,8 @@ class PeftCacheManager(BaseResourceManager):
                  world_config: WorldConfig | None = None,
                  execution_stream: Optional[torch.cuda.Stream] = None,
                  lora_target_modules: Optional[List[str]] = None,
-                 initial_data_type: Optional[torch.dtype] = None):
+                 initial_data_type: Optional[torch.dtype] = None,
+                 enable_stats: bool = False):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -3120,7 +3121,8 @@ class PeftCacheManager(BaseResourceManager):
         self.impl = PeftCacheManagerCpp(config=peft_cache_manager_config,
                                         model_config=model_config,
                                         world_config=world_config,
-                                        buffer_manager=buffer_manager)
+                                        buffer_manager=buffer_manager,
+                                        enable_stats=enable_stats)
         if initial_data_type is not None:
             self.impl.configure_data_type(
                 torch_dtype_to_binding(initial_data_type))
