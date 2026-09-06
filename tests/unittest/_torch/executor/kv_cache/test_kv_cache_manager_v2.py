@@ -105,6 +105,7 @@ def _make_cache_config_for_test(
     num_extra_kv_tokens: int = 0,
     max_attention_window_vec: list[int | None] | None = None,
     pp_layers: list[int] | None = None,
+    ledger_tokens_per_block: int = 128,
 ) -> KVCacheManagerConfig:
     if max_attention_window_vec is None:
         max_attention_window_vec = [None]
@@ -132,9 +133,8 @@ def _make_cache_config_for_test(
     cache_manager.enable_joint_kv_cache_reuse = False
     cache_manager.reuse_match_backoff = 0
     cache_manager.get_layer_bytes_per_token = lambda **_: 128
-    # Mirrors __init__: without helix the ledger block equals the physical
-    # page (the helper re-enacts construction for partial instances).
-    cache_manager._ledger_tokens_per_block = 128
+    # Mirrors __init__; callers can override this to model a Helix super-block.
+    cache_manager._ledger_tokens_per_block = ledger_tokens_per_block
 
     return cache_manager._build_base_config(
         kv_cache_config,
@@ -545,7 +545,7 @@ def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
     ) == [None, 0, recurrent_states, 6, None]
 
 
-def test_pool_ratio_overrides_constraints() -> None:
+def test_pool_ratio_preserves_concurrent_decode_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(pool_ratio=[1.0], avg_seq_len=256, host_cache_size=0),
         max_batch_size=3,
@@ -554,10 +554,10 @@ def test_pool_ratio_overrides_constraints() -> None:
 
     assert config.initial_pool_ratio == pytest.approx([1.0])
     assert config.typical_step is None
-    assert config.constraints == []
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=128, history_length=127)] * 3)]
 
 
-def test_default_uses_allocator_fallback() -> None:
+def test_default_preserves_allocator_ratio_with_decode_constraint() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0),
         max_batch_size=3,
@@ -567,8 +567,28 @@ def test_default_uses_allocator_fallback() -> None:
     )
 
     assert config.initial_pool_ratio is None
-    assert config.typical_step is None
-    assert config.constraints == []
+    assert config.typical_step == BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)])
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=128, history_length=127)] * 3)]
+
+
+def test_concurrent_decode_constraint_uses_ledger_block_and_token_budget() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, max_tokens=512),
+        max_batch_size=4,
+        ledger_tokens_per_block=256,
+    )
+
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=256, history_length=255)] * 2)]
+
+
+def test_concurrent_decode_constraint_keeps_one_slot_below_budget() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0, max_tokens=255),
+        max_batch_size=4,
+        ledger_tokens_per_block=256,
+    )
+
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=256, history_length=255)])]
 
 
 def test_avg_seq_len_builds_warmup_constraints() -> None:
@@ -593,6 +613,7 @@ def test_avg_seq_len_builds_warmup_constraints() -> None:
             ]
         ),
         BatchDesc([KVCacheDesc(capacity=2048, history_length=0)]),
+        BatchDesc([KVCacheDesc(capacity=128, history_length=127)] * 3),
     ]
 
 
