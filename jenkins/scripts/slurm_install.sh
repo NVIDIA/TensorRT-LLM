@@ -78,6 +78,16 @@ slurm_install_setup() {
             retry_command --timeout 2700 pip3 install --retries 10 --no-deps \
                 "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl" \
                 "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl"
+            # These are prebuilt against one torch ABI, and upstream publishes no
+            # build for every base image we run on, so on a mismatch the extension
+            # loads with an undefined c10 symbol. Leaving a broken install behind is
+            # worse than having none: transformers gates its causal_conv1d import on
+            # a package-metadata probe, which a broken install still passes, so the
+            # import blows up and takes the whole module -- and every test collected
+            # from it -- down with it. Uninstalled, the gate says no and the model
+            # falls back to its Python path.
+            python3 -c "import causal_conv1d, mamba_ssm" 2>/dev/null \
+                || pip3 uninstall -y causal_conv1d mamba_ssm
         fi
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
