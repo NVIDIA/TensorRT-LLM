@@ -204,7 +204,7 @@ def test_fused_indexer_topk_nospill_fp8(batch, n_comp, k_top, weight_mode):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("batch", [1, 4, 16, 36, 70])
 @pytest.mark.parametrize("n_comp", [16384, 65536])
 def test_fused_indexer_topk_nospill_fp8_split(batch, n_comp, monkeypatch):
     monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "1")

@@ -272,7 +272,7 @@ def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("batch", [1, 4, 16, 36, 70])
 @pytest.mark.parametrize("n_comp", [16384, 65536])
 @pytest.mark.parametrize("k_top", [1024])
 def test_fused_indexer_topk_nospill_split(batch, n_comp, k_top, monkeypatch):
@@ -575,6 +575,13 @@ def test_fused_indexer_topk_nospill_routing(monkeypatch):
         (1, 4096): (148, 1),
         (4, 4096): (37, 1),
         (32, 4096): (4, 0),
+        (60, 4096): (2, 0),
+        # off the power-of-two grid the split places 1.2x+ the CTAs: 22 -> 6x22, 36 -> 4x36, 70 -> 2x70
+        (22, 4096): (6, 1),
+        (36, 4096): (4, 1),
+        (70, 4096): (2, 1),
+        (25, 2048): (5, 1),
+        (22, 256): (4, 0),
     }
     for (batch, maxb), (cs, gm) in cases.items():
         key, _, _ = fused_indexer_topk_nospill._config(batch, maxb, 4096, 1024)
