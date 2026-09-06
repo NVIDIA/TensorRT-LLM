@@ -13,16 +13,16 @@ from transformers import LlamaConfig, PretrainedConfig
 from tensorrt_llm.logger import logger
 
 from ...functional import PositionEmbeddingType
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.mla import MLA
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
-from ..modules.mla import MLA
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -1272,6 +1272,9 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+            case "qwen4_exp_text":
+                from .modeling_qwen4_exp import Qwen4ExpMTP
+                mtp_layer = Qwen4ExpMTP
             case "step3p7" | "step3p5":
                 from .modeling_step3p7 import Step3p7MTP
                 mtp_layer = Step3p7MTP

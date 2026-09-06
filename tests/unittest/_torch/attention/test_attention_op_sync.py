@@ -45,13 +45,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.attention_backend.fmha.fallback import (
+from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
     FallbackFmha,
 )
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 pytestmark = pytest.mark.cpu_only
 

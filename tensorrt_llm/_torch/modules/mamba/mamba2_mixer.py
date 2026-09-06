@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...attention_backend import AttentionMetadata
+from ...attention.backends import AttentionMetadata
 from ...model_config import ModelConfig
 from ...peft.lora.layer import LoraLayer, LoraModuleType
 from ...speculative import SpecMetadata

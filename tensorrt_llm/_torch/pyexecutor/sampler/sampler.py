@@ -2026,7 +2026,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and (
                 has_stable_greedy_batch
                 or all(
-                    request._py_embedding_bias_1d is None
+                    request.py_embedding_bias is None
                     and not getattr(request, "py_bad_words", None)
                     and not getattr(request, "py_no_repeat_ngram_size", None)
                     and not has_occurrence_penalty(request)

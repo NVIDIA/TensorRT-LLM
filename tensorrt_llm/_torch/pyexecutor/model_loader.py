@@ -27,7 +27,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     check_weight_sharing_compatibility)
-from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
@@ -154,6 +154,20 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+
+    effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
+                                else mapped_pyt_quant)
+    if (torch.cuda.is_available() and get_sm_version() == 107
+            and effective_kv_cache_quant
+            in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)):
+        logger.warning(
+            "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
+            "using FP8 KV cache instead.")
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.FP8.value
+        if model_config.quant_config_dict is not None:
+            for layer_quant_config in model_config.quant_config_dict.values():
+                layer_quant_config.kv_cache_quant_algo = QuantAlgo.FP8.value
+        return
 
     # If we're letting the checkpoint dictate the quant with auto, simply
     # return and do not modify the checkpoint.
@@ -823,6 +837,21 @@ class ModelLoader:
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
+
+            requires_standard_hf_loading = any(
+                getattr(module, "_requires_standard_hf_loading", False)
+                for module in model.modules())
+            # Pinned-host parameters must be materialized and filled in place.
+            # AUTO uses the HF mapper that preserves their stable addresses;
+            # AUTO may still resolve to MX, so check the resolved format too.
+            uses_standard_hf_loader = (load_format == LoadFormat.AUTO
+                                       and checkpoint_loader.checkpoint_format
+                                       != "MX")
+            if requires_standard_hf_loading and not uses_standard_hf_loader:
+                raise ValueError(
+                    "Host-resident model weights currently require the standard "
+                    "Hugging Face AUTO loader; DUMMY, VISION_ONLY, GMS, and MX "
+                    "loaders cannot materialize them")
 
             loads_draft_weights = (
                 self.spec_config is not None

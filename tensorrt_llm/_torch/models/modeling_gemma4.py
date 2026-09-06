@@ -25,8 +25,8 @@ import transformers
 from packaging.version import Version
 from torch import nn
 
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.moe.fused_moe.activation import SimpleActivation
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
@@ -36,12 +36,12 @@ from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (
+from ..attention.backends import (
     AttentionMetadata,
     FlashInferAttentionMetadata,
     TrtllmAttentionMetadata,
 )
-from ..attention_backend.interface import (
+from ..attention.backends.interface import (
     AttentionMask,
     CustomAttentionMask,
     PositionalEmbeddingParams,

@@ -13,12 +13,12 @@ truncated at the query token's own causal extent.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
 )
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.triton_sparse_decode import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
@@ -384,7 +384,7 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs():
 @pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
 def test_sparse_decode_matches_msa_kernel():
     """A/B against the fmha_sm100 sparse GQA path this kernel replaces."""
-    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_sparse_gqa
+    from tensorrt_llm._torch.attention.backends.fmha.msa_sparse_gqa import run_msa_sparse_gqa
 
     seq_lens = [1025, 4097, 300, 8192]
     q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(
