@@ -97,7 +97,7 @@ def test_forward_preserves_native_int32_state_indices(monkeypatch):
 def test_forward_uses_metadata_aligned_generation_state_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0)
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).cuda()
     captured: dict[str, torch.Tensor] = {}
 
     def forward_prefill(
