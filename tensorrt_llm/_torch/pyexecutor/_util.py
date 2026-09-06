@@ -467,6 +467,45 @@ def _normalize_attention_windows(
     return normalized
 
 
+def _derive_layer_type_attention_windows(
+    config: object,
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    """Per-layer attention windows for a mixed sliding/full-attention config.
+
+    Returns one window per decoder layer, in global model layer order
+    (sliding layers get the model's ``sliding_window``, full-attention layers
+    ``max_seq_len``), or ``None`` when the schedule is uniform and the
+    single-window default is already right. Layer types that
+    ``get_layer_attention_window`` does not recognize as sliding are treated
+    as full attention.
+    """
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if not isinstance(num_layers, int) or num_layers <= 0:
+        return None
+    if not getattr(config, "layer_types", None):
+        return None
+    try:
+        windows = [
+            get_layer_attention_window(config, layer_idx)
+            for layer_idx in range(num_layers)
+        ]
+    except (NotImplementedError, ValueError) as error:
+        logger.warning(
+            "Unable to derive per-layer attention windows from layer_types "
+            f"({error}); falling back to the single-window default.")
+        return None
+    if not any(window is not None for window in windows):
+        return None
+    resolved = _normalize_attention_windows(
+        [max_seq_len if window is None else window for window in windows],
+        max_seq_len)
+    if resolved is None or len(resolved) == 1:
+        # Uniform schedule: the single-window default already covers it.
+        return None
+    return resolved
+
+
 def _get_num_pool_groups_for_estimation(
     model_config: object,
     max_seq_len: int,
@@ -2471,6 +2510,18 @@ def _create_kv_cache_manager(
                 if lt == "sliding_attention" else int(max_seq_len)
                 for lt in layer_types
             ]
+    elif (kv_cache_config.max_attention_window is None
+          and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
+        # Same derivation for any model that publishes a mixed sliding/full
+        # `layer_types` schedule plus a single `sliding_window`: without it V2
+        # would put every layer in one full-context pool, so the bounded
+        # layers would keep blocks they can never read. A user-supplied
+        # max_attention_window always wins.
+        derived_windows = _derive_layer_type_attention_windows(
+            config, max_seq_len)
+        if derived_windows is not None:
+            kv_cache_config = copy.copy(kv_cache_config)
+            kv_cache_config.max_attention_window = derived_windows
 
     # Note: Gemma4 KV sharing is handled at the model level — shared layers
     # use cache_layer_idx to read from the target layer's cache slot via
