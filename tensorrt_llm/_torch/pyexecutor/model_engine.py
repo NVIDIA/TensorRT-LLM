@@ -4257,10 +4257,14 @@ class PyTorchModelEngine(ModelEngine):
         # sequence contributes one token per iteration).
         spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
         spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-        # DSpark drafts only for generation requests (it needs the bonus
-        # token's target hidden states), so on mixed steps num_seqs
-        # over-counts the draft MoE workload; gen-only per-rank counts keep
-        # the FUSED_COMM chunk loop identical across EP ranks.
+        # DSpark can draft only after the target processes the current bonus token,
+        # because it consumes captured target-layer hidden states for that token.
+        # Prefill computes hidden states for prompt tokens; the first generated token
+        # is sampled from the last prompt logits and has not itself passed through the
+        # target layers. Thus context requests seed the rolling window but do not run
+        # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
+        # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
+        # chunk loop identical across EP ranks.
         if all_rank_num_gens is not None:
             spec_metadata.all_rank_num_gens = all_rank_num_gens
         if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
