@@ -5047,7 +5047,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
                 // ModelExpress imports nixl._api, while requirements-dev.txt
                 // installs only the nixl-cu13 backend. Install the matching
-                // namespace shim without pulling the unused CUDA 12 backend.
+                // namespace shim without pulling the unused CUDA 12 backend. The
+                // shim only dispatches; which nixl_cu13 it resolves to is decided
+                // by the PYTHONPATH runLLMTestlistOnPlatform sets for this stage.
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
             }
         }
@@ -5477,13 +5479,28 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
         // pair (Open MPI 4 only checked that in mpirun). An outer `mpirun
         // --allow-run-as-root` does not cover the DVM a nested MPI_Comm_spawn
         // starts, so test_mpi_session's spawn dies with MPI_ERR_UNKNOWN.
-        withEnv([
+        def testEnv = [
             "OMPI_ALLOW_RUN_AS_ROOT=1",
             "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
             "PRTE_ALLOW_RUN_AS_ROOT=1",
             "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
             "PMIX_HOSTNAME=mpi-node0",
-        ]) {
+        ]
+        // The NGC 26.08 torch links HPCX's UCX directly (libtorch_cuda.so lists
+        // libucp/libucs/libucc as NEEDED), so plain `import torch` already maps
+        // /opt/hpcx/ucx into the process. The PyPI nixl-cu13 wheel then loads the
+        // second UCX it bundles -- auditwheel renamed those sonames, so nothing
+        // dedups them -- and two UCX runtimes registering ucm hooks in one process
+        // segfault inside uct_md_query_tl_resources. Resolve nixl_cu13 to the
+        // build in the image instead: it links the container UCX, leaving exactly
+        // one stack loaded. Ahead of site-packages, so the PyPI wheel can stay
+        // installed for everything else. Prepended, not overwritten, so whatever
+        // PYTHONPATH the environment already carries survives.
+        if (stageName.contains("-ModelExpress-")) {
+            def nixlPythonPath = "/opt/nvidia/nvda_nixl/lib/python3/dist-packages"
+            testEnv += "PYTHONPATH=" + (env.PYTHONPATH ? "${nixlPythonPath}:${env.PYTHONPATH}" : nixlPythonPath)
+        }
+        withEnv(testEnv) {
             runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
         }
     }, {
