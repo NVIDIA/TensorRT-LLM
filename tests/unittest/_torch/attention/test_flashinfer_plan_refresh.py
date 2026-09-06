@@ -80,7 +80,9 @@ class _FakeMetadata:
 
     def _plan_with_params(self, plan_params):
         self.replanned.append(plan_params)
-        self._plan_params_to_wrappers[plan_params].is_planned = True
+        wrappers = self._plan_params_to_wrappers[plan_params]
+        wrappers.fa2_plan_num_blocks = tuple(self.num_blocks[self.num_contexts :])
+        wrappers.is_planned = True
 
     refresh = FlashInferAttentionMetadata._refresh_fa2_cuda_graph_plans
 
@@ -105,7 +107,7 @@ def test_page_table_change_replans_every_recorded_wrapper():
     meta.refresh()
 
     assert meta.replanned == [windowed, global_]
-    assert cache[windowed].fa2_plan_num_blocks == (3, 3)
+    assert cache[windowed].fa2_plan_num_blocks == (4, 4)
     assert all(w.is_planned for w in cache.values())
 
 
