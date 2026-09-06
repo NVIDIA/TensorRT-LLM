@@ -17,6 +17,7 @@
 import types
 from typing import Optional
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler import penalties as penalty_ops
@@ -172,6 +173,44 @@ def test_uniform_verify_window_keeps_runtime_draft_length():
 
     assert SpecSampler._snapshot_verify_lens([request]) is None
     assert SpecSampler._verified_len(request, 5, None) == 5
+
+
+@pytest.mark.parametrize("return_confidence", [False, True])
+def test_dspark_forward_publishes_windows_only_for_confidence(return_confidence):
+    from tensorrt_llm._torch.speculative.dspark import DSv4DSparkWorker
+    from tensorrt_llm._torch.speculative.dspark_schedule import NATIVE_UNIFORM_VERIFY_OUTPUT
+
+    worker = DSv4DSparkWorker.__new__(DSv4DSparkWorker)
+    worker.spec_config = types.SimpleNamespace(max_draft_len=1)
+    worker.return_confidence = return_confidence
+    worker.guided_decoder = None
+    worker._lazy_init = lambda *_args: None
+    worker._execute_guided_decoder_if_present = lambda *_args: None
+    worker.sample_and_accept_draft_tokens = lambda *_args: (
+        torch.tensor([[11, 12]]),
+        torch.tensor([2]),
+    )
+    worker._draft_gen_block_batched = lambda *_args, **_kwargs: torch.zeros((1, 1, 8))
+    worker.sample_draft_tokens = lambda *_args, **_kwargs: torch.tensor([[13]])
+    worker.write_context_onehot_draft_probs = lambda *_args: None
+    worker._prepare_next_new_tokens = lambda *_args: torch.tensor([[12, 13]])
+    metadata = types.SimpleNamespace(
+        batch_indices_cuda=torch.tensor([0]),
+        draft_probs_last_dim=8,
+        verify_lens=None,
+    )
+
+    outputs = worker._forward_impl(
+        input_ids=torch.tensor([11, 12]),
+        position_ids=torch.tensor([[0, 1]]),
+        hidden_states=None,
+        logits=torch.zeros((2, 8)),
+        attn_metadata=types.SimpleNamespace(num_seqs=1, num_contexts=0),
+        spec_metadata=metadata,
+        draft_model=types.SimpleNamespace(block_size=1),
+    )
+
+    assert (NATIVE_UNIFORM_VERIFY_OUTPUT in outputs) is return_confidence
 
 
 def test_ragged_strict_acceptance_stops_at_each_request_window():

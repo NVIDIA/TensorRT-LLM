@@ -952,7 +952,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # with finished contexts) the rows would misalign AND come up short.
         # Mixed steps keep exact windows on py_verify_len, so the sampler's
         # snapshot fallback stays correct there.
-        _publish_policy_window_output(outputs, spec_metadata.verify_lens, batch_size)
+        if self.return_confidence:
+            _publish_policy_window_output(outputs, spec_metadata.verify_lens, batch_size)
         return outputs
 
 
