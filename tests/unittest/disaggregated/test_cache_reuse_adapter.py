@@ -20,7 +20,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.transfer import TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import Sender
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
@@ -350,28 +349,8 @@ class TestTrimReceiverWindowHead:
 
 
 # ---------------------------------------------------------------------------
-# TokenRange dataclass invariants.
-# ---------------------------------------------------------------------------
-
-
-class TestTokenRange:
-    def test_zero_start(self):
-        tr = TokenRange(start=0, end=256)
-        assert (tr.start, tr.end) == (0, 256)
-
-    def test_nonzero_start(self):
-        # Allowed: caller may pass a non-prompt-zero range (e.g., chunk).
-        tr = TokenRange(start=128, end=256)
-        assert (tr.start, tr.end) == (128, 256)
-
-    def test_start_eq_end_rejected(self):
-        with pytest.raises(ValueError):
-            TokenRange(start=256, end=256)
-
-
-# ---------------------------------------------------------------------------
-# _create_kv_slice: default TokenRange spans prompt_len, matching the
-# trimmed block list actually transferred.
+# _create_kv_slice: the block list spans prompt_len, excluding the extra KV
+# slots speculative decoding reserves.
 # ---------------------------------------------------------------------------
 
 
@@ -427,26 +406,26 @@ def _build_transceiver_for_kv_slice(
     return transceiver, req
 
 
-class TestCreateKvSliceTokenRange:
-    """token_range.end must be prompt_len, matching the trimmed block list.
+class TestCreateKvSliceBlockSpan:
+    """The block list must span prompt_len, not prompt_len + num_extra_kv_tokens.
 
-    The sender reconstructs total_blocks from token_range.end (ceil(end / tpb)),
-    so end must stay at prompt_len -- not prompt_len + num_extra_kv_tokens --
-    to match the blocks actually transferred.
+    A monolithic slice carries no extent of its own: the sender's suffix
+    arithmetic anchors on the session's prompt_len and assumes the list is the
+    tail of ceil(prompt_len / tpb) blocks. An extra block would shift every
+    per-layer token start.
     """
 
     def test_excludes_num_extra_kv_tokens(self):
         prompt_len = 17
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+        tpb = transceiver._reuse_adapter.tokens_per_block
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
 
     def test_extra_tokens_do_not_cross_block_boundary(self):
-        # Reconstructed total_blocks (ceil(end / tpb)) must match the blocks sent.
         prompt_len = 16
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
@@ -459,20 +438,18 @@ class TestCreateKvSliceTokenRange:
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        end = kv_slice.token_range.end
-        transferred_blocks = kv_slice.block_ids_per_layer_groups[0].size
-        assert (end + tpb - 1) // tpb == transferred_blocks
+        assert kv_slice.block_ids_per_layer_groups[0].size == prompt_len // tpb
 
     def test_defaults_to_prompt_len_when_no_extra(self):
         prompt_len = 17
         transceiver, req = _build_transceiver_for_kv_slice(
             num_extra_kv_tokens=0, prompt_len=prompt_len
         )
+        tpb = transceiver._reuse_adapter.tokens_per_block
 
         kv_slice = transceiver._create_kv_slice(req)
 
-        assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+        assert kv_slice.block_ids_per_layer_groups[0].size == (prompt_len + tpb - 1) // tpb
 
     def test_swa_caps_oversized_non_speculative_v1_list_before_window_trim(self):
         transceiver, req = _build_transceiver_for_kv_slice(
@@ -882,6 +859,7 @@ class TestTransceiverContextManager:
         tc._send_reqs = {}
         tc._recv_reqs = {}
         tc._transfer_worker = MagicMock()
+        tc._shutdown_complete = False
         return tc
 
     def test_enter_returns_self(self):
@@ -894,7 +872,7 @@ class TestTransceiverContextManager:
         with tc:
             pass
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_exit_calls_shutdown_on_exception(self):
         tc = self._tc()
@@ -903,10 +881,10 @@ class TestTransceiverContextManager:
                 raise RuntimeError("boom")
         # __exit__ still ran shutdown despite the in-block exception.
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_shutdown_is_idempotent(self):
         tc = self._tc()
         tc.shutdown()
-        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()

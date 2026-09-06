@@ -37,8 +37,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -134,12 +136,18 @@ def _assert_llm_api_config_capture(params):
     assert meta["captured_field_count"] > 0
 
 
-def _wait_for_event(event_name, timeout=30):
-    """Wait until the local server captures an event with the requested name."""
+def _wait_for_event(
+    event_name: str,
+    timeout: float = 30,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Wait until the local server captures a matching event."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for payload in CaptureHandler.captured_payloads:
-            if payload.get("events", [{}])[0].get("name") == event_name:
+            event = payload.get("events", [{}])[0]
+            parameters = event.get("parameters", {})
+            if event.get("name") == event_name and (predicate is None or predicate(parameters)):
                 return payload
         time.sleep(0.05)
     pytest.fail(f"Timed out waiting for {event_name}")
@@ -242,7 +250,11 @@ class TestE2ECapture:
                 "Timed out waiting for telemetry POST. The background reporter may not have fired."
             )
 
-        heartbeat_payload = _wait_for_event("trtllm_heartbeat", timeout=5)
+        heartbeat_payload = _wait_for_event(
+            "trtllm_heartbeat",
+            timeout=5,
+            predicate=lambda parameters: parameters.get("activeLlmInstances") == 0,
+        )
 
         # --- Validate the captured payload ---
         assert len(CaptureHandler.captured_payloads) >= 1, "Expected at least 1 captured payload"
@@ -334,7 +346,6 @@ class TestE2ECapture:
         assert heartbeat_payload["eventSchemaVer"] == "0.7"
         heartbeat = heartbeat_payload["events"][0]
         assert heartbeat["name"] == "trtllm_heartbeat"
-        assert heartbeat["parameters"]["seq"] == 0
         _assert_lifecycle_snapshot(
             heartbeat["parameters"],
             active_instances=0,

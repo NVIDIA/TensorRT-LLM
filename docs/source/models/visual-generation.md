@@ -12,9 +12,9 @@ Visual generation models based on diffusion transformers (DiT) have become the s
 TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:
 
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
-- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
+- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100).
+- Quantized attention support: `QK16PV8` to quantize Bmm2 on `CUTEDSL`, `SAGE` to run SageAttention on `TRTLLM` (requires Blackwell SM100), and FlashInfer block-scaled MXFP8/NVFP4 on `FLASHINFER`.
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
@@ -117,7 +117,50 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 
 The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; the video is downloadable via `/content` once `completed`.
 
-`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
+
+### Reference Inputs
+
+Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
+
+| `format` | Content | Notes |
+|---|---|---|
+| `path` | A local file readable by the coordinator process | Bare path or `file://` URI. |
+| `url` | An `http(s)` URL | Fetched on the coordinator through the SSRF-guarded loader. |
+| `base64` | Base64 text | A `data:` URI is also accepted. |
+| `bytes` | Raw `bytes` | Python API only. |
+
+Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`, and a request is validated against that declaration before generation begins. References are resolved to raw bytes on the coordinator, so a worker never needs a filesystem shared with the client.
+
+Most models take a single reference whose role is unambiguous:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+params = vg.default_params
+params.image_reference = MediaRef(content="start.png", format="path")
+output = vg.generate(inputs="the scene comes alive with gentle motion", params=params)
+```
+
+Models that accept the same modality in more than one role need `role`. Wan 2.1 I2V takes a first frame and an optional last frame:
+
+```python
+from tensorrt_llm import VisualGen
+from tensorrt_llm.visual_gen import MediaRef
+
+vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
+params = vg.default_params
+params.image_reference = [
+    MediaRef(content="start.png", format="path", role="first_frame"),
+    MediaRef(content="end.png", format="path", role="last_frame"),
+]
+```
+
+FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
+
+The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
 
 ## Optimizations
 
@@ -170,11 +213,12 @@ By default, `strict=True` raises when adapter tensors cannot be matched, have un
 
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
+In addition to linear-layer quantization, VisualGen supports several **attention-level** quantization recipes, which define the Q/K/V data types and scaling granularity used inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and are mutually exclusive with each other.
 
 - **QK16PV8** (`CUTEDSL` backend): Keeps Q & K in BF16 and quantizes only V to FP8 (E4M3, per-tensor), thus Bmm1 will be carried out in BF16 with Bmm2 in FP8. Targets Blackwell-class GPUs (`sm_100a` / `sm_103a`) with `head_dim = 128`.
 - **SAGE** (`TRTLLM` backend): Quantizes Q, K, and V with per-block scaling factors. Q/K are stored as INT8 or FP8 (e4m3) and V as FP8 (e4m3); block sizes are tunable per axis (typically `(q, k, v) = (1, 4, 1)` for Wan-1.3B and `(1, 16, 1)` for larger Wan / FLUX checkpoints). Supported recipes are validated at runtime.
 
+- **FlashInfer block-scaled attention** (`FLASHINFER` backend): Uses FlashInfer's architecture-specific FMHA. On SM100/SM103 (B200/B300), set `qk_dtype` to `mxfp8` or `nvfp4` with `v_dtype: fp8`. On SM120/SM121 (RTX PRO 6000), only dense Q/K/V NVFP4 self-attention is supported, using `qk_dtype: nvfp4` and `v_dtype: nvfp4`; this path requires a sequence length divisible by 128.
 
 Python API for SageAttention:
 
@@ -209,6 +253,23 @@ args = VisualGenArgs(
             "q_block_size": 0,
             "k_block_size": 0,
             "v_block_size": 0,
+        },
+    },
+)
+```
+
+Python API for FlashInfer MXFP8 on B200/B300:
+
+```python
+from tensorrt_llm import VisualGenArgs
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    attention_config={
+        "backend": "FLASHINFER",
+        "quant_attention_config": {
+            "qk_dtype": "mxfp8",
+            "v_dtype": "fp8",
         },
     },
 )

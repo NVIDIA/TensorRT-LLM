@@ -84,6 +84,11 @@ class NVLinkTwoSidedFlashinfer(Communication):
         alltoall_result_do_sum: bool = False,
     ):
         super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkTwoSidedFlashinfer does not support Helix context parallelism "
+                "because its MNNVL communicator covers only the tensor-parallel group"
+            )
 
         # Store needed parameters
         self.num_experts = num_experts

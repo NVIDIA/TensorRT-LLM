@@ -743,3 +743,19 @@ class TestPydanticValidation:
         """PositiveInt field (ge=0) rejects negative value."""
         with pytest.raises(ValidationError):
             schema.TrtllmInitialReport(cpuCount=-1)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "llmInitializationAttempts",
+            "llmInstancesCreated",
+            "activeLlmInstances",
+            "maxConcurrentLlmInstances",
+            "llmInitializationFailures",
+        ],
+    )
+    @pytest.mark.parametrize("invalid_value", [-1, schema._UINT32_MAX + 1])
+    def test_lifecycle_counters_reject_out_of_range_values(self, field_name, invalid_value):
+        """Lifecycle counters enforce the unsigned 32-bit wire bounds."""
+        with pytest.raises(ValidationError):
+            schema.TrtllmInitialReport(**{field_name: invalid_value})

@@ -55,6 +55,7 @@ def _deployment(
     ep_size: int = 1,
     use_dp: bool = False,
     parallel_size: Optional[int] = None,
+    eplb: bool = False,
 ) -> MoEDeployment:
     """Declare the machine rather than patching the probes that read it."""
     return MoEDeployment(
@@ -63,6 +64,7 @@ def _deployment(
         parallel_size=ep_size if parallel_size is None else parallel_size,
         use_dp=use_dp,
         num_slots=8,
+        eplb_enabled=eplb,
         env=MoEEnvironment(
             sm=sm,
             available_deps=(MoEDep.FLASHINFER.value,) if flashinfer else (),
@@ -136,6 +138,13 @@ def test_can_implement_rejects_missing_flashinfer():
     verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, flashinfer=False))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+
+
+def test_can_implement_rejects_eplb():
+    """EPLB is its own reject class, not a topology one: the machine is fine."""
+    verdict = CuteDslB12xFusedMoE.can_implement(_problem(), _deployment(120, eplb=True))
+    assert not verdict.eligible
+    assert verdict.reject_reason is MoERejectReason.EPLB_UNSUPPORTED
 
 
 def test_can_implement_rejects_expert_parallelism():

@@ -12,14 +12,15 @@ from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..model_config import ModelConfig
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
+                        SpecWorkerBase)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -430,6 +431,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        if self.spec_dec_mode.is_mtp_eagle_one_model():
+            self.allocate_context_prompt_lookahead()
         if self.layers_to_capture is None:
             if self.spec_dec_mode.is_mtp_eagle_one_model():
                 # MTP Eagle one-model feeds the target model's hidden_states
@@ -833,6 +836,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
+        # Commit model-owned target state only after draft preparation has
+        # succeeded; SpecWorkerBase aborts the still-pending snapshots on any
+        # exception above this point.
+        if self._auxiliary_state_handlers:
+            self.commit_auxiliary_speculative_states(
+                num_accepted_tokens,
+                attn_metadata.mamba_metadata.state_indices[:batch_size],
+                num_contexts,
+            )
+
         return {
             'logits': raw_logits,
             'new_tokens': accepted_tokens,
@@ -872,6 +885,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             sequence_lengths=attn_metadata.seq_lens_cuda[:batch_size],
             num_contexts=num_contexts,
             batch_indices=spec_metadata.batch_indices_cuda[:batch_size],
+            prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens),
         )
 
         draft_metadata = attn_metadata.get_draft_metadata()
@@ -939,8 +954,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                    num_accepted_tokens,
                                    original_all_rank_num_tokens):
         """Linear draft loop, unified for Eagle3 and MTP Eagle."""
-        from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
-                                                    is_dsa_cache_manager)
+        from ..attention.backends.sparse.dsa import (DSAtrtllmAttentionMetadata,
+                                                     is_dsa_cache_manager)
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
@@ -1060,12 +1075,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     elif lm_head_tp_in_adp_configured:
                         # Advanced-sampling bypass: the model's shared_head
                         # would re-apply the LM-head-TP stacked/sharded path
-                        # from config on its own, so call lm_head directly.
-                        # Under ADP the LMHead weight is replicated and
-                        # is_spec_decoding_head defaults to False, so this is
-                        # a plain local full-vocab GEMM over this rank's own
-                        # rows -- the same computation the target head runs.
-                        logits = draft_model.lm_head(hidden_states[gather_ids])
+                        # from config on its own. Under ADP the LMHead weight
+                        # is replicated, so project this rank's own rows to the
+                        # full vocabulary. Model-specific shared heads may need
+                        # preprocessing before that local projection.
+                        shared_head = draft_model.mtp_layers[0].shared_head
+                        local_full_vocab_forward = getattr(
+                            shared_head, "forward_local_full_vocab", None)
+                        if local_full_vocab_forward is None:
+                            logits = draft_model.lm_head(
+                                hidden_states[gather_ids])
+                        else:
+                            logits = local_full_vocab_forward(
+                                hidden_states[gather_ids],
+                                draft_model.lm_head,
+                                attn_metadata,
+                                True,
+                            )
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,
@@ -1373,8 +1399,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         # context
         input_ids_ctx = self._prepare_context_input_ids(
-            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
-            accepted_tokens, num_contexts)
+            input_ids,
+            attn_metadata.num_ctx_tokens,
+            spec_metadata.gather_ids,
+            accepted_tokens,
+            num_contexts,
+            prompt_lookahead_tokens=(
+                spec_metadata.context_prompt_lookahead_tokens),
+        )
 
         # generation
         input_ids_gen = accepted_tokens[
@@ -1401,8 +1433,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         sequence_lengths: torch.Tensor,
         num_contexts: int,
         batch_indices: torch.Tensor,
+        prompt_lookahead_tokens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Select the accepted token, hidden row, and fixed draft position."""
+        """Select the next token, recurrent hidden row, and draft position.
+
+        Args:
+            accepted_tokens: Accepted target tokens with shape
+                ``[batch_size, max_draft_len + 1]``.
+            num_accepted_tokens: Accepted-token count for each request with
+                shape ``[batch_size]``.
+            hidden_states: Target hidden states for the current input tokens.
+            position_ids: Position IDs corresponding to ``hidden_states``.
+            sequence_lengths: Current input length for each request with shape
+                ``[batch_size]``.
+            num_contexts: Number of context requests at the front of the batch.
+            batch_indices: Request row indices with shape ``[batch_size]``.
+            prompt_lookahead_tokens: Immediate prompt token following each
+                context chunk with shape ``[max_num_requests]``. Entries equal
+                to ``INVALID_PROMPT_LOOKAHEAD_TOKEN`` have no valid lookahead.
+
+        Returns:
+            The draft input IDs, recurrent hidden states, and draft position
+            IDs for the current batch.
+        """
         sequence_starts = torch.cumsum(
             sequence_lengths, dim=0, dtype=torch.long) - sequence_lengths
         recurrent_indices = sequence_starts + sequence_lengths - 1
@@ -1411,6 +1464,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens[num_contexts:] - 1)
         draft_input_ids = accepted_tokens[batch_indices,
                                           num_accepted_tokens - 1]
+        context_lookahead = prompt_lookahead_tokens[:num_contexts]
+        draft_input_ids[:num_contexts] = torch.where(
+            context_lookahead != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+            context_lookahead,
+            draft_input_ids[:num_contexts],
+        )
         recurrent_hidden_states = hidden_states[recurrent_indices]
         draft_position_ids = (
             _select_mtp_position_ids(position_ids, recurrent_indices) + 1)

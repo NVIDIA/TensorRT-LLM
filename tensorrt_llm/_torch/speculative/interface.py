@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Type
+from typing import TYPE_CHECKING, List, Optional, Protocol, Type
 
 import torch
 from packaging.version import Version
@@ -28,9 +28,9 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
-from ..attention_backend.interface import AttentionMetadata
-from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
-                                        TrtllmAttentionMetadata)
+from ..attention.backends.interface import AttentionMetadata
+from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
+                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -91,6 +91,11 @@ def rejection_sampling_one_model(
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
+
+# Prompt token IDs are nonnegative. Use a distinct value for positions without
+# a valid prompt lookahead token so CUDA-graph replay can select the sampled
+# token without a separate validity buffer.
+INVALID_PROMPT_LOOKAHEAD_TOKEN = -1
 
 # RNG pool configuration for the fractional (probabilistic) component of the
 # synthetic acceptance rate. Pool size MUST be a power of two so we can use
@@ -455,6 +460,10 @@ class SpecMetadata:
     draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
     draft_lens: Optional[torch.Tensor] = None
+    # Immediate prompt token following each context request's current chunk.
+    # Shape: [max_num_requests]. Final-chunk rows contain
+    # INVALID_PROMPT_LOOKAHEAD_TOKEN.
+    context_prompt_lookahead_tokens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
@@ -665,6 +674,37 @@ class SpecMetadata:
 
     def __post_init__(self):
         pass
+
+    def allocate_context_prompt_lookahead(self) -> None:
+        """Allocate a CUDA-graph-stable prompt lookahead buffer."""
+        self.context_prompt_lookahead_tokens = torch.full(
+            (self.max_num_requests, ),
+            INVALID_PROMPT_LOOKAHEAD_TOKEN,
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+    def populate_context_prompt_lookahead(self,
+                                          lookahead_tokens: List[int]) -> None:
+        """Populate immediate prompt lookahead for this batch's context rows."""
+        if self.context_prompt_lookahead_tokens is None:
+            return
+
+        num_contexts = len(lookahead_tokens)
+        if num_contexts == 0:
+            return
+        assert num_contexts <= self.context_prompt_lookahead_tokens.shape[0], (
+            f"Context batch size {num_contexts} exceeds prompt lookahead "
+            f"capacity {self.context_prompt_lookahead_tokens.shape[0]}")
+
+        tokens_cpu = torch.tensor(
+            lookahead_tokens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=prefer_pinned(),
+        )
+        self.context_prompt_lookahead_tokens[:num_contexts].copy_(
+            tokens_cpu, non_blocking=True)
 
     def _populate_request_rng_state(
             self, requests: list["LlmRequest"],
@@ -1060,10 +1100,6 @@ class SpecMetadata:
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
-        def _first_or_none(values):
-            """Return the first sampling parameter value when present."""
-            return values[0] if values is not None and len(values) > 0 else None
-
         def _normalize_request_sampling_params(
             *,
             temperature: Optional[float],
@@ -1107,9 +1143,9 @@ class SpecMetadata:
 
         for request in requests:
             sampling_config = request.sampling_config
-            temp_val = _first_or_none(sampling_config.temperature)
-            tk_val = _first_or_none(sampling_config.top_k)
-            tp_val = _first_or_none(sampling_config.top_p)
+            temp_val = sampling_config.temperature
+            tk_val = sampling_config.top_k
+            tp_val = sampling_config.top_p
 
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
@@ -1388,6 +1424,22 @@ class SpecMetadata:
         self._sampling_params_signature[1] = None
 
 
+class AuxiliarySpeculativeStateHandler(Protocol):
+    """Model-side state that verification writes once per draft token.
+
+    Only some draft tokens are accepted. The commit keeps the state written
+    for the accepted ones and undoes the rest.
+    """
+
+    def commit_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        ...
+
+
 class SpecWorkerBase(nn.Module, ABC):
     """
     Base class for speculative decoding workers.
@@ -1419,6 +1471,26 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+        self._auxiliary_state_handlers: list[
+            AuxiliarySpeculativeStateHandler] = []
+
+    def register_auxiliary_state_handler(
+            self, handler: AuxiliarySpeculativeStateHandler) -> None:
+        """Register one model-owned state handler without re-parenting the module."""
+        if not any(registered is handler
+                   for registered in self._auxiliary_state_handlers):
+            self._auxiliary_state_handlers.append(handler)
+
+    def commit_auxiliary_speculative_states(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_contexts: int,
+    ) -> None:
+        """Promote registered model-side states using accepted token counts."""
+        for handler in self._auxiliary_state_handlers:
+            handler.commit_speculative_states(num_accepted_tokens,
+                                              state_indices, num_contexts)
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -2593,8 +2665,15 @@ class SpecWorkerBase(nn.Module, ABC):
                                        dim=1)
         return next_new_tokens
 
-    def _prepare_context_input_ids(self, input_ids, num_ctx_tokens, gather_ids,
-                                   accepted_tokens, num_contexts):
+    def _prepare_context_input_ids(
+        self,
+        input_ids,
+        num_ctx_tokens,
+        gather_ids,
+        accepted_tokens,
+        num_contexts,
+        prompt_lookahead_tokens=None,
+    ):
         """
         Prepare context input IDs for draft model forward.
         Shifts input IDs left by 1 and places the first accepted token at gather positions.
@@ -2605,6 +2684,8 @@ class SpecWorkerBase(nn.Module, ABC):
             gather_ids: Indices for placing accepted tokens (last token positions)
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
             num_contexts: Number of context requests
+            prompt_lookahead_tokens: Optional immediate prompt token following
+                each current context chunk. Shape: [max_num_requests].
 
         Returns:
             input_ids_ctx: Prepared context input IDs
@@ -2615,8 +2696,15 @@ class SpecWorkerBase(nn.Module, ABC):
                                              dtype=torch.int32,
                                              device="cuda")
             input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-            input_ids_ctx[
-                gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            context_tail_tokens = accepted_tokens[:num_contexts, 0]
+            if prompt_lookahead_tokens is not None:
+                lookahead_tokens = prompt_lookahead_tokens[:num_contexts]
+                context_tail_tokens = torch.where(
+                    lookahead_tokens != INVALID_PROMPT_LOOKAHEAD_TOKEN,
+                    lookahead_tokens,
+                    context_tail_tokens,
+                )
+            input_ids_ctx[gather_ids[:num_contexts]] = context_tail_tokens
             return input_ids_ctx
         else:
             return torch.empty(0, dtype=torch.int32, device="cuda")
@@ -2646,7 +2734,7 @@ class SpecWorkerBase(nn.Module, ABC):
             yield attn_metadata
             return
 
-        from ..attention_backend.flashinfer import FlashInferAttentionMetadata
+        from ..attention.backends.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
             return

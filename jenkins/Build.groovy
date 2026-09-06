@@ -59,6 +59,18 @@ POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "432
 // the override goes through toBoolean() rather than the bare elvis.
 ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
 
+// BOLT consume: re-BOLT the packed tarball in place with the branch's latest
+// promoted profile bundle, so the uploaded artifact (and every downstream test)
+// exercises the bolted binaries. Resolution order mirrors BuildDockerImage.groovy's
+// bolt toggles -- the `boltConsume` job parameter the parent pipeline
+// (L0_MergeRequest.groovy) passes down, then the `BOLT_CONSUME` env var this gate
+// was keyed on before it became a real parameter, so a job-level env override keeps
+// working. This job declares no `parameters {}` block (its inputs are defined on the
+// Jenkins job config and surface as both `params.X` and `env.X`), so `boltConsume`
+// must be declared there as a boolean parameter defaulting to false. Until it is,
+// the parameter is simply absent and this stays false.
+BOLT_CONSUME_ENABLED = (params.boltConsume ?: env.boltConsume ?: env.BOLT_CONSUME ?: "false").toString() == "true"
+
 // Literals for easier access.
 @Field
 def WHEEL_EXTRA_ARGS = "extraArgs"
@@ -129,11 +141,17 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (TRTLLM_VERSION_OVERRIDE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent's globalVars:
+    // that helper only updates keys already present in the target map, so a key that
+    // is absent here (like this one previously) is silently dropped during the merge.
+    (BOLT_CONSUME_BUILD): false,
 ]
 
 // TODO: Move common variables to an unified location
@@ -400,7 +418,7 @@ def prepareLLMBuild(pipeline, config, versionOverride)
     def artifacts = ["${tarName}": tarName]
     def runner = {
         runLLMBuild(
-            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck)
+            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck, artifacts)
     }
 
     return [artifacts, runner]
@@ -408,7 +426,7 @@ def prepareLLMBuild(pipeline, config, versionOverride)
 }
 
 def runLLMBuild(
-    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false)
+    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false, artifacts=null)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
@@ -502,30 +520,41 @@ def runLLMBuild(
         sh "tar -czvf ${tarName} TensorRT-LLM/"
     }
 
-    // BOLT consume (premerge): opt-in via BOLT_CONSUME. Pull the branch's latest
-    // postmerge-promoted profile bundle and re-BOLT the just-packed
+    // BOLT consume (premerge): opt-in via BOLT_CONSUME_ENABLED. Pull the branch's
+    // latest postmerge-promoted profile bundle and re-BOLT the just-packed
     // tarball IN PLACE, so the artifact that gets uploaded (and every downstream
-    // test) exercises the bolted binaries. No-op unless BOLT_CONSUME=true, so
+    // test) exercises the bolted binaries. No-op unless the caller opted in, so
     // normal builds are unaffected. STRICT by design: apply_latest.sh exits
     // non-zero on any failure (missing bundle / apply error) and we do NOT catch
     // it -- a build that asked to consume BOLT profiles fails loudly rather than
-    // silently shipping an un-BOLTed tarball that tests would wrongly bless.
-    if ((env.BOLT_CONSUME ?: "false").toString() == "true") {
-        applyLatestBolt(pipeline, tarName, is_linux_x86_64)
+    // silently shipping an un-BOLTed tarball that tests would wrongly bless. The
+    // parent restricts who may opt in (premerge only, main only); see
+    // resolveBoltConsume in L0_MergeRequest.groovy.
+    if (BOLT_CONSUME_ENABLED) {
+        applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts)
     }
 }
 
 // Premerge consumption helper: stage llvm-bolt if needed, then run the OSS
 // engine's apply_latest.sh (pull-latest + apply_bolt) to replace <tarName> with
 // its bolted equivalent. Runs inside the build pod after packing.
-def applyLatestBolt(pipeline, tarName, is_linux_x86_64)
+def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
 {
+    // Resolved here rather than passed down, so it must agree with the branch the
+    // parent vetted before setting boltConsume. It does today: getCommonParameters
+    // forwards neither of these, so a build launched by L0_MergeRequest.groovy lands
+    // on "main" -- the only branch with a promoted bundle. Revisit together with the
+    // parent's main-only gate if either name starts being forwarded.
     def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
     def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
-        sh """
+        // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
+        // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
+        // x86_64 before an x86 bundle is promoted) is a graceful SKIP rather than a
+        // hard build failure, while a real apply error still fails loudly.
+        def rc = sh(returnStatus: true, script: """
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
@@ -539,9 +568,32 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64)
             fi
             bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
                  ${branch} ${triple} ${tarName} bolted-${tarName}
+        """)
+        if (rc == 3) {
+            echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"
+            return
+        }
+        if (rc != 0) {
+            error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
+        }
+        // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
+        // the BOLTed build to the canonical name. Matches the postmerge
+        // publishBoltedCanonical convention (canonical = BOLTed).
+        sh """
+            set -e
+            cp -f ${tarName} unbolted-${tarName}
             mv -f bolted-${tarName} ${tarName}
-            echo '[bolt-consume] ${tarName} is now BOLTed'
+            echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
         """
+        // Register the unbolted- variant for upload via the caller's artifacts map,
+        // so it is pushed by buildOrCache OUTSIDE the build container (where the
+        // JFrog 'Artifactory' server resolves). Uploading here with rtUpload fails
+        // with "Couldn't find JFrog Instance ID: Artifactory" -- the server is not
+        // available inside the container context. Added only on a successful apply,
+        // so a skipped arch never references a nonexistent file.
+        if (artifacts != null) {
+            artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+        }
     }
 }
 
@@ -661,6 +713,16 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
         globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
+        // BOLT consume flag: source it from globalVars (set by L0_MergeRequest as
+        // bolt_consume_build), which is reliably propagated. The standalone
+        // boltConsume job parameter is NOT registered on the remote build jobs, so
+        // the Parameterized Remote Trigger silently DROPS it -- reading globalVars
+        // avoids that per-instance registration dependency. The param/env resolution
+        // at the top of the file still applies when set directly on the job.
+        if (globalVars[BOLT_CONSUME_BUILD]?.toString() == "true") {
+            BOLT_CONSUME_ENABLED = true
+            echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
+        }
     }
 
     def wheelDockerImage = env.wheelDockerImagePy310
