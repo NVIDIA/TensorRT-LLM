@@ -1696,6 +1696,43 @@ class ResponsesRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def hoist_additional_tools(cls, data):
+        """Move an `additional_tools` input item into `tools`.
+
+        Codex declares its tools this way rather than in `tools`. The item
+        carries no text, so the input-item conversion dropped it as
+        unrecognised and the model was offered nothing to call.
+
+        The payload is already what `tools` accepts -- namespace entries whose
+        nested tools are flattened to `namespace.tool` downstream -- so it is
+        moved here, before validation, and the entries are validated as tools
+        like any other. Hoisting at the protocol boundary rather than in the
+        prompt builder keeps the response side in agreement: a call can only
+        be reported back with its namespace if the tool was in `tools` when
+        the reply was parsed.
+        """
+        if not isinstance(data, dict):
+            return data
+        items = data.get("input")
+        if not isinstance(items, list):
+            return data
+        hoisted = []
+        kept = []
+        for item in items:
+            if isinstance(item,
+                          dict) and item.get("type") == "additional_tools":
+                hoisted.extend(item.get("tools") or [])
+            else:
+                kept.append(item)
+        if not hoisted:
+            return data
+        data = dict(data)
+        data["input"] = kept
+        data["tools"] = list(data.get("tools") or []) + hoisted
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def validate_background(cls, data):
         if not data.get("background"):
             return data

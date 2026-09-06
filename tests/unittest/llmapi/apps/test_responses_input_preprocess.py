@@ -511,3 +511,132 @@ def test_a_plain_string_content_is_left_alone():
     )
 
     assert msg == {"role": "user", "content": "hello"}
+
+
+def test_additional_tools_item_becomes_tools():
+    """Codex declares its tools as an input item, not in `tools`.
+
+    The item carries no text, so the input-item conversion dropped it as
+    unrecognised and the model was offered nothing to call -- it then narrated
+    a terminal session it had invented, because narrating was the only thing
+    left to do.
+    """
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "get_time",
+                                "description": "Return the time.",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    }
+                ],
+            },
+            {"role": "user", "content": "what time is it"},
+        ],
+    )
+
+    # The item is gone from the input: it is a tool declaration, not a turn,
+    # and replaying it as one would put the tool schema in the prompt as prose.
+    assert [item.get("type") for item in request.input] == [None]
+    assert len(request.tools) == 1
+    assert request.tools[0].type == "namespace"
+    assert [t.name for t in request.tools[0].tools] == ["get_time"]
+
+
+def test_hoisted_tools_are_offered_to_the_template_namespaced():
+    """The nested tools have to reach the prompt under qualified names.
+
+    `_namespaced_tool_names` maps a reply's call back to its namespace, so a
+    tool that never made it into `tools` would come back as an unsupported
+    call even if the model somehow guessed it.
+    """
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.responses_utils import (
+        _get_chat_completion_function_tools,
+        _namespaced_tool_names,
+    )
+
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "spawn_agent",
+                                "description": "",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": "go",
+            },
+        ],
+    )
+
+    offered = [t.function.name for t in _get_chat_completion_function_tools(request.tools)]
+    assert offered == ["collaboration.spawn_agent"]
+    assert _namespaced_tool_names(request.tools) == {
+        "collaboration.spawn_agent": ("collaboration", "spawn_agent"),
+    }
+
+
+def test_tools_already_in_the_tools_field_are_kept():
+    """Hoisting appends; it must not discard what the client sent normally."""
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    request = ResponsesRequest(
+        model="m",
+        tools=[
+            {
+                "type": "function",
+                "name": "existing",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        input=[
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{"type": "namespace", "name": "ns", "description": "", "tools": []}],
+            }
+        ],
+    )
+
+    assert [getattr(t, "name", None) for t in request.tools] == ["existing", "ns"]
+
+
+def test_a_request_without_the_item_is_untouched():
+    """The common case must not be reshaped by the hoist."""
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+
+    request = ResponsesRequest(model="m", input="hello")
+
+    assert request.input == "hello"
+    assert request.tools == []
