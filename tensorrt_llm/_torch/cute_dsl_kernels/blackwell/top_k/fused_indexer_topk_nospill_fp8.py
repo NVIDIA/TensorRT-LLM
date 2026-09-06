@@ -1856,11 +1856,10 @@ def _config(B, MAXB, NPAGES, KTOP):
     nsm = _sm_count()
     mode = os.environ.get("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "auto")
     S_gm = min(nsm // B, ntile) if 2 * B <= nsm else 1
-    # measured (real rows): the split wins on long rows at any small batch, on rows of
-    # 512+ tiles once 8 rows share the chip and at 16+ rows regardless of length; 1-4 rows
-    # of up to 512 tiles and 8 rows of up to 256 tiles stay on one cluster each
+    # measured (fp8 rows, 16 KB tiles): the split wins from 512 tiles at any small batch and
+    # at 16+ rows regardless of length; shorter rows at 1-8 rows stay on one cluster each
     if S_gm >= 2 and mode != "0":
-        if mode == "1" or (S_gm >= 8 and (ntile >= 1024 or (B >= 8 and ntile >= 512) or B >= 16)):
+        if mode == "1" or (S_gm >= 8 and (ntile >= 512 or B >= 16)):
             GM = 1
             CS = S_gm
             NREP = 4 if CS >= 32 else (2 if CS >= 8 else 1)
