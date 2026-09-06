@@ -685,8 +685,9 @@ BlockRadixTree::BlockRadixTree(
 
 BlockRadixTree::~BlockRadixTree()
 {
-    // Clear all roots (which will drop all blocks without external owners).
-    mRoots.clear();
+    // Detach blocks leaf-first in O(1) extra space. Dropping mRoots directly would instead
+    // destroy each chain recursively, one frame per block.
+    KVCM2_LOG_ON_EXCEPT([this]() { clear(); });
 }
 
 LifeCycleId BlockRadixTree::numLifeCycles() const noexcept

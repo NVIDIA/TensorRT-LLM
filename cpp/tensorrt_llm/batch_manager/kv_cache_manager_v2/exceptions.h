@@ -32,6 +32,9 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+// The diagnostic is written to native stderr. pytest's default capture mode (--capture=fd)
+// redirects that file descriptor and discards the buffer when the process aborts, so a failure
+// under pytest is visible only when the suite runs with --capture=tee-sys or --capture=no.
 template <typename F>
 void abortOnExcept(char const* context, F&& func) noexcept
 {
