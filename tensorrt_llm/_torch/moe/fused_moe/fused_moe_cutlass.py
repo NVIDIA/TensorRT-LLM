@@ -955,7 +955,8 @@ class CutlassFusedMoE(MoEImplBase):
 
         # SM120 + FP8 block scales: use Triton kernel (CUTLASS TMA fails on SM120
         # for large token counts due to cuTensorMapEncodeTiled limitations).
-        if self.has_deepseek_fp8_block_scales and get_sm_version() == 120:
+        if self.has_deepseek_fp8_block_scales and get_sm_version() in (120,
+                                                                       121):
             from .fused_moe_triton_fp8_block_scale import \
                 run_triton_fp8_block_scale_moe
 
