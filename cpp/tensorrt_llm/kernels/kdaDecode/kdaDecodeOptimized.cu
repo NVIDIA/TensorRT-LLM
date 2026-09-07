@@ -236,7 +236,7 @@ __device__ __forceinline__ void cp_async_state_chunk(float* shared_state, float 
 
 #endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
 
-template <KernelSchedule kSchedule, int kHeads>
+template <KernelSchedule kSchedule, int kHeads, bool kUpdateConvCache>
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfloat16 const* __restrict__ x_q,
     __nv_bfloat16 const* __restrict__ x_k, __nv_bfloat16 const* __restrict__ x_v,
     __nv_bfloat16 const* __restrict__ w_q_t, __nv_bfloat16 const* __restrict__ w_k_t,
@@ -246,8 +246,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
     __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
     float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices, float* __restrict__ state,
-    int64_t state_slot_stride, int64_t conv_state_slot_stride, __nv_bfloat16* __restrict__ out, bool update_conv_cache,
-    float lower_bound, float scale, float onorm_epsilon, KdaDecodeIoLayout layout)
+    int64_t state_slot_stride, int64_t conv_state_slot_stride, __nv_bfloat16* __restrict__ out, float lower_bound,
+    float scale, float onorm_epsilon, KdaDecodeIoLayout layout)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     __trap();
@@ -278,7 +278,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
     cudaGridDependencySynchronize();
 #endif
     int const state_slot = ssm_state_indices == nullptr ? batch_index : ssm_state_indices[batch_index];
-    int const conv_slot = update_conv_cache ? state_slot : batch_index;
+    int const conv_slot = kUpdateConvCache ? state_slot : batch_index;
     float* const state_head
         = state + static_cast<int64_t>(state_slot) * state_slot_stride + static_cast<int64_t>(head) * kDim * kDim;
 
@@ -364,13 +364,10 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
             * bf16_load(w_q_t, (kKernelWidth - 1) * kFlat + head_column);
         k_accumulator += __bfloat162float(k_new_conv_state[kConvCacheWidth - 1])
             * bf16_load(w_k_t, (kKernelWidth - 1) * kFlat + head_column);
-        if constexpr (!kUseCluster)
+        if constexpr (!kUseCluster && kUpdateConvCache)
         {
-            if (update_conv_cache)
-            {
-                update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
-                update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
-            }
+            update_conv_state(cs_q + cache_base, q_new_conv_state[0], q_new_conv_state[1], q_new_conv_state[2]);
+            update_conv_state(cs_k + cache_base, k_new_conv_state[0], k_new_conv_state[1], k_new_conv_state[2]);
         }
         shared_q[column] = silu_fast(q_accumulator);
         shared_k[column] = silu_fast(k_accumulator);
@@ -404,7 +401,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         v_new_conv_state[kConvCacheWidth - 1] = x_v[v_index];
         v_accumulator += __bfloat162float(v_new_conv_state[kConvCacheWidth - 1])
             * bf16_load(w_v_t, (kKernelWidth - 1) * kFlat + head_row);
-        if (update_conv_cache)
+        if constexpr (kUpdateConvCache)
         {
             update_conv_state(cs_v + cache_base, v_new_conv_state[0], v_new_conv_state[1], v_new_conv_state[2]);
         }
@@ -611,7 +608,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
         cluster.sync();
         float const normalization_sum_square = *cluster.map_shared_rank(&reduction[0], 0);
 
-        if (update_conv_cache)
+        if constexpr (kUpdateConvCache)
         {
             // Defer update until all ranks have consumed the old values.
             static_assert(kDim % kClusterBlocks == 0);
@@ -658,7 +655,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_native_kernel(__nv_bfl
 #endif
 }
 
-template <KernelSchedule kSchedule, int kHeads>
+template <KernelSchedule kSchedule, int kHeads, bool kUpdateConvCache>
 cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t stream)
 {
     constexpr bool kUseCpAsyncBulk = kSchedule == KernelSchedule::kSingleCtaTwoStageCpAsyncBulk
@@ -671,8 +668,9 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
 
     if constexpr (kUseCpAsyncBulk)
     {
-        const cudaError_t attribute_status = cudaFuncSetAttribute(kda_decode_native_kernel<kSchedule, kHeads>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSharedBytes);
+        const cudaError_t attribute_status
+            = cudaFuncSetAttribute(kda_decode_native_kernel<kSchedule, kHeads, kUpdateConvCache>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSharedBytes);
         if (attribute_status != cudaSuccess)
         {
             return attribute_status;
@@ -698,17 +696,18 @@ cudaError_t launchKernelSchedule(KdaDecodeParams const& params, cudaStream_t str
         config.numAttrs = 2;
     }
 
-    cudaError_t const launchStatus = cudaLaunchKernelEx(&config, kda_decode_native_kernel<kSchedule, kHeads>,
-        static_cast<__nv_bfloat16 const*>(params.xQ), static_cast<__nv_bfloat16 const*>(params.xK),
-        static_cast<__nv_bfloat16 const*>(params.xV), static_cast<__nv_bfloat16 const*>(params.wQT),
-        static_cast<__nv_bfloat16 const*>(params.wKT), static_cast<__nv_bfloat16 const*>(params.wVT),
-        static_cast<__nv_bfloat16 const*>(params.biasQ), static_cast<__nv_bfloat16 const*>(params.biasK),
-        static_cast<__nv_bfloat16 const*>(params.biasV), static_cast<__nv_bfloat16*>(params.convStateQ),
-        static_cast<__nv_bfloat16*>(params.convStateK), static_cast<__nv_bfloat16*>(params.convStateV), params.logA,
-        static_cast<__nv_bfloat16 const*>(params.gate), params.dtBias, static_cast<__nv_bfloat16 const*>(params.beta),
+    cudaError_t const launchStatus = cudaLaunchKernelEx(&config,
+        kda_decode_native_kernel<kSchedule, kHeads, kUpdateConvCache>, static_cast<__nv_bfloat16 const*>(params.xQ),
+        static_cast<__nv_bfloat16 const*>(params.xK), static_cast<__nv_bfloat16 const*>(params.xV),
+        static_cast<__nv_bfloat16 const*>(params.wQT), static_cast<__nv_bfloat16 const*>(params.wKT),
+        static_cast<__nv_bfloat16 const*>(params.wVT), static_cast<__nv_bfloat16 const*>(params.biasQ),
+        static_cast<__nv_bfloat16 const*>(params.biasK), static_cast<__nv_bfloat16 const*>(params.biasV),
+        static_cast<__nv_bfloat16*>(params.convStateQ), static_cast<__nv_bfloat16*>(params.convStateK),
+        static_cast<__nv_bfloat16*>(params.convStateV), params.logA, static_cast<__nv_bfloat16 const*>(params.gate),
+        params.dtBias, static_cast<__nv_bfloat16 const*>(params.beta),
         static_cast<__nv_bfloat16 const*>(params.outputNormGate), params.outputNormWeight, params.ssmStateIndices,
         params.state, params.stateSlotStride, params.convStateSlotStride, static_cast<__nv_bfloat16*>(params.output),
-        params.updateConvCache, params.lowerBound, params.scale, params.outputNormEps, params.layout);
+        params.lowerBound, params.scale, params.outputNormEps, params.layout);
     if (launchStatus != cudaSuccess)
     {
         return launchStatus;
@@ -725,27 +724,40 @@ void validateOptimizedParams(KdaDecodeParams const& params)
     TLLM_CHECK_WITH_INFO(params.applyBetaSigmoid, "Optimized KDA decode requires beta sigmoid in the kernel");
 }
 
-template <KernelSchedule kSchedule>
+template <KernelSchedule kSchedule, bool kUpdateConvCache>
 void dispatchKdaDecodeOptimizedHeads(KdaDecodeParams const& params, cudaStream_t stream)
+{
+    switch (params.numHeads)
+    {
+    case 1: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 1, kUpdateConvCache>(params, stream))); break;
+    case 2: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 2, kUpdateConvCache>(params, stream))); break;
+    case 3: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 3, kUpdateConvCache>(params, stream))); break;
+    case 4: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 4, kUpdateConvCache>(params, stream))); break;
+    case 6: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 6, kUpdateConvCache>(params, stream))); break;
+    case 8: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 8, kUpdateConvCache>(params, stream))); break;
+    case 12: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 12, kUpdateConvCache>(params, stream))); break;
+    case 16: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 16, kUpdateConvCache>(params, stream))); break;
+    case 24: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 24, kUpdateConvCache>(params, stream))); break;
+    case 32: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 32, kUpdateConvCache>(params, stream))); break;
+    case 48: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 48, kUpdateConvCache>(params, stream))); break;
+    case 96: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 96, kUpdateConvCache>(params, stream))); break;
+    default: TLLM_CHECK_WITH_INFO(false, "Optimized KDA decode does not support numHeads=%d", params.numHeads);
+    }
+}
+
+template <KernelSchedule kSchedule>
+void dispatchKdaDecodeOptimized(KdaDecodeParams const& params, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(tensorrt_llm::common::getSMVersion() >= 90,
         "Optimized KDA decode kernels require compute capability 9.0 or later");
     validateOptimizedParams(params);
-    switch (params.numHeads)
+    if (params.updateConvCache)
     {
-    case 1: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 1>(params, stream))); break;
-    case 2: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 2>(params, stream))); break;
-    case 3: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 3>(params, stream))); break;
-    case 4: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 4>(params, stream))); break;
-    case 6: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 6>(params, stream))); break;
-    case 8: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 8>(params, stream))); break;
-    case 12: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 12>(params, stream))); break;
-    case 16: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 16>(params, stream))); break;
-    case 24: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 24>(params, stream))); break;
-    case 32: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 32>(params, stream))); break;
-    case 48: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 48>(params, stream))); break;
-    case 96: TLLM_CUDA_CHECK((launchKernelSchedule<kSchedule, 96>(params, stream))); break;
-    default: TLLM_CHECK_WITH_INFO(false, "Optimized KDA decode does not support numHeads=%d", params.numHeads);
+        dispatchKdaDecodeOptimizedHeads<kSchedule, true>(params, stream);
+    }
+    else
+    {
+        dispatchKdaDecodeOptimizedHeads<kSchedule, false>(params, stream);
     }
 }
 
@@ -753,22 +765,22 @@ void dispatchKdaDecodeOptimizedHeads(KdaDecodeParams const& params, cudaStream_t
 
 void launchKdaDecodeOptimizedSingleCta(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaCpAsync>(params, stream);
+    dispatchKdaDecodeOptimized<KernelSchedule::kSingleCtaCpAsync>(params, stream);
 }
 
 void launchKdaDecodeOptimizedTwoStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeOptimized<KernelSchedule::kSingleCtaTwoStageCpAsyncBulk>(params, stream);
 }
 
 void launchKdaDecodeOptimizedFourStageBulk(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
+    dispatchKdaDecodeOptimized<KernelSchedule::kSingleCtaFourStageCpAsyncBulk>(params, stream);
 }
 
 void launchKdaDecodeOptimizedFourCtaCluster(KdaDecodeParams const& params, cudaStream_t stream)
 {
-    dispatchKdaDecodeOptimizedHeads<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
+    dispatchKdaDecodeOptimized<KernelSchedule::kFourCtaThreadBlockClusterCpAsync>(params, stream);
 }
 
 } // namespace kernels::kdaDecode
