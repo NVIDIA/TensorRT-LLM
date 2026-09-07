@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
+from .._block_radix_tree import BlockKey, BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -423,8 +423,9 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: int | None = None,
-        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
-        __: PRIORITY_DEFAULT,
+        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _, __: (
+            PRIORITY_DEFAULT
+        ),
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
@@ -486,6 +487,102 @@ class KVCacheManager:
             self.enable_partial_match,
             self.init_config.reuse_match_backoff,
         )
+
+    def _match_reuse_by_keys(self, keys: Sequence[BlockKey]) -> ReuseMatch:
+        """What a chain named by content currently matches. Holds nothing.
+
+        Private: the C++ binding exposes no counterpart, and a method that
+        answers hasattr on one backend only is the divergence this PR removes.
+        """
+        return self._radix_tree.match_keys(keys)
+
+    def servable_chain(
+        self, keys: Sequence[BlockKey], life_cycles: Sequence[LifeCycleId]
+    ) -> tuple[CacheLevel, int] | None:
+        """Where a content-named chain sits and how much of it is real.
+
+        ``None`` when nothing matched, a life cycle is uncovered, or the chain
+        straddles levels. ``life_cycles`` narrows, never widens.
+        """
+        # Materialized because it is walked twice, and because the C++ binding
+        # walks a vector: a generator would answer None here and correctly there.
+        life_cycles = list(life_cycles)
+        # Keys first, then life cycles: the C++ binding casts the keys before
+        # the call, so refusing in the other order would name a different fault.
+        match = self._match_reuse_by_keys(keys)
+        # Unvalidated, ``-1`` indexes the last life cycle here and reads out of
+        # bounds in a C++ release build -- two wrong answers, neither a refusal.
+        for lc_id in life_cycles:
+            if not 0 <= lc_id < self._life_cycles.size:
+                raise ValueError("servable_chain: life cycle id out of range")
+        # All-or-nothing cannot serve a fraction of a block, and the peer would
+        # read the untouched tail as if it were content.
+        if not self._is_whole_block_chain(match):
+            return None
+        level = self._uniform_cache_level(match, life_cycles)
+        return None if level is None else (level, match.num_tokens)
+
+    def _uniform_cache_level(
+        self, match: ReuseMatch, life_cycles: Sequence[LifeCycleId]
+    ) -> CacheLevel | None:
+        """The one level holding every matched block, or ``None``.
+
+        Topology only. Gating on readiness here would buy nothing: the query
+        holds nothing, so a migration may start the moment it returns.
+        """
+        if not match.blocks:
+            return None
+        levels = set()
+        for block in match.blocks:
+            for lc_id in life_cycles:
+                page = block.get_page(lc_id)
+                if page is None:
+                    return None
+                levels.add(page.cache_level)
+        return levels.pop() if len(levels) == 1 else None
+
+    def create_kv_cache_from_keys(
+        self,
+        keys: Sequence[BlockKey],
+        id: int | None = None,
+    ) -> "_KVCache":
+        """A cache holding a content-named chain, for reading it out to a peer.
+
+        Holds against dropping, NOT against migration: a page evicted downward
+        hands its slot back, so an address taken from it can name other data.
+        """
+        if not keys:
+            raise ValueError("create_kv_cache_from_keys: an empty key chain names no blocks")
+        match = self._match_reuse_by_keys(keys)
+        # The scope below is the default one, not the chain's -- a key is a
+        # digest and does not invert. Refusing anything but whole blocks is what
+        # keeps close from committing a remainder under that wrong root.
+        if not self._is_whole_block_chain(match):
+            raise ValueError("create_kv_cache_from_keys: the chain does not name whole blocks")
+        return _KVCache(
+            self,
+            ReuseScope(),
+            match,
+            id,
+            # Neither may be left blank: a ``None`` priority callback is called
+            # on any commit path, and ``text_only=False`` is rejected outright
+            # by a manager configured text-only. Both follow ``create_kv_cache``.
+            lambda _, __: PRIORITY_DEFAULT,
+            (len(keys) - 1) * self.tokens_per_block,
+            None,
+            False,
+        )
+
+    def _is_whole_block_chain(self, match: ReuseMatch) -> bool:
+        """Whether every link of the match names a block that is actually whole.
+
+        ``num_tokens`` counts every matched link as a whole block, so it cannot
+        be the test: a link naming a shorter block still passes it.
+        """
+        tokens_per_block = self.tokens_per_block
+        if match.num_tokens != len(match.blocks) * tokens_per_block:
+            return False
+        return all(len(block.tokens) == tokens_per_block for block in match.blocks)
 
     def probe_reuse(
         self,

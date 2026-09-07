@@ -714,6 +714,16 @@ class StorageManager:
         storage = self._levels[GPU_LEVEL].storage
         return MemAddress(cast(int, storage.slot_address(pg_idx, pool_idx, SlotId(0))))
 
+    def mem_pool_base_address(
+        self, level: CacheLevel, pg_idx: PoolGroupIndex, pool_idx: PoolIndex
+    ) -> MemAddress | None:
+        """Base of one pool at one level, or ``None`` when that level is not memory.
+
+        A disk level addresses by ``(fd, offset)``, which is not a base pointer.
+        """
+        addr = self._levels[level].storage.slot_address(pg_idx, pool_idx, SlotId(0))
+        return MemAddress(addr) if isinstance(addr, int) else None
+
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
         return self._buffer_attr[BufferId(layer_id, data_role)]
 

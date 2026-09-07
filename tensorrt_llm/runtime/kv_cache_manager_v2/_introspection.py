@@ -480,3 +480,52 @@ def compute_slots_for_batch(
             batch, tokens_per_block, swa_scratch_reuse
         )
     )
+
+
+def pool_group_descs_at(manager: Any, level: int) -> list[Any] | None:
+    """The pool layout at a cache level, or ``None`` if that level has no base.
+
+    Here, not on the manager: only the hot base is stable -- a host pool is
+    resized through ``mremap``. ``slot_desc`` stays the hot one throughout.
+    """
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return cpp_introspection.pool_group_descs_at(manager, level)
+
+    from ._core._kv_cache_manager import PoolDesc, PoolGroupDesc
+    from ._storage._core import PoolGroupIndex, PoolIndex
+    from ._utils import make_typed
+
+    storage = manager._storage
+    if not 0 <= level < storage.num_cache_levels:
+        return None
+    descs: list[PoolGroupDesc] = []
+    for pg_idx in map(PoolGroupIndex, range(storage.num_pool_groups)):
+        # Native builds concatenate a group into one cold pool, so they answer
+        # None here. This backend keeps the hot shape and could answer -- but a
+        # peer must not hear a different story depending on who it asked.
+        if level != 0 and storage.num_pools(pg_idx) != 1:
+            return None
+        slot_size_list = storage.slot_size(pg_idx)
+        bases = [
+            storage.mem_pool_base_address(level, pg_idx, PoolIndex(pool_idx))
+            for pool_idx in range(storage.num_pools(pg_idx))
+        ]
+        if any(b is None for b in bases):
+            return None
+        descs.append(
+            PoolGroupDesc(
+                pool_group_index=pg_idx,
+                num_slots=storage.num_slots(pg_idx, level),
+                slot_desc=storage._slot_desc_list[pg_idx],
+                pools=make_typed(
+                    lambda i: PoolDesc(
+                        pool_index=PoolIndex(i),
+                        base_address=bases[i],
+                        slot_bytes=slot_size_list[PoolIndex(i)],
+                    ),
+                    storage.num_pools(pg_idx),
+                ),
+            )
+        )
+    return descs

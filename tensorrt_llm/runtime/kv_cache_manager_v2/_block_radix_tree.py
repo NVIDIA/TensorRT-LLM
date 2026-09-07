@@ -703,11 +703,24 @@ class BlockRadixTree:
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
+        yield from self._match_key_path(
+            sequence_to_blockchain_keys(self._tokens_per_block, reuse_scope, tokens),
+            enable_partial_match,
+        )
+
+    def _match_key_path(
+        self,
+        key_path: Iterable[tuple[TokenBlock, BlockKey]],
+        enable_partial_match: bool = False,
+    ) -> Iterator[tuple[Block, int]]:
+        """Walk ``key_path`` down from the root. The keys are what the walk uses.
+
+        Tokens only reach here to be hashed into keys, so a peer holding the
+        keys drives the same walk. Only partial match still needs tokens.
+        """
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
-        for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, reuse_scope, tokens
-        ):
+        for token_block, key in key_path:
             if key in block.next:
                 block = block.next[key]
                 if token_block:
@@ -847,6 +860,48 @@ class BlockRadixTree:
                 else num_reusable_tokens_before_hybrid_pruning
             ),
             num_reusable_tokens_before_pruning,
+        )
+
+    def match_keys(self, keys: Sequence[BlockKey]) -> ReuseMatch:
+        """``match`` for a chain named by content instead of by tokens.
+
+        ``keys`` is the reuse-scope root then one key per whole block. Pruning
+        is the same call ``match`` makes: one question, asked one way.
+        """
+        if not keys:
+            return ReuseMatch([], 0, 0, 0, 0)
+        # Same refusal the binding makes as it casts: unchecked, a corrupt name
+        # reads as a miss, and a bytearray dies unhashable inside the walk.
+        # isinstance, not an exact type -- PyBytes_Check takes subclasses too.
+        for key in keys:
+            if not isinstance(key, bytes) or len(key) != _SHA256_DIGEST_SIZE:
+                raise ValueError(f"a block key must be {_SHA256_DIGEST_SIZE} bytes")
+        tpb = self._tokens_per_block
+        # Root first, then one whole block per key; ``_match_key_path`` yields a
+        # block only for a non-empty token block, so the root passes through.
+        key_path: list[tuple[TokenBlock, BlockKey]] = [([], keys[0])]
+        key_path += [([0] * tpb, key) for key in keys[1:]]
+        # Explicitly off, not merely defaulted: partial match works by
+        # scanning tokens, and the tokens here are placeholders. Left to a
+        # default it would silently match any sibling starting with them.
+        raw_matched = list(self._match_key_path(key_path, enable_partial_match=False))
+        ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        matched = self._prune_match(raw_matched, ssm_lc_id)
+        num_tokens = self._num_matched_tokens(matched)
+        # Same meaning as in ``match``: the prefix the attention pages alone
+        # would support, before recurrent snapshots shorten it. Equal to
+        # ``num_tokens`` when there is no SSM life cycle.
+        before_hybrid = (
+            self._num_matched_tokens(self._prune_match(list(raw_matched), None))
+            if ssm_lc_id is not None
+            else num_tokens
+        )
+        return ReuseMatch(
+            [block for block, _ in matched],
+            num_tokens,
+            (len(keys) - 1) * tpb,
+            before_hybrid,
+            self._num_matched_tokens(raw_matched),
         )
 
     def _check_sanity(self) -> bool:
