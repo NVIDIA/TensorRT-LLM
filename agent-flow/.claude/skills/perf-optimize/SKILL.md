@@ -166,24 +166,30 @@ than inventing values:
   defaults `min_share_pct: 0.5`, `coverage_target_pct: 95`) when the
   user wants the **per-kernel coverage contract** — ncu SOL analysis on
   every kernel above the share bar (multi-pass capture) and, per
-  kernel, an explicit answer to *can it be made faster?*, *can it be
-  fused with its neighbors?* and *can it be overlapped with independent
-  work on another stream?* recorded in a schema-validated
+  kernel, an explicit answer to *can it be eliminated?*, *can it be
+  made faster?*, *can it be fused with its neighbors?* and *can it be
+  overlapped with independent work on another stream?* recorded in a
+  schema-validated
   `kernel_ledger.yaml` each profiling round (a roadmap item or an
   evidence-backed dismissal per question; the orchestrator aborts the
   round on an incomplete ledger — replan-only rounds run no ncu and are
   waived — and the report gains a Kernel Coverage accountability section
-  resolving every disposition to its outcome). The overlap question
-  catches what the first two structurally cannot: both presuppose the
-  kernel runs *alone*, so a kernel at its bound-class ceiling whose
-  neighbors move only mandatory bytes is legitimately closed on both and
-  can still give back most of its share on an aux stream (it needs CUDA
-  graphs enabled — multi-stream no-ops without them, so mention that if
-  the user is running graphs off). The ledger also records the profiled
+  resolving every disposition to its outcome). The four are ordered by
+  how much they presuppose. *Elimination* comes first because it assumes
+  only that the kernel runs today, and a `yes` recovers its whole share
+  rather than a fraction — redundant work, work over padded/masked data,
+  per-step recompute of an invariant, or a fallback kernel firing
+  because a gated fast path did not. *Overlap* catches what faster and
+  fusion structurally cannot: both presuppose the kernel runs *alone*,
+  so a kernel at its bound-class ceiling whose neighbors move only
+  mandatory bytes is legitimately closed on both and can still give back
+  most of its share on an aux stream (it needs CUDA graphs enabled —
+  multi-stream no-ops without them, so mention that if the user is
+  running graphs off). The ledger also records the profiled
   window's `gpu_busy_pct`, because a kernel's share of GPU time is not
   its share of wall clock and only the latter can move the target
-  metric. This is the "every kernel optimization/fusion/overlap
-  possibility considered before done" guarantee; it needs `nsys` +
+  metric. This is the "every kernel elimination/optimization/fusion/
+  overlap possibility considered before done" guarantee; it needs `nsys` +
   `ncu` in `profile.methods` and adds profiling wall-clock to every
   round that profiles.
 - `accuracy`: include only if the user has an eval command they want the

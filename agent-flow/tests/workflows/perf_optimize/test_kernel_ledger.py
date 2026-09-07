@@ -29,6 +29,11 @@ def _row(kernel: str = "gdn_bf16_state", share: float = 60.0, **overrides) -> di
             "occupancy_pct": 62.0,
             "bound": "memory",
         },
+        "elimination": {
+            "disposition": "dismissed",
+            "why_it_runs": "state update read by the next layer's gate (NVTX + source)",
+            "ref": "mandatory-math: per-step recurrence, no padded or invariant part",
+        },
         "faster": {"disposition": "item", "ref": "opt-001"},
         "fusion": {
             "disposition": "dismissed",
@@ -47,7 +52,7 @@ def _row(kernel: str = "gdn_bf16_state", share: float = 60.0, **overrides) -> di
 
 def _ledger(**overrides) -> dict:
     data = {
-        "version": 2,
+        "version": 3,
         "source": "rounds/round_1/analysis/nsys_stats.txt",
         "coverage": {
             "enumerated_share_pct": 96.0,
@@ -256,7 +261,7 @@ def test_note_does_not_excuse_a_non_numeric_metric(tmp_path):
 def test_every_question_required_per_row(tmp_path, question):
     ledger = _ledger()
     del ledger["kernels"][0][question]
-    with pytest.raises(LedgerError, match="answers all three questions"):
+    with pytest.raises(LedgerError, match="answers all four questions"):
         load_ledger(_write(tmp_path, ledger))
 
 
@@ -297,6 +302,30 @@ def test_overlap_item_does_not_require_the_partner(tmp_path):
     ledger["kernels"][0]["overlap"] = {"disposition": "item", "ref": "opt-001"}
     data = load_ledger(_write(tmp_path, ledger))
     assert "concurrent_with" not in data["kernels"][0]["overlap"]
+
+
+def test_elimination_requires_why_the_kernel_runs(tmp_path):
+    # Question 1's verdict rests on what consumes the output (or the
+    # guard that selected this path) — its neighbors/concurrent_with
+    # analogue, so "it is needed" cannot be asserted bare.
+    ledger = _ledger()
+    del ledger["kernels"][0]["elimination"]["why_it_runs"]
+    with pytest.raises(LedgerError, match="elimination.why_it_runs"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_elimination_disposition_enum_is_exact(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["elimination"]["disposition"] = "probably"
+    with pytest.raises(LedgerError, match="elimination.disposition"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_elimination_is_asked_before_the_other_three(tmp_path):
+    # Order matters for the prompt and the report: a `yes` here moots the
+    # rest and recovers the whole share, so it leads.
+    assert kernel_ledger.QUESTIONS[0] == "elimination"
+    assert kernel_ledger.QUESTIONS == ("elimination", "faster", "fusion", "overlap")
 
 
 def test_overlap_requires_the_candidate_partner(tmp_path):
@@ -388,6 +417,20 @@ def test_item_refs_must_resolve_to_roadmap_ids(tmp_path):
     assert len(problems) == 1
     assert "faster.ref" in problems[0]
     assert "opt-001" in problems[0]
+
+
+def test_elimination_item_refs_must_resolve_to_roadmap_ids(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["elimination"] = {
+        "disposition": "item",
+        "why_it_runs": "unfused fallback: is_fused=False guard (modeling_x.py:412)",
+        "ref": "opt-007",
+    }
+    loaded = load_ledger(_write(tmp_path, ledger))
+    problems = cross_validate(loaded, _roadmap("opt-001"), coverage_target_pct=95.0)
+    assert len(problems) == 1
+    assert "elimination.ref" in problems[0]
+    assert cross_validate(loaded, _roadmap("opt-001", "opt-007"), 95.0) == []
 
 
 def test_overlap_item_refs_must_resolve_to_roadmap_ids(tmp_path):

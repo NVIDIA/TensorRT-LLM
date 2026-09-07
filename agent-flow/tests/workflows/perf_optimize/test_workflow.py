@@ -3327,7 +3327,7 @@ _KC_EXTRA = {"profile": {"kernel_coverage": {}}}
 def _ledger_yaml(faster_ref: str = "opt-001") -> str:
     return yaml.safe_dump(
         {
-            "version": 2,
+            "version": 3,
             "source": "rounds/round_1/analysis/nsys_stats.txt",
             "coverage": {
                 "enumerated_share_pct": 96.0,
@@ -3346,6 +3346,11 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                         "mem_sol_pct": 78.5,
                         "occupancy_pct": 62.0,
                         "bound": "memory",
+                    },
+                    "elimination": {
+                        "disposition": "dismissed",
+                        "why_it_runs": "read by the next layer (NVTX + source)",
+                        "ref": "mandatory-math: per-step recurrence",
                     },
                     "faster": {"disposition": "item", "ref": faster_ref},
                     "fusion": {
@@ -3491,13 +3496,14 @@ def test_kernel_coverage_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
     assert state.stage == state_module.STAGE_ANALYZER
 
 
-def test_kernel_coverage_unanswered_overlap_blocks_advance(tmp_path, fake_git):
-    """A row that skips question 3 aborts the stage like any other gap.
+@pytest.mark.parametrize("dropped", ["elimination", "faster", "fusion", "overlap"])
+def test_kernel_coverage_unanswered_question_blocks_advance(tmp_path, fake_git, dropped):
+    """A row that skips any question aborts the stage.
 
     The exhaustiveness guarantee is only worth the weakest question it
-    enforces — a ledger answering faster/fusion but silently dropping
-    overlap would let a campaign conclude with a kernel nobody asked
-    whether it had to run alone.
+    enforces — a ledger silently dropping one would let a campaign
+    conclude with a kernel nobody asked whether it had to exist, run
+    alone, or run at all.
     """
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
@@ -3505,17 +3511,17 @@ def test_kernel_coverage_unanswered_overlap_blocks_advance(tmp_path, fake_git):
     trace = _stub_agents(workflow)
     original_analyzer = workflow._run_analyzer
 
-    def analyzer_with_two_question_ledger(state):
+    def analyzer_with_incomplete_ledger(state):
         original_analyzer(state)
         data = yaml.safe_load(_ledger_yaml())
-        del data["kernels"][0]["overlap"]
+        del data["kernels"][0][dropped]
         (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
             yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
         )
 
-    workflow._run_analyzer = analyzer_with_two_question_ledger
+    workflow._run_analyzer = analyzer_with_incomplete_ledger
     try:
-        with pytest.raises(RuntimeError, match="answers all three questions"):
+        with pytest.raises(RuntimeError, match="answers all four questions"):
             workflow.run(str(task))
     finally:
         workflow.close()
@@ -3595,7 +3601,7 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     assert "kernel_ledger.yaml" in analyzer
     assert "per-kernel coverage contract" in analyzer
     assert "0.5%" in analyzer and "95.0%" in analyzer
-    assert "faster? fusible? overlappable?" in analyzer
+    assert "eliminable? faster? fusible? overlappable?" in analyzer
     # The busy share is asked for by name — it is what converts a share of
     # GPU time into the share of wall clock the noise floor judges.
     assert "coverage.gpu_busy_pct" in analyzer

@@ -951,25 +951,29 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
 
     Appended only when ``task.yaml`` declares ``profile.kernel_coverage``.
     It supersedes Run B's top-kernel target selection with coverage-driven
-    enumeration, poses the three per-kernel questions (faster? fusible?
-    overlappable?), fixes the unit every materiality claim is made in
-    (wall clock, not GPU time), and defines ``kernel_ledger.yaml`` — the
-    machine-readable proof, validated by the orchestrator each round,
-    that every enumerated kernel's optimization, fusion, and overlap
-    possibility was considered.
+    enumeration, poses the four per-kernel questions (eliminable?
+    faster? fusible? overlappable?), fixes the unit every materiality
+    claim is made in (wall clock, not GPU time), and defines
+    ``kernel_ledger.yaml`` — the machine-readable proof, validated by
+    the orchestrator each round, that every enumerated kernel's
+    elimination, optimization, fusion, and overlap possibility was
+    considered.
     """
     return f"""\
 ## Per-kernel coverage contract (this task declares `profile.kernel_coverage`)
 
 This campaign carries an exhaustiveness guarantee: **every kernel
 at/above the coverage bar gets an ncu SOL deep dive and an explicit
-answer to three questions — (1) can this kernel be made faster? (2) can
-it be fused with its neighbors? (3) can it be overlapped with
-independent work on another stream? — each answer a roadmap item or an
-evidence-backed dismissal.** The three are not redundant: the first two
-both presuppose the kernel must run *alone*, so a kernel legitimately
-closed on both can still be this round's largest opportunity. You record
-the answers in
+answer to four questions — (1) can this kernel be eliminated? (2) can it
+be made faster? (3) can it be fused with its neighbors? (4) can it be
+overlapped with independent work on another stream? — each answer a
+roadmap item or an evidence-backed dismissal.** They are ordered by how
+much they presuppose, each asking less than the last: elimination
+presupposes only that the kernel runs today; faster and fusion
+presuppose the work is necessary *and* that the kernel must run alone;
+overlap drops the alone assumption. That is why a kernel legitimately
+closed on one question can still be this round's largest opportunity
+under another. You record the answers in
 `kernel_ledger.yaml` (contract below) in this round's `analysis/`
 directory, every round **that profiles**. The orchestrator
 schema-validates the ledger the moment your turn ends — a missing row,
@@ -1026,7 +1030,7 @@ superseded — this task pays for breadth:
   own server relaunch, gated to the same iteration window.
 - **Degrade honestly, never fabricate**: a kernel no pass captured (or
   ncu itself unavailable) keeps its ledger row with
-  `ncu: "unavailable: <reason>"` — all three questions are still owed,
+  `ncu: "unavailable: <reason>"` — all four questions are still owed,
   answered from the nsys timeline and the source.
 
 ### The materiality unit — wall clock, not GPU time
@@ -1057,7 +1061,73 @@ A low `gpu_busy_pct` is itself a finding: the gap between the two units
 the roadmap as its own item (the taxonomy's launch/host category) rather
 than spreading it thin across every kernel row.
 
-### Question 1 per kernel — can it be made faster?
+### Question 1 per kernel — can it be eliminated?
+
+Ask this **first**, because a `yes` moots the other three and recovers
+the row's **whole** wall-clock share rather than a fraction of it — the
+only question whose ceiling is the kernel's entire cost. Questions 2-4
+all presuppose the work is necessary; this one asks whether it is. Four
+recurring shapes, checked against the source and the NVTX-annotated
+timeline rather than the ncu metrics:
+
+- **Redundant** — it produces something already available: a cast whose
+  result exists in the needed dtype upstream, a copy that could be a
+  view, a layout transform undone a few kernels later, the same
+  reduction or index computation done twice in one step.
+- **Wasted** — it runs over data that cannot affect the output: positions
+  padded to `max_seq_len`, masked-out tokens, inactive experts, the dummy
+  slots a padded CUDA-graph batch carries. The recoverable fraction is
+  the padded fraction — measure it, do not assume it.
+- **Hoistable** — it recomputes per step (or per layer) something
+  invariant across steps: weight preprocessing/requantization, scale
+  computation, block-table or index math, RoPE tables. The fix moves it
+  to load/warmup or caches it, and the kernel leaves the steady-state
+  loop entirely.
+- **Accidental slow path** — it exists only because an intended fast path
+  did not fire: an `is_fused=False` fallback, an unsupported-shape or
+  unsupported-dtype guard, a backend selector landing on the generic
+  implementation. Here elimination means *making the intended path fire*,
+  not editing this kernel. This is the per-kernel, per-round teeth on
+  round 1's dormant-capability sweep: the sweep looks for gated-off
+  capabilities globally and only once, while a kernel that should not
+  exist is the sweep's signal showing up in the profile.
+
+Distinguish this from question 2. "A better kernel exists for this
+shape" is *faster*; "this work does not need to happen" is *elimination*.
+When the kernel disappears rather than improves, it belongs here.
+
+The recurring legitimate dismissals — lead the `ref` with the matching
+tag:
+
+- `mandatory-math: <what>` — model-defined work on real data every step,
+  not duplicated and not invariant. Cite the consumer in `why_it_runs`;
+  this is the correct and most common answer for a GEMM or attention
+  kernel.
+- `padding-minimal: <n>%` — the padded/masked fraction it processes is
+  small enough that skipping it lands under the noise floor (show the
+  fraction and the wall-clock arithmetic).
+- `already-hoisted` — the invariant part already runs once at load or
+  warmup; what remains per step is genuinely per-step (cite where the
+  hoisted part lives).
+- `fast-path-active` — this kernel **is** the intended path; the gated
+  alternative is already on (cite the flag / selector / config value you
+  read, not an assumption).
+- `fast-path-blocked: <guard>` — a better path exists but its guard
+  cannot be satisfied here (unsupported dtype, shape, or hardware —
+  quote the guard). If the guard *can* be satisfied, that is an item,
+  not this tag.
+- `below-materiality` — the whole kernel's wall-clock share is under the
+  noise floor, so even deleting it outright would not register (show the
+  arithmetic).
+- `approach-restricted` / `accuracy-scope` — as in question 2.
+
+**An elimination item outranks the row's other answers.** Removing the
+work is worth more than speeding it up, and both cannot be banked: when
+`elimination` is an `item`, rank it above any other item this row
+produces and do not add their expected gains together — the other three
+answers describe a kernel this item intends to delete.
+
+### Question 2 per kernel — can it be made faster?
 
 Classify the kernel with the `perf-nsight-compute-analysis` skill's
 thresholds and take the levers for that class from its bottleneck
@@ -1065,7 +1135,7 @@ guide. What the guide cannot tell you is where they live in this
 codebase:
 
 - **memory-bound** → the round trip may be removable outright, which is
-  question 2.
+  question 3.
 - **compute-bound** → a better kernel/backend for the shape usually
   already exists (the checkout's backend selectors, flashinfer,
   provider GEMMs); lower-precision math only where the task's accuracy
@@ -1074,7 +1144,7 @@ codebase:
   roadmap item rather than a kernel edit. Note that graphs only collapse
   the gaps *between* launches; a kernel that is latency-bound *inside* a
   step (already replayed from a graph, still not filling the device) is
-  answered by question 3, not here.
+  answered by question 4, not here.
 - Whatever the class, run the *Prefer existing kernels* search first —
   the faster variant usually already ships somewhere in the checkout or
   its providers.
@@ -1108,7 +1178,7 @@ dismissals — lead the `ref` with the matching tag when one fits:
   insight under *Out-of-scope opportunities* in the findings and point
   the ref there.
 
-### Question 2 per kernel — can it be fused with its neighbors?
+### Question 3 per kernel — can it be fused with its neighbors?
 
 Fusion verdicts rest on **observed adjacency, not guesses**. Derive each
 kernel's neighborhood from the traces: the launch sequence inside one
@@ -1143,15 +1213,15 @@ legitimate dismissals:
   mandatory model/KV traffic; fusing saves no traffic (show the bytes).
 - `below-materiality` — the whole chain's share × best-case saving is
   under the noise floor (show the arithmetic, converted to wall clock).
-- `needs-rebuild` — same bar as question 1's tag: "absorbing the
+- `needs-rebuild` — same bar as question 2's tag: "absorbing the
   neighbor means editing a compiled kernel" dismisses the fusion only
   when a *newly written* fused kernel replacing the incumbent plus its
   glue is also ruled out (no reroutable call site, or no credible
   headroom over the tuned incumbent — with evidence).
 
-### Question 3 per kernel — can it be overlapped with independent work?
+### Question 4 per kernel — can it be overlapped with independent work?
 
-Questions 1 and 2 both presuppose the kernel must run **alone**; this one
+Questions 2 and 3 both presuppose the kernel must run **alone**; this one
 asks whether it has to. A kernel dismissed `at-sol-floor` on one resource
 is by definition *not* saturating the others — a memory-bound kernel at
 89% mem SOL / 11% SM SOL leaves nearly all the math units idle for its
@@ -1171,7 +1241,7 @@ block:
   spare SMs are free real estate.
 
 **The partner must be data-independent, and proving that is the hard
-part.** Derive the pair from the same traces question 2 uses: the launch
+part.** Derive the pair from the same traces question 3 uses: the launch
 sequence (`cuda_gpu_trace`) says what runs before/after it and on which
 stream, and the NVTX ranges around them, read against the source, say
 whether the two touch the same data. The pair qualifies only when neither reads what
@@ -1226,7 +1296,7 @@ The recurring legitimate dismissals:
 - `phase-boundary` — the only independent work sits across a graph
   capture, stream, or prefill/decode boundary the pairing cannot cross.
 
-**Never book the same saving twice.** Questions 2 and 3 compete for one
+**Never book the same saving twice.** Questions 3 and 4 compete for one
 adjacency: a pair can be fused *or* overlapped, and either way the saving
 is the same time. When a row answers `item` on both, say in the second
 item's `expected_gain_rationale` that it is an alternative realization of
@@ -1239,7 +1309,7 @@ Write one ledger per round into this round's `analysis/` directory. Its
 exact shape:
 
 ```yaml
-version: 2
+version: 3
 source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
@@ -1258,6 +1328,11 @@ kernels:                        # descending share_pct; one row per kernel/group
       occupancy_pct: null               # a metric the capture did not yield is null
       bound: memory                     # compute | memory | latency | balanced | comm
       note: "occupancy section empty: replay stalled"   # required by that null
+    elimination:
+      disposition: dismissed            # item | dismissed
+      why_it_runs: "state update consumed by the next layer's gate (NVTX + source);
+        selected by the fused path (is_fused=True, modeling_x.py:412)"
+      ref: "mandatory-math: per-step recurrence, no padded or invariant part"
     faster:
       disposition: item                 # item | dismissed
       ref: opt-003                      # roadmap item id | evidence-backed dismissal
@@ -1276,6 +1351,10 @@ kernels:                        # descending share_pct; one row per kernel/group
     share_pct: 9.2
     ncu: "unavailable: collective — kernel replay deadlocks the ranks"
     bound: comm                         # with the string form, `bound` sits here
+    elimination:
+      disposition: dismissed
+      why_it_runs: "TP-sharded partials summed for the next layer's norm (source)"
+      ref: "mandatory-math: the parallelism, not the kernel, requires the sum"
     faster:
       disposition: dismissed
       ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
@@ -1292,10 +1371,12 @@ kernels:                        # descending share_pct; one row per kernel/group
 
 Rules:
 
-- **All three questions, every row.** `disposition: item` refs a roadmap item
+- **All four questions, every row.** `disposition: item` refs a roadmap item
   id — one existing already, or one you author this round; several rows
   may share one item (a fusion item covers every kernel it merges; an
-  overlap item covers both kernels of the pair, cited from each), and
+  overlap item covers both kernels of the pair, cited from each; one
+  "make the fused path fire" item may eliminate a whole family of
+  fallback kernels), and
   the referenced item may already be `accepted`/`failed` (the
   possibility *was* considered — that is the point). `disposition:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
@@ -1329,12 +1410,12 @@ Rules:
   (an accepted host-side item changes what every kernel is worth).
 - **Mirror it for humans**: add a `## Kernel disposition ledger` section
   to `profile_findings.md` — the same rows as a table (kernel, share %
-  of GPU time, share % of wall clock, bound, faster →, fusion →,
-  overlap →) with a one-line rationale each, headed by the window's
-  `gpu_busy_pct`, and marking every row whose `bound` did *not* come
-  from an ncu capture (the degrade string, or a null metric's `note`) so
-  the table cannot be read as more measured than it is. The YAML file is
-  authoritative; the findings section carries the prose.
+  of GPU time, share % of wall clock, bound, eliminate →, faster →,
+  fusion →, overlap →) with a one-line rationale each, headed by the
+  window's `gpu_busy_pct`, and marking every row whose `bound` did *not*
+  come from an ncu capture (the degrade string, or a null metric's
+  `note`) so the table cannot be read as more measured than it is. The
+  YAML file is authoritative; the findings section carries the prose.
 """
 
 
@@ -1343,8 +1424,8 @@ KERNEL_COVERAGE_REPORTER_GUIDANCE = """\
 
 Every analyzer round wrote a `kernel_ledger.yaml` into its `analysis/`
 directory — one row per kernel at/above the task's share bar, each
-answering *faster?*, *fusible?* and *overlappable?* with a roadmap item
-or an evidence-backed dismissal. `Read` the **final round's** ledger
+answering *eliminable?*, *faster?*, *fusible?* and *overlappable?* with
+a roadmap item or an evidence-backed dismissal. `Read` the **final round's** ledger
 (your instructions name it) and add one section to
 `optimization_report.md`,
 placed **between "Kernel-Level Comparison" and "Failed Attempts"** (the
@@ -1359,18 +1440,18 @@ was Z% GPU-busy (`coverage.gpu_busy_pct` — state it, since it is what
 converts every share below into wall clock), from round <n>'s ledger.
 Then the accountability table, one row per ledger kernel in descending
 share:
-| kernel | share % | bound | faster → | fusion → | overlap → |
+| kernel | share % | bound | eliminate → | faster → | fusion → | overlap → |
 where each `→` cell resolves the ledger disposition to its campaign
 outcome: an item ref becomes `<item-id>: accepted +X%` / `failed
 (<reason_category>)` / `pending at campaign end` (from roadmap.yaml);
-a dismissal shows its leading tag (`at-sol-floor`, `below-materiality`,
-`multi-consumer-pinned`, `graph-disabled`, `no-independent-partner`,
-...) — keep the full evidence one click away in the ledger rather than
+a dismissal shows its leading tag (`mandatory-math`, `at-sol-floor`,
+`below-materiality`, `multi-consumer-pinned`, `graph-disabled`,
+`no-independent-partner`, ...) — keep the full evidence one click away in the ledger rather than
 inflating the table. One item id may legitimately appear in two cells of
 one row (an alternative realization) or in the same cell of two rows (a
 fusion/overlap item covering the pair) — resolve it to the same outcome
 in each and never count its gain twice. Close with the coverage
-accountability sentence: every enumerated kernel had all three questions
+accountability sentence: every enumerated kernel had all four questions
 answered; itemize the rows whose item was still `pending` when the
 budget ran out — the untried tail a follow-up campaign starts from —
 and mirror those into Remaining Roadmap / Durable facts (`[alive]`).>

@@ -2,23 +2,30 @@
 
 The ledger is the machine-readable exhaustiveness proof behind
 ``profile.kernel_coverage``: one row per kernel (or grouped kernel
-family) at/above the task's share bar, each row answering the three
-per-kernel questions — *(1) can it be made faster?*, *(2) can it be
-fused with its neighbors?* and *(3) can it be overlapped with
-independent work on another stream?* — with either a roadmap item or an
-evidence-backed dismissal. The analyzer writes one ledger per round into
-that round's ``analysis/`` directory; the orchestrator validates it the
-moment the turn ends (shape here, roadmap cross-references and the
-coverage target in :func:`cross_validate`), so a campaign can never
-conclude with a hot kernel whose optimization, fusion, or overlap
-possibility was silently skipped.
+family) at/above the task's share bar, each row answering the four
+per-kernel questions — *(1) can it be eliminated?*, *(2) can it be made
+faster?*, *(3) can it be fused with its neighbors?* and *(4) can it be
+overlapped with independent work on another stream?* — with either a
+roadmap item or an evidence-backed dismissal. The analyzer writes one
+ledger per round into that round's ``analysis/`` directory; the
+orchestrator validates it the moment the turn ends (shape here, roadmap
+cross-references and the coverage target in :func:`cross_validate`), so
+a campaign can never conclude with a hot kernel whose elimination,
+optimization, fusion, or overlap possibility was silently skipped.
 
-Question 3 exists because the first two both presuppose the kernel must
-run *alone*: a kernel already at its bound-class ceiling (``faster`` →
-``at-sol-floor``) whose neighbors move only mandatory bytes (``fusion``
-→ ``neighbors-at-bandwidth-floor``) is legitimately closed on both and
-can still give back most of its share by running concurrently with
-independent work.
+The four are ordered by how much they presuppose, each asking less than
+the last:
+
+- *elimination* presupposes only that the kernel currently runs. It is
+  first because a `yes` moots the other three and recovers the row's
+  **whole** share rather than a fraction of it.
+- *faster* and *fusion* presuppose the work is necessary **and** that
+  the kernel must run alone.
+- *overlap* drops the alone assumption: a kernel at its bound-class
+  ceiling (``faster`` → ``at-sol-floor``) whose neighbors move only
+  mandatory bytes (``fusion`` → ``neighbors-at-bandwidth-floor``) is
+  legitimately closed on both and can still give back most of its share
+  by running concurrently with independent work.
 
 ``share_pct`` is read from the nsys **timeline decomposition** under
 ``analysis/nsys_analysis/``, not from ``nsys_stats.txt``: ``kern_sum``
@@ -31,7 +38,7 @@ could not run, ``kern_sum`` is the honest fallback — say so in
 
 Shape::
 
-    version: 2
+    version: 3
     source: rounds/round_1/analysis/nsys_analysis   # the decomposition enumerated
     coverage:
       enumerated_share_pct: 96.8    # sum of kernels[].share_pct
@@ -51,14 +58,18 @@ Shape::
           occupancy_pct: null               # a metric the capture did not yield
           bound: memory                     # compute | memory | latency | balanced | comm
           note: "occupancy section empty: replay stalled"   # required by the null
-        faster:                             # question 1 — make this kernel faster
+        elimination:                        # question 1 — should it run at all?
+          disposition: dismissed            # item | dismissed
+          why_it_runs: "state update read by the next layer's gate (NVTX + source)"
+          ref: "mandatory-math: per-step recurrence, no padded/invariant part"
+        faster:                             # question 2 — make this kernel faster
           disposition: item                 # item | dismissed
           ref: opt-003                      # item id, or the dismissal evidence
-        fusion:                             # question 2 — fuse with neighbors
+        fusion:                             # question 3 — fuse with neighbors
           disposition: dismissed
           neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace step 120)"
           ref: "multi-consumer-pinned: intermediate feeds residual + norm (cuda_gpu_trace)"
-        overlap:                            # question 3 — run concurrently with
+        overlap:                            # question 4 — run concurrently with
           disposition: item                 # independent work on an aux stream
           concurrent_with: "moe_gemm (data-independent; serialized on stream 7,
             cuda_gpu_trace step 120)"
@@ -68,6 +79,10 @@ Shape::
         share_pct: 9.2
         ncu: "unavailable: collective — kernel replay deadlocks the ranks"
         bound: comm                         # with the string form, `bound` sits here
+        elimination:
+          disposition: dismissed
+          why_it_runs: "TP-sharded partials summed for the next layer's norm (source)"
+          ref: "mandatory-math: the parallelism, not the kernel, requires the sum"
         faster:
           disposition: dismissed
           ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
@@ -95,19 +110,24 @@ from typing import Any, Mapping
 
 import yaml
 
-LEDGER_VERSION = 2
+LEDGER_VERSION = 3
 LEDGER_FILENAME = "kernel_ledger.yaml"
 
 DISPOSITIONS = ("item", "dismissed")
 
 # The per-kernel questions every row must answer. Order is the order they
 # are posed in the analyzer prompt and rendered in the report.
-QUESTIONS = ("faster", "fusion", "overlap")
+QUESTIONS = ("elimination", "faster", "fusion", "overlap")
 
 # Questions whose verdict rests on an observed relationship to other work:
 # question -> (field name, what the field must carry). Recorded so a
 # fusion/overlap verdict cites the trace rather than a guess.
 _EVIDENCE_FIELD = {
+    "elimination": (
+        "why_it_runs",
+        "what consumes this kernel's output, or the guard/selector that chose "
+        "this path — what an elimination verdict rests on",
+    ),
     "fusion": ("neighbors", "the observed adjacency a fusion verdict rests on"),
     "overlap": (
         "concurrent_with",
@@ -270,7 +290,7 @@ def _validate_disposition(
     if not isinstance(block, dict):
         errors.append(
             f"'{where}.{question}' must be a mapping with 'disposition' and "
-            f"'ref' — every kernel row answers all three questions "
+            f"'ref' — every kernel row answers all four questions "
             f"{list(QUESTIONS)}; got {block!r}"
         )
         return
