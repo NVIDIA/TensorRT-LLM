@@ -26,76 +26,28 @@ The inputs to `SimpleScheduler` include `active_requests` and `inflight_request_
 To customize the scheduler or batching mechanism, implement your own `CapacityScheduler` and `MicroBatchScheduler` by inheriting their respective classes.
 If two-step scheduling is unnecessary, inherit `RequestScheduler` and implement `schedule_request` directly.
 
-An example of a `CapacityScheduler` implementation is the `GuaranteedNoEvictScheduler` class, found in [scheduler.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/scheduler.py).
-This class was used before the C++ binding of `CapacityScheduler` and initially employed a Python-based scheduler.
-It inherits `CapacityScheduler` and implements its own `schedule_request` method.
-This method processes all `active_requests` and tries to schedule more requests that can fit in the KV cache.
-Resource estimation should align with resource allocation and deallocation in `kv_cache_manager`.
-
-Here is the code snippet:
-
-```python
-class GuaranteedNoEvictScheduler(CapacityScheduler):
-    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
-    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
-    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
-
-    def __init__(self, max_num_requests: int, kv_cache_manager):
-        super(GuaranteedNoEvictScheduler, self).__init__()
-        self.max_num_requests = max_num_requests
-        self.kv_cache_manager = kv_cache_manager
-
-    def schedule_request(
-        self, active_requests: RequestList
-    ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        scheduled_requests = []
-        pending_requests = []
-        reserved_blocks = 0
-        max_blocks = self.kv_cache_manager.get_max_resource_count()
-        for request in active_requests:
-            req_state = request.state
-            # if request cannot be scheduled yet or request should no longer be scheduled, skip
-            if req_state.value < self.no_schedule_until_state.value or req_state.value >= self.no_schedule_after_state.value:
-                continue
-
-            if len(scheduled_requests
-                   ) >= self.max_num_requests or reserved_blocks >= max_blocks:
-                break
-            elif req_state == LlmRequestState.GENERATION_IN_PROGRESS or req_state == LlmRequestState.GENERATION_TO_COMPLETE:
-                scheduled_requests.append(request)
-                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(
-                    request)
-            else:
-                pending_requests.append(request)
-
-        available_blocks = max_blocks - reserved_blocks
-        for request in pending_requests:
-            req_state = request.state
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-            elif req_state == LlmRequestState.CONTEXT_INIT:
-                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(
-                    request)
-                if needed_blocks <= available_blocks:
-                    scheduled_requests.append(request)
-                    available_blocks -= needed_blocks
-                elif needed_blocks > available_blocks:
-                    # If one requests fails to be scheduled, break
-                    break
-
-        assert len(scheduled_requests) > 0, (
-            "no pending request can get enough resource to complete, "
-            "please increase KV cache pool size.")
-        return scheduled_requests, []
-```
+The live `CapacityScheduler` implementation is `BindCapacityScheduler` in [scheduler/scheduler.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/scheduler/scheduler.py).
+It wraps the C++ capacity scheduler and selects a policy such as `CapacitySchedulerPolicy.GUARANTEED_NO_EVICT`.
+The Python-side policy helper is `GuaranteedNoEvictPolicy` in the same module (used by `PyCapacityScheduler`); there is no longer a `GuaranteedNoEvictScheduler` `CapacityScheduler` subclass.
+When implementing a custom scheduler, resource estimation should align with resource allocation and deallocation in `kv_cache_manager`.
 
 After implementing your own scheduler, integrate it into the PyExecutor.
-For the PyTorch backend, the code is in [py_executor_creator.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py).
-In the `create_py_executor` function, there are two lines creating `CapacityScheduler`:
+For the PyTorch backend, construction lives in `create_py_executor_instance` in [_util.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/_util.py):
 
 ```python
-    capacity_scheduler = BindCapacityScheduler(max_num_requests,
-                                               kv_cache_manager.impl)
+    capacity_scheduler = BindCapacityScheduler(
+        scheduler_capacity,
+        kv_cache_manager.impl if kv_cache_manager is not None else None,
+        peft_cache_manager.impl if peft_cache_manager is not None else None,
+        scheduler_config.capacity_scheduler_policy,
+        ...
+    )
+    mb_scheduler = BindMicroBatchScheduler(
+        max_batch_size,
+        max_num_tokens,
+        ctx_chunk_config,
+        no_schedule_until_state=no_schedule_until_state,
+    )
 ```
 
 Similar adjustments can be made for `MicroBatchScheduler`. This allows the `PyExecutor` to execute with your customized scheduling logic.
