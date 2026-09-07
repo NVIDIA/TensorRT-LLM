@@ -444,8 +444,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         raise ValueError(
                             f"{name} and its derived constants must be representable as Float16"
                         )
-            if vectorized_f32:
-                raise ValueError("SiTU currently supports only non-vectorized compute")
+            if vectorized_f32 and self.swiglu_compute_dtype != cutlass.Float32:
+                raise ValueError("SiTU vectorized compute requires Float32")
         self.epilogue_compute_dtype = self.swiglu_compute_dtype if self.is_gated else self.acc_dtype
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -1438,7 +1438,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         griddepcontrol_wait()
 
-        if cutlass.const_expr(self.is_gated and self.swiglu_compute_dtype != cutlass.Float32):
+        if cutlass.const_expr(
+            self.is_gated
+            and (
+                self.swiglu_compute_dtype != cutlass.Float32
+                or (self.activation_type == ActivationType.SiTu and self.vectorized_f32)
+            )
+        ):
             if warp_idx <= self.epilog_warp_id[-1]:
                 cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
             else:
@@ -2848,12 +2854,85 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         alpha_val,
         tCompute: cute.Tensor,
     ):
-        """Apply scalar FP32 or FP16 SiTU to interleaved accumulators.
+        """Apply packed/scalar FP32 or scalar FP16 SiTU to accumulators.
 
         ``softcap(x, beta) = beta * tanh(x / beta)`` and
         ``tanh(z) = 2 * sigmoid(2 * z) - 1``.
         """
-        if cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32):
+        if cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32 and self.vectorized_f32):
+            neg_log2e_pair = (
+                cutlass.Float32(-1.4426950408889634),
+                cutlass.Float32(-1.4426950408889634),
+            )
+            one_pair = (cutlass.Float32(1.0), cutlass.Float32(1.0))
+            inv_gate_softcap_pair = (
+                cutlass.Float32(2.0 / self.situ_beta),
+                cutlass.Float32(2.0 / self.situ_beta),
+            )
+            twice_gate_softcap_pair = (
+                cutlass.Float32(2.0 * self.situ_beta),
+                cutlass.Float32(2.0 * self.situ_beta),
+            )
+            neg_gate_softcap_pair = (
+                cutlass.Float32(-self.situ_beta),
+                cutlass.Float32(-self.situ_beta),
+            )
+            inv_linear_softcap_pair = (
+                cutlass.Float32(2.0 / self.situ_linear_beta),
+                cutlass.Float32(2.0 / self.situ_linear_beta),
+            )
+            twice_linear_softcap_pair = (
+                cutlass.Float32(2.0 * self.situ_linear_beta),
+                cutlass.Float32(2.0 * self.situ_linear_beta),
+            )
+            neg_linear_softcap_pair = (
+                cutlass.Float32(-self.situ_linear_beta),
+                cutlass.Float32(-self.situ_linear_beta),
+            )
+            alpha_pair = (
+                cutlass.Float32(alpha_val),
+                cutlass.Float32(alpha_val),
+            )
+
+            for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
+                gate_pair = cute.arch.mul_packed_f32x2(
+                    (acc_vec_gate[i], acc_vec_gate[i + 1]), alpha_pair
+                )
+
+                def sigmoid_pair(value_pair):
+                    neg_log2e = cute.arch.mul_packed_f32x2(value_pair, neg_log2e_pair)
+                    exp_pair = (
+                        cute.math.exp2(neg_log2e[0], fastmath=True),
+                        cute.math.exp2(neg_log2e[1], fastmath=True),
+                    )
+                    denominator = cute.arch.add_packed_f32x2(exp_pair, one_pair)
+                    return (
+                        cute.arch.rcp_approx(denominator[0]),
+                        cute.arch.rcp_approx(denominator[1]),
+                    )
+
+                gate_softcap_sigmoid = sigmoid_pair(
+                    cute.arch.mul_packed_f32x2(gate_pair, inv_gate_softcap_pair)
+                )
+                softcapped_gate = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(gate_softcap_sigmoid, twice_gate_softcap_pair),
+                    neg_gate_softcap_pair,
+                )
+                gate_sigmoid = sigmoid_pair(gate_pair)
+                situ_gate = cute.arch.mul_packed_f32x2(softcapped_gate, gate_sigmoid)
+                up_pair = cute.arch.mul_packed_f32x2((acc_vec_up[i], acc_vec_up[i + 1]), alpha_pair)
+                up_softcap_sigmoid = sigmoid_pair(
+                    cute.arch.mul_packed_f32x2(up_pair, inv_linear_softcap_pair)
+                )
+                softcapped_up = cute.arch.add_packed_f32x2(
+                    cute.arch.mul_packed_f32x2(up_softcap_sigmoid, twice_linear_softcap_pair),
+                    neg_linear_softcap_pair,
+                )
+                (
+                    tCompute[i],
+                    tCompute[i + 1],
+                ) = cute.arch.mul_packed_f32x2(situ_gate, softcapped_up)
+        elif cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32):
             inv_gate_softcap = cutlass.Float32(2.0 / self.situ_beta)
             twice_gate_softcap = cutlass.Float32(2.0 * self.situ_beta)
             gate_softcap = cutlass.Float32(self.situ_beta)

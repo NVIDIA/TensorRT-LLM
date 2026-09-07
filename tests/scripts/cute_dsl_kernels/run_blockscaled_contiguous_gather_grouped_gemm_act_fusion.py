@@ -652,11 +652,14 @@ def run(
     )
 
     # Configure gemm kernel
+    vectorized_f32 = (
+        activation_type != ActivationType.SiTu or swiglu_compute_dtype == cutlass.Float32
+    )
     gemm = BlockScaledContiguousGatherGroupedGemmKernel(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
-        activation_type != ActivationType.SiTu,
+        vectorized_f32,
         topk=1,
         raster_along_m=raster_along_m,
         activation_type=activation_type,
