@@ -159,6 +159,7 @@ def test_qsa_empty_batch_keeps_the_regular_backend_path() -> None:
         relative_attention_bias=None,
         relative_attention_max_distance=0,
         has_lora=False,
+        output_gate=None,
     )
 
     assert output is None
