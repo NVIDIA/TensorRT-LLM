@@ -234,26 +234,28 @@ For calibration, configuration parameters, and current requirements, see the
 ## Support
 
 The two methods share the compression framework but support different cache
-structures. Platform and method requirements are noted below.[^support-requirements]
+structures. Both share the same general platform requirements.[^general-requirements]
 
-| Cache structure | NVFP4 cold-page quantization | TriAttention |
+| Cache structure | NVFP4 cold-page quantization[^cold-page-requirements] | TriAttention[^triattention-requirements] |
 | --- | --- | --- |
-| MHA Attention KV | Supported | Not supported |
-| MQA Attention KV | Supported | Not supported |
-| GQA Attention KV | Supported | Restricted; see the TriAttention example |
+| MHA Attention KV | Supported | Supported |
+| MQA Attention KV | Supported | Supported |
+| GQA Attention KV | Supported | Supported |
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
 | DeepSeek-V4 specialized sparse cache | Not supported | Not supported |
 
-[^support-requirements]: Both methods currently require the PyTorch backend,
-    KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103. NVFP4
-    cold-page quantization additionally requires the native C++ KVCM V2 backend
-    and a nonzero Host or Disk cache. TriAttention requires a model-specific
-    offline calibration file and currently supports only BF16 GQA pools with
-    group size 4 or 8 and the score geometry listed in its detailed example.
-    See each method's example for its remaining requirements and validated
-    modes.
+[^general-requirements]: Both methods currently require the PyTorch backend,
+    KVCM V2, and an NVIDIA GPU with compute capability SM100 or SM103.
+[^cold-page-requirements]: NVFP4 cold-page quantization additionally requires
+    the native C++ KVCM V2 backend and a nonzero Host or Disk cache. See the
+    [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md)
+    for its remaining requirements and validated modes.
+[^triattention-requirements]: TriAttention requires a model-specific offline
+    calibration file. See the
+    [detailed TriAttention example](source:examples/kv_cache_compression/triattention.md)
+    for its remaining requirements and validated modes.
 
 ### Tested Models
 
@@ -264,10 +266,15 @@ NVFP4 cold-page quantization has been tested with the following model families:
 - GLM family, including GLM-5.2
 - DeepSeek-R1 family
 
-TriAttention has been tested with Qwen3-8B. These are tested-model lists, not
-exhaustive support lists. Other models that use a supported KV-cache structure
-are expected to work; consult the method example for method-specific
-restrictions.
+TriAttention has been tested with the following model families:
+
+- Qwen3 family
+- GPT-OSS family
+- Llama 3 family
+
+These are tested-model lists, not exhaustive support lists. Other models that
+use a supported KV-cache structure are expected to work; consult the method
+examples for method-specific requirements.
 
 ## Further Reading
 
