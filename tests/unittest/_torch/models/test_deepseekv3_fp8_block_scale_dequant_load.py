@@ -24,11 +24,15 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import (
     weight_dequant,
 )
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
 
-def _fp8_block_scaled(out_features: int, in_features: int, block: int = 128):
+def _fp8_block_scaled(
+    out_features: int, in_features: int, block: int = 128
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a random FP8 weight with a 128x128 block scale like the DeepSeek
     recipe (``weight_scale_inv`` is a multiplier)."""
     torch.manual_seed(0)
@@ -47,7 +51,7 @@ def _fp8_block_scaled(out_features: int, in_features: int, block: int = 128):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_unquantized_linear_gets_dequantized_weight(dtype):
+def test_unquantized_linear_gets_dequantized_weight(dtype: torch.dtype) -> None:
     out_features, in_features = 128, 512
     codes, scale, reference = _fp8_block_scaled(out_features, in_features)
 
@@ -77,7 +81,7 @@ def test_unquantized_linear_gets_dequantized_weight(dtype):
     assert not torch.allclose(loaded, codes.float(), rtol=0.1, atol=0.1)
 
 
-def test_quantized_or_scaleless_weights_are_untouched():
+def test_quantized_or_scaleless_weights_are_untouched() -> None:
     linear = Linear(
         512,
         128,
@@ -100,3 +104,23 @@ def test_quantized_or_scaleless_weights_are_untouched():
         "weight_scale_inv": torch.ones(1, 4),
     }
     assert maybe_dequantize_fp8_block_scaled_weight(not_a_linear, weights) is weights
+
+
+def test_quantized_linear_keeps_fp8_block_scaled_weights() -> None:
+    """Quantized Linear must receive the original FP8 codes and scale mapping."""
+    linear = Linear(
+        512,
+        128,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128),
+        skip_create_weights_in_init=True,
+    )
+    linear.create_weights()
+    assert linear.has_any_quant
+    codes, scale, _ = _fp8_block_scaled(128, 512)
+    weights = {"weight": codes, "weight_scale_inv": scale}
+    prepared = maybe_dequantize_fp8_block_scaled_weight(linear, weights)
+    assert prepared is weights
+    assert prepared["weight"] is codes
+    assert prepared["weight_scale_inv"] is scale
