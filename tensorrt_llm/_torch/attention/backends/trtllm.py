@@ -140,6 +140,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_decoding_enabled: bool = False
     # use_spec_decoding determines if the attention layer should be run in spec-dec mode at the specific step / layer.
     use_spec_decoding: bool = False
+    # Per-step logical draft length for a dynamic-draft speculative band.
+    # -1 means "unset / not applicable" (non-speculative step); 0 marks the
+    # draft-0 band (the schedule disables speculation for this batch size).
+    # In that band no draft/tree sub-steps advance kv_lens_cuda past the host
+    # snapshot, so prepare() may cap block-offset staging like the
+    # non-speculative path (plus a one-token + reserved-draft margin).
+    spec_dec_runtime_draft_len: int = -1
 
     # if spec-dec tree is a tree or a chain (linear tree)
     is_spec_dec_tree: bool = False
@@ -794,6 +801,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             if not spec_active and self.kv_cache_manager.tokens_per_block:
                 max_blocks = ceil_div(max_kv_len,
                                       self.kv_cache_manager.tokens_per_block)
+            elif (spec_active and self.spec_dec_runtime_draft_len == 0
+                  and self.max_total_draft_tokens is not None
+                  and self.kv_cache_manager.tokens_per_block):
+                # Draft-0 speculative band: speculation is disabled for this
+                # batch size, so no draft/tree sub-steps advance kv_lens_cuda
+                # past the host snapshot. The staged width can then be capped
+                # like the non-speculative path, with a margin covering the one
+                # base token appended this step plus the reserved draft columns.
+                max_blocks = ceil_div(
+                    max_kv_len + 1 + self.max_total_draft_tokens,
+                    self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets,
                 self.request_ids,

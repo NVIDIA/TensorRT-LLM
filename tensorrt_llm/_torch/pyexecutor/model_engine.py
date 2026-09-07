@@ -6396,6 +6396,12 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
+        # Propagate the per-step logical draft length so prepare() can cap
+        # block-offset staging in the draft-0 speculative band (no draft
+        # sub-steps advance kv_lens past the host snapshot there). -1 signals
+        # that speculation is inactive this step.
+        attn_metadata.spec_dec_runtime_draft_len = (
+            self.runtime_draft_len if self.enable_spec_decode else -1)
         attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
