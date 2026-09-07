@@ -180,6 +180,10 @@ def dsa_fused_indexer_topk_decode(
     dereferenced). K = indices.shape[1]; values receive the fp16-rounded
     selected scores.
     """
+    assert q_fp4.shape[1] == 1, (
+        f"dsa_fused_indexer_topk_decode: one query per sequence only (got {q_fp4.shape[1]}); "
+        "MTP drafts (next_n > 1) take the unfused path."
+    )
     n_comp = block_table.shape[1] * 32
     assert n_comp % 128 == 0 and _FUSED_TOPK_NCOMP_MIN <= n_comp <= _FUSED_TOPK_NCOMP_MAX, (
         f"dsa_fused_indexer_topk_decode: block_table width {n_comp} tokens "
