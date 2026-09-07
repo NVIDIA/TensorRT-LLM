@@ -74,7 +74,7 @@ CachedCudaEvent CachedCudaEvent::makeNull() noexcept
 
 CachedCudaEvent::CachedCudaEvent(CudaStream stream) noexcept
 {
-    KVCM2_ABORT_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [&]()
         {
             mEvent = std::make_shared<PooledEvent>(CudaEventPool::instance().get());

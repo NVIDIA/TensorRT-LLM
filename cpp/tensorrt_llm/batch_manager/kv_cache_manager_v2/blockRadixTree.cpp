@@ -366,7 +366,7 @@ void Block::releasePages()
 
 Block::~Block()
 {
-    KVCM2_ABORT_ON_EXCEPT([this]() { releasePages(); });
+    KVCM2_POISON_ON_EXCEPT([this]() { releasePages(); });
 }
 
 bool Block::isOrphan() const noexcept
@@ -687,7 +687,7 @@ BlockRadixTree::~BlockRadixTree()
 {
     // Detach blocks leaf-first in O(1) extra space. Dropping mRoots directly would instead
     // destroy each chain recursively, one frame per block.
-    KVCM2_LOG_ON_EXCEPT([this]() { clear(); });
+    KVCM2_POISON_ON_EXCEPT([this]() { clear(); });
 }
 
 LifeCycleId BlockRadixTree::numLifeCycles() const noexcept

@@ -111,7 +111,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
 KvCache::~KvCache()
 {
-    KVCM2_ABORT_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
             // close() takes the exclusive API lock. When Python drops the last reference nanobind
@@ -1898,7 +1898,7 @@ PlannedDropHandle::~PlannedDropHandle()
     if (mPageRefs.has_value())
     {
         // Mirror Python's __del__: apply the plan if not already dropped.
-        KVCM2_ABORT_ON_EXCEPT(
+        KVCM2_POISON_ON_EXCEPT(
             [this]()
             {
                 // drop() takes the exclusive API lock. The explicit drop() binding releases the

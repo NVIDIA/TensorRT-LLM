@@ -458,7 +458,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
 StorageManager::~StorageManager()
 {
-    KVCM2_ABORT_ON_EXCEPT([this]() { destroy(); });
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void StorageManager::destroy()

@@ -157,7 +157,7 @@ StagingBufferManager::StagingBufferManager(size_t size, StagingBufferMemory memo
 
 StagingBufferManager::~StagingBufferManager() noexcept
 {
-    KVCM2_LOG_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [&]
         {
             for (auto& range : mRanges)
