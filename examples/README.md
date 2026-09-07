@@ -61,19 +61,13 @@ points as the default PyTorch backend.
 See [`auto_deploy/`](auto_deploy/) for development examples, Jupyter cookbooks,
 and a registry of 90+ validated models.
 
-## Legacy Engine-Build Workflow
+## Model-Specific Guides
 
-> **⚠️ Legacy:** The `convert_checkpoint.py` → `trtllm-build` → `run.py`
-> workflow is legacy and may not receive new features.
-> For new projects, use `trtllm-serve` or the LLM API as shown above.
+The [`models/`](models/) directory contains model-specific guides for serving
+Hugging Face checkpoints with `trtllm-serve` or the LLM API.
 
-The [`models/`](models/) directory contains per-model scripts for the legacy
-TensorRT engine-build workflow. These scripts convert Hugging Face checkpoints
-to TensorRT engines for deployment. While still functional for supported models,
-this workflow is no longer the recommended path and may not support newly added
-models.
-
-If you are following a tutorial or guide that references `convert_checkpoint.py`
-or `trtllm-build`, please refer to the
-[Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-for the current recommended workflow.
+The legacy `convert_checkpoint.py` → `trtllm-build` → `run.py` TensorRT engine
+workflow has been removed. See the
+[TensorRT backend removal guide](https://nvidia.github.io/TensorRT-LLM/legacy/tensorrt-backend-removal.html)
+and the [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+for the current recommended path.
