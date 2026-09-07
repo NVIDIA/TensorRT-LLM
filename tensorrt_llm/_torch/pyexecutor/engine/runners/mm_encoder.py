@@ -11,13 +11,13 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from tensorrt_llm._torch.pyexecutor.llm_request import get_multimodal_embedding_lengths
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 
-from ...llm_request import get_multimodal_embedding_lengths
-from ...resource_manager import ResourceManager
-from ...scheduler import ScheduledRequests
 from .interface import PreparedInputs, RunnerDeps
 from .no_cache import prepare_no_cache_inputs
 

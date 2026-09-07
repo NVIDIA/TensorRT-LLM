@@ -12,12 +12,12 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
-from ...resource_manager import ResourceManager
-from ...scheduler import ScheduledRequests
 from ..lora import LoraParamBuilder
 
 

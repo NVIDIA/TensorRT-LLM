@@ -14,6 +14,8 @@ from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetad
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import prefer_pinned
@@ -21,8 +23,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
-from ...resource_manager import ResourceManager
-from ...scheduler import ScheduledRequests
 from ..lora import LoraParamBuilder
 from .common import (
     apply_position_id_offset,
