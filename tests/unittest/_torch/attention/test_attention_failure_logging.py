@@ -23,10 +23,15 @@ reader needs.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends import interface
-from tensorrt_llm._torch.attention.backends.interface import log_attention_failure_context
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    PredefinedAttentionMask,
+    log_attention_failure_context,
+)
 
 
 class _CapturingLogger:
@@ -118,3 +123,152 @@ def test_reraise_preserves_the_original_exception() -> None:
         assert caught is original
     else:
         raise AssertionError("the exception must propagate")
+
+
+def _spy_on_failure_context(monkeypatch, module):
+    """Replace the backend module's `log_attention_failure_context` with a spy
+    that records its positional args and still calls the real (resilient)
+    implementation, so a test can prove the wrapper reached it."""
+    calls: list[tuple] = []
+    real = module.log_attention_failure_context
+
+    def spy(*args) -> None:
+        calls.append(args)
+        real(*args)
+
+    monkeypatch.setattr(module, "log_attention_failure_context", spy)
+    return calls
+
+
+def test_trtllm_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
+    """The real `TrtllmAttention.forward` wrapper must log the failure context
+    and re-raise the *same* RuntimeError instance when the FMHA kernel throws.
+
+    CPU-only: the FMHA selection/launch is mocked, so no GPU kernel runs."""
+    from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
+    from tensorrt_llm._torch.attention.backends.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
+
+    calls = _spy_on_failure_context(monkeypatch, trtllm_backend)
+    # `prepare_sparse_runtime_params` touches sparse scheduler state we don't
+    # build here; the wrapper under test is downstream of it.
+    monkeypatch.setattr(trtllm_backend, "prepare_sparse_runtime_params", lambda *a, **k: None)
+
+    num_heads, num_kv_heads, head_dim = 2, 2, 8
+    qkv_hidden = (num_heads + 2 * num_kv_heads) * head_dim
+    num_tokens, batch = 3, 3
+
+    original = RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    class _ThrowingFmha:
+        def forward(self, *args, **kwargs):
+            raise original
+
+    backend = TrtllmAttention.__new__(TrtllmAttention)
+    backend.sparse_params = None
+    backend.is_mla_enable = False
+    backend.num_heads = num_heads
+    backend.num_kv_heads = num_kv_heads
+    backend.head_dim = head_dim
+    backend.layer_idx = 5
+    backend.local_layer_idx = 0
+    backend.kv_scale_orig_quant = None
+    backend.kv_scale_quant_orig = None
+    backend.print_skip_softmax_stat = False
+    backend._fmha_manager = SimpleNamespace(select=lambda *a, **k: _ThrowingFmha())
+    # Skip rope-table growth; it dereferences rope_params we do not construct.
+    backend._ensure_rope_table_size = lambda *a, **k: None
+
+    seq_lens = torch.tensor([2047, 1, 1], dtype=torch.int32)
+    metadata = TrtllmAttentionMetadata.__new__(TrtllmAttentionMetadata)
+    # `is_cross` is `seq_lens is not seq_lens_kv`; share the object to stay self.
+    metadata.seq_lens = seq_lens
+    metadata.seq_lens_kv = seq_lens
+    metadata.kv_lens_runtime = torch.tensor([2047, 2048, 5], dtype=torch.int32)
+    metadata.kv_lens_cuda_runtime = torch.tensor([2047, 2048, 5], dtype=torch.int32)
+    metadata.prompt_lens_cuda_runtime = torch.zeros(batch, dtype=torch.int32)
+    metadata.prompt_lens_cpu_runtime = torch.zeros(batch, dtype=torch.int32)
+    metadata.host_request_types_runtime = torch.zeros(batch, dtype=torch.int32)
+    metadata.request_ids = [11, 12, 13]
+    metadata.num_contexts = 2
+    metadata.num_generations = 1
+    metadata.num_tokens = num_tokens
+    metadata.kv_cache_block_offsets = torch.zeros((1, 3, 2, 8), dtype=torch.int32)
+    metadata.workspace = torch.zeros(1024, dtype=torch.int8)
+    metadata.cu_q_seqlens = torch.zeros(batch + 1, dtype=torch.int32)
+    metadata.cu_kv_seqlens = torch.zeros(batch + 1, dtype=torch.int32)
+    metadata.enable_flash_mla = False
+    metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
+    metadata.spec_decoding_bl_tree_mask = None
+    metadata.max_context_q_len_override = None
+    metadata.kv_cache_manager = SimpleNamespace(
+        max_attention_window_vec=[2048, None],
+        tokens_per_block=64,
+        max_seq_len=4096,
+    )
+
+    q = torch.zeros(num_tokens, qkv_hidden)
+    forward_args = AttentionForwardArgs(
+        output=torch.zeros(num_tokens, num_heads * head_dim),
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        TrtllmAttention.forward(backend, q, None, None, metadata, forward_args)
+
+    # The wrapper must not wrap or replace the kernel's exception.
+    assert excinfo.value is original
+    assert len(calls) == 1
+    backend_name, layer_idx, logged_metadata, window, exc = calls[0]
+    assert backend_name == "TrtllmAttention"
+    assert layer_idx == 5
+    # Window defaults from the KV cache manager's per-layer vector (exclusive).
+    assert window == 2048
+    assert logged_metadata is metadata
+    assert exc is original
+
+
+def test_flashinfer_forward_logs_and_reraises_kernel_failure(monkeypatch) -> None:
+    """The real `FlashInferAttention.forward` wrapper must log the failure
+    context and re-raise the *same* RuntimeError when the kernel call throws.
+
+    CPU-only: `forward_impl` (the kernel launch) is mocked to raise."""
+    from tensorrt_llm._torch.attention.backends import flashinfer as flashinfer_backend
+    from tensorrt_llm._torch.attention.backends.flashinfer import FlashInferAttention
+
+    calls = _spy_on_failure_context(monkeypatch, flashinfer_backend)
+
+    original = RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    backend = FlashInferAttention.__new__(FlashInferAttention)
+    backend.is_mla_enable = False
+    backend.layer_idx = 7
+
+    def _throwing_forward_impl(**kwargs):
+        raise original
+
+    backend.forward_impl = _throwing_forward_impl
+
+    metadata = _fake_metadata()
+    q = torch.zeros(4, 16)
+    forward_args = AttentionForwardArgs(
+        output=torch.zeros(4, 16),
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_window_size=2048,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        FlashInferAttention.forward(backend, q, None, None, metadata, forward_args)
+
+    assert excinfo.value is original
+    assert len(calls) == 1
+    backend_name, layer_idx, logged_metadata, window, exc = calls[0]
+    assert backend_name == "FlashInferAttention"
+    assert layer_idx == 7
+    # The wrapper logs the TRTLLM-convention (exclusive) window, not the
+    # decremented FlashInfer one.
+    assert window == 2048
+    assert logged_metadata is metadata
+    assert exc is original
