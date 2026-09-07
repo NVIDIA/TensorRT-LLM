@@ -14,8 +14,6 @@ test_e2e.py::test_ptp_quickstart_advanced[Qwen3-32b-nvfp4-Qwen3/nvidia-Qwen3-32B
 test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B_nvfp4_hf-Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
-test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
 
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4

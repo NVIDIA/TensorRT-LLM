@@ -1005,7 +1005,8 @@ if __name__ == "__main__":
     operations = []
     operations += generate_sm120_operations(has_arch(120) or has_arch(121))
     operations += generate_sm103_operations(has_arch(103))
-    operations += generate_sm100_operations(has_arch(100) or has_arch(103))
+    operations += generate_sm100_operations(
+        any(has_arch(sm) for sm in range(100, 110)))
     operations += generate_sm90_operations(has_arch(90))
     operations += generate_sm80_operations(has_arch(80) or has_arch(89))
 

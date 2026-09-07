@@ -193,6 +193,15 @@ commands:
         is_flag: true
         flags:
         - "--grpc"
+      grpc_protocol:
+        type: Choice(['openengine', 'smg'])
+        default: smg
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--grpc-protocol"
       host:
         type: str
         default: localhost
@@ -568,6 +577,16 @@ commands:
         flags:
         - "--server_start_timeout"
         - "-t"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
   disaggregated_mpi_worker:
     options:
       config_file:
@@ -590,6 +609,16 @@ commands:
         is_flag: false
         flags:
         - "--log_level"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
   mm_embedding_serve:
     options:
       allow_request_chat_template:

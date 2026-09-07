@@ -149,6 +149,87 @@ def test_fused_qkv_prep_parity_bf16_and_strided():
         )
 
 
+@pytest.mark.parametrize(
+    "nq,nk,hd,rotary_frac,theta",
+    [
+        (32, 16, 256, 1.0, 10000.0),
+        (32, 4, 512, 0.25, 1000000.0),
+    ],
+)
+@pytest.mark.parametrize("n_tokens", [0, 1, 65])
+def test_fused_qkv_prep_packed_bf16(nq, nk, hd, rotary_frac, theta, n_tokens):
+    """Packed BF16 mode matches separate output for real Gemma4 shapes."""
+    torch.manual_seed(11)
+    max_pos = 2048
+    width = (nq + 2 * nk) * hd
+    buf = torch.randn((n_tokens, width + 256), dtype=torch.bfloat16, device="cuda")
+    qkv = buf[:, :width]
+    position_ids = torch.randint(0, max_pos, (n_tokens,), dtype=torch.int32, device="cuda")
+    cos_sin = _make_cos_sin(max_pos, hd, rotary_frac, theta)
+    q_w = torch.rand((hd,), dtype=torch.bfloat16, device="cuda") + 0.5
+    k_w = torch.rand((hd,), dtype=torch.bfloat16, device="cuda") + 0.5
+    eps = 1e-6
+
+    packed, k_out, v_out = gemma4_fused_qkv_norm_rope_quant(
+        qkv,
+        position_ids,
+        cos_sin,
+        q_w,
+        k_w,
+        eps,
+        nq,
+        nk,
+        hd,
+        out_fp8=False,
+        packed_output=True,
+    )
+
+    assert k_out is None and v_out is None
+    assert packed.shape == (n_tokens, width)
+    assert packed.dtype == torch.bfloat16
+    assert packed.is_contiguous()
+    if n_tokens == 0:
+        return
+
+    rq, rk, rv = _ref_chain(
+        qkv.contiguous(),
+        position_ids,
+        cos_sin,
+        q_w,
+        k_w,
+        eps,
+        nq,
+        nk,
+        hd,
+        out_fp8=False,
+    )
+    ref = torch.cat([rq, rk, rv], dim=-1)
+    assert torch.allclose(packed.float(), ref.float(), atol=0.02, rtol=0.02), (
+        f"packed QKV max diff {(packed.float() - ref.float()).abs().max()}"
+    )
+
+
+def test_fused_qkv_prep_rejects_packed_fp8():
+    qkv = torch.empty((0, 384), dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.empty(0, dtype=torch.int32, device="cuda")
+    cos_sin = torch.empty((1, 2, 64), dtype=torch.float32, device="cuda")
+    weight = torch.empty(128, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="packed_output requires BF16"):
+        gemma4_fused_qkv_norm_rope_quant(
+            qkv,
+            position_ids,
+            cos_sin,
+            weight,
+            weight,
+            1e-6,
+            1,
+            1,
+            128,
+            out_fp8=True,
+            packed_output=True,
+        )
+
+
 if __name__ == "__main__":
     test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 333)
     test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 6455)

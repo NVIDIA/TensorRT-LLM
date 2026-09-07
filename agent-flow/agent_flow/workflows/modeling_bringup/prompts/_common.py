@@ -104,10 +104,10 @@ DOMAIN_PRIMING = """\
   implementation reference. Verify whether cited TensorRT-LLM classes/functions are
   real definitions, wrappers, import aliases, or bindings before relying on them.
 - For attention work, read
-  `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` and reason across
+  `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` and reason across
   module, backend, runtime contract, and KV-cache semantics.
 - For MoE work, read
-  `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
+  `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` and reason
   across routing, expert parallelism, quantization, and fused-kernel contracts.
 - Use `KVCacheManagerV2` for new-model bring-up. The TRTLLM and FlashInfer
   attention backends are both valid targets when the plan tests the selected

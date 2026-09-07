@@ -407,22 +407,10 @@ server_with_custom_sampler = make_server_with_custom_sampler_fixture(
 
 
 @pytest.mark.asyncio(loop_scope='function')
-@pytest.mark.parametrize(
-    'server_with_custom_sampler',
-    [
-        {
-            'sampler_type': "TorchSampler"
-        },  # torch_sampler
-        {
-            'sampler_type': "TRTLLMSampler"
-        },  # trtllm_sampler
-    ],
-    indirect=True,
-    ids=['torch_sampler', 'trtllm_sampler'])
 async def test_completion_with_logit_bias_effect(
         server_with_custom_sampler: RemoteOpenAIServer,
         model_name: str) -> None:
-    '''Test that logit bias affects output as expected for both samplers (completions endpoint).'''
+    '''Test that logit bias affects output as expected (completions endpoint).'''
     client = server_with_custom_sampler.get_async_client()
     await logit_bias_effect_helper(client, model_name, 'completions')
 

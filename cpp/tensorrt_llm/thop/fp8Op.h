@@ -85,6 +85,8 @@ torch::Tensor symmetric_dequantize_weight(torch::Tensor weight, torch::Tensor sc
 torch::Tensor symmetric_dequantize_activation(torch::Tensor activation, torch::Tensor scales);
 torch::Tensor symmetric_dequantize_per_tensor(torch::Tensor input, torch::Tensor scales);
 
+std::tuple<torch::Tensor, torch::Tensor> vectorized_per_token_fp8_quant(torch::Tensor input);
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END

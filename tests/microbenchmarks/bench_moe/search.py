@@ -24,19 +24,23 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
     canonical_activation,
     canonical_quant,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, get_backend_class
-from .mapping import _PARALLEL_MODE_LAYOUTS, _resolve_mapping_layout
+from .mapping import (
+    _resolve_mapping_layout,
+    default_hybrid_parallel_modes,
+    parallel_mode_enable_attention_dp,
+)
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"})
@@ -117,15 +121,16 @@ def _comm_axis_for_parallel_mode(pmode: str, comm_methods: Tuple[Any, ...]) -> T
     """Collapse comm axis to AUTO for parallel modes without attention DP.
 
     Non-AUTO forced comm methods require enable_attention_dp=True (see
-    is_candidate_valid). TEP and TTP have enable_dp=False, so only AUTO
-    is ever valid for them. Generating forced-comm candidates for these
-    modes only produces prune rows — handle it at generation time instead.
-    CUSTOM mode is passed through unchanged (validated separately).
+    is_candidate_valid). TEP, TTP and the hybrid ``TTP<k>EP<m>`` names have
+    enable_dp=False, so only AUTO is ever valid for them. Generating
+    forced-comm candidates for these modes only produces prune rows — handle
+    it at generation time instead. CUSTOM mode is passed through unchanged
+    (validated separately).
     """
-    layout = _PARALLEL_MODE_LAYOUTS.get(str(pmode).upper())
-    if layout is None:
-        return comm_methods  # CUSTOM: unknown layout, keep as-is
-    if not layout["enable_attention_dp"]:
+    enable_dp = parallel_mode_enable_attention_dp(pmode)
+    if enable_dp is None:
+        return comm_methods  # CUSTOM: layout not known from the name, keep as-is
+    if not enable_dp:
         return ("AUTO",)
     return comm_methods
 
@@ -269,6 +274,25 @@ def is_candidate_valid(
                 f"intermediate_size/tp={per_tp_k} not aligned to NVFP4 weight "
                 f"alignment={_NVFP4_WEIGHT_ALIGNMENT} (CUTLASS pads to 128, "
                 f"CUTEDSL/TRTLLM do not)"
+            )
+
+    # FP8_BLOCK_SCALES: DeepSeekFP8BlockScalesFusedMoEMethod.load_weights asserts
+    # intermediate_size_per_partition % 128 == 0 on the VANILLA path bench_moe uses,
+    # so a misaligned shard kills the MPI step at weight load. Not backend-scoped:
+    # CUTLASS/DeepGemm/TRTLLM-Gen/CuteDSL share that method and none pads here.
+    # Example: DeepSeek-V3 (intermediate_size=2048) at moe_tp_size=32 -> 64, 64%128!=0.
+    if model.quant_algo_enum == QuantAlgo.FP8_BLOCK_SCALES and moe_tp > 1:
+        _FP8_QUANT_BLOCK_SIZE = 128
+        if model.intermediate_size % moe_tp != 0:
+            return False, (
+                f"FP8_BLOCK_SCALES: intermediate_size={model.intermediate_size} "
+                f"not divisible by moe_tp_size={moe_tp}"
+            )
+        per_tp_k = model.intermediate_size // moe_tp
+        if per_tp_k % _FP8_QUANT_BLOCK_SIZE != 0:
+            return False, (
+                f"FP8_BLOCK_SCALES moe_tp_size={moe_tp}: intermediate_size/tp="
+                f"{per_tp_k} not aligned to FP8 quant block size={_FP8_QUANT_BLOCK_SIZE}"
             )
 
     # Forced communication on non-DP / MoE-TP paths.
@@ -434,7 +458,18 @@ def _parse_search_axes(value: Any) -> Tuple[str, ...]:
     return tuple(out)
 
 
-_DEFAULT_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+_BASE_PARALLEL_AXIS_VALUES: Tuple[str, ...] = ("DEP", "TEP", "DTP", "TTP")
+
+
+def _default_parallel_axis_values(world_size: int) -> Tuple[str, ...]:
+    """Default ``--search parallel`` expansion for a world size.
+
+    The four presets plus the even-split hybrid grids, so a bare
+    ``--search parallel`` compares pure EP, pure MoE-TP and the balanced middle
+    instead of only the extremes. World sizes with no non-degenerate split
+    (``< 4``) keep the historical four-value expansion.
+    """
+    return _BASE_PARALLEL_AXIS_VALUES + default_hybrid_parallel_modes(world_size)
 
 
 def _axis_values_from_args(
@@ -505,7 +540,7 @@ def _resolve_search_from_args(args: argparse.Namespace, base_config: ConfigSpec)
             cli_dest="parallel_mode",
             cli_flag_name="--parallel_mode",
             config_key="parallel_mode",
-            full_set=_DEFAULT_PARALLEL_AXIS_VALUES,
+            full_set=_default_parallel_axis_values(int(getattr(args, "world_size", 1) or 1)),
         )
     if "comm" in enabled_axes:
         comm_methods = _axis_values_from_args(

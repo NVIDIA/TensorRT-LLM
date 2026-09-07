@@ -217,7 +217,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `request_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `return_perf_metrics` | `<class 'bool'>` | `value` |  |  |
 | `sampler_force_async_worker` | `<class 'bool'>` | `value` |  |  |
-| `sampler_type` | `Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]` | `categorical` | allowlist | `TRTLLMSampler`, `TorchSampler`, `auto` |
 | `scheduler_config.capacity_scheduler_policy` | `<enum 'CapacitySchedulerPolicy'>` | `categorical` |  | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]` | `categorical` |  | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
@@ -268,7 +267,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM']` | `categorical` |  | `VANILLA`, `TRTLLM` |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
+| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
@@ -292,10 +291,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_total_draft_tokens` | `Optional[int]` | `value` |  |  |
 | `speculative_config.max_verification_set_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_window_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.medusa_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
-| `speculative_config.num_medusa_heads` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.posterior_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.relaxed_delta` | `<class 'float'>` | `value` |  |  |
@@ -310,7 +307,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `<class 'int'>` | `value` |  |  |
 | `stream_interval` | `<class 'int'>` | `value` |  |  |
 | `telemetry_config.disabled` | `<class 'bool'>` | `value` |  |  |
-| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval` |
+| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `tokenizer_mode` | `Literal['auto', 'slow']` | `categorical` |  | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |

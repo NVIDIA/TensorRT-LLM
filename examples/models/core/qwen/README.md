@@ -188,22 +188,32 @@ To serve the model in disaggregated mode, you should launch context and generati
 For example, you can launch a single context server on port 8001 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml"
 
-trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ${EXTRA_LLM_API_FILE} &> output_ctx &
+# The curated configs set no cache_transceiver_config, and backend has no default,
+# so without this the transceiver stays disabled and the worker rejects requests.
+cat "${TRTLLM_DIR}/examples/configs/curated/qwen3-disagg-prefill.yaml" > ./ctx_config.yaml
+cat >>./ctx_config.yaml <<EOF
+cache_transceiver_config:
+  backend: NIXL
+EOF
+
+trtllm-serve Qwen3-30B-A3B/ --port 8001 --config ./ctx_config.yaml &> output_ctx &
 ```
 
 And you can launch two generation servers on port 8002 and 8003 with:
 
 ```bash
-export TRTLLM_USE_UCX_KVCACHE=1
 export TRTLLM_DIR=/app/tensorrt_llm
-export EXTRA_LLM_API_FILE="${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml"
+
+cat "${TRTLLM_DIR}/examples/configs/curated/qwen3.yaml" > ./gen_config.yaml
+cat >>./gen_config.yaml <<EOF
+cache_transceiver_config:
+  backend: NIXL
+EOF
 
 for port in {8002..8003}; do \
-trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ${EXTRA_LLM_API_FILE} &> output_gen_${port} & \
+trtllm-serve Qwen3-30B-A3B/ --port ${port} --config ./gen_config.yaml &> output_gen_${port} & \
 done
 ```
 
@@ -211,7 +221,7 @@ Finally, you can launch the disaggregated server which will accept requests from
 the orchestration between the context and generation servers with:
 
 ```bash
-cat >./disagg-config.yml <<EOF
+cat >./disagg-config.yaml <<EOF
 hostname: localhost
 port: 8000
 backend: pytorch

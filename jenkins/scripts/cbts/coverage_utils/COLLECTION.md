@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS Coverage Collection — Current State
 
 How per-test coverage data is produced on this branch, and **what it does not record**.
@@ -155,5 +158,7 @@ stage:
 - single-GPU stages only (name carries no `-<N>_GPUs` / `-<N>_Nodes`)
 - not listed in `CBTS_EXCLUDE_STAGES`
 
-The per-process files ride back inside `results-<stage>.tar.gz`; the `Test Coverage` stage merges
-them all and uploads to `${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz`.
+The per-process files ride back inside `results-<stage>.tar.gz`; architecture checkpoints first
+upload `cbts_pystart_report_x86_64.tar.gz` and `cbts_pystart_report_SBSA.tar.gz`, which the selector
+requires and hierarchically merges. The later `Test Coverage` stage merges all files and uploads
+`${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz` for the full report.

@@ -16,12 +16,14 @@
 import abc
 import json
 from typing import NamedTuple
+from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
+from tensorrt_llm.serve.postprocess_handlers import forced_tool_arguments_end
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
                                                        StructureInfo)
@@ -4281,6 +4283,304 @@ class TestBuildToolStrictGuidedDecoding:
         assert "calculate" in fmt["tags"][0]["begin"]
 
 
+# ============================================================================
+# Named tool_choice (forced function call) Tests — TRTLLM-12758
+# ============================================================================
+
+
+def _make_tools(*specs):
+    """Helper: build a list of ChatCompletionToolsParam from (name, params) specs."""
+    return [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(name=name, parameters=params),
+        ) for name, params in specs
+    ]
+
+
+_SCHEMA_LOCATION = {
+    "type": "object",
+    "properties": {
+        "location": {
+            "type": "string"
+        },
+    },
+    "required": ["location"],
+}
+
+_SCHEMA_QUERY = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string"
+        },
+    },
+    "required": ["query"],
+}
+
+
+class TestBuildForcedToolCallDecoding:
+    """Test ``_build_forced_tool_call_decoding`` from openai_server.
+
+    Covers OpenAI-spec ``tool_choice = {"type": "function",
+    "function": {"name": "X"}}`` for non-harmony tool parsers (TRTLLM-12758).
+    The helper returns ``(begin_prefix, GuidedDecodingParams)``: the caller
+    prefix-injects ``begin_prefix`` into the rendered chat prompt and applies
+    the guided-decoding params to the request, so the model is forced to
+    start generation inside the tool call and the resulting arguments are
+    JSON-schema valid.
+    """
+
+    @pytest.mark.parametrize(
+        "parser_name",
+        ["qwen3", "deepseek_v3", "kimi_k2", "gemma4"],
+    )
+    def test_forced_name_returns_prefix_and_json_schema(self, parser_name):
+        """Forced-name path returns a parser-specific prefix and JSON schema.
+
+        Across parser families, ``begin_prefix`` must contain the forced
+        function name and the guided-decoding params must constrain the args
+        to the function's ``parameters`` JSON Schema.
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION),
+                            ("search_web", _SCHEMA_QUERY))
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, parser_name, "get_weather")
+
+        # ``begin_prefix`` is exactly the parser's tool-call begin string.
+        parser = ToolParserFactory.parsers[parser_name.lower()]()
+        expected_begin = parser.structure_info()("get_weather").begin
+        assert begin_prefix == expected_begin
+        assert "get_weather" in begin_prefix
+
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json == _SCHEMA_LOCATION
+        assert guided.json_object is False
+        assert guided.structural_tag is None
+
+    def test_forced_name_no_parameters_uses_json_object(self):
+        """Forced-name path falls back to ``json_object`` when no schema.
+
+        When the forced function has no ``parameters``, the helper falls back
+        to ``json_object=True`` so the synthesized ``arguments`` field is still
+        well-formed JSON (typically ``{}``).
+        """
+        from tensorrt_llm.sampling_params import GuidedDecodingParams
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="ping"),
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(name="other",
+                                            parameters=_SCHEMA_QUERY),
+            ),
+        ]
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "ping")
+        assert "ping" in begin_prefix
+        assert isinstance(guided, GuidedDecodingParams)
+        assert guided.json is None
+        assert guided.json_object is True
+
+    def test_forced_name_ignores_strict_flag(self):
+        """The forced-call path engages regardless of any ``strict=True``."""
+        from tensorrt_llm.serve.openai_server import (
+            _build_forced_tool_call_decoding,
+            _build_tool_strict_guided_decoding_params)
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # Strict-tools path is unchanged: no strict → None.
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+        # Forced-call path: always constrains.
+        begin_prefix, guided = _build_forced_tool_call_decoding(
+            tools, "qwen3", "get_weather")
+        assert begin_prefix
+        assert guided is not None
+
+    def test_forced_name_missing_raises_value_error(self):
+        """Forcing a function that is not in tools must raise ValueError."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError) as exc:
+            _build_forced_tool_call_decoding(tools, "qwen3", "missing_fn")
+        msg = str(exc.value)
+        assert "missing_fn" in msg
+        assert "get_weather" in msg  # available functions reported
+
+    def test_forced_name_no_tools_raises_value_error(self):
+        """Forcing a function without any tools provided is a 4xx-class error."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding([], "qwen3", "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(None, "qwen3", "get_weather")
+
+    def test_forced_name_no_parser_raises_value_error(self):
+        """Forcing a function on a server without a tool_parser is a 4xx."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, None, "get_weather")
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "", "get_weather")
+
+    def test_forced_name_unsupported_parser_raises_value_error(self):
+        """Parsers that do not support structural tags cannot honor forced names."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        # glm4, glm47, qwen3_coder, minimax_m2 do not support structural tags.
+        for parser_name in ("glm4", "glm47", "qwen3_coder", "minimax_m2"):
+            with pytest.raises(ValueError) as exc:
+                _build_forced_tool_call_decoding(tools, parser_name,
+                                                 "get_weather")
+            assert "structural" in str(exc.value).lower()
+
+    def test_forced_name_unknown_parser_raises_value_error(self):
+        """An unregistered parser name should also raise."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_forced_tool_call_decoding
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with pytest.raises(ValueError):
+            _build_forced_tool_call_decoding(tools, "no_such_parser",
+                                             "get_weather")
+
+    def test_strict_path_unchanged_by_default(self):
+        """Strict-tools path stays untouched without ``strict=True``.
+
+        Regression guard: ``_build_tool_strict_guided_decoding_params`` must
+        still return ``None`` when no tool has ``strict=True``, independent of
+        the new forced-call helper.
+        """
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        assert _build_tool_strict_guided_decoding_params(tools, "qwen3") is None
+
+
+class TestForcedToolCallStreamingFinishReason:
+    """A forced call that streams nothing must not claim ``tool_calls``.
+
+    The streaming forced-call branch sets ``has_tool_call`` so the final chunk
+    reports ``finish_reason="tool_calls"``. It used to do so on every
+    iteration, including ones with empty ``delta_text``. When generation ends
+    before any non-empty text -- ``max_completion_tokens`` reached before the
+    first detokenized chunk, or an abort -- no ``DeltaToolCall`` is ever
+    emitted, so the client saw a ``tool_calls`` finish reason with no tool
+    call attached.
+    """
+
+    @staticmethod
+    def _args(**overrides):
+        from tensorrt_llm.serve.openai_protocol import (
+            ChatCompletionNamedFunction, ChatCompletionNamedToolChoiceParam)
+        from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
+
+        args = ChatPostprocArgs(role="assistant", model="test-model")
+        args.tool_parser = "qwen3"
+        # The forced call is derived from the request, not from a dedicated
+        # field: both ``tool_choice`` and ``tools`` must be set or
+        # ``_forced_tool_choice`` / ``_forced_choice_uses_tool_parser`` will
+        # not see a forced call and these assertions become vacuous.
+        args.tool_choice = ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name="get_weather"))
+        args.tools = [
+            ChatCompletionToolsParam(type="function",
+                                     function=FunctionDefinition(
+                                         name="get_weather",
+                                         parameters=_SCHEMA_LOCATION))
+        ]
+        args.num_prompt_tokens = 3
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    @staticmethod
+    def _rsp(text, finish_reason):
+        output = Mock()
+        output.index = 0
+        output.text_diff = text
+        output.text = text
+        output.token_ids_diff = [1] if text else []
+        output.token_ids = [1] if text else []
+        output.finish_reason = finish_reason
+        output.stop_reason = None
+        output.logprobs_diff = None
+        output.disaggregated_params = None
+
+        rsp = Mock()
+        rsp.outputs = [output]
+        rsp._done = finish_reason is not None
+        rsp.cached_tokens = 0
+        rsp.prompt_token_ids = [1, 2, 3]
+        # Read via getattr() and fed straight into a pydantic model, so it must
+        # be a real value: a bare Mock fails float validation.
+        rsp.avg_decoded_tokens_per_iter = None
+        return rsp
+
+    def _finish_reasons(self, chunks):
+        reasons = []
+        for chunk in chunks:
+            for line in chunk.splitlines():
+                if not line.startswith("data: ") or line.endswith("[DONE]"):
+                    continue
+                payload = json.loads(line[len("data: "):].strip())
+                for choice in payload.get("choices", []):
+                    if choice.get("finish_reason"):
+                        reasons.append(choice["finish_reason"])
+        return reasons
+
+    def test_forced_call_with_no_text_does_not_report_tool_calls(self):
+        """Generation ending before any text must not claim a tool call."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        args = self._args()
+        # A single terminal iteration that never produced detokenized text.
+        chunks = chat_stream_post_processor(self._rsp("", "length"), args)
+
+        assert not args.has_tool_call.get(0, False), (
+            "has_tool_call was set without any DeltaToolCall being emitted")
+        reasons = self._finish_reasons(chunks)
+        assert "tool_calls" not in reasons, (
+            f"reported a tool-call finish reason with no tool call: {reasons}")
+        assert reasons == ["length"]
+
+    def test_forced_call_with_text_still_reports_tool_calls(self):
+        """Baseline: once a delta is emitted the finish reason still flips."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_stream_post_processor
+
+        args = self._args()
+        chat_stream_post_processor(self._rsp('{"city":', None), args)
+        assert args.forced_tool_name_sent.get(0, False)
+        assert args.has_tool_call.get(0, False)
+
+        args.first_iteration = False
+        chunks = chat_stream_post_processor(self._rsp(' "Rome"}', "stop"), args)
+        assert self._finish_reasons(chunks) == ["tool_calls"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
@@ -4826,10 +5126,11 @@ class TestForcedToolChoicePostprocessing:
 
     def test_forced_choice_raw_passthrough_keeps_text_as_arguments(
             self, sample_tools):
-        """Ungated parsers keep the legacy raw passthrough on forced calls.
+        """Ungated parsers report the constrained arguments value.
 
-        Parsers without ``extracts_forced_tool_calls`` pass text through as
-        arguments, but now report finish_reason="tool_calls".
+        Parsers without ``extracts_forced_tool_calls`` rely on JSON-schema
+        guided decoding, so the generated text is the arguments value and is
+        reported as-is, with finish_reason="tool_calls".
         """
         from tensorrt_llm.serve.postprocess_handlers import \
             chat_response_post_processor
@@ -4845,6 +5146,101 @@ class TestForcedToolChoicePostprocessing:
         function = choice.message.tool_calls[0].function
         assert function.name == "get_weather"
         assert function.arguments == '{"location": "NYC"}'
+
+    def test_forced_choice_truncates_overrun_arguments(self, sample_tools):
+        """A model that overruns the arguments must not leak the tail.
+
+        Generation starts inside the tool call, so an unconstrained model
+        closes the enclosing object, emits the parser's end tag and keeps
+        talking. Only the arguments value may be reported, otherwise the
+        caller cannot json.loads() it.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response(
+            ' {"location":"NYC"}}\n</tool_call>\n\nOkay, the user just said '
+            '"Just say hi."\n</think>\n\nHello! How can I assist you today?')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        function = choice.message.tool_calls[0].function
+        assert function.name == "get_weather"
+        assert json.loads(function.arguments) == {"location": "NYC"}
+        assert choice.finish_reason == "tool_calls"
+
+    def test_forced_choice_incomplete_arguments_returns_content(
+            self, sample_tools):
+        """A truncated arguments value must not be reported as a tool call.
+
+        Guided decoding constrains the shape but not the length: hitting the
+        token budget leaves a partial JSON value. Reporting it as `arguments`
+        would hand the caller something json.loads() rejects, and claiming
+        finish_reason="tool_calls" would assert a call that never completed.
+        """
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response('{"location": "San Fra')
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.message.content == '{"location": "San Fra'
+        assert choice.finish_reason != "tool_calls"
+
+    def test_forced_choice_empty_generation_returns_no_tool_call(
+            self, sample_tools):
+        """An empty generation must not become a tool call with empty args."""
+        from tensorrt_llm.serve.postprocess_handlers import \
+            chat_response_post_processor
+
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather")
+        rsp = self._fake_response("")
+
+        choice = chat_response_post_processor(rsp, args).choices[0]
+
+        assert not choice.message.tool_calls
+        assert choice.finish_reason != "tool_calls"
+
+    def test_forced_choice_streaming_stops_at_end_of_arguments(
+            self, sample_tools):
+        """The stream stops emitting once the arguments value completes."""
+        args = self._make_args(sample_tools,
+                               tool_parser="qwen3",
+                               forced_tool_name="get_weather",
+                               stream=True)
+        payloads = self._stream_deltas(
+            args,
+            ['{"location"', ':"NYC"}', '}\n</tool_call>\n', 'Hello there!'])
+
+        deltas = [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+        tool_deltas = [d for d in deltas if d.get("tool_calls")]
+        arguments = "".join(
+            d["tool_calls"][0]["function"].get("arguments") or ""
+            for d in tool_deltas)
+        assert json.loads(arguments) == {"location": "NYC"}
+        # Name and id are sent exactly once, on the opening delta.
+        named = [
+            d for d in tool_deltas if d["tool_calls"][0]["function"].get("name")
+        ]
+        assert len(named) == 1
+        assert named[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert len([d for d in tool_deltas
+                    if d["tool_calls"][0].get("id")]) == 1
+        # A forced call produces no assistant text. Content here means the raw
+        # generation -- including the overrun tail -- leaked into the message.
+        assert not any(d.get("content") for d in deltas), (
+            "forced call leaked content: "
+            f"{[d.get('content') for d in deltas if d.get('content')]}")
 
     def test_forced_choice_k3_streaming_extracts(self, sample_tools):
         """Extract the forced call from a streamed K3 response.
@@ -4960,3 +5356,106 @@ class TestConfigureParserSpecialTokenDecoding:
 
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
+
+
+# ============================================================================
+# Forced tool call: argument truncation — TRTLLM-12758
+# ============================================================================
+
+
+class TestParserExtractsForcedToolCalls:
+    """Routing between the two forced-call strategies.
+
+    Parsers that extract forced calls from their own markup must NOT be sent
+    down the grammar path: none of them supports structural tags, so the
+    server would reject every forced request against them and the extraction
+    path in the post-processor would be unreachable.
+    """
+
+    def test_kimi_k3_is_routed_to_extraction(self) -> None:
+        from tensorrt_llm.serve.openai_server import \
+            _parser_extracts_forced_tool_calls
+
+        assert _parser_extracts_forced_tool_calls("kimi_k3") is True
+        # Guard the premise: K3 has no structural-tag support, so without the
+        # routing above it would be rejected outright.
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert ToolParserFactory.parsers["kimi_k3"]().supports_structural_tag(
+        ) is False
+
+    def test_json_parsers_use_the_grammar_path(self) -> None:
+        from tensorrt_llm.serve.openai_server import \
+            _parser_extracts_forced_tool_calls
+
+        assert _parser_extracts_forced_tool_calls("qwen3") is False
+        assert _parser_extracts_forced_tool_calls(None) is False
+        assert _parser_extracts_forced_tool_calls("not_a_parser") is False
+
+
+class TestForcedToolArgumentsEnd:
+    """Test ``forced_tool_arguments_end`` from postprocess_handlers.
+
+    The forced-call path prefix-injects ``{"name": X, "arguments":`` into the
+    prompt, so generation begins inside a tool-call object. Whatever the model
+    produces after the arguments value -- the enclosing ``}``, the parser's end
+    tag, reasoning, ordinary prose -- must not be reported as ``arguments``.
+    """
+
+    def test_returns_none_for_incomplete_json(self) -> None:
+        assert forced_tool_arguments_end('{"location": "San Fra') is None
+
+    def test_returns_none_for_empty_or_blank(self) -> None:
+        assert forced_tool_arguments_end("") is None
+        assert forced_tool_arguments_end("   ") is None
+
+    def test_exact_json_consumes_everything(self) -> None:
+        text = '{"location": "Paris"}'
+        assert forced_tool_arguments_end(text) == len(text)
+
+    def test_skips_leading_whitespace(self) -> None:
+        text = '  {"location": "Paris"}'
+        assert forced_tool_arguments_end(text) == len(text)
+
+    def test_truncates_model_overrun(self) -> None:
+        """Regression for the observed CI failure.
+
+        The model closed the enclosing tool-call object, emitted the end tag,
+        then carried on with reasoning and a chat reply. Only the leading
+        arguments object may survive.
+        """
+        overrun = (' {"location":"Hello", "unit":"fahrenheit"}}\n</tool_call>\n'
+                   '\nOkay, the user just said "Just say hi."\n</think>\n\n'
+                   'Hello! How can I assist you today?')
+        end = forced_tool_arguments_end(overrun)
+        assert end is not None
+        arguments = overrun[:end]
+        # Must be parseable on its own -- this is exactly what the failing
+        # test did with ``json.loads(forced_call.function.arguments)``.
+        assert json.loads(arguments) == {
+            "location": "Hello",
+            "unit": "fahrenheit",
+        }
+
+    def test_streaming_incremental_cutoff(self) -> None:
+        """Feeding the overrun in chunks yields the same arguments and stops."""
+        chunks = [
+            ' {"location":', '"Hello", "unit"', ':"fahrenheit"}', '}\n</tool_',
+            'call>\n\nHello!'
+        ]
+        buffered, sent_len, done, streamed = "", 0, False, ""
+        for chunk in chunks:
+            if done:
+                continue
+            buffered += chunk
+            end = forced_tool_arguments_end(buffered)
+            limit = len(buffered) if end is None else end
+            if end is not None:
+                done = True
+            streamed += buffered[sent_len:limit]
+            sent_len = max(sent_len, limit)
+        assert done, "stream never detected the end of the arguments"
+        assert json.loads(streamed) == {
+            "location": "Hello",
+            "unit": "fahrenheit",
+        }

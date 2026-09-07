@@ -21,7 +21,7 @@ from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .dspark import DSparkSpecMetadata, DSparkWorker
+from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
                      Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
                      Eagle3ResourceManager, Eagle3SpecMetadata, MTPEagleWorker)
@@ -465,7 +465,13 @@ def _build_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_dflash():
+    # A standalone DSpark drafter is drafted by DFlashWorker, so it needs the
+    # DFlash metadata (paged draft KV, DFlash capture buffer). Only the
+    # embedded DeepSeek-V4-Pro draft uses DSparkSpecMetadata and its rolling
+    # window. See DSparkDecodingConfig.draft_is_embedded_in_target.
+    if spec_config.spec_dec_mode.is_dflash() or (
+            spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
         return DFlashSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -543,11 +549,16 @@ def _build_spec_metadata(spec_config,
 
 def get_mtp_hidden_size(model_config) -> int:
     pretrained_config = getattr(model_config, "pretrained_config", model_config)
+    if getattr(pretrained_config, "model_type", None) == "qwen4_exp":
+        pretrained_config = pretrained_config.text_config
     hidden_size = getattr(pretrained_config, "hidden_size", None)
     if hidden_size is None:
         hidden_size = getattr(model_config, "hidden_size")
-    if getattr(pretrained_config, "model_type", None) == "deepseek_v4":
+    model_type = getattr(pretrained_config, "model_type", None)
+    if model_type == "deepseek_v4":
         return hidden_size * getattr(pretrained_config, "hc_mult", 1)
+    if model_type == "qwen4_exp_text":
+        return hidden_size * getattr(pretrained_config, "hc_count", 1)
     return hidden_size
 
 
@@ -571,7 +582,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             return MTPEagleDynamicTreeResourceManager(
                 spec_config,
                 model_config.torch_dtype,
-                model_config.hidden_size,
+                get_mtp_hidden_size(model_config),
                 max_num_requests,
                 sa_manager=sa_manager,
             )
@@ -790,7 +801,16 @@ def get_spec_worker(spec_config,
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    # DSpark splits by deployment form, mirroring the draft-model side. The
+    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
+    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
+    # forward_batched). A standalone drafter is DFlash lineage and is served by
+    # DSparkWorker, which adds only the Markov bias and the shift_label
+    # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():
+        if spec_config.draft_is_embedded_in_target:
+            return DSv4DSparkWorker(spec_config, mapping,
+                                    use_separate_draft_kv_cache)
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)

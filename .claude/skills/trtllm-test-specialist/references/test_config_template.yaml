@@ -25,7 +25,7 @@ report_file: results/llama_3_1_8b-report.md
 
 # [required for module test] Exact pytest (or other) command to run verbatim.
 #                            Presence of this field triggers the module-test workflow.
-test_cmd: pytest tests/unittest/_torch/modules/test_attention.py -v
+test_cmd: pytest tests/unittest/_torch/attention/test_attention.py -v
 
 # [optional] Name of the class under test (used in the report only).
 class_name: LlamaAttention

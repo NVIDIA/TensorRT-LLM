@@ -4,7 +4,6 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
-#include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
