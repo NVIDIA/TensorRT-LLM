@@ -5519,6 +5519,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Disable the overlap scheduler.",
         status="beta")
 
+    enable_return_routed_experts: bool = Field(
+        default=False,
+        description=
+        "Router Replay (R3): capture per-token pre-EPLB logical top-k MoE expert "
+        "ids so they can be returned on outputs (per request via "
+        "SamplingParams.return_routed_experts), for train/inference routing "
+        "alignment in MoE reinforcement learning. Zero overhead when disabled. "
+        "Separated-routing MoE backends only.",
+        status="beta")
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
