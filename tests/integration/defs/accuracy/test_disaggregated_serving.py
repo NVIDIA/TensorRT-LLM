@@ -787,7 +787,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
@@ -937,7 +937,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(48000)
-    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str,
                                          eagle3_one_model: bool, mocker):
@@ -963,7 +963,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            # Two-model eagle3 does not support overlap scheduler
             "disable_overlap_scheduler": not eagle3_one_model,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {

@@ -466,39 +466,6 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     )
 
 
-def test_eagle3_resource_manager_shares_padding_dummy_slot() -> None:
-    """The target and draft engines of two-model EAGLE3 share one
-    Eagle3ResourceManager, and each registers its own CUDA graph padding dummy
-    under the same draft-length-derived request ID
-    (CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len). The second registration must
-    reuse the already-reserved slot instead of tripping the strict re-add
-    assert in SlotManager.add_slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-        CUDA_GRAPH_DUMMY_REQUEST_ID
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
-
-    config = Eagle3DecodingConfig(max_draft_len=4,
-                                  speculative_model="/dummy/eagle3")
-    manager = Eagle3ResourceManager(config,
-                                    torch.half,
-                                    hidden_size=8,
-                                    max_num_requests=4,
-                                    max_seq_len=32,
-                                    max_num_tokens=64)
-
-    dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - config.max_draft_len
-    # The target engine registers the padding dummy first (e.g. during warmup
-    # preallocation), then the draft engine registers the same ID.
-    manager.add_dummy_requests([dummy_request_id])
-    dummy_slot = manager.slot_manager.get_slot(dummy_request_id)
-    manager.add_dummy_requests([dummy_request_id])
-    assert manager.slot_manager.get_slot(dummy_request_id) == dummy_slot
-
-    # Real request IDs still get their own slots.
-    real_slot = manager.slot_manager.add_slot(7)
-    assert real_slot != dummy_slot
-
-
 @pytest.fixture(scope="function")
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -650,25 +617,10 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, False, False, False],
-        [True, "FLASHINFER", True, False, False, False, False, False, False],
-        [False, "FLASHINFER", True, False, False, False, False, False, False],
         [False, "TRTLLM", False, True, True, False, False, False, False],
         [True, "TRTLLM", False, True, True, False, False, False, False],
         [True, "TRTLLM", True, False, True, True, False, False, False],
         [True, "TRTLLM", True, False, True, False, False, False, False],
-        [True, "TRTLLM", True, False, False, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, False, False, False],
-        [False, "TRTLLM", False, False, False, False, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, True, True, False],
-        [False, "TRTLLM", False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False],
-        [True, "FLASHINFER", False, False, False, False, False, False, False],
-        [False, "FLASHINFER", False, False, False, False, False, False, False],
-        # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
@@ -677,9 +629,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       multi_batch: bool, attention_dp: bool,
                       use_hf_speculative_model: bool):
-    if not use_one_model:
-        pytest.skip("Two model Eagle3 is deprecated")
-
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -725,7 +674,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        # Llama 3 does not support one model eagle.
         eagle3_one_model=use_one_model,
     )
 
@@ -786,7 +734,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
+@pytest.mark.parametrize("eagle3_one_model", [True])
 def test_eagle3_spec_decoding_stats(eagle3_one_model):
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
     models_path = llm_models_root()
@@ -883,7 +831,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
     )
 
     if use_cuda_graph:
@@ -1029,7 +976,7 @@ def test_deepseek_mla_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [True, False])
+@pytest.mark.parametrize("use_one_model", [True])
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
     attn_backend = "TRTLLM"

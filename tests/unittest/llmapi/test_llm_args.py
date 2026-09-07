@@ -2642,7 +2642,6 @@ class TestTorchLlmArgs:
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir="/path/to/model",
-            eagle3_one_model=False,
         )
 
         args = TorchLlmArgs(model=llama_model_path,

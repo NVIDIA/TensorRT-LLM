@@ -495,7 +495,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True])
     @parametrize_with_ids("sampler_async_worker", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model,
                     sampler_async_worker):
@@ -507,9 +507,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(max_batch_size=1,
                                               enable_padding=True),
         )
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True, free_gpu_memory_fraction=0.8
-        )  # both one-model and two-model supports this feature
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                        free_gpu_memory_fraction=0.8)
 
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
@@ -1044,7 +1043,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
-    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str,
                                          eagle3_one_model: bool, mocker):
@@ -1055,16 +1054,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             max_draft_len=3,
             speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
             eagle3_one_model=eagle3_one_model)
-        llm = LLM(
-            self.MODEL_PATH,
-            guided_decoding_backend=backend,
-            kv_cache_config=kv_cache_config,
-            cuda_graph_config=cuda_graph_config,
-            enable_chunked_prefill=True,
-            max_num_tokens=256,
-            speculative_config=spec_config,
-            # Two-model eagle3 does not support overlap scheduler
-            disable_overlap_scheduler=not eagle3_one_model)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=spec_config,
+                  disable_overlap_scheduler=not eagle3_one_model)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
@@ -1725,25 +1722,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
-    def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
-        pytorch_config = dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig(),
-        )
-        mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
-                                       speculative_model=self.MODEL_PATH)
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 enable_chunked_prefill=False,
-                 max_num_tokens=8192,
-                 **pytorch_config,
-                 speculative_config=mtp_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device_memory(60000)
     # Builds two LLM() instances back-to-back; the MPI-pool-reuse test layer
     # would otherwise hand the second one the first's just-used worker pool.
     @pytest.mark.private_mpi_session
@@ -1751,7 +1729,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         """TRTLLM-14874 regression on the MTP capture path (see test_one_engine_non_greedy_cuda_graph_matches_eager in TestLlama3_1_8BInstruct for the EAGLE3/SA equivalents)."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         mtp_config = MTPDecodingConfig(max_draft_len=3,
-                                       mtp_eagle_one_model=False,
                                        speculative_model=self.MODEL_PATH)
 
         def build_llm_kwargs(cuda_graph_config):
@@ -4959,11 +4936,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
-            # Base coverage: eagle3_one_model x enable_chunked_prefill.
+            # Base one-model coverage with and without chunked prefill.
             (True, True, False, False),
             (True, False, False, False),
-            (False, True, False, False),
-            (False, False, False, False),
             # Test max_concurrency control and draft_len_schedule.
             (True, False, False, True),
             (True, False, True, False),
@@ -6328,8 +6303,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -6355,12 +6329,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 sizes the target and draft managers from the "
-                "same budget, so two-model Eagle3 is rejected")
-
-        # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
@@ -6413,8 +6381,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
@@ -6427,11 +6394,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
-
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
-            )
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
@@ -6485,8 +6447,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     def test_eagle3_guided_decoding_4gpus(self, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -6530,8 +6491,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -6550,7 +6510,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
-        # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(
             max_batch_size=8,
             disable_overlap_scheduler=not overlap_scheduler,
@@ -6604,8 +6563,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device_memory(90000)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
