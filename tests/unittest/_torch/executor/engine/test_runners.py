@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine.runners import no_cache as no_cache_module
+from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
     PreparedInputs,
@@ -18,9 +18,9 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
     RunnerDeps,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import (
-    NoCacheRunner,
-    NoCacheRunnerConfig,
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
+    NoKVCacheRunner,
+    NoKVCacheRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -47,7 +47,7 @@ def _make_runner(
     runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
     model: Any,
     deps: RunnerDeps | None = None,
-    config: NoCacheRunnerConfig | None = None,
+    config: NoKVCacheRunnerConfig | None = None,
 ) -> PoolingRunner | MultimodalEncoderRunner:
     return runner_type(model, deps or _deps(), config or _config())
 
@@ -68,8 +68,8 @@ def _deps(*, model_forward: Mock | None = None) -> RunnerDeps:
     )
 
 
-def _config() -> NoCacheRunnerConfig:
-    return NoCacheRunnerConfig(
+def _config() -> NoKVCacheRunnerConfig:
+    return NoKVCacheRunnerConfig(
         max_batch_size=4,
         max_num_tokens=16,
         max_seq_len=16,
@@ -152,13 +152,13 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     assert resolve_runner_type(_model(is_generation=False), args) is MultimodalEncoderRunner
 
 
-def test_model_engine_initializes_no_cache_runner_by_family() -> None:
+def test_model_engine_initializes_no_kv_cache_runner_by_family() -> None:
     engine = object.__new__(PyTorchModelEngine)
-    expected = Mock(spec=NoCacheRunner)
-    engine._initialize_no_cache_runner = Mock(return_value=expected)
+    expected = Mock(spec=NoKVCacheRunner)
+    engine._initialize_no_kv_cache_runner = Mock(return_value=expected)
 
-    assert engine._initialize_runner(NoCacheRunner) is expected
-    engine._initialize_no_cache_runner.assert_called_once_with(NoCacheRunner)
+    assert engine._initialize_runner(NoKVCacheRunner) is expected
+    engine._initialize_no_kv_cache_runner.assert_called_once_with(NoKVCacheRunner)
 
 
 def test_model_engine_rejects_unregistered_runner_family() -> None:
@@ -189,7 +189,7 @@ def _model_engine_with_runner(
 
 
 def test_model_engine_forward_delegates_to_resolved_runner() -> None:
-    runner = Mock(spec=NoCacheRunner)
+    runner = Mock(spec=NoKVCacheRunner)
     expected_outputs = {"logits": object()}
     runner.forward.return_value = expected_outputs
     engine, resource_manager = _model_engine_with_runner(
@@ -211,8 +211,8 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
     )
 
 
-def test_model_engine_rejects_kv_manager_with_no_cache_runner() -> None:
-    runner = Mock(spec=NoCacheRunner)
+def test_model_engine_rejects_kv_manager_with_no_kv_cache_runner() -> None:
+    runner = Mock(spec=NoKVCacheRunner)
     engine, resource_manager = _model_engine_with_runner(
         runner,
         kv_cache_manager=object(),
@@ -220,7 +220,7 @@ def test_model_engine_rejects_kv_manager_with_no_cache_runner() -> None:
 
     with pytest.raises(
         AssertionError,
-        match="no-cache runner was initialized, but a KV cache manager was allocated",
+        match="no-KV-cache runner was initialized, but a KV cache manager was allocated",
     ):
         engine.forward(ScheduledRequests(), resource_manager)
 
@@ -236,23 +236,23 @@ def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
         prepared.gather_ids = torch.tensor([0])
 
 
-def test_no_cache_config_extends_common_runner_config() -> None:
+def test_no_kv_cache_config_extends_common_runner_config() -> None:
     assert isinstance(_config(), RunnerConfig)
 
 
-def test_no_cache_runner_exposes_only_forward_step_as_abstract() -> None:
-    assert NoCacheRunner.__abstractmethods__ == frozenset({"_forward_step"})
+def test_no_kv_cache_runner_exposes_only_forward_step_as_abstract() -> None:
+    assert NoKVCacheRunner.__abstractmethods__ == frozenset({"_forward_step"})
 
 
 @pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
-def test_concrete_runners_implement_no_cache_forward_step(
-    runner_type: type[NoCacheRunner],
+def test_concrete_runners_implement_no_kv_cache_forward_step(
+    runner_type: type[NoKVCacheRunner],
 ) -> None:
-    assert issubclass(runner_type, NoCacheRunner)
-    assert runner_type._forward_step is not NoCacheRunner._forward_step
+    assert issubclass(runner_type, NoKVCacheRunner)
+    assert runner_type._forward_step is not NoKVCacheRunner._forward_step
 
 
-def test_no_cache_runner_owns_and_reuses_attention_metadata() -> None:
+def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     runner = _make_runner(PoolingRunner, _model(is_generation=False))
 
     first = runner.setup_attn_metadata()
@@ -267,7 +267,7 @@ def test_no_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.kv_block_ids_per_seq is None
 
 
-def test_no_cache_runner_owns_spec_metadata_setup(
+def test_no_kv_cache_runner_owns_spec_metadata_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec_mode = SimpleNamespace(
@@ -280,7 +280,7 @@ def test_no_cache_runner_owns_spec_metadata_setup(
         is_spec_dec_dynamic_tree=False,
     )
     get_spec_metadata = Mock(return_value=spec_metadata)
-    monkeypatch.setattr(no_cache_module, "get_spec_metadata", get_spec_metadata)
+    monkeypatch.setattr(no_kv_cache_module, "get_spec_metadata", get_spec_metadata)
     deps = _deps()
     runner = _make_runner(
         PoolingRunner,

@@ -24,7 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import NoCacheRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
@@ -186,12 +186,12 @@ def _capture_tllm_logs():
 class TestWarmupCleanup(unittest.TestCase):
     """Lock in warmup-cleanup behavior introduced by PR #14609 (Plan B)."""
 
-    def test_no_cache_warmup_delegates_runner_lifecycle(self):
+    def test_no_kv_cache_warmup_delegates_runner_lifecycle(self):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        model_engine._runner = Mock(spec=NoCacheRunner)
+        model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
 

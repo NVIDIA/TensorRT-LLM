@@ -37,7 +37,7 @@ class PreparedInputs:
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    """Immutable settings shared by encoder, decoder, and no-cache runners."""
+    """Immutable settings shared by encoder, decoder, and no-KV-cache runners."""
 
     max_batch_size: int
     max_num_tokens: int

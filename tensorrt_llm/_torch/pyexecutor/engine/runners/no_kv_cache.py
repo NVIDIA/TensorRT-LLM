@@ -40,7 +40,7 @@ from .interface import PreparedInputs, RunnerConfig, RunnerDeps
 
 
 @dataclass(frozen=True)
-class NoCacheRunnerConfig(RunnerConfig):
+class NoKVCacheRunnerConfig(RunnerConfig):
     """Settings used to prepare scheduled requests without a KV cache."""
 
     enable_attention_dp: bool
@@ -55,14 +55,14 @@ class NoCacheRunnerConfig(RunnerConfig):
     spec_dec_max_total_draft_tokens: int
 
 
-class NoCacheRunner(ABC):
+class NoKVCacheRunner(ABC):
     """Common execution template for model families that do not use a KV cache."""
 
     def __init__(
         self,
         model: nn.Module,
         deps: RunnerDeps,
-        config: NoCacheRunnerConfig,
+        config: NoKVCacheRunnerConfig,
     ) -> None:
         self._model = model
         self._deps = deps
@@ -286,13 +286,14 @@ class NoCacheRunner(ABC):
             self._deps.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
 
-        # this is for no cache attention, not for dummy attention
+        # This is for no-KV-cache attention, not for dummy attention.
         if attn_metadata.kv_cache_manager is None:
             assert isinstance(
                 attn_metadata,
                 (VanillaAttentionMetadata, TrtllmAttentionMetadata),
             ), (
-                "Only vanilla and trtllm attention metadata are supported for no cache attention for now"
+                "Only vanilla and trtllm attention metadata are supported for "
+                "no-KV-cache attention for now"
             )
             attn_metadata.max_seq_len = runner_config.max_seq_len
             attn_metadata.request_ids = request_ids
@@ -316,7 +317,7 @@ class NoCacheRunner(ABC):
         }
 
         if mm_token_indices_cpu is not None:
-            # No extend/draft tokens in the no-cache path, so num_tokens covers
+            # No extend/draft tokens in the no-KV-cache path, so num_tokens covers
             # the full range and the helper's arange/cat branch is skipped.
             ship_multimodal_indices(
                 inputs,

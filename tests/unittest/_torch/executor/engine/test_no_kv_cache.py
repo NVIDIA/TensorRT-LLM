@@ -8,9 +8,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine.runners import no_cache as no_cache_module
+from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import RunnerDeps
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import NoCacheRunnerConfig
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
@@ -67,8 +67,8 @@ def _prepare(
     torch.Tensor,
     torch.Tensor,
 ]:
-    monkeypatch.setattr(no_cache_module, "prefer_pinned", lambda: False)
-    monkeypatch.setattr(no_cache_module, "VanillaAttentionMetadata", _AttentionMetadata)
+    monkeypatch.setattr(no_kv_cache_module, "prefer_pinned", lambda: False)
+    monkeypatch.setattr(no_kv_cache_module, "VanillaAttentionMetadata", _AttentionMetadata)
     attn_metadata = _AttentionMetadata(sum(len(request.get_tokens(0)) for request in requests))
     scheduled_requests = SimpleNamespace(
         context_requests=requests,
@@ -93,7 +93,7 @@ def _prepare(
             lora=lora,
             model_forward=Mock(),
         ),
-        NoCacheRunnerConfig(
+        NoKVCacheRunnerConfig(
             max_batch_size=4,
             max_num_tokens=16,
             max_seq_len=8,
@@ -141,12 +141,12 @@ def _prepare(
     )
 
 
-def test_no_cache_runner_prepare_inputs_packs_context_requests(
+def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     set_prefill_flag = Mock()
     monkeypatch.setattr(
-        no_cache_module,
+        no_kv_cache_module,
         "set_per_request_prefill_cuda_graph_flag",
         set_prefill_flag,
     )
@@ -185,7 +185,7 @@ def test_no_cache_runner_prepare_inputs_packs_context_requests(
     torch.testing.assert_close(position_ids_cuda[:3], torch.tensor([0, 1, 7], dtype=torch.int))
 
 
-def test_no_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
+def test_no_kv_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request(3, [1, 101], multimodal_data={"image": object()})
@@ -199,14 +199,14 @@ def test_no_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     prepare_indices = Mock(return_value=(text_indices, mm_indices))
     ship_indices = Mock()
     lora_value = object()
-    monkeypatch.setattr(no_cache_module, "MultimodalParams", multimodal_params_factory)
+    monkeypatch.setattr(no_kv_cache_module, "MultimodalParams", multimodal_params_factory)
     monkeypatch.setattr(
-        no_cache_module,
+        no_kv_cache_module,
         "_build_request_multimodal_input",
         build_multimodal_input,
     )
-    monkeypatch.setattr(no_cache_module, "prepare_multimodal_indices", prepare_indices)
-    monkeypatch.setattr(no_cache_module, "ship_multimodal_indices", ship_indices)
+    monkeypatch.setattr(no_kv_cache_module, "prepare_multimodal_indices", prepare_indices)
+    monkeypatch.setattr(no_kv_cache_module, "ship_multimodal_indices", ship_indices)
     model = SimpleNamespace(config=SimpleNamespace(vocab_size=100))
 
     inputs, _, _, _, _, _, _, _ = _prepare(
@@ -240,7 +240,7 @@ def test_no_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     )
 
 
-def test_no_cache_runner_prepare_inputs_populates_spec_and_attention_dp_metadata(
+def test_no_kv_cache_runner_prepare_inputs_populates_spec_and_attention_dp_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec_metadata = SimpleNamespace(

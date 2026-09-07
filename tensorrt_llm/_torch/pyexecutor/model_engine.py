@@ -95,7 +95,7 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              set_spec_metadata_all_rank_num_tokens,
                              ship_multimodal_indices)
 from .engine.runners.interface import ModelRunner, RunnerDeps
-from .engine.runners.no_cache import NoCacheRunner, NoCacheRunnerConfig
+from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -1064,13 +1064,13 @@ class PyTorchModelEngine(ModelEngine):
             runner_cls: Optional[Type[ModelRunner]]) -> Optional[ModelRunner]:
         if runner_cls is None:
             return None
-        if issubclass(runner_cls, NoCacheRunner):
-            return self._initialize_no_cache_runner(runner_cls)
+        if issubclass(runner_cls, NoKVCacheRunner):
+            return self._initialize_no_kv_cache_runner(runner_cls)
         raise TypeError(f"No runner initializer registered for "
                         f"{runner_cls.__module__}.{runner_cls.__qualname__}")
 
-    def _initialize_no_cache_runner(
-            self, runner_cls: Type[NoCacheRunner]) -> NoCacheRunner:
+    def _initialize_no_kv_cache_runner(
+            self, runner_cls: Type[NoKVCacheRunner]) -> NoKVCacheRunner:
         runner_deps = RunnerDeps(
             dist=self.dist,
             mapping=self.mapping,
@@ -1083,7 +1083,7 @@ class PyTorchModelEngine(ModelEngine):
             lora=self._lora,
             model_forward=self.model_forward,
         )
-        runner_config = NoCacheRunnerConfig(
+        runner_config = NoKVCacheRunnerConfig(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
@@ -1428,9 +1428,9 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         if self._runner is not None:
-            if isinstance(self._runner, NoCacheRunner):
+            if isinstance(self._runner, NoKVCacheRunner):
                 assert kv_cache_manager is None, (
-                    "a no-cache runner was initialized, but a KV cache manager was allocated"
+                    "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
                 )
             self._runner.warmup(resource_manager)
             self._runner.capture_graphs(resource_manager)
@@ -6925,9 +6925,9 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         if self._runner is not None:
-            if isinstance(self._runner, NoCacheRunner):
+            if isinstance(self._runner, NoKVCacheRunner):
                 assert kv_cache_manager is None, (
-                    "a no-cache runner was initialized, but a KV cache manager was allocated"
+                    "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
                 )
             return self._runner.forward(
                 scheduled_requests,
@@ -7235,7 +7235,7 @@ class PyTorchModelEngine(ModelEngine):
         sequence_lengths: List[int],
         request_ids: List[int],
     ):
-        """Build fresh, no-cache attention metadata for one packed encoder
+        """Build fresh, no-KV-cache attention metadata for one packed encoder
         batch. ``self.attn_metadata`` is not reused because that object is
         bound to the decoder's KV-cache manager."""
         if len(sequence_lengths) != len(request_ids):
@@ -7431,7 +7431,7 @@ class PyTorchModelEngine(ModelEngine):
     ):
         """Pack encoder-side inputs for an encoder-decoder forward pass.
 
-        Mirrors the no-cache path used by ``mm_encoder_only`` and the
+        Mirrors the no-KV-cache path used by ``mm_encoder_only`` and the
         legacy ``EncoderBuffers`` shape contract: ``encoder_input_ids``
         and ``encoder_position_ids`` are concatenated across requests
         into a single ``[sum(encoder_output_len)]`` tensor, with one

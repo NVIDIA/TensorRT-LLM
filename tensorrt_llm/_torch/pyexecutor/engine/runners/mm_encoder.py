@@ -12,10 +12,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 
-from .no_cache import NoCacheRunner
+from .no_kv_cache import NoKVCacheRunner
 
 
-class MultimodalEncoderRunner(NoCacheRunner):
+class MultimodalEncoderRunner(NoKVCacheRunner):
     """Run an engine whose only job is multimodal encoding.
 
     This family is distinct from ``MultimodalItemScheduler``, which schedules vision items

@@ -10,10 +10,10 @@ import torch
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range
 
-from .no_cache import NoCacheRunner
+from .no_kv_cache import NoKVCacheRunner
 
 
-class PoolingRunner(NoCacheRunner):
+class PoolingRunner(NoKVCacheRunner):
     """Run models whose outputs feed embedding, classification, or scoring pools.
 
     This is a model runner because the family diverges during input preparation. It is
