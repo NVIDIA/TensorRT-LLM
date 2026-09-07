@@ -1469,6 +1469,28 @@ class ResponsesRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
 
+    # doc: begin-responses-extra-params
+    # TensorRT-LLM extensions, mirroring ChatCompletionRequest. These are not
+    # part of the OpenAI Responses schema; they carry the disaggregated-serving
+    # handoff between the orchestrator and the context/generation workers, so a
+    # client never sets them.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
+    # Set by the orchestrator from the context worker's response so the
+    # generation worker skips re-rendering the chat template and re-tokenizing
+    # an input it has already been given as token ids.
+    prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids, relayed by the
+    # orchestrator from the ctx response. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
+    # doc: end-responses-extra-params
+
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -1603,6 +1625,20 @@ class ResponsesResponse(OpenAIBaseModel):
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
+
+    # TensorRT-LLM extensions for disaggregated serving; see the matching block
+    # on ResponsesRequest. A context-only response carries the KV-cache handle
+    # and first generated token here, plus the tokenized prompt so the
+    # generation worker does not have to render the chat template again.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    # The engine's raw finish reason, which `status` cannot express. The
+    # orchestrator decides whether a generation phase is still pending by
+    # looking for "length"/"not_finished", and `status` maps both of those onto
+    # "incomplete" while `finish_reason_mapping` raises outright on
+    # "not_finished". Carrying the unmapped value keeps that decision exact.
+    finish_reason: Optional[str] = None
 
     @classmethod
     def from_request(

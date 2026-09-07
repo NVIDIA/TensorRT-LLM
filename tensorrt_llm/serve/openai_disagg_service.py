@@ -16,6 +16,8 @@ import asyncio
 import os
 from typing import Callable, Optional
 
+from fastapi import HTTPException
+
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
@@ -25,20 +27,69 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UCompletionResponse,
+    UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    responses_done_generator,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
+
+# The Completions and Chat Completions responses carry the KV-cache handoff on
+# `choices[0]`, one entry per generated sequence. A Responses API response has
+# no `choices` - it is a single `output` list - so it carries the same handoff
+# at the top level. These three accessors are the only places that difference
+# matters; everything downstream works on the extracted values.
+def _ctx_handoff_slots(response: UCompletionResponse) -> list:
+    """The parts of a context response that carry a KV-cache handoff.
+
+    Returns objects exposing ``disaggregated_params`` and ``finish_reason``.
+    """
+    if isinstance(response, ResponsesResponse):
+        return [response]
+    return list(response.choices)
+
+
+def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
+    """The context phase's token counts, in the shape DisaggregatedParams uses.
+
+    Completions and Chat Completions report usage as ``UsageInfo``
+    (prompt/completion/total). The Responses API reports ``ResponseUsage``
+    (input/output/total) - same numbers, different field names - and
+    ``ctx_usage`` is typed as the former. Assigning the latter straight across
+    survives locally and then loses every count when the generation worker
+    validates the request, because none of the field names line up.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None or isinstance(usage, UsageInfo):
+        return usage
+    return UsageInfo(
+        prompt_tokens=usage.input_tokens,
+        completion_tokens=usage.output_tokens,
+        total_tokens=usage.total_tokens,
+    )
+
+
+def _drop_ctx_handoff(response: UCompletionResponse) -> None:
+    """Strip the handoff from a context response that will not be handed off.
+
+    Left in place it would travel back to the client as an internal field
+    describing a KV-cache transfer that never happens.
+    """
+    for slot in _ctx_handoff_slots(response):
+        slot.disaggregated_params = None
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -110,6 +161,30 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
+    async def openai_responses(
+        self, request: ResponsesRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+
+        # Response storage is per-worker in-process state. Two workers sit
+        # behind this orchestrator and requests are not pinned to either, so a
+        # stored response is only findable again by chance. Rejecting says so;
+        # accepting would fail later as a "response not found" that looks like
+        # the client's mistake, and `store` would silently do nothing.
+        if request.previous_response_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "'previous_response_id' is not supported on a disaggregated "
+                    "server: responses are stored per worker and this request "
+                    "may not reach the worker that holds it. Send the prior "
+                    "turns in 'input' instead."
+                ),
+            )
+
+        return await self._send_disagg_request(request, hooks)
+
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
@@ -147,7 +222,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
                 await self._verify_ctx_response(ctx_response)
-                ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+                ctx_response_disagg_params = _ctx_handoff_slots(ctx_response)[
+                    0
+                ].disaggregated_params
                 if ctx_response_disagg_params.disagg_request_id is not None:
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                     if hooks:
@@ -183,12 +260,22 @@ class OpenAIDisaggregatedService(OpenAIService):
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
+                if isinstance(ctx_response, ResponsesResponse):
+                    # The Responses protocol has no "[DONE]" sentinel, so the
+                    # completions-style terminator would leave the client
+                    # waiting for a response.completed that never comes. Replay
+                    # the finished response as events instead - it also carries
+                    # the answer, which the "[DONE]" path drops on the floor.
+                    return responses_done_generator(ctx_response)
                 return done_generator()
             return ctx_response
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
-        if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
-            del response.choices[0].disaggregated_params
+        if not response:
+            return True
+        slots = _ctx_handoff_slots(response)
+        if slots and slots[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
+            _drop_ctx_handoff(response)
             return False
         return True
 
@@ -217,13 +304,22 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
         if ctx_response:
-            request.disaggregated_params = ctx_response.choices[0].disaggregated_params
+            request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
-            request.disaggregated_params.ctx_usage = ctx_response.usage
+            request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
+            elif isinstance(request, ResponsesRequest):
+                # Same relay as the chat path below. The message history is
+                # never stripped here: the Responses input list is also what
+                # the conversation store keys on, and the generation worker
+                # rebuilds nothing from it once prompt_token_ids is set.
+                if ctx_response.prompt_token_ids_b64 is not None:
+                    request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
                 # Relay the base64 token-id string verbatim (no int-list
                 # materialization on the orchestrator loop), else the int array.
@@ -341,7 +437,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
-            for idx, choice in enumerate(ctx_response.choices):
+            for idx, choice in enumerate(_ctx_handoff_slots(ctx_response)):
                 if choice.disaggregated_params is None:
                     raise ValueError(
                         f"Context server choice {idx} did not return disaggregated params."
