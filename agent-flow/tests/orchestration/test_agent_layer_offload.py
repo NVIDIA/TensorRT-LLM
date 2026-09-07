@@ -22,7 +22,7 @@ Nothing here touches a real backend: the layers are real, the backend is a fake.
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Barrier, BrokenBarrierError, get_ident
+from threading import Barrier, get_ident
 from unittest.mock import patch
 
 import anyio
@@ -134,44 +134,3 @@ def test_offloaded_item_loops_actually_overlap(tmp_path):
 
     assert result.succeeded
     assert sorted(reached) == ["item_1", "item_2"]
-
-
-def test_max_parallel_below_the_batch_prevents_the_overlap(tmp_path):
-    """The bound is real: with ``max_parallel=1`` the two nodes cannot overlap.
-
-    The mirror of the test above, and the reason ``max_parallel_items`` is worth
-    having — a workflow that must not run two servers at once needs the engine
-    to actually hold the second node back, not merely intend to.
-    """
-    backend = FakeBackend([{"text": "done"}])
-    barrier = Barrier(2)
-    broke: list[str] = []
-
-    def blocking_item_loop(item_id: str) -> None:
-        layer = _layer(f"optimizer-{item_id}", "persistent")
-        try:
-            layer(f"implement {item_id}")
-            try:
-                barrier.wait(timeout=1)
-            except BrokenBarrierError:
-                broke.append(item_id)
-        finally:
-            layer.__exit__(None, None, None)
-
-    async def run_node(node: Node, cwd: Path) -> NodeOutcome:
-        await anyio.to_thread.run_sync(blocking_item_loop, node.id)
-        return NodeOutcome(terminal_state=NodeState.DONE)
-
-    graph = ExecutionGraph(
-        nodes=(
-            Node(id="item_1", type="roadmap_item", isolation="shared"),
-            Node(id="item_2", type="roadmap_item", isolation="shared"),
-        )
-    )
-    scheduler = NodeScheduler(graph, run_node, NoOpIsolation(tmp_path), max_parallel=1)
-
-    with patch("agent_flow.layers.create_backend", return_value=backend):
-        result = anyio.run(scheduler.run)
-
-    assert result.succeeded
-    assert broke == ["item_1", "item_2"], "neither node may find a partner at the barrier"

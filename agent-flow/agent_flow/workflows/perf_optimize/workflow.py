@@ -1017,26 +1017,17 @@ class PerfOptimizeWorkflow:
     ) -> None:
         """Drive one round's pending items through the concurrent DAG engine.
 
-        The batch is a flat graph — the items are independent by construction
-        (they all fork from the same frozen base) and the Integrator runs after
-        this returns rather than as a fan-in node, so there are no edges. What
-        the engine buys here is the parts that were hand-rolled before: a
-        ``max_parallel`` bound that is independent of the batch size, isolation
-        behind :class:`~agent_flow.orchestration.IsolationProvider` (acquire ⇄
-        release, with reclamation deferred — see
-        :mod:`~agent_flow.workflows.perf_optimize.isolation`), and orderly
-        cancellation of still-running items when one raises.
+        The graph is flat: the items all fork from the same frozen base, and the
+        Integrator runs after this returns rather than as a fan-in node.
 
-        Each item's optimizer ⇄ evaluator loop is unchanged and still
-        synchronous, so it is offloaded with ``anyio.to_thread.run_sync``
-        rather than rewritten as a coroutine: the agents keep driving their own
-        ``AgentLayer`` sessions exactly as they do on the serial path, and the
-        scheduler's event loop stays free to supervise the other items.
+        The per-item optimizer ⇄ evaluator loop stays synchronous and is
+        offloaded with ``anyio.to_thread.run_sync``; calling it straight from
+        the coroutine would stall the event loop and silently serialize the
+        batch (pinned by ``tests/orchestration/test_agent_layer_offload.py``).
 
-        ``checkpoint_path`` is deliberately ``None``. ``item_batch`` is already
-        the campaign's authority on which items are terminal, and the graph is
-        rebuilt from it on every resume, so a second on-disk cursor could only
-        drift out of agreement with the first.
+        ``checkpoint_path`` is ``None`` on purpose — ``item_batch`` is already
+        the authority on which items are terminal and the graph is rebuilt from
+        it on resume, so a second on-disk cursor could only drift.
         """
         base_commit = str(pending[0]["item_base_commit"])
         isolation = self._item_isolation(state, base_commit)
@@ -1572,15 +1563,10 @@ class PerfOptimizeWorkflow:
 
         defect = self._integrator_verdict_defect(verdict, decision, candidates, included)
         if defect is not None:
-            # An unverifiable acceptance is downgraded, not raised. The checks
-            # exist to keep a verdict the orchestrator cannot confirm out of
-            # ``current_best``, and the safe reading of "cannot confirm" is
-            # "change nothing" — which is exactly REJECT. Raising here instead
-            # ALSO stranded the campaign: the integrator's report and progress
-            # entry are already on disk, so the cached-verdict guard above skips
-            # re-running it on resume and the same check fails forever, leaving
-            # ``--clean`` as the only exit from a run that had already paid for
-            # its measurements.
+            # Downgraded, not raised: "cannot confirm" safely reads as "change
+            # nothing", and raising also stranded the run — the cached-verdict
+            # guard above skips re-running the integrator on resume, so the same
+            # check would fail forever.
             print_message(
                 f"[bold yellow]⚠ integrator verdict {decision} failed the "
                 f"orchestrator's consistency check and was downgraded to "
@@ -1642,14 +1628,11 @@ class PerfOptimizeWorkflow:
         self._finish_item_batch(state, log)
 
     def _finish_item_batch(self, state: WorkflowState, log) -> None:
-        """Clean batch worktrees and branches, then deterministically close the round.
+        """Free the round's worktrees and branches, then close it deterministically.
 
-        On the parallel path the isolation provider already released each item's
-        worktree as the item finished, but its branch was deliberately kept
-        alive for the out-of-graph Integrator to cherry-pick (see
-        :class:`~agent_flow.workflows.perf_optimize.isolation.CandidateWorktreeIsolation`).
-        Integration is over by the time this runs, so the branches are freed
-        here — the deferred half of the provider's two-stage teardown.
+        This is the deferred half of ``CandidateWorktreeIsolation``'s teardown:
+        the provider keeps candidate branches alive for the out-of-graph
+        Integrator, and integration is over by the time this runs.
         """
         repo = self._trtllm_repo_path()
         paths = [str(entry.get("item_worktree_path", "")) for entry in state.item_batch]
@@ -1659,10 +1642,8 @@ class PerfOptimizeWorkflow:
             if path and Path(path).exists():
                 self._remove_worktree_best_effort(repo, path, log)
         branches = [str(entry.get("item_branch", "")) for entry in state.item_batch]
-        # The integration branch goes with them. On an accepted integration its
-        # commits are already on the campaign branch (fast-forwarded above), and
-        # on a rejected one nothing was taken from it — either way it is spent,
-        # and leaving it would drop one dangling ref per round.
+        # Spent either way: an accepted integration is already fast-forwarded
+        # onto the campaign branch, a rejected one contributed nothing.
         branches.append(state.integration_branch)
         for branch in branches:
             if branch:

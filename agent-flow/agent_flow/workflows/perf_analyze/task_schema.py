@@ -83,21 +83,12 @@ SLURM_REQUIRED_FIELDS: tuple[str, ...] = (
 SLURM_CLUSTER_SSH_FIELD = "cluster_ssh"
 REMOTE_RUN_ROOT_FIELD = "remote_run_root"
 
-# Optional shell prelude the agents run INSIDE the container, before any
-# other command, in every Slurm step they open.
-#
-# ``docker_image`` is assumed to be a container where ``trtllm-serve`` just
-# works, which is true of a release image and false of the CI *build* images
-# a site often already has on disk: those carry the toolchain but not the
-# runtime dependencies, so a bare ``import tensorrt_llm`` fails on the first
-# third-party package. The usual local remedy — a virtualenv on the shared
-# filesystem — cannot be handed to the container from outside, because pyxis
-# resets ``PATH`` when it starts one (``PYTHONPATH`` does survive, ``PATH``
-# does not). Without a hook there is nowhere to say "activate it".
-#
-# The value is shell, run verbatim, so it also covers the neighbouring cases:
-# a ``module load``, an extra ``PATH`` entry, a license variable. Absent is
-# the historical behaviour — the agents launch straight into their work.
+# Optional shell, run verbatim inside the container before anything else, in
+# every Slurm step. Needed when ``docker_image`` is a CI *build* image rather
+# than a release one: those carry the toolchain but not the runtime
+# dependencies, and pyxis resets ``PATH`` when it starts a container, so a
+# virtualenv on the shared filesystem cannot be handed in from outside.
+# Absent ⇒ the agents launch straight into their work.
 SLURM_CONTAINER_SETUP_FIELD = "container_setup"
 
 # SOL-projection block. The workflow runs the projector stage

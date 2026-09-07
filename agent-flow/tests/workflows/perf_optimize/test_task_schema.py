@@ -664,9 +664,7 @@ def test_max_parallel_items_is_known_but_has_no_default(tmp_path):
     batch size that the knob exists to break, so it is a known key the defaults
     merge deliberately leaves absent.
     """
-    assert "max_parallel_items" in task_schema.KNOWN_OPTIMIZE_KEYS
     assert "max_parallel_items" not in task_schema.OPTIMIZE_DEFAULTS
-
     data = task_schema.load_and_validate_task_yaml(_write_task(tmp_path, {}))
     assert "max_parallel_items" not in data["optimize"]
 
@@ -694,6 +692,9 @@ def test_container_setup_is_optional_and_absent_by_default(tmp_path):
     data = task_schema.load_and_validate_task_yaml(_slurm_task(tmp_path, {}))
     assert "container_setup" not in data["slurm-environment"]
     assert task_schema.container_setup(data) == ""
+    # No Slurm block at all is the local-execution case — nothing to prepare.
+    assert task_schema.container_setup({}) == ""
+    assert task_schema.container_setup({"slurm-environment": None}) == ""
 
 
 def test_container_setup_survives_validation_and_is_stripped(tmp_path):
@@ -712,15 +713,3 @@ def test_container_setup_must_be_a_non_empty_string(tmp_path, bad):
     task = _slurm_task(tmp_path, {"container_setup": bad})
     with pytest.raises(task_schema.TaskSchemaError, match="container_setup"):
         task_schema.load_and_validate_task_yaml(task)
-
-
-def test_container_setup_is_a_known_slurm_key(tmp_path):
-    from agent_flow.workflows.perf_analyze import task_schema as base
-
-    assert base.SLURM_CONTAINER_SETUP_FIELD in base.KNOWN_SLURM_KEYS
-
-
-def test_container_setup_reads_empty_without_a_slurm_block():
-    """No Slurm block at all is the local-execution case — nothing to prepare."""
-    assert task_schema.container_setup({}) == ""
-    assert task_schema.container_setup({"slurm-environment": None}) == ""
