@@ -19,6 +19,7 @@ import pickle
 import threading
 import time
 from importlib.util import find_spec
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -1032,6 +1033,95 @@ def test_v2_kv_cache_event_manager_uses_stored_registry_for_removed_event(
     assert "layer_groups" not in events[0]["data"]["blocks"][0]
     assert events[1]["data"]["block_hashes"] == [block_hash]
     assert "layer_groups" not in events[1]["data"]
+
+
+def test_v2_kv_cache_event_manager_attaches_registered_mm_keys(real_block_factory):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [2, 2])
+    block_key = _block_key(block)
+    mm_hash = bytes(range(32))
+
+    event_manager.register_mm_keys(block_key, [(mm_hash, 0, "image-uuid")])
+    _add_stored_block(event_manager, block)
+    events = _flush_serialized_events(event_manager)
+
+    expected_mm_keys = [
+        {
+            "type": "mm_key",
+            "hash": "image-uuid",
+            "start_offset": 0,
+        }
+    ]
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+    assert events[1]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    # Lifecycle removal does not remove the radix block. Metadata must survive
+    # all lifecycle detachments so a later lifecycle can emit the same keys.
+    event_manager.add_removed_life_cycle_event(block_key, 0)
+    event_manager.add_removed_life_cycle_event(block_key, 1)
+    _flush_serialized_events(event_manager)
+    with pytest.raises(ValueError, match="Conflicting multimodal metadata"):
+        event_manager.register_mm_keys(block_key, [(mm_hash, 1, "other-uuid")])
+    _add_stored_life_cycle(event_manager, block, 0)
+    events = _flush_serialized_events(event_manager)
+    assert events[0]["data"]["blocks"][0]["mm_keys"] == expected_mm_keys
+
+    # Whole-block removal is the metadata cleanup boundary.
+    event_manager.add_removed_event(block_key)
+    _flush_serialized_events(event_manager)
+    event_manager.register_mm_keys(block_key, [(bytes(reversed(range(32))), 1, None)])
+
+
+def test_v2_kv_cache_event_manager_drops_mm_keys_for_unstored_block(real_block_factory):
+    event_manager = NativeKVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    make_block = real_block_factory(event_manager, num_life_cycles=2)
+    block = make_block([1, 2], [1, 1])
+    block_key = _block_key(block)
+    mm_hash = bytes(range(32))
+
+    event_manager.register_mm_keys(block_key, [(mm_hash, 0, "first")])
+    _add_stored_block(event_manager, block)
+    assert _flush_serialized_events(event_manager) == []
+
+    # An incomplete block never enters the stored-event registry, but actual
+    # radix-tree removal must still release its separately registered metadata.
+    event_manager.add_removed_event(block_key)
+    event_manager.register_mm_keys(block_key, [(mm_hash, 1, "second")])
+
+
+def test_python_v2_kv_cache_event_manager_attaches_registered_mm_keys():
+    event_manager = KVCacheEventManager(max_kv_event_entries=8, window_size=128)
+    block_key = bytes(range(32))
+    mm_hash = bytes(reversed(range(32)))
+    page = SimpleNamespace(num_tokens_in_block=2, cache_level=0, priority=0)
+    block = SimpleNamespace(
+        key=block_key,
+        tokens=[1, 2],
+        storage=[page],
+        prev=SimpleNamespace(ordinal=-1),
+        get_page=lambda _life_cycle_id: page,
+    )
+
+    event_manager.register_mm_keys(block_key, [(mm_hash, 1, "image-uuid")])
+    stored_block = event_manager._stored_block_from_radix_block(block)
+    assert stored_block is not None
+    assert stored_block.mm_keys == [(mm_hash, 1, "image-uuid")]
+
+    with pytest.raises(ValueError, match="Conflicting multimodal metadata"):
+        event_manager.register_mm_keys(block_key, [(mm_hash, 2, "other-uuid")])
+
+    event_manager.add_stored_block_event_from_block(block)
+    event_manager.add_removed_life_cycle_event(block_key, 0)
+    with pytest.raises(ValueError, match="Conflicting multimodal metadata"):
+        event_manager.register_mm_keys(block_key, [(mm_hash, 2, "other-uuid")])
+    event_manager.add_stored_life_cycle_event_from_block(block, 0)
+    stored_block = event_manager._stored_block_from_radix_block(block)
+    assert stored_block is not None
+    assert stored_block.mm_keys == [(mm_hash, 1, "image-uuid")]
+
+    event_manager.add_removed_event(block_key)
+    event_manager.register_mm_keys(block_key, [(mm_hash, 2, "other-uuid")])
 
 
 def test_v2_kv_cache_event_manager_omits_partial_life_cycle_coverage(
