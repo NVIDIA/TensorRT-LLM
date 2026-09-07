@@ -17,7 +17,7 @@ import torch
 
 from tensorrt_llm._utils import is_sm_100f
 
-from .interface import Fmha, FmhaPhase
+from .interface import Fmha
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
@@ -202,19 +202,6 @@ class MsaSparseGqaFmha(Fmha):
         # sparse algorithm lets FmhaManager construction add it to that layer
         # alone, so no custom library discovery is needed.
         return attn.sparse_params is not None and attn.sparse_params.algorithm == "minimax_m3"
-
-    def _is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: "AttentionForwardArgs",
-        *,
-        phase: Optional[FmhaPhase] = None,
-    ) -> bool:
-        del q, k, v, metadata, phase
-        return forward_args.block_sparse_inputs is None
 
     def forward(
         self,

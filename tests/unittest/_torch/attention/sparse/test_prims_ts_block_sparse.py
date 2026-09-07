@@ -15,7 +15,6 @@
 
 import math
 from contextlib import nullcontext
-from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -24,6 +23,7 @@ import torch
 from utils.util import isSM100Family
 
 from tensorrt_llm._torch.attention.backends import prims_ts
+from tensorrt_llm._torch.attention.backends.fmha import prims_ts_block_sparse as block_sparse_fmha
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -31,8 +31,14 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
+from tensorrt_llm._torch.attention.backends.sparse.params import (
+    BlockSparseForwardInputs,
+    SparseRuntimeParams,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
+
+pytestmark = pytest.mark.cpu_only
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not isSM100Family(),
@@ -40,15 +46,8 @@ _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
 )
 
 
-def _generic_api():
-    carrier_module = import_module("tensorrt_llm._torch.attention.backends.sparse.params")
-    fmha_module = import_module("tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse")
-    return carrier_module.BlockSparseForwardInputs, fmha_module
-
-
 def _bsr_inputs(*, kv_valid_bits: torch.Tensor | None = None):
-    inputs_type, _ = _generic_api()
-    return inputs_type(
+    return BlockSparseForwardInputs(
         q_block_size=64,
         kv_block_size=64,
         max_blocks_per_row=2,
@@ -59,17 +58,31 @@ def _bsr_inputs(*, kv_valid_bits: torch.Tensor | None = None):
 
 
 def _bitmask_inputs(*, proxy: bool):
-    inputs_type, _ = _generic_api()
     summaries = {
         "k_summary": torch.zeros((2, 4, 1, 128), dtype=torch.bfloat16),
         "v_summary": torch.zeros((2, 4, 1, 128), dtype=torch.bfloat16),
     }
-    return inputs_type(
+    return BlockSparseForwardInputs(
         q_block_size=64,
         kv_block_size=64,
         exact_block_bits=torch.ones((2, 1, 1, 1), dtype=torch.uint32),
         **(summaries if proxy else {}),
     )
+
+
+def _set_block_sparse_inputs(
+    forward_args: AttentionForwardArgs,
+    block_sparse_inputs,
+) -> None:
+    forward_args.sparse_runtime_params = SparseRuntimeParams(
+        block_sparse_inputs=block_sparse_inputs
+    )
+
+
+def _get_block_sparse_inputs(forward_args: AttentionForwardArgs):
+    block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
+    assert block_sparse_inputs is not None
+    return block_sparse_inputs
 
 
 def _pack_token_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -125,14 +138,15 @@ class _Attention:
 
 
 def _contiguous_case():
-    _inputs_type, fmha_module = _generic_api()
     attention = _Attention()
-    fmha = fmha_module.PrimsTSBlockSparseFmha(attention)
+    fmha = block_sparse_fmha.PrimsTSBlockSparseFmha(attention)
     q = torch.zeros((128, 256), dtype=torch.bfloat16)
     k = torch.zeros((512, 128), dtype=torch.bfloat16)
     v = torch.zeros_like(k)
     metadata = SimpleNamespace(
         is_cross=False,
+        num_sparse_topk=0,
+        helix_position_offsets=None,
         kv_cache_manager=None,
         seq_lens=torch.tensor([64, 64], dtype=torch.int32),
     )
@@ -140,7 +154,7 @@ def _contiguous_case():
         output=torch.empty_like(q),
         attention_input_type=AttentionInputType.context_only,
         attention_mask=PredefinedAttentionMask.FULL,
-        block_sparse_inputs=_bsr_inputs(),
+        sparse_runtime_params=SparseRuntimeParams(block_sparse_inputs=_bsr_inputs()),
     )
     return attention, fmha, q, k, v, metadata, args
 
@@ -155,10 +169,16 @@ def _paged_metadata():
     manager.host_kv_cache_block_offsets = block_offsets
     return SimpleNamespace(
         is_cross=False,
+        num_sparse_topk=0,
+        helix_position_offsets=None,
         num_contexts=0,
         num_generations=batch_size,
         seq_lens=torch.ones(batch_size, dtype=torch.int32),
         beam_width=1,
+        is_spec_decoding_enabled=False,
+        use_spec_decoding=False,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
         tokens_per_block=page_size,
         max_seq_len=max_pages * page_size,
         kv_layout="HND",
@@ -171,9 +191,8 @@ def _paged_metadata():
 
 
 def _paged_case():
-    _inputs_type, fmha_module = _generic_api()
     attention = _Attention()
-    fmha = fmha_module.PrimsTSBlockSparseFmha(attention)
+    fmha = block_sparse_fmha.PrimsTSBlockSparseFmha(attention)
     fmha._multi_processor_count = 1
     metadata = _paged_metadata()
     q = torch.zeros((2, 512), dtype=torch.bfloat16)
@@ -183,7 +202,7 @@ def _paged_case():
         attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_window_size=metadata.max_seq_len,
         is_fused_qkv=True,
-        block_sparse_inputs=_bsr_inputs(),
+        sparse_runtime_params=SparseRuntimeParams(block_sparse_inputs=_bsr_inputs()),
     )
     return attention, fmha, q, metadata, args
 
@@ -211,7 +230,6 @@ def test_block_sparse_route_mode_is_derived_from_payload() -> None:
     ],
 )
 def test_block_sparse_payload_rejects_ambiguous_combinations(overrides, message) -> None:
-    inputs_type, _ = _generic_api()
     kwargs = {
         "q_block_size": 64,
         "kv_block_size": 64,
@@ -222,7 +240,7 @@ def test_block_sparse_payload_rejects_ambiguous_combinations(overrides, message)
     kwargs.update(overrides)
 
     with pytest.raises((TypeError, ValueError), match=message):
-        inputs_type(**kwargs)
+        BlockSparseForwardInputs(**kwargs)
 
 
 def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
@@ -234,7 +252,7 @@ def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
     assert not contiguous.is_supported(q, k, v, metadata, args, phase=FmhaPhase.GENERATION)
 
     _attention, paged, q, metadata, args = _paged_case()
-    args.block_sparse_inputs = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, _bitmask_inputs(proxy=True))
     _supported, reason = paged._is_supported_with_reason(
         q, None, None, metadata, args, phase=FmhaPhase.GENERATION
     )
@@ -244,7 +262,7 @@ def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
 
 def test_contiguous_proxy_routes_reject_causal_mask_before_planning(monkeypatch) -> None:
     _attention, fmha, q, k, v, metadata, args = _contiguous_case()
-    args.block_sparse_inputs = _bitmask_inputs(proxy=True)
+    _set_block_sparse_inputs(args, _bitmask_inputs(proxy=True))
     args.attention_mask = PredefinedAttentionMask.CAUSAL
     monkeypatch.setattr(fmha, "_common_unsupported_reason", Mock(return_value=None))
 
@@ -303,14 +321,13 @@ def test_block_sparse_support_rejects_invalid_static_kernel_profile(
 
 def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypatch) -> None:
     _attention, fmha, q, k, v, _metadata, args = _contiguous_case()
-    _inputs_type, fmha_module = _generic_api()
     wrapper = Mock()
     factory = Mock(return_value=wrapper)
-    monkeypatch.setattr(fmha_module, "_BlockSparseTSWrapper", factory)
+    monkeypatch.setattr(block_sparse_fmha, "_BlockSparseTSWrapper", factory)
 
     bsr_inputs = [
         _bsr_inputs(),
-        _inputs_type(
+        BlockSparseForwardInputs(
             q_block_size=64,
             kv_block_size=64,
             max_blocks_per_row=2,
@@ -319,12 +336,12 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
         ),
     ]
     for inputs in bsr_inputs:
-        args.block_sparse_inputs = inputs
+        _set_block_sparse_inputs(args, inputs)
         fmha._forward_contiguous(q, k, v, args)
 
     proxy_inputs = [_bitmask_inputs(proxy=True), _bitmask_inputs(proxy=True)]
     for inputs in proxy_inputs:
-        args.block_sparse_inputs = inputs
+        _set_block_sparse_inputs(args, inputs)
         fmha._forward_contiguous(q, k, v, args)
 
     assert factory.call_count == 2
@@ -346,14 +363,13 @@ def test_contiguous_wrappers_cache_static_profile_and_keep_routes_live(monkeypat
 
 
 def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
-    _, fmha_module = _generic_api()
     inputs = _bitmask_inputs(proxy=True)
     q = torch.empty((128, 256), dtype=torch.bfloat16)
     first_attention = _Attention()
     second_attention = _Attention()
     second_attention.num_heads = 4
-    first = fmha_module.PrimsTSBlockSparseFmha(first_attention)
-    second = fmha_module.PrimsTSBlockSparseFmha(second_attention)
+    first = block_sparse_fmha.PrimsTSBlockSparseFmha(first_attention)
+    second = block_sparse_fmha.PrimsTSBlockSparseFmha(second_attention)
 
     def _key(fmha):
         return fmha._make_plan_key(
@@ -370,9 +386,8 @@ def test_block_sparse_plan_key_includes_attention_head_topology() -> None:
 
 
 def test_block_sparse_plan_cache_is_shared_only_when_explicitly_bound() -> None:
-    _, fmha_module = _generic_api()
-    first = fmha_module.PrimsTSBlockSparseFmha(_Attention())
-    second = fmha_module.PrimsTSBlockSparseFmha(_Attention())
+    first = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
+    second = block_sparse_fmha.PrimsTSBlockSparseFmha(_Attention())
 
     assert first._contiguous_wrappers is not second._contiguous_wrappers
     assert first._paged_wrappers is not second._paged_wrappers
@@ -391,10 +406,9 @@ def test_block_sparse_plan_cache_is_shared_only_when_explicitly_bound() -> None:
 
 def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
-    _inputs_type, fmha_module = _generic_api()
     wrapper = Mock()
-    monkeypatch.setattr(fmha_module, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
-    monkeypatch.setattr(fmha_module, "get_kv_page_offset", Mock(return_value=8))
+    monkeypatch.setattr(block_sparse_fmha, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
+    monkeypatch.setattr(block_sparse_fmha, "get_kv_page_offset", Mock(return_value=8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=False))
     q_processed = torch.zeros((2, 2, 128), dtype=torch.bfloat16)
     kv_pool = torch.empty((16, 1, 64, 128), dtype=torch.bfloat16)
@@ -436,16 +450,19 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
         )
 
     wrapper.run.side_effect = snapshot
-    first_inputs = args.block_sparse_inputs
+    first_inputs = _get_block_sparse_inputs(args)
     fmha.run_generation(params)
     block_tables[:, 0].add_(10)
     params.sequence_lengths = torch.tensor([130, 194], dtype=torch.int32)
-    args.block_sparse_inputs = _inputs_type(
-        q_block_size=64,
-        kv_block_size=64,
-        max_blocks_per_row=2,
-        block_indptr=torch.tensor([[[0, 1]], [[1, 4]]], dtype=torch.int32),
-        block_indices=torch.tensor([3, 2, 1, 0], dtype=torch.int32),
+    _set_block_sparse_inputs(
+        args,
+        BlockSparseForwardInputs(
+            q_block_size=64,
+            kv_block_size=64,
+            max_blocks_per_row=2,
+            block_indptr=torch.tensor([[[0, 1]], [[1, 4]]], dtype=torch.int32),
+            block_indices=torch.tensor([3, 2, 1, 0], dtype=torch.int32),
+        ),
     )
     fmha.run_generation(params)
 
@@ -460,15 +477,14 @@ def test_paged_wrapper_uses_zero_copy_padded_row_stride_block_tables(monkeypatch
     torch.testing.assert_close(snapshots[0][2], torch.arange(8, dtype=torch.int32).view(2, 4))
     torch.testing.assert_close(snapshots[1][2], torch.arange(8, dtype=torch.int32).view(2, 4) + 10)
     assert snapshots[0][3] is first_inputs.block_indptr
-    assert snapshots[1][3] is args.block_sparse_inputs.block_indptr
+    assert snapshots[1][3] is _get_block_sparse_inputs(args).block_indptr
 
 
 def test_paged_block_tables_remain_live_across_graph_replay(monkeypatch) -> None:
     attention, fmha, q, metadata, args = _paged_case()
-    _inputs_type, fmha_module = _generic_api()
     wrapper = Mock()
-    monkeypatch.setattr(fmha_module, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
-    monkeypatch.setattr(fmha_module, "get_kv_page_offset", Mock(return_value=8))
+    monkeypatch.setattr(block_sparse_fmha, "_BlockSparsePagedTSWrapper", Mock(return_value=wrapper))
+    monkeypatch.setattr(block_sparse_fmha, "get_kv_page_offset", Mock(return_value=8))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
     q_processed = torch.zeros((2, 2, 128), dtype=torch.bfloat16)
     kv_pool = torch.empty((16, 1, 64, 128), dtype=torch.bfloat16)
@@ -520,6 +536,7 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
         shape=(2, 512),
     )
     metadata = SimpleNamespace(
+        kv_cache_manager=object(),
         kv_cache_block_offsets=SimpleNamespace(device=query_device, shape=(1, 2, 4)),
         max_num_requests=2,
         tokens_per_block=64,
@@ -543,6 +560,20 @@ def test_prepare_workspace_checks_capture_before_resize(monkeypatch) -> None:
     assert workspace.numel() == 0
 
 
+def test_prepare_workspace_skips_generation_layout_for_contiguous_requests(monkeypatch) -> None:
+    _attention, fmha, q, _k, _v, metadata, args = _contiguous_case()
+    layout = Mock()
+    monkeypatch.setattr(fmha, "_get_generation_workspace_layout", layout)
+    monkeypatch.setattr(torch.cuda, "device", Mock(return_value=nullcontext()))
+    fmha._multi_processor_count = 1
+    workspace = torch.empty(0, dtype=torch.uint8)
+
+    fmha.prepare_workspace(q, None, None, metadata, args, workspace)
+
+    layout.assert_not_called()
+    assert workspace.numel() == 0
+
+
 @_REQUIRES_PRIMTS_GPU
 @torch.no_grad()
 def test_real_gpu_raw_routes_and_token_mask_match_reference() -> None:
@@ -552,8 +583,7 @@ def test_real_gpu_raw_routes_and_token_mask_match_reference() -> None:
     v = torch.randn_like(k)
     token_mask = torch.ones(256, device="cuda", dtype=torch.bool)
     token_mask[[1, 63, 64, 95, 129, 190, 255]] = False
-    inputs_type, _ = _generic_api()
-    inputs = inputs_type(
+    inputs = BlockSparseForwardInputs(
         q_block_size=64,
         kv_block_size=64,
         max_blocks_per_row=3,
@@ -602,21 +632,22 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
     live_v_summary = initial_v_summary.clone()
     live_exact_bits = torch.tensor([[[[1]]]], device="cuda", dtype=torch.uint32)
 
-    inputs_type, fmha_module = _generic_api()
     attention = _Attention()
     attention.num_heads = attention.num_kv_heads = 1
-    fmha = fmha_module.PrimsTSBlockSparseFmha(attention)
+    fmha = block_sparse_fmha.PrimsTSBlockSparseFmha(attention)
     output = torch.empty_like(q).view(64, 128)
     args = AttentionForwardArgs(
         output=output,
         attention_input_type=AttentionInputType.context_only,
         attention_mask=PredefinedAttentionMask.FULL,
-        block_sparse_inputs=inputs_type(
-            q_block_size=64,
-            kv_block_size=64,
-            exact_block_bits=live_exact_bits,
-            k_summary=live_k_summary,
-            v_summary=live_v_summary,
+        sparse_runtime_params=SparseRuntimeParams(
+            block_sparse_inputs=BlockSparseForwardInputs(
+                q_block_size=64,
+                kv_block_size=64,
+                exact_block_bits=live_exact_bits,
+                k_summary=live_k_summary,
+                v_summary=live_v_summary,
+            ),
         ),
     )
     metadata = SimpleNamespace(
@@ -654,8 +685,7 @@ def test_real_gpu_paged_routes_use_live_length_below_capacity() -> None:
     v_cache = torch.randn_like(k_cache)
     page_indices = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int32)
     seq_lens_kv = torch.tensor([160], device="cuda", dtype=torch.int32)
-    inputs_type, _ = _generic_api()
-    inputs = inputs_type(
+    inputs = BlockSparseForwardInputs(
         q_block_size=64,
         kv_block_size=64,
         max_blocks_per_row=2,
@@ -688,3 +718,188 @@ def test_real_gpu_paged_routes_use_live_length_below_capacity() -> None:
     ).to(q.dtype)[None, :, None, :]
 
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+# Block-sparse FMHA support matrix (generic PrimTS block-sparse kernels):
+#
+#   GPU architecture       SM100 and SM103
+#   Compute phase          Contiguous prefill with separate Q/K/V and no KV cache;
+#                          fixed-query generation over a paged HND KV cache
+#   Attention type         MHA, MQA, and GQA; num_heads % num_kv_heads == 0
+#   Q/K/V head dimension   128
+#   Model dtype            BF16 or FP16; Q, K/V, and output share one dtype
+#   Route format           BSR (block_indptr [B, Hkv, num_q_blocks + 1] plus flat
+#                          block IDs) or a packed block bitmask, optionally with
+#                          K/V block summaries for proxy routes (contiguous only)
+#   KV block size          8, 16, 32, or a positive multiple of 64 (contiguous);
+#                          a positive multiple of 64 (paged)
+#   KV-cache layout        Paged HND; page size 64 or 128 (a page holds at least
+#                          one 64-token route fragment)
+#   Attention semantics    Dense or causal; proxy routes require dense
+
+_REAL_GPU_DTYPES = (torch.float16, torch.bfloat16)
+# (num_heads, num_kv_heads): MHA, GQA, and MQA head topologies.
+_REAL_GPU_HEAD_TOPOLOGIES = ((1, 1), (8, 8), (8, 2), (8, 1))
+_REAL_GPU_KV_BLOCK_SIZES = (64, 128)
+_REAL_GPU_PAGE_SIZES = (64, 128)
+
+
+def _bsr_routes_per_kv_head(
+    num_kv_heads: int,
+    num_q_blocks: int,
+    num_kv_blocks: int,
+    num_selected: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[list[list[int]]]]:
+    """Build head-dependent, increasing BSR routes and the selection per (head, q block)."""
+    selections: list[list[list[int]]] = []
+    indptr = torch.zeros((1, num_kv_heads, num_q_blocks + 1), dtype=torch.int32)
+    indices: list[int] = []
+    for head_idx in range(num_kv_heads):
+        head_selection = []
+        indptr[0, head_idx, 0] = len(indices)
+        for q_block in range(num_q_blocks):
+            start = (head_idx + q_block) % num_kv_blocks
+            selected = sorted({(start + step) % num_kv_blocks for step in range(num_selected)})
+            indices.extend(selected)
+            indptr[0, head_idx, q_block + 1] = len(indices)
+            head_selection.append(selected)
+        selections.append(head_selection)
+    return indptr.cuda(), torch.tensor(indices, dtype=torch.int32, device="cuda"), selections
+
+
+def _reference_block_sparse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    selections: list[list[list[int]]],
+    *,
+    q_block_size: int,
+    kv_block_size: int,
+    seq_len_kv: int,
+) -> torch.Tensor:
+    """Dense reference with a per-(kv head, q block) block mask; Q/K/V are [1, S, H, D]."""
+    num_heads, num_kv_heads = q.shape[2], k.shape[2]
+    heads_per_kv = num_heads // num_kv_heads
+    key_blocks = torch.arange(seq_len_kv, device=q.device) // kv_block_size
+    outputs = []
+    for head_idx in range(num_heads):
+        kv_head = head_idx // heads_per_kv
+        allowed = torch.zeros((q.shape[1], seq_len_kv), device=q.device, dtype=torch.bool)
+        for q_block, selected in enumerate(selections[kv_head]):
+            rows = slice(q_block * q_block_size, (q_block + 1) * q_block_size)
+            allowed[rows] = torch.isin(key_blocks, torch.tensor(selected, device=q.device))
+        scores = (q[0, :, head_idx].float() @ k[0, :seq_len_kv, kv_head].float().T) * (
+            q.shape[-1] ** -0.5
+        )
+        probs = torch.softmax(scores.masked_fill(~allowed, float("-inf")), dim=-1)
+        outputs.append(probs @ v[0, :seq_len_kv, kv_head].float())
+    return torch.stack(outputs, dim=1).to(q.dtype)[None]
+
+
+@_REQUIRES_PRIMTS_GPU
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", _REAL_GPU_DTYPES, ids=lambda d: str(d).removeprefix("torch."))
+@pytest.mark.parametrize("num_heads,num_kv_heads", _REAL_GPU_HEAD_TOPOLOGIES)
+@pytest.mark.parametrize("kv_block_size", _REAL_GPU_KV_BLOCK_SIZES)
+def test_real_gpu_contiguous_routes_match_reference_across_topologies(
+    dtype: torch.dtype, num_heads: int, num_kv_heads: int, kv_block_size: int
+) -> None:
+    torch.manual_seed(7)
+    seq_len_q, seq_len_kv, q_block_size = 128, 512, 64
+    q = torch.randn((1, seq_len_q, num_heads, 128), device="cuda", dtype=dtype)
+    k = torch.randn((1, seq_len_kv, num_kv_heads, 128), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    num_kv_blocks = seq_len_kv // kv_block_size
+    block_indptr, block_indices, selections = _bsr_routes_per_kv_head(
+        num_kv_heads, seq_len_q // q_block_size, num_kv_blocks, num_selected=2
+    )
+
+    actual = prims_ts.block_sparse_attention(
+        q,
+        k,
+        v,
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+    )
+
+    expected = _reference_block_sparse(
+        q,
+        k,
+        v,
+        selections,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+        seq_len_kv=seq_len_kv,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@_REQUIRES_PRIMTS_GPU
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", _REAL_GPU_DTYPES, ids=lambda d: str(d).removeprefix("torch."))
+@pytest.mark.parametrize("num_heads,num_kv_heads", _REAL_GPU_HEAD_TOPOLOGIES)
+@pytest.mark.parametrize("kv_block_size", _REAL_GPU_KV_BLOCK_SIZES)
+@pytest.mark.parametrize("page_size", _REAL_GPU_PAGE_SIZES)
+def test_real_gpu_paged_routes_match_reference_across_topologies(
+    dtype: torch.dtype, num_heads: int, num_kv_heads: int, kv_block_size: int, page_size: int
+) -> None:
+    torch.manual_seed(11)
+    max_seq_len_kv, seq_len_kv = 512, 400
+    num_pages = max_seq_len_kv // page_size
+    q = torch.randn((1, 1, num_heads, 128), device="cuda", dtype=dtype)
+    k_cache = torch.randn((num_pages, num_kv_heads, page_size, 128), device="cuda", dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    page_indices = torch.randperm(num_pages, device="cuda").to(torch.int32)
+    num_kv_blocks = -(-seq_len_kv // kv_block_size)
+    block_indptr, block_indices, selections = _bsr_routes_per_kv_head(
+        num_kv_heads, 1, num_kv_blocks, num_selected=3
+    )
+
+    actual = prims_ts.block_sparse_attention_with_paged_kv_cache(
+        q,
+        (k_cache, v_cache),
+        block_tables=page_indices.view(1, num_pages),
+        seq_lens_kv=torch.tensor([seq_len_kv], device="cuda", dtype=torch.int32),
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        max_seq_len_kv=max_seq_len_kv,
+        q_block_size=64,
+        kv_block_size=kv_block_size,
+    )
+
+    logical_k = k_cache.index_select(0, page_indices.long()).permute(0, 2, 1, 3)
+    logical_k = logical_k.reshape(1, max_seq_len_kv, num_kv_heads, 128)
+    logical_v = v_cache.index_select(0, page_indices.long()).permute(0, 2, 1, 3)
+    logical_v = logical_v.reshape(1, max_seq_len_kv, num_kv_heads, 128)
+    expected = _reference_block_sparse(
+        q,
+        logical_k,
+        logical_v,
+        selections,
+        q_block_size=64,
+        kv_block_size=kv_block_size,
+        seq_len_kv=seq_len_kv,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_paged_support_rejects_pages_smaller_than_a_route_fragment() -> None:
+    page_size = 32
+    _attention, fmha, q, metadata, args = _paged_case()
+    metadata.tokens_per_block = page_size
+    metadata.max_seq_len = 4 * page_size
+    metadata.kv_lens_runtime = torch.tensor([page_size + 1, 3 * page_size], dtype=torch.int32)
+    args = AttentionForwardArgs(
+        output=args.output,
+        attention_input_type=args.attention_input_type,
+        attention_mask=args.attention_mask,
+        attention_window_size=metadata.max_seq_len,
+        is_fused_qkv=True,
+        sparse_runtime_params=args.sparse_runtime_params,
+    )
+
+    reason = fmha._paged_unsupported_reason(q, metadata, args)
+
+    assert reason == "atom_size must not exceed page_size"

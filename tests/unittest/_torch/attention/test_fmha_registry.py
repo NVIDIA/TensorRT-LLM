@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import pytest
-import torch
 
 from tensorrt_llm._torch.attention.backends.fmha import registry
 from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
@@ -47,20 +46,10 @@ def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> 
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
 
 
-@pytest.mark.parametrize("name", [PRIMS_TS, "fallback"])
-def test_dense_fmhas_reject_unconsumed_block_sparse_inputs(name: str) -> None:
-    attention = type("Attention", (), {})()
-    fmha = object.__new__(registry.FMHA_LIBS[name])
-    Fmha.__init__(fmha, attention)
-    forward_args = type("ForwardArgs", (), {"block_sparse_inputs": object()})()
-
-    assert not fmha.is_supported(
-        torch.empty((1, 4), dtype=torch.bfloat16),
-        None,
-        None,
-        object(),
-        forward_args,
-    )
+def test_only_the_block_sparse_fmha_declares_block_sparse_support() -> None:
+    assert Fmha.supports_block_sparse_inputs is False
+    for name, fmha_cls in registry.FMHA_LIBS.items():
+        assert fmha_cls.supports_block_sparse_inputs is (name == PRIMS_TS_BLOCK_SPARSE), name
 
 
 @pytest.mark.parametrize("value", ["", "   ", ", ,"])

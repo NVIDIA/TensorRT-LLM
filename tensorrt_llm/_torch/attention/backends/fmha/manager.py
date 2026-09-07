@@ -367,7 +367,7 @@ class FmhaManager:
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
             )
 
-        block_sparse_inputs = forward_args.block_sparse_inputs
+        block_sparse_inputs = forward_args.sparse_runtime_params.block_sparse_inputs
         return _FmhaCacheKey(
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,

@@ -155,9 +155,12 @@ their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
 pass it through the registered `AttentionForwardArgs.sparse_backend_args`
 field. For example, DSA owns `DSABackendForwardArgs`, whose indexer
 intermediates are consumed by `DSATrtllmAttention.sparse_attn_predict`.
-Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices` and
-the backend-to-AttentionOp `SparseRuntimeParams`, live in
-`attention/backends/sparse/params.py`.
+Shared sparse carriers, including `SparseBackendForwardArgs.topk_indices`,
+`SparseBackendForwardArgs.block_sparse_inputs`, and the
+backend-to-FMHA/`AttentionOp` `SparseRuntimeParams`, live in
+`attention/backends/sparse/params.py`. The latter is carried by
+`AttentionForwardArgs.sparse_runtime_params` and nests optional general
+block-sparse inputs in `SparseRuntimeParams.block_sparse_inputs`.
 
 For MLA-related tasks, first check whether the work fits the current
 projection structure, can stay on an existing backend and metadata family, and
@@ -213,17 +216,32 @@ registration alone.
 
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral
-`BlockSparseForwardInputs`: block geometry plus either canonical BSR routes or
-an exact packed bitmask. Optional K/V summaries enable proxy routes, and
-optional token-validity bits mask ragged KV tails. Plans contain only static
-format, proxy, geometry, and capacity choices; every run receives the live
-routes, summaries, validity bits, page tables, and sequence lengths.
+`BlockSparseForwardInputs`, nested at
+`SparseRuntimeParams.block_sparse_inputs`: block geometry plus either canonical
+BSR routes or an exact packed bitmask. Optional K/V summaries enable proxy
+routes, and optional token-validity bits mask ragged KV tails. Plans contain
+only static format, proxy, geometry, and capacity choices; every run receives
+the live routes, summaries, validity bits, page tables, and sequence lengths.
 
 `PrimsTSBlockSparseFmha` owns its wrapper-plan cache by default. Integrations
 whose attention layers execute serially may explicitly bind a model-scoped
 cache to reuse graph-stable route workspaces across compatible layers. The
 cache must not be shared by concurrent forwards; each independent model
 component must own separate state.
+
+`TrtllmAttention.block_sparse_attn_predict(q, k, v, metadata, forward_args)`
+is the backend hook that produces this payload; `prepare_sparse_runtime_params`
+calls it even when the backend has no `SparseParams`. The default hands through
+`SparseBackendForwardArgs.block_sparse_inputs`, which lets an attention module
+predict routes before the core forward and pass the complete payload in
+`AttentionForwardArgs.sparse_backend_args`. Algorithms that predict inside the
+backend override the hook and return `None` for dense phases.
+
+The core library owns this general planning, validation, and execution
+contract. Algorithm integrations own the surrounding lifecycle: prediction
+policy, effective Q/K/V preparation before the core forward, plus any
+algorithm-specific post-processing afterward. They route their payload through
+these hooks instead of adding algorithm-specific FMHA libraries.
 
 ### 2.3 Backend contract
 
@@ -365,15 +383,22 @@ preserve its routing semantics. Delta entries update the
 default membership and follow canonical registry order, while an exact list
 preserves the user-specified order. Each FMHA library exposes `is_available()`
 for module/static environment checks and `is_supported()` for per-forward
-request checks. `AttentionForwardArgs.block_sparse_inputs` is exclusive: the
-block-sparse implementation validates and consumes it, while every other
-library rejects it rather than silently dropping sparse routing semantics.
+request checks. `AttentionForwardArgs.sparse_runtime_params` is the sole
+per-call lowered sparse runtime carrier and defaults to an empty
+`SparseRuntimeParams()`. The core forward overwrites that field with the carrier
+that `prepare_sparse_runtime_params` builds from the caller's carrier plus the
+hook results. The carrier holds both flat `AttentionOp` parameters and optional
+`BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
+`Fmha.is_supported()` rejects a request that carries routes for every library
+that does not declare `supports_block_sparse_inputs`, so no dense kernel can
+silently drop the routing semantics.
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
-class attributes, such as `supports_skip_correction`, and override only
+class attributes, such as `supports_skip_correction` and
+`supports_block_sparse_inputs`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared

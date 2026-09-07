@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
-from .interface import Fmha, FmhaPhase
+from .interface import Fmha
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -59,19 +59,6 @@ class FlashInferSparseMlaFmha(Fmha):
         if not attn.is_mla_enable or getattr(attn, "kv_cache_dtype", None) != "fp8_ds_mla":
             return False
         return is_flashinfer_sparse_mla_enabled(getattr(attn.sparse_params, "algorithm", None))
-
-    def _is_supported(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: AttentionForwardArgs,
-        *,
-        phase: Optional[FmhaPhase] = None,
-    ) -> bool:
-        del q, k, v, metadata, phase
-        return forward_args.block_sparse_inputs is None
 
     def forward(
         self,

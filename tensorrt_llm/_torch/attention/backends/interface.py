@@ -32,8 +32,8 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
-from .sparse.params import (BlockSparseForwardInputs, SparseBackendForwardArgs,
-                            SparseMetadataParams, SparseRuntimeParams)
+from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
+                            SparseRuntimeParams)
 
 try:
     # Transformers v5
@@ -964,7 +964,6 @@ class AttentionForwardArgs:
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
 
-    block_sparse_inputs: Optional[BlockSparseForwardInputs] = None
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
         default_factory=SparseRuntimeParams)
