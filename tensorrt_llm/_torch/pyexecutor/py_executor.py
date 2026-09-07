@@ -684,8 +684,16 @@ class PyExecutor:
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
+        #
+        # The router's overlap correction spends sequence-slot headroom, so it is
+        # handed the engine's headroom flag rather than re-deriving the
+        # predicate: the flag is what sized the seat pool, and it withholds the
+        # headroom for architectures (hybrid/SSM) whose state-slot pool is not
+        # sized from that number. Absent flag => no headroom => no correction.
         self.adp_router: ADPRouter = ADPRouter.create(
             dist=self.dist,
+            has_seq_slot_headroom=getattr(
+                model_engine, "_enable_adp_overlap_seq_slot_headroom", False),
             kv_cache_manager=self.kv_cache_manager,
             attention_dp_config=self.llm_args.attention_dp_config,
             async_transfer_manager=self.async_transfer_manager,

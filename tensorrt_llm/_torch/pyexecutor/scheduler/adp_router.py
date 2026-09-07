@@ -227,31 +227,50 @@ class ADPRouter(ABC):
 
     needs_prefix_matches: bool = False
 
-    def __init__(self, dist: Distributed):
+    def __init__(self, dist: Distributed, has_seq_slot_headroom: bool = True):
         self.dist = dist
         # Whether to route on the overlap-corrected active list (nvbug-6627795).
         #
-        # Gated off under pipeline parallelism, deliberately matching
-        # ``should_enable_adp_overlap_seq_slot_headroom`` in ``_util.py``: the
-        # correction lets a rank hold more requests than it is charged for, so
-        # it is only safe where the sequence-slot pool has the matching
-        # headroom, and that headroom is sized for non-PP only. Beyond the slot
-        # accounting, ``GENERATION_TO_COMPLETE`` is marked on the last pipeline
-        # stage alone, while every rank pops from its own copy of the waiting
-        # queue -- so a PP-enabled correction would have the stages admit
-        # different numbers of requests and diverge.
+        # This is the *model engine's* headroom flag, passed in rather than
+        # re-derived here, because the two must never disagree:
         #
-        # Not additionally gated on ``disable_overlap_scheduler``: without
-        # overlap the retire is not deferred, so no request is ever in
-        # ``GENERATION_TO_COMPLETE`` when the router runs and the filter is
-        # arithmetically a no-op (measured: zero such requests on 5126/5126
-        # routing records with overlap disabled).
-        self.exclude_retiring_requests = not dist.mapping.has_pp()
+        # 1. The correction lets a rank hold more requests than it is charged
+        #    for, so it is only sound where the sequence-slot pool has matching
+        #    headroom. That pool is sized by
+        #    ``_util.compute_max_num_sequences`` from the same flag
+        #    (``should_enable_adp_overlap_seq_slot_headroom``), which withholds
+        #    the headroom from hybrid/SSM architectures whose state-slot pool is
+        #    sized from ``max_batch_size`` alone. Re-deriving the predicate here
+        #    -- as ``not dist.mapping.has_pp()`` used to -- is exactly how the
+        #    router comes to credit a rank with seats the engine never
+        #    allocated.
+        # 2. Pipeline parallelism is excluded by that same flag, and the reason
+        #    is no longer the sizing -- the seat pool is well defined under PP at
+        #    ``(pp_size + 1) * max_batch_size``. It is that the stages must agree
+        #    on *which* requests are retiring: each rank pops from its own copy
+        #    of the waiting queue, so a per-stage disagreement makes them admit
+        #    different numbers of requests and diverge. Only the last stage marks
+        #    ``GENERATION_TO_COMPLETE`` for generation requests today. Note the
+        #    *context* path in ``_update_request_states_tp`` already evaluates the
+        #    same predicate on every rank, so the asymmetry is only ever in the
+        #    generation path.
+        #
+        # Not additionally gated on ``disable_overlap_scheduler`` here: the flag
+        # already is, and without overlap the retire is not deferred, so no
+        # request is ever in ``GENERATION_TO_COMPLETE`` when the router runs and
+        # the filter is arithmetically a no-op (measured: zero such requests on
+        # 5126/5126 routing records with overlap disabled).
+        #
+        # Erring off is the safe direction: excluding fewer retirees admits
+        # fewer requests (a missed optimization), while excluding more than the
+        # seat pool covers is a slot exhaustion or a stage divergence.
+        self.exclude_retiring_requests = has_seq_slot_headroom
 
     @classmethod
     def create(
         cls,
         dist: "Distributed",
+        has_seq_slot_headroom: bool,
         kv_cache_manager=None,
         attention_dp_config=None,
         async_transfer_manager=None,
@@ -260,6 +279,14 @@ class ADPRouter(ABC):
 
         Args:
             dist: Distributed communicator.
+            has_seq_slot_headroom: Whether the executor's sequence-slot pool was
+                sized with the overlap headroom
+                (``should_enable_adp_overlap_seq_slot_headroom``). Required, not
+                defaulted, because the router's retiring-request correction is
+                only sound when those extra seats exist -- see
+                ``__init__``. Passed through from
+                ``model_engine._enable_adp_overlap_seq_slot_headroom`` so the
+                sizing and the routing decision cannot drift apart.
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
             async_transfer_manager: PyExecutor's AsyncTransferManager, used by
@@ -281,6 +308,7 @@ class ADPRouter(ABC):
             # KV-cache-aware path and takes precedence when both are enabled.
             return ConversationAwareADPRouter(
                 dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
                 max_sessions=attention_dp_config.kv_cache_routing_max_sessions,
                 fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
                 new_conv_placement=attention_dp_config.kv_cache_routing_new_conv_placement,
@@ -294,6 +322,7 @@ class ADPRouter(ABC):
         ):
             return KVCacheAwareADPRouter(
                 dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
                 kv_cache_manager=kv_cache_manager,
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
                 match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
@@ -303,7 +332,7 @@ class ADPRouter(ABC):
                 account_for_in_transfer=attention_dp_config.kv_cache_routing_account_for_in_transfer,
             )
 
-        return DefaultADPRouter(dist=dist)
+        return DefaultADPRouter(dist=dist, has_seq_slot_headroom=has_seq_slot_headroom)
 
     @abstractmethod
     def create_rank_state(
@@ -607,6 +636,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         self,
         dist: "Distributed",
         kv_cache_manager,
+        has_seq_slot_headroom: bool = True,
         load_balance_weight: float = 1.0,
         match_rate_threshold: float = 0.1,
         fair_share_multiplier: float = 2.0,
@@ -614,7 +644,7 @@ class KVCacheAwareADPRouter(ADPRouter):
         async_transfer_manager=None,
         account_for_in_transfer: bool = False,
     ):
-        super().__init__(dist)
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
         self.match_rate_threshold = match_rate_threshold
@@ -912,11 +942,12 @@ class ConversationAwareADPRouter(ADPRouter):
     def __init__(
         self,
         dist: "Distributed",
+        has_seq_slot_headroom: bool = True,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         fair_share_multiplier: float = 2.0,
         new_conv_placement: str = "round_robin",
     ):
-        super().__init__(dist)
+        super().__init__(dist, has_seq_slot_headroom=has_seq_slot_headroom)
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))

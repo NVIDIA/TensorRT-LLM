@@ -572,6 +572,25 @@ def get_mtp_hidden_size(model_config) -> int:
     return hidden_size
 
 
+def seat_pool_or_none(model_engine) -> Optional[int]:
+    """The engine's sequence-slot pool size, or None to keep max_batch_size.
+
+    Pools keyed by live-request identity must follow the executor's
+    SeqSlotManager pool rather than max_batch_size: the overlap scheduler holds a
+    finished request's slot for one more iteration while its replacement is
+    admitted, so the transient demand exceeds max_batch_size (nvbug-6627795).
+    Buffers indexed by *batch position* deliberately keep max_batch_size -- the
+    micro-batch scheduler caps every forward at max_batch_size.
+
+    Gated on the same flag ``_set_up_spec_metadata`` reads, so every spec-decoding
+    pool agrees with the metadata about which number it is indexed by. Returning
+    None (headroom off) preserves the established max_batch_size sizing.
+    """
+    if not getattr(model_engine, "_enable_adp_overlap_seq_slot_headroom", False):
+        return None
+    return getattr(model_engine, "max_num_seq_slots", None)
+
+
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
     spec_config = model_engine.spec_config
     if spec_config is None:
@@ -580,19 +599,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_requests = model_engine.batch_size
     max_seq_len = model_engine.max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    # Pools keyed by live-request identity must follow the executor's
-    # SeqSlotManager pool rather than max_batch_size: the attention-DP overlap
-    # headroom makes it 2 * max_batch_size so a finished request can hold its slot
-    # for one more iteration while its replacement is admitted (nvbug-6627795).
-    # Buffers indexed by *batch position* deliberately keep max_num_requests --
-    # the micro-batch scheduler caps every forward at max_batch_size.
-    #
-    # Opted into by the same flag ``_set_up_spec_metadata`` uses, so the manager
-    # and the metadata never disagree about the pool. None (the other topologies,
-    # PP included) preserves the established max_num_requests sizing.
-    num_seq_slots = None
-    if getattr(model_engine, "_enable_adp_overlap_seq_slot_headroom", False):
-        num_seq_slots = getattr(model_engine, "max_num_seq_slots", None)
+    num_seq_slots = seat_pool_or_none(model_engine)
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         sa_manager = None
@@ -760,6 +767,16 @@ def get_spec_drafter(model_engine,
         return spec_config.drafter
 
     max_num_requests = model_engine.batch_size
+    # The draft loop runs its own slot pool, but the indices it hands out address
+    # buffers sized by the *target* engine's seat pool: the shared sampler
+    # (instantiate_sampler), the draft KV cache manager's IndexMapper
+    # (KvCacheCreator._target_max_num_seq_slots) and spec_resource_manager above.
+    # It must therefore be sized from the same number. It is also load-bearing,
+    # not merely tidy: the previous draft batch's slots are released by
+    # cleanup_previous_draft_resources a full iteration later
+    # (py_executor.py:5347), so a pool of max_batch_size raises NoFreeSlotsError
+    # precisely when the overlap headroom is doing its job.
+    draft_slots = seat_pool_or_none(model_engine) or max_num_requests
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
@@ -767,7 +784,7 @@ def get_spec_drafter(model_engine,
                             draft_model_engine,
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1,
-                            SeqSlotManager(max_num_requests),
+                            SeqSlotManager(draft_slots),
                             sampler,
                             spec_resource_manager=spec_resource_manager,
                             guided_decoder=guided_decoder)

@@ -7,6 +7,7 @@ Tests for:
 - Strict/relaxed attention-DP request routing while respecting rank capacity
 """
 
+import inspect
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -417,16 +418,16 @@ class TestDefaultADPRouter:
         assert states[0].num_active_tokens == 0
         assert states[0].num_retiring_requests == 2
 
-    def test_gather_all_rank_states_keeps_retiring_under_pp(self):
-        # Under pipeline parallelism the correction is off, matching the
-        # sequence-slot headroom gate in _util.py. Two reasons it must stay off:
-        # the slot pool is sized pp_size * max_batch_size with no headroom for
-        # requests a rank holds but is not charged for, and
-        # GENERATION_TO_COMPLETE is marked on the last stage only while every
-        # rank pops from its own copy of the waiting queue -- so a corrected
-        # count would have the stages admit different numbers of requests.
+    def test_gather_all_rank_states_keeps_retiring_without_headroom(self):
+        # Without seat headroom the correction is off, whatever the topology.
+        # The correction lets a rank hold more requests than it is charged for,
+        # so it is only sound when the sequence-slot pool was sized with the
+        # extra generation of seats -- e.g. hybrid/SSM architectures are excluded
+        # from the headroom because their state-slot pool is sized from
+        # max_batch_size alone, and the router must follow that exclusion rather
+        # than re-derive its own predicate.
         dist = _mock_dist(tp_rank=0, has_cp_helix=False, has_pp=True)
-        router = DefaultADPRouter(dist=dist)
+        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=False)
         assert router.exclude_retiring_requests is False
         active = [
             Mock(py_orig_prompt_len=100, state=LlmRequestState.GENERATION_IN_PROGRESS),
@@ -443,11 +444,76 @@ class TestDefaultADPRouter:
         assert states[0].num_retiring_requests == 0
         assert states[0].num_active_tokens == 600
 
-    def test_exclude_retiring_requests_follows_pipeline_parallelism(self):
+    def test_exclude_retiring_requests_follows_the_seat_pool_headroom(self):
         # The flag is the single gate; _pad_attention_dp_dummy_request reads it
         # rather than re-deriving the predicate, so the two cannot drift.
-        assert DefaultADPRouter(dist=_mock_dist(has_pp=False)).exclude_retiring_requests is True
-        assert DefaultADPRouter(dist=_mock_dist(has_pp=True)).exclude_retiring_requests is False
+        #
+        # It tracks the *engine's* headroom flag and nothing else. It used to be
+        # `not dist.mapping.has_pp()`, which was a second derivation of the same
+        # fact: correct only as long as the sizing gate happened to exclude
+        # exactly PP. Once the sizing gate also excluded hybrid architectures the
+        # two disagreed, and the router credited a rank with seats that were
+        # never allocated. Pipeline parallelism is now in scope on both sides.
+        for has_pp in (False, True):
+            dist = _mock_dist(has_pp=has_pp)
+            assert (
+                DefaultADPRouter(dist=dist, has_seq_slot_headroom=True).exclude_retiring_requests
+                is True
+            )
+            assert (
+                DefaultADPRouter(dist=dist, has_seq_slot_headroom=False).exclude_retiring_requests
+                is False
+            )
+
+    def test_router_factory_requires_the_headroom_flag(self):
+        # Required rather than defaulted: a caller that silently got the
+        # aggressive behaviour would be re-introducing the skew this parameter
+        # exists to remove. There is exactly one production call site
+        # (PyExecutor.__init__), which passes the engine's flag.
+        params = inspect.signature(ADPRouter.create).parameters
+        assert params["has_seq_slot_headroom"].default is inspect.Parameter.empty
+
+    @pytest.mark.parametrize("has_seq_slot_headroom", [True, False])
+    def test_router_factory_propagates_the_headroom_flag(self, has_seq_slot_headroom):
+        # Every branch of the factory, not just the default one: the KV-cache-
+        # aware and conversation-affinity routers run the same admission
+        # correction and need the same gate.
+        dist = _mock_dist(tp_size=2)
+        mgr = Mock(enable_block_reuse=True)
+        configs = [
+            None,
+            Mock(
+                kv_cache_routing_conversation_affinity=False,
+                enable_kv_cache_aware_routing=True,
+                kv_cache_routing_load_balance_weight=1.0,
+                kv_cache_routing_match_rate_threshold=0.1,
+                kv_cache_routing_fair_share_multiplier=2.0,
+                kv_cache_routing_cold_start_warmup=False,
+                kv_cache_routing_account_for_in_transfer=False,
+            ),
+            Mock(
+                kv_cache_routing_conversation_affinity=True,
+                kv_cache_routing_max_sessions=1 << 16,
+                kv_cache_routing_fair_share_multiplier=2.0,
+                kv_cache_routing_new_conv_placement="round_robin",
+            ),
+        ]
+        built = set()
+        for attention_dp_config in configs:
+            router = ADPRouter.create(
+                dist=dist,
+                has_seq_slot_headroom=has_seq_slot_headroom,
+                kv_cache_manager=mgr,
+                attention_dp_config=attention_dp_config,
+            )
+            built.add(type(router).__name__)
+            assert router.exclude_retiring_requests is has_seq_slot_headroom
+        # Anti-vacuity: the three configs must actually reach three branches.
+        assert built == {
+            "DefaultADPRouter",
+            "KVCacheAwareADPRouter",
+            "ConversationAwareADPRouter",
+        }
 
     def test_create_rank_state_cp_helix(self):
         dist = _mock_dist(tp_rank=1, has_cp_helix=True)
@@ -1443,10 +1509,18 @@ class TestConversationAwareADPRouter:
         assert states[0].num_active_tokens == 100
 
     def test_factory_selects_conversation_router(self):
+        # has_seq_slot_headroom is required rather than defaulted (see
+        # test_router_factory_requires_the_headroom_flag), so every call site states
+        # it -- including the ones that are only about which class gets built.
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert isinstance(router, ConversationAwareADPRouter)
         assert router._max_sessions == 8
         # A mocked (non-string) placement value must fall back to round_robin.
@@ -1501,7 +1575,12 @@ class TestConversationAwareADPRouter:
         cfg.kv_cache_routing_conversation_affinity = True
         cfg.kv_cache_routing_max_sessions = 8
         cfg.kv_cache_routing_new_conv_placement = "least_queued"
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert router._new_conv_placement == "least_queued"
         bad = ConversationAwareADPRouter(dist=_mock_dist(tp_size=4), new_conv_placement="banana")
         assert bad._new_conv_placement == "round_robin"
@@ -1510,7 +1589,12 @@ class TestConversationAwareADPRouter:
         cfg = MagicMock()
         cfg.kv_cache_routing_conversation_affinity = False
         cfg.enable_kv_cache_aware_routing = False
-        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        router = ADPRouter.create(
+            dist=_mock_dist(),
+            has_seq_slot_headroom=True,
+            kv_cache_manager=None,
+            attention_dp_config=cfg,
+        )
         assert isinstance(router, DefaultADPRouter)
 
     def test_returned_expected_covers_every_rank(self):

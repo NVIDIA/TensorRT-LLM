@@ -896,6 +896,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        max_num_seq_slots: Optional[int] = None,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         **kwargs,
@@ -1399,17 +1400,45 @@ class KVCacheManagerV2(BaseResourceManager):
         # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
+        #
+        # `max_num_seq_slots` is the executor's sequence-slot pool size
+        # (`PyTorchModelEngine.max_num_seq_slots`, sized by
+        # `_util.compute_max_num_sequences`). An index slot and a sequence slot are
+        # both leases held for the whole lifetime of a request, so whenever the
+        # executor can admit N concurrent sequences the index mapper must be able
+        # to hand out N indices. Under the overlap scheduler with attention DP the
+        # seat pool carries an extra factor of 2 because teardown of the retiring
+        # batch (`_process_previous_batch`) happens *after* the replacement batch
+        # has already been scheduled, so both cohorts hold their leases at once.
+        # Without this term the index mapper runs dry and `_create_kv_cache`
+        # silently defers requests one at a time (nvbug 6627795).
+        #
+        # Take the larger of the two bounds rather than multiplying them: the
+        # disagg and overlap coefficients each cover one extra set of in-flight
+        # sequences, so they overlap rather than compose.
         max_num_sequences = max_batch_size * mapping.pp_size
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         index_mapper_capacity = (
-            max_num_sequences * (2 if is_disagg else 1) + num_reserved_index_slots
+            max(max_num_sequences * (2 if is_disagg else 1), max_num_seq_slots or 0)
+            + num_reserved_index_slots
         )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
+            f"max_num_seq_slots={max_num_seq_slots}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
             f"max_beam_width={max_beam_width})"
         )
+        # Concurrent sequences this manager can seat: the index pool net of the
+        # slots reserved for padding/dummy requests, which are not available to
+        # real sequences. Published so that
+        # `_util.validate_seq_slot_pool_covers_admission` can compare it against
+        # the executor's sequence-slot pool without re-deriving either number --
+        # every skew between the two is a bug, in both directions (a smaller
+        # index pool defers requests one at a time, a larger one lets a request
+        # be admitted that cannot be seated and `SlotManager.add_slot` then
+        # raises on the executor's event loop).
+        self.max_admissible_sequences = index_mapper_capacity - num_reserved_index_slots
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)

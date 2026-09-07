@@ -37,8 +37,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
-                    validate_feature_combination)
+                    create_py_executor_instance, instantiate_sampler,
+                    is_disagg_enabled, is_mla, validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_vswa_kv_cache_layout)
@@ -756,14 +756,17 @@ def create_py_executor(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
-                guided_decoder_slots = (max_num_seq_slots if getattr(
-                    model_engine, "_enable_adp_overlap_seq_slot_headroom",
-                    False) else max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # The attention-DP overlap path follows the expanded slot
-                    # pool. Other configurations retain max_batch_size.
-                    "max_num_sequences": guided_decoder_slots,
+                    # Unconditionally the seat pool. The guided decoder's state
+                    # is indexed by py_seq_slot (guided_decoder.py: grammar_matchers
+                    # [req.seq_slot], the bitmask rows), and py_seq_slot ranges over
+                    # the whole pool -- so sizing this at max_batch_size is an
+                    # IndexError under pipeline parallelism, where admission already
+                    # permits max_batch_size * pp_size live requests. The previous
+                    # conditional made the correct size depend on an unrelated
+                    # attention-DP flag.
+                    "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -874,8 +877,10 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        is_disagg = (cache_transceiver_config is not None
-                     and cache_transceiver_config.backend is not None)
+        # Same helper the model engine sizes its seat pool with: this predicate
+        # feeds KVCacheManagerV2's index-pool coefficient, so an independent copy
+        # here could disagree with the seat pool by a factor of 2.
+        is_disagg = is_disagg_enabled(cache_transceiver_config)
         is_hybrid = is_hybrid_linear(
             model_engine.model.model_config.pretrained_config)
 
