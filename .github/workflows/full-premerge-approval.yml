@@ -44,7 +44,7 @@ jobs:
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         startsWith(github.event.workflow_run.display_title,
-                   'Review approved for PR #')))
+                   'Full approval re-check for PR #')))
     runs-on: ubuntu-latest
     steps:
       - name: Download full approval signal

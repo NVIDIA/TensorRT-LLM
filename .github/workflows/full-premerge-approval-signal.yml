@@ -14,11 +14,11 @@
 # limitations under the License.
 
 name: Full Pre-Merge Approval Signal
-run-name: "Review ${{ github.event.review.state }} for PR #${{ github.event.pull_request.number }}"
+run-name: "Full approval re-check for PR #${{ github.event.pull_request.number }}"
 
 on:
   pull_request_review:
-    types: [submitted]
+    types: [submitted, dismissed]
 
 permissions:
   pull-requests: read
@@ -27,7 +27,8 @@ jobs:
   evaluate-full-approval:
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
-      github.event.review.state == 'approved'
+      (github.event.action == 'dismissed' ||
+       github.event.review.state == 'approved')
     runs-on: ubuntu-latest
     steps:
       - name: Publish approval candidate
