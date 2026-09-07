@@ -586,7 +586,8 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     pool agrees with the metadata about which number it is indexed by. Returning
     None (headroom off) preserves the established max_batch_size sizing.
     """
-    if not getattr(model_engine, "_enable_adp_overlap_seq_slot_headroom", False):
+    if not getattr(model_engine, "_enable_adp_overlap_seq_slot_headroom",
+                   False):
         return None
     return getattr(model_engine, "max_num_seq_slots", None)
 

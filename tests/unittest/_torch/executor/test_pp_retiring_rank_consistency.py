@@ -50,7 +50,9 @@ class _StageLocalRequest:
     state that lives on the last stage.
     """
 
-    def __init__(self, num_generated_tokens: int, max_new_tokens: int, tokens_per_iteration: int = 1):
+    def __init__(
+        self, num_generated_tokens: int, max_new_tokens: int, tokens_per_iteration: int = 1
+    ):
         self.num_generated_tokens = num_generated_tokens
         self.max_new_tokens = max_new_tokens
         self.tokens_per_iteration = tokens_per_iteration
@@ -78,7 +80,8 @@ def _mark(requests) -> None:
     from both loops without any stage-local context.
     """
     PyExecutor._update_generation_requests_that_will_complete_next_iteration(
-        SimpleNamespace(), requests)
+        SimpleNamespace(), requests
+    )
 
 
 EXPECTED_RETIRING = 2
@@ -105,7 +108,9 @@ def test_every_stage_derives_the_same_retiring_count(pp_size):
     # Stronger than the count: the same *requests* are marked on every stage, so
     # each rank subtracts the same load, not merely the same amount of it.
     marked = {
-        tuple(i for i, req in enumerate(batch) if req.state == LlmRequestState.GENERATION_TO_COMPLETE)
+        tuple(
+            i for i, req in enumerate(batch) if req.state == LlmRequestState.GENERATION_TO_COMPLETE
+        )
         for batch in stages
     }
     assert len(marked) == 1
@@ -187,6 +192,8 @@ def test_marking_stays_paired_with_the_state_update_on_both_paths():
         source = inspect.getsource(func)
         assert "_update_generation_requests_that_will_complete_next_iteration" in source, (
             f"{func.__name__} does not mark retiring generation requests; the ADP "
-            "router's admission correction would then diverge between stages")
+            "router's admission correction would then diverge between stages"
+        )
         assert source.index("_update_request_states") < source.index(
-            "_update_generation_requests_that_will_complete_next_iteration")
+            "_update_generation_requests_that_will_complete_next_iteration"
+        )

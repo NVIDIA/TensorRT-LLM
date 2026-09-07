@@ -104,9 +104,7 @@ def test_adp_overlap_seq_slot_headroom_gate(
     )
 
     assert (
-        should_enable_adp_overlap_seq_slot_headroom(
-            mapping, disable_overlap, is_hybrid=is_hybrid
-        )
+        should_enable_adp_overlap_seq_slot_headroom(mapping, disable_overlap, is_hybrid=is_hybrid)
         is expected
     )
 

@@ -28,6 +28,7 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError
 from tensorrt_llm._torch.speculative.eagle3 import (
     Eagle3OneModelDynamicTreeResourceManager,
     Eagle3ResourceManager,
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager
 from tensorrt_llm._torch.speculative.mtp_dynamic_tree import MTPEagleDynamicTreeResourceManager
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError
 from tensorrt_llm._torch.speculative.utils import (
     _build_spec_metadata,
     get_spec_drafter,
