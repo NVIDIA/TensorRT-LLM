@@ -288,8 +288,16 @@ class BenchmarkDataset(ABC):
         Args:
             requests (List[SampleRequest]): The current list of sampled
             requests.  num_requests (int): The target number of requests.
+
+        Raises:
+            ValueError: If the sampled list is empty and num_requests > 0,
+            since there is nothing to oversample from.
         """
         if len(requests) < num_requests:
+            if not requests:
+                raise ValueError(
+                    f"Cannot oversample an empty dataset to {num_requests} requests"
+                )
             additional = random.choices(requests,
                                         k=num_requests - len(requests))
             requests.extend(additional)
