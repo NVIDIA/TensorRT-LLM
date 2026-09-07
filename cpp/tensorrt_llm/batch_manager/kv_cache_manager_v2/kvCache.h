@@ -294,6 +294,18 @@ public:
         return mLastCachedTokenLevel;
     }
 
+    //! Drop this sequence's staged cached-token attribution so its reuse match is not reported as a
+    //! local cache hit. For traffic that is not user-visible reuse at all (KV cache size
+    //! estimation), and for a disaggregated-serving generation request whose whole matched prefix
+    //! the incoming transfer overwrites (a recurrent state summarizes and replaces the entire local
+    //! slot).
+    void dropCachedTokenAttribution();
+
+    //! Drop only the trailing partial block from the staged attribution. A disaggregated-serving
+    //! transfer overwrites the incomplete tail block of the local match while complete blocks
+    //! survive, so only the tail stops counting as a local hit.
+    void dropPartialBlockCachedTokenAttribution();
+
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
     int numReusableTokensBeforeHybridPruning() const noexcept

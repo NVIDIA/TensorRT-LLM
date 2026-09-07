@@ -468,6 +468,7 @@ class _KVCache:
             self.manager._commit_reused_blocks_by_level(
                 self._pending_stats.reused_blocks_by_level_by_life_cycle
             )
+            self.manager._commit_cached_tokens_by_level(self._pending_stats.cached_tokens_by_level)
         request_stats = (
             self._pending_stats.request_stats.copy()
             if record_request_stats
@@ -2177,6 +2178,43 @@ class _KVCache:
         self._last_cached_token_level = last_cached_token_level
         assert NDEBUG or sum(counts) == num_tokens
         assert NDEBUG or last_cached_token_level is not None
+
+        # Stage the attribution alongside the reuse counters derived from the same walk, so it is
+        # committed (or discarded) with them instead of being pushed back in through a public setter.
+        if (
+            self._should_record_manager_stats()
+            and self._pending_stats.record_cached_tokens_by_level(counts)
+        ):
+            self.manager.mark_stats_dirty(self.id)
+
+    def drop_cached_token_attribution(self) -> None:
+        """Drop this sequence's staged cached-token attribution so its reuse match is not reported
+        as a local cache hit.
+
+        For traffic that is not user-visible reuse at all (KV cache size estimation), and for a
+        disaggregated-serving generation request whose whole matched prefix the incoming transfer
+        overwrites (a recurrent state summarizes and replaces the entire local slot).
+        """
+        self._pending_stats.cached_tokens_by_level = []
+        self._refresh_stats_dirty_state()
+
+    def drop_partial_block_cached_token_attribution(self) -> None:
+        """Drop only the trailing partial block from the staged attribution.
+
+        A disaggregated-serving transfer overwrites the incomplete tail block of the local match
+        while complete blocks survive, so only the tail stops counting as a local hit.
+        """
+        partial_tokens = self.num_committed_tokens % self.manager.tokens_per_block
+        if partial_tokens == 0:
+            return
+        # A partial cached prefix always has a final block, so it always has a level to discount.
+        assert NDEBUG or self._last_cached_token_level is not None
+        if self._last_cached_token_level is None:
+            return
+        self._pending_stats.discount_cached_tokens_by_level(
+            self._last_cached_token_level, partial_tokens
+        )
+        self._refresh_stats_dirty_state()
 
     def _setup_for_reuse(self, match: ReuseMatch) -> None:
         manager = self.manager

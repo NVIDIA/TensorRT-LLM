@@ -2680,42 +2680,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
 
-            if (
-                not self.is_draft
-                and self.kv_cache_type != CacheTypeCpp.CROSS
-                and not req.is_dummy_request
-                and not self.is_estimating_kv_cache
-            ):
-                # This attribution only feeds an observability counter. A mismatch means the
-                # counter would be wrong, not that the request cannot be served, so drop the
-                # sample and log instead of failing the request. The underlying invariant is a
-                # debug-only assertion in both the Python and C++ core for the same reason.
-                counts: Optional[List[int]] = list(kv_cache.cached_tokens_by_level)
-                if any(type(count) is not int or count < 0 for count in counts):
-                    logger.warning_once(
-                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
-                        f"invalid counts {counts!r}",
-                        key="kv_cache_v2_cached_tokens_by_level_invalid",
-                    )
-                    counts = None
-                elif sum(counts) != kv_cache.num_committed_tokens:
-                    logger.warning_once(
-                        f"Dropping cached-token level attribution for request {req.py_request_id}: "
-                        f"{counts!r} does not sum to the reused-token count "
-                        f"{kv_cache.num_committed_tokens}",
-                        key="kv_cache_v2_cached_tokens_by_level_sum_mismatch",
-                    )
-                    counts = None
-                if counts is not None and req.is_disagg_generation_init_state:
-                    counts = self._get_disagg_generation_preserved_cached_tokens_by_level(
-                        counts,
-                        kv_cache.num_committed_tokens,
-                        kv_cache._get_last_cached_token_level(),
-                    )
-                    if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
-                        counts = None
-                if counts is not None:
-                    self.impl.record_cached_tokens_by_level(counts)
+            # The core stages the cached-token level attribution when it takes the reuse match and
+            # commits it with the rest of this sequence's stats. Only the cases the core cannot see
+            # are handled here.
+            if self.is_estimating_kv_cache:
+                # A sizing dry run is not user-visible reuse.
+                kv_cache.drop_cached_token_attribution()
+            elif req.is_disagg_generation_init_state:
+                if self._disagg_transfer_overwrites_whole_cached_prefix() or (
+                    os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+                ):
+                    kv_cache.drop_cached_token_attribution()
+                else:
+                    kv_cache.drop_partial_block_cached_token_attribution()
 
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
@@ -2732,38 +2709,13 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
 
-    def _get_disagg_generation_preserved_cached_tokens_by_level(
-        self,
-        counts: List[int],
-        num_cached_tokens: int,
-        last_cached_token_level: Optional[int],
-    ) -> Optional[List[int]]:
-        """Keep only complete local blocks not overwritten by P/D transfer.
+    def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
+        """Whether an incoming P/D transfer overwrites the entire locally matched prefix.
 
-        Returns None when the attribution cannot be adjusted consistently, so the caller skips
-        recording this sample rather than failing the request over an observability counter.
+        Attention-only caches keep their complete local blocks, so only the trailing partial block
+        is overwritten. Recurrent-state managers override this.
         """
-        result = list(counts)
-        partial_tokens = num_cached_tokens % self.tokens_per_block
-        if partial_tokens:
-            if last_cached_token_level is None or not 0 <= last_cached_token_level < len(result):
-                logger.warning_once(
-                    "Dropping cached-token level attribution: partial cached prefix of "
-                    f"{num_cached_tokens} tokens is missing its final cache level "
-                    f"(got {last_cached_token_level!r} for {len(result)} levels)",
-                    key="kv_cache_v2_cached_tokens_by_level_missing_last_level",
-                )
-                return None
-            result[last_cached_token_level] -= partial_tokens
-            if result[last_cached_token_level] < 0:
-                logger.warning_once(
-                    "Dropping cached-token level attribution: removing the "
-                    f"{partial_tokens}-token partial block from level {last_cached_token_level} "
-                    f"of {counts!r} goes negative",
-                    key="kv_cache_v2_cached_tokens_by_level_partial_negative",
-                )
-                return None
-        return result
+        return False
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.

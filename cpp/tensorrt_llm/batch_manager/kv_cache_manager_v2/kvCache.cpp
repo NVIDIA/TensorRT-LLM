@@ -613,6 +613,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
         mManager->commitStats(mPendingStats.globalStats(), mPendingStats.iterationStatsByLifeCycle());
         mManager->commitSsmSnapshotIterationStats(mPendingStats.ssmSnapshotIterationStatsByLifeCycle());
         mManager->commitReusedBlocksByLevel(mPendingStats.reusedBlocksByLevelByLifeCycle());
+        mManager->commitCachedTokensByLevel(mPendingStats.cachedTokensByLevel());
     }
     KVCacheStatsDelta const requestStats
         = _shouldRecordRequestStats() ? mPendingStats.requestStats().copy() : KVCacheStatsDelta{};
@@ -2093,6 +2094,36 @@ void KvCache::_finalizeCachedTokensByLevel(
 
     TLLM_CHECK_DEBUG(countsByLevelTotal(mCachedTokensByLevel) == numTokens);
     TLLM_CHECK_DEBUG(mLastCachedTokenLevel.has_value());
+
+    // Stage the attribution alongside the reuse counters derived from the same walk, so it is
+    // committed (or discarded) with them instead of being pushed back in through a public setter.
+    if (_shouldRecordManagerStats() && mPendingStats.recordCachedTokensByLevel(mCachedTokensByLevel))
+    {
+        mManager->markStatsDirty(id);
+    }
+}
+
+void KvCache::dropCachedTokenAttribution()
+{
+    mPendingStats.clearCachedTokensByLevel();
+    _refreshStatsDirtyState();
+}
+
+void KvCache::dropPartialBlockCachedTokenAttribution()
+{
+    int const partialTokens = numCommittedTokens() % mTokensPerBlock;
+    if (partialTokens == 0)
+    {
+        return;
+    }
+    // A partial cached prefix always has a final block, so it always has a level to discount.
+    TLLM_CHECK_DEBUG(mLastCachedTokenLevel.has_value());
+    if (!mLastCachedTokenLevel.has_value())
+    {
+        return;
+    }
+    mPendingStats.discountCachedTokensByLevel(*mLastCachedTokenLevel, partialTokens);
+    _refreshStatsDirtyState();
 }
 
 // ---------------------------------------------------------------------------

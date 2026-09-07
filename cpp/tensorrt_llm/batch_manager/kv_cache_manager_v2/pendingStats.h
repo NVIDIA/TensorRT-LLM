@@ -58,7 +58,7 @@ public:
     [[nodiscard]] bool empty() const noexcept
     {
         return mRequestStats.empty() && mGlobalStats.empty() && mIterationStatsByLifeCycle.empty()
-            && mSsmSnapshotIterationStatsByLifeCycle.empty();
+            && mSsmSnapshotIterationStatsByLifeCycle.empty() && countsByLevelEmpty(mCachedTokensByLevel);
     }
 
     void clear() noexcept
@@ -68,6 +68,7 @@ public:
         mIterationStatsByLifeCycle.clear();
         mSsmSnapshotIterationStatsByLifeCycle.clear();
         mReusedBlocksByLevelByLifeCycle.clear();
+        mCachedTokensByLevel.clear();
         mAllocationSegments.clear();
     }
 
@@ -208,6 +209,48 @@ public:
         return mReusedBlocksByLevelByLifeCycle;
     }
 
+    // Cached-token attribution for the sequence's reuse match, indexed by cache level.
+    //
+    // Unlike the reuse counters this is a manager-global quantity rather than a per-lifecycle one:
+    // a match spans every lifecycle at once (the final SSM checkpoint summarizes the whole
+    // recurrent prefix, so its tier applies to every matched token), leaving no single lifecycle to
+    // attribute it to. It still rides the pending-stats lifecycle so it is committed or discarded
+    // together with the counters it was derived from -- in particular, a dummy sequence's
+    // attribution is dropped by the same discardPendingStats() that drops its reuse counters.
+    bool recordCachedTokensByLevel(CountsByLevel const& counts)
+    {
+        if (countsByLevelEmpty(counts))
+        {
+            return false;
+        }
+        addCountsByLevel(mCachedTokensByLevel, counts);
+        return true;
+    }
+
+    void clearCachedTokensByLevel() noexcept
+    {
+        mCachedTokensByLevel.clear();
+    }
+
+    //! Remove `numTokens` from `level`. Clamps at zero: the attribution only feeds an observability
+    //! counter, so an inconsistency must not underflow it into a nonsense negative reading.
+    void discountCachedTokensByLevel(CacheLevel level, int64_t numTokens)
+    {
+        TLLM_CHECK_DEBUG(level < mCachedTokensByLevel.size());
+        if (level >= mCachedTokensByLevel.size())
+        {
+            return;
+        }
+        auto& count = mCachedTokensByLevel.at(level);
+        TLLM_CHECK_DEBUG(count >= numTokens);
+        count = std::max(int64_t{0}, count - numTokens);
+    }
+
+    [[nodiscard]] CountsByLevel const& cachedTokensByLevel() const noexcept
+    {
+        return mCachedTokensByLevel;
+    }
+
 private:
     static PendingStatsDelta allocationDelta(
         PendingAllocationSegment const& segment, BlockOrdinal blockBegin, BlockOrdinal blockEnd)
@@ -279,6 +322,7 @@ private:
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     SsmSnapshotIterationStatsByLifeCycle mSsmSnapshotIterationStatsByLifeCycle;
     ReusedBlocksByLevelByLifeCycle mReusedBlocksByLevelByLifeCycle;
+    CountsByLevel mCachedTokensByLevel;
     std::vector<PendingAllocationSegment> mAllocationSegments;
 };
 

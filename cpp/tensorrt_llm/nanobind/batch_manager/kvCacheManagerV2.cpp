@@ -1696,6 +1696,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
         .def("commit_pending_stats", [](kv::KvCache& self) { return castStatsDelta(self.commitPendingStats()); })
         .def("discard_pending_stats", &kv::KvCache::discardPendingStats)
+        .def("drop_cached_token_attribution", &kv::KvCache::dropCachedTokenAttribution)
+        .def("drop_partial_block_cached_token_attribution", &kv::KvCache::dropPartialBlockCachedTokenAttribution)
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -2329,11 +2331,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_and_reset_iteration_suspend_resume_stats", &kv::KvCacheManager::getAndResetIterationSuspendResumeStats)
         .def(
             "get_and_reset_iteration_disk_prefetch_blocks", &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks)
-        .def(
-            "record_cached_tokens_by_level",
-            [](kv::KvCacheManager& self, std::vector<int64_t> counts)
-            { self.recordCachedTokensByLevel(kv::CountsByLevel{std::move(counts)}); },
-            nb::arg("counts"))
         .def("get_and_reset_iteration_cached_tokens_by_level",
             [](kv::KvCacheManager& self) { return self.getAndResetIterationCachedTokensByLevel().raw(); })
         .def("get_and_reset_iteration_reused_blocks_by_level",

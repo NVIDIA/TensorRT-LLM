@@ -252,8 +252,9 @@ public:
     // Return the number of disk-prefetched blocks since the last drain and reset it.
     int64_t getAndResetIterationDiskPrefetchBlocks();
     // Accumulate a request's initial current-residency cached-token attribution, indexed by cache
-    // level, into the current iteration window.
-    void recordCachedTokensByLevel(CountsByLevel const& counts);
+    // level, into the current iteration window. Committed alongside the scalar iteration stats so
+    // both views cover exactly the same requests.
+    void commitCachedTokensByLevel(CountsByLevel const& counts);
     // Return the per-cache-level cached-token counts accumulated since the last drain and reset
     // them.
     CountsByLevel getAndResetIterationCachedTokensByLevel();

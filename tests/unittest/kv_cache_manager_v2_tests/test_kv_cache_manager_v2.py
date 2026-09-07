@@ -5070,14 +5070,65 @@ class TestCachedTokensByTier(TestKVCacheManagerV2):
                 cache.close()
 
     def test_iteration_accumulation(self) -> None:
-        self.prepare(16 << 20, 16 << 20, 16 << 20, 2, 16, 0, tokens_per_block=4)
-        self.manager.record_cached_tokens_by_level([3, 1, 0])
-        self.manager.record_cached_tokens_by_level([2, 0, 4])
-        self.assertEqual(
-            list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [5, 1, 4]
-        )
-        # Draining resets the accumulator.
-        self.assertEqual(list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [])
+        """Attribution is staged with the reuse match and committed with the sequence's stats."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                # Nothing is reported until the sequence's pending stats are committed.
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 3]
+                )
+                # Draining resets the accumulator, and committing again does not re-report the
+                # same match.
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_cached_token_attribution(self) -> None:
+        """Dropping suppresses the whole match, e.g. for a KV cache sizing dry run."""
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), []
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_cached_token_attribution(self) -> None:
+        """Only the trailing partial block stops counting; complete blocks survive."""
+        with self._tiered_prefix() as (tokens, _):
+            # 11 tokens is two full blocks plus a 3-token tail resident on level 2.
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:11])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
+
+    def test_drop_partial_block_keeps_block_aligned_attribution(self) -> None:
+        with self._tiered_prefix() as (tokens, _):
+            cache = self.manager.create_kv_cache(input_tokens=tokens[:8])
+            try:
+                cache.drop_partial_block_cached_token_attribution()
+                cache.commit_pending_stats()
+                self.assertEqual(
+                    list(self.manager.get_and_reset_iteration_cached_tokens_by_level()), [4, 4, 0]
+                )
+            finally:
+                cache.close()
 
 
 @pytest.mark.cpu_only

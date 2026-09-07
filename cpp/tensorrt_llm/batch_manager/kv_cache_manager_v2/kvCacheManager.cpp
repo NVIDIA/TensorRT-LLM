@@ -559,7 +559,7 @@ int64_t KvCacheManager::getAndResetIterationDiskPrefetchBlocks()
     return numBlocks;
 }
 
-void KvCacheManager::recordCachedTokensByLevel(CountsByLevel const& counts)
+void KvCacheManager::commitCachedTokensByLevel(CountsByLevel const& counts)
 {
     TLLM_CHECK_DEBUG(std::all_of(counts.begin(), counts.end(), [](int64_t count) { return count >= 0; }));
     if (!mConfig.enableStats)

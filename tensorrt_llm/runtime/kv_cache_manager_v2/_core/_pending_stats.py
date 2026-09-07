@@ -15,13 +15,15 @@
 
 from dataclasses import dataclass, field
 
-from .._common import BlockOrdinal
+from .._common import NDEBUG, BlockOrdinal, CacheLevel
 from .._life_cycle_registry import LifeCycleId
 from .._stats import (
+    CountsByLevel,
     KVCacheIterationStatsDelta,
     KVCacheStatsDelta,
     ReusedBlocksByLevel,
     SsmSnapshotIterationStatsDelta,
+    add_counts_by_level,
 )
 
 
@@ -62,6 +64,15 @@ class _PendingStats:
     reused_blocks_by_level_by_life_cycle: dict[LifeCycleId, ReusedBlocksByLevel] = field(
         default_factory=dict
     )
+    # Cached-token attribution for the sequence's reuse match, indexed by cache level.
+    #
+    # Unlike the reuse counters this is a manager-global quantity rather than a per-lifecycle one:
+    # a match spans every lifecycle at once (the final SSM checkpoint summarizes the whole recurrent
+    # prefix, so its tier applies to every matched token), leaving no single lifecycle to attribute
+    # it to. It still rides the pending-stats lifecycle so it is committed or discarded together
+    # with the counters it was derived from -- in particular, a dummy sequence's attribution is
+    # dropped by the same discard_pending_stats() that drops its reuse counters.
+    cached_tokens_by_level: CountsByLevel = field(default_factory=list)
     allocation_segments: list[_PendingAllocationSegment] = field(default_factory=list)
 
     @property
@@ -71,6 +82,7 @@ class _PendingStats:
             and self.global_stats.empty
             and not self.iteration_stats_by_life_cycle
             and not self.ssm_snapshot_iteration_stats_by_life_cycle
+            and not any(self.cached_tokens_by_level)
         )
 
     def clear(self) -> None:
@@ -79,7 +91,26 @@ class _PendingStats:
         self.iteration_stats_by_life_cycle.clear()
         self.ssm_snapshot_iteration_stats_by_life_cycle.clear()
         self.reused_blocks_by_level_by_life_cycle.clear()
+        self.cached_tokens_by_level = []
         self.allocation_segments.clear()
+
+    def record_cached_tokens_by_level(self, counts: CountsByLevel) -> bool:
+        if not any(counts):
+            return False
+        self.cached_tokens_by_level = add_counts_by_level(self.cached_tokens_by_level, counts)
+        return True
+
+    def discount_cached_tokens_by_level(self, level: CacheLevel, num_tokens: int) -> None:
+        """Remove ``num_tokens`` from ``level``.
+
+        Clamps at zero: the attribution only feeds an observability counter, so an inconsistency
+        must not underflow it into a nonsense negative reading.
+        """
+        assert NDEBUG or level < len(self.cached_tokens_by_level)
+        if level >= len(self.cached_tokens_by_level):
+            return
+        assert NDEBUG or self.cached_tokens_by_level[level] >= num_tokens
+        self.cached_tokens_by_level[level] = max(0, self.cached_tokens_by_level[level] - num_tokens)
 
     def add(self, delta: _PendingStatsDelta) -> bool:
         if delta.empty:

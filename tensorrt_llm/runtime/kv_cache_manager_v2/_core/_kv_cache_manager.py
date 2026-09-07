@@ -709,9 +709,10 @@ class KVCacheManager:
         self._iter_disk_prefetch_blocks = 0
         return num_blocks
 
-    def record_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
+    def _commit_cached_tokens_by_level(self, counts: CountsByLevel) -> None:
         """Accumulate a request's initial cached-token attribution, by cache level, into this
-        iteration."""
+        iteration. Committed alongside the scalar iteration stats so both views cover exactly the
+        same requests."""
         assert NDEBUG or all(count >= 0 for count in counts)
         if self._stats_enabled:
             self._iter_cached_tokens_by_level = add_counts_by_level(

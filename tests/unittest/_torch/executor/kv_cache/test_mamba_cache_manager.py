@@ -917,10 +917,15 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
 
 def test_v2_disagg_gen_init_with_local_mamba_layers_reports_no_local_cached_tokens():
     manager = object.__new__(MambaHybridCacheManagerV2)
-    manager.tokens_per_block = 4
     manager.local_num_mamba_layers = 1
-    local_counts = manager._get_disagg_generation_preserved_cached_tokens_by_level([4, 2, 0], 6, 1)
-    assert local_counts == [0, 0, 0]
+    # The incoming recurrent state replaces the whole local slot, so nothing survives as a hit.
+    assert manager._disagg_transfer_overwrites_whole_cached_prefix()
+
+
+def test_v2_disagg_gen_init_without_local_mamba_layers_keeps_complete_blocks():
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.local_num_mamba_layers = 0
+    assert not manager._disagg_transfer_overwrites_whole_cached_prefix()
 
 
 def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
