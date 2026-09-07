@@ -1,10 +1,11 @@
 # HyperCLOVAX
 
 > [!WARNING]
-> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
-> below is **legacy** and will not receive new features. New projects should use
+> The legacy TensorRT engine-build workflow (`convert_checkpoint.py` /
+> `trtllm-build` / `run.py`) was **removed** with the TensorRT backend.
+> Use the PyTorch flow below via
 > [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html).
 
 This document shows how to build and run a [HyperCLOVAX](https://huggingface.co/naver/hyperclovax) model in TensorRT-LLM.
 
@@ -17,13 +18,7 @@ This document shows how to build and run a [HyperCLOVAX](https://huggingface.co/
   - [PyTorch flow](#pytorch-flow)
     - [LLM](#llm)
     - [Multimodal](#multimodal)
-  - [TRT flow](#trt-flow)
-    - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
-    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
-    - [SmoothQuant](#smoothquant)
-    - [Groupwise quantization (AWQ)](#groupwise-quantization-awq)
-        - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
-    - [Run Engine](#run-engine)
+  - [TRT flow (removed)](#trt-flow-removed)
 
 ## Support Matrix
   * FP16
@@ -89,170 +84,12 @@ The output will be like:
 
 For more information, you can refer to [examples/llm-api](../../../llm-api).
 
-## TRT flow
-The next section describes how to convert the weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use llama's [convert_checkpoint.py](../../core/llama/convert_checkpoint.py) for the HyperCLOVAX model and then build the model with `trtllm-build`.
 
-### Convert checkpoint and build TensorRT engine(s)
+## TRT flow (removed)
 
-```bash
-pip install -r requirements.txt
+The legacy engine-build path documented here previously
+(`examples/models/core/llama/convert_checkpoint.py`, `trtllm-build`, and
+`examples/run.py`) was removed together with the TensorRT backend. Those paths
+and the `trtllm-build` CLI are no longer in the tree.
 
-# Build a single-GPU float16 engine from HF weights.
-
-# Build the HyperCLOVAX model using a single GPU and FP16.
-python ../../core/llama/convert_checkpoint.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --output_dir trt_models/$MODEL_NAME/fp16/1-gpu \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/fp16/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/fp16/1-gpu \
-    --gemm_plugin auto
-
-# Build the HyperCLOVAX model using a single GPU and apply INT8 weight-only quantization.
-python ../../core/llama/convert_checkpoint.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --output_dir trt_models/$MODEL_NAME/int8_wq/1-gpu \
-    --use_weight_only \
-    --weight_only_precision int8 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/int8_wq/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/int8_wq/1-gpu \
-    --gemm_plugin auto
-
-# Build the HyperCLOVAX model using a single GPU and apply INT4 weight-only quantization.
-python ../../core/llama/convert_checkpoint.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --output_dir trt_models/$MODEL_NAME/int4_wq/1-gpu \
-    --use_weight_only \
-    --weight_only_precision int4 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/int4_wq/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/int4_wq/1-gpu \
-    --gemm_plugin auto
-
-# Build the HyperCLOVAX model using 2-way tensor parallelism and FP16.
-python ../../core/llama/convert_checkpoint.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --output_dir trt_models/$MODEL_NAME/fp16/2-gpu \
-    --tp_size 2 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/fp16/2-gpu \
-    --output_dir trt_engines/$MODEL_NAME/fp16/2-gpu \
-    --gemm_plugin auto
-```
-
-### FP8 Post-Training Quantization
-
-The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
-
-First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the HyperCLOVAX model using a single GPU and apply FP8 quantization.
-python ../../../quantization/quantize.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --dtype float16 \
-    --qformat fp8 \
-    --kv_cache_dtype fp8 \
-    --output_dir trt_models/$MODEL_NAME/fp8/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/fp8/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/fp8/1-gpu \
-    --gemm_plugin auto
-```
-
-### SmoothQuant
-
-The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
-
-First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the HyperCLOVAX model using a single GPU and apply INT8 SmoothQuant.
-python ../../../quantization/quantize.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --dtype float16 \
-    --qformat int8_sq \
-    --output_dir trt_models/$MODEL_NAME/int8_sq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/int8_sq/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/int8_sq/1-gpu \
-    --gemm_plugin auto
-```
-
-### Groupwise quantization (AWQ)
-
-The examples below use the NVIDIA Modelopt toolkit for the model quantization process.
-
-First, make sure the Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the HyperCLOVAX model using a single GPU and apply INT4 AWQ.
-python ../../../quantization/quantize.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --dtype float16 \
-    --qformat int4_awq \
-    --output_dir trt_models/$MODEL_NAME/int4_awq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/int4_awq/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/int4_awq/1-gpu \
-    --gemm_plugin auto
-```
-
-#### W4A16 AWQ with FP8 GEMM (W4A8 AWQ)
-For Hopper GPUs, TRT-LLM also supports using FP8 GEMM for accelerating linear layers. This mode is denoted as `w4a8_awq` for Modelopt and TRT-LLM, where both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
-
-Please ensure your system contains a Hopper GPU before trying the commands below.
-
-```bash
-# Build the HyperCLOVAX model using a single GPU and apply W4A8 AWQ.
-python ../../../quantization/quantize.py \
-    --model_dir hf_models/$MODEL_NAME \
-    --dtype float16 \
-    --qformat w4a8_awq \
-    --output_dir trt_models/$MODEL_NAME/w4a8_awq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/$MODEL_NAME/w4a8_awq/1-gpu \
-    --output_dir trt_engines/$MODEL_NAME/w4a8_awq/1-gpu \
-    --gemm_plugin auto
-```
-
-### Run Engine
-Test your engine with the [run.py](../../../run.py) script:
-
-```bash
-python3 ../../../run.py \
-    --input_text "When did the first world war end?" \
-    --max_output_len=100 \
-    --tokenizer_dir hf_models/$MODEL_NAME \
-    --engine_dir trt_engines/$MODEL_NAME/fp16/1-gpu
-
-# Run with 2 GPUs
-mpirun -n 2 --allow-run-as-root \
-    python3 ../../../run.py \
-    --input_text "When did the first world war end?" \
-    --max_output_len=100 \
-    --tokenizer_dir hf_models/$MODEL_NAME \
-    --engine_dir trt_engines/$MODEL_NAME/fp16/2-gpu
-
-python ../../../summarize.py \
-    --test_trt_llm \
-    --data_type fp16 \
-    --hf_model_dir hf_models/$MODEL_NAME \
-    --engine_dir trt_engines/$MODEL_NAME/fp16/1-gpu
-```
-
-The TensorRT LLM HyperCLOVAX implementation is based on the LLaMA model. The implementation can be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-For more examples, see [`examples/models/core/llama/README.md`](../../core/llama/README.md)
+Use the **PyTorch flow** section above (`trtllm-serve` / LLM API) instead.
