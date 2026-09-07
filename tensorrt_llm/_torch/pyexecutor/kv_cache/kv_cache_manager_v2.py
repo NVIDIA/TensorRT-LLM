@@ -79,6 +79,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -506,6 +507,26 @@ def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
     return b"".join(v.to_bytes(4, "big", signed=True) for v in hash_ints)
 
 
+def _multimodal_cache_digest(hash_ints: Sequence[int], uuid: str | None) -> bytes:
+    """Return the radix-tree digest for multimodal content and its optional UUID."""
+    content_digest = _hash_to_digest(hash_ints)
+    if uuid is None:
+        return content_digest
+    uuid_bytes = uuid.encode("utf-8")
+    hasher = hashlib.sha256()
+    hasher.update(b"tensorrt-llm-kv-cache-v2-mm-key\0")
+    hasher.update(content_digest)
+    hasher.update(len(uuid_bytes).to_bytes(8, "little"))
+    hasher.update(uuid_bytes)
+    return hasher.digest()
+
+
+def _multimodal_uuid(uuids: Sequence[str | None] | None, item_idx: int) -> str | None:
+    if uuids is None or item_idx >= len(uuids):
+        return None
+    return uuids[item_idx]
+
+
 def _ensure_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tensor:
     # Block-reuse augmentation is Python-side index math. The metadata is
     # produced by host mm preprocessing and carried in
@@ -615,6 +636,7 @@ def _augment_tokens_with_mm_run_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     metadata: _MmRunMetadata,
     chunk_start: int,
     chunk_end: int,
@@ -658,7 +680,9 @@ def _augment_tokens_with_mm_run_metadata(
     ):
         if item_idx != current_item_idx:
             current_item_idx = item_idx
-            digest = _hash_to_digest(multimodal_hashes[item_idx])
+            digest = _multimodal_cache_digest(
+                multimodal_hashes[item_idx], _multimodal_uuid(multimodal_uuids, item_idx)
+            )
         # Feed the coarse item property (content digest) and granular run
         # properties (item-local offset and span length) into the key
         # generator, so cache keys reflect the actual multimodal tokens being
@@ -676,6 +700,7 @@ def _augment_tokens_with_contiguous_mm_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     multimodal_positions: Sequence[int] | torch.Tensor,
     multimodal_lengths: Sequence[int] | torch.Tensor,
     chunk_start: int,
@@ -700,11 +725,68 @@ def _augment_tokens_with_contiguous_mm_metadata(
         overlap_length = overlap_end - overlap_start
         result[result_offset : result_offset + overlap_length] = gen_multimodal_cache_key_tokens(
             vocab_size,
-            _hash_to_digest(multimodal_hashes[item_idx]),
+            _multimodal_cache_digest(
+                multimodal_hashes[item_idx], _multimodal_uuid(multimodal_uuids, item_idx)
+            ),
             overlap_length,
             token_offset=source_offset,
         )
 
+    return result
+
+
+def _multimodal_event_keys_for_range(
+    req: LlmRequest, start_token_idx: int, end_token_idx: int
+) -> list[tuple[bytes, int, str | None]]:
+    """Build V1-compatible multimodal event keys for one KV-cache block range."""
+    multimodal_hashes = req.multimodal_hashes
+    if not multimodal_hashes or start_token_idx >= end_token_idx:
+        return []
+
+    multimodal_uuids = getattr(req, "multimodal_uuids", None)
+    run_metadata = _resolve_multimodal_run_metadata(req)
+    if run_metadata is not None:
+        overlap_mask = (run_metadata.run_ends > start_token_idx) & (
+            run_metadata.run_positions < end_token_idx
+        )
+        result = []
+        for run_idx in torch.nonzero(overlap_mask).flatten().tolist():
+            item_idx = int(run_metadata.run_item_indices[run_idx])
+            run_start = int(run_metadata.run_positions[run_idx])
+            overlap_start = max(start_token_idx, run_start)
+            start_offset = int(run_metadata.run_item_offsets[run_idx]) + overlap_start - run_start
+            result.append(
+                (
+                    _hash_to_digest(multimodal_hashes[item_idx]),
+                    start_offset,
+                    _multimodal_uuid(multimodal_uuids, item_idx),
+                )
+            )
+        return result
+
+    multimodal_positions = req.multimodal_positions
+    multimodal_lengths = req.multimodal_lengths
+    if multimodal_positions is None or multimodal_lengths is None:
+        return []
+    positions = _ensure_int64_cpu_tensor(multimodal_positions)
+    lengths = _ensure_int64_cpu_tensor(multimodal_lengths)
+    if len(multimodal_hashes) != positions.numel() or positions.numel() != lengths.numel():
+        raise ValueError("Multimodal hashes, positions, and lengths must have the same size")
+
+    result = []
+    for item_idx, (position, length) in enumerate(
+        zip(positions.tolist(), lengths.tolist(), strict=True)
+    ):
+        item_end = position + length
+        if end_token_idx > position and start_token_idx < item_end:
+            start_offset = max(start_token_idx, position) - position
+            result.append(
+                (
+                    _hash_to_digest(multimodal_hashes[item_idx]),
+                    start_offset,
+                    _multimodal_uuid(multimodal_uuids, item_idx),
+                )
+            )
     return result
 
 
@@ -2933,20 +3015,58 @@ class KVCacheManagerV2(BaseResourceManager):
         chunk = tokens[chunk_start:chunk_end]
         result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
         run_metadata = _resolve_multimodal_run_metadata(req)
+        multimodal_uuids = getattr(req, "multimodal_uuids", None)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size, result, req.multimodal_hashes, run_metadata, chunk_start, chunk_end
+                self.vocab_size,
+                result,
+                req.multimodal_hashes,
+                multimodal_uuids,
+                run_metadata,
+                chunk_start,
+                chunk_end,
             )
 
         return _augment_tokens_with_contiguous_mm_metadata(
             self.vocab_size,
             result,
             req.multimodal_hashes,
+            multimodal_uuids,
             req.multimodal_positions,
             req.multimodal_lengths,
             chunk_start,
             chunk_end,
         )
+
+    def _register_multimodal_event_keys(
+        self,
+        req: LlmRequest,
+        augmented_tokens: Sequence[TokenIdExt],
+        *,
+        include_partial: bool,
+    ) -> None:
+        if getattr(self, "event_manager", None) is None or req.multimodal_hashes is None:
+            return
+        reuse_scope = ReuseScope(
+            lora_id=req.lora_task_id,
+            salt=self._derive_reuse_salt(req.cache_salt),
+        )
+        block_start = 0
+        for token_block, block_key in sequence_to_blockchain_keys(
+            self._ledger_tokens_per_block, reuse_scope, augmented_tokens
+        ):
+            if not token_block:
+                continue
+            # A chunked prefill does not insert its intermediate partial block
+            # unless minimum snapshots are enabled. Do not retain metadata for
+            # a radix key that cannot produce a stored event.
+            if len(token_block) < self._ledger_tokens_per_block and not include_partial:
+                break
+            block_end = block_start + len(token_block)
+            mm_keys = _multimodal_event_keys_for_range(req, block_start, block_end)
+            if mm_keys:
+                self.event_manager.register_mm_keys(block_key, mm_keys)
+            block_start = block_end
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
         return self.max_seq_len if window_size is None else int(window_size)
@@ -3692,12 +3812,32 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         if request.context_current_position > kv_cache.num_committed_tokens:
-            tokens = self._augment_tokens_for_block_reuse(
-                self._reuse_token_source(request),
-                request,
-                start=kv_cache.num_committed_tokens,
-                end=request.context_current_position,
-            )
+            token_source = self._reuse_token_source(request)
+            if (
+                getattr(self, "event_manager", None) is not None
+                and getattr(request, "multimodal_hashes", None) is not None
+            ):
+                augmented_tokens = self._augment_tokens_for_block_reuse(
+                    token_source,
+                    request,
+                    end=request.context_current_position,
+                )
+                self._register_multimodal_event_keys(
+                    request,
+                    augmented_tokens,
+                    include_partial=(
+                        request.context_remaining_length == 0
+                        or self.kv_cache_manager_py_config.commit_min_snapshot
+                    ),
+                )
+                tokens = augmented_tokens[kv_cache.num_committed_tokens :]
+            else:
+                tokens = self._augment_tokens_for_block_reuse(
+                    token_source,
+                    request,
+                    start=kv_cache.num_committed_tokens,
+                    end=request.context_current_position,
+                )
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)

@@ -169,6 +169,7 @@ public:
     void addCreatedEvent(
         std::vector<int> numBlocksPerCacheLevel, std::optional<std::vector<int>> layerGroupIds = std::nullopt);
     void setLayerGroupWindowSizes(std::map<int, int> windowSizes);
+    void registerMmKeys(Digest const& blockKey, std::vector<MmKey> mmKeys);
     void addStoredEvent(KVCacheStoredData data, EventLayerGroupId layerGroupId = std::nullopt);
     void addRemovedEvent(std::vector<EventBlockHash> blockHashes, EventLayerGroupId layerGroupId = std::nullopt);
     void addUpdatedEvent(EventBlockHash blockHash, std::optional<KVCacheEventDiff> cacheLevel = std::nullopt,
@@ -245,6 +246,7 @@ private:
     int64_t mNextEventId = 0;
 
     std::unordered_map<Digest, StoredBlockState> mStoredBlocks;
+    std::unordered_map<Digest, std::vector<MmKey>> mMmKeysByBlockKey;
     std::map<EventLayerGroupId, int64_t> mLatestStoredEventIds;
     std::map<EventLayerGroupId, std::vector<EventBlockHash>> mLatestRemovedBlockHashes;
     std::vector<KVCacheEvent> mPendingEvents;

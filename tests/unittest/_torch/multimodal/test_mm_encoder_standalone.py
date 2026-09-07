@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import functools
 import json
@@ -99,6 +113,7 @@ def _create_mm_disagg_llm(
     model_dir: Path,
     enable_block_reuse: bool,
     disable_overlap_scheduler: bool = False,
+    force_kv_cache_manager_v2: bool = False,
 ) -> LLM:
     kv_cache_kwargs = {
         "enable_block_reuse": enable_block_reuse,
@@ -106,10 +121,19 @@ def _create_mm_disagg_llm(
     }
     if enable_block_reuse:
         kv_cache_kwargs["event_buffer_max_size"] = 1024
+    if force_kv_cache_manager_v2:
+        kv_cache_kwargs["use_kv_cache_manager_v2"] = True
 
     kv_cache_config = KvCacheConfig(**kv_cache_kwargs)
-    cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT",
-                                                   max_tokens_in_buffer=10240)
+    if force_kv_cache_manager_v2:
+        cache_transceiver_cfg = CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            max_tokens_in_buffer=10240,
+        )
+    else:
+        cache_transceiver_cfg = CacheTransceiverConfig(
+            backend="DEFAULT", max_tokens_in_buffer=10240)
     return LLM(model=model_dir,
                kv_cache_config=kv_cache_config,
                trust_remote_code=True,
@@ -220,6 +244,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,  # Enable KV cache events
+        use_kv_cache_manager_v2=True,
     )
     moe_config = _get_moe_config_for_blackwell()
 
@@ -306,6 +331,7 @@ def test_kv_event_mm_keys_with_uuid(use_uuids, expected_hash_type):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -401,6 +427,7 @@ def test_kv_event_mm_keys_with_partial_uuids(uuids, expected_patterns):
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -487,6 +514,7 @@ def test_kv_event_mm_keys_with_uuid_multiple_prompts():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=2048,
+        use_kv_cache_manager_v2=True,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -564,6 +592,7 @@ def test_kv_event_mm_keys_with_very_long_uuid():
         enable_block_reuse=True,
         free_gpu_memory_fraction=free_gpu_memory_fraction,
         event_buffer_max_size=1024,
+        use_kv_cache_manager_v2=True,
     )
 
     llm = LLM(model=encoder_model_dir,
@@ -1178,7 +1207,8 @@ def test_epd_disagg_mm_hash_kv_cache_reuse(prompts):
 
     create_llm = functools.partial(_create_mm_disagg_llm,
                                    encoder_model_dir,
-                                   enable_block_reuse=True)
+                                   enable_block_reuse=True,
+                                   force_kv_cache_manager_v2=True)
 
     llm_prefill, encoder, llm_decode = _instantiate_models(
         functools.partial(create_llm, disable_overlap_scheduler=True),

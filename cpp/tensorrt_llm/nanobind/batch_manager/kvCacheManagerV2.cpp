@@ -1054,6 +1054,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "register_mm_keys",
+            [](kv::EventManager& self, nb::handle blockKey, nb::handle mmKeys)
+            {
+                if (!nb::isinstance<nb::bytes>(blockKey))
+                {
+                    throw std::invalid_argument("block key must be bytes");
+                }
+                auto digest = castDigest(blockKey);
+                auto keys = castMmKeys(mmKeys);
+                nb::gil_scoped_release release;
+                self.registerMmKeys(digest, std::move(keys));
+            },
+            nb::arg("block_key"), nb::arg("mm_keys"))
+        .def(
             "add_stored_event",
             [](kv::EventManager& self, nb::object parentHash, nb::object blocks, kv::EventLayerGroupId layerGroupId)
             {

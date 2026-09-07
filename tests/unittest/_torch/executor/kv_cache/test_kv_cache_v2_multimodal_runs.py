@@ -161,6 +161,120 @@ def test_hash_to_digest_rejects_malformed_hashes():
         resource_manager._hash_to_digest([*_HASH_INTS[:-1], "8"])
 
 
+def test_augment_tokens_for_block_reuse_uses_uuid_aware_digest():
+    vocab_size = 1000
+    tokens = list(range(8))
+    manager = _make_manager(vocab_size)
+
+    def augmented_tokens(uuid):
+        req = _make_request(
+            tokens,
+            multimodal_hashes=[_HASH_INTS],
+            multimodal_positions=[2],
+            multimodal_lengths=[3],
+            multimodal_uuids=[uuid],
+            multimodal_item_run_cu_offsets=None,
+            multimodal_run_positions=None,
+            multimodal_run_lengths=None,
+        )
+        return KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req)
+
+    no_uuid = augmented_tokens(None)
+    uuid_a = augmented_tokens("image-a")
+    uuid_b = augmented_tokens("image-b")
+
+    content_digest = resource_manager._hash_to_digest(_HASH_INTS)
+    assert no_uuid[2:5] == gen_multimodal_cache_key_tokens(vocab_size, content_digest, 3)
+    assert uuid_a[2:5] == gen_multimodal_cache_key_tokens(
+        vocab_size,
+        resource_manager._multimodal_cache_digest(_HASH_INTS, "image-a"),
+        3,
+    )
+    assert uuid_a[2:5] != no_uuid[2:5]
+    assert uuid_a[2:5] != uuid_b[2:5]
+
+
+def test_multimodal_event_keys_use_item_local_offsets_and_partial_uuids():
+    req = _make_request(
+        list(range(12)),
+        multimodal_hashes=[_HASH_INTS, _OTHER_HASH_INTS],
+        multimodal_positions=[1, 6],
+        multimodal_lengths=[4, 4],
+        multimodal_uuids=["image-a", None],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+    hash_a = resource_manager._hash_to_digest(_HASH_INTS)
+    hash_b = resource_manager._hash_to_digest(_OTHER_HASH_INTS)
+
+    assert resource_manager._multimodal_event_keys_for_range(req, 0, 4) == [(hash_a, 0, "image-a")]
+    assert resource_manager._multimodal_event_keys_for_range(req, 4, 8) == [
+        (hash_a, 3, "image-a"),
+        (hash_b, 0, None),
+    ]
+    assert resource_manager._multimodal_event_keys_for_range(req, 8, 12) == [(hash_b, 2, None)]
+
+
+def test_multimodal_event_keys_accumulate_item_offsets_across_runs():
+    req = _make_request(
+        list(range(12)),
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[1],
+        multimodal_lengths=[4],
+        multimodal_uuids=["split-image"],
+        multimodal_item_run_cu_offsets=[0, 2],
+        multimodal_run_positions=[1, 8],
+        multimodal_run_lengths=[2, 2],
+    )
+    mm_hash = resource_manager._hash_to_digest(_HASH_INTS)
+
+    assert resource_manager._multimodal_event_keys_for_range(req, 0, 10) == [
+        (mm_hash, 0, "split-image"),
+        (mm_hash, 2, "split-image"),
+    ]
+    assert resource_manager._multimodal_event_keys_for_range(req, 9, 10) == [
+        (mm_hash, 3, "split-image")
+    ]
+
+
+def test_register_multimodal_event_keys_respects_partial_block_policy():
+    class RecordingEventManager:
+        def __init__(self):
+            self.calls = []
+
+        def register_mm_keys(self, block_key, mm_keys):
+            self.calls.append((block_key, mm_keys))
+
+    tokens = list(range(6))
+    req = _make_request(
+        tokens,
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[1],
+        multimodal_lengths=[5],
+        multimodal_uuids=["image-a"],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+    manager = _make_manager(1000)
+    manager._ledger_tokens_per_block = 4
+    manager.event_manager = RecordingEventManager()
+    augmented = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req)
+
+    KVCacheManagerV2._register_multimodal_event_keys(manager, req, augmented, include_partial=False)
+    assert [mm_keys for _, mm_keys in manager.event_manager.calls] == [
+        [(resource_manager._hash_to_digest(_HASH_INTS), 0, "image-a")]
+    ]
+
+    manager.event_manager.calls.clear()
+    KVCacheManagerV2._register_multimodal_event_keys(manager, req, augmented, include_partial=True)
+    assert [mm_keys for _, mm_keys in manager.event_manager.calls] == [
+        [(resource_manager._hash_to_digest(_HASH_INTS), 0, "image-a")],
+        [(resource_manager._hash_to_digest(_HASH_INTS), 3, "image-a")],
+    ]
+
+
 def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
     vocab_size = 1000
     digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)

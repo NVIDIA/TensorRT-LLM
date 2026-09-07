@@ -167,6 +167,7 @@ class KVCacheEventManager:
         self._pending_events: list[KVCacheEvent] = []
         self._events: deque[KVCacheEvent] = deque()
         self._condition = Condition()
+        self._mm_keys_by_block_key: dict[bytes, list[MmKey]] = {}
         self._v1_hash_by_block_key: dict[bytes, int] = {}
         self._v1_hash_compatible_keys: set[bytes] = set()
         self._v1_root_attrs_by_block_key: dict[bytes, tuple[int | None, int | None]] = {}
@@ -187,6 +188,16 @@ class KVCacheEventManager:
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
         with self._condition:
             self._window_size_by_layer_group = dict(window_sizes)
+
+    def register_mm_keys(self, block_key: bytes, mm_keys: Sequence[MmKey]) -> None:
+        """Associate multimodal event metadata with a radix-tree block key."""
+        key = bytes(block_key)
+        normalized = list(mm_keys)
+        with self._condition:
+            previous = self._mm_keys_by_block_key.get(key)
+            if previous is not None and previous != normalized:
+                raise ValueError("Conflicting multimodal metadata for KV cache block")
+            self._mm_keys_by_block_key[key] = normalized
 
     def add_stored_event(
         self,
@@ -494,6 +505,7 @@ class KVCacheEventManager:
         self, block_hash: BlockHashLike
     ) -> tuple[EventBlockHash, set[int]] | None:
         if isinstance(block_hash, bytes):
+            self._mm_keys_by_block_key.pop(block_hash, None)
             state = self._stored_blocks.pop(block_hash, None)
             if state is None:
                 return None
@@ -555,7 +567,7 @@ class KVCacheEventManager:
             tokens=[self._normalize_token(token) for token in block.tokens],
             cache_level=int(cache_level),
             priority=int(priority),
-            mm_keys=[],
+            mm_keys=list(self._mm_keys_by_block_key.get(bytes(block.key), ())),
         )
 
     @staticmethod
