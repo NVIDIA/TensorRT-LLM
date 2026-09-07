@@ -1690,7 +1690,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         new_tokens[0, 0, 0] = 999
         new_tokens[0, 1, 0] = 777
         overlap_state = SimpleNamespace(new_tokens=new_tokens)
-        model_engine._can_use_incremental_update = Mock(return_value=True)
         model_engine._can_use_steady_gen_fast_prepare = Mock(return_value=True)
 
         inputs, _ = model_engine._prepare_tp_inputs(
@@ -1707,7 +1706,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(
             attn_metadata.kv_cache_params.num_cached_tokens_per_seq, [2, 5])
         self.assertEqual(context.cached_tokens, 3)
-        model_engine._can_use_incremental_update.assert_not_called()
         model_engine._can_use_steady_gen_fast_prepare.assert_not_called()
         self.assertEqual(
             model_engine.previous_batch_indices_cuda[:1].cpu().tolist(), [1])
