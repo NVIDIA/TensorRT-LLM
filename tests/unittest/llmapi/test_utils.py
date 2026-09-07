@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 import threading
 
@@ -56,12 +58,16 @@ def test_set_affinity_all_threads_binds_existing_threads():
         release.wait()
         seen.append(sorted(os.sched_getaffinity(0)))
 
-    thread = threading.Thread(target=worker)
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     ready.wait()
     try:
         subset = all_cpus[:1]
-        assert _set_affinity_all_threads(subset) >= 2
+        bound, attempted = _set_affinity_all_threads(subset)
+        # The main thread and `thread` at a minimum, and none of the live
+        # threads may fail to be bound.
+        assert bound == attempted
+        assert bound >= 2
         release.set()
         thread.join()
         assert seen == [subset]
@@ -69,6 +75,13 @@ def test_set_affinity_all_threads_binds_existing_threads():
     finally:
         release.set()
         _set_affinity_all_threads(all_cpus)
+
+
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="Linux only")
+def test_set_affinity_all_threads_rejects_empty_cpu_list():
+    before = sorted(os.sched_getaffinity(0))
+    assert _set_affinity_all_threads([]) == (0, 0)
+    assert sorted(os.sched_getaffinity(0)) == before
 
 
 class DelayedAssert:

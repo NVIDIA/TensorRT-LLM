@@ -2,6 +2,7 @@ import asyncio
 import collections
 import ctypes
 import datetime
+import errno
 import hashlib
 import inspect
 import io
@@ -635,23 +636,58 @@ def get_numa_aware_cpu_affinity(device_id):
     return cpu_affinity
 
 
-def _set_affinity_all_threads(cpus: List[int]) -> int:
-    """Bind every thread of this process to `cpus`; returns the thread count.
+def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
+    """Bind every thread of this process to `cpus`.
 
     sched_setaffinity(pid) only binds the main thread, so threads created
     earlier (MPI, communication and I/O helpers) would keep their old mask.
+
+    Args:
+        cpus: The logical CPU ids to bind to. Must not be empty.
+
+    Returns:
+        `(bound, attempted)`: the number of threads that were successfully
+        bound, and the number of live threads the call was attempted on.
+        Threads that exit while `/proc/self/task` is being walked count
+        towards neither.
     """
+    if not cpus:
+        # sched_setaffinity() rejects an empty mask with EINVAL, so silently
+        # applying one would leave every thread on its previous mask.
+        logger.warning("Refusing to apply an empty CPU affinity mask; the "
+                       "affinity of this process is left unchanged.")
+        return 0, 0
+
     if not os.path.isdir("/proc/self/task"):
+        # Without procfs there is no way to enumerate thread ids. psutil sets
+        # a process-wide mask on Windows and FreeBSD; on Linux this degrades
+        # to the main thread, which is the pre-existing behaviour.
         psutil.Process().cpu_affinity(cpus)
-        return 1
-    nthreads = 0
+        return 1, 1
+
+    bound = 0
+    attempted = 0
+    failures = collections.Counter()
     for tid in os.listdir("/proc/self/task"):
         try:
             os.sched_setaffinity(int(tid), cpus)
-            nthreads += 1
-        except OSError:
-            pass
-    return nthreads
+        except ProcessLookupError:
+            # The thread exited between the listdir() and the call. The
+            # listing is a snapshot, so this race is expected and benign.
+            continue
+        except OSError as e:
+            attempted += 1
+            failures[errno.errorcode.get(e.errno, e.errno)] += 1
+        else:
+            attempted += 1
+            bound += 1
+
+    if failures:
+        logger.warning(
+            f"Could not set the CPU affinity of {attempted - bound} of "
+            f"{attempted} threads ({dict(failures)}). Those threads keep "
+            f"their previous affinity mask.")
+    return bound, attempted
 
 
 def configure_cpu_affinity(device_id: int) -> None:
@@ -692,19 +728,29 @@ def configure_cpu_affinity(device_id: int) -> None:
             logger.warning(f"Worker process {pid} has constrained CPU affinity "
                            f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
                            f"Removing CPU affinity constraints.")
-            _set_affinity_all_threads(all_cpus)
+            bound, attempted = _set_affinity_all_threads(all_cpus)
+            if bound < attempted:
+                logger.warning(
+                    f"Worker process {pid} could only remove the CPU affinity "
+                    f"constraints of {bound} of {attempted} threads.")
 
     # If affinity is unconstrained and the user hasn't explicitly
     # prohibited it or the user has explicitly requested it, choose the
     # optimal affinity based upon the NUMA topology
     if ((numa_aware_affinity is None and not constrained_affinity)
             or (numa_aware_affinity == "1")):
-        nthreads = _set_affinity_all_threads(
+        bound, attempted = _set_affinity_all_threads(
             get_numa_aware_cpu_affinity(device_id))
-        logger.info(
-            f"Worker process {pid} CPU affinity set to "
-            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
-            f"({nthreads} threads).")
+        if bound == 0:
+            logger.warning(
+                f"Worker process {pid} could not set the NUMA-aware CPU "
+                f"affinity of any thread. It will run without NUMA pinning, "
+                f"which may impact performance.")
+        else:
+            logger.info(
+                f"Worker process {pid} CPU affinity set to "
+                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
+                f"({bound}/{attempted} threads).")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
