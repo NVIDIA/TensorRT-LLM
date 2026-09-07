@@ -110,7 +110,8 @@ def _is_in_inline_code(text, position):
         delimiter = text[offset:delimiter_end]
         closing_offset = text.find(delimiter, delimiter_end)
         if closing_offset == -1:
-            return delimiter_end <= position
+            offset = delimiter_end
+            continue
         if delimiter_end <= position < closing_offset:
             return True
         offset = closing_offset + len(delimiter)
