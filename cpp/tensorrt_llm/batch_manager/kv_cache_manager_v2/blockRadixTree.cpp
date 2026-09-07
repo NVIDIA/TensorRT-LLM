@@ -912,13 +912,40 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
     return matched;
 }
 
+namespace
+{
+// Drop `backoff` tokens off the tail of a match, dropping whole blocks while the backoff
+// outruns them. Only the tail shrinks, so pruneMatch's "leading entries are full blocks"
+// invariant still holds.
+void backOffMatch(std::vector<BlockRadixTree::MatchResult>& matched, int backoff)
+{
+    while (backoff > 0 && !matched.empty())
+    {
+        auto& last = matched.back();
+        if (last.numMatchedTokens > backoff)
+        {
+            last.numMatchedTokens -= backoff;
+            return;
+        }
+        backoff -= last.numMatchedTokens;
+        matched.pop_back();
+    }
+}
+} // namespace
+
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
-    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
+    ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch, int backoff) const
 {
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Page requirements depend on the final endpoint. Back off before pruning
+    // so SWA coverage and recurrent snapshots are validated at that endpoint.
+    if (backoff > 0)
+    {
+        backOffMatch(rawMatched, backoff);
+    }
     // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
@@ -927,7 +954,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     {
         numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
     }
-    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());

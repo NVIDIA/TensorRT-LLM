@@ -768,6 +768,17 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
             copy(src, staging_dir / name)
 
 
+def install_editable_package(venv_python: Path) -> None:
+    """Editable-install the built package into the venv `setup_venv` created.
+
+    Not `sys.executable`: a fresh checkout has to start this script with the
+    system interpreter, so installing with it puts the package in the system
+    site-packages and leaves the new venv without it. The wheel build above
+    already uses `venv_python` for the same reason.
+    """
+    build_run(f"\"{venv_python}\" -m pip install -e .[devel]")
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -1523,7 +1534,7 @@ def main(*,
             env=env)
 
     if install:
-        build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
+        install_editable_package(venv_python)
 
 
 def add_arguments(parser: ArgumentParser):

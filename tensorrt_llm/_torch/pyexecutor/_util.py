@@ -48,8 +48,9 @@ from ..disaggregation.kv_cache_transceiver import (
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
+                           get_num_spec_layers, get_spec_decoder,
+                           should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            extract_qwen4_exp_ple_cache_params,
@@ -591,6 +592,10 @@ class KvCacheCreator:
     # is preallocated. Every live manager reserves its own, so these budgets
     # must be divided rather than handed out whole.
     _OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
+
+    # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
+    # it to both constructors; the managers must not re-derive it.
+    _joint_kv_cache_reuse = False
 
     def __init__(
         self,
@@ -1473,6 +1478,7 @@ class KvCacheCreator:
             # target engine, and every manager must cover it.
             max_num_seq_slots=self._target_max_num_seq_slots(),
             cold_page_codec_provider=cold_page_codec_provider,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
         if not self._skip_est:
@@ -1525,6 +1531,17 @@ class KvCacheCreator:
                 self._mapping.pp_size)
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _joint_reuse_supported(self) -> bool:
+        """Span half of the pairing decision; ``build_managers`` ANDs it with
+        ``has_separate_one_model_draft``. ``False`` = leave the run unpaired.
+        """
+        if not self._is_kv_cache_manager_v2:
+            return False
+        if not getattr(self._kv_cache_manager_cls,
+                       "_supports_reuse_match_backoff", False):
+            return False
+        return draft_prompt_lookahead(self._speculative_config) is not None
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1668,6 +1685,7 @@ class KvCacheCreator:
             is_disagg=self._is_disagg,
             max_num_seq_slots=self._target_max_num_seq_slots(),
             cold_page_codec_provider=cold_page_codec_provider,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2105,6 +2123,15 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
+        has_separate_one_model_draft = (
+            self._draft_model_engine is None
+            and self._should_create_separate_draft_kv_cache())
+        # One term per axis: a draft pool exists to pair with, block reuse is on,
+        # and the span is known. Anything outside keeps its unpaired path.
+        self._joint_kv_cache_reuse = (has_separate_one_model_draft and
+                                      self_kv_cache_config.enable_block_reuse
+                                      and self._joint_reuse_supported())
+
         # Estimation managers are throwaway probes whose pools only hold dummy
         # requests, so an explicit offload tier would reserve capacity the probe
         # cannot fill. Encoder-decoder runs skip estimation, so dropping the
@@ -2118,7 +2145,7 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers.
         has_draft = (
             self._draft_model_engine is not None  # two-model
-            or self._should_create_separate_draft_kv_cache())  # one-model
+            or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
         if has_draft:
             # The GPU split applies when each manager sizes its pools from
@@ -2354,7 +2381,8 @@ def _create_kv_cache_manager(
         kv_cache_type=None,
         is_disagg: bool = False,
         max_num_seq_slots: Optional[int] = None,
-        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
+        cold_page_codec_provider: Optional[object] = None,
+        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2493,6 +2521,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         # Hybrid managers size their SSM state-slot pool from max_batch_size
         # (see MambaHybridCacheManager._max_resident_sequences), so growing only
         # the index mapper would let a request hold an index with no state slot.
@@ -2543,8 +2572,10 @@ def _create_kv_cache_manager(
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
         kimi_extra_kwargs = {}
-        if spec_config is not None and issubclass(kv_cache_manager_cls,
-                                                  MixedMambaHybridCacheManager):
+        kda_replay_manager_types = (MixedMambaHybridCacheManager,
+                                    MambaHybridCacheManagerV2)
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():

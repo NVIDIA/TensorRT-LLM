@@ -18,7 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -165,16 +165,37 @@ def make_kv_cache_manager(
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
     can_evict=False,
+    enable_joint_kv_cache_reuse=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
+    mgr.block_reuse_policy = "per_request"
+    mgr.enable_partial_reuse = True
+    mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
+    mgr.enable_block_reuse = False
+    mgr.num_extra_kv_tokens = 0
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.kv_cache_map = _KVCacheMap()
-    mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
+    mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
+    mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
+    # The backoff lives in KVCacheManagerV2; the scheduler only clips the two
+    # already-backed-off probe depths against each other.
+    mgr.reuse_match_backoff = 0
+    mgr.probe_context_reuse.side_effect = lambda req: None
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
+    mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
+    mgr._resume_and_restore.return_value = True
+
+    def create_kv_cache(request_id, *_args, **_kwargs):
+        kv_cache = Mock(capacity=0)
+        kv_cache.resize.return_value = True
+        mgr.kv_cache_map[request_id] = kv_cache
+        return kv_cache
+
+    mgr._create_kv_cache.side_effect = create_kv_cache
 
     def suspend_request(req):
         if can_evict:
@@ -201,6 +222,7 @@ def make_scheduler(
     scheduler_capacity: int | None = None,
     no_schedule_until_state: LlmRequestState | None = None,
     no_schedule_after_state: LlmRequestState | None = None,
+    draft_kv_cache_manager: Mock | None = None,
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
@@ -217,6 +239,8 @@ def make_scheduler(
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
             kwargs["no_schedule_after_state"] = no_schedule_after_state
+        if draft_kv_cache_manager is not None:
+            kwargs["draft_kv_cache_manager"] = draft_kv_cache_manager
         if cross_kv_cache_manager is not None:
             kwargs["cross_kv_cache_manager"] = cross_kv_cache_manager
         return KVCacheV2Scheduler(
@@ -745,6 +769,28 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
 
+    def test_generation_admission_rolls_back_target_when_draft_fails(self):
+        """The draft pool mirrors the target pool, so a draft-side failure is
+        an ordinary KV shortage: roll the target growth back and run the same
+        last-resort self-suspend used for target-pool pressure."""
+        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.paused_requests) == [0]
+        mgr.try_allocate_generation.assert_called_once_with(req)
+        draft_mgr.try_allocate_generation.assert_called_once_with(req)
+        mgr.revert_allocate_generation.assert_called_once_with(req)
+        mgr.suspend_request.assert_called_once_with(req)
+        draft_mgr.suspend_request.assert_called_once_with(req)
+
     def test_suspended_request_not_evictable(self):
         """A started request with suspended (inactive) KV cache is not a valid victim."""
         call_count = [0]
@@ -829,6 +875,163 @@ class TestKVCacheFailuresCtx:
         ]
         out = sched.schedule_request(reqs, set())
         assert ids(out.context_requests) == [1]
+
+    def test_draft_reuse_uses_common_prefix_before_budgeting(self):
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            enable_joint_kv_cache_reuse=True,
+        )
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        # The draft matches further, so the target claim is capped to it and
+        # the draft is re-claimed at the target's shorter match.
+        draft_mgr.prepare_context_cache.side_effect = [256, 129]
+        mgr.prepare_context_cache.side_effect = [129]
+
+        sched = make_scheduler(
+            mgr,
+            # The 500-token prompt cannot fit without applying the common
+            # 129-token reusable prefix before budget accounting.
+            max_num_tokens=400,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=500)
+
+        # Stands in for the C++ setPrepopulatedPromptLen: advances the cursor
+        # and shortens the remaining context the budget is charged for.
+        def apply_prepopulated(reuse, tokens_per_block):
+            del tokens_per_block
+            req.context_current_position = reuse
+            req.context_remaining_length = req.prompt_len - reuse
+
+        req.set_prepopulated_prompt_len.side_effect = apply_prepopulated
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_current_position == 129
+        mgr.prepare_context_cache.assert_called_once_with(req, 256)
+        assert [c.args for c in draft_mgr.prepare_context_cache.call_args_list] == [
+            (req, None),
+            (req, 129),
+        ]
+        draft_mgr.free_resources.assert_called_once_with(req)
+        mgr.free_resources.assert_not_called()
+        mgr.resize_context.assert_called_once_with(req, 371)
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 371)
+
+    @pytest.mark.parametrize(
+        ("draft_probe", "target_probe", "expected"),
+        [
+            pytest.param(253, 509, 253, id="draft_binds"),
+            pytest.param(509, 197, 197, id="target_binds"),
+            pytest.param(509, 507, 507, id="target_binds_by_two"),
+            pytest.param(0, 509, 0, id="zero_match"),
+        ],
+    )
+    def test_pools_are_paired_on_one_depth_before_either_claims(
+        self, draft_probe, target_probe, expected
+    ):
+        """Both pools claim the minimum of their backed-off probe depths.
+
+        Pairing up front rather than claim-then-reconcile keeps the mismatch path
+        -- free the draft pages, re-claim shallower -- off the common case.
+        """
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        draft_mgr.probe_context_reuse.side_effect = lambda req: draft_probe
+        mgr.probe_context_reuse.side_effect = lambda req: target_probe
+        draft_mgr.prepare_context_cache.side_effect = [expected]
+        mgr.prepare_context_cache.side_effect = [expected]
+
+        req = make_ctx_request(0, context_remaining_length=600, prompt_len=600)
+        req.context_chunk_size = 600
+
+        def apply_prepopulated(reuse, tokens_per_block):
+            del tokens_per_block
+            req.context_current_position = reuse
+            req.context_remaining_length = req.prompt_len - reuse
+
+        req.set_prepopulated_prompt_len.side_effect = apply_prepopulated
+
+        sched = make_scheduler(mgr, max_num_tokens=2000, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
+        mgr.prepare_context_cache.assert_called_once_with(req, expected)
+        draft_mgr.free_resources.assert_not_called()
+
+    def test_paired_reuse_falls_back_to_zero_when_pools_disagree(self):
+        mgr = make_kv_cache_manager(
+            tokens_per_block=32,
+            enable_joint_kv_cache_reuse=True,
+        )
+        draft_mgr = make_kv_cache_manager(tokens_per_block=32)
+        # Draft claims 97, target only reaches 65, and the draft re-claim at
+        # 65 falls to 49 -- both pools then drop to no reuse.
+        mgr.prepare_context_cache.side_effect = [65, 0]
+        draft_mgr.prepare_context_cache.side_effect = [97, 49, 0]
+        req = make_ctx_request(0, context_remaining_length=500, prompt_len=500)
+        req.context_chunk_size = 500
+
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert mgr.prepare_context_cache.call_args_list[-1].args == (req, 0)
+        assert draft_mgr.prepare_context_cache.call_args_list[-1].args == (req, 0)
+        mgr.free_resources.assert_called_once_with(req)
+        assert draft_mgr.free_resources.call_count == 2
+        assert req.context_current_position == 0
+        mgr.resize_context.assert_called_once_with(req, 500)
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 500)
+
+    def test_reentry_with_a_shallower_match_rewinds_the_shared_cursor(self):
+        """A retried first chunk must not keep a prefix it no longer matches.
+
+        setPrepopulatedPromptLen only moves the cursor forward, so a request
+        whose earlier attempt finalized a deeper prefix would otherwise start
+        prefill past positions that nothing ever computed.
+        """
+        mgr = make_kv_cache_manager(tokens_per_block=32, enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager(tokens_per_block=32)
+        req = make_ctx_request(0, context_remaining_length=500, prompt_len=500)
+        req.context_chunk_size = 500
+        # An earlier attempt reused 64 tokens, then dropped both caches after
+        # an admission failure. This time neither pool matches anything.
+        req.context_current_position = 64
+
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_current_position == 0
+
+    def test_draft_context_failure_rolls_back_target(self):
+        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.try_allocate_draft_context.side_effect = lambda req, n: False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            draft_kv_cache_manager=draft_mgr,
+        )
+        reqs = [make_ctx_request(0, 500), make_gen_request(1)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [1]
+        assert not out.context_requests
+        mgr.resize_context.assert_called_once_with(reqs[0], 500)
+        mgr.suspend_request.assert_called_once_with(reqs[0])
+        draft_mgr.suspend_request.assert_called_once_with(reqs[0])
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(reqs[0], 500)
+        mgr.revert_allocate_context.assert_called_once_with(reqs[0])
 
 
 class TestKVCacheFailuresCtxChunked:
@@ -1328,8 +1531,11 @@ class TestEncoder:
         assert ids(out2.context_requests) == [0]
         self_mgr.prepare_context.assert_called_once_with(ctx_req)
         self_mgr.resize_context.assert_called_once_with(ctx_req, 50)
-        cross_mgr.prepare_context.assert_called_once_with(ctx_req)
-        cross_mgr.resize_context.assert_called_once_with(ctx_req, 80)
+        cross_mgr._create_kv_cache.assert_called_once()
+        cross_mgr._resume_and_restore.assert_called_once_with(
+            ctx_req.py_request_id, cross_mgr.kv_cache_map[ctx_req.py_request_id]
+        )
+        cross_mgr.kv_cache_map[ctx_req.py_request_id].resize.assert_called_once_with(80)
 
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
         """Later decoder chunks read existing cross-KV without reallocation."""
@@ -1635,13 +1841,24 @@ class TestChunkedContext:
         assert req.context_chunk_size == 100  # last chunk, no rounding
 
     def test_budget_limits_chunk(self):
-        mgr = make_kv_cache_manager(tokens_per_block=64)
-        sched = make_scheduler(mgr, max_num_tokens=300, ctx_chunk_config=(None, 64))
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            enable_joint_kv_cache_reuse=True,
+        )
+        draft_mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=300,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
         req = make_ctx_request(0, context_remaining_length=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
         # 300 // 64 * 64 = 256
         assert req.context_chunk_size == 256
+        mgr.resize_context.assert_called_once_with(req, 256)
+        draft_mgr.try_allocate_draft_context.assert_called_once_with(req, 256)
 
     def test_min_budget_check(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
