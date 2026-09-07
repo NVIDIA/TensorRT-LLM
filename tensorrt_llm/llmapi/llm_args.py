@@ -2630,16 +2630,6 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
         "Called to prepare/free resources before/after target model forward passes."
     )  # Type is Optional[ResourceManager]
 
-    @field_validator("mtp_eagle_one_model")
-    @classmethod
-    def _reject_two_model_mtp(cls, value: bool) -> bool:
-        if value is False:
-            raise ValueError(
-                "mtp_eagle_one_model=False is no longer supported: the "
-                "two-model MTP path has been removed. Omit the field or set "
-                "it to True.")
-        return value
-
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only supports linear tree
@@ -2791,6 +2781,16 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "one-model implementation (drafter as submodule) is the only supported "
         "path. Setting False is rejected: the two-model path has been "
         "removed.")
+
+    @field_validator("mtp_eagle_one_model")
+    @classmethod
+    def _reject_two_model_mtp(cls, value: bool) -> bool:
+        if value is False:
+            raise ValueError(
+                "mtp_eagle_one_model=False is no longer supported: the "
+                "two-model MTP path has been removed. Omit the field or set "
+                "it to True.")
+        return value
 
     use_dynamic_tree: bool = Field(
         default=False,
