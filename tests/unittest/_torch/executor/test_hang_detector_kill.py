@@ -24,6 +24,8 @@ import sys
 import threading
 import time
 import types
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -34,6 +36,7 @@ from tensorrt_llm._torch.pyexecutor.hang_detector import (
     hard_kill_on_rank_crash,
     start_rank_crash_kill_watchdog,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 
 def test_detector_fires_after_timeout():
@@ -196,6 +199,34 @@ def test_status_provider_errors_are_logged(monkeypatch):
     assert "transceiver status" in messages
     assert events[1] == ("stacks", None)
     assert events[-1] == ("detected", None)
+
+
+def test_control_request_wait_pauses_detector():
+    fired = []
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
+    executor.active_requests = []
+    executor.waiting_queue = []
+    executor.control_request_barrier = threading.Event()
+    executor.control_action_done = threading.Event()
+    executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
+
+    def complete_control_action():
+        executor.control_request_barrier.wait()
+        time.sleep(2.0)
+        executor.control_action_done.set()
+        executor.control_request_barrier.clear()
+
+    completion_thread = threading.Thread(target=complete_control_action)
+    completion_thread.start()
+    with patch("torch.cuda.synchronize"), executor.hang_detector:
+        executor.hang_detector.checkpoint()
+        executor._handle_control_request()
+    completion_thread.join()
+
+    assert fired == []
+    assert executor.control_requests == []
+    assert not executor.control_action_done.is_set()
 
 
 def test_propagate_hard_kill_self_sigkills_without_mpi():
