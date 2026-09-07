@@ -223,7 +223,8 @@ def _run_command_with_captured_output(cmd: list[str],
                 buf += chunk
                 # Only inspect bytes appended since the last pass; rescanning
                 # the whole buffer makes an undelimited stream quadratic.
-                cut = max(buf.rfind(b'\n', scanned), buf.rfind(b'\r', scanned)) + 1
+                cut = max(buf.rfind(b'\n', scanned), buf.rfind(b'\r',
+                                                               scanned)) + 1
                 decoded = []
                 if cut > scanned:
                     records = re.split(rb'(?<=[\r\n])', bytes(buf[:cut]))
