@@ -463,7 +463,9 @@ void BounceReceiver::forget(std::string const& peer)
     // (1) Drop this peer's not-yet-started scatter jobs — no point scattering for a gone peer; their
     //     incoming regions are quarantined (or freed) by the reclaim below. A queued job whose
     //     flow was ALREADY reclaimed (cancel / lease expiry flagged it orphaned in mScattering) sits
-    //     in the scheduler's orphan set, so dropping it here is its only path to freeOrphanRegion.
+    //     in the scheduler's orphan set; collect those offsets here and free them in (4), AFTER the
+    //     peer's flows are dropped — freeOrphanRegion runs schedule(), which would otherwise grant the
+    //     freed region straight back to a flow of the very peer being forgotten.
     std::vector<std::uint64_t> orphanedOffsets;
     {
         std::lock_guard<std::mutex> lk(mJobMu);
@@ -490,10 +492,6 @@ void BounceReceiver::forget(std::string const& peer)
         }
         mJobs.swap(keep);
     }
-    for (auto const off : orphanedOffsets)
-    {
-        mCtx.sendGrants(mCtx.scheduler.freeOrphanRegion(off)); // mirrors drainScatterDone
-    }
     // (2) Regions of this peer still scattering are reads already RUNNING in a worker — they must not
     //     be re-granted until the worker finishes. reclaimByPrefix defers those; we flag them orphaned
     //     in mScattering so drainScatterDone frees them via freeOrphanRegion on completion.
@@ -507,6 +505,12 @@ void BounceReceiver::forget(std::string const& peer)
             return mCtx.scheduler.reclaimByPrefix(
                 peer + kSep, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
         });
+    // (4) Now that none of this peer's flows is in the ring, free the orphaned regions collected in
+    //     (1); the re-grants can only reach other peers.
+    for (auto const off : orphanedOffsets)
+    {
+        mCtx.sendGrants(mCtx.scheduler.freeOrphanRegion(off)); // mirrors drainScatterDone
+    }
 }
 
 void BounceReceiver::checkTimeouts()
@@ -667,10 +671,12 @@ void BounceReceiver::scatterWorkerLoop()
             // GRANT) could point them past the region and, if we only bounded against the whole arena,
             // read from an ADJACENT flow's region and copy its bytes into our KV — silent cross-flow
             // corruption. The region is one buddy block [regionBase, regionBase+regionBytes) owned solely
-            // by this flow, so bounding to it prevents any cross-flow read. dstAddr is NOT bounded: it is
-            // the receiver's own KV address round-tripped through the trusted control plane (same trust
-            // model as the Python bounce, which also does not validate it); only the SOURCE side is
-            // bounded to prevent cross-flow reads. Any bad entry -> skip launch, NACK, no ACK.
+            // by this flow, so bounding to it prevents any cross-flow read. dstAddr is NOT bounded here
+            // by decision: it is the receiver's own KV address round-tripped through the control plane;
+            // the standard NIXL path would reject an out-of-region address via covers() (createXferReq
+            // -> populate), so bounce drops that check (accepted cost/benefit; the Python bounce does
+            // not validate it either). Only the SOURCE side is bounded to prevent cross-flow reads.
+            // Any bad entry -> skip launch, NACK, no ACK.
             // regionBytes==0 means the region wasn't allocated (stale) -> reject the whole job.
             std::uint64_t const arenaLo = mCtx.arena->baseAddr();
             auto const regionBase = arenaLo + job.offset;
@@ -1125,9 +1131,8 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor
         // (no recv/poll/ACK) for that delay. Instead drainGatherReady() polls this event and posts
         // the write only once the gather is done (NIXL's postXferReq is not stream-ordered anyway).
-        // The ONE exception is failRequest: it syncs still-gathering chunks before recycling their
-        // regions — bounded by at most maxInflightChunksPerRequest queued gathers — which is accepted
-        // on a request that is failing anyway.
+        // The rule has no exception: even failRequest parks a still-gathering chunk (mOrphanGather)
+        // and drainOrphanGather() recycles its region once cudaStreamQuery reports the exec stream idle.
         cudaError_t const recordErr = cudaEventRecord(ctx->event, ctx->stream);
         bool const gatherFailed = (gatherErr != cudaSuccess || recordErr != cudaSuccess);
         if (gatherFailed)
@@ -1137,7 +1142,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             // write of an UN-gathered region (garbage). Clear any non-sticky error so the next launch
             // does not inherit it (a sticky, context-level error cannot be cleared and will surface on
             // the next CUDA call) and flag the Posted so drainGatherReady fails the request
-            // deterministically (region/ctx released there).
+            // deterministically (parked by failRequest, recycled by drainOrphanGather).
             (void) cudaGetLastError();
             TLLM_LOG_WARNING("BounceTransport(%s): gather launch/record failed (launch=%d record=%d) rid=%llu chunk=%u",
                 mCtx.selfName.c_str(), static_cast<int>(gatherErr), static_cast<int>(recordErr),
@@ -1537,6 +1542,60 @@ bool BounceSender::drainOrphanLocal()
     return didWork;
 }
 
+bool BounceSender::drainOrphanGather()
+{
+    if (mOrphanGather.empty())
+    {
+        return false;
+    }
+    bool didWork = false;
+    std::vector<OrphanGather> keep;
+    keep.reserve(mOrphanGather.size());
+    for (auto& o : mOrphanGather)
+    {
+        // Non-blocking poll of the exec STREAM, not the event: a GatherFailed chunk may have a
+        // successfully launched kernel whose cudaEventRecord failed, so only the stream tells us when
+        // the region is no longer being written. A held ExecCtx stream carries only this chunk's work.
+        cudaError_t const st = cudaStreamQuery(o.ctx->stream);
+        if (st == cudaErrorNotReady)
+        {
+            // Warn once when an orphaned gather outlives requestTimeoutMs: nothing gives up on it
+            // (the kernel may still write the region), but an operator should know the region is held.
+            // A never-completing gather keeps busy() true (0 ms poll with the 50 us backoff) until
+            // process exit.
+            auto const ageMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - o.since)
+                      .count();
+            if (!o.warned && ageMs >= mCtx.cfg.requestTimeoutMs)
+            {
+                o.warned = true;
+                TLLM_LOG_WARNING(
+                    "BounceTransport(%s): orphaned gather rid=%llu region offset=%llu has not completed after "
+                    "%lld ms; staging region held until it does",
+                    mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
+                    static_cast<unsigned long long>(o.localOffset), static_cast<long long>(ageMs));
+            }
+            keep.push_back(o); // kernel may still be writing the region -> wait
+            continue;
+        }
+        if (st != cudaSuccess)
+        {
+            // A non-NotReady error here is most likely a sticky async kernel fault, which
+            // cudaGetLastError cannot clear (the clear only helps a non-sticky one): the WARNING is the
+            // signal. The region is recycled only because the request already failed — nothing
+            // consumes its content.
+            (void) cudaGetLastError();
+            TLLM_LOG_WARNING("BounceTransport(%s): orphaned gather rid=%llu ended with CUDA error %s",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid), cudaGetErrorString(st));
+        }
+        mCtx.exec->release(o.ctx);
+        mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.localOffset));
+        didWork = true;
+    }
+    mOrphanGather.swap(keep);
+    return didWork;
+}
+
 void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason reason)
 {
     // An abandoned flow (GRANT mispair / plan overflow) reaches here through the timeout path;
@@ -1551,14 +1610,16 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(reason), req.acked,
         req.nextPost, req.numChunks);
     // Release in-flight transfer handles and return each gather-staging region to the shared arena —
-    // but only once nothing is still touching the region's memory, else recycling races a live DMA:
+    // but only once nothing is still touching the region's memory, else recycling races a live DMA.
+    // Nothing here blocks on the GPU or the NIC (this runs on the IO thread, commonly from onNack):
     //   - Writing: the RDMA write may still be reading the region as its source. Defer to mOrphanLocal;
     //     drainOrphanLocal() releases the xfer + region once poll() is terminal.
-    //   - Gathering / GatherFailed: our gather kernel may still be WRITING the region; sync its stream
-    //     before recycling (else an abandoned gather scribbles a re-granted region — the write is not
-    //     ordered against the new owner). A NACK makes this path common (a NACK on chunk 0 can arrive
-    //     with up to maxInflightChunksPerRequest gathers queued); the sync is bounded by those queued
-    //     gathers, which is acceptable on a request that is failing anyway.
+    //   - Gathering / GatherFailed: our gather kernel may still be WRITING the region (an abandoned
+    //     gather would scribble a re-granted region — the write is not ordered against the new owner;
+    //     GatherFailed includes "launch OK, event-record failed", so its event cannot be trusted but
+    //     its stream can). Park it in mOrphanGather; drainOrphanGather() returns the ctx + region once
+    //     cudaStreamQuery(ctx->stream) reports the stream idle.
+    //   - Gathered: gather done (event observed), ctx already returned -> recycle now.
     //   - Sent: write landed (poll==kDone), xfer already released in pollSenderHandles, NIC done
     //     reading -> recycle now.
     bool deferredWrite = false;
@@ -1573,19 +1634,14 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
             mOrphanLocal.push_back(
                 OrphanLocal{std::move(p.xfer), p.localOffset, rid, std::chrono::steady_clock::now(), false});
             deferredWrite = true;
-            continue; // do NOT release xfer or recycle the region yet
+            continue;         // do NOT release xfer or recycle the region yet
         }
-        if ((p.state == PostState::Gathering || p.state == PostState::GatherFailed) && p.ctx != nullptr)
+        if (p.ctx != nullptr) // Gathering or GatherFailed: the exec stream may still write the region
         {
-            cudaError_t const se = cudaStreamSynchronize(p.ctx->stream);
-            if (se != cudaSuccess)
-            {
-                TLLM_LOG_WARNING("BounceTransport(%s): failRequest stream sync error rid=%llu chunk=%u: %s",
-                    mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx, cudaGetErrorString(se));
-                (void) cudaGetLastError();
-            }
-            mCtx.exec->release(p.ctx);
+            mOrphanGather.push_back(
+                OrphanGather{p.ctx, p.localOffset, rid, std::chrono::steady_clock::now(), /*warned=*/false});
             p.ctx = nullptr;
+            continue; // do NOT release ctx or recycle the region yet
         }
         mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
     }
@@ -1644,10 +1700,59 @@ void BounceSender::failAll()
     // Fail any still-pending requests so no submit() future hangs, releasing their in-flight
     // transfer handles first (same handle-leak fix as failRequest). Called after the device has been
     // synced and the IO thread joined, so no lock contention — but keep mReqMu for consistency.
-    // cudaDeviceSynchronize covers only local kernels. NIXL_SUCCESS from releaseXferReq means an
-    // active write was canceled/released; retain failures for retry instead of polling forever and
-    // letting a failed peer/backend hang teardown.
+    // cudaDeviceSynchronize covers only local kernels, NOT the NIC: TransferStatus::release() cannot
+    // reliably cancel a posted NIXL write (UCX's release issues ucp_request_cancel, which acts only on
+    // tag-matching receives, and returns success regardless; libfabric's release is a no-op), so an
+    // outbound write may still be READING the arena when ~NixlBounceState frees it. The only
+    // protection is to wait for those writes to reach a terminal state — bounded by
+    // min(requestTimeoutMs, 5 s) so a dead peer cannot hang teardown — and warn once if some are
+    // still in flight past the deadline. The once-retry of failed releases below is kept only as a
+    // cheap guard for other backends. This bounded wait runs while NixlTransferAgent::shutdown holds
+    // mLock, which is acceptable at teardown. It covers OUTBOUND writes only: inbound writes into
+    // regions we granted can neither be waited on nor revoked — deregistration invalidates the rkey and
+    // the process is exiting (the same exposure as KV-pool deregistration).
     std::lock_guard<std::mutex> lk(mReqMu);
+    {
+        std::vector<TransferStatus*> inFlight;
+        for (auto& [rid, req] : mRequests)
+        {
+            for (auto& p : req.posted)
+            {
+                if (p.state == PostState::Writing && p.xfer != nullptr)
+                {
+                    inFlight.push_back(p.xfer.get());
+                }
+            }
+        }
+        for (auto& o : mOrphanLocal)
+        {
+            if (o.xfer != nullptr)
+            {
+                inFlight.push_back(o.xfer.get());
+            }
+        }
+        // 5 s is long enough for an in-flight chunk to land on a live link; a dead peer's write never
+        // completes, so waiting longer buys nothing.
+        auto const deadline
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(mCtx.cfg.requestTimeoutMs, 5000));
+        while (!inFlight.empty())
+        {
+            inFlight.erase(std::remove_if(inFlight.begin(), inFlight.end(),
+                               [](TransferStatus* x) { return x->wait(0) != TransferState::kIN_PROGRESS; }),
+                inFlight.end());
+            if (inFlight.empty() || std::chrono::steady_clock::now() >= deadline)
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!inFlight.empty())
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): %zu outbound writes still in flight at shutdown; arena teardown may race the NIC",
+                mCtx.selfName.c_str(), inFlight.size());
+        }
+    }
     std::vector<std::unique_ptr<TransferStatus>> releaseRetry;
     for (auto& [rid, req] : mRequests)
     {
@@ -1684,8 +1789,9 @@ void BounceSender::failAll()
         }
     }
     mRequests.clear();
-    // Cancel/release deferred writes without recycling their regions or sending deferred control
-    // messages: no producer remains, and shutdown must not grant work against an arena being torn down.
+    // Release the handles of deferred writes (waited on above) without recycling their regions or
+    // sending deferred control messages: no producer remains, and shutdown must not grant work
+    // against an arena being torn down.
     for (auto& o : mOrphanLocal)
     {
         if (o.xfer != nullptr && !o.xfer->release())
@@ -1694,7 +1800,15 @@ void BounceSender::failAll()
         }
     }
     mOrphanLocal.clear();
-    // Retry failed cancellations once after all producers/futures have been stopped. A persistent
+    // Parked gathers: the caller's cudaDeviceSynchronize already drained every stream, so return the
+    // exec contexts unconditionally. Their regions are left to arena destruction like every other
+    // chunk's: the ring is torn down and grants are discarded, so recycling would be pointless.
+    for (auto const& o : mOrphanGather)
+    {
+        mCtx.exec->release(o.ctx);
+    }
+    mOrphanGather.clear();
+    // Retry failed releases once after all producers/futures have been stopped. A persistent
     // backend failure gets a final bounded attempt from the status object's destructor.
     for (auto& status : releaseRetry)
     {
@@ -1854,15 +1968,19 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
         || handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes
         || handshake.requestTimeoutMs != mCtx.cfg.requestTimeoutMs)
     {
+        // The chunk cap is clamped to each side's usable arena capacity, so differing caps with equal
+        // configured max_chunk_size usually mean different kv_cache_bounce_size_mb on the two sides.
+        char const* hint = handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes ? " (arena sizes differ?)" : "";
         TLLM_LOG_WARNING(
             "BounceTransport(%s): peer %s bounce handshake incompatible (wireVersion %u vs %u, controlKind "
-            "%u vs %u, maxChunkSizeBytes %llu vs %zu, requestTimeoutMs %d vs %d, peer arenaUsableCapacityBytes "
+            "%u vs %u, maxChunkSizeBytes %llu vs %zu%s, requestTimeoutMs %d vs %d, peer arenaUsableCapacityBytes "
             "%llu vs %zu) -> bounce disabled for this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned>(handshake.wireVersion),
             static_cast<unsigned>(kBounceVersion), static_cast<unsigned>(handshake.controlKind),
             static_cast<unsigned>(localControlKind), static_cast<unsigned long long>(handshake.maxChunkSizeBytes),
-            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), handshake.requestTimeoutMs, mCtx.cfg.requestTimeoutMs,
-            static_cast<unsigned long long>(handshake.arenaUsableCapacityBytes), mCtx.scheduler.arenaCapacity());
+            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), hint, handshake.requestTimeoutMs,
+            mCtx.cfg.requestTimeoutMs, static_cast<unsigned long long>(handshake.arenaUsableCapacityBytes),
+            mCtx.scheduler.arenaCapacity());
         return false;
     }
     // Peer input must never throw out of the metadata-exchange path (loadRemoteAgent): an empty or
@@ -1996,11 +2114,12 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     work |= mSender.drainGatherReady(); // post writes for chunks whose gather kernel just finished
     work |= mSender.pollSenderHandles();
     work |= mReceiver.drainScatterDone();
-    work |= mSender.drainOrphanLocal(); // recycle failed-but-in-flight write regions once their write ends
+    work |= mSender.drainOrphanLocal();  // recycle failed-but-in-flight write regions once their write ends
+    work |= mSender.drainOrphanGather(); // recycle failed-but-still-gathering regions once their exec stream is idle
     drainForgets();
-    mSender.drainPendingPosts();        // retry credits parked when the arena was full (onAck freed regions)
+    mSender.drainPendingPosts();         // retry credits parked when the arena was full (onAck freed regions)
     mSender.checkTimeouts();
-    mReceiver.checkTimeouts();          // expire grant leases of silent senders + free post-quarantine regions
+    mReceiver.checkTimeouts();           // expire grant leases of silent senders + free post-quarantine regions
     // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
     // this pass — the classic case being a gather stalled behind unrelated model kernels (gather
     // event stays NotReady) — keep latency low for the first few spins, then sleep briefly so we

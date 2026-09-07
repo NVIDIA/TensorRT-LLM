@@ -3819,7 +3819,7 @@ class TransferWorker:
                 f"TransferWorker: the C++ transfer-agent bounce was requested "
                 f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
                 f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
-                f"{self._agent.name} (not built or init failed); standard per-descriptor NIXL "
+                f"{self._agent.name} (init failed); standard per-descriptor NIXL "
                 "transfers are in use."
             )
         self._registered_mem: list = []

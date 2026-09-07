@@ -283,6 +283,7 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/8192, /*seed=*/12);
+    auto const execBaseline = A->exec->freeCount(); // every gather ctx idle before submit
     auto const start = std::chrono::steady_clock::now();
     auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "nackB");
     // Hang guard = the full request timeout, so a slow NACK fails the timing bound below, not this.
@@ -291,6 +292,20 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerNack);
     EXPECT_LT(elapsed, std::chrono::milliseconds(kTimeoutMs / 2)) << "NACK did not short-circuit the timeout";
+
+    // The eager gather of the failed chunk holds an ExecCtx + staging region until failRequest (or,
+    // for a still-running gather, the IO loop's drainOrphanGather()) releases both in one step. The
+    // ExecCtx returning to the pool guards against a ctx leak in any failRequest path; it cannot
+    // tell the parked (Gathering) branch from the immediate (Gathered) one — an 8 KiB eager gather
+    // finishes before the ZMQ round trip, and if the NACK wins the race nothing was posted at all —
+    // so the parked-gather branch is not deterministically exercised here (it would need a
+    // gather-stall hook).
+    auto const releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (A->exec->freeCount() != execBaseline && std::chrono::steady_clock::now() < releaseDeadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(A->exec->freeCount(), execBaseline) << "orphaned gather ctx/staging not released after NACK";
 
     A->tx->shutdown();
     B->tx->shutdown();
@@ -474,9 +489,33 @@ TEST(BounceTransportFailure, OversizedScatterRunListIsRejectedNotCounted)
     sender.sendTo("bigRunReceiver",
         b::encodeData(/*rid=*/1, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run}));
 
-    // The rejected scatter must not ACK...
-    EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), /*rid=*/1), 0);
-    // ...and must release the single region promptly: rid=2 can only be granted once rid=1's
+    // The rejected scatter must NACK the chunk (so a real sender fails at once) and never ACK it.
+    // One full-window pump covers both: the NACK must arrive, and no ACK may show up afterwards.
+    int acks = 0;
+    bool nacked = false;
+    pumpChannel(sender, std::chrono::seconds(2),
+        [&](b::BounceMsgHeader const& h, std::string const&)
+        {
+            if (h.requestId != 1)
+            {
+                return false;
+            }
+            auto const type = static_cast<b::BounceMsgType>(h.msgType);
+            if (type == b::BounceMsgType::kACK)
+            {
+                ++acks;
+            }
+            if (type == b::BounceMsgType::kNACK)
+            {
+                nacked = true;
+                EXPECT_EQ(h.chunkIdx, 0u);
+                EXPECT_EQ(h.regionHandle, credits.front().regionHandle);
+            }
+            return false;
+        });
+    EXPECT_TRUE(nacked) << "plan overflow was not NACKed";
+    EXPECT_EQ(acks, 0);
+    // The rejection must also release the single region promptly: rid=2 can only be granted once rid=1's
     // region is freed, which a worker stuck counting 2^32 pieces cannot do within the deadline.
     sender.sendTo("bigRunReceiver", b::encodeWant(/*rid=*/2, {256}, sender.localEndpoint()));
     std::vector<b::BounceCreditEntry> credits2;

@@ -281,7 +281,10 @@ private:
     std::optional<std::string> mDrainFlow;
     std::chrono::steady_clock::time_point mDrainSince{}; // when mDrainFlow was latched
     std::chrono::milliseconds mDrainTimeout{15000};
-    bool mDrainAbandonWarned{false};                     // first drain abandon is a WARNING, later ones DEBUG
+    // Per drain episode: the first abandon is a WARNING, repeated abandons of the same flow DEBUG.
+    // An episode ends when a DIFFERENT flow latches (mLastAbandonedFlow != new drain flow).
+    bool mDrainAbandonWarned{false};
+    std::string mLastAbandonedFlow;
     // Round-robin ring of active flow keys (insertion order). NOTE: "ring" not "order" — distinct
     // from BuddyAllocator's size `order` (mArena), which is the power-of-two block exponent.
     std::vector<std::string> mRing;

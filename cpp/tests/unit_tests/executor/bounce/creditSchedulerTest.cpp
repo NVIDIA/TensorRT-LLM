@@ -767,6 +767,41 @@ TEST(CreditScheduler, SharedArenaLocalAndRemoteShareOneAllocator)
     checkConservation(s, {flow}, 4);
 }
 
+TEST(CreditScheduler, EagerLocalCappedAtHalfArena)
+{
+    // Eager (credit-less) staging is capped at HALF the arena so a bidirectional pair can always
+    // still grant incoming regions; credit-backed acquisitions are not capped. promoteLocal (credit
+    // arrived) and releaseLocal both return budget.
+    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
+    std::vector<std::uint64_t> eager;
+    for (int i = 0; i < 4; ++i)
+    {
+        auto off = s.acquireLocal(kRegion, /*eager=*/true);
+        ASSERT_TRUE(off.has_value()) << "eager acquisition " << i << " within the half-arena budget refused";
+        eager.push_back(*off);
+    }
+    EXPECT_FALSE(s.acquireLocal(kRegion, /*eager=*/true).has_value()) << "eager staging exceeded half the arena";
+    EXPECT_EQ(freeRegions(s), 4u); // the cap is the eager budget, not arena exhaustion...
+    auto credited = s.acquireLocal(kRegion, /*eager=*/false);
+    ASSERT_TRUE(credited.has_value()) << "credit-backed acquisition wrongly capped";
+    EXPECT_EQ(s.localHeldCount(), 5u);
+
+    // Credit arrives for one eager region -> it stops counting; one more eager fits, then capped again.
+    s.promoteLocal(eager[0]);
+    auto more = s.acquireLocal(kRegion, /*eager=*/true);
+    ASSERT_TRUE(more.has_value());
+    EXPECT_FALSE(s.acquireLocal(kRegion, /*eager=*/true).has_value());
+
+    // Releasing an eager region frees its budget; releasing a promoted one must not over-credit.
+    (void) s.releaseLocal(eager[1]);
+    EXPECT_TRUE(s.acquireLocal(kRegion, /*eager=*/true).has_value());
+    (void) s.releaseLocal(eager[0]);
+    EXPECT_FALSE(s.acquireLocal(kRegion, /*eager=*/true).has_value()) << "promoted region still counted as eager";
+    EXPECT_EQ(s.localHeldCount(), 5u);
+    EXPECT_EQ(freeRegions(s), 3u);
+    checkConservation(s, {}, 8);
+}
+
 TEST(CreditScheduler, ScatterDoneIdempotentForUnknownRegion)
 {
     auto s = makeSched(/*nRegions=*/4, /*maxInflightChunksPerRequest=*/16);

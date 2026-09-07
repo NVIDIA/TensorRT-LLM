@@ -81,7 +81,7 @@ if(NIXL_ROOT)
   else()
     message(
       STATUS
-        "NIXL bounce v2: disabled - libzmq/pkg-config not found; with agent_bounce_buffer_enable the runtime will warn and fall back to standard NIXL"
+        "NIXL bounce v2: disabled - libzmq/pkg-config not found; an explicit agent_bounce_buffer_enable opt-in fails at agent construction (on a bounce build, runtime setup failures degrade to standard NIXL with a WARNING)"
     )
   endif()
 

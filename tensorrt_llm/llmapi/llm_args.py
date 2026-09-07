@@ -4692,15 +4692,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     agent_bounce_buffer_enable: bool = Field(
         default=False,
         description=
-        "Run the KV-cache bounce inside the C++ transfer agent (the NIXL "
-        "transport layer) instead of in the Python transceiver. It uses one "
-        "kv_cache_bounce_size_mb buffer shared by send and recv (about half "
-        "the memory of the Python bounce); make that size a power of two "
-        "(256/512/1024). Set it identically on context and generation. Only "
-        "writes with many small descriptors (>= 1024, <= 16 KiB average) take "
-        "the bounce path; others stay on standard NIXL. Thresholds and other "
-        "expert knobs live in agent_bounce_params. Requires the Python (v2) "
-        "transceiver; the C++ transceiver ignores this field.")
+        "Run the KV-cache bounce in the C++ transfer agent instead of the "
+        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
+        "(use a power of two). Set this and kv_cache_bounce_size_mb "
+        "identically on context and generation (a mismatch falls back to "
+        "standard NIXL). By default only writes with "
+        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
+        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
+        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
+        "relaxes the gate. Requires the Python (v2) transceiver; see the "
+        "disaggregated-serving docs.")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
@@ -4710,7 +4711,10 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
         "Precedence: this dict > environment variable > built-in default. "
         "Requires agent_bounce_buffer_enable. request_timeout_ms and "
-        "max_chunk_size must match between context and generation.")
+        "max_chunk_size must match between context and generation. "
+        "max_average_descriptor_size=0 stops outbound routing only (arena, "
+        "handshake and inbound scatter stay active); set "
+        "agent_bounce_buffer_enable=False to turn the feature off.")
 
     @field_validator('agent_bounce_params', mode='before')
     @classmethod

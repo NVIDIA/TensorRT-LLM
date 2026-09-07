@@ -294,23 +294,28 @@ public:
     /// Free local regions whose failed request still had an RDMA write in flight, once that write
     /// reaches a terminal state (so the NIC is done reading the source). Returns true if any freed.
     bool drainOrphanLocal();
+    /// Free the staging regions of failed requests whose gather may still be running, once their exec
+    /// stream is idle (non-blocking cudaStreamQuery), and return the exec context. Returns true if
+    /// any freed. Keeps failRequest off the GPU: the IO thread never blocks on a stream sync.
+    bool drainOrphanGather();
     /// Retry parked credits for every request (called on the IO loop after ACKs free regions).
     void drainPendingPosts();
     /// Fail requests that have made no progress within requestTimeoutMs (e.g. peer never granted).
     void checkTimeouts();
     /// A peer is gone: fail any in-flight request targeting it so its wait() returns.
     void forget(std::string const& peer);
-    /// Shutdown: fail every still-pending request and release each active write's TransferStatus
-    /// handle (a bounded cancel/release, with one retry pass over any release that failed). Does
-    /// not recycle regions or send new grants. Called after the IO/workers are joined and local
-    /// CUDA work has been synced.
+    /// Shutdown: fail every still-pending request, wait (bounded) for in-flight outbound writes to
+    /// reach a terminal state so the NIC is done reading the arena before it is freed, then release
+    /// each write's TransferStatus handle and return the parked gathers' exec contexts. Recycles no
+    /// regions (all are left to arena destruction) and sends no grants. Called after the IO/workers
+    /// are joined and local CUDA work has been synced.
     void failAll();
 
-    /// True while a local gather region is held or an orphan-local write is in flight (drives the IO
-    /// loop's 0ms busy-poll). Called on the IO thread.
+    /// True while a local gather region is held or an orphaned write/gather is still in flight
+    /// (drives the IO loop's 0ms busy-poll). Called on the IO thread.
     [[nodiscard]] bool busy() const
     {
-        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty();
+        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty() || !mOrphanGather.empty();
     }
 
 private:
@@ -402,6 +407,22 @@ private:
         bool warned{false};                            // stall WARNING already emitted once
     };
 
+    // Staging regions of a FAILED request whose gather may still be running (state == Gathering, or
+    // GatherFailed — a failed cudaEventRecord after a successful launch still leaves a kernel on the
+    // stream). A held ExecCtx stream carries only this chunk's work, so recycling is deferred until
+    // cudaStreamQuery(ctx->stream) is no longer NotReady — drainOrphanGather() polls it (non-blocking)
+    // and only then returns the exec context + region. Parking (instead of a cudaStreamSynchronize in
+    // failRequest) keeps the IO thread off the GPU on the NACK path. A never-completing gather keeps
+    // busy() true (0 ms poll with the 50 us backoff) until process exit. IO-thread-only (no lock).
+    struct OrphanGather
+    {
+        ExecCtx* ctx{nullptr};
+        std::uint64_t localOffset{};
+        std::uint64_t rid{};
+        std::chrono::steady_clock::time_point since{}; // when the gather was orphaned (age for the stall warning)
+        bool warned{false};                            // stall WARNING already emitted once
+    };
+
     /// GRANT-mispair guard shared by attachCredits()/pumpRequest(): a credit smaller than its chunk
     /// would make the RDMA write overflow the granted region into an adjacent flow's region on the
     /// peer. On a mispair it abandons the flow (kProtocolError) and returns true — the caller stops
@@ -434,6 +455,7 @@ private:
     std::atomic<std::uint64_t> mNextRid{1};
 
     std::vector<OrphanLocal> mOrphanLocal;
+    std::vector<OrphanGather> mOrphanGather;
     // A failed request's cancel (empty WANT) must be DEFERRED while any of its RDMA writes are still
     // in flight: those writes are landing on the RECEIVER's regions, and an early cancel would let the
     // receiver reclaim + re-grant those regions under the in-flight write -> cross-node corruption.

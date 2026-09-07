@@ -180,9 +180,10 @@ void NixlTransferAgent::maybeInitBounce(
             mName.c_str(), cfg.maxChunkSizeBytes);
         cfg.maxChunkSizeBytes = std::numeric_limits<std::uint32_t>::max();
     }
-    // Any setup failure (e.g. the arena/ExecPool cudaMalloc fails on a busy GPU, or fabric alloc
-    // throws) must NOT take down agent construction — bounce is an opt-in fast path. Catch, warn,
-    // and leave mBounce null so the agent runs the standard per-desc NIXL path unchanged.
+    // Contract: an explicit opt-in on a build without libzmq fails at agent construction (see the
+    // !TLLM_BOUNCE_V2 stub); runtime setup failures (cudaMalloc / registerMem / ZMQ bind) on a bounce
+    // build degrade to standard NIXL with a WARNING. So catch here, warn, and leave mBounce null so the
+    // agent runs the standard per-desc NIXL path unchanged.
     try
     {
         int dev = 0;
@@ -231,19 +232,31 @@ void NixlTransferAgent::maybeInitBounce(
         st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments);
         st->transport = std::make_unique<bounce::BounceTransport>(
             mName, cfg, dev, st->channel.get(), *this, st->arena.get(), st->exec.get());
-        mBounce = std::move(st);
-        // Log EVERY resolved knob so a mis-tuned deployment can tell which of dict/env/default won.
+        // Log EVERY resolved knob so a mis-tuned deployment can tell which of dict/env/default won. The
+        // chunk cap is printed as the transport's EFFECTIVE value (after its clamp to the usable arena
+        // capacity — the one advertised in the handshake) next to the configured one.
         TLLM_LOG_INFO(
             "NixlTransferAgent(%s): bounce v2 enabled (arenaSizeBytes=%zu arenaAllocationGranularityBytes=%zu "
-            "maxChunkSizeBytes=%zu maxInflightChunksPerRequest=%u copyStreamCount=%u scatterWorkerCount=%u "
-            "minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu requestTimeoutMs=%d receiverFlowTimeoutMs=%d "
-            "quarantineMs=%d disableFabricMemory=%d enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
-            mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, cfg.maxChunkSizeBytes,
-            static_cast<unsigned>(cfg.maxInflightChunksPerRequest), static_cast<unsigned>(cfg.copyStreamCount),
-            static_cast<unsigned>(cfg.scatterWorkerCount), cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes,
-            cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs, cfg.quarantineMs,
-            static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
+            "maxChunkSizeBytes(effective)=%zu (agent-side value before the arena capacity clamp: %zu) "
+            "maxInflightChunksPerRequest=%u "
+            "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
+            "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
+            "enableEagerGather=%d useZeroCopyArguments=%d control=%s)",
+            mName.c_str(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes, st->transport->maxChunkSizeBytes(),
+            cfg.maxChunkSizeBytes, static_cast<unsigned>(cfg.maxInflightChunksPerRequest),
+            static_cast<unsigned>(cfg.copyStreamCount), static_cast<unsigned>(cfg.scatterWorkerCount),
+            cfg.minDescriptorCount, cfg.maxAverageDescriptorSizeBytes, cfg.requestTimeoutMs, cfg.receiverFlowTimeoutMs,
+            cfg.quarantineMs, static_cast<int>(cfg.disableFabricMemory), static_cast<int>(cfg.enableEagerGather),
             static_cast<int>(cfg.useZeroCopyArguments), controlDesc.c_str());
+        if (cfg.maxAverageDescriptorSizeBytes == 0)
+        {
+            // Make "enabled but nothing routed" visible once; the per-rejection log stays DEBUG-only.
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent(%s): bounce gate disabled by max_average_descriptor_size=0: no outbound write "
+                "will use bounce; arena/handshake still active",
+                mName.c_str());
+        }
+        mBounce = std::move(st);
     }
     catch (std::exception const& e)
     {
@@ -380,7 +393,7 @@ bool NixlTransferAgent::shouldUseBounce(TransferRequest const& request) const
     }
     return false;
 }
-#else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null and these are no-ops.
+#else  // !TLLM_BOUNCE_V2 — bounce not built; the member stays null; the stubs warn or throw as documented.
 namespace bounce
 {
 struct NixlBounceState
@@ -389,13 +402,23 @@ struct NixlBounceState
 } // namespace bounce
 
 void NixlTransferAgent::maybeInitBounce(
-    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& /*bounceParams*/)
+    std::size_t agentBufferSizeMb, std::unordered_map<std::string, std::string> const& bounceParams)
 {
+    // Contract: an explicit opt-in on a build without libzmq fails at agent construction; only runtime
+    // setup failures (cudaMalloc / registerMem / ZMQ bind) on a BOUNCE build degrade to standard NIXL
+    // with a WARNING.
     if (agentBufferSizeMb > 0)
     {
+        TLLM_THROW("agent_bounce_buffer_enable requires a build with libzmq; this build has no bounce support");
+    }
+    // Same diagnostic as the bounce build for params without an arena.
+    if (!bounceParams.empty())
+    {
         TLLM_LOG_WARNING(
-            "agent_bounce_buffer_enable requested (kv_cache_bounce_size_mb > 0) but bounce support is not built; "
-            "ignoring");
+            "NixlTransferAgent(%s): agent_bounce_params set but the bounce arena size is 0 "
+            "(agent_bounce_buffer_enable off or kv_cache_bounce_size_mb 0) -> bounce stays "
+            "disabled and the params are ignored",
+            mName.c_str());
     }
 }
 
