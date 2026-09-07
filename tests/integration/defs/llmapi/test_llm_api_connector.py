@@ -372,6 +372,13 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 @pytest.mark.parametrize("save_async", [False, True])
 def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
                                   save_async):
+    # TEMPORARY: deliberately fail after >10 min with a message that
+    # matches none of the CI rerun fail-signatures, to verify that
+    # unrerunnable failures are reported as stage FAILURE (see
+    # jenkins/L0_Test.groovy rerun_0.txt handling). Remove before merge.
+    time.sleep(605)
+    assert False, "CI_UNRERUNNABLE_FAILURE_TEST_MARKER: intentional failure to validate rerun_0.txt stage-failure reporting"
+
     model_fn, scheduler, worker = model_with_connector
 
     prefill_worker = model_fn(
