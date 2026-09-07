@@ -720,10 +720,16 @@ class CustomDataset(BenchmarkDataset):
                 self.data.append(json.loads(line))
         random.shuffle(self.data)
 
-    def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               output_len: Optional[int] = None,
+               **kwargs) -> list[SampleRequest]:
         """
         Optimized version using batch tokenization for better performance.
+
+        If output_len is provided, it overrides the per-sample "max_tokens"
+        from the dataset, which then becomes optional.
         """
         # Collect all prompts and metadata
         prompts = []
@@ -734,7 +740,8 @@ class CustomDataset(BenchmarkDataset):
             if len(prompts) >= num_requests:
                 break
             prompt = entry["input"]["messages"][1]["content"]
-            max_tokens = entry["input"]["max_tokens"]
+            max_tokens = entry["input"][
+                "max_tokens"] if output_len is None else output_len
             prompts.append(prompt)
             max_tokens_list.append(max_tokens)
             if "num_tokens" in entry["input"] and isinstance(
