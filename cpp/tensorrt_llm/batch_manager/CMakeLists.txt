@@ -39,7 +39,6 @@ set(SRCS
     peftCacheManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    utils/staticThreadPool.cpp
     evictionPolicy.cpp
     cacheTransBuffer.cpp
     agentTree.cpp)
