@@ -470,11 +470,14 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_authorized_artifact_paths_fail_closed
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_golden_digest_is_pinned
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_golden_runtime_provenance_is_complete
-  # The remaining MiniMax-H3 cases in that file need the real checkpoint and are
-  # gated on MINIMAX_H3_E2E_AUTHORIZED, which no CI job sets, so listing them
-  # here would report coverage that never runs. Re-add them once the
-  # authorization is settled AND they have been shown to pass in CI. Until then
-  # they are run manually; see the module docstring for the required variables.
+  # Real-checkpoint cases; the weights come from the shared CI model store.
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_loads_and_runs TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_transformer_dynamic_fp8_compile_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_released_pipeline_smoke TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
+  # test_minimax_h3_t2va_diffusers_lpips_and_audio_golden is deliberately absent:
+  # its Diffusers tensor golden is not in the model store, so it would fail here.
+  # Register it once MINIMAX_H3_DIFFUSERS_GOLDEN's artifact is provisioned.
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
