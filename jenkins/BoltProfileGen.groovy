@@ -156,7 +156,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
     // amd64 is hardcoded: the jnlp + alpine images are arch-specific, so the pod
     // must land on an amd64 node (the aarch64/SBSA work runs on the SLURM cluster,
     // not on this pod). The `arch` arg is intentionally ignored.
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/arch: amd64
