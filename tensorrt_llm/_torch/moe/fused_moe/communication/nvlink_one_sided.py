@@ -25,11 +25,12 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
+import sys
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlMemory
+from tensorrt_llm._mnnvl_utils import CftMnnvlMemory, MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -40,6 +41,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -296,6 +298,11 @@ class NVLinkOneSided(Communication):
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkOneSided does not support Helix context parallelism because "
+                "its MNNVL communicator covers only the tensor-parallel group"
+            )
 
         if self.mapping.world_size != self.ep_size:
             raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
@@ -396,7 +403,7 @@ class NVLinkOneSided(Communication):
 
         workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
         memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
-
+        workspace_created = workspace_state is None
         if workspace_state is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
@@ -429,7 +436,6 @@ class NVLinkOneSided(Communication):
                 "metainfo": metainfo,
                 "cft_initialized": False,
             }
-            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
             expected_workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
@@ -449,41 +455,53 @@ class NVLinkOneSided(Communication):
                     f"reuse workspace with different {key}"
                 )
 
-        NVLinkOneSided._WORKSPACE = workspace_state
-        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
-            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
-        )
         self._destroyed = False
+        self._workspace_registered = False
         self._workspace_state = workspace_state
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
-        self.moe_a2a_metainfo = workspace_state["metainfo"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
         self._rank_mask_enabled = ep_group_health is not None
-        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
-            workspace_state=workspace_state,
-            workspace=self.workspace,
-            metainfo=self.moe_a2a_metainfo,
-            metainfo_index={
-                "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
-                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
-                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
-            },
-            ep_rank=self.ep_rank,
-            health=self.ep_group_health,
-        )
-        self._alltoall_watchdog: AlltoAllWatchdog | None = None
         if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
             alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
-        if alltoall_watchdog_timeout_s is not None:
-            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
-                ep_size=self.ep_size,
-                timeout_s=alltoall_watchdog_timeout_s,
-                poll_interval_s=alltoall_watchdog_poll_interval_s,
-                on_timeout=alltoall_watchdog_on_timeout,
-            )
+        flag_val_offset_index = self.FLAG_VAL_OFFSET_INDEX
+        dispatch_flags_offset_index = self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX
+        combine_flags_offset_index = self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
+        if (
+            flag_val_offset_index is None
+            or dispatch_flags_offset_index is None
+            or combine_flags_offset_index is None
+        ):
+            raise RuntimeError("MoE All-to-All metadata indices are not initialized")
+        self._workspace_lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
+            workspace_state=workspace_state,
+            memory=self.mnnvl_mem,
+            workspace=self.workspace,
+            metainfo=workspace_state["metainfo"],
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": flag_val_offset_index,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": dispatch_flags_offset_index,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": combine_flags_offset_index,
+            },
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            health=self.ep_group_health,
+        )
+        self._workspace_lifecycle.register(
+            self,
+            watchdog_timeout_s=alltoall_watchdog_timeout_s,
+            watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
+            watchdog_on_timeout=alltoall_watchdog_on_timeout,
+        )
+        if workspace_created:
+            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
+        NVLinkOneSided._WORKSPACE = workspace_state
+        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
+        )
+        self._workspace_registered = True
 
         # Initialize CFT Logical Endpoints by binding the LE to the workspace.
         # The LE IS the workspace — no separate allocation or payload layout needed.
@@ -503,6 +521,24 @@ class NVLinkOneSided(Communication):
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
 
+    @property
+    def moe_a2a_metainfo(self) -> torch.Tensor:
+        return self._require_workspace_lifecycle().metainfo
+
+    @property
+    def _watchdog_coordinator(self) -> AlltoAllWatchdogCoordinator:
+        return self._require_workspace_lifecycle().coordinator
+
+    @property
+    def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
+        return self._require_workspace_lifecycle().watchdog_for(self)
+
+    def _require_workspace_lifecycle(self) -> _MnnvlAlltoAllWorkspaceLifecycle:
+        lifecycle = self._workspace_lifecycle
+        if lifecycle is None:
+            raise RuntimeError("NVLinkOneSided workspace has been destroyed")
+        return lifecycle
+
     @staticmethod
     def is_platform_supported() -> bool:
         """
@@ -517,17 +553,19 @@ class NVLinkOneSided(Communication):
         return True
 
     def destroy(self):
-        """Release this instance's reference to the shared symmetric workspace."""
+        """Release shared state during explicit, rank-coordinated teardown."""
         if getattr(self, "_destroyed", False):
             return
 
         self._destroyed = True
-        if self._alltoall_watchdog is not None:
-            self._watchdog_coordinator.release_watchdog(self._alltoall_watchdog)
-            self._alltoall_watchdog = None
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
+            lifecycle.unregister(self)
         workspace_key = getattr(self, "_workspace_key", None)
-        if workspace_key is None:
+        if workspace_key is None or not getattr(self, "_workspace_registered", False):
+            self._workspace_lifecycle = None
             return
+        self._workspace_registered = False
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -545,9 +583,27 @@ class NVLinkOneSided(Communication):
 
         self.mnnvl_mem = None
         self.workspace = None
-        self.moe_a2a_metainfo = None
         self._workspace_state = None
+        self._workspace_lifecycle = None
         self._dispatch_state = {"phase": "destroyed"}
+
+    def __del__(self) -> None:
+        if sys.is_finalizing():
+            return
+        # Finalizers cannot safely perform collective cache eviction because
+        # their order is nondeterministic across ranks.
+        lifecycle = getattr(self, "_workspace_lifecycle", None)
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
+            lifecycle.unregister(self)
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is not None and getattr(self, "_workspace_registered", False):
+            refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+            if refcount > 0:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+            else:
+                NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+        self._workspace_registered = False
+        self._workspace_lifecycle = None
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
@@ -573,6 +629,57 @@ class NVLinkOneSided(Communication):
             self.cft_max_batch_for_combine,
             runtime_max_tokens_per_rank,
         )
+
+    def _require_mapped(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
+
+    def checkpoint_resource_key(self) -> int:
+        """Identify wrappers sharing the same MNNVL workspace lifecycle."""
+        return id(self._require_workspace_lifecycle())
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after every shared owner is idle."""
+        if self.can_use_cft_counted_writes:
+            raise RuntimeError(
+                "Checkpointing a CFT-backed MoE All-to-All workspace is not supported"
+            )
+        self._require_workspace_lifecycle().checkpoint_prepare()
+
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
+        """Collectively restore handles and all shared frontend state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocation. Every rank must call this method
+                symmetrically.
+        """
+        if comm is None:
+            comm = self.mnnvl_mem.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
+        self._require_workspace_lifecycle().checkpoint_restore(
+            comm,
+            lambda: torch.ops.trtllm.moe_a2a_initialize(
+                self.workspace,
+                self.ep_rank,
+                self.ep_size,
+                self.max_num_tokens_per_rank,
+                self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
+            ),
+        )
+
+    def _mnnvl_checkpoint_is_idle(self) -> bool:
+        return self._dispatch_state.get("phase") == "idle"
+
+    def _mnnvl_checkpoint_reset(self) -> None:
+        self._dispatch_state = {"phase": "idle"}
 
     def dispatch(
         self,
@@ -604,6 +711,7 @@ class NVLinkOneSided(Communication):
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
             Each tensor has shape [ep_size, max_tokens_per_rank, ...]
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
@@ -744,6 +852,7 @@ class NVLinkOneSided(Communication):
             Combined output tensor [local_num_tokens, hidden_size]
 
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
@@ -840,6 +949,7 @@ class NVLinkOneSided(Communication):
         Returns:
             Tensor view into workspace [ep_size, max_tokens_per_rank, hidden_size]
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError(
                 "get_combine_payload_tensor_in_workspace called before a successful dispatch"

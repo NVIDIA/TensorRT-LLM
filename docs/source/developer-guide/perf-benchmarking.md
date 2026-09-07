@@ -339,7 +339,7 @@ trtllm-bench \
   --model Qwen/Qwen2-VL-2B-Instruct \
   prepare-dataset \
   --output mm_data.jsonl \
-  real-dataset
+  real-dataset \
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
   --dataset-image-key image \
@@ -511,6 +511,7 @@ Nested metric names are rendered as dotted paths:
 ===========================================================
 model_loader.checkpoint_preparation_seconds: 1.1774
 model_loader.weight_population_seconds: 0.5979
+model_loader.checkpoint_finalization_seconds: 0.0312
 model_loader.post_load_processing_seconds: 0.0049
 model_loader.total_model_loading_seconds: 1.9708
 ```

@@ -606,9 +606,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Gemma4-specific defaults — see Gemma4ForCausalLM.get_model_defaults."""
-        return {
-            "attn_backend": "FLASHINFER",
-        }
+        return Gemma4ForCausalLM.get_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
@@ -899,11 +897,11 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         pretrained_config = getattr(model_config.pretrained_config, name)
         quant_config = model_config.quant_config if name == "text_config" else None
-        preferred_backend = "FLASHINFER" if name == "text_config" else "TRTLLM"
+        attn_backend = model_config.attn_backend if name == "text_config" else "TRTLLM"
         sub_config: ModelConfig = dataclasses.replace(
             model_config,
             pretrained_config=pretrained_config,
-            attn_backend=preferred_backend,
+            attn_backend=attn_backend,
             quant_config=quant_config,
         )
         if (

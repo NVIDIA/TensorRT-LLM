@@ -26,6 +26,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 import yaml
 from pydantic import model_validator
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -44,12 +45,14 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / FLASHINFER / CUTEDSL backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
-    Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
-    Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
+    Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
+    backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected
+    by AttentionConfig's validator with a ValueError.
     """
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
@@ -60,10 +63,13 @@ class QuantAttentionConfig(StrictBaseModel):
             "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
         ),
     )
-    v_dtype: Literal["fp8"] = Field(
+    v_dtype: Literal["fp8", "nvfp4"] = Field(
         "fp8",
         status="prototype",
-        description="V quantization dtype. The current kernels always load V in FP8 (e4m3).",
+        description=(
+            "V quantization dtype. The current kernels always load V in FP8 (e4m3) "
+            "or block-scaled NVFP4."
+        ),
     )
     q_block_size: int = Field(
         0,
@@ -97,16 +103,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+        description=("Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FLASHINFER, FA4, CUTEDSL"),
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / FLASHINFER / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -137,6 +143,11 @@ class AttentionConfig(StrictBaseModel):
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 1)),
         }
+        FLASHINFER_RECIPES = {
+            ("mxfp8", "fp8", (0, 0, 0)),
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "nvfp4", (0, 0, 0)),
+        }
 
         if self.quant_attention_config is None:
             return self
@@ -148,7 +159,14 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            if recipe not in SAGE_RECIPES:
+            if recipe in SAGE_RECIPES:
+                # int8 Q/K SAGE has a compiled cubin only on SM100.
+                if q_config.qk_dtype == "int8" and get_sm_version() != 100:
+                    raise ValueError(
+                        f"int8 Q/K SAGE quantized attention (backend='TRTLLM', "
+                        f"qk_dtype='int8', v_dtype='{q_config.v_dtype}') only supports sm_100."
+                    )
+            else:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
                     f"for backend='TRTLLM'. Supported SAGE recipes "
@@ -163,9 +181,17 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(CUTEDSL_RECIPES)}."
                 )
+        elif self.backend == "FLASHINFER":
+            if recipe not in FLASHINFER_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='FLASHINFER'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(FLASHINFER_RECIPES)}."
+                )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'FLASHINFER', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )
@@ -483,6 +509,57 @@ class CudaGraphConfig(StrictBaseModel):
     enable: bool = Field(False, status="prototype")
 
 
+class CpuOffloadConfig(StrictBaseModel):
+    """Configuration for offloading visual-generation model components to CPU.
+
+    A diffusion pipeline is a sequence of large *components* (text encoder,
+    denoising transformer, VAE, optional guardrails, ...) that run one after
+    another, so only one is needed on the GPU at any moment. Offloading
+    exploits this: weights are loaded and quantized normally, then held in
+    packed host (CPU) storage and brought onto the GPU one *stage* at a time,
+    rebinding each module's parameters/buffers to a reusable GPU arena while
+    that stage runs and evicting it back to CPU afterwards. This lowers peak
+    GPU memory to roughly the largest single stage rather than the whole
+    pipeline, letting larger models fit on limited VRAM, at the cost of
+    host<->device copies between stages (mitigated by ``pin_memory``).
+
+    Terminology (used consistently across these fields):
+
+    - **component**: a named, public sub-model of the pipeline, e.g.
+      ``text_encoder``, ``transformer``, ``vae``.
+    - **stage**: one step of the offload schedule — a single component, or a
+      group of components that are co-resident on the GPU and run together
+      before being evicted. For example, a stage ``["text_encoder", "transformer"]``
+      keeps both components on GPU until that stage completes. The ordered list
+      of stages is set by ``stages``.
+    """
+
+    enable: bool = Field(
+        False,
+        status="prototype",
+        description="Enable offloading of model components to CPU between pipeline stages.",
+    )
+    pin_memory: bool = Field(
+        True,
+        status="prototype",
+        description="Allocate pinned CPU storage for faster host-to-device copies.",
+    )
+    stages: Optional[List[Union[str, List[str]]]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Optional ordered list of stages, named with model-specific public component "
+            "names. Each entry is a single component, or a list of components that are "
+            "co-resident on the GPU and run together as one stage. For example, "
+            "[['text_encoder', 'transformer'], 'vae'] keeps text_encoder and "
+            "transformer co-resident before moving to vae. Example components: "
+            "['text_encoder', 'transformer', 'vae'] for Wan T2V, or "
+            "['reasoner', 'generator', 'text_guardrail', 'video_guardrail', 'vae'] for Cosmos3. "
+            "If omitted, the model chooses default stages."
+        ),
+    )
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -627,6 +704,10 @@ class VisualGenArgs(StrictBaseModel):
     )
     cuda_graph_config: CudaGraphConfig = Field(
         default_factory=CudaGraphConfig,
+        status="prototype",
+    )
+    cpu_offload_config: CpuOffloadConfig = Field(
+        default_factory=CpuOffloadConfig,
         status="prototype",
     )
     attention_config: AttentionConfig = Field(

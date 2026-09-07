@@ -29,7 +29,9 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from .fused_moe_cutlass import CutlassFusedMoE
+from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
+                         MoEActivation, MoEActivationSupport)
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability)
@@ -749,7 +751,7 @@ def set_strides(workspace: torch.Tensor, g: int, m: int, k: int):
     return workspace
 
 
-class DeepGemmFusedMoE(CutlassFusedMoE):
+class DeepGemmFusedMoE(MoEImplBase):
     """DeepGEMM flow of fused mixture of experts (MoE) Layer.
 
     Args:
@@ -763,23 +765,25 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
-    # Restated rather than inherited from CutlassFusedMoE: this backend does
-    # not fuse routed-expert LoRA, and the exact-class comparison this field
-    # replaces already answered False here.
-    capabilities = MoEStaticCapability(supports_moe_lora=False)
+    capabilities = MoEStaticCapability(
+        supports_eplb=True, supports_apply_router_weight_on_input=True)
 
-    # ``routing_scales_dtype`` is repeated from CutlassFusedMoE because setting
-    # any field here replaces the parent's object wholesale.
     input_requirement = MoEInputRequirement(
         routing_scales_dtype=torch.float32,
         requires_run_moe_workspace=True,
     )
 
+    # The DeepGEMM Triton activation kernel implements SwiGLU only, and takes
+    # the clamp by value -- a per-expert tensor would never be read.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu}),
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+    )
+
     def supports_moe_output_in_alltoall_workspace(self):
-        # Overrides the CutlassFusedMoE "True": run_moe emits into its own
-        # workspace buffers and never writes a caller-supplied output tensor,
-        # so a workspace-backed buffer would be left unfilled while combine()
-        # read from it.
+        # ``run_moe`` emits into its own workspace buffers and never writes a
+        # caller-supplied output tensor, so nothing would fill a workspace-backed
+        # buffer that ``combine()`` then reads.
         return False
 
     @classmethod
@@ -846,8 +850,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
-        swiglu_limit_scalar: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
     ):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -863,7 +866,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # does not size the DeepGEMM workspace deliberately.
         _configure_deepgemm_moe_max_num_tokens(model_config)
 
-        super().__init__(
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -873,12 +878,23 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
-            apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
-            swiglu_limit=swiglu_limit,
-            swiglu_limit_scalar=swiglu_limit_scalar,
+            activation=activation,
             init_load_balancer=init_load_balancer,
         )
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        self._weights_created = False
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+
+    def _supports_load_balancer(self) -> bool:
+        return True
+
+    def _check_configs(self):
+        assert self._weights_created
+        if self.apply_router_weight_on_input:
+            assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
 
     def get_workspace(self, m_max: int, group_size: int):
         capture_graph = torch.cuda.is_current_stream_capturing()
@@ -1113,7 +1129,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             quant_group_size=128,
             masked_m=masked_m,
             scale_ue8m0=True,
-            swiglu_limit=self.swiglu_limit_scalar)
+            swiglu_limit=self.act_clamp)
 
         # Grouped gemm 2
         h3 = set_strides(workspace["workspace_1"],

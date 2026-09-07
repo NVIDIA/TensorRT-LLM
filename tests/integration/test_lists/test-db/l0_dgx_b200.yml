@@ -17,6 +17,9 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
+  # ------------- Disaggregated Serving: Pipelined KV Transfer (multi-GPU) ---------------
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[use_kv_cache_manager_v2=False-enable_block_reuse=True]
+  - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[use_kv_cache_manager_v2=True-enable_block_reuse=True]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
@@ -181,8 +184,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp1] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp3_no_adp] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4[tp_size=8-ep_size=8] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4_mtp_index_share[tp_size=8-ep_size=8] TIMEOUT (60)
+  - accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8] TIMEOUT (60)
+  - accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy TIMEOUT (240)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph TIMEOUT (120) ISOLATION
   - examples/test_deepseek_v4_pro.py::test_short_token_boundary_smoke TIMEOUT (120)
@@ -345,7 +348,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[ulysses4]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2]
@@ -362,3 +364,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_attn_multi_gpus TIMEOUT (60)
   # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale/W4A8 stay in pre ----
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES and not W4A8 and not MXFP8"
+  # Kimi K3 Tier-1: truncated 4-layer (KDA + first full-attention) SA spec-dec
+  # logits parity on TP=4 (skips cleanly when the Kimi-K3 checkpoint is not
+  # staged under LLM_MODELS_ROOT).
+  - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (45)

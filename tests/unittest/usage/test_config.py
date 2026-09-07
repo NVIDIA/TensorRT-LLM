@@ -46,7 +46,14 @@ class TestTelemetryConfigLocation:
         """UsageContext enum has all expected members."""
         from tensorrt_llm.usage import config
 
-        expected = {"UNKNOWN", "LLM_CLASS", "CLI_SERVE", "CLI_BENCH", "CLI_EVAL"}
+        expected = {
+            "UNKNOWN",
+            "LLM_CLASS",
+            "CLI_SERVE",
+            "CLI_BENCH",
+            "CLI_EVAL",
+            "DISAGGREGATED",
+        }
         actual = {e.name for e in config.UsageContext}
         assert expected == actual
 
@@ -59,6 +66,7 @@ class TestTelemetryConfigLocation:
         assert config.UsageContext.CLI_SERVE.value == "cli_serve"
         assert config.UsageContext.CLI_BENCH.value == "cli_bench"
         assert config.UsageContext.CLI_EVAL.value == "cli_eval"
+        assert config.UsageContext.DISAGGREGATED.value == "disaggregated"
 
     def test_telemetry_config_disabled_flag(self):
         """TelemetryConfig(disabled=True) sets the flag."""

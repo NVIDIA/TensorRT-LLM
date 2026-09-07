@@ -402,12 +402,15 @@ down).
 
 ## Notes
 
-- **Agent operator guide.** Upstream agent-flow additionally ships a
-  `perf-optimize` project skill that teaches Claude Code to reach for this
-  workflow instead of hand-rolling a tune loop. It is not vendored here
-  because it hardcodes one site's cluster and registry; drive the
-  `perf-optimize` CLI directly, using this README and
-  [`task.example.yaml`](task.example.yaml) as the operator guide.
+- **Agent operator guide.** A `perf-optimize` project skill ships alongside
+  this workflow, at
+  [`agent-flow/.claude/skills/perf-optimize/SKILL.md`](../../../.claude/skills/perf-optimize/SKILL.md).
+  It teaches Claude Code to reach for this workflow instead of hand-rolling
+  a tune loop, and covers preflight, authoring `task.yaml`, driving the
+  campaign and reading the result. Bringing up the node and container is
+  left to your own site's recipe. To drive the CLI yourself instead, this
+  README and [`task.example.yaml`](task.example.yaml) are the operator
+  guide.
 - **Session scoping.** Agent sessions match each role's unit of work:
   the analyzer keeps one session across the whole campaign (it must
   remember the roadmap it authored), the optimizer's session spans one

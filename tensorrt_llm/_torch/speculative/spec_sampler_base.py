@@ -27,8 +27,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm.logger import logger
-
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -91,12 +89,31 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         return True
 
     def validate_request(self, request: LlmRequest) -> None:
-        """Reject sampling parameters the configured backend cannot honor."""
+        """Reject sampling parameters the one-model speculative path cannot honor.
+
+        The fused backend supports min_p; other one-model sampling backends do
+        not. This sampler also does not return context logits, generation logits,
+        or log probabilities. Raised during request admission, so only the
+        offending request fails rather than the whole executor step.
+        """
+        requested_outputs = (
+            ("return_context_logits / prompt_logprobs", request.py_return_context_logits),
+            ("return_generation_logits", request.py_return_generation_logits),
+            ("logprobs", request.py_return_log_probs),
+        )
+        unsupported_outputs = [name for name, requested in requested_outputs if requested]
+        if unsupported_outputs:
+            raise ValueError(
+                "The following output options are not supported with speculative decoding: "
+                f"{', '.join(unsupported_outputs)}. Drop these options from "
+                "the request, or disable speculative decoding."
+            )
+
         sampling_config = request.sampling_config
         if sampling_config is None:
             return
         min_p = sampling_config.min_p
-        if min_p and min_p[0] > 0.0 and not self._fused_sampling:
+        if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(
                 "min_p requires 'advanced_sampling_mode: fused' in the speculative "
                 "decoding config when using one-model speculative decoding. Set that "
@@ -141,11 +158,11 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         frontend may forward a default explicitly.
         """
         # py_min_length mirrors the C++ SamplingConfig field, i.e. an optional
-        # singleton list. The OpenAI frontend always forwards min_tokens (default
-        # 0), so the list is routinely present and holds the neutral value --
-        # gate on the value, not on the list being non-empty.
+        # scalar. The OpenAI frontend always forwards min_tokens (default 0), so
+        # it is routinely present and holds the neutral value -- gate on the
+        # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
-        if min_length and min_length[0] > 0:
+        if min_length and min_length > 0:
             raise ValueError(
                 "min_length is not supported with one-model speculative decoding. "
                 "Drop min_length from the request, or disable speculative decoding."
@@ -161,7 +178,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 "decoding. Drop no_repeat_ngram_size from the request, or disable "
                 "speculative decoding."
             )
-        if getattr(request, "_py_embedding_bias_1d", None) is not None:
+        if getattr(request, "py_embedding_bias", None) is not None:
             raise ValueError(
                 "embedding_bias is not supported with one-model speculative decoding. "
                 "Drop embedding_bias from the request, or disable speculative decoding."
@@ -258,23 +275,6 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
-        if request.py_return_context_logits:
-            logger.warning(
-                "return_context_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_generation_logits:
-            logger.warning(
-                "return_generation_logits not supported with speculative decoding, "
-                "skipping for request %s",
-                request.py_request_id,
-            )
-        if request.py_return_log_probs:
-            logger.warning(
-                "return_log_probs not supported with speculative decoding, skipping for request %s",
-                request.py_request_id,
-            )
         request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 

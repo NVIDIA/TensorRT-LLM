@@ -19,13 +19,6 @@ MODEL_PATH_DICT = {
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_8b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
-    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
-    "llama_v3.3_70b_instruct_fp8": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
-    "llama_v3.3_70b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.3_nemotron_super_49b_v1.5_fp8": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8",
-    "llama_v4_scout_17b_16e_instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
-    "llama_v4_scout_17b_16e_instruct_fp8": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
-    "llama_v4_scout_17b_16e_instruct_fp4": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
@@ -75,13 +68,17 @@ MODEL_PATH_DICT = {
     "qwen3.5_122b_a10b": "Qwen3.5-122B-A10B",
     "qwen3.5_397b_a17b_fp8": "Qwen3.5-397B-A17B-FP8",
     "qwen3.5_397b_a17b_fp4": "Qwen3.5-397B-A17B-NVFP4",
-    # Qwen3.6 (GDN linear-attn MoE, NVFP4)
+    # Qwen3.6 (GDN linear-attn MoE, NVFP4). The _mtp key is the same checkpoint
+    # benchmarked with one-model MTP drafting, so the two can be compared.
     "qwen3.6_35b_a3b_fp4": "Qwen3.6-35B-A3B-NVFP4",
+    "qwen3.6_35b_a3b_fp4_mtp": "Qwen3.6-35B-A3B-NVFP4",
     # DeepSeek V4
     "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
+    # NVFP4 routed experts (MIXED_PRECISION); the -DSpark entry above is FP8.
+    "deepseek_v4_pro_nvfp4_dspark": "DeepSeek-V4-Pro-nvfp4-DSpark",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)

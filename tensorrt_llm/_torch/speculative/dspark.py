@@ -234,6 +234,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
         self._win_inited = False
+        self._attention_warmup_attempted = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
@@ -277,51 +278,79 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 f"got block_size={block_size} and max_draft_len={self.max_draft_len}"
             )
 
-        if self._win_inited:
+        if not self._win_inited:
+            max_batch = spec_metadata.max_num_requests
+            num_stages = draft_model.num_stages
+            self._win = int(draft_model._attn_params["window_size"])
+            head_dim = int(draft_model._attn_params["head_dim"])
+
+            # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
+            # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+            # padding, ADP idle requests, or disagg seed forwards that arrive without
+            # a real request id) so they can never overwrite a live request's rolling
+            # window. Previously such IDs aliased to slot 0 and corrupted whichever
+            # real request occupied it. The scratch row is never handed out through
+            # ``_free_slots`` and its contents are throwaway.
+            self._scratch_slot = max_batch
+            num_rows = max_batch + 1
+
+            # CUDA-graph padding requests carry ids in
+            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+            # while real request ids start at ``max_batch_size`` and grow, so a simple
+            # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
+            # (0) these dummies must route to the scratch row (see ``prepare()``) and
+            # never consume a real slot. Imported lazily to break the
+            # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
+            from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+
+            self._kv_windows = torch.zeros(
+                (num_rows, num_stages, self._win, head_dim),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+            self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+            self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
+            self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+            self._free_slots = deque(range(max_batch))
+            self._req_to_slot = {}
+            logger.info(
+                f"DSpark: allocated rolling KV windows "
+                f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+                f"({max_batch} request slots + 1 scratch row)"
+            )
+            # Buffer state is complete independently of CuTe DSL prewarming.
+            # A failed prewarm must not cause the next forward to recreate the
+            # windows or reset the live slot maps.
+            self._win_inited = True
+
+        if self._attention_warmup_attempted:
             return
-        max_batch = spec_metadata.max_num_requests
-        num_stages = draft_model.num_stages
-        self._win = int(draft_model._attn_params["window_size"])
-        head_dim = int(draft_model._attn_params["head_dim"])
 
-        # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
-        # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
-        # padding, ADP idle requests, or disagg seed forwards that arrive without
-        # a real request id) so they can never overwrite a live request's rolling
-        # window. Previously such IDs aliased to slot 0 and corrupted whichever
-        # real request occupied it. The scratch row is never handed out through
-        # ``_free_slots`` and its contents are throwaway.
-        self._scratch_slot = max_batch
-        num_rows = max_batch + 1
+        # Prewarm the same self-JIT ops used by production before CUDA graph
+        # capture. This is best-effort inside the named warmup entry; the ops
+        # remain able to compile themselves on a later eager first use.
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
-        # CUDA-graph padding requests carry ids in
-        # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
-        # while real request ids start at ``max_batch_size`` and grow, so a simple
-        # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
-        # (0) these dummies must route to the scratch row (see ``prepare()``) and
-        # never consume a real slot. Imported lazily to break the
-        # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
-        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        if IS_CUTLASS_DSL_AVAILABLE:
+            from ..custom_ops.dspark_attention_custom_op import (
+                is_dsv4_dspark_attention_config_supported,
+                warmup_fused_dsv4_dspark_attention,
+            )
 
-        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
-
-        self._kv_windows = torch.zeros(
-            (num_rows, num_stages, self._win, head_dim),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
-        self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
-        self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
-        self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
-        self._free_slots = deque(range(max_batch))
-        self._req_to_slot = {}
-        self._win_inited = True
-        logger.info(
-            f"DSpark: allocated rolling KV windows "
-            f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
-            f"({max_batch} request slots + 1 scratch row)"
-        )
+            if is_dsv4_dspark_attention_config_supported(
+                block_size,
+                int(draft_model._attn_params["n_heads"]),
+                int(draft_model._attn_params["head_dim"]),
+                int(draft_model._attn_params["window_size"]),
+            ):
+                warmup_fused_dsv4_dspark_attention(
+                    block_size,
+                    eps=float(draft_model._attn_params["eps"]),
+                )
+        self._attention_warmup_attempted = True
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
         """Get (or refresh) the slot for a request; reset clears its window."""
