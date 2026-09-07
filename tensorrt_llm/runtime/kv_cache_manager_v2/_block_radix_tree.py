@@ -786,21 +786,47 @@ class BlockRadixTree:
                 break
         return matched
 
+    @staticmethod
+    def _back_off_match(
+        matched: list[tuple["Block", int]], backoff: int
+    ) -> list[tuple["Block", int]]:
+        """Drop `backoff` tokens from the tail of a match.
+
+        Shortens the last entry, dropping whole blocks while the backoff outruns
+        them. Leading entries stay full blocks, so _prune_match's invariant holds.
+        """
+        while backoff > 0 and matched:
+            block, num_matched = matched[-1]
+            if num_matched > backoff:
+                matched[-1] = (block, num_matched - backoff)
+                break
+            backoff -= num_matched
+            matched.pop()
+        return matched
+
     def match(
         self,
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        backoff: int = 0,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
 
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
+
+        `backoff` trims that many tokens off the tail (see
+        KVCacheManagerConfig.reuse_match_backoff).
         """
         raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         num_reusable_tokens_before_pruning = self._num_matched_tokens(raw_matched)
         ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        # Page requirements depend on the final endpoint. Back off before pruning
+        # so SWA coverage and recurrent snapshots are validated at that endpoint.
+        if backoff > 0:
+            raw_matched = self._back_off_match(raw_matched, backoff)
         # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
         # the prefix the attention pages alone support. Only hybrid models pay for
         # the second pass; without an SSM life cycle the two results are identical.

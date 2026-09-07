@@ -78,6 +78,7 @@ from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
+from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -592,12 +593,17 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
+                                            KVCacheManagerV2)
+        self.enable_joint_kv_cache_reuse = (
+            self._is_kv_manager_v2
+            and self.kv_cache_manager.enable_joint_kv_cache_reuse)
         # V2 owns KV allocation, suspend, resume, and context finalization.
         # The executor skips the V1 terminate/pause paths and finalizes V2
         # context resources before transfer or response handling can terminate
         # a request.
-        self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
-                                            KVCacheManagerV2)
         self._prefetched_request_ids: set[int] = set()
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
@@ -605,7 +611,7 @@ class PyExecutor:
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse
-            and not isinstance(self.kv_cache_manager, KVCacheManagerV2))
+            and not self._is_kv_manager_v2)
         # Store+pin ctx blocks into the reuse trie at transfer start so the next
         # request reuses them immediately (PP>1 otherwise commits too late and
         # only partially matches). No collective is required for the
@@ -947,6 +953,9 @@ class PyExecutor:
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
         self._fill_admit_cap: int = 0
+        # Optional GPU keepalive for the fill gate (TRTLLM_GPU_KEEPALIVE=1).
+        # Allocates nothing here; its device side is set up at its first tick.
+        self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -2511,6 +2520,11 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
+        # The loop may exit while the benchmark fill gate is still closed.
+        keepalive = getattr(self, "_gpu_keepalive", None)
+        if keepalive is not None:
+            keepalive.close()
+
         for i in range(self.num_micro_batches):
             try:
                 self.wait_on_pp_send_handles(self.send_handles, i)
@@ -2640,7 +2654,7 @@ class PyExecutor:
                 # other two loops -- the ring has to drain first -- so this
                 # only starts the drain.  Skipped while one is already
                 # pending so the decision is not retaken mid-drain.
-                if (self._uses_kv_manager_v2()
+                if (self._is_kv_manager_v2
                         and self._pp_rebalance_drain_iters is None
                         and self._can_pause_for_rebalance()
                         and self._agreed_need_adjustment()):
@@ -2950,7 +2964,7 @@ class PyExecutor:
 
                 # Stage 3.4: Rebalance the KV pools once the drain started at
                 # the top of some earlier iteration has emptied the ring.
-                if self._uses_kv_manager_v2():
+                if self._is_kv_manager_v2:
                     self._maybe_finish_pp_rebalance()
 
                 if not can_queue and self._pp_ring_is_drained():
@@ -3345,8 +3359,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2:
                     # Finalize V2 context KV before disagg transfer/response
                     # handling can terminate the request.
-                    self.kv_cache_manager.update_context_resources(
-                        scheduled_requests)
+                    self._update_v2_context_resources(scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3556,6 +3569,15 @@ class PyExecutor:
                 if getattr(req, "py_skip_gen_alloc_revert", False):
                     continue
                 self.kv_cache_manager.revert_allocate_generation(req)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.revert_allocate_generation(req)
+
+    def _update_v2_context_resources(self, scheduled_batch) -> None:
+        """Commit one context frontier to target and draft caches."""
+        self.kv_cache_manager.update_context_resources(scheduled_batch)
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.update_context_resources(
+                scheduled_batch)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -3594,13 +3616,16 @@ class PyExecutor:
     def _revert_ctx_alloc(self, dropped_context_requests):
         """Revert V2 context KV growth for requests deferred after scheduling."""
         for req in dropped_context_requests:
-            self.kv_cache_manager.revert_allocate_context(req)
+            if not self.kv_cache_manager.revert_allocate_context(req):
+                # The cache was dropped and the shared cursor rewound, so drop
+                # the paired draft pool too or it describes abandoned progress.
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.free_resources(req)
 
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
         """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
-        if not isinstance(getattr(self, "kv_cache_manager", None),
-                          KVCacheManagerV2):
+        if not self._is_kv_manager_v2:
             return
         if not self.kv_cache_manager.enable_block_reuse:
             return
@@ -3683,13 +3708,6 @@ class PyExecutor:
         return (not self._is_disagg_gen_only_no_context_benchmark() and
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
 
-    def _uses_kv_manager_v2(self) -> bool:
-        explicit_flag = getattr(self, "_is_kv_manager_v2", None)
-        if explicit_flag is not None:
-            return bool(explicit_flag)
-        return isinstance(getattr(self, "kv_cache_manager", None),
-                          KVCacheManagerV2)
-
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
@@ -3725,7 +3743,7 @@ class PyExecutor:
     def _revert_deferred_disagg_gen_init_alloc(
             self, candidates: List[LlmRequest],
             admitted_requests: List[LlmRequest]) -> None:
-        if not (self._uses_kv_manager_v2() and candidates):
+        if not (self._is_kv_manager_v2 and candidates):
             return
 
         admitted_request_ids = {
@@ -4154,7 +4172,9 @@ class PyExecutor:
         A short sleep (0.1s) yields the CPU between retries that made no
         transfer progress while keeping the polling interval short enough to
         avoid KV transfer backpressure on the CTX server. Retries that complete
-        a transfer do not sleep.
+        a transfer do not sleep. With ``TRTLLM_GPU_KEEPALIVE=1`` every closed
+        retry also queues a short GPU keepalive chunk, so the GPU does not read
+        idle for the whole wait; the chunks are drained when the gate opens.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -4170,13 +4190,19 @@ class PyExecutor:
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch, transfer_made_progress)
             transfer_made_progress = self._benchmark_transfer_progress_global
+            keepalive = getattr(self, "_gpu_keepalive", None)
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
                 self._benchmark_fill_stall_since = None
                 self._benchmark_completed_gen_transfer_ids.clear()
-            elif not transfer_made_progress:
-                time.sleep(0.1)
+                if keepalive is not None:
+                    keepalive.drain()
+            else:
+                if keepalive is not None:
+                    keepalive.tick()
+                if not transfer_made_progress:
+                    time.sleep(0.1)
             if not can_forward:
                 self._fail_if_fill_gate_stalled(transfer_made_progress)
                 return can_forward, True
@@ -4374,9 +4400,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -4536,8 +4560,7 @@ class PyExecutor:
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
                         # handling can terminate the request.
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -5199,9 +5222,7 @@ class PyExecutor:
                     scheduled_batch, can_forward)
                 if should_retry:
                     if self._is_kv_manager_v2:
-                        for req in scheduled_batch.generation_requests:
-                            self.kv_cache_manager.revert_allocate_generation(
-                                req)
+                        self._revert_gen_alloc(scheduled_batch)
                         self._terminate_recompute_paused_requests(
                             scheduled_batch)
                         self._pause_recompute_paused_requests(scheduled_batch)
@@ -5412,8 +5433,7 @@ class PyExecutor:
                     # Only applies to KV cache manager V2 + scheduler V2.
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
-                        self.kv_cache_manager.update_context_resources(
-                            scheduled_batch)
+                        self._update_v2_context_resources(scheduled_batch)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -8954,6 +8974,8 @@ class PyExecutor:
 
     def reset_prefix_cache(self):
         self.kv_cache_manager.reset_reuse_state()
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.reset_reuse_state()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

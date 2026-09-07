@@ -1152,7 +1152,11 @@ class _KVCache:
         # preceding conversation plan intact if this turn no longer has a
         # complete reusable endpoint. All PP ranks use the same lookup so
         # attention-only ranks include the final partial SWA block too.
-        match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+        match = self.manager._radix_tree.match(
+            self.reuse_scope,
+            self._committed_tokens,
+            self.manager.enable_partial_match,
+        )
         if match.num_tokens != self.num_committed_tokens or not match.blocks:
             return None
 
