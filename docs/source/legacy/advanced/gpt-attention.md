@@ -189,7 +189,7 @@ The paged KV cache decomposes the KV cache into blocks that are distributed to
 the different requests by a cache manager during processing. That cache manager
 keeps track of the sequences, allocate new blocks from a pool and recycle those
 blocks when required. See the simplified implementation of
-[`tensorrt_llm.runtime.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager.py).
+[`tensorrt_llm.runtime.kv_cache_manager_v2.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager_v2).
 A more efficient C++ implementation is included in the
 [Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
 
