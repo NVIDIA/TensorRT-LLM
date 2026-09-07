@@ -135,7 +135,7 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
 
 VirtMem::~VirtMem() noexcept
 {
-    KVCM2_LOG_ON_EXCEPT([this]() { destroy(); });
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)

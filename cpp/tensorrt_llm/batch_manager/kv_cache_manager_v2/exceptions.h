@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/utils/poison.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -32,44 +33,32 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-// The diagnostic goes through the TRT-LLM logger, which writes to a native stream. Under pytest
-// it is discarded: tests/unittest/conftest.py has an autouse fixture that requests `capfd`, which
-// redirects fds 1 and 2 per test and drops what it captured when the process aborts. `-s` and
-// `--capture=tee-sys` set the global capture mode and do not disable that fixture, so neither
-// makes the message visible.
+// Runs cleanup that must not throw, and poisons KVCM2 if it does.
+//
+// The early return is what makes poisoning safe: once the cache is known to be inconsistent, the
+// cleanup here would act on structures whose invariants no longer hold — releasing a slot that
+// may already be released, unlinking a block from a tree that is no longer intact. Skipping leaks
+// instead, which is the direction that cannot corrupt anything. It also suppresses the cascade of
+// secondary check failures that a poisoned teardown would otherwise produce, leaving the first
+// violation as the reported one.
 template <typename F>
-void abortOnExcept(char const* context, F&& func) noexcept
+void poisonOnExcept(char const* context, F&& func) noexcept
 {
+    if (TLLM_UNLIKELY(Poison::poisoned()))
+    {
+        return;
+    }
     try
     {
         std::forward<F>(func)();
     }
     catch (std::exception const& error)
     {
-        TLLM_LOG_ERROR("%s: %s", context, error.what());
-        std::abort();
+        Poison::set(context, error.what());
     }
     catch (...)
     {
-        TLLM_LOG_ERROR("%s: unknown error", context);
-        std::abort();
-    }
-}
-
-template <typename F>
-void logOnExcept(char const* context, F&& func) noexcept
-{
-    try
-    {
-        std::forward<F>(func)();
-    }
-    catch (std::exception const& error)
-    {
-        TLLM_LOG_ERROR("%s: %s", context, error.what());
-    }
-    catch (...)
-    {
-        TLLM_LOG_ERROR("%s: unknown error", context);
+        Poison::set(context, "unknown error");
     }
 }
 
@@ -210,24 +199,20 @@ inline void cuCheck(CUresult result)
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
-// Runs a callable and, if it throws, logs the error prefixed with the enclosing function, then
-// aborts. Variadic so the callable may contain commas.
-#define KVCM2_ABORT_ON_EXCEPT(...)                                                                                     \
-    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
+// Runs cleanup that must not throw. On failure, or if KVCM2 is already poisoned, the callable is
+// abandoned and the cache is marked unusable. Variadic so the callable may contain commas.
+#define KVCM2_POISON_ON_EXCEPT(...)                                                                                    \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
 
-// Runs a callable and, if it throws, logs the error prefixed with the enclosing function and
-// returns normally. The remainder of the callable is skipped. Variadic so it may contain commas.
-#define KVCM2_LOG_ON_EXCEPT(...)                                                                                       \
-    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::logOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
-
-// Check variants for noexcept contexts such as destructors: on failure they log the assertion
+// Check variants for noexcept contexts such as destructors: on failure they record the assertion
 // message, source location and backtrace captured by TLLM_CHECK, prefixed with the enclosing
-// function, then abort.
+// function, and poison KVCM2. Once poisoned they evaluate nothing, so a single root violation is
+// reported rather than every consequence of it.
 #define KVCM2_CHECK_FATAL(cond)                                                                                        \
-    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(__PRETTY_FUNCTION__, [&]() { TLLM_CHECK(cond); })
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, [&]() { TLLM_CHECK(cond); })
 
 #define KVCM2_CHECK_FATAL_WITH_INFO(cond, info, ...)                                                                   \
-    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::abortOnExcept(                                                 \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(                                                \
         __PRETTY_FUNCTION__, [&]() { TLLM_CHECK_WITH_INFO(cond, info, ##__VA_ARGS__); })
 
 // As above, but only evaluated when debug checks are enabled. The gDebug test comes first so

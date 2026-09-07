@@ -39,7 +39,7 @@ public:
 
     ~FuncGuard() noexcept
     {
-        KVCM2_ABORT_ON_EXCEPT([this]() { run(); });
+        KVCM2_POISON_ON_EXCEPT([this]() { run(); });
     }
 
     FuncGuard(FuncGuard&& other) noexcept

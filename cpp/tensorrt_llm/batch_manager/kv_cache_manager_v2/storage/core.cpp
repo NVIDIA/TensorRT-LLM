@@ -474,7 +474,7 @@ SlotCount PoolGroupBase::getNumSlotsFromPools() const noexcept
 
 PoolGroupBase::~PoolGroupBase()
 {
-    KVCM2_ABORT_ON_EXCEPT([this]() { destroy(); });
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
 SlotCount PoolGroupBase::numSlots() const noexcept

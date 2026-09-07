@@ -41,7 +41,7 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
 
 Page::~Page()
 {
-    KVCM2_ABORT_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
             TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
@@ -116,7 +116,7 @@ CommittedPage::~CommittedPage()
         // the block pointer first. Pass `this` as the expected page: if a newer
         // page already replaced us in the slot (e.g. a larger SSM snapshot), the
         // slot is left alone and prev is nullptr — skip stale-block cleanup then.
-        KVCM2_ABORT_ON_EXCEPT(
+        KVCM2_POISON_ON_EXCEPT(
             [this]()
             {
                 Block* blk = block;
@@ -222,7 +222,7 @@ PageHolder::PageHolder(SharedPtr<Page> p)
 
 PageHolder::~PageHolder()
 {
-    KVCM2_ABORT_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
             TLLM_CHECK_DEBUG_WITH_INFO(uniqLock.expired(), "PageHolder destroyed while lock still active");
@@ -288,7 +288,7 @@ UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
 
 UniqPageLock::~UniqPageLock()
 {
-    KVCM2_ABORT_ON_EXCEPT(
+    KVCM2_POISON_ON_EXCEPT(
         [this]
         {
             Page& p = *page();
@@ -358,7 +358,7 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
 SharedPageLock::~SharedPageLock()
 {
     if (mUniqLock)
-        KVCM2_ABORT_ON_EXCEPT([this]() { unlock(); });
+        KVCM2_POISON_ON_EXCEPT([this]() { unlock(); });
 }
 
 SharedPageLock::SharedPageLock(SharedPageLock&& other) noexcept
@@ -508,7 +508,7 @@ ScratchSlotLock::~ScratchSlotLock()
 {
     if (mSlot.hasValidSlot())
     {
-        KVCM2_ABORT_ON_EXCEPT([this]() { unlock(); });
+        KVCM2_POISON_ON_EXCEPT([this]() { unlock(); });
     }
 }
 
