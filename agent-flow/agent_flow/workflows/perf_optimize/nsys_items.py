@@ -1,6 +1,6 @@
 """Coverage of the nsys timeline analysis's ``items.json`` by the roadmap.
 
-The ``perf-nsight-system-analysis`` skill ends every run by writing
+The ``internal-perf-nsight-system-analysis`` skill ends every run by writing
 ``items.json`` beside its per-step JSON: the performance opportunities
 the timeline analysis found, each with an ``id``, a ``claim``, the step
 table behind it and a ``magnitudeMs``. The skill states the id's purpose

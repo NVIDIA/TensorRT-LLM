@@ -14,7 +14,7 @@ tells both serving roles to load ``perf-optimization-casebook`` as
 read-only reference so their analysis is grounded in known TRT-LLM
 performance precedents; ``PROFILING_RUNS_REFERENCE`` has the analyzer
 load a methodology skill per profiler run, unprompted —
-``perf-nsight-system-analysis`` to read the Run A timeline (per-iteration
+``internal-perf-nsight-system-analysis`` to read the Run A timeline (per-iteration
 anchor, the busy/idle rungs, and what caused each compute-absent
 stretch) and ``perf-nsight-compute-analysis`` to capture and interpret
 the Run B ncu per-kernel deep dive; and the
@@ -397,7 +397,7 @@ PROFILING_RUNS_REFERENCE = f"""\
 ## Run A — Nsight Systems (GPU timeline)
 
 Capture the trace (steps 1-4), then **read it with the
-`perf-nsight-system-analysis` skill** (step 5). `nsys stats` alone gives
+`internal-perf-nsight-system-analysis` skill** (step 5). `nsys stats` alone gives
 you a kernel-sum table; the skill turns the same trace into the
 iteration's actual budget — per-iteration time, the busy/idle rungs, and
 a cause for every stretch where no compute ran. It re-reads the report
@@ -491,9 +491,9 @@ time nsys runs, without waiting to be asked.
    attention / tensor-core vs memory/elementwise kernel mix, GPU busy vs
    idle, inter-kernel gaps (host/launch exposure), and any NCCL/collective
    time for multi-GPU runs.
-5. **Decompose the timeline with the `perf-nsight-system-analysis`
+5. **Decompose the timeline with the `internal-perf-nsight-system-analysis`
    skill.** Load it via the `Skill` tool (fully-qualified
-   `trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare name
+   `trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare name
    is not found); the load announces the skill's base directory, and its
    pipeline is `<skill_dir>/scripts/run_all.py`. It is the methodology
    for everything nsys — the per-iteration anchor, the three nested busy
@@ -962,7 +962,7 @@ instructions, using this structure. Section headers must match.
   anchor it was measured on
 - The three busy rungs and each rung's idle complement — device busy,
   non-transfer busy, compute busy / **compute-absent** (the
-  perf-nsight-system-analysis skill's vocabulary; never "compute idle")
+  internal-perf-nsight-system-analysis skill's vocabulary; never "compute idle")
 - The compute-absent split — launch-starved / blocking (naming the
   producer) / dependency-stalled — in ms and % of the iteration, with
   the two reconciliation checks (`iter ≈ busy + idle`; the split sums

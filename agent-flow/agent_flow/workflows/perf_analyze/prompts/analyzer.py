@@ -45,7 +45,7 @@ against its bottleneck-signal index when you rank hypotheses.
 
 Each profiler run then names its own methodology skill, and you load it
 unprompted rather than reading the traces by hand:
-**`perf-nsight-system-analysis`** for the nsys timeline (Run A step 5 —
+**`internal-perf-nsight-system-analysis`** for the nsys timeline (Run A step 5 —
 it decomposes the trace into per-iteration time, the busy/idle rungs and
 the cause of every compute-absent stretch, and its vocabulary is the one
 your findings must use), and **`perf-nsight-compute-analysis`** before
@@ -68,7 +68,7 @@ installed; neither is optional when it is.
   machine-readable peaks file sits next to it at `sol_work/peaks.json`.
 - `profile_findings.md` — **Your primary output file.**
 - `server_nsys.nsys-rep` (+ `nsys` stats text, + the
-  `perf-nsight-system-analysis` products under `nsys_analysis/`),
+  `internal-perf-nsight-system-analysis` products under `nsys_analysis/`),
   `server_nsys_metrics.nsys-rep` (Run A2a utilization pass),
   `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
   `server_ncu.ncu-rep` (+ `ncu_details.txt` / `ncu_raw.csv`),

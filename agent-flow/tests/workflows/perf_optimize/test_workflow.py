@@ -2296,8 +2296,8 @@ def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
         workflow._run_evaluator(state)
         prompt = recorder.messages[0]
         profile_dir = workflow._attempt_dir(state) / "profile"
-        assert "perf-nsight-system-analysis" in prompt
-        assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
         assert "nsys export --type sqlite" in prompt
         assert f"{profile_dir}/nsys_analysis" in prompt
         # The point of it: the mechanism check rests on a measured budget.
@@ -3241,8 +3241,8 @@ def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
     # Not SOL-gated: every profiling round decomposes the timeline it just
     # captured, into the round's own analysis directory.
     for prompt in (without, with_sol):
-        assert "perf-nsight-system-analysis" in prompt
-        assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
         assert "nsys export --type sqlite" in prompt
         assert "analysis/nsys_analysis" in prompt
         assert "nsys_analysis/` directory" in prompt

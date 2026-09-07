@@ -744,8 +744,8 @@ def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
     # captured, and the driving prompt names the workspace path so the
     # products land next to the other traces.
     for prompt in (without, with_sol):
-        assert "perf-nsight-system-analysis" in prompt
-        assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
         assert "nsys export --type sqlite" in prompt
         assert f"{ws}/nsys_analysis" in prompt
         assert "nsys_analysis/" in prompt

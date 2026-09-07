@@ -153,12 +153,12 @@ def test_findings_contract_carries_the_run_a2_evidence():
 
 def test_analyzer_carries_the_nsys_timeline_decomposition():
     # Run A does not stop at ``nsys stats``: the analyzer exports a
-    # ``.sqlite`` and runs the perf-nsight-system-analysis pipeline, whose
+    # ``.sqlite`` and runs the internal-perf-nsight-system-analysis pipeline, whose
     # per-iteration budget is what separates a host-exposure item from a
     # slow-kernel item.
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "perf-nsight-system-analysis" in prompt
-    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
     assert "nsys export --type sqlite" in prompt
     # Proactive by construction — it re-reads a trace already captured.
     assert "costs no extra server launch" in prompt
@@ -173,8 +173,8 @@ def test_evaluator_decomposes_the_accept_evidence_capture():
     # The accept-evidence trace gets the same treatment, so "the launch
     # gaps shrunk" is measured on both sides rather than eyeballed.
     prompt = _norm(EVALUATOR_SYSTEM_PROMPT)
-    assert "perf-nsight-system-analysis" in prompt
-    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
     assert "nsys_analysis" in prompt
     assert "the launch-starved share shrunk" in prompt
     # Never blocks the verdict, never states an unmeasured split.

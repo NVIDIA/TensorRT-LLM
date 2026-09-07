@@ -50,7 +50,7 @@ benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_roun
   build-changing code attempt it runs **replan-only**, planning from the
   standing profile and that round's verdicts — see *What a round costs*):
   profiles the *current* build (nsys — decomposed with the
-  `perf-nsight-system-analysis` skill into per-iteration time, busy/idle
+  `internal-perf-nsight-system-analysis` skill into per-iteration time, busy/idle
   rungs and the compute-absent split (launch-starved / blocking /
   dependency-stalled) — plus an ncu per-kernel deep dive on the top
   kernels of that decomposition (ranked by in-window union time, not by
@@ -172,7 +172,7 @@ structured decisions in `progress.yaml`.
 
 ## The nsys opportunity-coverage gate
 
-The `perf-nsight-system-analysis` skill closes every run by writing
+The `internal-perf-nsight-system-analysis` skill closes every run by writing
 `nsys_analysis/items.json` — the performance opportunities the timeline
 found, each with a stable `id`, the step table behind it and a
 `magnitudeMs`. Without a consumer that list is prose: the analyzer reads
@@ -514,7 +514,7 @@ running the CLI.
   point in Pareto-curve mode — so numbers stay comparable across the
   whole campaign. Every nsys capture — the analyzer's round profile and
   the evaluator's accept-evidence capture alike — is exported to
-  `.sqlite` and decomposed with the `perf-nsight-system-analysis` skill
+  `.sqlite` and decomposed with the `internal-perf-nsight-system-analysis` skill
   into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
   per-iteration budget on both sides rather than an eyeballed kernel
   table. The accept-evidence capture runs that pipeline **comparative**

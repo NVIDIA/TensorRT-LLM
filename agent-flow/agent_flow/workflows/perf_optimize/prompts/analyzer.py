@@ -158,7 +158,7 @@ acceptance gate, so it must be defensible:
   round** (the exact path is given in your instructions):
   `profile_findings.md` (your findings report), `server_nsys.nsys-rep`,
   `nsys_stats.txt`, `nsys_analysis/` (the
-  `perf-nsight-system-analysis` products),
+  `internal-perf-nsight-system-analysis` products),
   `server_nsys_metrics.nsys-rep` (Run A2a utilization
   pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
   `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`, `serve.log`,
@@ -189,7 +189,7 @@ context — do not touch them.
    `benchmark.num_prompts` is a list — profiling replays are not curve
    measurements), capture the nsys traces into this round's
    `analysis/` directory, decompose the nsys timeline with the
-   **`perf-nsight-system-analysis` skill** (Run A step 5 below — load it
+   **`internal-perf-nsight-system-analysis` skill** (Run A step 5 below — load it
    unprompted; it re-reads the trace you just captured and costs no
    extra server launch), then run the ncu deep dive (Run B below) on
    the top nsys kernels — **loading the `perf-nsight-compute-analysis`

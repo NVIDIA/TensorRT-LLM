@@ -33,7 +33,7 @@ benchmarker ──▶ projector ──▶ analyzer ──▶ reporter
   constants merged in) that the analyzer's correlation joins against.
 - **Analyzer** — replays the same load under **Nsight Systems (nsys)**
   and **Nsight Compute (ncu)** — the nsys timeline is decomposed with
-  the **`perf-nsight-system-analysis` skill** (per-iteration time,
+  the **`internal-perf-nsight-system-analysis` skill** (per-iteration time,
   busy/idle rungs, and the compute-absent split into launch-starved /
   blocking / dependency-stalled), and the ncu run is a bounded
   per-kernel deep dive on the top nsys kernels, captured
@@ -163,7 +163,7 @@ workspace/perf-analyze/<name>/
   measured fingerprint groups rather than an assumed rank layout.
 - **nsys timeline analysis (Run A).** `nsys stats` gives a kernel-sum
   table; the Analyzer additionally exports the trace to `.sqlite` and
-  runs the **`perf-nsight-system-analysis` skill**'s pipeline into
+  runs the **`internal-perf-nsight-system-analysis` skill**'s pipeline into
   `nsys_analysis/`, which answers *where the iteration's wall clock
   went*: per-iteration time against a detected anchor, three nested
   busy rungs with their idle complements, the compute-absent time split

@@ -167,7 +167,7 @@ def test_analyzer_keeps_capture_range_end_stop_safety_flag():
 
 # --------------------------------------------------------------------------- #
 # nsys timeline decomposition (Run A step 5): the analyzer does not read the
-# trace by hand — it exports a .sqlite and runs the perf-nsight-system-analysis
+# trace by hand — it exports a .sqlite and runs the internal-perf-nsight-system-analysis
 # skill's pipeline, whose vocabulary the findings must then use.
 # --------------------------------------------------------------------------- #
 
@@ -176,8 +176,8 @@ def test_analyzer_loads_nsys_analysis_skill_and_degrades():
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
     # Named with the fully-qualified fallback for plugin-namespaced installs,
     # exactly as the ncu methodology skill is.
-    assert "perf-nsight-system-analysis" in prompt
-    assert "trtllm-agent-toolkit:perf-nsight-system-analysis" in prompt
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
     # It is proactive: the trace is already captured, so the pipeline costs
     # no extra server launch and runs whenever nsys runs.
     assert "costs no extra server launch" in prompt

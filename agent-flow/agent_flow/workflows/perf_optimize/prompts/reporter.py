@@ -37,7 +37,7 @@ inventing it.
   the kernel-summary rows with shell tools (`grep`/`head`/`awk`) rather
   than reading them whole.
 - `rounds/round_<n>/analysis/nsys_analysis/` — the same round's
-  `perf-nsight-system-analysis` products: small JSON holding the
+  `internal-perf-nsight-system-analysis` products: small JSON holding the
   per-iteration time, the busy rungs and the compute-absent split.
   Present only where the skill ran; read `summary.json` and the
   per-rank `busy.json` / `gap.json` rather than the whole tree.

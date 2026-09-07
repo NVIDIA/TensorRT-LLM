@@ -106,12 +106,12 @@ story. Procedure, after your clean measurement and gate arithmetic:
   log. Give the replay client a timeout sized from your own un-profiled
   benchmark at that same point (at least 2× its measured wall time,
   never a default shell timeout).
-- Then **decompose that capture with the `perf-nsight-system-analysis`
+- Then **decompose that capture with the `internal-perf-nsight-system-analysis`
   skill**, exactly as the Analyzer's Run A step 5 does: `nsys export
   --type sqlite`, then the skill's `run_all.py`. This is what makes "the
   launch gaps shrunk" a number rather than an impression. Load the skill
   via the `Skill` tool (fully-qualified
-  `trtllm-agent-toolkit:perf-nsight-system-analysis` if the bare name is
+  `trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare name is
   not found); if it is unavailable or its pipeline errors, note that in
   one line and compare on the `nsys stats` kernel table alone — never
   block the verdict on it, and never state a split you did not measure.
