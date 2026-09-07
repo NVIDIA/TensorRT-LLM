@@ -7670,6 +7670,21 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             monkeypatch=monkeypatch,
             mocker=mocker)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_trtllm_ple_offload(self,
+                                                monkeypatch: pytest.MonkeyPatch,
+                                                mocker) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=1,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
+
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "ByteDance-Seed/Seed-OSS-36B-Instruct"

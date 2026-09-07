@@ -477,7 +477,6 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
     """MMMU accuracy for the composite Qwen4-Exp vision + text model."""
 
     MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
-    MODEL_PATH = f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4"
     MAX_NUM_TOKENS = 8192
     MAX_BATCH_SIZE = 16
 
@@ -504,14 +503,14 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
         mamba_ssm_cache_dtype="bfloat16",
     )
 
-    @pytest.mark.skip_less_device_memory(105000)
-    @pytest.mark.skip_less_host_memory(131072)
-    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(self, monkeypatch) -> None:
-        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+    def _run_mmmu(
+        self, model_path: str, moe_backend: str, expected_quant_algo: QuantAlgo, monkeypatch
+    ) -> None:
+        """Evaluate MMMU on one GPU with MTP3 and the PLE table on the host."""
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
         with LLM(
-            self.MODEL_PATH,
+            model_path,
             trust_remote_code=True,
             max_num_tokens=self.MAX_NUM_TOKENS,
             enable_chunked_prefill=True,
@@ -520,16 +519,38 @@ class TestQwen3_8_Flash_Next_VL(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(
                 max_batch_size=self.MAX_BATCH_SIZE, enable_padding=True
             ),
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(backend=moe_backend),
             speculative_config=MTPDecodingConfig(max_draft_len=3),
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
                 llm,
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+    @pytest.mark.skip_less_device_memory(105000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(self, monkeypatch) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_mmmu(
+            f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",
+            "CUTEDSL",
+            QuantAlgo.NVFP4,
+            monkeypatch,
+        )
+
+    @pytest.mark.skip_less_device_memory(105000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_trtllm_ple_offload(self, monkeypatch) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_mmmu(
+            f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+            "TRTLLM",
+            QuantAlgo.MIXED_PRECISION,
+            monkeypatch,
+        )
 
 
 class TestKimiK25(LlmapiAccuracyTestHarness):
