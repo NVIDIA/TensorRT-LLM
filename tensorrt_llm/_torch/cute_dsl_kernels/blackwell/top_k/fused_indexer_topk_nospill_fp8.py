@@ -1069,6 +1069,11 @@ def _fp8_kernel(
     b1 = sCtl[0]
     cabove = sCtl[1]
     r1 = I32(KTOP) - cabove
+    # the K-th bin's population decides the row's merge path; read it before the streaming
+    # pass stages winner keys in the same buffer (sWK aliases sTot)
+    nb1 = I32(0)
+    if cutlass.const_expr(GM == 1):
+        nb1 = sTot[b1]
 
     # ---------------- single streaming pass: claim + fine histogram ----------
     # Single-CTA rows stage winners in SMEM (sHist / sTot are dead after the
@@ -1159,7 +1164,7 @@ def _fp8_kernel(
             gV[j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
     use_list = I32(0)
     if cutlass.const_expr(GM == 1):
-        if sTot[b1] <= CAPL:
+        if nb1 <= CAPL:
             use_list = I32(1)
         gb = I32(0)
         nwin = I32(0)

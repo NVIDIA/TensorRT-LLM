@@ -51,6 +51,10 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="rand
             c = 0.5 + 2.5 * (t % (n_comp * 1.0)) / n_comp
         elif pattern == "allequal":  # one fp16 tie class over the whole row
             c = torch.full_like(t, 2.0)
+        elif pattern == "skewsplit":  # even tiles hold every winner, odd tiles lose by far
+            pos = t % (n_comp * 1.0)
+            tile = torch.div(pos, 128.0, rounding_mode="floor")
+            c = torch.where(tile % 2 == 0, 1.0 + pos / n_comp, torch.full_like(t, 25.0))
         else:  # "giantbin": 70% of the row shares one high value
             c = torch.where(
                 torch.rand(t.shape, generator=g, device=device) < 0.7,
@@ -73,12 +77,10 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="rand
         device=device,
         dtype=torch.int32,
     )
-    block_table = (
-        torch.randperm(nb_total, generator=g, device=device)
-        .to(torch.int32)
-        .view(batch, maxb)
-        .contiguous()
-    )
+    pages = torch.randperm(nb_total, generator=g, device=device)
+    if pattern == "skewsplit":  # tile parity must survive the page mapping
+        pages = torch.arange(nb_total, device=device)
+    block_table = pages.to(torch.int32).view(batch, maxb).contiguous()
     weights = torch.randn((batch, 64), generator=g, device=device)
     if weight_mode == "nonneg":
         weights = weights.abs()
@@ -285,3 +287,17 @@ def test_fused_indexer_topk_nospill_fp8_mixed_lengths(batch, split, monkeypatch)
     )
     indices, values = _run(inp, 1024)
     _check(inp, indices, values, 1024)
+
+
+@skip_not_sm100
+def test_fused_indexer_topk_nospill_fp8_split_skewed_winners(monkeypatch):
+    # GMEM split of 64 rows into 2 CTAs each: with all-negative weights every winner sits in
+    # the even tiles (CTA 0) and the K-th key is deep in the negative range, so CTA 0 stages
+    # more winner keys than twice the boundary bin index while CTA 1 stages none; both CTAs
+    # must still decide the row's merge path from the same K-th bin count
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "1")
+    inp = _build_inputs(
+        64, 16384, 2048, "allneg", seed=4711, device=torch.device("cuda"), pattern="skewsplit"
+    )
+    indices, values = _run(inp, 2048)
+    _check(inp, indices, values, 2048)
