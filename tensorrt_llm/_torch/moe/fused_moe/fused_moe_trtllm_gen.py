@@ -900,12 +900,15 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             # for cases like deepep low latency where fake top_k=1 might be used
             top_k = token_selected_experts.shape[-1]
 
-        # Ensure x_sf is 2D before flattening
+        # Communication-delivered scaling factors use backend-specific flat
+        # layouts. FP8 1x128 keeps the native ``[K / 128, M]`` layout returned
+        # by its quantizer and required by the block-scale runner.
         if x_sf is not None:
             assert len(
                 x_sf.shape
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
-            x_sf = x_sf.flatten()
+            if not self.has_deepseek_fp8_block_scales:
+                x_sf = x_sf.flatten()
 
         if not self.has_any_quant:
             result = self.op_backend.run_bf16_moe(

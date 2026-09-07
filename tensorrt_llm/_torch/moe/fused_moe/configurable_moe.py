@@ -44,7 +44,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    is_torch_compiling,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -642,6 +647,7 @@ class ConfigurableMoE(MoE):
         DP-padding handling and chunking live in the scheduler.
         """
         input_ids = kwargs.get("input_ids")
+        prequantized_input = kwargs.get("prequantized_input")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -664,6 +670,7 @@ class ConfigurableMoE(MoE):
             use_dp_padding=use_dp_padding,
             input_ids=input_ids,
             lora_params=lora_params,
+            prequantized_input=prequantized_input,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
@@ -851,6 +858,22 @@ class ConfigurableMoE(MoE):
     def has_nvfp4(self):
         """Delegate has_nvfp4 to backend"""
         return getattr(self.backend, "has_nvfp4", False)
+
+    def supports_prequantized_fp8_block_scale_input(self) -> bool:
+        """Whether a producer may supply the backend's input quantization.
+
+        Communication and fused-comm schedulers own different input layouts,
+        while router-weight folding changes the activation after routing. Only
+        the local external-comm FP8 block-scale path can safely reuse a side
+        output produced alongside an earlier operation.
+        """
+        return (
+            self.backend.scheduler_kind == MoESchedulerKind.EXTERNAL_COMM
+            and self.comm is None
+            and not self.apply_router_weight_on_input
+            and getattr(self.backend, "has_deepseek_fp8_block_scales", False)
+            and not (self.register_to_config and is_torch_compiling())
+        )
 
     def forward_fake(
         self,

@@ -645,18 +645,12 @@ def prepare_low_m_gemm(
     return dispatcher
 
 
-def apply_direct_low_m_gemm(
+def _select_direct_low_m_gemm(
     input_tensor: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Return a direct BF16 result, or ``None`` to keep the caller's GEMM.
-
-    This path does not require AutoTuner state, so it also serves hand-written
-    projections such as MoE router gates. It accepts only conservative shapes
-    measured to beat the normal GEMM path; all other dtype, device, layout,
-    bias, architecture, and tactic combinations fall through.
-    """
+) -> Optional[tuple[torch.Tensor, int, Any]]:
+    """Return the flattened input, output width, and direct tactic when eligible."""
     if (
         not _DIRECT_LOW_M_GEMM_ACTIVE
         or bias is not None
@@ -667,7 +661,6 @@ def apply_direct_low_m_gemm(
     from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import (
         default_tactic,
         prefer_direct_bf16_gemm_sm100,
-        run_direct_dense,
     )
 
     k = int(input_tensor.shape[-1])
@@ -680,7 +673,29 @@ def apply_direct_low_m_gemm(
     except ValueError:
         return None
 
-    input_2d = input_tensor.view(m, k)
+    return input_tensor.view(m, k), n, tactic
+
+
+def apply_direct_low_m_gemm(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return a direct BF16 result, or ``None`` to keep the caller's GEMM.
+
+    This path does not require AutoTuner state, so it also serves hand-written
+    projections such as MoE router gates. It accepts only conservative shapes
+    measured to beat the normal GEMM path; all other dtype, device, layout,
+    bias, architecture, and tactic combinations fall through.
+    """
+    selected = _select_direct_low_m_gemm(input_tensor, weight, bias)
+    if selected is None:
+        return None
+
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import run_direct_dense
+
+    input_2d, n, tactic = selected
+    m = input_2d.shape[0]
     output = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
     run_direct_dense(
         input_2d,
@@ -690,6 +705,44 @@ def apply_direct_low_m_gemm(
         tactic,
     )
     return output.view(*input_tensor.shape[:-1], n)
+
+
+def apply_direct_low_m_gemm_with_input_quant(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Run an eligible M=1 direct GEMM and emit FP8 1x128 input blocks.
+
+    The side outputs match ``fp8_quantize_1x128`` on SM100-family GPUs. A
+    caller may pass them to a compatible consumer and otherwise keep the
+    ordinary GEMM/quantization path by treating ``None`` as a rejection.
+    """
+    selected = _select_direct_low_m_gemm(input_tensor, weight, bias)
+    if selected is None:
+        return None
+
+    input_2d, n, tactic = selected
+    m, k = input_2d.shape
+    num_output_blocks = (n + tactic.outputs_per_block - 1) // tactic.outputs_per_block
+    if m != 1 or k % 128 or num_output_blocks < k // 128:
+        return None
+
+    from ..cute_dsl_kernels.blackwell.low_m_bf16_direct import run_direct_dense_with_input_quant
+
+    output = torch.empty((m, n), dtype=input_2d.dtype, device=input_2d.device)
+    quantized_input = torch.empty_like(input_2d, dtype=torch.float8_e4m3fn)
+    input_scale = torch.empty((k // 128, m), dtype=torch.float32, device=input_2d.device)
+    run_direct_dense_with_input_quant(
+        input_2d,
+        weight.detach().t(),
+        output,
+        quantized_input,
+        input_scale,
+        get_env_enable_pdl(),
+        tactic,
+    )
+    return output.view(*input_tensor.shape[:-1], n), quantized_input, input_scale
 
 
 def apply_low_m_gemm(
@@ -718,6 +771,7 @@ __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "_MAX_M",
     "apply_direct_low_m_gemm",
+    "apply_direct_low_m_gemm_with_input_quant",
     "apply_low_m_gemm",
     "low_m_gemm_fused_epilogue_enabled",
     "prepare_low_m_gemm",
