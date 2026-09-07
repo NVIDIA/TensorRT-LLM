@@ -317,7 +317,7 @@ def throughput_command(
     bench_env: BenchmarkEnvironment,
     **params,
 ) -> None:
-    """Run a throughput test on a TRT-LLM engine."""
+    """Run a throughput benchmark with TRT-LLM."""
     logger.info("Preparing to run throughput benchmark...")
 
     # Parameters from CLI
