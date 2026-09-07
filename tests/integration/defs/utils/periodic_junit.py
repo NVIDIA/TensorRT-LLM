@@ -225,7 +225,8 @@ class PeriodicJUnitXML:
             try:
                 # Create the directory actually being written to, not output_dir --
                 # they differ when self.unfinished_test_path redirects elsewhere.
-                os.makedirs(os.path.dirname(unfinished_test_path), exist_ok=True)
+                os.makedirs(os.path.dirname(unfinished_test_path),
+                            exist_ok=True)
                 with open(unfinished_test_path, "a", encoding="utf-8") as f:
                     f.write(report.nodeid + "\n")
             except Exception as e:
