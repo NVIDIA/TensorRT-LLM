@@ -16,10 +16,12 @@ import asyncio
 import json
 import os
 import sys
+from typing import Optional
 from unittest import mock
 
 import pytest
 import torch
+import torch._inductor.config as inductor_config
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
@@ -76,6 +78,31 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
 
     mocker.patch.object(MpiPoolSession, '_start_mpi_pool',
                         patched_start_mpi_pool)
+
+
+def _count_prims_ts_phase_calls(mocker):
+    """Count PrimTS phase launches while keeping the real kernels installed."""
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    calls = {
+        "context": 0,
+        "generation": 0,
+        "mla_generation": 0,
+    }
+
+    def patch_method(method_name, counter_name):
+        original = getattr(PrimsTSFmha, method_name)
+
+        def counted(self, params):
+            calls[counter_name] += 1
+            return original(self, params)
+
+        mocker.patch.object(PrimsTSFmha, method_name, counted)
+
+    patch_method("run_context", "context")
+    patch_method("run_generation", "generation")
+    patch_method("run_mla_generation", "mla_generation")
+    return calls
 
 
 # MPI session reuse cannot safely reset Userbuffers between Engines. Tests
@@ -1571,6 +1598,43 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_prims_ts_bfloat16(self, mocker):
+        if get_sm_version() not in (100, 103):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            "TLLM_FMHA_LIBS": "+prims_ts",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=False,
+        )
+        # Keep the TP=1 worker in this process so the call counter observes the
+        # real PrimTS launch. Compile Inductor kernels synchronously because its
+        # process-global async reader thread otherwise outlives this test and is
+        # reported as a leak; persistent compiler caches remain enabled.
+        with (inductor_config.patch(compile_threads=1),
+              mock.patch.dict(os.environ, env)):
+            with LLM(self.MODEL_PATH,
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     enable_chunked_prefill=False,
+                     enable_attention_dp=False,
+                     cuda_graph_config=None,
+                     speculative_config=None,
+                     max_batch_size=1350) as llm:
+                calls.update({name: 0 for name in calls})
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+
+        assert calls["mla_generation"] > 0
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -4864,6 +4928,34 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    def test_prims_ts_bfloat16(self, mocker):
+        if get_sm_version() not in (100, 103):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            "TLLM_FMHA_LIBS": "+prims_ts",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=True,
+        )
+        with mock.patch.dict(os.environ, env):
+            with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     cuda_graph_config=None) as llm:
+                calls.update({name: 0 for name in calls})
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+
+        assert calls["context"] > 0
+        assert calls["generation"] > 0
+
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
@@ -7581,6 +7673,119 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                         moe_backend="CUTEDSL",
                         max_draft_len=None,
                         mocker=mocker)
+
+
+@pytest.mark.timeout(28800)
+class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
+    """Qwen3.8-Flash-Next: Gated-DeltaNet + QSA hybrid with MoE, PLE, and MTP3."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MAX_NUM_TOKENS = 8192
+    MAX_BATCH_SIZE = 16
+    GSM8K_MAX_OUTPUT_LEN = 512
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    MMLU_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=("Answer with a single letter: A, B, C, or D. "
+                       "Output only that letter and nothing else."),
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def _build_llm(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int]) -> LLM:
+        """Construct the engine shared by both evaluation tasks."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
+                                            enable_padding=True)
+        mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
+            max_draft_len=max_draft_len))
+        return LLM(model_path,
+                   trust_remote_code=True,
+                   tensor_parallel_size=tensor_parallel_size,
+                   moe_expert_parallel_size=1,
+                   max_num_tokens=self.MAX_NUM_TOKENS,
+                   enable_chunked_prefill=True,
+                   max_batch_size=self.MAX_BATCH_SIZE,
+                   kv_cache_config=kv_cache_config,
+                   cuda_graph_config=cuda_graph_config,
+                   moe_config=MoeConfig(backend=moe_backend),
+                   speculative_config=mtp_config)
+
+    def _run_evals(self, model_path: str, tensor_parallel_size: int,
+                   moe_backend: str, max_draft_len: Optional[int],
+                   expected_quant_algo: Optional[QuantAlgo],
+                   monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+
+        with self._build_llm(model_path, tensor_parallel_size, moe_backend,
+                             max_draft_len) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(142000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_bf16_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                              mocker) -> None:
+        """BF16 TP2, no MTP, PLE offloaded to pinned host memory."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
+                        tensor_parallel_size=2,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=None,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self,
+                                              monkeypatch: pytest.MonkeyPatch,
+                                              mocker) -> None:
+        """Block-FP8 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=1,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(
+            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
+        self._run_evals(
+            f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",
+            tensor_parallel_size=1,
+            moe_backend="CUTEDSL",
+            max_draft_len=3,
+            expected_quant_algo=QuantAlgo.NVFP4,
+            monkeypatch=monkeypatch,
+            mocker=mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):

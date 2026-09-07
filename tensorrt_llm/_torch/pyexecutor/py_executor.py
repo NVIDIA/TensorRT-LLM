@@ -60,6 +60,8 @@ from ..disaggregation.executor.coordinator import (DisaggLoopDelegates,
                                                    NoopDisaggCoordinator)
 from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
 from ..disaggregation.executor.transfer_manager import AsyncTransferManager
+from ..disaggregation.kv_cache_transceiver import (
+    KvCacheTransceiver, is_disagg_inflight_cancel_enabled)
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..models.modeling_multimodal_mixin import \
@@ -81,18 +83,16 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
                             propagate_hard_kill, start_rank_crash_kill_watchdog)
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
+                                           MixedMambaHybridCacheManager)
 from .kv_cache_stats import append_kv_cache_iteration_stats
-from .kv_cache_transceiver import (KvCacheTransceiver,
-                                   is_disagg_inflight_cancel_enabled)
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           MultimodalEncoderRequestError, get_draft_token_length,
                           initialize_multimodal_encoder_request,
                           is_multimodal_encoder_ready)
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import PPCommTag
@@ -6585,7 +6585,7 @@ class PyExecutor:
             warmup(self.resource_manager)
 
     def _submit_encoder_step(self, encoder_requests: List[LlmRequest]) -> None:
-        """Queue encoder work, serializing it with decoder work under TP."""
+        """Queue encoder work, joining the launch before the caller runs the decoder."""
         executor = self.encoder_launch_executor
         if executor is None:
             raise RuntimeError("Encoder launch executor is unavailable.")
@@ -6621,8 +6621,18 @@ class PyExecutor:
                 self.inflight_req_ids.erase(request.request_id)
             return
 
+        # torch.fx's tracing state is process-global, so a dynamo compile on
+        # either thread captures the other's concurrent module calls
+        # (https://nvbugs/6683840). Join the launch, but leave ready_event
+        # unsynchronized so encoder kernels still overlap decoder work.
+        try:
+            result = future.result()
+        except Exception as e:
+            self._finish_failed_encoder_step(requests, e)
+            return
+
         self.pending_encoder_steps.append(
-            PendingEncoderStep(requests=requests, future=future))
+            PendingEncoderStep(requests=requests, future=future, result=result))
 
     @nvtx_range("_poll_encoder_steps")
     def _poll_encoder_steps(self) -> None:

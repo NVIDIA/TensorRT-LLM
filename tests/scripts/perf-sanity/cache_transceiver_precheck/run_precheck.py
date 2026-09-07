@@ -235,14 +235,14 @@ def load_internal_apis():
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
         create_kv_cache_transceiver,
         maybe_enable_fabric_memory_for_python_transceiver,
     )
+    from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
         LlmRequest,
         LlmRequestState,
@@ -1764,16 +1764,7 @@ def parse_args(argv=None):
     ap.add_argument("--server-idx", type=int, required=True)
     ap.add_argument("--config", required=True, help="disagg perf-sanity yaml path")
     ap.add_argument("--work-dir", required=True, help="shared dir for rendezvous/status")
-    # Only the benchmark mode is forwarded, never a test id's instrumentation
-    # modifier (e.g. `time_breakdown`): those change what the harness records,
-    # not the KV transfer being prechecked. submit.py pastes this value into
-    # shell text verbatim, so a mode missing from `choices` would kill the
-    # precheck srun before the workload started.
-    ap.add_argument(
-        "--benchmark-mode",
-        default="e2e",
-        choices=["e2e", "gen_only"],
-    )
+    ap.add_argument("--benchmark-mode", default="e2e", choices=["e2e", "gen_only"])
     ap.add_argument("--llm-src", default="", help="repo root (model path dict lookup)")
     ap.add_argument("--dry-run", action="store_true", help="print the resolved plan and exit")
     return ap.parse_args(argv)

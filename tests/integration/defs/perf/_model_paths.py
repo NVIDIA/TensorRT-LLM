@@ -75,6 +75,8 @@ MODEL_PATH_DICT = {
     "deepseek_v4_flash": "DeepSeek-V4-Flash",
     "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
     "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
+    # NVFP4 routed experts (MIXED_PRECISION); the -DSpark entry above is FP8.
+    "deepseek_v4_pro_nvfp4_dspark": "DeepSeek-V4-Pro-nvfp4-DSpark",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)

@@ -13,13 +13,13 @@ import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
-                                                   FlashInferAttentionMetadata)
-from tensorrt_llm._torch.attention_backend import \
+from tensorrt_llm._torch.attention.backends import (FlashInferAttention,
+                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention.backends import \
     flashinfer as flashinfer_backend
-from tensorrt_llm._torch.attention_backend.flashinfer import (
+from tensorrt_llm._torch.attention.backends.flashinfer import (
     FlashInferWrappers, PlanParams)
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager

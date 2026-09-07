@@ -558,7 +558,7 @@ def test_pipelined_transfer_rejects_bounce_buffer():
 def test_pipelined_transfer_rejects_mamba_cache_manager():
     """Pipelined transfer does not support recurrent-state cache managers."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1)
@@ -577,8 +577,10 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
 
 def test_python_transceiver_rejects_cpp_mamba_cache_manager():
     """Python transceiver requires separate Python-managed Mamba state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import create_kv_cache_transceiver
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        CppMambaHybridCacheManager,
+    )
 
     kv_cache_manager = object.__new__(CppMambaHybridCacheManager)
     cache_transceiver_config = CacheTransceiverConfig(

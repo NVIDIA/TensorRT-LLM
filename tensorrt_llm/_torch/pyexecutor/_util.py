@@ -41,7 +41,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..disaggregation.kv_cache_transceiver import (
+    AttentionTypeCpp, create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -49,23 +52,21 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
+                                           CppMambaHybridCacheManager,
+                                           MambaHybridCacheManagerV2,
+                                           MixedMambaHybridCacheManager,
+                                           use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager,
-                                  MambaHybridCacheManagerV2,
-                                  MixedMambaHybridCacheManager,
-                                  use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
@@ -156,8 +157,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -291,8 +296,17 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
+        if sparse_attn_algorithm == "qsa":
+            # The QSA manager extends the hybrid manager because it must retain
+            # both paged attention data and recurrent GDN state.
+            raise ValueError(
+                "QSA sparse attention currently requires a hybrid Mamba / "
+                "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
@@ -363,7 +377,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
     workspace is reserved and no admission cap is installed for it. See ``ATTENTION_DEVELOPER_GUIDE.md``
     §2.3.
     """
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     # Resolved without ``sparse_params``: those are per-layer, while this workspace is one buffer shared
     # across every attention layer, so the declaration is a whole-model question. The sparse backends all
@@ -375,7 +389,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
 
 def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
     """Whether chunked prefill bounds the selected backend's runtime workspace."""
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     return get_attention_backend(
         model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
@@ -2273,6 +2287,29 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # Unified one-model caches append attention-only MTP layers.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2668,7 +2705,7 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2744,6 +2781,23 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
+            # Resolve the side-cache shape from the same checkpoint geometry
+            # used to construct the QSA index projection.
+            mamba_manager_extra_kwargs.update(
+                sparse_attention_config=sparse_attention_config,
+                pretrained_config=config,
+            )
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
