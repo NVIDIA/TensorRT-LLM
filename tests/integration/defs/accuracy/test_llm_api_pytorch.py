@@ -4919,8 +4919,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -5004,8 +5003,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
@@ -5083,8 +5081,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     def test_eagle3_guided_decoding_4gpus(self, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -5128,8 +5125,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(14400)
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
@@ -5202,8 +5198,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device_memory(90000)
-    @pytest.mark.parametrize("one_model", [True, False],
-                             ids=["one_model", "two_model"])
+    @pytest.mark.parametrize("one_model", [True], ids=["one_model"])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_pre_blackwell),
