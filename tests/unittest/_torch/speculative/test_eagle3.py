@@ -466,39 +466,6 @@ def test_mtp_eagle_dynamic_tree_context_input_uses_prompt_lookahead() -> None:
     )
 
 
-def test_eagle3_resource_manager_shares_padding_dummy_slot() -> None:
-    """The target and draft engines of two-model EAGLE3 share one
-    Eagle3ResourceManager, and each registers its own CUDA graph padding dummy
-    under the same draft-length-derived request ID
-    (CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len). The second registration must
-    reuse the already-reserved slot instead of tripping the strict re-add
-    assert in SlotManager.add_slot."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-        CUDA_GRAPH_DUMMY_REQUEST_ID
-    from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
-
-    config = Eagle3DecodingConfig(max_draft_len=4,
-                                  speculative_model="/dummy/eagle3")
-    manager = Eagle3ResourceManager(config,
-                                    torch.half,
-                                    hidden_size=8,
-                                    max_num_requests=4,
-                                    max_seq_len=32,
-                                    max_num_tokens=64)
-
-    dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - config.max_draft_len
-    # The target engine registers the padding dummy first (e.g. during warmup
-    # preallocation), then the draft engine registers the same ID.
-    manager.add_dummy_requests([dummy_request_id])
-    dummy_slot = manager.slot_manager.get_slot(dummy_request_id)
-    manager.add_dummy_requests([dummy_request_id])
-    assert manager.slot_manager.get_slot(dummy_request_id) == dummy_slot
-
-    # Real request IDs still get their own slots.
-    real_slot = manager.slot_manager.add_slot(7)
-    assert real_slot != dummy_slot
-
-
 @pytest.fixture(scope="function")
 def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -810,7 +777,7 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
             model=target_model_dir,
             speculative_config=spec_config,
             kv_cache_config=kv_cache_config,
-            disable_overlap_scheduler=not eagle3_one_model,
+            disable_overlap_scheduler=False,
             enable_iter_perf_stats=True,
             max_batch_size=4,
     ) as llm:

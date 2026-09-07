@@ -3531,7 +3531,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         max_draft_len = 4
         pytorch_config = dict(
-            disable_overlap_scheduler=not eagle3_one_model,
+            disable_overlap_scheduler=False,
             cuda_graph_config=cuda_graph_config,
         )
         kv_cache_config = KvCacheConfig(
@@ -4945,11 +4945,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 sizes the target and draft managers from the "
-                "same budget, so two-model Eagle3 is rejected")
-
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
@@ -5016,11 +5011,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
-
-        if v2_kv_cache and not one_model:
-            pytest.skip(
-                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
-            )
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         if v2_kv_cache:
@@ -5213,7 +5203,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             max_batch_size=8,
-            disable_overlap_scheduler=not one_model,
+            disable_overlap_scheduler=False,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         dtype="auto",
