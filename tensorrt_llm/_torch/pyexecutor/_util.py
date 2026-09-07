@@ -2367,7 +2367,7 @@ def _create_kv_cache_manager(
         kv_cache_type=None,
         is_disagg: bool = False,
         cold_page_codec_provider: Optional[object] = None,
-        kv_events_config: Optional[KVEventsConfig] = None) -> KVCacheManager:
+        kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
