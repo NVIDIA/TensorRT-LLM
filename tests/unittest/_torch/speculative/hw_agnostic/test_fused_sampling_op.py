@@ -37,11 +37,8 @@ DISABLE_TOPP = 1.0
 DISABLE_MINP = 0.0
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not fused.is_available(),
-    reason=(
-        "requires CUDA and the fused sampling op "
-        "(set TLLM_FUSED_SAMPLING_JIT=1 in an editable checkout)"
-    ),
+    not torch.cuda.is_available(),
+    reason="requires CUDA",
 )
 
 

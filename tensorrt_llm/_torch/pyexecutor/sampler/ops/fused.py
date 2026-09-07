@@ -39,30 +39,6 @@ from typing import Optional
 
 import torch
 
-_OP_NAMES = (
-    "fused_sample_from_logits",
-    "fused_sample_from_logits_with_probs",
-    "fused_compute_probs_from_logits",
-)
-
-
-def _ops_registered() -> bool:
-    return all(hasattr(torch.ops.trtllm, name) for name in _OP_NAMES)
-
-
-def is_available() -> bool:
-    """Whether the op is present in this build."""
-    return _ops_registered()
-
-
-def ensure_available() -> None:
-    if is_available():
-        return
-    raise RuntimeError(
-        "the fused sampling op is not available in this build; it is compiled into "
-        "the C++ extension, so a build that predates it will not have it."
-    )
-
 
 def fused_sample_from_logits(
     logits: torch.Tensor,
@@ -111,29 +87,3 @@ def fused_compute_probs_from_logits(
     return torch.ops.trtllm.fused_compute_probs_from_logits(
         logits, temperatures, top_ks, top_ps, min_ps
     )
-
-
-def _register_fake_impls() -> None:
-    """Shape-only implementations, so ``torch.compile`` can trace a call site.
-
-    Registered once the op exists, since a fake for an unregistered schema is an error.
-    """
-
-    @torch.library.register_fake("trtllm::fused_sample_from_logits")
-    def _(logits, temperatures, top_ks, top_ps, min_ps, seed=None, offset=None):
-        return logits.new_empty((logits.shape[0],), dtype=torch.int32)
-
-    @torch.library.register_fake("trtllm::fused_sample_from_logits_with_probs")
-    def _(logits, temperatures, top_ks, top_ps, min_ps, seed=None, offset=None):
-        return (
-            logits.new_empty((logits.shape[0],), dtype=torch.int32),
-            logits.new_empty(logits.shape, dtype=torch.float32),
-        )
-
-    @torch.library.register_fake("trtllm::fused_compute_probs_from_logits")
-    def _(logits, temperatures, top_ks, top_ps, min_ps):
-        return logits.new_empty(logits.shape, dtype=torch.float32)
-
-
-if _ops_registered():
-    _register_fake_impls()

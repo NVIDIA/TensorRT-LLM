@@ -242,12 +242,7 @@ def available_impls() -> dict[str, Impl]:
             impl = _flashinfer_impl(mode)
             impls[impl.name] = impl
 
-    try:
-        from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
-    except ImportError:
-        return impls
-    if not fused.is_available():
-        return impls
+    from tensorrt_llm._torch.pyexecutor.sampler.ops import fused
 
     def call(shape: str, inp: Inputs) -> Callable[[], Any]:
         args = (inp.logits, inp.temperatures, inp.top_ks, inp.top_ps, inp.min_ps)
