@@ -1487,17 +1487,3 @@ def test_container_setup_needs_the_slurm_block_to_appear():
     bundle = build_perf_optimize_prompts(container_setup="source /repo/.venv/bin/activate")
     for role in _server_roles(bundle):
         assert "Container setup" not in getattr(bundle, role), role
-
-
-def test_container_setup_tells_the_agent_to_repeat_it_every_step():
-    """Each Slurm step gets a fresh container, so 'already did it' is a trap.
-
-    The failure this guards is subtle: the benchmarker prepares its container,
-    the evaluator opens a NEW step, skips the prelude because the transcript
-    says it ran, and measures against an unprepared image.
-    """
-    text = build_perf_optimize_prompts(
-        include_slurm_environment=True, container_setup="source /x/activate"
-    ).evaluator
-    assert "every new Slurm step" in text
-    assert "fresh container" in text

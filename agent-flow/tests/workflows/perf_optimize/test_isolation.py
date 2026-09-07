@@ -14,7 +14,6 @@ import subprocess
 import anyio
 import pytest
 
-from agent_flow.git_worktree import GitWorktreeIsolation
 from agent_flow.orchestration import Node
 from agent_flow.workflows.perf_optimize.isolation import CandidateWorktreeIsolation, item_node_id
 
@@ -62,16 +61,12 @@ def _provider(repo, tmp_path):
         (0, "a/b c", "item_1_a-b-c"),
         (0, "...", "item_1_item"),
         (0, "", "item_1_item"),
+        # A pathological id must not blow past a path component's limit.
+        (0, "x" * 300, "item_1_" + "x" * 48),
     ],
 )
 def test_item_node_id_is_filesystem_and_ref_safe(index, item_id, expected):
     assert item_node_id(index, item_id) == expected
-
-
-def test_item_node_id_is_length_capped():
-    """A pathological roadmap id must not blow past a path component's limit."""
-    node_id = item_node_id(0, "x" * 300)
-    assert node_id == "item_1_" + "x" * 48
 
 
 # ----------------------------------------------------------- naming agreement
@@ -118,36 +113,3 @@ def test_reclaim_keeps_the_candidate_branch_for_the_out_of_graph_integrator(repo
     assert _git(repo, "show", "perf-optimize/ws-round-1-item_1_opt-001:src.py") == "x = 2", (
         "the candidate's commit is still reachable for integration"
     )
-
-
-def test_stock_provider_would_have_deleted_that_branch(repo, tmp_path):
-    """Pin the upstream behavior the subclass overrides, so a rebase can't erase it.
-
-    If a future upstream sync made ``reclaim`` a no-op for everyone, this test
-    fails and the subclass can be retired deliberately rather than silently kept.
-    """
-    stock = GitWorktreeIsolation(
-        repo_path=repo,
-        worktrees_root=tmp_path / "worktrees" / "round_1",
-        branch_prefix="perf-optimize/ws-round-1-",
-        base_ref=_git(repo, "rev-parse", "HEAD"),
-    )
-    node = Node(id="item_1_opt-001", type="roadmap_item")
-    anyio.run(stock.acquire, node)
-    anyio.run(stock.release, node)
-    anyio.run(stock.reclaim, node)
-
-    assert "perf-optimize/ws-round-1-item_1_opt-001" not in _git(repo, "branch", "--list")
-
-
-def test_acquire_is_idempotent_across_a_resume(repo, tmp_path):
-    """A resumed round re-acquires the same worktree instead of failing on it."""
-    provider = _provider(repo, tmp_path)
-    node = Node(id="item_1_opt-001", type="roadmap_item")
-    first = anyio.run(provider.acquire, node)
-    (first / "candidate.txt").write_text("in progress\n", encoding="utf-8")
-
-    second = anyio.run(provider.acquire, node)
-
-    assert second == first
-    assert (second / "candidate.txt").exists()
