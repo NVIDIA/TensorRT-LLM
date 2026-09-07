@@ -1,5 +1,4 @@
 accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v1] SKIP (https://nvbugs/6619883)
-accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False] SKIP (https://nvbugs/6686534)
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform] SKIP (https://nvbugs/6661863)
 accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_contention_opt] SKIP (https://nvbugs/6644489)
