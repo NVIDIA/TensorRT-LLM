@@ -166,12 +166,16 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(repor
         total_cases=100,
         multi_gpu_required=True,
         multi_gpu_label_gate_open=False,
+        cbts_applied=False,
+        coverage_pilot_eligible=False,
     )
 
     assert document["d_case_skip_rate"] == 0.75
     assert document["b_case_skip_rate_valid"] is True
     assert document["b_non_cbts_multi_gpu_required"] is True
     assert document["b_multi_gpu_label_gate_open"] is False
+    assert document["b_cbts_applied"] is False
+    assert document["b_coverage_pilot_eligible"] is False
     assert document["flat_detail"]["hit_stages"] == [
         "H100-PyTorch-1",
         "H100-PyTorch-2",
@@ -213,6 +217,8 @@ def test_main_posts_case_skip_rate_to_opensearch(report_module, monkeypatch, tmp
                 ".",
                 "--multi-gpu-required",
                 "--multi-gpu-label-gate-open",
+                "--cbts-applied",
+                "--coverage-pilot-eligible",
             ]
         )
         == 0
@@ -221,3 +227,5 @@ def test_main_posts_case_skip_rate_to_opensearch(report_module, monkeypatch, tmp
     assert posted_documents[0]["b_case_skip_rate_valid"] is True
     assert posted_documents[0]["b_non_cbts_multi_gpu_required"] is True
     assert posted_documents[0]["b_multi_gpu_label_gate_open"] is True
+    assert posted_documents[0]["b_cbts_applied"] is True
+    assert posted_documents[0]["b_coverage_pilot_eligible"] is True
