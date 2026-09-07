@@ -14,6 +14,8 @@ These examples show how to interact with the visual generation server using both
   - Multipart/form-data support for file uploads
 - **Video Management**: Retrieving and deleting generated videos
 
+For benchmarking a running server, see [BENCHMARKING.md](BENCHMARKING.md).
+
 ## Prerequisites
 
 Before running these examples, ensure you have:
