@@ -55,7 +55,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype"
+pytest "accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
