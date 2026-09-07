@@ -808,6 +808,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
+    static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -1850,6 +1851,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     // Make Status accessible as _KVCache.Status.
     m.attr("_KVCache").attr("Status") = kvCacheStatus;
 
+    // Reports the first invariant violation KVCM2 recorded, if any. Once set, every manager in
+    // this process refuses further work and raises CorruptedError. Never clears, so a server can
+    // poll it to decide to drain and restart.
+    m.def(
+        "poison_reason", []() -> std::optional<std::string> { return kv::Poison::reason(); },
+        "First recorded KVCM2 invariant violation, or None.");
+
+    // Reports the recorded violation and clears it, but only once no manager is alive: a poisoned
+    // manager skipped its own cleanup, so re-enabling it would resume work on structures known to
+    // be inconsistent. The reason is still returned in that case, and the latch stays set.
+    m.def(
+        "take_poison", []() -> std::optional<std::string> { return kv::takePoison(); },
+        "Report the recorded KVCM2 violation and clear it if no manager is alive.");
+
+    m.def(
+        "num_live_managers", []() { return kv::KvCacheManager::numLiveManagers(); },
+        "Number of constructed, not-yet-destroyed KVCacheManagers in this process.");
+
     // ---- Introspection -------------------------------------------------------
     auto mIntrospection = m.def_submodule("_introspection", "KV cache manager v2 introspection helpers");
     mIntrospection.def(
@@ -1857,6 +1876,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](std::map<int, size_t> coldPageBytesByLayer) -> std::unique_ptr<kv::IKvCacheColdPageCodec>
         { return std::make_unique<TestPaddingColdPageCodec>(std::move(coldPageBytesByLayer)); },
         nb::arg("cold_page_bytes_by_layer"));
+
+    mIntrospection.def(
+        "poison_for_testing", [](std::string const& reason) { kv::Poison::set("poison_for_testing", reason.c_str()); },
+        nb::arg("reason"), "Set the KVCM2 poison latch directly, to exercise the refusal paths.");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 
