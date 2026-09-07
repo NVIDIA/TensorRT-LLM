@@ -76,6 +76,12 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
 
     @property
     @require_device_mesh
+    def tp_group_name(self) -> str:
+        pg = self._get_mesh_dim_by_name('tp').get_group()
+        return pg.group_name if hasattr(pg, 'group_name') else ''
+
+    @property
+    @require_device_mesh
     def pp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('pp').get_group()
 
@@ -83,6 +89,12 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     @require_device_mesh
     def cp_group_pg(self) -> Union[ProcessGroup, SingleProcessGroup]:
         return self._get_mesh_dim_by_name('cp').get_group()
+
+    @property
+    @require_device_mesh
+    def cp_group_name(self) -> str:
+        pg = self._get_mesh_dim_by_name('cp').get_group()
+        return pg.group_name if hasattr(pg, 'group_name') else ''
 
     @property
     @require_device_mesh
