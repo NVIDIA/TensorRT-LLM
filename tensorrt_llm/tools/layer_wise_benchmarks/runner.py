@@ -632,7 +632,6 @@ class Runner:
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         sparse_attention_config = self.model_config.sparse_attention_config
         sparse_params = (
@@ -674,16 +673,11 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        # One entry per ATTENTION-DP rank, not per world rank. Mapping.dp_size is
-        # tp_size when attention DP is on and 1 when it is off; world_size is
-        # unconditional. So under --no-enable-attention-dp this handed an 8-element list
-        # to a MoE that takes the non-DP branch, where ConfigurableMoE.calculate_num_chunks
-        # asserts `len(all_rank_num_tokens) == 1` and reports
-        #   AssertionError: non-DP path expects a single-element list, got 8
-        # Every rank died at the first MoE layer, so the replay wrote per-rank logs and no
-        # report csv at all. The same expression is already used at :124 for the sweep.
-        dp_size = world_size if self.model_config.mapping.enable_attention_dp else 1
-        attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * dp_size
+        # One entry per attention-DP rank, not per world rank: the non-DP MoE path
+        # asserts len(all_rank_num_tokens) == 1.
+        attn_metadata.all_rank_num_tokens = [
+            batch_size * seq_len_q
+        ] * self.model_config.mapping.dp_size
         # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
         # serving the executor announces that via update_spec_dec_param(), the only
         # place max_draft_tokens is set. Without it the DSA indexer's context_lens
