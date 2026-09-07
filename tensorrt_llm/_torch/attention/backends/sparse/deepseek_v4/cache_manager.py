@@ -46,7 +46,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-from .compressor import KVCacheDtype
+from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, KVCacheDtype
 from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
@@ -134,7 +134,8 @@ def get_token_bytes(
         )
 
     if attn_type == DeepseekV4AttentionType.COMPRESS and has_nvfp4_compress:
-        return attn_dim // 2 + attn_dim // NVFP4_VECTOR_SIZE
+        storage_dim = attn_dim + NVFP4_COMPRESS_RESIDUAL_DIM
+        return storage_dim // 2 + storage_dim // NVFP4_VECTOR_SIZE
 
     return attn_dim * dtype_bytes
 
@@ -525,7 +526,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
             dim_per_token = footer_scale_kv.TOKEN_BYTES
         elif attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress:
-            dim_per_token = attn_dim // 2
+            dim_per_token = (attn_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
         else:
             dim_per_token = attn_dim
 
@@ -569,7 +570,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         shape = (
             page_index_upper_bound,
             self.compressed_block_sizes[layer_idx],
-            self.head_dim // NVFP4_VECTOR_SIZE,
+            (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // NVFP4_VECTOR_SIZE,
         )
         return convert_to_torch_tensor(TensorWrapper(addr, DataType.FP8, shape))
 
@@ -590,14 +591,22 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             TensorWrapper(
                 self.compress_pool_ptrs[compress_ratio],
                 DataType.UINT8,
-                [data_pages * tokens_per_page * (self.head_dim // 2)],
+                [
+                    data_pages
+                    * tokens_per_page
+                    * ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2)
+                ],
             )
         )
         scales = convert_to_torch_tensor(
             TensorWrapper(
                 self.compress_scale_pool_ptrs[compress_ratio],
                 DataType.FP8,
-                [scale_pages * tokens_per_page * (self.head_dim // NVFP4_VECTOR_SIZE)],
+                [
+                    scale_pages
+                    * tokens_per_page
+                    * ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // NVFP4_VECTOR_SIZE)
+                ],
             )
         )
         return data, scales
@@ -1038,7 +1047,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                         role=COMPRESS_BLOCK_SCALE_ROLE,
                         size=(
                             self.compressed_block_sizes[layer_idx]
-                            * self.head_dim
+                            * (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM)
                             // NVFP4_VECTOR_SIZE
                         ),
                     )
@@ -1233,7 +1242,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
         if attn_type == DeepseekV4AttentionType.COMPRESS and self._use_nvfp4_compress:
-            token_bytes = self.head_dim // 2
+            token_bytes = (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
 
         block_size = self.tokens_per_block
         if attn_type in [

@@ -34,7 +34,7 @@ from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
 from .cache_manager import get_token_bytes
-from .compressor import Compressor
+from .compressor import NVFP4_COMPRESS_RESIDUAL_DIM, Compressor
 from .indexer import DeepseekV4Indexer
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
@@ -344,7 +344,9 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             tokens_per_block=kv_cache_manager.tokens_per_block,
             token_stride=token_stride,
             compressed_token_stride=(
-                self.head_dim // 2 if self._uses_nvfp4_compress else token_stride
+                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+                if self._uses_nvfp4_compress
+                else token_stride
             ),
             block_table_compressed=block_table_compressed,
             compressed_local_indices=compressed_local_indices,
@@ -379,8 +381,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 compressed_indices,
                 scratch,
                 self._nvfp4_compress_scale_quant_orig,
-                0,
-                data_pool.numel() // (self.head_dim // 2),
+                NVFP4_COMPRESS_RESIDUAL_DIM,
+                data_pool.numel() // ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2),
             )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices

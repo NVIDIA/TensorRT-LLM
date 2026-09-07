@@ -91,6 +91,7 @@ void postProcessScatterLaunch(void const* kv_comp,  // [total_tokens, head_dim] 
     int batch_size, int tokens_per_block, int head_dim, int max_blocks_per_seq, int elem_bytes, int total_tokens,
     int cache_scale_type, float nvfp4_global_scale, // 0=none (bf16/fp32 by elem_bytes), 1=fp8_pertensor,
                                                     // 2=fp8_blockwise, 3=mxfp4, 4=nvfp4 (packed FP4)
+    int nvfp4_residual_dim,                         // extra second-level FP4 dimensions for NVFP4
     bool rotate_activation,                         // whether to apply Hadamard transform (false to skip)
     void* quant_output,                             // optional fp8/fp4 packed output (nullptr if unused)
     void* scale_output,                             // optional scale output (float* for fp8, uint8_t* for fp4)

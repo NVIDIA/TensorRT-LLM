@@ -93,8 +93,8 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
     torch::Tensor start_pos,                               // [bsz] int32
     torch::Tensor block_offsets,                           // [bsz, max_blocks] int32
     torch::Tensor compressed_mask,                         // [total_tokens] bool — per-token mask
-    int64_t tokens_per_block, int64_t cache_scale_type, double nvfp4_global_scale, bool rotate_activation,
-    std::optional<torch::Tensor> quant_output, std::optional<torch::Tensor> scale_output)
+    int64_t tokens_per_block, int64_t cache_scale_type, double nvfp4_global_scale, int64_t nvfp4_residual_dim,
+    bool rotate_activation, std::optional<torch::Tensor> quant_output, std::optional<torch::Tensor> scale_output)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -125,7 +125,8 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
         static_cast<int>(block_offsets.size(1)),  // max_blocks
         static_cast<int>(kv_comp.element_size()), // elem_bytes
         static_cast<int>(kv_comp.size(0)),        // total_tokens
-        static_cast<int>(cache_scale_type), static_cast<float>(nvfp4_global_scale), rotate_activation,
+        static_cast<int>(cache_scale_type), static_cast<float>(nvfp4_global_scale),
+        static_cast<int>(nvfp4_residual_dim), rotate_activation,
         quant_output.has_value() ? quant_output->data_ptr() : nullptr,
         scale_output.has_value() ? scale_output->data_ptr() : nullptr, stream);
 }
@@ -171,6 +172,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor compressed_mask, "
         "int tokens_per_block, int cache_scale_type, "
         "float nvfp4_global_scale, "
+        "int nvfp4_residual_dim, "
         "bool rotate_activation, "
         "Tensor(c!)? quant_output, Tensor(d!)? scale_output) -> ()");
 }

@@ -174,6 +174,13 @@ __device__ inline uint8_t packE2M1x2(float lo, float hi)
 #endif
 }
 
+__device__ inline float decodeE2M1(uint8_t value)
+{
+    constexpr float kMagnitude[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
+    float const magnitude = kMagnitude[value & 0x7U];
+    return (value & 0x8U) == 0 ? magnitude : -magnitude;
+}
+
 // Vectorized load/store types: maps byte-width to CUDA vector type.
 template <int V>
 struct VecType;
@@ -1305,7 +1312,7 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
 // ============================================================================
 
 template <int HEAD_DIM, int ELEM_BYTES, CacheScaleType SCALE_TYPE = CacheScaleType::kNone,
-    bool ROTATE_ACTIVATION = true>
+    bool ROTATE_ACTIVATION = true, int NVFP4_RESIDUAL_DIM = 0>
 __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [total_tokens, head_dim] input
     void* __restrict__ kv_out,                // [total_tokens, head_dim] postprocessed output (may be nullptr)
     void const* __restrict__ rms_weight,      // [head_dim]
@@ -1322,6 +1329,10 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
     int cache_stride_blk_bytes, int total_tokens, int num_scale_blocks, float nvfp4_global_scale,
     void* __restrict__ quant_output, void* __restrict__ scale_output)
 {
+    static_assert(NVFP4_RESIDUAL_DIM == 0 || SCALE_TYPE == CacheScaleType::kNVFP4Blockwise,
+        "Residual quantization is only valid for NVFP4 cache storage");
+    static_assert(NVFP4_RESIDUAL_DIM == 0 || NVFP4_RESIDUAL_DIM == 64,
+        "NVFP4 residual quantization supports a 64-wide RoPE suffix");
     using ElementT = typename std::conditional<ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     constexpr int MAX_VEC = 16 / ELEM_BYTES;
     constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
@@ -1718,22 +1729,81 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
             fp4_bytes[i / 2] = packE2M1x2(v[i] * quantScale, v[i + 1] * quantScale);
         }
 
-        int const packed_head_dim = HEAD_DIM / 2;
-        uint8_t* fp4_dst = block_base + token_offset * packed_head_dim + tid * PACKED_VEC_BYTES;
+        constexpr int PACKED_HEAD_DIM = (HEAD_DIM + NVFP4_RESIDUAL_DIM) / 2;
+        constexpr int MAIN_GROUPS = (HEAD_DIM - NVFP4_RESIDUAL_DIM) / 16;
+        int const group_idx = tid / GROUP_SIZE;
+        int const group_lane = tid % GROUP_SIZE;
+        constexpr bool hasResidual = NVFP4_RESIDUAL_DIM > 0;
+        bool const isResidualGroup = hasResidual && group_idx >= MAIN_GROUPS;
+        int const residualGroup = group_idx - MAIN_GROUPS;
+        int const dataGroupOffset
+            = isResidualGroup ? MAIN_GROUPS * 8 + residualGroup * 16 : group_idx * (SCALE_VECTOR_SIZE / 2);
+        int const mainScaleIdx = isResidualGroup ? MAIN_GROUPS + residualGroup * 2 : group_idx;
+
+        uint8_t* fp4_dst
+            = block_base + token_offset * PACKED_HEAD_DIM + dataGroupOffset + group_lane * PACKED_VEC_BYTES;
 #pragma unroll
         for (int i = 0; i < PACKED_VEC_BYTES; ++i)
             fp4_dst[i] = fp4_bytes[i];
 
-        if (tid % GROUP_SIZE == 0)
+        uint8_t residualFp4Bytes[PACKED_VEC_BYTES];
+        float residualScale = 0.F;
+        if constexpr (hasResidual)
         {
-            int const scale_idx = tid / GROUP_SIZE;
+            if (isResidualGroup)
+            {
+                float localResidualAmax = 0.F;
+                float residualValues[VEC];
+#pragma unroll
+                for (int i = 0; i < VEC; ++i)
+                {
+                    uint8_t const packed = fp4_bytes[i / 2];
+                    uint8_t const e2m1 = packed >> ((i & 1) * 4);
+                    float const mainValue = decodeE2M1(e2m1) * scale / nvfp4_global_scale;
+                    residualValues[i] = v[i] - mainValue;
+                    localResidualAmax = fmaxf(localResidualAmax, fabsf(residualValues[i]));
+                }
+#pragma unroll
+                for (int offset = GROUP_SIZE / 2; offset > 0; offset >>= 1)
+                    localResidualAmax
+                        = fmaxf(localResidualAmax, __shfl_xor_sync(0xFFFFFFFF, localResidualAmax, offset));
+
+                __nv_fp8_e4m3 const fp8ResidualScale(
+                    fminf(localResidualAmax * nvfp4_global_scale * kFp4MaxInv, 448.0F));
+                residualScale = static_cast<float>(fp8ResidualScale);
+                float const residualQuantScale = nvfp4_global_scale / fmaxf(residualScale, 1.0e-12F);
+#pragma unroll
+                for (int i = 0; i < VEC; i += 2)
+                {
+                    residualFp4Bytes[i / 2] = packE2M1x2(
+                        residualValues[i] * residualQuantScale, residualValues[i + 1] * residualQuantScale);
+                }
+
+                uint8_t* residualDst
+                    = block_base + token_offset * PACKED_HEAD_DIM + dataGroupOffset + 8 + group_lane * PACKED_VEC_BYTES;
+#pragma unroll
+                for (int i = 0; i < PACKED_VEC_BYTES; ++i)
+                    residualDst[i] = residualFp4Bytes[i];
+            }
+        }
+
+        if (group_lane == 0)
+        {
             uint8_t* scale_dst = SCALE_TYPE == CacheScaleType::kNVFP4Blockwise
-                ? scale_block_base + token_offset * num_scale_blocks + scale_idx
-                : block_base + tokens_per_block * packed_head_dim + token_offset * num_scale_blocks + scale_idx;
+                ? scale_block_base + token_offset * num_scale_blocks + mainScaleIdx
+                : block_base + tokens_per_block * PACKED_HEAD_DIM + token_offset * num_scale_blocks + mainScaleIdx;
             if constexpr (SCALE_TYPE == CacheScaleType::kNVFP4Blockwise)
             {
                 __nv_fp8_e4m3 const fp8Scale(scale);
                 *scale_dst = *reinterpret_cast<uint8_t const*>(&fp8Scale);
+                if constexpr (hasResidual)
+                {
+                    if (isResidualGroup)
+                    {
+                        __nv_fp8_e4m3 const fp8ResidualScale(residualScale);
+                        scale_dst[1] = *reinterpret_cast<uint8_t const*>(&fp8ResidualScale);
+                    }
+                }
             }
             else
             {
@@ -1744,16 +1814,41 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
         if (quant_output != nullptr)
         {
             uint8_t* fp4_out_dst = reinterpret_cast<uint8_t*>(quant_output)
-                + static_cast<int64_t>(token_idx) * packed_head_dim + tid * PACKED_VEC_BYTES;
+                + static_cast<int64_t>(token_idx) * PACKED_HEAD_DIM + dataGroupOffset + group_lane * PACKED_VEC_BYTES;
 #pragma unroll
             for (int i = 0; i < PACKED_VEC_BYTES; ++i)
                 fp4_out_dst[i] = fp4_bytes[i];
+            if constexpr (hasResidual)
+            {
+                if (isResidualGroup)
+                {
+#pragma unroll
+                    for (int i = 0; i < PACKED_VEC_BYTES; ++i)
+                        fp4_out_dst[8 + i] = residualFp4Bytes[i];
+                }
+            }
         }
-        if (scale_output != nullptr && tid % GROUP_SIZE == 0)
+        if (scale_output != nullptr && group_lane == 0)
         {
-            int const scale_idx = tid / GROUP_SIZE;
-            reinterpret_cast<uint8_t*>(scale_output)[static_cast<int64_t>(token_idx) * num_scale_blocks + scale_idx]
-                = toUe8m0(scale);
+            uint8_t* scaleOut = reinterpret_cast<uint8_t*>(scale_output)
+                + static_cast<int64_t>(token_idx) * num_scale_blocks + mainScaleIdx;
+            if constexpr (SCALE_TYPE == CacheScaleType::kNVFP4Blockwise)
+            {
+                __nv_fp8_e4m3 const fp8Scale(scale);
+                *scaleOut = *reinterpret_cast<uint8_t const*>(&fp8Scale);
+                if constexpr (hasResidual)
+                {
+                    if (isResidualGroup)
+                    {
+                        __nv_fp8_e4m3 const fp8ResidualScale(residualScale);
+                        scaleOut[1] = *reinterpret_cast<uint8_t const*>(&fp8ResidualScale);
+                    }
+                }
+            }
+            else
+            {
+                *scaleOut = toUe8m0(scale);
+            }
         }
     }
 }
@@ -1762,14 +1857,14 @@ __global__ void postProcessScatterKernel(void const* __restrict__ kv_comp, // [t
 // kNone supports bf16 (EB=2) and fp32 (EB=4) input types; the quantized
 // scale types only support bf16 input since the compressor output is bf16.
 // Each combination is instantiated with ROTATE_ACTIVATION=true and false.
-#define INST_PPS(HD, EB, CST, AR)                                                                                      \
-    template __global__ void postProcessScatterKernel<HD, EB, CST, AR>(void const*, void*, void const*, float,         \
-        float const*, int32_t const*, int, int, void*, void*, int32_t const*, int32_t const*, int32_t const*,          \
+#define INST_PPS(HD, EB, CST, AR, RESIDUAL_DIM)                                                                        \
+    template __global__ void postProcessScatterKernel<HD, EB, CST, AR, RESIDUAL_DIM>(void const*, void*, void const*,  \
+        float, float const*, int32_t const*, int, int, void*, void*, int32_t const*, int32_t const*, int32_t const*,   \
         int32_t const*, bool const*, int, int, int, int, int, int, float, void*, void*);
 
 #define INST_PPS_AR(HD, EB, CST)                                                                                       \
-    INST_PPS(HD, EB, CST, true)                                                                                        \
-    INST_PPS(HD, EB, CST, false)
+    INST_PPS(HD, EB, CST, true, 0)                                                                                     \
+    INST_PPS(HD, EB, CST, false, 0)
 
 INST_PPS_AR(128, 2, CacheScaleType::kNone)
 INST_PPS_AR(128, 4, CacheScaleType::kNone)
@@ -1782,6 +1877,8 @@ INST_PPS_AR(512, 2, CacheScaleType::kFP8Blockwise)
 INST_PPS_AR(128, 2, CacheScaleType::kMXFP4Blockwise)
 INST_PPS_AR(512, 2, CacheScaleType::kMXFP4Blockwise)
 INST_PPS_AR(512, 2, CacheScaleType::kNVFP4Blockwise)
+INST_PPS(512, 2, CacheScaleType::kNVFP4Blockwise, true, 64)
+INST_PPS(512, 2, CacheScaleType::kNVFP4Blockwise, false, 64)
 #undef INST_PPS_AR
 #undef INST_PPS
 
@@ -1806,7 +1903,7 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     void* kv_cache_scale, int32_t const* num_outputs, int32_t const* cu_kv_comp, int32_t const* start_pos,
     int32_t const* block_offsets, bool const* compressed_mask, int batch_size, int tokens_per_block, int head_dim,
     int max_blocks_per_seq, int elem_bytes, int total_tokens, int cache_scale_type, float nvfp4_global_scale,
-    bool rotate_activation, void* quant_output, void* scale_output, cudaStream_t stream)
+    int nvfp4_residual_dim, bool rotate_activation, void* quant_output, void* scale_output, cudaStream_t stream)
 {
     if (total_tokens == 0)
     {
@@ -1820,6 +1917,11 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
         "NVFP4 COMPRESS cache requires a non-null scale buffer");
     TLLM_CHECK_WITH_INFO(cst != CacheScaleType::kNVFP4Blockwise || head_dim == 512,
         "NVFP4 COMPRESS cache requires head_dim=512, got %d", head_dim);
+    TLLM_CHECK_WITH_INFO(cst == CacheScaleType::kNVFP4Blockwise || nvfp4_residual_dim == 0,
+        "NVFP4 residual quantization requires NVFP4 cache storage");
+    TLLM_CHECK_WITH_INFO(nvfp4_residual_dim == 0 || (nvfp4_residual_dim == 64 && rope_dim == 64),
+        "NVFP4 COMPRESS residual_dim must be 0 or rope_dim=64, got residual_dim=%d and rope_dim=%d", nvfp4_residual_dim,
+        rope_dim);
     TLLM_CHECK_WITH_INFO(
         cst != CacheScaleType::kNVFP4Blockwise || (nvfp4_global_scale > 0.F && std::isfinite(nvfp4_global_scale)),
         "NVFP4 COMPRESS cache requires a finite positive global scale, got %f", nvfp4_global_scale);
@@ -1841,7 +1943,8 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     //   fp8 pertensor:    tpb * HD
     //   fp8 blockwise:    tpb * HD + tpb * (HD/128)*4
     //   mxfp4:            tpb * (HD/2) + tpb * (HD/32)
-    //   nvfp4:            tpb * (HD/2), plus a separate tpb * (HD/16) scale buffer
+    //   nvfp4:            tpb * ((HD+residual)/2), plus a separate
+    //                      tpb * ((HD+residual)/16) scale buffer
     int num_scale_blocks = 0;
     int cache_stride_blk_bytes = 0;
     switch (cst)
@@ -1856,26 +1959,37 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
         cache_stride_blk_bytes = tokens_per_block * (head_dim / 2) + tokens_per_block * num_scale_blocks;
         break;
     case CacheScaleType::kNVFP4Blockwise:
-        num_scale_blocks = head_dim / 16;
-        cache_stride_blk_bytes = tokens_per_block * (head_dim / 2);
+        num_scale_blocks = (head_dim + nvfp4_residual_dim) / 16;
+        cache_stride_blk_bytes = tokens_per_block * ((head_dim + nvfp4_residual_dim) / 2);
         break;
     default: cache_stride_blk_bytes = tokens_per_block * head_dim * elem_bytes; break;
     }
 
-#define LAUNCH_PPS(HD, EB, CST, AR)                                                                                    \
-    postProcessScatterKernel<HD, EB, CST, AR><<<total_tokens, nthreads, smem_bytes, stream>>>(kv_comp, kv_out,         \
-        rms_weight, rms_eps, cos_sin_table, position_ids, nope_dim, rope_dim, kv_cache, kv_cache_scale, num_outputs,   \
-        cu_kv_comp, start_pos, block_offsets, compressed_mask, batch_size, tokens_per_block, max_blocks_per_seq,       \
-        cache_stride_blk_bytes, total_tokens, num_scale_blocks, nvfp4_global_scale, quant_output, scale_output)
+#define LAUNCH_PPS(HD, EB, CST, AR, RESIDUAL_DIM)                                                                      \
+    postProcessScatterKernel<HD, EB, CST, AR, RESIDUAL_DIM><<<total_tokens, nthreads, smem_bytes, stream>>>(kv_comp,   \
+        kv_out, rms_weight, rms_eps, cos_sin_table, position_ids, nope_dim, rope_dim, kv_cache, kv_cache_scale,        \
+        num_outputs, cu_kv_comp, start_pos, block_offsets, compressed_mask, batch_size, tokens_per_block,              \
+        max_blocks_per_seq, cache_stride_blk_bytes, total_tokens, num_scale_blocks, nvfp4_global_scale, quant_output,  \
+        scale_output)
 
 #define DISPATCH_ROTATE(HD, EB, CST)                                                                                   \
     if (rotate_activation)                                                                                             \
     {                                                                                                                  \
-        LAUNCH_PPS(HD, EB, CST, true);                                                                                 \
+        LAUNCH_PPS(HD, EB, CST, true, 0);                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-        LAUNCH_PPS(HD, EB, CST, false);                                                                                \
+        LAUNCH_PPS(HD, EB, CST, false, 0);                                                                             \
+    }
+
+#define DISPATCH_NVFP4_RESIDUAL()                                                                                      \
+    if (rotate_activation)                                                                                             \
+    {                                                                                                                  \
+        LAUNCH_PPS(512, 2, CacheScaleType::kNVFP4Blockwise, true, 64);                                                 \
+    }                                                                                                                  \
+    else                                                                                                               \
+    {                                                                                                                  \
+        LAUNCH_PPS(512, 2, CacheScaleType::kNVFP4Blockwise, false, 64);                                                \
     }
 #define DISPATCH_HD_EB(CST)                                                                                            \
     if (elem_bytes == 4)                                                                                               \
@@ -1915,7 +2029,14 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
     }
     else if (cst == CacheScaleType::kNVFP4Blockwise)
     {
-        DISPATCH_HD_BF16(CacheScaleType::kNVFP4Blockwise);
+        if (nvfp4_residual_dim == 64)
+        {
+            DISPATCH_NVFP4_RESIDUAL();
+        }
+        else
+        {
+            DISPATCH_HD_BF16(CacheScaleType::kNVFP4Blockwise);
+        }
     }
     else
     {
@@ -1924,6 +2045,7 @@ void postProcessScatterLaunch(void const* kv_comp, void* kv_out, void const* rms
 
 #undef DISPATCH_HD_BF16
 #undef DISPATCH_HD_EB
+#undef DISPATCH_NVFP4_RESIDUAL
 #undef DISPATCH_ROTATE
 #undef LAUNCH_PPS
 }
