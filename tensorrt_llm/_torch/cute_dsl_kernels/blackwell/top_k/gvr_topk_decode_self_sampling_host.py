@@ -695,7 +695,12 @@ def _varlen_launcher(
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
-    n_eff = max(min(n_env, npad), k + 1)
+    # Two envelopes: the kernel gets the PHYSICAL bound (never past the row
+    # stride, so a row whose kv length exceeds the logits width clamps and
+    # takes the short path instead of reading into the next row); the router
+    # gets the k+1 floor it needs to pick a non-degenerate family.
+    n_kernel = min(n_env, npad)
+    n_route = max(n_kernel, k + 1)
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
     # ---- route() parity, family tier 1: clustered register-resident --------
@@ -703,7 +708,7 @@ def _varlen_launcher(
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_eff, npad, k)
+    plan_free = route(num_rows, n_route, npad, k)
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -712,7 +717,7 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
         )
-        lc = ("reg_clus", fn, n_eff)
+        lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
         return lc
     # ---- route() parity, family tier 2: register-resident (+img flavor) ----
@@ -734,7 +739,7 @@ def _varlen_launcher(
         lc = (
             "reg",
             fn,
-            (rt_f["n"], rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -759,11 +764,11 @@ def _varlen_launcher(
         lc = (
             "clus",
             fn,
-            (n_eff, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
+            (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0),
         )
         _VARLEN_CACHE[key] = lc
         return lc
-    plan = route_streaming(num_rows, n_eff, npad, k, force_main=True)
+    plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
@@ -894,13 +899,13 @@ def default_workspace(ref: torch.Tensor) -> torch.Tensor:
 def validate_run_ws(workspace: torch.Tensor, logits: torch.Tensor) -> None:
     """run_ws() workspace hardening, in a fixed predicate order:
     CUDA + same device as logits; numel*element_size >= workspace_bytes();
-    base 8-byte aligned."""
+    base 16-byte aligned (the DSL workspace fake declares assumed_align=16)."""
     if not (workspace.is_cuda and workspace.get_device() == logits.get_device()):
         raise RuntimeError("workspace must be a CUDA tensor on the same device")
     if workspace.numel() * workspace.element_size() < WS_BYTES:
         raise RuntimeError(f"workspace too small: need {WS_BYTES} bytes")
-    if workspace.data_ptr() & 7:
-        raise RuntimeError("workspace must be 8-byte aligned")
+    if workspace.data_ptr() & 15:
+        raise RuntimeError("workspace must be 16-byte aligned")
 
 
 def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
@@ -908,10 +913,9 @@ def kernel_view(workspace: torch.Tensor) -> torch.Tensor:
     bytes at the tensor's data_ptr() as int32[WS_BYTES/4], ignoring
     dtype/shape.
 
-    NOTE: the DSL-side fake tensor declares assumed_align=16; a workspace at
-    8-but-not-16-byte alignment passes the validate_run_ws check but is
-    rejected by the DSL at conversion -- surfaced as a launch failure with
-    shape context."""
+    NOTE: the DSL-side fake tensor declares assumed_align=16, matching the
+    validate_run_ws base-alignment check, so misaligned workspaces fail on
+    the host with a clear message instead of at DSL conversion."""
     if (
         workspace.dtype is torch.int32
         and workspace.dim() == 1
@@ -1540,27 +1544,32 @@ def warmup_varlen(
         tuple(rows_list),
         npad,
     )
+    # The done key covers the GPU band launches only (one per engine compile
+    # key). The exact-row launcher population below is keyed by the requested
+    # row counts, which the band key does not see, so it always runs: a later
+    # call with a new row count inside an already-warmed band must still
+    # create that row count's entry, or capture at it raises not-compiled.
     with _VARLEN_WARMUP_LOCK:
-        if key in _VARLEN_WARMUP_DONE:
-            return
-    rows_max = rows_list[-1]
-    # one allocation at the largest geometry; smaller row counts run on
-    # contiguous prefix views (compile keys depend on shapes only)
-    logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
-    kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
-    out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
-    for rows in rows_list:
-        batch = rows // nn
-        run_varlen(
-            logits[:rows],
-            kv_lens[:batch],
-            out[:rows],
-            next_n=nn,
-            compress_ratio=int(compress_ratio),
-            max_seq_len=int(max_seq_len),
-        )
-    del logits, kv_lens, out
-    torch.cuda.synchronize()
+        bands_done = key in _VARLEN_WARMUP_DONE
+    if not bands_done:
+        rows_max = rows_list[-1]
+        # one allocation at the largest geometry; smaller row counts run on
+        # contiguous prefix views (compile keys depend on shapes only)
+        logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
+        kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
+        out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+        for rows in rows_list:
+            batch = rows // nn
+            run_varlen(
+                logits[:rows],
+                kv_lens[:batch],
+                out[:rows],
+                next_n=nn,
+                compress_ratio=int(compress_ratio),
+                max_seq_len=int(max_seq_len),
+            )
+        del logits, kv_lens, out
+        torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
     # LAUNCHER cache entries for the exact requested row counts (pure host
     # work, zero allocation/launch — engines hit the compile cache), so a
@@ -1568,5 +1577,6 @@ def warmup_varlen(
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
         _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio))
-    with _VARLEN_WARMUP_LOCK:
-        _VARLEN_WARMUP_DONE.add(key)
+    if not bands_done:
+        with _VARLEN_WARMUP_LOCK:
+            _VARLEN_WARMUP_DONE.add(key)

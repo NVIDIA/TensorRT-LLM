@@ -2729,11 +2729,11 @@ class PyExecutor:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
                     if not self.pp_async_broadcast_sample_state:
-                        # Drain pending relay isends before forward: rendezvous
-                        # sends need this rank to keep entering MPI, and a forward
-                        # blocked in a native call would starve the receiving rank.
-                        for mb in range(self.num_micro_batches):
-                            self.wait_on_pp_send_handles(self.send_handles, mb)
+                        # Drain the relay isends whose recv is due before this
+                        # forward: rendezvous sends need this rank to keep
+                        # entering MPI, and a forward blocked in a native call
+                        # would starve the receiving rank.
+                        self._drain_relay_sends_before_forward(microbatch_id)
 
                     self._add_inflight_ids(scheduled_batch)
 
@@ -3399,6 +3399,34 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _drain_relay_sends_before_forward(self, microbatch_id: int) -> None:
+        """Wait on the inline relay isends whose matching recv is posted this
+        iteration, so a forward blocked in a native call cannot starve it.
+
+        Ranks other than the last relay each sample state in the iteration
+        they receive it, so every isend they still hold was matched last
+        iteration and the full sweep only clears finished handles.
+
+        The last rank originates the ring, and the first rank posts the
+        matching recv only ``pp_size - 2`` iterations later, when its
+        executed-microbatch cursor reaches that slot. Waiting on such a slot
+        earlier blocks this rank on a recv the peer issues after its next
+        top-of-loop collectives (the disagg transfer consensus, for one),
+        which cannot complete without this rank: with pp >= 4 and a
+        rendezvous-size sample state that is a deadlock. Wait only on the slot
+        the first rank relays this iteration; later slots are drained on the
+        iteration their recv is due, ahead of that iteration's forward.
+        """
+        if not self.dist.is_last_pp_rank:
+            for mb in range(self.num_micro_batches):
+                self.wait_on_pp_send_handles(self.send_handles, mb)
+            return
+        # Same offset the non-last ranks apply to pick their executed
+        # microbatch in stage 2 of this iteration.
+        due_microbatch_id = (microbatch_id + 1 -
+                             self.dist.pp_size) % self.num_micro_batches
+        self.wait_on_pp_send_handles(self.send_handles, due_microbatch_id)
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:

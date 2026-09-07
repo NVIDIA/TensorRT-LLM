@@ -28,6 +28,7 @@ import torch
 import transformers
 
 from tensorrt_llm import LLM
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
@@ -1412,6 +1413,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.metrics_collector = None
         server._collect_perf_metrics = False
         server._input_proc_executor = None
+        server._adjusted_steady_clock = AdjustedSteadyClock()
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],
