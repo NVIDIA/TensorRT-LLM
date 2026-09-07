@@ -116,8 +116,8 @@ NVIDIA GPUs.
 These improvements will be published in the `main` branch soon, and will be
 included in the v0.7 & v0.8 releases.
 
-Similar examples running Llama-70B in TensorRT LLM are published in
-[examples/models/core/llama](/examples/models/core/llama).
+Similar examples running Llama-70B in TensorRT LLM are published in the
+[Llama 3.3 70B deployment guide](../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.md).
 
 For more information about H200, please see the [H200 announcement blog](./H200launch.md).
 
