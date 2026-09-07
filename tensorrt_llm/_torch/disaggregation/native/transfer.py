@@ -648,9 +648,7 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        # Owned by the listener thread only: _respond_with_kv / _send_failed_result_to_receiver.
-        # Every other thread (workers, app threads) must use _get_or_connect_thread_dealer.
-        self._dealers = {}
+        self._dealers = {}  # used by listener thread only (single-threaded path)
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
@@ -1858,11 +1856,7 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                # Called from app threads and the listener thread: use the per-thread dealer, never
-                # the listener-owned self._dealers. Every caller is a long-lived thread (executor loop
-                # via TxSession.__init__/cancel_request, or the Sender listener), so the per-thread
-                # DEALER cache is not created and abandoned by short-lived threads.
-                self._get_or_connect_thread_dealer(peer_ri.self_endpoint).send(
+                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
                     [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
                 )
             except Exception as e:
