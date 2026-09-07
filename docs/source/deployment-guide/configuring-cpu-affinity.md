@@ -31,20 +31,15 @@ environment variable as follows:
 The mask is applied to each TID from a single `/proc/self/task` enumeration,
 not to the main thread alone, so threads created earlier (for example by MPI
 or communication libraries) are covered too. This is best effort: threads
-created concurrently may not be observed, and threads created later normally
-inherit their creator's mask.
+created concurrently may be missed, and later threads inherit their creator's
+mask.
 
-Where the worker does not get a process of its own, the sweep spans the
-hosting process, so observed non-worker TIDs may also be rebound -- an HTTP
-server's event loop, a request coordinator, or the application's own threads.
-That applies to a single-process TP1 worker on the classic IPC executor
-(`gather_generation_logits=True` or `TLLM_WORKER_USE_SINGLE_PROCESS=1`, but
-not the Ray or RPC orchestrators), rank 0 of an externally supplied
-`MpiCommSession`, rank 0 of an external-launch VisualGen deployment, and the
-MGMN leader started by `trtllm-llmapi-launch`. The original mask is not
-restored at shutdown; to opt out, set `TLLM_NUMA_AWARE_WORKER_AFFINITY=0` in
-the launch environment, before `LLM`/`VisualGen`, an `MpiSession` or MPI ranks
-start.
+Where the worker shares a process with caller code, non-worker threads in that
+process are rebound too, and the mask is not restored at shutdown. This covers
+a single-process TP1 worker on the classic IPC executor (not the Ray or RPC
+orchestrators), rank 0 of an external `MpiCommSession` or VisualGen launch,
+and the MGMN leader from `trtllm-llmapi-launch`. To opt out, set
+`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` in the launch environment.
 
 ## Other environmental considerations
 

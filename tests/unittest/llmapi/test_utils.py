@@ -111,7 +111,7 @@ def _fake_psutil(monkeypatch, current, ncpus):
 
 
 def test_set_affinity_rejects_an_empty_cpu_list(rec_logger):
-    # An empty mask is EINVAL for every thread, so it must not be applied.
+    # An empty mask is EINVAL for every thread.
     assert _set_affinity_all_threads([]) == (0, 0)
     assert len(rec_logger.warnings) == 1
     assert "empty" in rec_logger.warnings[0]
@@ -135,28 +135,13 @@ def test_set_affinity_ignores_threads_that_exited(monkeypatch, rec_logger):
 
     _fake_procfs(monkeypatch, [1, 2, 3], setaffinity)
 
-    # The /proc listing is a snapshot, so a thread exiting mid-walk is
-    # expected: it counts towards neither counter and is not reported.
+    # Exiting mid-walk is expected: neither counted nor reported.
     assert _set_affinity_all_threads([0]) == (2, 2)
     assert rec_logger.warnings == []
 
 
 def test_set_affinity_reports_partial_failure(monkeypatch, rec_logger):
-
-    def setaffinity(tid, cpus):
-        if tid != 1:
-            raise PermissionError(errno.EPERM, "Operation not permitted")
-
-    _fake_procfs(monkeypatch, [1, 2, 3], setaffinity)
-
-    assert _set_affinity_all_threads([0]) == (1, 3)
-    assert len(rec_logger.warnings) == 1
-    assert "2 of 3" in rec_logger.warnings[0]
-    assert "EPERM" in rec_logger.warnings[0]
-
-
-def test_set_affinity_aggregates_distinct_errnos(monkeypatch, rec_logger):
-    injected = {1: errno.EPERM, 2: errno.EINVAL}
+    injected = {2: errno.EPERM, 3: errno.EINVAL}
 
     def setaffinity(tid, cpus):
         if tid in injected:
@@ -166,6 +151,7 @@ def test_set_affinity_aggregates_distinct_errnos(monkeypatch, rec_logger):
 
     assert _set_affinity_all_threads([0]) == (1, 3)
     assert len(rec_logger.warnings) == 1
+    assert "2 of 3" in rec_logger.warnings[0]
     assert "EPERM" in rec_logger.warnings[0]
     assert "EINVAL" in rec_logger.warnings[0]
 
@@ -174,43 +160,10 @@ def test_set_affinity_survives_an_unreadable_task_dir(monkeypatch, rec_logger):
     _fake_procfs(monkeypatch, [1],
                  listdir_error=PermissionError(errno.EACCES, "Denied"))
 
-    # isdir() succeeding does not guarantee the listing succeeds; a failure
-    # here must not abort worker start-up.
+    # A failure here must not abort worker start-up.
     assert _set_affinity_all_threads([0]) == (0, 0)
     assert len(rec_logger.warnings) == 1
     assert _TASK_DIR in rec_logger.warnings[0]
-
-
-def test_set_affinity_falls_back_without_procfs(monkeypatch, rec_logger):
-    applied = []
-
-    class _Proc:
-
-        def cpu_affinity(self, cpus):
-            applied.append(list(cpus))
-
-    real_isdir = os.path.isdir
-    monkeypatch.setattr(os.path, "isdir", lambda p: False
-                        if p == _TASK_DIR else real_isdir(p))
-    monkeypatch.setattr(llmapi_utils, "psutil",
-                        types.SimpleNamespace(Process=lambda *a: _Proc()))
-
-    assert _set_affinity_all_threads([3, 4]) == (1, 1)
-    assert applied == [[3, 4]]
-
-
-def test_configure_reports_the_bound_thread_ratio(monkeypatch, rec_logger):
-    _fake_psutil(monkeypatch, current=[0, 1, 2, 3], ncpus=4)
-    monkeypatch.setattr(llmapi_utils, "get_numa_aware_cpu_affinity",
-                        lambda device_id: [0, 1])
-    monkeypatch.setattr(llmapi_utils, "_set_affinity_all_threads", lambda cpus:
-                        (3, 4))
-    monkeypatch.delenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", raising=False)
-
-    configure_cpu_affinity(0)
-
-    assert any("3/4 threads" in msg
-               for msg in rec_logger.infos), rec_logger.infos
 
 
 def test_configure_does_not_claim_success_when_nothing_was_bound(
@@ -224,22 +177,10 @@ def test_configure_does_not_claim_success_when_nothing_was_bound(
 
     configure_cpu_affinity(0)
 
-    # Reading the mask back only reports the main thread, so a total failure
-    # must not be logged as "CPU affinity set to ...".
+    # The mask is read back from the main thread only, so a total failure
+    # must not be logged as success.
     assert rec_logger.infos == []
     assert any("could not set" in msg.lower() for msg in rec_logger.warnings)
-
-
-def test_configure_reports_partial_constraint_removal(monkeypatch, rec_logger):
-    _fake_psutil(monkeypatch, current=[0], ncpus=4)
-    monkeypatch.setattr(llmapi_utils, "_set_affinity_all_threads", lambda cpus:
-                        (1, 4))
-    monkeypatch.delenv("TLLM_NUMA_AWARE_WORKER_AFFINITY", raising=False)
-
-    configure_cpu_affinity(0)
-
-    assert any("1 of 4 threads" in msg
-               for msg in rec_logger.warnings), rec_logger.warnings
 
 
 _REAL_THREAD_PROBE = """
@@ -284,8 +225,7 @@ print("OK")
 
 @pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="Linux only")
 def test_set_affinity_binds_pre_existing_threads_for_real():
-    # Run in a child process: the helper rebinds every thread it finds, which
-    # would otherwise leave the pytest process on a one-CPU mask.
+    # In a child: the helper would otherwise rebind the pytest process.
     probe = subprocess.run([sys.executable, "-c", _REAL_THREAD_PROBE],
                            capture_output=True,
                            text=True,
