@@ -2,7 +2,16 @@
 
 # Adding a Model
 
-This document describes how to add a typical decoder-only model in TensorRT LLM.
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
+> [!WARNING]
+> This page describes the **legacy** TensorRT engine-build workflow for adding a model.
+> For new projects, follow the PyTorch backend guide: [Adding a New Model](../../torch/adding_new_model.md)
+> (also published as [models/adding-new-model](../../models/adding-new-model.md)).
+
+This document describes how to add a typical decoder-only model in the **legacy** TensorRT LLM engine workflow.
 
 ## Step 1. Write Modeling Part
 
@@ -67,7 +76,7 @@ class MyModelForCausalLM(DecoderModelForCausalLM):
         # load the weights to MyModelForCausalLM object
 ```
 
-It's optional to develop a `convert_checkpoint.py` script in the `examples/my_model/` directory for the convenience of offline weights conversion.
+Historically, an optional `convert_checkpoint.py` script lived under `examples/my_model/` for offline weights conversion. That script and the `trtllm-build` CLI were removed with the TensorRT backend; do not add new convert/build scripts.
 
 ## Step 3. Register New Model
 
@@ -75,21 +84,10 @@ Please register the new model class `MyModelForCausalLM` in `tensorrt_llm/models
 
 ## Step 4. Verify New Model
 
-At last, let's verify the new model. The typical commands are as following:
+The legacy verification flow depended on per-model `convert_checkpoint.py`, the removed `trtllm-build` CLI, and deleted helpers `examples/run.py` / `examples/summarize.py`. Those entry points no longer exist.
 
-```bash
-cd examples/my_model/
-
-python convert_checkpoint.py --model_dir hf_model_dir --output_dir tllm_ckpt_dir
-
-trtllm-build --checkpoint_dir tllm_ckpt_dir --output_dir tllm_engine_dir
-
-# try the model with a single prompt
-python ../run.py --engine_dir tllm_engine_dir --tokenizer_dir hf_model_dir --input_text "Born in north-east France, Soyer trained as a"
-# run summarization task
-python ../summarize.py --engine_dir tllm_engine_dir --hf_model_dir hf_model_dir --test_trt_llm
-```
+For current end-to-end verification on the PyTorch backend, follow [Adding a New Model](../../torch/adding_new_model.md) and use `trtllm-serve` or the LLM API instead of building a TensorRT engine.
 
 ## Reference
 
-It's recommended to read the [workflow](./workflow.md) and [checkpoint](./checkpoint.md) documents for more details.
+This page is retained next to the legacy [workflow](./workflow.md) and [checkpoint](./checkpoint.md) documents. For the supported path to add a model, see [torch/adding_new_model.md](../../torch/adding_new_model.md).
