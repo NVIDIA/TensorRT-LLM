@@ -951,19 +951,25 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
 
     Appended only when ``task.yaml`` declares ``profile.kernel_coverage``.
     It supersedes Run B's top-kernel target selection with coverage-driven
-    enumeration, poses the two per-kernel questions (faster? fusible?),
-    and defines ``kernel_ledger.yaml`` — the machine-readable proof,
-    validated by the orchestrator each round, that every enumerated
-    kernel's optimization and fusion possibility was considered.
+    enumeration, poses the three per-kernel questions (faster? fusible?
+    overlappable?), fixes the unit every materiality claim is made in
+    (wall clock, not GPU time), and defines ``kernel_ledger.yaml`` — the
+    machine-readable proof, validated by the orchestrator each round,
+    that every enumerated kernel's optimization, fusion, and overlap
+    possibility was considered.
     """
     return f"""\
 ## Per-kernel coverage contract (this task declares `profile.kernel_coverage`)
 
 This campaign carries an exhaustiveness guarantee: **every kernel
 at/above the coverage bar gets an ncu SOL deep dive and an explicit
-answer to two questions — (1) can this kernel be made faster? (2) can it
-be fused with its neighbors? — each answer a roadmap item or an
-evidence-backed dismissal.** You record the answers in
+answer to three questions — (1) can this kernel be made faster? (2) can
+it be fused with its neighbors? (3) can it be overlapped with
+independent work on another stream? — each answer a roadmap item or an
+evidence-backed dismissal.** The three are not redundant: the first two
+both presuppose the kernel must run *alone*, so a kernel legitimately
+closed on both can still be this round's largest opportunity. You record
+the answers in
 `kernel_ledger.yaml` (contract below) in this round's `analysis/`
 directory, every round **that profiles**. The orchestrator
 schema-validates the ledger the moment your turn ends — a missing row,
@@ -996,7 +1002,10 @@ superseded — this task pays for breadth:
   while the decomposition is a union clipped to the iteration window,
   and the two rank kernels differently. Where the pipeline could not
   run, `kern_sum` is the honest fallback — say so in the ledger's
-  `source`.
+  `source`. Record the window's **GPU busy share** in
+  `coverage.gpu_busy_pct` from the same trace (busy vs idle over the
+  captured iterations) — every materiality claim below is denominated in
+  it.
 - **Group where the disposition is genuinely shared**: closely related
   kernels (e.g. a family of small elementwise/cast variants between the
   same producers and consumers) may share one row, with the members
@@ -1017,8 +1026,36 @@ superseded — this task pays for breadth:
   own server relaunch, gated to the same iteration window.
 - **Degrade honestly, never fabricate**: a kernel no pass captured (or
   ncu itself unavailable) keeps its ledger row with
-  `ncu: "unavailable: <reason>"` — both questions are still owed,
+  `ncu: "unavailable: <reason>"` — all three questions are still owed,
   answered from the nsys timeline and the source.
+
+### The materiality unit — wall clock, not GPU time
+
+`share_pct` is a share of **profiled GPU time**. Every gate downstream —
+`optimize.noise_floor_pct`, an item's `expected_gain_pct`, the
+evaluator's measured gain on the target metric — is a share of **wall
+clock**. The two are equal only when the GPU is busy 100% of the window.
+Convert before every materiality claim, using the busy share you
+recorded in `coverage.gpu_busy_pct`:
+
+```
+wall_clock_share   = share_pct x gpu_busy_pct / 100
+best_case_gain_pct = wall_clock_share x recovery_fraction
+```
+
+An 8% kernel in a window that is 60% GPU-busy is worth at most 4.8% of
+wall clock; a fix recovering half of it is 2.4%. That is the number a
+`below-materiality` dismissal compares against `optimize.noise_floor_pct`
+and the number an item's `expected_gain_pct` may claim. Doing the
+arithmetic in GPU-time units overstates every candidate by `1 / busy` and
+buys the campaign items that cannot move the target metric even when they
+work exactly as designed — each one costing a full evaluator benchmark to
+disprove.
+
+A low `gpu_busy_pct` is itself a finding: the gap between the two units
+*is* the host-overhead opportunity. Say so in your findings and put it on
+the roadmap as its own item (the taxonomy's launch/host category) rather
+than spreading it thin across every kernel row.
 
 ### Question 1 per kernel — can it be made faster?
 
@@ -1034,7 +1071,10 @@ codebase:
   provider GEMMs); lower-precision math only where the task's accuracy
   scope allows.
 - **latency-bound** → most often a CUDA-graph / launch-amortization
-  roadmap item rather than a kernel edit.
+  roadmap item rather than a kernel edit. Note that graphs only collapse
+  the gaps *between* launches; a kernel that is latency-bound *inside* a
+  step (already replayed from a graph, still not filling the device) is
+  answered by question 3, not here.
 - Whatever the class, run the *Prefer existing kernels* search first —
   the faster variant usually already ships somewhere in the checkout or
   its providers.
@@ -1044,8 +1084,11 @@ dismissals — lead the `ref` with the matching tag when one fits:
 
 - `at-sol-floor: <side> SOL <n>%` — the binding side already runs at
   ~≥85% of its ceiling; nothing material left in this kernel alone.
-- `below-materiality: <share>% × best-case recovery < noise floor` —
-  show the arithmetic against `optimize.noise_floor_pct`.
+- `below-materiality: <wall-clock share>% × best-case recovery < noise
+  floor` — show the arithmetic **in wall-clock units** (convert per *The
+  materiality unit* above) against `optimize.noise_floor_pct`. A
+  dismissal quoting a raw `share_pct` is not evidence, it is the wrong
+  unit.
 - `needs-rebuild: <artifact>` — the lever lives in compiled artifacts
   this campaign cannot rebuild (cite how you verified). Being unable to
   rebuild the incumbent does **not** by itself close the kernel: the
@@ -1085,7 +1128,9 @@ Then test the candidate patterns:
 
 Judge materiality on the **whole chain**, not the single kernel: a
 0.6% kernel between two 0.5% neighbors in one fusible chain is a ~1.6%
-opportunity. The recurring legitimate dismissals:
+opportunity **of GPU time** — 1.3% of wall clock at `gpu_busy_pct: 80`,
+and that converted number is what the noise floor judges. The recurring
+legitimate dismissals:
 
 - `multi-consumer-pinned` — the intermediate feeds >1 consumer, so
   fusion cannot remove the round trip (cite the consumers from the
@@ -1097,12 +1142,96 @@ opportunity. The recurring legitimate dismissals:
 - `neighbors-at-bandwidth-floor` — every byte both sides move is
   mandatory model/KV traffic; fusing saves no traffic (show the bytes).
 - `below-materiality` — the whole chain's share × best-case saving is
-  under the noise floor (show the arithmetic).
+  under the noise floor (show the arithmetic, converted to wall clock).
 - `needs-rebuild` — same bar as question 1's tag: "absorbing the
   neighbor means editing a compiled kernel" dismisses the fusion only
   when a *newly written* fused kernel replacing the incumbent plus its
   glue is also ruled out (no reroutable call site, or no credible
   headroom over the tuned incumbent — with evidence).
+
+### Question 3 per kernel — can it be overlapped with independent work?
+
+Questions 1 and 2 both presuppose the kernel must run **alone**; this one
+asks whether it has to. A kernel dismissed `at-sol-floor` on one resource
+is by definition *not* saturating the others — a memory-bound kernel at
+89% mem SOL / 11% SM SOL leaves nearly all the math units idle for its
+whole duration — and running it concurrently with independent work
+recovers up to the shorter of the two, i.e. the **whole** kernel rather
+than a fraction of it. That is why a row can be legitimately `dismissed`
+on both earlier questions and still be this round's largest item.
+
+**Spot the candidates from metrics you already have** in the row's `ncu`
+block:
+
+- **low on both SOL sides** (`bound: latency`, low `occupancy_pct`) — the
+  kernel occupies the GPU without using it.
+- **lopsided SOL** (high one side, low the other) — pair it with a kernel
+  lopsided the other way.
+- **small grid / partial wave** — too few CTAs to fill the device; the
+  spare SMs are free real estate.
+
+**The partner must be data-independent, and proving that is the hard
+part.** Derive the pair from the same traces question 2 uses: the launch
+sequence (`cuda_gpu_trace`) says what runs before/after it and on which
+stream, and the NVTX ranges around them, read against the source, say
+whether the two touch the same data. The pair qualifies only when neither reads what
+the other writes — disjoint output slices, disjoint step state. Record
+the partner **and the evidence the two are serialized today** in the
+row's `overlap.concurrent_with`.
+
+**Overlap only pays when the machine is idle.** Two kernels each at 80%
+mem SOL do not overlap into anything: they serialize on HBM no matter
+which stream issued them. Before writing an item, add up the pair's
+demand on the *binding* resource and show the sum stays under ~100%. The
+ceiling on the gain is `min(wall_clock_share_A, wall_clock_share_B)` —
+converted per *The materiality unit* — and less whenever that sum
+exceeds 100%.
+
+**Apply via the shipped idiom** — the *Prefer existing kernels* rule's
+analogue for scheduling. The PyTorch backend already carries
+`maybe_execute_in_parallel(fn0, fn1, event0, event1, aux_stream)`
+(`tensorrt_llm/_torch/modules/multi_stream_utils.py`), with per-purpose
+aux streams enumerated in `AuxStreamType` (`tensorrt_llm/_torch/utils.py`)
+and allocated in each model's `__init__`. The casebook's
+runtime-execution family carries the precedents under *Overlap, launch &
+scheduling knobs* — the multi-stream shared/routed-expert and MLA
+RoPE/uk-BGEMM rows — so a real overlap item can name a `casebook_ref`.
+An item's `how_to_apply` names the call site to wrap and the aux-stream
+slot to use — never a hand-rolled stream/event pair alongside the
+existing one.
+
+**The CUDA-graph gate is a hard precondition.** Multi-stream
+self-activates only under graph capture (the runner wraps capture in
+`with_multi_stream(True)`, and `maybe_execute_in_parallel` falls back to
+sequential `fn0(); fn1()` whenever it is off) because stream switching
+costs host overhead that only graph replay hides. Check the **live tuning
+config** before planning any overlap item; with CUDA graphs off, every
+row's honest answer is `graph-disabled` and the item to write instead is
+enabling graphs.
+
+The recurring legitimate dismissals:
+
+- `graph-disabled` — CUDA graphs are off in the live tuning config, so
+  the multi-stream path no-ops (cite the config).
+- `no-independent-partner` — every candidate within reach reads what this
+  kernel writes or writes what it reads (cite the tensors).
+- `resource-saturated` — the kernel and every candidate partner contend
+  for the same binding resource; concurrency cannot beat a shared ceiling
+  (show the summed SOL).
+- `already-concurrent` — the timeline already shows it running on a
+  non-default stream alongside other work (cite the stream ids and the
+  overlapped span).
+- `below-materiality` — `min()` of the pair's wall-clock shares is under
+  the noise floor (show the arithmetic).
+- `phase-boundary` — the only independent work sits across a graph
+  capture, stream, or prefill/decode boundary the pairing cannot cross.
+
+**Never book the same saving twice.** Questions 2 and 3 compete for one
+adjacency: a pair can be fused *or* overlapped, and either way the saving
+is the same time. When a row answers `item` on both, say in the second
+item's `expected_gain_rationale` that it is an alternative realization of
+the first, and do not sum their expected gains — the roadmap's ordering
+is only as good as those numbers being independent.
 
 ### The kernel ledger contract (`kernel_ledger.yaml`)
 
@@ -1110,12 +1239,14 @@ Write one ledger per round into this round's `analysis/` directory. Its
 exact shape:
 
 ```yaml
-version: 1
+version: 2
 source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
   other_share_pct: 3.2          # the explicit below-bar tail (they must total ~100)
   min_share_pct: {min_share_pct}
+  gpu_busy_pct: 82.4            # GPU busy share of the profiled window; share_pct
+                                # x this = share of WALL CLOCK (see the unit above)
 kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
@@ -1134,6 +1265,12 @@ kernels:                        # descending share_pct; one row per kernel/group
       disposition: dismissed
       neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)"
       ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (cuda_gpu_trace)"
+    overlap:
+      disposition: item                 # the partner work, and the evidence the
+      concurrent_with: "moe_gemm: data-independent (disjoint outputs, per the NVTX
+        ranges + source); serialized back-to-back on stream 7 today
+        (cuda_gpu_trace, step 120)"
+      ref: opt-004
   - kernel: allreduce_fusion            # a collective: never goes under ncu at all
     full_name: "void tensorrt_llm::kernels::ar_fusion::..."
     share_pct: 9.2
@@ -1146,13 +1283,19 @@ kernels:                        # descending share_pct; one row per kernel/group
       disposition: dismissed
       neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
       ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
+    overlap:
+      disposition: dismissed
+      concurrent_with: "nothing independent in reach: every rank blocks here before
+        the next layer (cuda_gpu_trace, step 120)"
+      ref: "no-independent-partner: the collective is the layer's barrier"
 ```
 
 Rules:
 
-- **Both questions, every row.** `disposition: item` refs a roadmap item
+- **All three questions, every row.** `disposition: item` refs a roadmap item
   id — one existing already, or one you author this round; several rows
-  may share one item (a fusion item covers every kernel it merges), and
+  may share one item (a fusion item covers every kernel it merges; an
+  overlap item covers both kernels of the pair, cited from each), and
   the referenced item may already be `accepted`/`failed` (the
   possibility *was* considered — that is the point). `disposition:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
@@ -1167,8 +1310,9 @@ Rules:
   throwing away the numbers you did measure. `bound` is the one field
   always owed, and the schema enforces it in both shapes: inside `ncu`
   when `ncu` is a metrics mapping, on the row when `ncu` is the degrade
-  string. `neighbors` is the evidence a fusion *dismissal* rests on — a
-  fusion `item` carries its adjacency in the roadmap entry `ref` names.
+  string. `neighbors` and `concurrent_with` are the evidence a fusion or
+  overlap *dismissal* rests on — a promoted `item` carries its adjacency
+  or its partner in the roadmap entry `ref` names.
 - **An unactionable item is not an answer.** Do not park a kernel on an
   item whose `expected_gain_pct` sits below `optimize.noise_floor_pct`
   (the orchestrator never dispatches it) — that is a
@@ -1178,14 +1322,19 @@ Rules:
   ~20% relative, same bound class, no accepted item touched it) — cite
   the original round's evidence plus `carried from round <k>`;
   re-derive every row an accepted item changed, and give fresh rows to
-  kernels that newly crossed the bar.
+  kernels that newly crossed the bar. A `fusion` or `overlap` dismissal
+  additionally depends on the **other side** of the pair: re-derive it
+  when the neighbor or partner changed, even if this kernel did not, and
+  re-derive every row's materiality arithmetic when `gpu_busy_pct` moved
+  (an accepted host-side item changes what every kernel is worth).
 - **Mirror it for humans**: add a `## Kernel disposition ledger` section
-  to `profile_findings.md` — the same rows as a table (kernel, share,
-  bound, faster →, fusion →) with a one-line rationale each, marking
-  every row whose `bound` did *not* come from an ncu capture (the
-  degrade string, or a null metric's `note`) so the table cannot be read
-  as more measured than it is. The YAML file is authoritative; the
-  findings section carries the prose.
+  to `profile_findings.md` — the same rows as a table (kernel, share %
+  of GPU time, share % of wall clock, bound, faster →, fusion →,
+  overlap →) with a one-line rationale each, headed by the window's
+  `gpu_busy_pct`, and marking every row whose `bound` did *not* come
+  from an ncu capture (the degrade string, or a null metric's `note`) so
+  the table cannot be read as more measured than it is. The YAML file is
+  authoritative; the findings section carries the prose.
 """
 
 
@@ -1194,9 +1343,10 @@ KERNEL_COVERAGE_REPORTER_GUIDANCE = """\
 
 Every analyzer round wrote a `kernel_ledger.yaml` into its `analysis/`
 directory — one row per kernel at/above the task's share bar, each
-answering *faster?* and *fusible?* with a roadmap item or an
-evidence-backed dismissal. `Read` the **final round's** ledger (your
-instructions name it) and add one section to `optimization_report.md`,
+answering *faster?*, *fusible?* and *overlappable?* with a roadmap item
+or an evidence-backed dismissal. `Read` the **final round's** ledger
+(your instructions name it) and add one section to
+`optimization_report.md`,
 placed **between "Kernel-Level Comparison" and "Failed Attempts"** (the
 HTML companion mirrors it like every other section):
 
@@ -1204,17 +1354,23 @@ HTML companion mirrors it like every other section):
 ## Kernel Coverage
 
 <Open with the coverage headline: N kernels/groups enumerated covering
-X% of profiled GPU time (the explicit `other` tail Y%), from round <n>'s
-ledger. Then the accountability table, one row per ledger kernel in
-descending share:
-| kernel | share % | bound | faster → | fusion → |
+X% of profiled GPU time (the explicit `other` tail Y%) in a window that
+was Z% GPU-busy (`coverage.gpu_busy_pct` — state it, since it is what
+converts every share below into wall clock), from round <n>'s ledger.
+Then the accountability table, one row per ledger kernel in descending
+share:
+| kernel | share % | bound | faster → | fusion → | overlap → |
 where each `→` cell resolves the ledger disposition to its campaign
 outcome: an item ref becomes `<item-id>: accepted +X%` / `failed
 (<reason_category>)` / `pending at campaign end` (from roadmap.yaml);
 a dismissal shows its leading tag (`at-sol-floor`, `below-materiality`,
-`multi-consumer-pinned`, ...) — keep the full evidence one click away in
-the ledger rather than inflating the table. Close with the coverage
-accountability sentence: every enumerated kernel had both questions
+`multi-consumer-pinned`, `graph-disabled`, `no-independent-partner`,
+...) — keep the full evidence one click away in the ledger rather than
+inflating the table. One item id may legitimately appear in two cells of
+one row (an alternative realization) or in the same cell of two rows (a
+fusion/overlap item covering the pair) — resolve it to the same outcome
+in each and never count its gain twice. Close with the coverage
+accountability sentence: every enumerated kernel had all three questions
 answered; itemize the rows whose item was still `pending` when the
 budget ran out — the untried tail a follow-up campaign starts from —
 and mirror those into Remaining Roadmap / Durable facts (`[alive]`).>

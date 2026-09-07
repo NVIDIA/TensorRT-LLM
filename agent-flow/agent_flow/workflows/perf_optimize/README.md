@@ -549,25 +549,45 @@ running the CLI.
   coverage target is reached, captured over up to 3 bounded ncu passes
   that re-filter on still-missing stems so once-per-step kernels are
   not starved by per-layer hot ones). Each round the analyzer must then
-  answer two questions per enumerated kernel — *can it be made faster?*
-  *can it be fused with its neighbors?* — in
+  answer three questions per enumerated kernel — *can it be made
+  faster?* *can it be fused with its neighbors?* *can it be overlapped
+  with independent work on another stream?* — in
   `rounds/round_<n>/analysis/kernel_ledger.yaml`: every row carries the
-  kernel's ncu SOL metrics/bound class plus a `faster` and a `fusion`
-  disposition, each either a roadmap item id or an evidence-backed
-  dismissal (`at-sol-floor`, `below-materiality` with arithmetic,
-  `multi-consumer-pinned`, `already-fused`, `phase-boundary`,
-  `needs-rebuild`, ...); `needs-rebuild` is valid only when a
-  written-from-scratch replacement kernel routed from the Python call
-  site is also ruled out, not merely because the incumbent ships
-  compiled; fusion rows record the observed neighbors from the trace. The orchestrator schema-validates the ledger after every
-  analyzer turn (both dispositions per row, `item` refs resolving to
-  real roadmap ids, coverage ≥ target) and **aborts the stage on an
-  incomplete ledger**, so the campaign cannot conclude while a hot
-  kernel's optimization or fusion possibility was never considered; the
-  reporter's *Kernel Coverage* section resolves the final ledger's
-  dispositions to campaign outcomes and itemizes the untried tail.
-  Requires `nsys` + `ncu` in `profile.methods`; costs extra profiling
-  wall-clock per round.
+  kernel's ncu SOL metrics/bound class plus a `faster`, a `fusion` and
+  an `overlap` disposition, each either a roadmap item id or an
+  evidence-backed dismissal (`at-sol-floor`, `below-materiality` with
+  arithmetic, `multi-consumer-pinned`, `already-fused`,
+  `phase-boundary`, `needs-rebuild`, `graph-disabled`,
+  `no-independent-partner`, `resource-saturated`, ...);
+  `needs-rebuild` is valid only when a written-from-scratch replacement
+  kernel routed from the Python call site is also ruled out, not merely
+  because the incumbent ships compiled; fusion rows record the observed
+  neighbors from the trace and overlap rows the candidate partner plus
+  the evidence the two are serialized today.
+
+  The third question exists because the first two both presuppose the
+  kernel must run *alone*: a kernel at its bound-class ceiling
+  (`at-sol-floor`) whose neighbors move only mandatory bytes
+  (`neighbors-at-bandwidth-floor`) is legitimately closed on both and
+  can still give back most of its share by running concurrently with
+  independent work — realized through the checkout's own
+  `maybe_execute_in_parallel` / `AuxStreamType` idiom, and gated on
+  CUDA graphs being enabled (multi-stream no-ops without them). The
+  ledger also carries `coverage.gpu_busy_pct`, the busy share of the
+  profiled window: `share_pct` is a share of *GPU time* while
+  `noise_floor_pct` and `expected_gain_pct` are shares of *wall clock*,
+  so every materiality claim converts through it rather than
+  overstating candidates by `1/busy` on a host-bound deployment.
+
+  The orchestrator schema-validates the ledger after every analyzer
+  turn (all three dispositions per row, `item` refs resolving to real
+  roadmap ids, coverage ≥ target, `gpu_busy_pct` present) and **aborts
+  the stage on an incomplete ledger**, so the campaign cannot conclude
+  while a hot kernel's optimization, fusion, or overlap possibility was
+  never considered; the reporter's *Kernel Coverage* section resolves
+  the final ledger's dispositions to campaign outcomes and itemizes the
+  untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
+  extra profiling wall-clock per round.
 - **Optimization casebook.** The benchmarker/analyzer load the
   `trtllm-agent-toolkit:perf-optimization-casebook` skill as read-only
   reference; the optimizer uses it *actionably* (how-to-apply /

@@ -1693,8 +1693,10 @@ class PerfOptimizeWorkflow:
             raise RuntimeError(
                 f"analyzer stage finished but {kernel_ledger.LEDGER_FILENAME} failed "
                 f"validation:\n{exc}\nEvery kernel above the coverage bar must "
-                f"carry both dispositions (faster / fusion). Re-run the workflow "
-                f"to retry the analyzer stage, or pass --clean to start over."
+                f"carry all three dispositions "
+                f"({' / '.join(kernel_ledger.QUESTIONS)}), and the coverage block "
+                f"its `gpu_busy_pct`. Re-run the workflow to retry the analyzer "
+                f"stage, or pass --clean to start over."
             ) from exc
         if problems:
             bullet = "\n  - "
@@ -2351,14 +2353,18 @@ class PerfOptimizeWorkflow:
                 f"{coverage['coverage_target_pct']}% is covered; group "
                 f"honestly-shared rows), capture them over bounded ncu "
                 f"passes (re-filtering each pass on the still-missing "
-                f"stems), and answer both questions per kernel — faster? "
-                f"fusible? — each with a roadmap item or an evidence-backed "
-                f"dismissal. `Write` the ledger to `{ledger_path}` per the "
-                f"contract; the orchestrator validates it (both dispositions "
-                f"per row, item refs resolving into `{self.roadmap_path}`, "
-                f"coverage ≥ target) and an incomplete ledger aborts the "
-                f"stage. Mirror the rows as the `## Kernel disposition "
-                f"ledger` section of your findings"
+                f"stems), record the window's GPU busy share in "
+                f"`coverage.gpu_busy_pct` (it converts every share of GPU "
+                f"time into the share of wall clock the noise floor judges), "
+                f"and answer all three questions per kernel — faster? "
+                f"fusible? overlappable? — each with a roadmap item or an "
+                f"evidence-backed dismissal. `Write` the ledger to "
+                f"`{ledger_path}` per the contract; the orchestrator "
+                f"validates it (all three dispositions per row, item refs "
+                f"resolving into `{self.roadmap_path}`, coverage ≥ target) "
+                f"and an incomplete ledger aborts the stage. Mirror the rows "
+                f"as the `## Kernel disposition ledger` section of your "
+                f"findings"
             )
             ncu_artifacts = "the per-pass `server_ncu_pass<k>.ncu-rep` reports + their summaries"
         else:
@@ -3056,9 +3062,9 @@ class PerfOptimizeWorkflow:
             coverage_read = (
                 f" {ledger_name} (the final round's per-kernel disposition "
                 f"ledger — the Kernel Coverage section per your system "
-                f"prompt: every kernel's faster/fusion disposition resolved "
-                f"to its campaign outcome, the still-pending refs itemized "
-                f"as the untried tail),"
+                f"prompt: every kernel's faster/fusion/overlap disposition "
+                f"resolved to its campaign outcome, the still-pending refs "
+                f"itemized as the untried tail),"
             )
             coverage_section = "Kernel Coverage / "
         reuse_read = ""

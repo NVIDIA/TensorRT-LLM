@@ -3327,12 +3327,13 @@ _KC_EXTRA = {"profile": {"kernel_coverage": {}}}
 def _ledger_yaml(faster_ref: str = "opt-001") -> str:
     return yaml.safe_dump(
         {
-            "version": 1,
+            "version": 2,
             "source": "rounds/round_1/analysis/nsys_stats.txt",
             "coverage": {
                 "enumerated_share_pct": 96.0,
                 "other_share_pct": 4.0,
                 "min_share_pct": 0.5,
+                "gpu_busy_pct": 82.4,
             },
             "kernels": [
                 {
@@ -3351,6 +3352,11 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                         "disposition": "dismissed",
                         "neighbors": "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace)",
                         "ref": "already-fused: neighbors are inside this kernel",
+                    },
+                    "overlap": {
+                        "disposition": "dismissed",
+                        "concurrent_with": "moe_gemm (cuda_gpu_trace, stream 7)",
+                        "ref": "graph-disabled: cuda_graph_config unset in the live tuning config",
                     },
                 }
             ],
@@ -3485,6 +3491,64 @@ def test_kernel_coverage_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
     assert state.stage == state_module.STAGE_ANALYZER
 
 
+def test_kernel_coverage_unanswered_overlap_blocks_advance(tmp_path, fake_git):
+    """A row that skips question 3 aborts the stage like any other gap.
+
+    The exhaustiveness guarantee is only worth the weakest question it
+    enforces — a ledger answering faster/fusion but silently dropping
+    overlap would let a campaign conclude with a kernel nobody asked
+    whether it had to run alone.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_two_question_ledger(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["kernels"][0]["overlap"]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_with_two_question_ledger
+    try:
+        with pytest.raises(RuntimeError, match="answers all three questions"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_kernel_coverage_missing_gpu_busy_blocks_advance(tmp_path, fake_git):
+    """Materiality is denominated in wall clock, so the busy share is owed."""
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_without_busy_share(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["coverage"]["gpu_busy_pct"]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_without_busy_share
+    try:
+        with pytest.raises(RuntimeError, match="gpu_busy_pct"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
 def test_kernel_coverage_below_target_blocks_advance(tmp_path, fake_git):
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
@@ -3531,7 +3595,10 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     assert "kernel_ledger.yaml" in analyzer
     assert "per-kernel coverage contract" in analyzer
     assert "0.5%" in analyzer and "95.0%" in analyzer
-    assert "faster? fusible?" in analyzer
+    assert "faster? fusible? overlappable?" in analyzer
+    # The busy share is asked for by name — it is what converts a share of
+    # GPU time into the share of wall clock the noise floor judges.
+    assert "coverage.gpu_busy_pct" in analyzer
     # The default bounded top-kernel wording is superseded, not repeated.
     assert "on the top nsys kernels: keep the canonical ncu flags" not in analyzer
     reporter = captured["reporter"]

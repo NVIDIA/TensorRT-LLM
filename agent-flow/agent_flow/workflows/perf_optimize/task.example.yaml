@@ -80,12 +80,18 @@ profile:
   # EVERY kernel at/above min_share_pct of GPU time (extending down the
   # kern_sum until coverage_target_pct is reached, over bounded capture
   # passes), and each profiling round writes a schema-validated
-  # kernel_ledger.yaml answering two questions per kernel — can it be
-  # made faster? can it be fused with its neighbors? — each with a
-  # roadmap item or an evidence-backed dismissal. The orchestrator
-  # aborts the round on an incomplete ledger (a replan-only round runs
-  # no ncu and is waived), so the campaign cannot end with a kernel
-  # whose optimization/fusion possibility was never considered. Costs
+  # kernel_ledger.yaml answering three questions per kernel — can it be
+  # made faster? can it be fused with its neighbors? can it be
+  # overlapped with independent work on another stream? — each with a
+  # roadmap item or an evidence-backed dismissal. The third exists
+  # because the first two both presuppose the kernel runs alone, so a
+  # kernel legitimately closed on both can still be a large win. The
+  # ledger also records the window's gpu_busy_pct, which converts every
+  # kernel's share of GPU time into the share of WALL CLOCK the noise
+  # floor actually judges. The orchestrator aborts the round on an
+  # incomplete ledger (a replan-only round runs no ncu and is waived),
+  # so the campaign cannot end with a kernel whose
+  # optimization/fusion/overlap possibility was never considered. Costs
   # extra profiling time per round that profiles; requires nsys+ncu in
   # methods.
   # kernel_coverage:

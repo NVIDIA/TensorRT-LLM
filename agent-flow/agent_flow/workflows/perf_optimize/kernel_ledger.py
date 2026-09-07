@@ -2,15 +2,23 @@
 
 The ledger is the machine-readable exhaustiveness proof behind
 ``profile.kernel_coverage``: one row per kernel (or grouped kernel
-family) at/above the task's share bar, each row answering the two
-per-kernel questions — *(1) can it be made faster?* and *(2) can it be
-fused with its neighbors?* — with either a roadmap item or an
+family) at/above the task's share bar, each row answering the three
+per-kernel questions — *(1) can it be made faster?*, *(2) can it be
+fused with its neighbors?* and *(3) can it be overlapped with
+independent work on another stream?* — with either a roadmap item or an
 evidence-backed dismissal. The analyzer writes one ledger per round into
 that round's ``analysis/`` directory; the orchestrator validates it the
 moment the turn ends (shape here, roadmap cross-references and the
 coverage target in :func:`cross_validate`), so a campaign can never
-conclude with a hot kernel whose optimization or fusion possibility was
-silently skipped.
+conclude with a hot kernel whose optimization, fusion, or overlap
+possibility was silently skipped.
+
+Question 3 exists because the first two both presuppose the kernel must
+run *alone*: a kernel already at its bound-class ceiling (``faster`` →
+``at-sol-floor``) whose neighbors move only mandatory bytes (``fusion``
+→ ``neighbors-at-bandwidth-floor``) is legitimately closed on both and
+can still give back most of its share by running concurrently with
+independent work.
 
 ``share_pct`` is read from the nsys **timeline decomposition** under
 ``analysis/nsys_analysis/``, not from ``nsys_stats.txt``: ``kern_sum``
@@ -23,12 +31,15 @@ could not run, ``kern_sum`` is the honest fallback — say so in
 
 Shape::
 
-    version: 1
+    version: 2
     source: rounds/round_1/analysis/nsys_analysis   # the decomposition enumerated
     coverage:
       enumerated_share_pct: 96.8    # sum of kernels[].share_pct
       other_share_pct: 3.2          # the explicit below-bar tail roll-up
       min_share_pct: 0.5            # the bar rows were enumerated down to
+      gpu_busy_pct: 82.4            # GPU busy share of the profiled window —
+                                    # share_pct x this = share of WALL CLOCK,
+                                    # the unit every materiality test uses
     kernels:
       - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
         full_name: "void tensorrt_llm::..." # representative full name(s)
@@ -47,6 +58,11 @@ Shape::
           disposition: dismissed
           neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace step 120)"
           ref: "multi-consumer-pinned: intermediate feeds residual + norm (cuda_gpu_trace)"
+        overlap:                            # question 3 — run concurrently with
+          disposition: item                 # independent work on an aux stream
+          concurrent_with: "moe_gemm (data-independent; serialized on stream 7,
+            cuda_gpu_trace step 120)"
+          ref: opt-004
       - kernel: allreduce_fusion            # a collective: never goes under ncu
         full_name: "void tensorrt_llm::kernels::ar_fusion::..."
         share_pct: 9.2
@@ -59,6 +75,11 @@ Shape::
           disposition: dismissed
           neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
           ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
+        overlap:
+          disposition: dismissed
+          concurrent_with: "nothing independent in reach: every rank blocks here
+            before the next layer (cuda_gpu_trace step 120)"
+          ref: "no-independent-partner: the collective is the layer's barrier"
 
 Ownership mirrors ``roadmap.yaml``: only the analyzer writes the ledger
 (a fresh file each round, carrying forward still-valid dismissals); the
@@ -74,10 +95,25 @@ from typing import Any, Mapping
 
 import yaml
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
 LEDGER_FILENAME = "kernel_ledger.yaml"
 
 DISPOSITIONS = ("item", "dismissed")
+
+# The per-kernel questions every row must answer. Order is the order they
+# are posed in the analyzer prompt and rendered in the report.
+QUESTIONS = ("faster", "fusion", "overlap")
+
+# Questions whose verdict rests on an observed relationship to other work:
+# question -> (field name, what the field must carry). Recorded so a
+# fusion/overlap verdict cites the trace rather than a guess.
+_EVIDENCE_FIELD = {
+    "fusion": ("neighbors", "the observed adjacency a fusion verdict rests on"),
+    "overlap": (
+        "concurrent_with",
+        "the candidate partner work (or the observed serialization) an overlap verdict rests on",
+    ),
+}
 
 # ncu bound classes per the perf-nsight-compute-analysis skill.
 BOUND_CLASSES = ("compute", "memory", "latency", "balanced", "comm")
@@ -127,7 +163,8 @@ def _validate_coverage(data: Mapping[str, Any], errors: list[str]) -> None:
     if not isinstance(coverage, dict):
         errors.append(
             f"'coverage' must be a mapping with 'enumerated_share_pct', "
-            f"'other_share_pct', and 'min_share_pct', got {coverage!r}"
+            f"'other_share_pct', 'min_share_pct', and 'gpu_busy_pct', "
+            f"got {coverage!r}"
         )
         return
     values: dict[str, float] = {}
@@ -137,6 +174,19 @@ def _validate_coverage(data: Mapping[str, Any], errors: list[str]) -> None:
             errors.append(f"'coverage.{field}' must be a number >= 0, got {value!r}")
         else:
             values[field] = float(value)
+    # The wall-clock conversion factor. `share_pct` is a share of *GPU
+    # time*, while every gate downstream (`optimize.noise_floor_pct`,
+    # `expected_gain_pct`) is a share of wall clock — on a host-bound
+    # deployment the two differ by 1/busy, so a materiality dismissal
+    # computed in GPU-time units overstates every candidate.
+    busy = coverage.get("gpu_busy_pct")
+    if not _is_number(busy) or not 0 < busy <= 100:
+        errors.append(
+            f"'coverage.gpu_busy_pct' must be a number in (0, 100] — the GPU "
+            f"busy share of the profiled window (nsys), which converts a "
+            f"kernel's share of GPU time into its share of wall clock; "
+            f"got {busy!r}"
+        )
     if {"enumerated_share_pct", "other_share_pct"} <= values.keys():
         total = values["enumerated_share_pct"] + values["other_share_pct"]
         if abs(total - 100.0) > _COVERAGE_SUM_TOLERANCE:
@@ -220,7 +270,8 @@ def _validate_disposition(
     if not isinstance(block, dict):
         errors.append(
             f"'{where}.{question}' must be a mapping with 'disposition' and "
-            f"'ref' — every kernel row answers both questions; got {block!r}"
+            f"'ref' — every kernel row answers all three questions "
+            f"{list(QUESTIONS)}; got {block!r}"
         )
         return
     disposition = block.get("disposition")
@@ -235,15 +286,16 @@ def _validate_disposition(
             f"'{where}.{question}.ref' must be a non-empty string (a roadmap "
             f"item id, or the evidence-backed dismissal), got {ref!r}"
         )
-    if question == "fusion" and disposition == "dismissed":
-        # `neighbors` is the evidence a dismissal rests on; a promoted
-        # `item` carries its adjacency in the roadmap entry `ref` names.
-        neighbors = block.get("neighbors")
-        if not isinstance(neighbors, str) or not neighbors.strip():
+    evidence = _EVIDENCE_FIELD.get(question)
+    if evidence is not None and disposition == "dismissed":
+        # The observed relationship is the evidence a dismissal rests on;
+        # a promoted `item` carries it in the roadmap entry `ref` names.
+        field, carries = evidence
+        observed = block.get(field)
+        if not isinstance(observed, str) or not observed.strip():
             errors.append(
-                f"'{where}.fusion.neighbors' must be a non-empty string when the "
-                f"disposition is 'dismissed' — the observed adjacency the "
-                f"dismissal rests on; got {neighbors!r}"
+                f"'{where}.{question}.{field}' must be a non-empty string when "
+                f"the disposition is 'dismissed' — {carries}; got {observed!r}"
             )
 
 
@@ -266,8 +318,8 @@ def _validate_row(row: Any, index: int, seen: set[str], errors: list[str]) -> No
     if not _is_number(share) or share < 0:
         errors.append(f"'{where}.share_pct' must be a number >= 0, got {share!r}")
     _validate_ncu(row, where, errors)
-    _validate_disposition(row, "faster", where, errors)
-    _validate_disposition(row, "fusion", where, errors)
+    for question in QUESTIONS:
+        _validate_disposition(row, question, where, errors)
 
 
 def load_ledger(path: str | Path) -> dict[str, Any]:
@@ -340,7 +392,7 @@ def cross_validate(
         if isinstance(item, Mapping) and item.get("id")
     }
     for index, row in enumerate(ledger.get("kernels", [])):
-        for question in ("faster", "fusion"):
+        for question in QUESTIONS:
             block = row.get(question, {})
             if block.get("disposition") == "item" and block.get("ref") not in item_ids:
                 errors.append(

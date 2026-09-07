@@ -1114,16 +1114,71 @@ def test_kernel_coverage_note_interpolates_the_task_bars():
     assert "supersedes Run B's target selection" in block
 
 
-def test_kernel_coverage_note_poses_both_questions_per_kernel():
+def test_kernel_coverage_note_poses_all_three_questions_per_kernel():
     block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
     assert "can it be made faster?" in block
     assert "can it be fused with its neighbors?" in block
+    assert "can it be overlapped with independent work on another stream?" in block
     # Each answer is an item or an evidence-backed dismissal — recorded
     # in the schema-validated ledger, with the abort consequence named.
     assert "kernel_ledger.yaml" in block
     assert "aborts the stage" in block
     assert "disposition: item" in block
     assert "disposition: dismissed" in block
+
+
+def test_kernel_coverage_note_justifies_the_overlap_question():
+    """Q3 is not redundant with Q1/Q2 — both presuppose running alone."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "presuppose the kernel must run *alone*" in block
+    # A latency-bound kernel is routed to Q3, not left at "use CUDA graphs":
+    # graphs collapse the gaps BETWEEN launches, not a kernel that fails to
+    # fill the device from inside a replayed graph.
+    assert "gaps *between* launches" in block
+    assert "answered by question 3" in block
+
+
+def test_kernel_coverage_note_grounds_overlap_in_an_independent_partner():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # The partner and the evidence of today's serialization are recorded,
+    # the same discipline `fusion.neighbors` imposes for adjacency.
+    assert "overlap.concurrent_with" in block
+    assert "data-independent" in block
+    assert "disjoint output slices, disjoint step state" in block
+    # Overlap only pays when the machine is idle — two saturated kernels
+    # serialize on the shared resource whatever stream issued them.
+    assert "do not overlap into anything" in block
+    assert "binding* resource" in block
+    # Realized through the shipped idiom, not a hand-rolled stream pair.
+    assert "maybe_execute_in_parallel" in block
+    assert "AuxStreamType" in block
+    # The CUDA-graph gate is a hard precondition, not a nicety.
+    assert "with_multi_stream(True)" in block
+    assert "graph-disabled" in block
+    for tag in (
+        "no-independent-partner",
+        "resource-saturated",
+        "already-concurrent",
+        "below-materiality",
+        "phase-boundary",
+    ):
+        assert tag in block, tag
+    # Fusion and overlap are alternative spends of one adjacency.
+    assert "Never book the same saving twice" in block
+
+
+def test_kernel_coverage_note_fixes_the_materiality_unit():
+    """`share_pct` is GPU time; every gate downstream is wall clock."""
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "The materiality unit — wall clock, not GPU time" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "wall_clock_share = share_pct x gpu_busy_pct / 100" in block
+    # The failure mode the conversion prevents is named with its factor.
+    assert "overstates every candidate by `1 / busy`" in block
+    # And dismissals must quote the converted number, not the raw share.
+    assert "dismissal quoting a raw `share_pct` is not evidence" in block
+    # A low busy share is itself a roadmap item, not per-kernel noise.
+    assert "*is* the host-overhead opportunity" in block
 
 
 def test_kernel_coverage_note_grounds_fusion_in_observed_adjacency():
@@ -1225,6 +1280,14 @@ def test_kernel_coverage_reporter_section_slots_after_kernel_comparison():
     # itemized, never buried.
     assert "pending at campaign end" in block
     assert "untried tail" in block
+    # All three questions get a column, and the busy share that makes the
+    # shares readable as wall clock is stated.
+    assert "| faster → | fusion → | overlap → |" in block
+    assert "coverage.gpu_busy_pct" in block
+    assert "all three questions" in block
+    # One item can span two cells (alternative realizations) or two rows
+    # (a pair) — resolved consistently, counted once.
+    assert "never count its gain twice" in block
     # Honest degrade when the final ledger is missing.
     assert "Kernel coverage ledger unavailable" in block
 
