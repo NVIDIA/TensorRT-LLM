@@ -146,11 +146,18 @@ within a run would make its own aggregate incomparable.
 | `--request-rate` | Arrival rate in req/s, which paces when a request is created; `--max-concurrency` caps how many run. Default `inf`, which creates them all at once. |
 | `--burstiness` | Spread of the arrival intervals, in effect while `--request-rate` is finite. Default `1.0`, an exponential interval. Below 1 the arrivals come in bursts; above 1 they even out. |
 | `--request-timeout` | Per-request timeout in seconds. Default 6 hours. |
-| `--response-format` | How the server returns media, which is inside the measured window: `path` returns a locator, the others return the bytes. Default `path`; the routes otherwise accept `file` (video, its own default) and `url` / `b64_json` (images, default `url`). |
-| `--format` | Encoding the server writes: `mp4`/`avi`/`auto` for video, `png`/`webp`/`jpeg` for images. Default: the server's own, which for video is `auto` — without ffmpeg that is AVI/MJPEG, a different encode inside the measured window. |
 | `--poll-interval` | Status poll interval for `openai-videos`, default `0.1`. It is the granularity of `gen_latency` and `e2e_latency`; the image routes are synchronous and ignore it. |
 | `--no-test-input` | Skip the single probe request sent before the measured run. It is not counted, and it fails fast on a workload the server rejects. |
 | `--disable-tqdm` | No progress bar. |
+
+#### Transport
+
+How the media comes back, both inside the measured window.
+
+| flag | meaning |
+|---|---|
+| `--response-format` | How the server returns media: `path` returns a locator, the others return the bytes. Default `path`; the routes otherwise accept `file` (video, its own default) and `url` / `b64_json` (images, default `url`). |
+| `--format` | Encoding the server writes: `mp4`/`avi`/`auto` for video, `png`/`webp`/`jpeg` for images. Default: the server's own, which for video is `auto` — without ffmpeg that is AVI/MJPEG, a different encode. |
 
 #### Where results go
 
