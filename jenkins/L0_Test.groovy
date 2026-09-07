@@ -545,19 +545,14 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
             } else {
-                // unfinished_test.txt is shared across the whole stage, so match
-                // by this test's own name instead of just checking file presence.
-                // isolateTestName may still carry a " TIMEOUT (N)" / " ISOLATION"
-                // suffix (processShardTestList only strips the ISOLATION token,
-                // not a chained TIMEOUT one), but unfinished_test.txt stores the
-                // bare pytest nodeid, so strip it the same way test_rerun.py does.
-                def bareTestName = isolateTestName.split(/ TIMEOUT | ISOLATION/)[0]
+                // Strip trailing " TIMEOUT (N)" / "TIMEOUT(N)" / " ISOLATION" turtle
+                // directives the same way generate_duration.py's _TURTLE_DIRECTIVE_RE does.
+                def bareTestName = isolateTestName.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
-                // conftest.py rewrites item._nodeid to "${test_prefix}/${nodeid}"
-                // (--test-prefix=${stageName}), so that's the line periodic_junit.py
-                // actually writes here — match the full prefixed form, not just the name.
+                // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
+                // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    sh(script: "grep -Fxq -- '${stageName}/${bareTestName}' ${unfinishedTestFile}", returnStatus: true) == 0
+                    readFile(unfinishedTestFile).readLines()*.trim().contains("${stageName}/${bareTestName}".toString())
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives

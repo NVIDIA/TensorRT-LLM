@@ -1565,8 +1565,7 @@ def pytest_addoption(parser):
         "--periodic-unfinished-test-path",
         action="store",
         default=None,
-        help=
-        "Override the unfinished_test.txt location (default: alongside "
+        help="Override the unfinished_test.txt location (default: alongside "
         "--periodic-junit-xmlpath). Use this to make a rerun attempt that writes "
         "its results XML elsewhere still share the original attempt's "
         "unfinished_test.txt, so a crash during the rerun itself is recorded in "
