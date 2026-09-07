@@ -10,15 +10,15 @@ from torch.fx import Node
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
-from ..utils import get_model_extra_attrs
 
 
 class _PhaseSelectiveForward:
     """
-    This utility class is used to selectively bypass torch.compile
-    for operations that do not need it (attention warmup, auto-tuning),
-    as well as for generation-only forwards, where the ordinary CUDA
-    graph machinery is deemed sufficient.
+    This utility class is a proxy implementing an engine-controlled
+    torch.compile bypass, enabled by the compile_only_piecewise_graphs
+    option. This will then skip torch.compile for certain operations
+    (attention warmup, auto-tuning), as well as for generation forwards
+    and prefill/mixed forwards that are not graph-eligible.
     """
 
     def __init__(self, eager_forward: Callable[..., object],
@@ -28,19 +28,7 @@ class _PhaseSelectiveForward:
         self._bypass_active = False
 
     def __call__(self, *args, **kwargs) -> object:
-        """
-        The wrapper will enforce the eager forward function if:
-        1) The torch compile bypass is active (e.g., for auto-tuning), or
-        2) The batch is generation-only (rely on ordinary CUDA graphs)
-        """
-        attrs = get_model_extra_attrs()
-        attn_metadata_ref = attrs.get("attention_metadata") if attrs else None
-        attn_metadata = (attn_metadata_ref()
-                         if attn_metadata_ref is not None else None)
-        # This is the finalized batch classification after any
-        # context-to-generation promotion.
-        if (self._bypass_active or
-            (attn_metadata is not None and attn_metadata.num_contexts == 0)):
+        if self._bypass_active:
             return self._eager_forward(*args, **kwargs)
         return self._compiled_forward(*args, **kwargs)
 

@@ -493,7 +493,6 @@ class PyTorchModelEngine(ModelEngine):
             'max_num_streams'].default
 
         self._torch_compile_enabled = torch_compile_enabled
-        self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
         self._phase_selective_forward: Optional[_PhaseSelectiveForward] = None
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
