@@ -27,23 +27,29 @@ scale and efficiency of KV-cache reuse.
 Existing KV cache compression methods use a range of techniques. Token eviction
 removes selected KV entries, quantization represents KV values at lower
 precision, and other methods use compact encodings or transformations to reduce
-the retained representation. Depending on the method and workload, these
-techniques can reduce Attention work, cache footprint, data movement, and
-recomputation while increasing effective cache capacity. Lossy methods may
-trade some output quality for those savings, so their accuracy and quality
-impact must be evaluated for the target workload.
+the retained representation. TensorRT-LLM already provides mature paths for
+applying these techniques during model forward computation. Active KV-cache
+quantization stores and processes KV at lower precision, while Sparse Attention
+can evict or select tokens and skip low-contribution work during prefill or
+generation. Depending on the method and workload, these techniques can reduce
+Attention work, cache footprint, data movement, and recomputation while
+increasing effective cache capacity. Lossy methods may trade some output
+quality for those savings, so their accuracy and quality impact must be
+evaluated for the target workload.
 
-As an LLM serving system, TensorRT-LLM KV cache compression supports both
-method-level techniques, such as eviction and quantization, and system-level
-co-design across storage, transfer, and execution. Compression can be
-co-designed with the KV-cache storage hierarchy, data-transfer path, and
-inference lifecycle to optimize storage capacity, data movement, and
-computation together. This includes storage-aware compressed layouts,
-compression placed on transfer paths, and fused or co-optimized compression and
-transfer operations.
+Beyond these forward-pass paths, an LLM serving system creates additional
+opportunities for KV cache compression at stable boundaries between model
+forward steps or when KV Pages move across cache tiers. This page introduces
+the KV cache compression framework for these lifecycle points, enabling
+system-level co-design across storage, transfer, and execution.
+Compression can be co-designed with the KV-cache storage hierarchy,
+data-transfer path, and inference lifecycle to optimize storage capacity, data
+movement, and computation together. This includes storage-aware compressed
+layouts, compression placed on transfer paths, and fused or co-optimized
+compression and transfer operations.
 
-TensorRT-LLM organizes its integration points along this lifecycle dimension. A
-compression method observes the current KV state at an appropriate boundary,
+The framework organizes its integration points along this lifecycle dimension.
+A compression method observes the current KV state at an appropriate boundary,
 applies a method-specific transformation, and makes the resulting state
 available to the existing inference path. These integration points sit outside
 the Attention kernel, so compression policies do not require model-specific or
@@ -56,7 +62,7 @@ decode them when they return.
 Prefill, generation, or a hot/cold Page transition reaches a safe boundary
   |
   v
-Compression manager reads the current KV-cache state
+Compression method reads the current KV-cache state
   |
   +-- iteration-driven method: reduce or compact the retained KV state
   |
@@ -67,7 +73,7 @@ Compression manager reads the current KV-cache state
 Use the resulting smaller cache for storage, transfer, or later inference
   |
   v
-Continue inference through the existing KVCM and Attention interfaces
+Continue inference through the existing cache-management and Attention paths
 ```
 
 Depending on the method, this design can reduce KV-cache storage, transfer
@@ -77,7 +83,8 @@ its own scoring or transform kernels. Compression can affect accuracy and output
 quality; the exact trade-off depends on the method, its settings, and the
 workload, and must be validated before deployment.
 
-TensorRT-LLM exposes three related but distinct KV-cache paths.
+Together with this framework, TensorRT-LLM exposes three related but distinct
+KV-cache optimization paths.
 
 Active KV-cache management (configured through `KvCacheConfig`) controls cache
 capacity, levels, reuse, offloading, Page lifetime, and the active KV dtype.
@@ -98,7 +105,7 @@ outside model forward computation, such as between forward steps or when a Page
 moves across cache tiers. These paths select distinct execution flows. A
 concrete compression method must understand the cache layout it transforms; it
 can preserve unsupported or non-Attention state losslessly, or reject a layout
-that it cannot handle.
+that it cannot handle. This page focuses on the KV cache compression framework.
 
 ## When Compression Runs
 
