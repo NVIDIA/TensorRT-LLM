@@ -179,7 +179,7 @@ def _expected_words(moe_world_size: int, num_words: int, fail_ranks: list[int]) 
 @pytest.mark.parametrize(
     "moe_world_size,num_words,fail_ranks",
     [
-        # default 2 words, all active -> (0xFF, 0)
+        # 2 words, all active -> (0xFF, 0)
         (8, 2, []),
         # one word, fully populated -> ((1<<64)-1,)
         (64, 1, []),
@@ -189,11 +189,11 @@ def _expected_words(moe_world_size: int, num_words: int, fail_ranks: list[int]) 
         (72, 2, [70]),
         # extra words past moe_world_size are zero
         (8, 4, []),
-        # moe_world_size > 128 (beyond default kernel ABI), one failure per word
+        # moe_world_size > 128 (default 4 words), one failure per word
         (256, 4, [10, 70, 130, 200]),
     ],
     ids=[
-        "ep8_default_all_active",
+        "ep8_two_words_all_active",
         "ep64_one_word_full",
         "nvl72_low_word_failure",
         "nvl72_high_word_failure",
@@ -236,12 +236,12 @@ def test_get_mask_words_rejects_non_positive(bad_num_words: int) -> None:
     "moe_world_size,num_words",
     [
         (72, 1),  # NVL72: 72 bits do not fit in a single uint64
-        (256, 2),  # moe_world_size > 128 does not fit in the default 2 words
+        (256, 2),  # moe_world_size > 128 does not fit in 2 words
         (256, 3),  # nor in 3 words
     ],
     ids=[
         "nvl72_in_one_word",
-        "ep256_in_default_two_words",
+        "ep256_in_two_words",
         "ep256_in_three_words",
     ],
 )
@@ -476,4 +476,4 @@ def test_len_returns_moe_world_size_not_active_count() -> None:
 
 def test_ep_mask_num_words_constant_default_value() -> None:
     """Lock in the kernel-ABI default. If this changes, kMaxRanks must too."""
-    assert EP_MASK_NUM_WORDS == 2
+    assert EP_MASK_NUM_WORDS == 4
