@@ -515,92 +515,99 @@ def _fp8_kernel(
     b = bidx // CS
     crk = bidx % CS
     CSd = I32(CS)
+    Lb = I32(0)
     if cutlass.const_expr(GM == 1):
         # balanced split: the grid's CTAs go to rows in proportion to their tile counts (each
-        # row keeps at least ceil(tiles / NLOC)); equal rows keep the uniform mapping. Warp 0
-        # plans in registers (rows lane, lane+32, ...), the plan goes out through sCand.
+        # pl_row keeps at least ceil(tiles / NLOC)); equal rows keep the uniform mapping. Every
+        # warp plans redundantly in registers (rows pl_lane, pl_lane+32, ...): no SMEM, no barrier.
         RPL = (B + 31) // 32
-        if warp_idx == 0:
-            gcl = cute.make_tensor(clen_ptr, cute.make_layout(1 << 20))
-            tb = [I32(0)] * RPL
-            tot = I32(0)
-            mx = I32(0)
-            mn = I32(1 << 30)
-            for r in cutlass.range_constexpr(RPL):
-                row = r * 32 + tidx
-                t = I32(0)
-                if row < B:
-                    t = (gcl[row] + TOK - 1) // TOK
-                    if t > mx:
-                        mx = t
-                    if t < mn:
-                        mn = t
-                tb[r] = t
-                tot = tot + t
-                if row < B:
-                    sCand[2 * B + row] = gcl[row]
-            tot = cute.arch.warp_redux_sync(tot, "add")
-            mx = cute.arch.warp_redux_sync(mx, "max")
-            mn = cute.arch.warp_redux_sync(mn, "min")
-            summin = I32(0)
-            mnb = [I32(0)] * RPL
-            for r in cutlass.range_constexpr(RPL):
-                m = I32(0)
-                if r * 32 + tidx < B:
-                    m = (tb[r] + NLOC - 1) // NLOC
-                    if m < 1:
-                        m = I32(1)
-                mnb[r] = m
-                summin = summin + m
-            summin = cute.arch.warp_redux_sync(summin, "add")
-            uni = I32(0)
-            if mx == mn:
-                uni = I32(1)
-            if summin > I32(B * CS):
-                uni = I32(1)
-            if tidx == 0:
-                sCtl[22] = uni
-            if uni == 0:
-                remc = I32(B * CS) - summin
-                sumex = I32(0)
-                exb = [I32(0)] * RPL
-                for r in cutlass.range_constexpr(RPL):
-                    e = I32(0)
-                    if r * 32 + tidx < B:
-                        e = (remc * tb[r]) // tot
-                    exb[r] = e
-                    sumex = sumex + e
-                sumex = cute.arch.warp_redux_sync(sumex, "add")
-                rleft = remc - sumex
-                base = I32(0)
-                for r in cutlass.range_constexpr(RPL):
-                    row = r * 32 + tidx
-                    sv = I32(0)
-                    if row < B:
-                        sv = mnb[r] + exb[r]
-                        if row < rleft:
-                            sv = sv + 1
-                    incl = sv
-                    for d in cutlass.range_constexpr(5):
-                        oth = cute.arch.shuffle_sync_up(incl, 1 << d, mask_and_clamp=0)
-                        if tidx >= (1 << d):
-                            incl = incl + oth
-                    if row < B:
-                        sCand[row] = sv
-                        sCand[B + row] = base + incl - sv
-                    base = base + cute.arch.shuffle_sync(incl, 31)
-        cute.arch.barrier()
-        Lb = sCand[2 * B + b]
-        if sCtl[22] == 0:
-            if tidx < B:
-                if (sCand[B + tidx] <= bidx) and (bidx < sCand[B + tidx] + sCand[tidx]):
-                    sCtl[25] = tidx
-            cute.arch.barrier()
-            # the plan is read back through SMEM: keep row, rank and split in uniform registers
-            b = cute.arch.make_warp_uniform(sCtl[25])
-            CSd = cute.arch.make_warp_uniform(sCand[b])
-            crk = cute.arch.make_warp_uniform(bidx - sCand[B + b])
-            Lb = sCand[2 * B + b]
+        pl_lane = tidx % 32
+        pl_gcl = cute.make_tensor(clen_ptr, cute.make_layout(1 << 20))
+        pl_ln = [I32(0)] * RPL
+        pl_tb = [I32(0)] * RPL
+        pl_tot = I32(0)
+        pl_mx = I32(0)
+        pl_mn = I32(1 << 30)
+        for pr in cutlass.range_constexpr(RPL):
+            pl_row = pr * 32 + pl_lane
+            pl_t = I32(0)
+            pl_lv = I32(0)
+            if pl_row < B:
+                pl_lv = pl_gcl[pl_row]
+                pl_t = (pl_lv + TOK - 1) // TOK
+                if pl_t > pl_mx:
+                    pl_mx = pl_t
+                if pl_t < pl_mn:
+                    pl_mn = pl_t
+            pl_ln[pr] = pl_lv
+            pl_tb[pr] = pl_t
+            pl_tot = pl_tot + pl_t
+        pl_tot = cute.arch.warp_redux_sync(pl_tot, "add")
+        pl_mx = cute.arch.warp_redux_sync(pl_mx, "max")
+        pl_mn = cute.arch.warp_redux_sync(pl_mn, "min")
+        pl_summin = I32(0)
+        pl_mnb = [I32(0)] * RPL
+        for pr in cutlass.range_constexpr(RPL):
+            pl_m = I32(0)
+            if pr * 32 + pl_lane < B:
+                pl_m = (pl_tb[pr] + NLOC - 1) // NLOC
+                if pl_m < 1:
+                    pl_m = I32(1)
+            pl_mnb[pr] = pl_m
+            pl_summin = pl_summin + pl_m
+        pl_summin = cute.arch.warp_redux_sync(pl_summin, "add")
+        pl_uni = I32(0)
+        if pl_mx == pl_mn:
+            pl_uni = I32(1)
+        if pl_summin > I32(B * CS):
+            pl_uni = I32(1)
+        if pl_uni == 0:
+            pl_remc = I32(B * CS) - pl_summin
+            pl_sumex = I32(0)
+            pl_exb = [I32(0)] * RPL
+            for pr in cutlass.range_constexpr(RPL):
+                pl_e = I32(0)
+                if pr * 32 + pl_lane < B:
+                    pl_e = (pl_remc * pl_tb[pr]) // pl_tot
+                pl_exb[pr] = pl_e
+                pl_sumex = pl_sumex + pl_e
+            pl_sumex = cute.arch.warp_redux_sync(pl_sumex, "add")
+            pl_rleft = pl_remc - pl_sumex
+            pl_base = I32(0)
+            for pr in cutlass.range_constexpr(RPL):
+                pl_row = pr * 32 + pl_lane
+                pl_sv = I32(0)
+                if pl_row < B:
+                    pl_sv = pl_mnb[pr] + pl_exb[pr]
+                    if pl_row < pl_rleft:
+                        pl_sv = pl_sv + 1
+                pl_incl = pl_sv
+                for pd in cutlass.range_constexpr(5):
+                    pl_oth = cute.arch.shuffle_sync_up(pl_incl, 1 << pd, mask_and_clamp=0)
+                    if pl_lane >= (1 << pd):
+                        pl_incl = pl_incl + pl_oth
+                pl_st = pl_base + pl_incl - pl_sv
+                pl_hit = (pl_row < B) and (pl_st <= bidx) and (bidx < pl_st + pl_sv)
+                pl_sel = I32(0)
+                if pl_hit:
+                    pl_sel = pl_lane + 1
+                pl_hm = cute.arch.warp_redux_sync(pl_sel, "max")
+                if pl_hm != 0:
+                    pl_src = pl_hm - 1
+                    b = pr * 32 + pl_src
+                    CSd = cute.arch.shuffle_sync(pl_sv, pl_src)
+                    crk = bidx - cute.arch.shuffle_sync(pl_st, pl_src)
+                    Lb = cute.arch.shuffle_sync(pl_ln[pr], pl_src)
+                pl_base = pl_base + cute.arch.shuffle_sync(pl_incl, 31)
+        else:
+            for pr in cutlass.range_constexpr(RPL):
+                pl_v = cute.arch.shuffle_sync(pl_ln[pr], b & 31)
+                if (b >> 5) == pr:
+                    Lb = pl_v
+        b = cute.arch.make_warp_uniform(b)
+        CSd = cute.arch.make_warp_uniform(CSd)
+        crk = cute.arch.make_warp_uniform(crk)
+        Lb = cute.arch.make_warp_uniform(Lb)
     # cluster-free row split: this row's GMEM workspace (zero at launch, re-zeroed by the last arriver)
     wrow_i = cutlass.Int64(0)
     gRow = cute.make_tensor(ws_ptr, cute.make_layout(WS_ROWW_OF(NREP)))
