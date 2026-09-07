@@ -295,9 +295,9 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
 
     layout = _layouts(native)[0]
     assert [buffer.role for buffer in layout.buffers] == ["key", "value"]
-    assert layout.num_kv_heads == 4
-    assert layout.tokens_per_page == 5
-    assert layout.head_dim == 128
+    assert layout.row_count == 20
+    assert layout.quantized_prefix_elements == 128
+    assert layout.hot_row_stride_elements == 128
     assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [
         1.0,
         1.0,
@@ -312,7 +312,7 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert metadata.wide[:2, 4].tolist() == [2560, 2720]
     assert metadata.wide[:2, 6].tolist() == [0, 0]
     assert metadata.integers[:2, 0].tolist() == [0, 0]
-    assert metadata.integers[:2, 5].tolist() == [128, 128]
+    assert metadata.integers[:2, 4].tolist() == [128, 128]
 
 
 def test_mha_layout_is_k_v_then_scales_and_layer_padding() -> None:
@@ -437,7 +437,7 @@ def test_codec_state_metadata_stays_on_cpu_with_non_cpu_default_device() -> None
         metadata = _configure_default_lifecycle(native, raw_bytes=2048)
     for tensor, dtype, shape in (
         (metadata.wide, torch.int64, (256, 7)),
-        (metadata.integers, torch.int32, (256, 6)),
+        (metadata.integers, torch.int32, (256, 5)),
         (metadata.scales, torch.float32, (256, 4)),
     ):
         assert tensor.device.type == "cpu"
@@ -719,9 +719,9 @@ def test_mla_key_only_layout_with_index_key_uses_identity_scales(tmp_path):
     assert [buffer.role for buffer in layout.buffers] == ["key", "index_key"]
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
     assert _codec_state(native).runtime_type == 1
-    assert layout.num_kv_heads == 1
-    assert layout.tokens_per_page == 64
-    assert layout.head_dim == 576
+    assert layout.row_count == 64
+    assert layout.quantized_prefix_elements == 576
+    assert layout.hot_row_stride_elements == 576
     scales = layout.buffers[0].scales
     assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
     assert layout.buffers[1].scales is None
@@ -801,25 +801,24 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     layout = _layouts(native)[0]
     assert _codec_state(native).layer_ids == (8,)
     assert (
-        layout.num_kv_heads,
-        layout.tokens_per_page,
-        layout.head_dim,
-        layout.raw_row_stride_elements,
-    ) == (1, 32, 448, 512)
+        layout.row_count,
+        layout.quantized_prefix_elements,
+        layout.hot_row_stride_elements,
+    ) == (32, 448, 512)
     assert [buffer.scales is not None for buffer in layout.buffers] == [True, False]
 
     metadata = _configure_lifecycle(
         native,
         {8: {compress: compress_bytes, indexer: indexer_bytes}},
     )
-    suffix_bytes = 32 * 64 * element_bytes
-    indexer_offset = 7168 + 896 + suffix_bytes
+    lossless_suffix_bytes = 32 * 64 * element_bytes
+    indexer_offset = 7168 + 896 + lossless_suffix_bytes
     assert metadata.cold_page_bytes == cold_page_bytes
     assert metadata.wide[:2, 3].tolist() == [0, indexer_offset]
     assert metadata.wide[:2, 4].tolist() == [7168, 0]
     assert metadata.wide[:2, 6].tolist() == [8064, 0]
-    assert metadata.integers[0].tolist() == [0, 0, 1, 32, 448, 512]
-    assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0]
+    assert metadata.integers[0].tolist() == [0, 0, 32, 448, 512]
+    assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0]
 
     sections = (
         (0, 7168),
