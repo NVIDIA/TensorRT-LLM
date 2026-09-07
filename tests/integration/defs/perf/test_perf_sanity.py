@@ -764,6 +764,7 @@ def _run_benchmark_with_log(cmd: List[str], env: Dict[str, str], log_path: str) 
             stdout=log_file,
             stderr=subprocess.STDOUT,
             check=False,
+            timeout=DEFAULT_TIMEOUT,
         )
 
     with open(log_path, "rb") as log_file:
@@ -1163,7 +1164,9 @@ class AccuracyConfig:
         ):
             print_info(f"[Accuracy] Running {task_name}, output: {log_file}")
             with open(log_file, "w") as lf:
-                ret = subprocess.run(cmd, env=run_env, stdout=lf, stderr=subprocess.STDOUT)
+                ret = subprocess.run(
+                    cmd, env=run_env, stdout=lf, stderr=subprocess.STDOUT, timeout=DEFAULT_TIMEOUT
+                )
             print_info(f"[Accuracy] {task_name} done, exit_code={ret.returncode}")
 
 

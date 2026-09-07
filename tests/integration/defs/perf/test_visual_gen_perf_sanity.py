@@ -682,6 +682,7 @@ class VisualGenPerfSanityTestConfig:
                         stderr=subprocess.STDOUT,
                         text=True,
                         check=False,
+                        timeout=DEFAULT_TIMEOUT,
                     )
                     with open(client_log_path, "w", encoding="utf-8") as client_log:
                         client_log.write(result.stdout)
