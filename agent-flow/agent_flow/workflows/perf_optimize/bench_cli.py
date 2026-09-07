@@ -1,204 +1,252 @@
-"""The one place this workflow calls ``bench-disagg`` from Python.
+"""Reading the benchmark suite's configs and results, without driving it.
 
-A SOL-track campaign does not drive ``bench-trtllm-disagg``'s scripts. It
-drives the CLI that repo ships, and that CLI's own README is explicit
-about why: "`bench-disagg` is the only supported agent-facing interface.
-The existing Python scripts are internal execution backends, not
-compatibility commands."
+A SOL-track campaign measures through `ibc-bench`, the CLI the
+`ibc-trtllm-harness` package ships. The agent drives it — `submit sweep`,
+`jobs check`, `process ctx`, `process frontier` are Bash commands in the
+track's prompt section, run by the role that needs them, the same way an
+aggregate campaign runs `trtllm-serve` and `benchmark_serving`.
 
-**The agent drives it, not this module.** ``sweep submit``, ``sweep
-status``, ``frontier build`` and ``frontier compare`` are Bash commands
-in the SOL-track prompt sections, run by the role that needs them — the
-same way an aggregate campaign runs ``trtllm-serve`` and
-``benchmark_serving``. Wrapping them in Python would add a layer with no
-caller and one more place for the command surface to drift.
+Python's part is smaller than it looks, and deliberately so: it reads two
+kinds of file the harness owns, and runs nothing.
 
-Python needs the CLI for the three questions an agent cannot be trusted
-with, all read-only and none of them queueing anything:
+- **The sweep** — at schema validation, before any agent exists, so
+  `task.yaml` can be reconciled against the run that will happen. The
+  expansion is computed here rather than asked of the CLI because
+  `ibc-bench` has no read-only "what would this submit" command:
+  `submit sweep --dry-run` answers, but by writing a case directory per
+  case, which is not something schema validation may do. The rule it
+  applies is the harness's own and is narrow — a `gen_configs` row is
+  `[ctx, gen, tp, batch, max_num_tokens, attention_dp, gpu_mem_frac, mtp,
+  eplb, concurrency_list]` and expands over that last field; a ctx
+  `benchmarks` entry expands over `max_batch` × `tp_size` × `mtp_range`.
+  The agent's own `--dry-run` step re-derives it against the harness
+  before an allocation is spent, so a drift shows up as a refusal rather
+  than as a campaign quoting points it never measured.
 
-- ``sweep plan``, at schema validation, before any agent exists. That
-  call answers what the sweep expands to — the operating points and the
-  sequence lengths — so ``task.yaml`` can be reconciled against the run
-  that will actually happen.
-- ``frontier show``, after a measurement, so the score lands on disk in
-  the shape the rest of perf-optimize already reads. Both ends of that
-  translation are vocabulary — ``tps_per_user`` here,
-  ``throughput_per_user`` there, a listed concurrency here, a total in
-  flight there — and vocabulary that only exists in a prompt is
-  vocabulary that gets it right most of the time.
-- ``sweep status``, for the ctx track only, because nothing else reports
-  its metric: a frontier snapshot is the rate-matched *generation* curve
-  and takes the ctx side as its anchor, so it holds no ctx point at all.
+- **The frontier CSV** — what `ibc-bench process frontier` writes. Its
+  columns are already the names this workflow scores on:
+  `throughput_per_user` needs no translation, and `output_tput_per_gpu`
+  and `ctx_gen_inst_ratio_round_float` carry the frontier the gate's
+  metric is not.
 
-The contract, verified against the installed 0.2.0 CLI rather than read
-off its source:
+- **The gen-only CSV** — what `get_gen_only_perf` writes, for a gen
+  campaign that declares no ctx anchor. The gate's metric is
+  ``accept_rate / avg_iteration_time``, which has no context term in it;
+  the frontier is the only thing that needs the anchor. Reading the score
+  out of the frontier therefore invented a dependency the measurement
+  does not have — a gen campaign had to wait for somebody's ctx run
+  before it could score a decode change that ctx cannot affect. Both
+  readers are kept because they answer different questions, and which one
+  applies is declared in `task.yaml` rather than guessed from the
+  directory.
 
-- every leaf command prints exactly one JSON object on stdout, because
-  the CLI redirects all subordinate output to stderr to keep it that way;
-- that object has ``ok``, and on failure an ``error.code`` from a fixed
-  taxonomy ("Agents branch on these; messages are for humans");
-- the exit code agrees with ``ok`` (0 / 2).
+What this module does **not** do is reconstruct the identity model the
+previous CLI carried (`config_id` / `code_id` / per-measurement records).
+Nothing here can tell an attempt from a repeat of its baseline, so the
+prompts make that an obligation the evaluator discharges by reading the
+case's materialized config — stated as such, rather than implied.
 """
 
 from __future__ import annotations
 
-import json
-import shutil
-import subprocess
-import sys
+import csv
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
-#: The console script the wheel installs.
-BENCH_DISAGG = "bench-disagg"
+#: The console script `ibc-trtllm-harness` installs. Named for the prompt
+#: sections and error messages; nothing here executes it.
+IBC_BENCH = "ibc-bench"
+
+#: Where `process frontier` leaves the scored points. One per (mtp tag,
+#: variant), so a run dir can hold several; the reader takes them all.
+FRONTIER_CSV_GLOB = "*_frontier_*.csv"
+
+#: The columns this workflow reads. The rest of the row is carried
+#: through untouched, because a number a reader can trace beats a number
+#: that arrived alone.
+CASE_KEY = ("name", "concurrency")
+GEN_METRIC = "throughput_per_user"
+
+#: Where `get_gen_only_perf` leaves the anchor-free scores — one file per
+#: run dir, written beside the cases it read.
+GEN_ONLY_CSV = "gen_only_perf.csv"
+
+#: What that file calls :data:`GEN_METRIC`. The same quantity by the same
+#: formula (`accept_rate / avg_iteration_time`); only the column name
+#: differs, so the rename happens here and nowhere else.
+GEN_ONLY_METRIC = "tps_per_user"
+
+#: How the harness exposes the gen-only extractor. It has no `ibc-bench`
+#: subcommand as of v0.5.7 — `process frontier` is the only scored gen
+#: path on the CLI — so the prompt runs the module directly. Named here so
+#: the error messages and the prompt cannot drift apart.
+GEN_ONLY_MODULE = "ibc_trtllm_harness.process_data.get_gen_only_perf"
 
 
 class BenchCliError(RuntimeError):
-    """A `bench-disagg` command failed, or did not answer in the protocol.
-
-    ``code`` is the CLI's own taxonomy value when there was a well-formed
-    envelope and ``None`` when there was not — the distinction matters,
-    because the second case means the contract itself is broken and no
-    amount of retrying will fix it.
-    """
-
-    def __init__(self, message: str, code: str | None = None, details: Any = None):
-        super().__init__(message)
-        self.code = code
-        self.details = details
+    """A sweep or a result set could not be read as the harness writes it."""
 
 
-def executable() -> str:
-    """Where to find the CLI: PATH first, then beside this interpreter.
-
-    The fallback matters because the two are installed together — the
-    console script lands in the same ``bin/`` as the ``python`` running
-    this code — but only an *activated* venv puts that directory on PATH.
-    Failing on that difference would be failing on an environment
-    variable rather than on a missing dependency, which is what it did the
-    first time this ran for real.
-    """
-    found = shutil.which(BENCH_DISAGG)
-    if found:
-        return found
-    sibling = Path(sys.executable).with_name(BENCH_DISAGG)
-    return str(sibling) if sibling.is_file() else BENCH_DISAGG
-
-
-def run(argv: Sequence[str], *, timeout: float | None = None) -> dict[str, Any]:
-    """Run one `bench-disagg` command and return its ``data`` block.
-
-    Raises :class:`BenchCliError` on any non-``ok`` envelope, carrying the
-    CLI's own error code so a caller can branch on it.
-    """
+def _int(value: Any) -> int | None:
     try:
-        completed = subprocess.run(
-            [executable(), *argv], capture_output=True, text=True, check=False, timeout=timeout
-        )
-    except FileNotFoundError as exc:
-        raise BenchCliError(
-            f"{BENCH_DISAGG} is not on PATH. A SOL-track campaign drives it rather "
-            f"than the benchmark repo's scripts: `pip install trtllm-disagg-bench` "
-            f"into the environment this workflow runs in."
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise BenchCliError(f"{BENCH_DISAGG} {' '.join(argv)} timed out") from exc
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed
 
-    text = completed.stdout.strip()
-    if not text:
-        raise BenchCliError(
-            f"{BENCH_DISAGG} {' '.join(argv)} printed nothing on stdout; the CLI "
-            f"emits one JSON envelope per command, so an empty one means it did "
-            f"not run (wrong PATH / venv) rather than that it found nothing"
-        )
+
+def _float(value: Any) -> float | None:
     try:
-        envelope = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise BenchCliError(
-            f"{BENCH_DISAGG} {' '.join(argv)} did not print a JSON envelope "
-            f"(starts: {text[:200]!r}). Something bypassed the CLI's stdout protection."
-        ) from exc
-
-    if not envelope.get("ok"):
-        error = envelope.get("error") or {}
-        raise BenchCliError(
-            error.get("message") or f"{BENCH_DISAGG} {' '.join(argv)} failed",
-            code=error.get("code"),
-            details=error.get("details"),
-        )
-    return dict(envelope.get("data") or {})
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed else None  # NaN is not a measurement
 
 
-def plan(sweep: str | Path, workspace: str) -> dict[str, Any]:
-    """Survey a sweep: the workload, the code identity, and every case."""
-    return run(["sweep", "plan", "--workspace", workspace, "-c", str(sweep), "--cases"])
+def _bool(value: Any) -> bool:
+    """A pandas-written boolean cell. Anything unrecognised is ``False``.
 
-
-def frontier_show(workspace: str, snapshot: str = "latest") -> dict[str, Any]:
-    """Read a built snapshot back: its points, and what each one scored.
-
-    The second and last thing Python asks the CLI for, and for the same
-    reason as :func:`plan` — read-only, queues nothing, and the answer has
-    to come from the tool that computed it rather than from a file this
-    workflow parses itself. Resolving ``latest`` in particular is not a
-    directory listing: the CLI skips snapshots whose build did not
-    complete, which is exactly the case where reading the newest directory
-    would silently score a campaign on a failed postprocess.
-
-    ``snapshot`` takes a snapshot id, ``"latest"``, or ``"baseline"``.
+    ``get_gen_only_perf`` writes Python bools through ``DataFrame.to_csv``,
+    so the cell is the literal ``True``/``False``. Only this column feeds
+    the ``dep``/``tep`` half of a case name, and a name that silently
+    changed shape would be worse than one that is visibly wrong, so the
+    accepted spellings are enumerated rather than inferred from
+    truthiness — ``"False"`` is a non-empty string.
     """
-    return run(["frontier", "show", "--workspace", workspace, "--snapshot", snapshot])
+    return str(value).strip().lower() in {"true", "1", "yes"}
 
 
-def status(workspace: str) -> dict[str, Any]:
-    """Every case in a workspace, with where its artifacts landed.
+# ------------------------------------------------------------------ the sweep
 
-    The third and last read-only question Python asks. It exists for the
-    ctx track, which no other command scores: ``frontier build`` selects
-    ``stage == GEN`` and refuses a workspace holding none, so a ctx
-    campaign has no snapshot to read.
 
-    This is not reaching around the CLI. Each case carries ``result`` —
-    the artifact the backend *validated the case on* — and for a ctx case
-    that is the ``run_*.json`` whose ``performance.request_throughput_req_s``
-    is the very key ``_inspect_ctx`` required before calling the case
-    successful. The CLI hands over the path and certifies the key is in
-    it; reading it is following that contract, not going behind it.
+def workload(sweep: Mapping[str, Any]) -> dict[str, Any]:
+    """What the run will serve, as the sweep states it.
+
+    ``isl`` is deliberately not read as the request length. The harness
+    spends it on ``max_seq_len`` and the client's ``input_length``; the
+    requests come from ``dataset_file``, a corpus with its own
+    distribution. The checked-in 8k sweep pairs ``isl: 8192`` with a
+    ``...-8192-1024-200000-...`` corpus and both are right.
     """
-    return run(["sweep", "status", "--workspace", workspace, "--cases"])
+    return {
+        "model": sweep.get("model_id"),
+        "model_path": sweep.get("model_path"),
+        "dataset": sweep.get("dataset_file"),
+        "precision": sweep.get("precision"),
+        "isl": sweep.get("isl"),
+        "osl": sweep.get("osl"),
+        "benchmark_client": sweep.get("benchmark_client"),
+    }
+
+
+def gen_cases(sweep: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every gen case a `gen_configs` sweep expands to.
+
+    The row order is the harness': `[ctx_num, gen_num, tp_size, batch,
+    max_num_tokens, attention_dp, gpu_memory_fraction, mtp, eplb,
+    concurrency_list]`. The case name mirrors what the postprocessor's
+    `name` column carries — `{dep|tep}_{tp}_eplb{N}_mtp{M}` — so a point
+    read back out of the CSV addresses the row that produced it.
+    """
+    cases: list[dict[str, Any]] = []
+    for row in sweep.get("gen_configs") or []:
+        if isinstance(row, Mapping):  # the dict form the harness also accepts
+            row = [
+                row.get(k)
+                for k in (
+                    "ctx_num",
+                    "gen_num",
+                    "gen_tp_size",
+                    "gen_batch_size",
+                    "gen_max_num_tokens",
+                    "gen_enable_attention_dp",
+                    "gen_gpu_memory_fraction",
+                    "gen_mtp_size",
+                    "gen_eplb_num_slots",
+                    "gen_concurrency_list",
+                )
+            ]
+        if not isinstance(row, (list, tuple)) or len(row) < 10:
+            continue
+        ctx_num, gen_num, tp, batch, mnt, adp, gmf, mtp, eplb, concurrencies = row[:10]
+        shape = f"{'dep' if adp else 'tep'}_{tp}_eplb{eplb}_mtp{mtp}"
+        for token in str(concurrencies).split(","):
+            concurrency = _int(token)
+            if concurrency is None:
+                continue
+            cases.append(
+                {
+                    "case": f"{shape}_conc{concurrency}",
+                    "name": shape,
+                    "stage": "gen",
+                    "config": {
+                        "ctx_num": _int(ctx_num),
+                        "gen_num": _int(gen_num),
+                        "tp_size": _int(tp),
+                        "batch_size": _int(batch),
+                        "max_num_tokens": _int(mnt),
+                        "attention_dp": bool(adp),
+                        "gpu_memory_fraction": _float(gmf),
+                        "mtp_size": _int(mtp),
+                        "eplb_num_slots": _int(eplb),
+                        "concurrency": concurrency,
+                    },
+                }
+            )
+    return cases
+
+
+def ctx_cases(sweep: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Every ctx case a `benchmarks` block expands to.
+
+    A ctx entry has no concurrency: `max_batch` is the in-flight request
+    count for a prefill-only run, which is what this workflow means by
+    concurrency everywhere else.
+    """
+    cases: list[dict[str, Any]] = []
+    for entry in sweep.get("benchmarks") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        isl, osl = entry.get("isl"), entry.get("osl", 1)
+        for batch in entry.get("max_batch") or []:
+            for tp in entry.get("tp_size") or []:
+                for ratio in entry.get("ratio") or [None]:
+                    for mtp in entry.get("mtp_range") or [0]:
+                        cases.append(
+                            {
+                                "case": f"ctx-isl{isl}_osl{osl}_b{batch}_tp{tp}_mtp{mtp}",
+                                "stage": "ctx",
+                                "config": {
+                                    "isl": _int(isl),
+                                    "osl": _int(osl),
+                                    "max_batch": _int(batch),
+                                    "tp_size": _int(tp),
+                                    "ratio": ratio,
+                                    "mtp": _int(mtp),
+                                },
+                            }
+                        )
+    return cases
+
+
+def plan(sweep: Mapping[str, Any]) -> dict[str, Any]:
+    """The sweep as a workload plus the cases it expands to."""
+    return {"workload": workload(sweep), "cases": gen_cases(sweep) + ctx_cases(sweep)}
 
 
 def operating_point(config: Mapping[str, Any]) -> int | None:
     """Total requests in flight at one case, or ``None`` if unstated.
 
-    Not ``config.concurrency`` verbatim. That is the sweep row's listed
-    value, which is **per generation server**: the client is driven at
-    ``concurrency * gen_num`` and the harness names its result directory
-    after that product. ``task.yaml``'s ``concurrency`` means what an
-    aggregate campaign means by it — total requests in flight — so the
-    product is what belongs there, and the case name (which uses the
-    listed value) stays the address.
-
-    This is the one trap driving the CLI does not remove: it belongs to
-    the harness, not to the file the numbers were read from. It applies
-    identically to a planned case and to a measured frontier point, since
-    both carry the sweep row's ``config`` unchanged — which is why the
-    rule lives here rather than at either call site.
+    Not ``concurrency`` verbatim on a gen case: the sweep row's value is
+    **per generation server**, the client is driven at ``concurrency *
+    gen_num``, and the harness names the result directory after that
+    product. A ctx case has no concurrency at all — ``max_batch`` is the
+    in-flight count for a prefill-only run.
     """
     listed = config.get("concurrency")
     if not isinstance(listed, int) or isinstance(listed, bool):
-        # A ctx case has no `concurrency`: its config is
-        # `{isl, osl, max_batch, tp_size, ratio, mtp}`. `max_batch` is the
-        # in-flight request count for a prefill-only run -- the server admits
-        # that many and no more -- which is what `concurrency` means
-        # everywhere else in this workflow. Reading it as the operating point
-        # is not a convention invented here; it is what the script-driven
-        # implementation reconciled against, and its ctx campaign ran to a
-        # finished report on that basis.
         batch = config.get("max_batch")
-        if isinstance(batch, int) and not isinstance(batch, bool):
-            return batch
-        return None
+        return batch if isinstance(batch, int) and not isinstance(batch, bool) else None
     gen_num = config.get("gen_num", 1)
     if not isinstance(gen_num, int) or isinstance(gen_num, bool) or gen_num < 1:
         gen_num = 1
@@ -209,3 +257,128 @@ def operating_points(plan_data: Mapping[str, Any]) -> list[int]:
     """The concurrency axis a `task.yaml` should carry, from a plan."""
     points = (operating_point(case.get("config") or {}) for case in plan_data.get("cases") or [])
     return sorted({point for point in points if point is not None})
+
+
+# ---------------------------------------------------------------- the results
+
+
+def frontier_points(run_dir: Path) -> list[dict[str, Any]]:
+    """Every scored point `process frontier` wrote under ``run_dir``.
+
+    Keyed by ``(name, concurrency)`` — the shape the row was measured at
+    and the point on its curve — because that pair is what survives a code
+    change, and therefore what an attempt and its baseline have in common.
+    """
+    found: dict[tuple[str, int], dict[str, Any]] = {}
+    csvs = sorted(Path(run_dir).rglob(FRONTIER_CSV_GLOB))
+    if not csvs:
+        raise BenchCliError(
+            f"no {FRONTIER_CSV_GLOB} under {run_dir}: `{IBC_BENCH} process frontier` "
+            f"has not run, or ran without producing a curve. `{IBC_BENCH} jobs check "
+            f"-f {run_dir}/job_status.csv --summary` says whether the cases behind it "
+            f"measured."
+        )
+    for path in csvs:
+        try:
+            rows: Iterable[dict[str, str]] = list(csv.DictReader(path.open(encoding="utf-8")))
+        except OSError as exc:  # pragma: no cover - message path
+            raise BenchCliError(f"could not read {path}: {exc}") from exc
+        for row in rows:
+            name = (row.get("name") or "").strip()
+            concurrency = _int(row.get("concurrency"))
+            value = _float(row.get(GEN_METRIC))
+            if not name or concurrency is None or value is None:
+                continue
+            found[(name, concurrency)] = {
+                "case": f"{name}_conc{concurrency}",
+                "name": name,
+                "concurrency": concurrency,
+                "metrics": {
+                    GEN_METRIC: value,
+                    "output_tput_per_gpu": _float(row.get("output_tput_per_gpu")),
+                    "ctx_gen_inst_ratio": _float(row.get("ctx_gen_inst_ratio_round_float")),
+                    "ctx_request_rate": _float(row.get("ctx_request_rate")),
+                },
+                "gpus": {
+                    "ctx": _float(row.get("ctx_gpus_round")),
+                    "gen": _float(row.get("gen_num_round")),
+                    "total": _float(row.get("total_gpus_round")),
+                },
+                "source_csv": str(path),
+            }
+    if not found:
+        raise BenchCliError(
+            f"the frontier CSVs under {run_dir} carry no row with a name, a "
+            f"concurrency and a {GEN_METRIC}. Check that the postprocessor scored "
+            f"the cases rather than only listing them."
+        )
+    return [found[key] for key in sorted(found)]
+
+
+def gen_only_points(run_dir: Path) -> list[dict[str, Any]]:
+    """Every scored point `get_gen_only_perf` wrote under ``run_dir``.
+
+    The same shape :func:`frontier_points` returns, keyed the same way, so
+    the rest of the workflow cannot tell which reader produced a point —
+    except by what is missing, which is the whole e2e half:
+    ``output_tput_per_gpu``, the ctx:gen ratio and the GPU counts all
+    divide by a context rate this campaign never measured.
+
+    They are **absent rather than zero**, and the caller is expected to
+    say so in the result it writes. A frontier column filled with a
+    plausible default is the failure this track is built to refuse: the
+    curve still plots, the deployment it describes never existed.
+
+    ``output_tps_per_gen_gpu`` is carried but deliberately not renamed to
+    ``output_tput_per_gpu``. They differ in the denominator — this one
+    divides by the generation GPUs alone, the frontier's by the whole
+    rate-matched deployment — so the two are never the same number, and
+    the smaller denominator makes this the flattering one.
+    """
+    path = Path(run_dir) / GEN_ONLY_CSV
+    if not path.is_file():
+        raise BenchCliError(
+            f"no {GEN_ONLY_CSV} in {run_dir}: this campaign declares no ctx anchor, "
+            f"so its score comes from the anchor-free extractor. Run "
+            f"`python -m {GEN_ONLY_MODULE} -i {run_dir}` after the sweep, then "
+            f"collect again. `{IBC_BENCH} jobs check -f {run_dir}/job_status.csv "
+            f"--summary` says whether the cases behind it measured."
+        )
+    try:
+        rows: Iterable[dict[str, str]] = list(csv.DictReader(path.open(encoding="utf-8")))
+    except OSError as exc:  # pragma: no cover - message path
+        raise BenchCliError(f"could not read {path}: {exc}") from exc
+
+    found: dict[tuple[str, int], dict[str, Any]] = {}
+    for row in rows:
+        concurrency = _int(row.get("concurrency"))
+        value = _float(row.get(GEN_ONLY_METRIC))
+        tp, mtp, eplb = _int(row.get("tp")), _int(row.get("mtp")), _int(row.get("eplb"))
+        if concurrency is None or value is None or tp is None:
+            continue
+        # Rebuilt from the columns rather than parsed out of `config`, so
+        # it matches `gen_cases()`'s shape and the frontier CSV's `name`
+        # exactly. A point read through either reader then addresses the
+        # same planned row.
+        name = f"{'dep' if _bool(row.get('adp')) else 'tep'}_{tp}_eplb{eplb}_mtp{mtp}"
+        found[(name, concurrency)] = {
+            "case": f"{name}_conc{concurrency}",
+            "name": name,
+            "concurrency": concurrency,
+            "metrics": {
+                GEN_METRIC: value,
+                "output_tput": _float(row.get("output_tput")),
+                "output_tps_per_gen_gpu": _float(row.get("output_tps_per_gen_gpu")),
+                "avg_itertime_ms": _float(row.get("avg_itertime_ms")),
+                "num_iters": _int(row.get("num_iters")),
+            },
+            "source_csv": str(path),
+            "harness_config": (row.get("config") or "").strip() or None,
+        }
+    if not found:
+        raise BenchCliError(
+            f"{path} carries no row with a concurrency, a tp and a {GEN_ONLY_METRIC}. "
+            f"The extractor drops a case whose iteration log never reached steady "
+            f"state, so an empty file means the cases ran but did not settle."
+        )
+    return [found[key] for key in sorted(found)]

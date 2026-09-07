@@ -86,6 +86,7 @@ from agent_flow.workflows.perf_optimize.disagg import (
 from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 from agent_flow.workflows.perf_optimize.sol_track import (
     CTX_JSON_KEY,
+    GEN_TRACK,
     SOL_TRACK_FIELD,
     SWEEP_KEY,
     TRACK_KEY,
@@ -102,7 +103,6 @@ from agent_flow.workflows.perf_optimize.sol_track import (
     sweep_accept_rate,
     sweep_path,
     track_name,
-    workspace_name,
 )
 
 # Defaults merged under the user's values. ``target_improvement_pct`` is
@@ -479,16 +479,11 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
             f"{block.get(TRACK_KEY)!r}"
         )
         return None
-    workspace = workspace_name(data)
-    if workspace is None:
-        errors.append(
-            f"'{SOL_TRACK_FIELD}.{WORKSPACE_KEY}' is required and must be a non-empty "
-            f"string: the bench-disagg workspace this campaign measures into. It fixes "
-            f"one workload on one cluster, and an image or code change appends to it "
-            f"rather than forking it — which is what lets an attempt be compared "
-            f"case-by-case against the baseline it must beat."
-        )
-        return None
+    # `workspace` is optional now, and no longer where results are read
+    # from: a stage submits into `<its result dir>/run` so submission and
+    # collection cannot be given different answers. Kept because task.yaml
+    # files carry it, and a harness work dir root is still a useful thing
+    # to state.
     path = sweep_path(data)
     if path is None:
         errors.append(
@@ -508,40 +503,47 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
     # `frontier build` requires it on every build and refuses to infer
     # one, so a sweep without it produces a campaign that measures fine
     # and cannot be turned into a curve. Cheaper to say so now.
-    if sweep_accept_rate(sweep) is None:
+    if track == GEN_TRACK and sweep_accept_rate(sweep) is None:
         errors.append(
-            f"{path} sets no 'options.accept_rate'. Every `frontier build` requires it "
+            f"{path} sets no 'options.accept_rate'. Every `process frontier` requires it "
             f"and none is inferred: the acceptance length scales both the numerator and "
             f"the ctx term of the frontier metric, so a wrong one tilts the whole curve "
             f"with no symptom. Freeze the measured value in the sweep's options."
         )
         return None
-    if track == "gen":
-        # `frontier build` rate-matches the whole curve, so it needs the
-        # context request rate even though the gate's metric is purely
-        # generation-side. Without a source it raises ANCHOR_MISSING --
-        # after the gen jobs have run and the cluster time is spent.
+    if track == GEN_TRACK:
+        # Optional, and the choice is which QUESTION the campaign can
+        # answer -- not whether it can be scored.
+        #
+        # The gate's metric is `accept_rate / avg_iteration_time`: decode
+        # iterations only, no context term, so a ctx measurement cannot
+        # move it. What the anchor buys is the e2e half -- the rate match
+        # that turns a decode rate into `output_tput_per_gpu` and hence
+        # into `frontier_elasticity`, the exchange rate saying what a gain
+        # at this point is worth to the deployment.
+        #
+        # It was required here once, because the score was read out of the
+        # frontier CSV, which `process frontier` will not write without an
+        # anchor. That made a decode campaign wait on somebody's prefill
+        # run to score a change prefill cannot affect. `get_gen_only_perf`
+        # computes the same column from the same iteration logs with no
+        # anchor at all, so the dependency is gone and the anchor is back
+        # to meaning what it always meant.
         anchor = ctx_json_path(data)
-        stages = sweep.get("stages") or {}
-        ctx_stage = stages.get("ctx") if isinstance(stages, Mapping) else None
-        ctx_enabled = isinstance(ctx_stage, Mapping) and ctx_stage.get("enabled", False)
-        if not ctx_enabled and anchor is None:
-            errors.append(
-                f"a gen track needs a CTX anchor: enable the 'ctx' stage in {path} so "
-                f"the campaign measures its own, or set "
-                f"'{SOL_TRACK_FIELD}.{CTX_JSON_KEY}' to an existing ctx.json. "
-                f"`frontier build` rate-matches the whole curve and refuses without "
-                f"one, which would strand every gen measurement this campaign paid for."
-            )
-            return None
         if anchor is not None and not anchor.is_file():
             errors.append(f"'{SOL_TRACK_FIELD}.{CTX_JSON_KEY}' is not a file: {anchor}")
             return None
     try:
-        return sweep_plan(path, workspace)
+        # The expansion, from the sweep this campaign will actually
+        # submit. Read rather than asked of the harness: `ibc-bench` has
+        # no read-only "what would this submit" command, and the one that
+        # answers -- `submit sweep --dry-run` -- answers by writing a
+        # directory per case, which schema validation may not do. The
+        # agent's own dry-run step re-derives it against the harness
+        # before an allocation is spent.
+        return sweep_plan(sweep)
     except BenchCliError as exc:
-        code = f" [{exc.code}]" if exc.code else ""
-        errors.append(f"`bench-disagg sweep plan` failed{code}: {exc}")
+        errors.append(f"could not expand {path}: {exc}")
         return None
 
 

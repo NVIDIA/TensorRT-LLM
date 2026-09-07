@@ -41,6 +41,7 @@ from .progress import (
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
 from .sol_track import (
+    GEN_TRACK,
     adopt_sweep,
     ctx_json_path,
     has_sol_track,
@@ -1292,11 +1293,26 @@ class PerfOptimizeWorkflow:
             anchor = ctx_json_path(task_data)
             if anchor is not None:
                 # Not discoverable: the campaign measures no ctx stage, so
-                # `frontier build` would refuse without being told where the
-                # rate-match's other half comes from.
+                # the postprocessor would refuse without being told where
+                # the rate-match's other half comes from.
                 directive += (
-                    f"This campaign has no ctx stage, so every `frontier build` must "
-                    f"carry `--ctx-json {anchor}`.\n\n"
+                    f"This campaign has no ctx stage, so every "
+                    f"`ibc-bench process frontier` must carry "
+                    f"`--ctx_json {anchor}`.\n\n"
+                )
+            elif track == GEN_TRACK:
+                # Said here too, not only in the resolved spec: this is the
+                # stage that will be tempted to reach for a frontier, and
+                # borrowing an undeclared anchor is the one mistake whose
+                # output looks exactly like a correct one.
+                directive += (
+                    "This campaign declares **no ctx anchor**, so it scores through "
+                    "`get_gen_only_perf`, not `process frontier`. The gate's metric is "
+                    "unaffected — it has no context term — but there is no end-to-end "
+                    "view here: `output_tput_per_gpu` and `frontier_elasticity` are "
+                    "absent, and no number this campaign produces may be quoted as an "
+                    "end-to-end result. Do not supply an anchor of your own to get "
+                    "one.\n\n"
                 )
             return directive
         return ""

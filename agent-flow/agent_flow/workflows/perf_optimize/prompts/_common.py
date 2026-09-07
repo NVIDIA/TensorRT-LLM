@@ -1245,87 +1245,84 @@ means per role:
 # in one `sol_track` helper for the single thing that CLI has no notion
 # of: this campaign's live tuning file.
 
-#: Steps 4-5 for the gen track. A frontier snapshot *is* the rate-matched
-#: generation curve, so this is the track the CLI scores end to end.
+#: Steps 5-6 for the gen track, which has two scorers. Both compute the
+#: same column by the same formula; they differ in what ELSE they report,
+#: and therefore in whether a CTX anchor is needed at all.
 _SOL_SCORING_GEN = """\
-# 5. Score it.
-bench-disagg frontier build   --workspace $W --select latest
-bench-disagg frontier compare --workspace $W
+# 5. Score it. WHICH command depends on whether `task.yaml` set
+#    `sol_track.ctx_json`. Run the one that matches; the other is not a
+#    fallback.
+#
+#    (a) ctx_json IS set -- the rate-matched frontier, the end-to-end view:
+ibc-bench process frontier -i $R --ctx_json <sol_track.ctx_json> --multi_round 1
+#
+#    (b) ctx_json is NOT set -- the anchor-free extractor:
+python -m ibc_trtllm_harness.process_data.get_gen_only_perf -i $R
+#
+#    Never run (a) with an anchor `task.yaml` did not declare. The one
+#    thing checked about an anchor is that its input length matches this
+#    sweep's; an undeclared anchor was checked against nothing, and a
+#    frontier built on a mismatched one still plots a clean curve --
+#    describing a deployment whose two halves never served one traffic.
 
 # 6. Land the score where every later stage reads results from.
 python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> \\
     --collect <the --result-dir this stage was told to write into>
 
-# `frontier compare` is the gate's input. Read it in this order:
+# The **sol-postprocess** skill is the runbook for 5(a) and worth reading
+# before your first one -- notably that `accept_rate` comes from the run's
+# archived `sweep_config.yaml`, never from a default. The built-in table it
+# replaced was measured 15 % high on one model, and it multiplies the metric
+# linearly with no symptom. 5(b) reads it from that same archived file and
+# refuses without it, for the same reason.
 #
-#   comparable: false        -> not evidence. Stop; say why.
-#   code.mixed: true         -> the curve is built from more than one code
-#                               version, so a delta is not attributable.
-#   from_samples/to_samples  -> a 1-sample point against a 3-sample point is
-#                               not a like-for-like comparison. Say which.
-#   resampled: true          -> the same configuration measured again. That
-#                               is a REPEATABILITY reading, not a result --
-#                               and it is the best noise floor you will get.
-#   delta_pct                -> only now, and only against that floor.
+# What the two do NOT differ in is the gate. `throughput_per_user` is
+# `accept_rate / avg_iteration_time` either way: decode iterations only, no
+# context term, so no ctx measurement can move it. Path (b) is missing the
+# END-TO-END half -- `output_tput_per_gpu`, the ctx:gen ratio, and the
+# `frontier_elasticity` that prices a 1 % gain here against the deployment.
+# On (b) those are ABSENT, not zero and not unchanged, and the result file
+# says so in `e2e_view_absent`. Never quote a number from a (b) campaign as
+# an end-to-end result. In particular `output_tps_per_gen_gpu`, which (b)
+# DOES report, is not that number: it divides by the generation GPUs alone,
+# which makes it always the flattering one.
 #
-# A delta smaller than the repeatability the workspace itself shows is not
-# a result in either direction. If you have no repeatability reading, say
-# the delta is unqualified rather than treating the noise floor as zero.
-#
-# Every point's result JSON also carries `frontier_elasticity`: what a
-# per-cent of `throughput_per_user` is worth at the deployment's real
-# objective, tok/s/GPU. The gate's metric is anchor-free while the
-# frontier's divides by a denominator the context side owns, so the same
-# measured +1 % was worth 0.97 % at concurrency 1 and 0.70 % at 32 on one
-# curve of this very campaign. Quote it when you report a gain; a bare
-# per-cent overstates the high-concurrency end.
-#
-# Step 6 does two translations that are easy to get plausibly wrong by
-# hand, which is why it is a command and not an instruction: the snapshot
-# spells the metric `tps_per_user` while `task.yaml` scores
-# `throughput_per_user`, and a point's concurrency is PER GENERATION
-# SERVER while the result directory is named for the total in flight.
-# Do not hand-write that JSON."""
+# Step 6 reads whichever CSV step 5 wrote and lands it under the name
+# `task.yaml` scores, at the total in flight rather than the row's listed
+# concurrency. Do not hand-write that JSON."""
 
-#: Steps 4-5 for the ctx track, which the CLI does not close. Stated
-#: rather than papered over: `frontier build` selects GEN measurements and
-#: refuses a workspace with none, taking ctx only as its anchor, so a ctx
-#: campaign that ran step 4 would get NO_DATA on a run that measured fine.
+#: Steps 5-6 for the ctx track. No frontier, and running one is an error:
+#: `process frontier` selects GEN measurements and takes ctx as its anchor.
 _SOL_SCORING_CTX = """\
-# 5. Read the score. There is no `frontier` step on this track and running
-#    one is an error, not a shortcut: a snapshot is the rate-matched GEN
-#    curve and takes ctx only as its anchor, so `frontier build` answers
-#    NO_DATA however well the ctx jobs ran. `--cases` above already carries
-#    what is needed -- each case's `result` is the `run_*.json` the backend
-#    VALIDATED the case on, and the field it validated is the number.
+# 5. Nothing to run. There is no `process frontier` on this track -- it
+#    builds the rate-matched GEN curve and takes ctx only as its anchor,
+#    so it answers with an error however well the ctx jobs ran. The score
+#    is already on disk: `performance.request_throughput_req_s` in the
+#    case's `run_*.json`, the field the harness itself validated it on.
 
 # 6. Land the score where every later stage reads results from.
 python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> \\
     --collect <the --result-dir this stage was told to write into>
 
-# Do not hand-write that JSON. It reads `sweep status`, takes each ctx
-# case's `result`, and writes `performance.request_throughput_req_s` under
-# the name `task.yaml` scores -- with `max_batch` as the operating point,
-# because for a prefill-only run that IS the in-flight request count.
-# Writing it yourself is how a number ends up under the wrong key or the
-# wrong concurrency, which reads as a stage that measured nothing."""
+# It reads that `run_*.json` for you and files it at the case's `max_batch`,
+# which for a prefill-only run IS the in-flight request count.
+# Do not hand-write that JSON."""
 
 _SOL_TRACK_SHARED = """\
 ### Per attempt
 
 ```bash
-W=<sol_track.workspace from task.yaml>;  S=<sol_track.sweep from task.yaml>
+S=<workspace>/sweep/<the sweep file>     # this campaign's copy, not the original
+R=<the --result-dir this stage was told to write into>/run
 
-# 0. approach: code ONLY -- build a wheel, once, before any measurement.
-#    Every measurement job installs a wheel if the sweep names one and
-#    compiles the repo only if it does not, so a wheel means ONE build
-#    instead of one per case, and no two jobs racing the same build cache.
-#    Keep CCACHE_DIR fixed across attempts or every build is a full build.
-#    Then put its path in <workspace>/sweep/<stage>.yaml:
-#        trtllm_install: {{trtllm_wheel_path: <the wheel>}}
-#    Identity is the wheel's sha256, so an uncommitted edit still counts as
-#    a different configuration -- and a wheel you forgot to rebuild shows up
-#    as `unchanged_config` in step 5 rather than as a silent wrong number.
+# 0. approach: code ONLY -- declare how the change reaches the workers, in
+#    the sweep. The harness runs whatever the image ships unless you do,
+#    so a source edit alone measures the image and comes back at baseline.
+#    Take the cheapest rung that fits:
+#      trtllm_patch:  single files, applied in-container, seconds, no rebuild
+#      trtllm_install.trtllm_repo:  python-only editable install, minutes
+#      trtllm_install.build_wheel:  full C++ rebuild
+#    Validation refuses `code` against a sweep that names none of them.
 
 # 1. Put the live tuning file into the sweep. Never skip: forgetting it does
 #    not fail, it measures the PREVIOUS attempt's configuration.
@@ -1334,63 +1331,67 @@ W=<sol_track.workspace from task.yaml>;  S=<sol_track.sweep from task.yaml>
 python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace>
 
 # 2. See what you are actually overriding, BEFORE spending an allocation.
-#    --dry-run materializes each case's worker config and queues nothing.
-bench-disagg sweep submit --workspace $W -c $S --dry-run{only}
-#    Then READ the generated config it wrote, under the artifacts root:
-#      <artifacts>/$W/<case>/m-NNNN/<case dir>/{{gen,ctx}}_config.yaml
-#    Your tuning file is a PARTIAL OVERLAY deep-merged onto that file, so
+#    --dry-run materializes every case's worker config and queues nothing.
+ibc-bench submit sweep -m all -c $S -w $R --dry-run
+#    Then READ what it wrote: $R/bm_*/<case>/gen_config.yaml (and ctx_config.yaml).
+#    Your tuning file is a PARTIAL OVERLAY deep-merged onto those, so
 #    "absent from the overlay" does NOT mean "unset" -- the sweep row's
 #    generator writes most of it. Proposing a value a key already holds
 #    costs a whole attempt and measures nothing.
+#    The **check-gen-config** skill lints the sweep's own invariants.
 
-# 3. Measure. Every selected case runs; a prior sample is reported, not
-#    skipped. Add --missing only to recover a partially-submitted attempt.
-bench-disagg sweep submit --workspace $W -c $S{only}
+# 3. Measure.
+ibc-bench submit sweep -m all -c $S -w $R
 
-# 4. Poll until nothing is inflight. There is no wait and no follow, so this
-#    is yours to repeat -- in the FOREGROUND, never a background poll.
-bench-disagg sweep status --workspace $W --cases
-#    Each case also carries `workdir` and `result` -- the artifact the
-#    backend VALIDATED the case on. That is where you read a worker log to
-#    check a change actually engaged, rather than inferring it from a delta.
-#    `<workdir>/**/start_logs/3_output_{{CTX,GEN}}_0.log` is the worker's own
-#    output; a knob the arg model rejected says so there.
-
+# 4. Poll until nothing is inflight -- in the FOREGROUND, never a background
+#    poll. The **check-job** skill diagnoses a hang from the logs; squeue
+#    alone will not tell you a job is stuck at the fill gate.
+ibc-bench jobs check -f $R/bm_*/job_status.csv --summary
 {scoring}
 ```
 
-Every command prints **one JSON envelope** and nothing else: branch on
-`ok` and on `error.code`, never on the message text. Exit 0 means `ok`.
+`-w $R` is not a free choice. The run directory the harness creates is named
+for the workload and the date and **carries no code identity**, so two
+attempts of one campaign submitted into one work dir compute the same name
+and the second overwrites the first. Deriving it from the result directory
+is what keeps them apart.
 
-The measurement record behind each case (`bench-disagg case show`)
-carries `code.worker_overrides` — what the workers were ACTUALLY handed,
-recorded by the tool that handed it to them. That answers "did my tuning
-reach them" directly, rather than by inferring it from a number that
-moved or did not.
+**A measurement nobody wrote down did not happen.** Every later stage — the
+baseline gate first — judges this attempt by whether a JSON under the result
+directory it named carries `{metric}`. Getting all the way to a good number
+and not landing it there is indistinguishable from a campaign that never
+measured, and it stops the run.
 
-**A measurement nobody wrote down did not happen.** Every later stage —
-the baseline gate first — judges this attempt by whether a JSON under the
-result directory it named carries `{metric}`. Getting all the way to a
-good number and not landing it there is indistinguishable from a campaign
-that never measured, and it stops the run.
+**Attribution is yours, and it is not in the numbers.** Nothing in this
+stack records which code produced which measurement — there is no
+configuration fingerprint to compare. So before you call anything an
+improvement, confirm the change reached the workers by reading what was
+served: `$R/bm_*/<case>/gen_config.yaml` for a tuning change, and the
+per-node `trtllm_patch` sha256 manifest beside the case logs for a source
+change. **Never infer "it took effect" from "the number moved."** Say in
+your report which artifact you read; a claim you cannot point at is a claim
+this campaign cannot make.
+
+Report sample counts alongside any delta, and if this workspace holds a
+second measurement of the same configuration, report that repeatability
+first — a delta smaller than it is not a result in either direction.
 
 `CANCELLED` is the **normal** end state for a GEN job: the harness cancels
-its own allocation once the client finishes. Judge a case by whether it
-has a validated measurement, never by its Slurm state.
+its own allocation once the client finishes. Judge a case by whether it has
+a validated measurement, never by its Slurm state.
 
 ### Frozen for this campaign
 
 {frozen}. Those live in the sweep row and appear in the case name; the
-tuning file is an overlay deep-merged *onto* the config that row
-generates. Putting one of them in the overlay fights the row silently --
-it is a REJECT whatever it measured. Everything else in the role config
-is normal `approach: config` work.
+tuning file is an overlay deep-merged *onto* the config that row generates.
+Putting one of them in the overlay fights the row silently -- it is a
+REJECT whatever it measured, and step 1 refuses it outright.
 
 ### Profiling
 
 nsys only, on the {role} workers. torch profiler and ncu have **no path
-through this harness**: record `not available in a SOL track campaign`
-and plan from nsys -- never fabricate a trace.
+through this harness**: record `not available in a SOL track campaign` and
+plan from nsys -- never fabricate a trace.
 """
 
 SOL_TRACK_CTX = """\
