@@ -55,15 +55,15 @@ from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
     get_global_profiler, host_profiler_context)
 
 from ..disaggregation.base.transfer import get_unique_rid
-from ..disaggregation.executor.admission import \
-    DisaggTransferAdmissionController
-from ..disaggregation.executor.coordinator import (DisaggLoopDelegates,
-                                                   DisaggTransferCoordinator,
-                                                   NoopDisaggCoordinator)
-from ..disaggregation.executor.pp_termination import DisaggPPTerminationHandler
-from ..disaggregation.executor.transfer_manager import AsyncTransferManager
 from ..disaggregation.kv_cache_transceiver import (
     KvCacheTransceiver, is_disagg_inflight_cancel_enabled)
+from ..disaggregation.orchestration.admission import \
+    DisaggTransferAdmissionController
+from ..disaggregation.orchestration.coordinator import (
+    DisaggLoopDelegates, DisaggTransferCoordinator, NoopDisaggCoordinator)
+from ..disaggregation.orchestration.pp_termination import \
+    DisaggPPTerminationHandler
+from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..models.modeling_multimodal_mixin import \

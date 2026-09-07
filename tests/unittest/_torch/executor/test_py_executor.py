@@ -21,7 +21,9 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation.executor.admission import DisaggTransferAdmissionController
+from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+    DisaggTransferAdmissionController,
+)
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,

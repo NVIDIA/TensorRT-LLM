@@ -9,8 +9,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.executor import coordinator as coordinator_module
-from tensorrt_llm._torch.disaggregation.executor.coordinator import (
+from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,

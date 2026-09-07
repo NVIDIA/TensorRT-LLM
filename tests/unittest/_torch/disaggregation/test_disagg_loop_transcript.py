@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.executor.coordinator import (
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
 )
