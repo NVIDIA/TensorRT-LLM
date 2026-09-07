@@ -10,13 +10,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine.runners import (
-    apply_position_id_offset,
-    get_padding_params,
-    get_top_level_model,
-    resolve_runner_type,
-)
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_cache as no_cache_module
+from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
     PreparedInputs,
     RunnerConfig,
@@ -28,6 +23,9 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import (
     NoCacheRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
@@ -154,6 +152,81 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     assert resolve_runner_type(_model(is_generation=False), args) is MultimodalEncoderRunner
 
 
+def test_model_engine_initializes_no_cache_runner_by_family() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    expected = Mock(spec=NoCacheRunner)
+    engine._initialize_no_cache_runner = Mock(return_value=expected)
+
+    assert engine._initialize_runner(NoCacheRunner) is expected
+    engine._initialize_no_cache_runner.assert_called_once_with(NoCacheRunner)
+
+
+def test_model_engine_rejects_unregistered_runner_family() -> None:
+    class UnregisteredRunner:
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+
+    with pytest.raises(TypeError, match="No runner initializer registered"):
+        engine._initialize_runner(UnregisteredRunner)
+
+
+def _model_engine_with_runner(
+    runner: Mock,
+    *,
+    kv_cache_manager: object | None,
+) -> tuple[PyTorchModelEngine, Mock]:
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = SimpleNamespace(extra_attrs={})
+    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine._runner = runner
+    engine.cuda_graph_lora_manager = None
+    engine.runtime_draft_len = 0
+    engine.moe_load_balancer = None
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = kv_cache_manager
+    return engine, resource_manager
+
+
+def test_model_engine_forward_delegates_to_resolved_runner() -> None:
+    runner = Mock(spec=NoCacheRunner)
+    expected_outputs = {"logits": object()}
+    runner.forward.return_value = expected_outputs
+    engine, resource_manager = _model_engine_with_runner(
+        runner,
+        kv_cache_manager=None,
+    )
+    batch = ScheduledRequests()
+
+    actual_outputs = engine.forward(batch, resource_manager)
+
+    assert actual_outputs is expected_outputs
+    runner.forward.assert_called_once_with(
+        batch,
+        resource_manager=resource_manager,
+        cuda_graph_lora_manager=None,
+        runtime_draft_len=0,
+        moe_load_balancer=None,
+        gather_context_logits=False,
+    )
+
+
+def test_model_engine_rejects_kv_manager_with_no_cache_runner() -> None:
+    runner = Mock(spec=NoCacheRunner)
+    engine, resource_manager = _model_engine_with_runner(
+        runner,
+        kv_cache_manager=object(),
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match="no-cache runner was initialized, but a KV cache manager was allocated",
+    ):
+        engine.forward(ScheduledRequests(), resource_manager)
+
+    runner.forward.assert_not_called()
+
+
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
     kwargs = {"input_ids": torch.tensor([1])}
     prepared = PreparedInputs(kwargs)
@@ -177,38 +250,6 @@ def test_concrete_runners_implement_no_cache_forward_step(
 ) -> None:
     assert issubclass(runner_type, NoCacheRunner)
     assert runner_type._forward_step is not NoCacheRunner._forward_step
-
-
-@pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
-def test_runner_wraps_prepared_input_dict_without_copying(
-    runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    kwargs = {"input_ids": torch.tensor([1])}
-    gather_ids = torch.tensor([0])
-    monkeypatch.setattr(
-        no_cache_module,
-        "prepare_no_cache_inputs",
-        Mock(return_value=(kwargs, gather_ids)),
-    )
-    deps = _deps()
-    runner = _make_runner(runner_type, _model(is_generation=False), deps)
-    runner._attn_metadata = SimpleNamespace()
-    lora_manager = object()
-
-    prepared = runner.prepare_inputs(
-        SimpleNamespace(),
-        resource_manager=SimpleNamespace(),
-        cuda_graph_lora_manager=lora_manager,
-        runtime_draft_len=3,
-    )
-
-    assert prepared.kwargs is kwargs
-    assert prepared.gather_ids is gather_ids
-    call_kwargs = no_cache_module.prepare_no_cache_inputs.call_args.kwargs
-    assert call_kwargs["lora"] is deps.lora
-    assert call_kwargs["cuda_graph_lora_manager"] is lora_manager
-    assert call_kwargs["runtime_draft_len"] == 3
 
 
 def test_no_cache_runner_owns_and_reuses_attention_metadata() -> None:
@@ -321,6 +362,21 @@ def test_pooling_runner_owns_forward_output_processing(
     )
 
 
+def test_pooling_runner_returns_raw_model_outputs_when_logits_are_disabled() -> None:
+    model_outputs = {"hidden_states": object()}
+    model_forward = Mock(return_value=model_outputs)
+    runner = _make_runner(
+        PoolingRunner,
+        _model(is_generation=False),
+        _deps(model_forward=model_forward),
+        replace(_config(), without_logits=True),
+    )
+
+    outputs = runner._forward_step({}, SimpleNamespace())
+
+    assert outputs is model_outputs
+
+
 @pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
 def test_pooling_runner_warmup_and_capture_are_noops(
     runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
@@ -387,37 +443,55 @@ def test_mm_encoder_runner_forward_step_skips_metadata_only_and_missing_length_r
     torch.testing.assert_close(result["mm_embeddings"][0], torch.arange(4).reshape(2, 2))
 
 
-def test_padding_params_preserve_existing_cases() -> None:
-    assert get_padding_params(
-        129,
-        1,
-        None,
-        dist=None,
-        enable_attention_dp=False,
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
-        prefill_cuda_graph_num_tokens=[128, 256, 512],
-    ) == (256, True, None)
+def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> None:
+    first_param = SimpleNamespace(
+        multimodal_data={
+            "image": object(),
+            "mrope_config": {
+                "mrope_position_ids": "first-ids",
+                "mrope_position_deltas": "first-deltas",
+            },
+        }
+    )
+    second_param = SimpleNamespace(
+        multimodal_data={
+            "image": object(),
+            "mrope_config": {
+                "mrope_position_ids": "second-ids",
+                "mrope_position_deltas": "second-deltas",
+            },
+        }
+    )
+    requests = [
+        SimpleNamespace(
+            py_multimodal_data={
+                "image": object(),
+                "multimodal_embedding_lengths": [1],
+            },
+            multimodal_lengths=[1],
+        ),
+        SimpleNamespace(
+            py_multimodal_data={
+                "image": object(),
+                "multimodal_embedding_lengths": [2],
+            },
+            multimodal_lengths=[2],
+        ),
+    ]
+    embeddings = torch.arange(6).reshape(3, 2)
+    model = SimpleNamespace(forward=Mock(return_value=[embeddings]))
+    runner = _make_runner(MultimodalEncoderRunner, model)
 
+    result = runner._forward_step(
+        {"multimodal_params": [first_param, second_param]},
+        SimpleNamespace(context_requests=requests),
+    )
 
-def test_padding_params_requires_dist_for_attention_dp() -> None:
-    with pytest.raises(AssertionError, match="attention DP requires"):
-        get_padding_params(
-            129,
-            1,
-            [129],
-            dist=None,
-            enable_attention_dp=True,
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
-            prefill_cuda_graph_num_tokens=[128, 256, 512],
-        )
-
-
-def test_position_offset_helpers_preserve_identity_and_unwrap_models() -> None:
-    position_ids = [0, 1]
-    model_without_offset = SimpleNamespace()
-    top_level = SimpleNamespace(position_id_offset=2)
-    wrapped = SimpleNamespace(_orig_mod=SimpleNamespace(model=SimpleNamespace(_orig_mod=top_level)))
-
-    assert apply_position_id_offset(position_ids, model=model_without_offset) is position_ids
-    assert get_top_level_model(wrapped) is top_level
-    assert apply_position_id_offset(position_ids, model=wrapped) == [2, 3]
+    model.forward.assert_called_once_with([first_param, second_param])
+    assert result["logits"] is None
+    assert result["mm_embedding_request_indices"] == [0, 1]
+    assert result["mm_embedding_lengths"] == [[1], [2]]
+    torch.testing.assert_close(result["mm_embeddings"][0], embeddings[:1])
+    torch.testing.assert_close(result["mm_embeddings"][1], embeddings[1:])
+    assert result["mrope_position_ids"] == ["first-ids", "second-ids"]
+    assert result["mrope_position_deltas"] == ["first-deltas", "second-deltas"]

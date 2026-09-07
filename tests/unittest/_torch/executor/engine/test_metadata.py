@@ -153,3 +153,53 @@ def test_update_spec_metadata_handles_parallel_draft_and_dynamic_tree() -> None:
         spec_tree_manager=spec_tree_manager,
         num_contexts=1,
     )
+
+
+def test_update_spec_metadata_uses_non_parallel_limits_for_draft_model() -> None:
+    spec_mode = SimpleNamespace(
+        attention_need_spec_dec_mode=Mock(return_value=False),
+        is_parallel_draft=Mock(return_value=False),
+    )
+    spec_metadata = SimpleNamespace(
+        spec_dec_mode=spec_mode,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+    )
+    scheduled_requests = SimpleNamespace(
+        batch_size=1,
+        num_context_requests=0,
+        context_requests=[],
+        generation_requests=[object()],
+    )
+    attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
+    spec_tree_manager = SimpleNamespace(
+        use_dynamic_tree=True,
+        slot_storage=SimpleNamespace(fill_all_slot_ids=Mock()),
+    )
+
+    update_spec_metadata(
+        spec_metadata,
+        scheduled_requests,
+        attn_metadata,
+        spec_tree_manager,
+        runtime_draft_len=2,
+        runtime_tokens_per_gen_step=3,
+        is_draft_model=True,
+        attention_backend=_AttentionBackend,
+        original_max_draft_len=4,
+        original_max_total_draft_tokens=8,
+        spec_dec_max_total_draft_tokens=6,
+    )
+
+    spec_tree_manager.slot_storage.fill_all_slot_ids.assert_not_called()
+    attn_metadata.update_spec_dec_param.assert_called_once_with(
+        batch_size=1,
+        is_spec_decoding_enabled=False,
+        is_spec_dec_tree=False,
+        is_spec_dec_dynamic_tree=False,
+        max_draft_len=4,
+        max_total_draft_tokens=6,
+        spec_metadata=spec_metadata,
+        spec_tree_manager=spec_tree_manager,
+        num_contexts=0,
+    )

@@ -1435,13 +1435,15 @@ class PyTorchModelEngine(ModelEngine):
             self._runner.warmup(resource_manager)
             self._runner.capture_graphs(resource_manager)
             return
-        assert kv_cache_manager is not None, (
-            "the legacy runner requires a KV cache manager")
 
         # Only the advanced-sampling CUDA graph capture pass exercises the
         # non-greedy sampler. Without this warmup, flashinfer's sampling kernels
         # would be JIT-built mid-serving when cuda_graph_config is None.
         warmup_sampling_module()
+
+        if kv_cache_manager is None:
+            logger.info("Skipping warm up as no KV Cache manager allocated.")
+            return
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.

@@ -25,9 +25,6 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
-from tensorrt_llm._torch.pyexecutor.engine.runners import \
-    prepare_multimodal_indices
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import NoCacheRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -100,18 +97,6 @@ class DummyModel(torch.nn.Module):
         self.recorded_position_ids = kwargs["position_ids"]
         batch_size = input_ids.size(0)
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
-
-
-class DummyMultimodalIndexModel(torch.nn.Module):
-
-    class Config:
-        vocab_size = 100
-
-    config = Config()
-
-    @property
-    def multimodal_token_ids(self) -> torch.Tensor:
-        return torch.tensor([90, 91], dtype=torch.int32)
 
 
 class DummyLegacyMultimodalIndexModel(MultimodalModelMixin, torch.nn.Module):
@@ -298,27 +283,6 @@ def _make_forward_only_engine(
 
     resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
-
-
-def test_runner_initializer_dispatches_no_cache_runner_explicitly() -> None:
-    engine = object.__new__(PyTorchModelEngine)
-    expected = Mock(spec=NoCacheRunner)
-    engine._initialize_no_cache_runner = Mock(return_value=expected)
-
-    assert engine._initialize_runner(NoCacheRunner) is expected
-    engine._initialize_no_cache_runner.assert_called_once_with(NoCacheRunner)
-
-
-def test_runner_initializer_rejects_unregistered_runner_type() -> None:
-
-    class UnregisteredRunner:
-        pass
-
-    engine = object.__new__(PyTorchModelEngine)
-
-    with unittest.TestCase().assertRaisesRegex(
-            TypeError, "No runner initializer registered"):
-        engine._initialize_runner(UnregisteredRunner)
 
 
 def create_model_engine_and_kvcache(
@@ -898,45 +862,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                                                      promoted_ids, None, False)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
-
-    def test_no_cache_forward_delegates_to_resolved_runner(self) -> None:
-        engine, _, _, _, _ = _make_forward_only_engine(None)
-        engine._runner = Mock(return_value=None)
-        expected_outputs = {"logits": object()}
-        engine._runner.forward.return_value = expected_outputs
-        resource_manager = Mock()
-        resource_manager.get_resource_manager.return_value = None
-        batch = ScheduledRequests()
-
-        actual_outputs = engine.forward(batch, resource_manager)
-
-        self.assertIs(actual_outputs, expected_outputs)
-        engine._runner.forward.assert_called_once_with(
-            batch,
-            resource_manager=resource_manager,
-            cuda_graph_lora_manager=None,
-            runtime_draft_len=0,
-            moe_load_balancer=None,
-            gather_context_logits=False,
-        )
-        engine._set_up_attn_metadata.assert_not_called()
-        engine._set_up_spec_metadata.assert_not_called()
-        engine._get_draft_kv_cache_manager.assert_not_called()
-        engine._prepare_inputs.assert_not_called()
-
-    def test_forward_rejects_kv_manager_with_no_cache_runner(self) -> None:
-        engine, _, resource_manager, _, _ = _make_forward_only_engine(None)
-        engine._runner = Mock(spec=NoCacheRunner)
-        batch = ScheduledRequests()
-
-        with self.assertRaisesRegex(
-                AssertionError,
-                "no-cache runner was initialized, but a KV cache manager was allocated",
-        ):
-            engine.forward(batch, resource_manager)
-
-        engine._set_up_attn_metadata.assert_not_called()
-        engine._runner.forward.assert_not_called()
 
     def test_forward_commits_candidate_only_on_graph_hit(self) -> None:
         key = KeyType(batch_size=2, draft_len=0, is_first_draft=False)
@@ -1601,24 +1526,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
-
-    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
-        model = DummyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = prepare_multimodal_indices(
-            [1, 90, 2, 91, 3], model=model)
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
-
-    def test_prepare_multimodal_indices_uses_legacy_token_ids(self) -> None:
-        model = DummyLegacyMultimodalIndexModel()
-
-        text_indices, multimodal_indices = prepare_multimodal_indices(
-            [1, 90, 2, 91, 3], model=model)
-
-        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
-        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:

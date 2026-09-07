@@ -206,6 +206,28 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         warmup_sampling.assert_not_called()
 
+    def test_legacy_warmup_skips_without_kv_cache(self):
+        model_engine = object.__new__(PyTorchModelEngine)
+        model_engine.moe_load_balancer = None
+        model_engine.is_warmup = False
+        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        model_engine._runner = None
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = None
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"
+            ) as warmup_sampling,
+            _capture_tllm_logs() as logs,
+        ):
+            model_engine.warmup(resource_manager)
+
+        self.assertTrue(
+            any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
+        )
+        warmup_sampling.assert_called_once_with()
+
     def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
         """Enc-dec encoder warmup is deferred and runs as two passes."""
         model_engine = object.__new__(PyTorchModelEngine)
