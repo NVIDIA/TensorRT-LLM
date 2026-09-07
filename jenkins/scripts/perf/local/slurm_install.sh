@@ -21,7 +21,13 @@ slurm_build_wheel() {
         fi
 
         echo "Building wheel on node ${SLURM_NODEID:-0}, task ${SLURM_LOCALID:-0}"
-        retry_command bash -c "cd $llmSrcNode && rm -rf .venv-3.12 && python3 ./scripts/build_wheel.py --use_ccache --cuda_architectures '100-real' --clean -c"
+        # Build for every Blackwell datacenter arch this harness runs on, not just
+        # SM100. GB300/B300 are SM103, and a wheel built for '100-real' alone is
+        # configured with -DEXCLUDE_SM_103, which drops the Sm103a trtllm-gen
+        # cubins entirely. On SM103 the kernel lookup then misses, and because
+        # isSMCompatible() accepts only kSM_103 or kSM_100f for a SM103 device, an
+        # sm100a cubin can never stand in for the missing one.
+        retry_command bash -c "cd $llmSrcNode && rm -rf .venv-3.12 && python3 ./scripts/build_wheel.py --use_ccache --cuda_architectures '100-real;103-real' --clean -c"
 
         cd $jobWorkspace
         echo "(Writing build wheel lock) Lock file: $build_lock_file"
