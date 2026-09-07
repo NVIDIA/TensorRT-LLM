@@ -68,6 +68,19 @@ _EXPERT_WEIGHT_NAMES = (
 )
 
 
+def _release_during_rollback(resource, what: str) -> None:
+    """Release a partially built resource without masking the in-flight error.
+
+    Rollback runs while an exception is propagating. A raise from ``release()``
+    would replace that exception, so the caller would see the cleanup failure
+    instead of the reason setup failed.
+    """
+    try:
+        resource.release()
+    except BaseException:  # noqa: BLE001 - cleanup must never mask the original
+        logger.exception(f"[DWDP Setup] {what} release failed during rollback")
+
+
 def setup_dwdp(
     model: nn.Module,
     mapping,
@@ -219,8 +232,8 @@ def setup_dwdp(
             dwdp_size=mapping.dwdp_size,
             device_id=device_id,
         )
-    except Exception:
-        transport.release()
+    except BaseException:
+        _release_during_rollback(transport, "transport")
         raise
     logger.info("[DWDP Setup] Weight buffer created successfully.")
 
@@ -235,9 +248,9 @@ def setup_dwdp(
             local_end=local_end,
             peer_ranges=peer_ranges,
         )
-    except Exception:
-        weight_buffer.release()
-        transport.release()
+    except BaseException:
+        _release_during_rollback(weight_buffer, "weight buffer")
+        _release_during_rollback(transport, "transport")
         raise
     logger.info("[DWDP Setup] Edge bytes filled.")
 
@@ -254,9 +267,9 @@ def setup_dwdp(
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
         )
-    except Exception:
-        weight_buffer.release()
-        transport.release()
+    except BaseException:
+        _release_during_rollback(weight_buffer, "weight buffer")
+        _release_during_rollback(transport, "transport")
         raise
     # Transfer resource ownership before backend fixup so every later failure
     # can be rolled back through one idempotent manager release.
@@ -276,8 +289,8 @@ def setup_dwdp(
             num_experts_per_worker=num_experts_per_worker,
             peer_ranges=peer_ranges,
         )
-    except Exception:
-        weight_manager.release()
+    except BaseException:
+        _release_during_rollback(weight_manager, "weight manager")
         raise
     logger.info("[DWDP Setup] MoE backends patched.")
 
@@ -318,8 +331,16 @@ def teardown_dwdp(
     ):
         managers.append(expected_manager)
 
+    first_error = None
     for manager in managers:
-        manager.release()
+        try:
+            manager.release()
+        except BaseException as exc:  # noqa: BLE001 - every manager must be tried
+            logger.exception("[DWDP Teardown] Manager release failed")
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 # ---------------------------------------------------------------------------

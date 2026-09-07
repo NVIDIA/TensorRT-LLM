@@ -523,12 +523,21 @@ class DWDPWeightManager:
         # before unmapping it.
         torch.cuda.synchronize(self._weight_buffer.device_id)
         self._peer_views.clear()
-        self._weight_buffer.release()
-        if self._transport is not None:
-            self._transport.release()
-            self._transport = None
-        self._batched_copy_plans.clear()
-        self._released = True
+        try:
+            self._weight_buffer.release()
+        finally:
+            # The transport owns MNNVL handles that outlive the process, so free
+            # them even when the buffer release raises; the buffer error stays in
+            # flight. Mark released either way so __del__ does not retry a call
+            # that just failed.
+            if self._transport is not None:
+                try:
+                    self._transport.release()
+                except Exception:  # noqa: BLE001 - must not mask the buffer error
+                    logger.exception("[DWDPWeightManager] Transport release failed")
+                self._transport = None
+            self._batched_copy_plans.clear()
+            self._released = True
 
     def __del__(self) -> None:
         """Best-effort fallback for callers that miss explicit teardown."""
