@@ -77,20 +77,28 @@ its own scoring or transform kernels. Compression can affect accuracy and output
 quality; the exact trade-off depends on the method, its settings, and the
 workload, and must be validated before deployment.
 
-TensorRT-LLM exposes three related but distinct KV-cache paths. The KV cache
-compression framework (configured through `KvCacheCompressionConfig`) selects
-the compression method and its algorithm-specific policy. Active KV-cache
-management (configured through `KvCacheConfig`) controls cache capacity, levels,
-reuse, offloading, Page lifetime, and the active KV dtype, including
-lower-precision active KV-cache quantization; see
-[Quantization](quantization.md). The Sparse Attention framework (configured
-through `SparseAttentionConfig`) controls how Attention selects or processes KV
-during model forward computation, including token eviction, token selection,
-and masking or skipping low-contribution work; see
-[Sparse Attention](sparse-attention.md). These paths select distinct execution
-flows. A concrete compression method must understand the cache layout it
-transforms; it can preserve unsupported or non-Attention state losslessly, or
-reject a layout that it cannot handle.
+TensorRT-LLM exposes three related but distinct KV-cache paths.
+
+The [Sparse Attention](sparse-attention.md) framework (configured through
+`SparseAttentionConfig`) supports token eviction, token selection, and masking
+or skipping low-contribution work. These operations run within prefill or
+generation forward computation and change which KV entries Attention retains or
+processes.
+
+Active KV-cache management (configured through `KvCacheConfig`) controls cache
+capacity, levels, reuse, offloading, Page lifetime, and the active KV dtype.
+Selecting a lower-precision dtype enables active KV-cache quantization, which
+keeps the GPU KV cache in that format and reads or writes it as part of each
+forward step; see [Quantization](quantization.md).
+
+The KV cache compression framework (configured through
+`KvCacheCompressionConfig`) selects a compression method and its
+algorithm-specific policy. Its methods run at stable cache-lifecycle boundaries
+outside model forward computation, such as between forward steps or when a Page
+moves across cache tiers. These paths select distinct execution flows. A
+concrete compression method must understand the cache layout it transforms; it
+can preserve unsupported or non-Attention state losslessly, or reject a layout
+that it cannot handle.
 
 ## When Compression Runs
 
