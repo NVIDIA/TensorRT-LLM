@@ -35,9 +35,8 @@ from tensorrt_llm.llmapi import (
     AttentionDpConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     DFlashDecodingConfig, DSparkDecodingConfig, Eagle3DecodingConfig,
     KvCacheConfig, MambaStateConfig, MiniMaxM3SparseAttentionConfig, MoeConfig,
-    MTPDecodingConfig, PrefillCudaGraphBackend, SADecodingConfig,
-    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
-    SAEnhancerConfig, TorchCompileConfig)
+    MTPDecodingConfig, PrefillCudaGraphBackend, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
