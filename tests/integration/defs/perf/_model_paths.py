@@ -100,6 +100,8 @@ MODEL_PATH_DICT = {
     "minimax_m2.5_fp8": "MiniMax-M2.5",
     # MiniMax M3 (block-sparse MoE, MXFP8 weights, BF16 activations + KV cache)
     "minimax_m3_mxfp8": "MiniMax-M3-MXFP8",
+    # MiniMax-M3 NVFP4: MXFP8 base layers with NVFP4 routed experts
+    "minimax_m3_fp4": "MiniMax-M3-NVFP4",
     # Qwen3.5 dense + MoE
     "qwen3.5_9b": "Qwen3.5-9B",
     "qwen3.5_27b": "Qwen3.5-27B",
