@@ -28,36 +28,23 @@ environment variable as follows:
 | 1                               | Affinity is unconditionally auto-configured.                                                                                 |
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
-The mask is not applied to the main thread alone, which would leave threads
-created earlier (for example by MPI or communication libraries) on their
-original mask. TensorRT LLM makes a best-effort attempt to apply the mask to
-each TID returned by a single `/proc/self/task` enumeration. Threads created
-concurrently may not be observed. Threads created after their creator is
-rebound normally inherit the creator's then-current affinity mask.
+The mask is applied to each TID from a single `/proc/self/task` enumeration,
+not to the main thread alone, so threads created earlier (for example by MPI
+or communication libraries) are covered too. This is best effort: threads
+created concurrently may not be observed, and threads created later normally
+inherit their creator's mask.
 
-### Deployments where the worker shares a process
-
-In some configurations the worker does not get a process of its own. In these
-configurations, the single-snapshot best-effort sweep spans the hosting
-process, so observed non-worker TIDs may also be rebound -- an HTTP server's
-event loop, a request coordinator, or an application's own threads:
-
-- a single-process TP1 worker on the classic IPC executor, selected by
-  `gather_generation_logits=True` or by `TLLM_WORKER_USE_SINGLE_PROCESS=1`.
-  This does not apply to the Ray orchestrator, which runs the worker in a
-  dedicated actor process, nor to the RPC orchestrator, which creates a proxy;
-- rank 0 of an externally supplied `MpiCommSession`, which runs the worker on
-  a thread pool of the submitting process;
-- rank 0 of an external-launch VisualGen deployment, which also hosts the
-  request coordinator and, under `trtllm-serve`, the HTTP server;
-- the MGMN leader process started by `trtllm-llmapi-launch`, which hosts
-  rank 0's engine alongside the MPI session server.
-
-The original mask is not restored when the worker shuts down. To opt out, set
-`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` in the launch environment: before
-constructing `LLM` or `VisualGen`, before creating an `MpiSession`, and before
-starting MPI ranks. It is read during worker start-up, so setting it later has
-no effect.
+Where the worker does not get a process of its own, the sweep spans the
+hosting process, so observed non-worker TIDs may also be rebound -- an HTTP
+server's event loop, a request coordinator, or the application's own threads.
+That applies to a single-process TP1 worker on the classic IPC executor
+(`gather_generation_logits=True` or `TLLM_WORKER_USE_SINGLE_PROCESS=1`, but
+not the Ray or RPC orchestrators), rank 0 of an externally supplied
+`MpiCommSession`, rank 0 of an external-launch VisualGen deployment, and the
+MGMN leader started by `trtllm-llmapi-launch`. The original mask is not
+restored at shutdown; to opt out, set `TLLM_NUMA_AWARE_WORKER_AFFINITY=0` in
+the launch environment, before `LLM`/`VisualGen`, an `MpiSession` or MPI ranks
+start.
 
 ## Other environmental considerations
 

@@ -641,24 +641,21 @@ def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
 
     sched_setaffinity(pid) only binds the main thread, so threads created
     earlier (MPI, communication and I/O helpers) would keep their old mask.
-
-    Makes a best-effort attempt to apply the mask to each TID returned by a
-    single `/proc/self/task` enumeration. Threads created concurrently may not
-    be observed. Threads created after their creator is rebound normally
-    inherit the creator's then-current affinity mask.
+    The mask is applied to each TID from a single `/proc/self/task`
+    enumeration: threads created concurrently may not be observed, and threads
+    created later normally inherit their creator's mask.
 
     Args:
         cpus: The logical CPU ids to bind to. Must not be empty.
 
     Returns:
-        `(bound, attempted)`: the number of threads that were successfully
-        bound, and the number of live threads the call was attempted on.
-        Threads that exit while `/proc/self/task` is being walked count
-        towards neither, so `(0, 0)` means nothing was rebound.
+        `(bound, attempted)`: threads successfully bound, and live threads the
+        call was attempted on. Threads that exit during the walk count towards
+        neither, so `(0, 0)` means nothing was rebound.
     """
     if not cpus:
-        # sched_setaffinity() rejects an empty mask with EINVAL, so silently
-        # applying one would leave every thread on its previous mask.
+        # sched_setaffinity() rejects an empty mask with EINVAL, which would
+        # leave every thread on its previous mask.
         logger.warning("Refusing to apply an empty CPU affinity mask; the "
                        "affinity of this process is left unchanged.")
         return 0, 0
@@ -673,8 +670,8 @@ def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
     try:
         tids = os.listdir("/proc/self/task")
     except OSError as e:
-        # isdir() succeeding does not guarantee the listing succeeds. Affinity
-        # is a performance knob, so degrade instead of failing worker startup.
+        # isdir() succeeding does not guarantee the listing does. Affinity is
+        # a performance knob, so degrade instead of failing worker startup.
         logger.warning(f"Could not enumerate /proc/self/task ({e}). The CPU "
                        f"affinity of this process is left unchanged.")
         return 0, 0
@@ -711,14 +708,11 @@ def configure_cpu_affinity(device_id: int) -> None:
         device_id: The CUDA device ID to determine optimal CPU affinity.
 
     Note:
-        The mask is not applied to the main thread alone. A best-effort
-        attempt is made to apply it to each TID returned by a single
-        `/proc/self/task` enumeration; threads created concurrently may not be
-        observed, and threads created after their creator is rebound normally
-        inherit the creator's then-current affinity mask. Where the worker
-        shares a process with caller code, threads that do not belong to the
-        worker are rebound too, and the original mask is not restored when the
-        worker shuts down.
+        The mask is applied to every thread observed at this point, not to the
+        main thread alone; see `_set_affinity_all_threads` for the exact
+        contract. Where the worker shares a process with caller code, threads
+        that do not belong to the worker are rebound too, and the mask is not
+        restored at shutdown.
         If the process already has constrained affinity, a warning is logged.
         Configuration is handled as follows:
             TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
