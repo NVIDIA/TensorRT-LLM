@@ -28,16 +28,32 @@ environment variable as follows:
 | 1                               | Affinity is unconditionally auto-configured.                                                                                 |
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
-The affinity is applied to every thread that exists at the configuration
-point, including threads created earlier (for example by MPI or communication
-libraries). Threads created afterwards inherit the affinity of the thread that
-creates them.
+The mask is not applied to the main thread alone, which would leave threads
+created earlier (for example by MPI or communication libraries) on their
+original mask. TensorRT LLM makes a best-effort attempt to apply the mask to
+each TID returned by a single `/proc/self/task` enumeration. Threads created
+concurrently may not be observed. Threads created after their creator is
+rebound normally inherit the creator's then-current affinity mask.
 
-In deployments where the worker shares a process with caller code -- a
-single-process TP1 worker, an externally supplied MPI communicator session, or
-the leader process of a multi-node launch -- every thread of that process is
-affected, including threads that do not belong to the worker. Set
-`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` to leave the affinity untouched.
+### Deployments where the worker shares a process
+
+In some configurations the worker does not get a process of its own. There,
+every thread of the hosting process is rebound, including threads that do not
+belong to the worker -- an HTTP server's event loop, a request coordinator, or
+an application's own threads:
+
+- a single-process TP1 worker, selected by `gather_generation_logits=True` or
+  by `TLLM_WORKER_USE_SINGLE_PROCESS=1`;
+- rank 0 of an externally supplied `MpiCommSession`, which runs the worker on
+  a thread pool of the submitting process;
+- rank 0 of an external-launch VisualGen deployment, which also hosts the
+  request coordinator and, under `trtllm-serve`, the HTTP server;
+- the leader process of a multi-node launch, which hosts rank 0's engine
+  alongside the MPI session server.
+
+The original mask is not restored when the worker shuts down. To opt out, set
+`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` before the worker starts; it is read
+during worker start-up, so setting it afterwards has no effect.
 
 ## Other environmental considerations
 

@@ -637,16 +637,15 @@ def get_numa_aware_cpu_affinity(device_id):
 
 
 def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
-    """Bind every thread that exists when this is called to `cpus`.
+    """Best-effort bind of this process's threads to `cpus`.
 
     sched_setaffinity(pid) only binds the main thread, so threads created
     earlier (MPI, communication and I/O helpers) would keep their old mask.
 
-    `/proc/self/task` is a snapshot, so the guarantee is bounded: a thread
-    created during the walk by a thread that has not been rebound yet keeps
-    the old mask and is never visited. Threads created after the walk inherit
-    the mask of the thread that creates them, so they are covered once their
-    creator is bound.
+    Makes a best-effort attempt to apply the mask to each TID returned by a
+    single `/proc/self/task` enumeration. Threads created concurrently may not
+    be observed. Threads created after their creator is rebound normally
+    inherit the creator's then-current affinity mask.
 
     Args:
         cpus: The logical CPU ids to bind to. Must not be empty.
@@ -712,10 +711,14 @@ def configure_cpu_affinity(device_id: int) -> None:
         device_id: The CUDA device ID to determine optimal CPU affinity.
 
     Note:
-        The affinity is applied to every thread that exists at this point, not
-        only the main thread; threads created afterwards inherit the mask of
-        the thread that creates them. Where the worker shares a process with
-        caller code, that includes threads which do not belong to the worker.
+        The mask is not applied to the main thread alone. A best-effort
+        attempt is made to apply it to each TID returned by a single
+        `/proc/self/task` enumeration; threads created concurrently may not be
+        observed, and threads created after their creator is rebound normally
+        inherit the creator's then-current affinity mask. Where the worker
+        shares a process with caller code, threads that do not belong to the
+        worker are rebound too, and the original mask is not restored when the
+        worker shuts down.
         If the process already has constrained affinity, a warning is logged.
         Configuration is handled as follows:
             TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
