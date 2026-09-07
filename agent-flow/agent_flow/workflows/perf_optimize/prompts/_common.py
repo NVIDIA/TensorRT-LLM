@@ -977,12 +977,20 @@ describes that build — the round changed nothing about it.
 Run B's "top 3–6 stems, never profile every kernel blindly" rule is
 superseded — this task pays for breadth:
 
-- **Enumerate from the fresh nsys `cuda_gpu_kern_sum`**: every kernel at
-  or above **{min_share_pct}%** of profiled GPU time gets a ledger row;
-  when those rows sum below **{coverage_target_pct}%**, keep taking the
-  next-largest kernels until the target is covered. Roll everything
-  below the cut into a single explicit `other` share — recorded, never
-  silently dropped.
+- **Enumerate from the fresh nsys timeline decomposition**: every
+  kernel at or above **{min_share_pct}%** of in-window GPU time gets a
+  ledger row; when those rows sum below **{coverage_target_pct}%**, keep
+  taking the next-largest kernels until the target is covered. Roll
+  everything below the cut into a single explicit `other` share —
+  recorded, never silently dropped. What this supersedes is Run B's
+  *breadth* (3–6 stems), never its *source*: rank from `nsys_analysis/`
+  — `cat_full.json`'s `per_category` and `matched_kernels`, plus
+  `opgroup.json` / `module_slice.json` for the residual — because
+  `cuda_gpu_kern_sum` sums overlapping streams over the whole capture
+  while the decomposition is a union clipped to the iteration window,
+  and the two rank kernels differently. Where the pipeline could not
+  run, `kern_sum` is the honest fallback — say so in the ledger's
+  `source`.
 - **Group where the disposition is genuinely shared**: closely related
   kernels (e.g. a family of small elementwise/cast variants between the
   same producers and consumers) may share one row, with the members
@@ -1097,7 +1105,7 @@ exact shape:
 
 ```yaml
 version: 1
-source: rounds/round_<n>/analysis/nsys_stats.txt   # the kern_sum you enumerated
+source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
   other_share_pct: 3.2          # the explicit below-bar tail (they must total ~100)
@@ -1105,7 +1113,7 @@ coverage:
 kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
-    share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
+    share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
     ncu:                                # metrics mapping (or the string below)
       duration_us: 41.2
       sm_sol_pct: 12.1

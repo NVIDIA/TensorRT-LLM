@@ -565,15 +565,38 @@ def test_reporter_carries_the_trajectory_section():
 def test_reporter_carries_the_kernel_comparison():
     prompt = _norm(REPORTER_SYSTEM_PROMPT)
     assert "Kernel-Level Comparison" in prompt
-    # Grounded in the analyzer rounds' nsys artifacts...
+    # Grounded in the analyzer rounds' nsys artifacts. The kernel table
+    # still comes from `kern_sum` — it is the only per-kernel artifact
+    # carrying call counts — but it is a sum across overlapping streams
+    # over the whole capture, so it carries the relative before/after
+    # shift and the iteration budget carries the magnitude.
     assert "cuda_gpu_kern_sum" in prompt
     assert "nsys_stats.txt" in prompt
+    assert "the only artifact carrying per-kernel call" in prompt
+    assert "never as a per-iteration magnitude" in prompt
+    assert "the budget is the one describing" in prompt
     # ...with honest provenance: what each profile covers, and no
     # fabricated "after" data when only round 1 was profiled.
     assert "which accepted items were in effect" in prompt
     assert "closing analyzer round may have profiled the final accepted state" in prompt
     assert "capture directory your driving instructions name as freshest" in prompt
     assert "no post-optimization profile exists" in prompt
+
+
+def test_reporter_lists_both_sides_of_the_iteration_budget():
+    # The comparison opens on the iteration budget "where both sides
+    # carry a nsys_analysis/" — so both sides have to be reachable. The
+    # round-level products are the *before* side; the *after* side lives
+    # under the accepted attempt's profile/, and listing only the former
+    # leaves the reporter looking for a directory it was never given.
+    prompt = _norm(REPORTER_SYSTEM_PROMPT)
+    assert "rounds/round_<n>/analysis/nsys_analysis/" in prompt
+    assert "`profile/nsys_analysis/` beside it" in prompt
+    assert "This is the **after** side of" in prompt
+    # And the budget leads the section, ahead of the kernel table.
+    assert "open the section with the iteration budget before the kernel table" in prompt
+    # Degrades rather than fabricating a one-sided budget.
+    assert "where either side lacks it, say so and compare on kernels alone" in prompt
 
 
 def test_html_companion_charts_are_self_contained():
