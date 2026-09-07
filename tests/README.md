@@ -78,14 +78,7 @@ For more options, refer to pytest --help, paying attention to Custom options add
 
 ### Common issues:
 
-1. `trtllm-build: not found`
-
-    Many of the test cases use `trtllm-build` command to build engines.
-    If you meet the error of `trtllm-build: not found`, you should add the `trtllm-build` path into your `PATH` env before launchig pytest. Normally if you install trtllm in the `$HOME/.local` or use `pip install -e ./` to install trtllm in-place, the trtllm-build command should be located in `$HOME/.local/bin`.
-
-    Thus you should do `export PATH=$HOME/.local/bin:$PATH` before running the pytest
-
-2. The `LLM_MODELS_ROOT` is not set correctly
+1. The `LLM_MODELS_ROOT` is not set correctly
 
     ```bash
         AssertionError: ...llm-models/gpt2-medium does not exist, and fail_if_path_is_invalid is True, please check the cache directory
