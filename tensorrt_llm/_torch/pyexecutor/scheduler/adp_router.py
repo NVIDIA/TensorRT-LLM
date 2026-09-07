@@ -244,16 +244,26 @@ class ADPRouter(ABC):
         #    -- as ``not dist.mapping.has_pp()`` used to -- is exactly how the
         #    router comes to credit a rank with seats the engine never
         #    allocated.
-        # 2. Pipeline parallelism is excluded by that same flag, and the reason
-        #    is no longer the sizing -- the seat pool is well defined under PP at
-        #    ``(pp_size + 1) * max_batch_size``. It is that the stages must agree
-        #    on *which* requests are retiring: each rank pops from its own copy
-        #    of the waiting queue, so a per-stage disagreement makes them admit
-        #    different numbers of requests and diverge. Only the last stage marks
-        #    ``GENERATION_TO_COMPLETE`` for generation requests today. Note the
-        #    *context* path in ``_update_request_states_tp`` already evaluates the
-        #    same predicate on every rank, so the asymmetry is only ever in the
-        #    generation path.
+        # 2. Pipeline parallelism is now in scope: the seat pool is
+        #    ``(pp_size + 1) * max_batch_size`` (additive, because pipeline depth
+        #    is already paid for by the ``pp_size`` term and the overlap deferral
+        #    is one iteration on top of it), and every rank must agree on which
+        #    requests are retiring or the stages admit different numbers of
+        #    requests and diverge. Previously only the last stage marked
+        #    ``GENERATION_TO_COMPLETE`` for generation requests;
+        #    ``_forward_step_inter_pp`` now makes the same call the last stage
+        #    makes, at the structurally identical point (right after
+        #    ``_update_request_states``, under the same overlap guard). That is
+        #    sound rather than merely symmetric because the predicate
+        #    (``LlmRequest::willCompleteNextIteration``) is pure arithmetic on
+        #    token counts that are replicated to every stage in the same
+        #    iteration by ``_ring_broadcast_sample_state`` /
+        #    ``_handle_executed_batch``, with the per-iteration batch count itself
+        #    ring-broadcast from rank 0.
+        #
+        # Note the *context* path in ``_update_request_states_tp`` already
+        # evaluated the same predicate on every rank, so the asymmetry was only
+        # ever in the generation path.
         #
         # Not additionally gated on ``disable_overlap_scheduler`` here: the flag
         # already is, and without overlap the retire is not deferred, so no
