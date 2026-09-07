@@ -14,7 +14,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import json
 import os
 from collections import defaultdict
 from typing import Any, Dict, List, NamedTuple, Optional
@@ -438,7 +437,6 @@ class ReportUtility:
             "engine": {
                 "model": self.rt_cfg.model,
                 "model_path": str(self.rt_cfg.model_path),
-                "engine_dir": str(self.rt_cfg.engine_dir),
                 "revision": self.rt_cfg.revision,
                 "version": self.rt_cfg.sw_version,
             },
@@ -466,49 +464,27 @@ class ReportUtility:
             if kv_cache_mem_percent is not None else None
 
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
-            config_path = self.rt_cfg.engine_dir / "config.json"
-            with open(config_path, "r") as config:
-                engine_config = json.load(config)
-            build_cfg = engine_config["build_config"]
-            pretrain_cfg = engine_config["pretrained_config"]
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._utils import torch_dtype_to_str
 
-            stats_dict["engine"] |= {
-                "backend":
-                "TRT",
-                "dtype":
-                pretrain_cfg["dtype"],
-                "kv_cache_dtype":
-                pretrain_cfg["quantization"]["kv_cache_quant_algo"],
-                "quantization":
-                pretrain_cfg["quantization"]["quant_algo"],
-                "max_input_length":
-                build_cfg["max_input_len"],
-                "max_sequence_length":
-                build_cfg["max_seq_len"]
-            }
-        else:
-            from tensorrt_llm._torch.model_config import ModelConfig
-            from tensorrt_llm._utils import torch_dtype_to_str
+        model = self.rt_cfg.model_path or self.rt_cfg.model
+        model_config = ModelConfig.from_pretrained(model,
+                                                   trust_remote_code=True)
 
-            model = self.rt_cfg.model_path or self.rt_cfg.model
-            model_config = ModelConfig.from_pretrained(model,
-                                                       trust_remote_code=True)
+        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
-            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
-
-            stats_dict["engine"] |= {
-                "backend":
-                "Pytorch",
-                "dtype":
-                torch_dtype_to_str(model_config.torch_dtype
-                                   or model_config.pretrained_config.
-                                   get_text_config().torch_dtype),
-                "kv_cache_dtype":
-                model_config.quant_config.kv_cache_quant_algo,
-                "quantization":
-                model_config.quant_config.quant_algo
-            }
+        stats_dict["engine"] |= {
+            "backend":
+            "Pytorch",
+            "dtype":
+            torch_dtype_to_str(
+                model_config.torch_dtype or
+                model_config.pretrained_config.get_text_config().torch_dtype),
+            "kv_cache_dtype":
+            model_config.quant_config.kv_cache_quant_algo,
+            "quantization":
+            model_config.quant_config.quant_algo
+        }
 
         # World and runtime info
         stats_dict["world_info"] = {
@@ -682,45 +658,18 @@ class ReportUtility:
         startup_metrics_info = self._format_startup_metrics(
             stats_dict.get("startup_metrics"))
 
-        backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
-            config_path = self.rt_cfg.engine_dir / "config.json"
-            with open(config_path, "r") as config:
-                engine_config = json.load(config)
-            build_cfg = engine_config["build_config"]
-            pretrain_cfg = engine_config["pretrained_config"]
-
-            backend_info = (
-                "\n\n===========================================================\n"
-                "= ENGINE DETAILS\n"
-                "===========================================================\n"
-                f"Model:\t\t\t{engine['model']}\n"
-                f"Model Path:\t\t{engine['model_path']}\n"
-                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
-                f"Engine Directory:\t{engine['engine_dir']}\n"
-                f"TensorRT LLM Version:\t{engine['version']}\n"
-                f"Dtype:\t\t\t{pretrain_cfg['dtype']}\n"
-                f"KV Cache Dtype:\t\t{pretrain_cfg['quantization']['kv_cache_quant_algo']}\n"
-                f"Quantization:\t\t{pretrain_cfg['quantization']['quant_algo']}\n"
-                f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-                f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-                f"\n")
-        else:
-            backend_info = (
-                "\n\n===========================================================\n"
-                f"= {self.rt_cfg.backend.upper()} BACKEND\n"
-                "===========================================================\n"
-                f"Model:\t\t\t{engine['model']}\n"
-                f"Model Path:\t\t{engine['model_path']}\n"
-                f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
-                f"TensorRT LLM Version:\t{engine['version']}\n"
-                f"Dtype:\t\t\t{engine['dtype']}\n"
-                f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
-                f"Quantization:\t\t{engine['quantization']}\n"
-                # TODO
-                # f"Max Input Length:\t{build_cfg['max_input_len']}\n"
-                # f"Max Sequence Length:\t{build_cfg['max_seq_len']}\n"
-                f"\n")
+        backend_info = (
+            "\n\n===========================================================\n"
+            f"= {self.rt_cfg.backend.upper()} BACKEND\n"
+            "===========================================================\n"
+            f"Model:\t\t\t{engine['model']}\n"
+            f"Model Path:\t\t{engine['model_path']}\n"
+            f"Revision:\t\t{engine['revision'] or 'N/A'}\n"
+            f"TensorRT LLM Version:\t{engine['version']}\n"
+            f"Dtype:\t\t\t{engine['dtype']}\n"
+            f"KV Cache Dtype:\t\t{engine['kv_cache_dtype']}\n"
+            f"Quantization:\t\t{engine['quantization']}\n"
+            f"\n")
 
         kv_cache_percentage = world_info.get("kv_cache_percentage", None)
         if kv_cache_percentage is not None:
