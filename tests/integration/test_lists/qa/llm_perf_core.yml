@@ -272,9 +272,9 @@ llm_perf_core:
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
   #kimi_k3 (TEP8 interactive serving, 8-GPU)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120) #min_latency
-  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT(120) #max_throughput
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
 
 
 # 9: H100, B200, B300, RTX6000-Server test cases
