@@ -1426,6 +1426,19 @@ def _fp8_kernel(
         last = sCtl[17] == CSd - 1
         ntg = I32(0)
         nall = I32(0)
+        if cutlass.const_expr(REFINE == 1):
+            if (use_list == 1) and (sCtl[17] != CSd - 1):
+                # warm L2 with this CTA's K-th-bin candidate pages for the tail CTA's fp32 pass
+                nmine = ncl
+                if ncl > CAP:
+                    nmine = sCtl[19]
+                if nmine > 512:
+                    nmine = I32(512)
+                for i in cutlass.range(tidx, nmine, NTHREADS, unroll=1):
+                    tc = gRow[WS_CAND_OF(NREP) + 2 * (cb + i)]
+                    pgc = kv_ptr.toint() + cutlass.Int64(gBT[tc >> 5]) * PGB
+                    for pfl in cutlass.range_constexpr(PGB // 128):
+                        _pfl2(pgc + pfl * 128)
         if last:
             if use_list == 1:
                 # the whole K-th bin of the row: fine histogram, descent, write-out, tie list
