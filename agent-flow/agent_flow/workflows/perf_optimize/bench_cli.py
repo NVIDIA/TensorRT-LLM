@@ -119,22 +119,60 @@ def _bool(value: Any) -> bool:
 # ------------------------------------------------------------------ the sweep
 
 
+def _one(values: Iterable[Any]) -> Any:
+    """The single distinct value, or ``None`` if there is not exactly one.
+
+    Disagreement is not resolved to a first or a maximum: two rows at two
+    input lengths are two workloads, and a campaign that quoted one of
+    them would describe half its own cases wrongly with nothing raising.
+    """
+    seen = [value for value in values if value is not None]
+    unique = {str(value): value for value in seen}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
 def workload(sweep: Mapping[str, Any]) -> dict[str, Any]:
     """What the run will serve, as the sweep states it.
 
-    ``isl`` is deliberately not read as the request length. The harness
-    spends it on ``max_seq_len`` and the client's ``input_length``; the
-    requests come from ``dataset_file``, a corpus with its own
-    distribution. The checked-in 8k sweep pairs ``isl: 8192`` with a
-    ``...-8192-1024-200000-...`` corpus and both are right.
+    The two sweep kinds spell this differently and the difference is not
+    cosmetic. A **gen** sweep is one deployment, so the model and the
+    corpus are top-level and ``isl``/``osl`` with them. A **ctx** sweep is
+    a list of prefill benchmarks: the model sits under ``model:`` and each
+    ``benchmarks`` entry carries its own lengths, because sweeping the
+    input length is the normal thing to do there. Read only the gen shape
+    and a ctx campaign resolves to a workload of ``None``s -- which does
+    not fail, it simply reconciles nothing, and `task.yaml` keeps the
+    defaults block's ``random_input_len: 1024`` as this campaign's stated
+    input length whatever the sweep measures.
+
+    So the ctx lengths are taken from the ``benchmarks`` entries, and only
+    when they agree. A campaign is frozen to one operating point, so they
+    do; a sweep spanning two input lengths has no single workload to
+    state, and saying nothing is the honest answer there.
+
+    ``isl`` is deliberately not read as the request length on the gen
+    side. The harness spends it on ``max_seq_len`` and the client's
+    ``input_length``; the requests come from ``dataset_file``, a corpus
+    with its own distribution. The checked-in 8k sweep pairs ``isl: 8192``
+    with a ``...-8192-1024-200000-...`` corpus and both are right. On a
+    ctx sweep the two coincide -- a prefill-only run at ``osl: 1`` reads a
+    corpus generated for that length -- but they are still read from where
+    each sweep puts them, not assumed equal.
     """
+    model = sweep.get("model")
+    model = model if isinstance(model, Mapping) else {}
+    entries = [entry for entry in sweep.get("benchmarks") or [] if isinstance(entry, Mapping)]
     return {
-        "model": sweep.get("model_id"),
-        "model_path": sweep.get("model_path"),
-        "dataset": sweep.get("dataset_file"),
+        "model": sweep.get("model_id") or model.get("model_card"),
+        "model_path": sweep.get("model_path") or model.get("model_path"),
+        "dataset": sweep.get("dataset_file") or model.get("dataset_file"),
         "precision": sweep.get("precision"),
-        "isl": sweep.get("isl"),
-        "osl": sweep.get("osl"),
+        "isl": sweep.get("isl")
+        if sweep.get("isl") is not None
+        else _one(e.get("isl") for e in entries),
+        "osl": sweep.get("osl")
+        if sweep.get("osl") is not None
+        else _one(e.get("osl") for e in entries),
         "benchmark_client": sweep.get("benchmark_client"),
     }
 

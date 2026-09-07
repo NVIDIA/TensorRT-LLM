@@ -117,6 +117,63 @@ def test_isl_is_reported_as_a_bound_beside_the_corpus_not_instead_of_it():
     assert load["dataset"].endswith("_for_serve.json")
 
 
+#: A ctx sweep as the config repo really writes one. It is not a gen
+#: sweep with fewer keys: the model moves under `model:` and the lengths
+#: move into the benchmark entries, because sweeping the input length is
+#: the normal thing to do on a prefill-only run.
+CTX_SWEEP = {
+    "model": {
+        "model_card": "deepseek-ai/DeepSeek-V4-Pro",
+        "model_path": {"aga-gb300": "/models/dsv4-pro"},
+        "dataset_file": "${home_dir}/dataset/DeepSeek-V4-8192-1-20000-ratio-08_for_bench.json",
+    },
+    "benchmarks": [
+        {"isl": 8192, "osl": 1, "max_batch": [2], "tp_size": [4], "ratio": [0.8], "mtp_range": [3]}
+    ],
+}
+
+
+def test_a_ctx_sweep_states_its_workload_somewhere_else_and_is_read_there():
+    """Reading only the gen shape resolves a ctx campaign to all `None`s.
+
+    Which does not fail -- it reconciles nothing, and `task.yaml` keeps
+    the defaults block's `random_input_len: 1024` as this campaign's
+    stated input length however long the requests really are.
+    """
+    load = bench_cli.workload(CTX_SWEEP)
+    assert load["model"] == "deepseek-ai/DeepSeek-V4-Pro"
+    assert load["isl"] == 8192
+    assert load["osl"] == 1
+    assert load["dataset"].endswith("_for_bench.json")
+    assert load["model_path"] == {"aga-gb300": "/models/dsv4-pro"}
+
+
+def test_a_ctx_sweep_spanning_two_input_lengths_states_no_single_one():
+    """Two rows at two lengths are two workloads.
+
+    Resolving to the first, or to the largest, would let a campaign quote
+    one of them and describe half its own cases wrongly, with nothing
+    raising.
+    """
+    spanning = {
+        **CTX_SWEEP,
+        "benchmarks": [
+            {"isl": 1024, "osl": 1, "max_batch": [16], "tp_size": [4]},
+            {"isl": 8192, "osl": 1, "max_batch": [2], "tp_size": [4]},
+        ],
+    }
+    load = bench_cli.workload(spanning)
+    assert load["isl"] is None
+    assert load["osl"] == 1  # they do agree on this one, so it is stated
+
+
+def test_a_top_level_length_still_wins_over_the_benchmark_entries():
+    """The gen shape is not overridden by a sweep that carries both."""
+    both = {**CTX_SWEEP, "isl": 4096, "osl": 512}
+    load = bench_cli.workload(both)
+    assert (load["isl"], load["osl"]) == (4096, 512)
+
+
 FRONTIER = (
     "name,concurrency,throughput_per_user,output_tput_per_gpu,"
     "ctx_gen_inst_ratio_round_float,ctx_request_rate,ctx_gpus_round,"
