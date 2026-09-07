@@ -128,6 +128,8 @@ def calculate_shift(
     "GlmImagePipeline",
     hf_ids=["zai-org/GLM-Image"],
     doc="GlmImage family (text-to-image).",
+    modality="image",
+    telemetry_safe=True,
 )
 class GlmImagePipeline(BasePipeline):
     # ------------------------------------------------------------------

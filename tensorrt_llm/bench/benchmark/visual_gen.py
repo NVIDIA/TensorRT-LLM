@@ -197,24 +197,57 @@ def visual_gen_command(
     """Benchmark VisualGen (image/video generation) models offline."""
     import yaml
 
+    from tensorrt_llm.commands import _telemetry as _command_telemetry
+    from tensorrt_llm.usage import apply_usage_session_config
+    from tensorrt_llm.usage import config as _telemetry_config
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    if prompt is None and prompt_file is None:
-        raise click.UsageError("Either --prompt or --prompt_file must be specified.")
-    if prompt is not None and prompt_file is not None:
-        raise click.UsageError("--prompt and --prompt_file are mutually exclusive.")
-
     model = bench_env.model
     model_path = str(bench_env.checkpoint_path or model)
+    apply_usage_session_config(
+        bench_env.telemetry_config,
+        default_usage_context=_telemetry_config.UsageContext.CLI_BENCH.value,
+        component="visual_gen",
+        lifecycle_phase="config_validation",
+    )
 
     # Build VisualGenArgs (same pattern as trtllm-serve _serve_visual_gen)
     extra_args: dict = {}
     if visual_gen_args is not None:
         with open(visual_gen_args, "r") as f:
             extra_args = yaml.safe_load(f) or {}
+        if not isinstance(extra_args, dict):
+            raise ValueError("VisualGenArgs YAML must contain a mapping at the document root")
 
-    visual_gen_args = VisualGenArgs(**extra_args) if extra_args else None
+    ctx = click.get_current_context()
+    explicit_cli_telemetry = (
+        ctx.parent is not None
+        and ctx.parent.get_parameter_source("telemetry") is click.core.ParameterSource.COMMANDLINE
+    )
+    _command_telemetry.apply_raw_config_telemetry_opt_out(
+        extra_args,
+        usage_context=_telemetry_config.UsageContext.CLI_BENCH,
+        component="visual_gen",
+        explicit_cli_telemetry=explicit_cli_telemetry,
+    )
+
+    if prompt is None and prompt_file is None:
+        raise click.UsageError("Either --prompt or --prompt_file must be specified.")
+    if prompt is not None and prompt_file is not None:
+        raise click.UsageError("--prompt and --prompt_file are mutually exclusive.")
+
+    visual_gen_args = VisualGenArgs(**extra_args)
+    telemetry_config = visual_gen_args.telemetry_config
+    cli_telemetry_disabled = (
+        bench_env.telemetry_config.disabled if bench_env.telemetry_config is not None else False
+    )
+    if explicit_cli_telemetry or cli_telemetry_disabled:
+        telemetry_config = telemetry_config.model_copy(update={"disabled": cli_telemetry_disabled})
+    telemetry_config = telemetry_config.model_copy(
+        update={"usage_context": _telemetry_config.UsageContext.CLI_BENCH}
+    )
+    visual_gen_args = visual_gen_args.model_copy(update={"telemetry_config": telemetry_config})
 
     n_workers = visual_gen_args.parallel_config.n_workers if visual_gen_args is not None else 1
     parallel_config = extra_args.get("parallel_config", {})

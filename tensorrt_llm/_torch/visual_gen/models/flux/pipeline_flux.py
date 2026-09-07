@@ -43,6 +43,8 @@ FLUX_TEACACHE_COEFFICIENTS = {
     "FluxPipeline",
     hf_ids=["black-forest-labs/FLUX.1-dev"],
     doc="Black Forest Labs FLUX.1 family (text-to-image).",
+    modality="image",
+    telemetry_safe=True,
 )
 class FluxPipeline(BasePipeline):
     """FLUX.1 Text-to-Image Pipeline.

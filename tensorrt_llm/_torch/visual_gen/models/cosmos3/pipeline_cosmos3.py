@@ -426,6 +426,8 @@ class _PreparedLatents:
         "nvidia/Cosmos3-Edge-Policy-DROID",
     ],
     doc="Cosmos3 Omnimodal world models.",
+    modality="mixed",
+    telemetry_safe=True,
 )
 class Cosmos3OmniMoTPipeline(BasePipeline):
     def __init__(self, pipeline_config):

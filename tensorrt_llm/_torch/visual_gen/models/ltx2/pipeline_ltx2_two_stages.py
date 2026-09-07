@@ -1012,7 +1012,7 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
 # class-name dispatch from the registry, so its own discovery surface
 # entry would duplicate the canonical ``LTX2Pipeline`` entry above and
 # make ``supported_models()`` / ``pipeline_config()`` ambiguous.
-@register_pipeline("LTX2TwoStagesPipeline")
+@register_pipeline("LTX2TwoStagesPipeline", modality="video_audio", telemetry_safe=True)
 class LTX2TwoStagesPipeline(LTX2Pipeline):
     """Lightricks LTX-Video two-stage text-to-video with audio.
 

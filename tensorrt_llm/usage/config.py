@@ -42,6 +42,7 @@ class UsageContext(str, Enum):
 
     UNKNOWN = "unknown"
     LLM_CLASS = "llm_class"
+    VISUAL_GEN_CLASS = "visual_gen_class"
     CLI_SERVE = "cli_serve"
     CLI_BENCH = "cli_bench"
     CLI_EVAL = "cli_eval"
@@ -95,5 +96,5 @@ class TelemetryConfig(_StrictUsageBaseModel):
         default=UsageContext.UNKNOWN,
         description="Identifies how TRT-LLM was invoked (CLI command vs Python API). "
         "Set automatically by CLI commands; defaults to UNKNOWN (promoted to "
-        "LLM_CLASS by BaseLLM.__init__ for direct Python API usage).",
+        "LLM_CLASS or VISUAL_GEN_CLASS for direct Python API usage).",
     )

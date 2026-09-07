@@ -7,7 +7,7 @@ Follows: VisualGenArgs → PipelineLoader → DiffusionPipelineConfig → AutoPi
 All pipelines (Wan, Flux, Flux2, LTX2, QwenImage) register via @register_pipeline decorator.
 
 The registry value is a private ``_PipelineEntry`` dataclass that carries
-the pipeline class plus three pieces of per-family metadata:
+the pipeline class plus five pieces of per-family metadata:
 
   * ``hf_ids``  — canonical HuggingFace model IDs that dispatch to this
                   pipeline. Powers ``VisualGen.supported_models()`` and
@@ -17,6 +17,8 @@ the pipeline class plus three pieces of per-family metadata:
   * ``defaults`` — default per-family ``pipeline_config`` knobs
                    (schema-by-example for the strict-validated dict).
   * ``doc``     — short human-readable description for discovery tooling.
+  * ``modality`` — bounded pipeline capability used by telemetry and discovery.
+  * ``telemetry_safe`` — explicit opt-in for transmitting public registry metadata.
 
 The dataclass and the registry itself are deliberately private — users go
 through ``VisualGenArgs(model=...)``, ``VisualGen.supported_models()``,
@@ -30,7 +32,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Type
 
 from tensorrt_llm.logger import logger
 
@@ -61,6 +63,16 @@ class PipelineComponent(str, Enum):
     VISION_LANGUAGE_ENCODER = "vision_language_encoder"
 
 
+VisualGenModality = Literal[
+    "image",
+    "video",
+    "video_audio",
+    "layered_image",
+    "mixed",
+    "unknown",
+]
+
+
 @dataclass
 class _PipelineEntry:
     """Private per-pipeline-family metadata stored in PIPELINE_REGISTRY."""
@@ -69,6 +81,8 @@ class _PipelineEntry:
     hf_ids: List[str] = field(default_factory=list)
     defaults: Dict[str, Any] = field(default_factory=dict)
     doc: str = ""
+    modality: VisualGenModality = "unknown"
+    telemetry_safe: bool = False
 
 
 # Keyed by Diffusers ``_class_name`` (from model_index.json). ~3-5 entries
@@ -83,6 +97,8 @@ def register_pipeline(
     hf_ids: Optional[List[str]] = None,
     defaults: Optional[Dict[str, Any]] = None,
     doc: str = "",
+    modality: VisualGenModality = "unknown",
+    telemetry_safe: bool = False,
 ):
     """Register a pipeline class with optional per-family metadata.
 
@@ -96,6 +112,8 @@ def register_pipeline(
             hf_ids=["Lightricks/LTX-Video"],
             defaults={"text_encoder_path": ""},
             doc="Lightricks LTX-Video family.",
+            modality="video_audio",
+            telemetry_safe=True,
         )
         class LTX2Pipeline(BasePipeline):
             ...
@@ -114,6 +132,8 @@ def register_pipeline(
             hf_ids=list(hf_ids or []),
             defaults=dict(defaults or {}),
             doc=doc,
+            modality=modality,
+            telemetry_safe=telemetry_safe,
         )
         logger.debug(f"Registered pipeline: {name} -> {cls.__name__}")
         return cls
@@ -142,7 +162,8 @@ class AutoPipeline:
                 f"Checkpoint: {checkpoint_dir}"
             )
 
-        pipeline_class = PIPELINE_REGISTRY[class_name].pipeline_cls
+        entry = PIPELINE_REGISTRY[class_name]
+        pipeline_class = entry.pipeline_cls
 
         # Let the pipeline class upgrade itself to a specialised variant
         # (e.g. LTX2Pipeline → LTX2TwoStagesPipeline) based on config.
@@ -150,8 +171,15 @@ class AutoPipeline:
 
         logger.info(f"AutoPipeline: Creating {pipeline_class.__name__} from {checkpoint_dir}")
 
-        # Instantiate pipeline with DiffusionPipelineConfig
-        return pipeline_class(config)
+        # Preserve the allowlisted registry key separately from the resolved
+        # runtime class (a pipeline may select a specialized variant).
+        pipeline = pipeline_class(config)
+        if entry.telemetry_safe:
+            try:
+                pipeline._telemetry_pipeline_class_name = class_name
+            except Exception as exc:
+                logger.debug(f"Could not attach pipeline telemetry metadata: {exc}")
+        return pipeline
 
     @staticmethod
     def _detect_from_checkpoint(checkpoint_dir: str) -> str:

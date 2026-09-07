@@ -58,9 +58,15 @@ from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
 from tensorrt_llm.usage.config import UsageContext
-from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
+from tensorrt_llm.usage.llmapi_config import (
+    _failure_llm_api_config_payloads,
+    _failure_visual_gen_config_payloads,
+)
 from tensorrt_llm.usage.llmapi_config import (
     collect_llm_api_config_payloads as _collect_llm_api_config_payloads,
+)
+from tensorrt_llm.usage.llmapi_config import (
+    collect_visual_gen_config_payloads as _collect_visual_gen_config_payloads,
 )
 
 logger = logging.getLogger("tensorrt_llm")
@@ -617,6 +623,105 @@ def _clamp_str(value: str, max_len: int) -> str:
     return value[:max_len] if len(value) > max_len else value
 
 
+def _bounded_uint(value: Any, default: int = 0) -> int:
+    """Return a value inside NvTelemetry's unsigned 32-bit range."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return min(max(value, 0), schema._UINT32_MAX)
+    return default
+
+
+def _bounded_fraction(value: Any) -> float:
+    """Return a finite numeric value in the closed interval [0, 1]."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = float(value)
+        if value == value and value not in (float("inf"), float("-inf")):
+            return min(max(value, 0.0), 1.0)
+    return 0.0
+
+
+def _visual_gen_initial_fields(
+    visual_gen_args: Any,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract bounded static VisualGen fields from validated runtime state."""
+    parallel = visual_gen_args.parallel_config
+    attention = visual_gen_args.attention_config
+    sparse = attention.sparse_attention_config
+    cache = visual_gen_args.cache_config
+
+    modality = metadata.get("modality", "unknown")
+    if modality not in {"image", "video", "video_audio", "layered_image", "mixed"}:
+        modality = "unknown"
+    launch_mode = metadata.get("launch_mode", "unknown")
+    if launch_mode not in {"local_spawn", "torchrun", "slurm"}:
+        launch_mode = "unknown"
+    sparse_algorithm = getattr(sparse, "algorithm", "none") if sparse is not None else "none"
+    if sparse_algorithm not in {"skip_softmax", "vsa"}:
+        sparse_algorithm = "none"
+    if sparse_algorithm == "vsa":
+        sparse_sparsity = getattr(sparse, "vsa_sparsity", 0.0)
+    else:
+        sparse_sparsity = getattr(sparse, "target_sparsity", 0.0) or 0.0
+    cache_backend = getattr(cache, "cache_backend", "none") if cache is not None else "none"
+    if cache_backend not in {"teacache", "cache_dit"}:
+        cache_backend = "none"
+    attention_backend = attention.backend
+    if attention_backend not in {"VANILLA", "TRTLLM", "FA4", "CUTEDSL"}:
+        attention_backend = "VANILLA"
+
+    quantized_components = metadata.get("quantized_components", [])
+    if not isinstance(quantized_components, list):
+        quantized_components = []
+    quantized_components = [
+        component
+        for component in quantized_components
+        if component in ("transformer", "transformer_2")
+    ]
+
+    attn2d_row, attn2d_col = parallel.attn2d_size
+    return {
+        "modelId": _clamp_str(str(metadata.get("model_id", "other")), schema._LONG_STR),
+        "pipelineClassName": _clamp_str(
+            str(metadata.get("pipeline_class_name", "unknown")), schema._LONG_STR
+        ),
+        "resolvedPipelineClass": _clamp_str(
+            str(metadata.get("resolved_pipeline_class", "unknown")), schema._LONG_STR
+        ),
+        "modality": modality,
+        "launchMode": launch_mode,
+        "nodeCount": _bounded_uint(metadata.get("node_count")),
+        "nWorkers": _bounded_uint(metadata.get("n_workers"), 1),
+        "quantizationAlgo": _clamp_str(
+            str(metadata.get("quantization_algo", "")), schema._SHORT_STR
+        ),
+        "dynamicWeightQuant": metadata.get("dynamic_weight_quant") is True,
+        "quantizedComponentsJson": json.dumps(
+            quantized_components,
+            separators=(",", ":"),
+        ),
+        "cfgSize": _bounded_uint(parallel.cfg_size, 1),
+        "ulyssesSize": _bounded_uint(parallel.ulysses_size, 1),
+        "asyncUlysses": parallel.async_ulysses is True,
+        "ringSize": _bounded_uint(parallel.ring_size, 1),
+        "attn2dRowSize": _bounded_uint(attn2d_row, 1),
+        "attn2dColSize": _bounded_uint(attn2d_col, 1),
+        "tensorParallelSize": _bounded_uint(parallel.tp_size, 1),
+        "parallelVaeSize": _bounded_uint(parallel.parallel_vae_size, 1),
+        "parallelVaeSplitDim": parallel.parallel_vae_split_dim,
+        "parallelVae": parallel.parallel_vae_size > 1,
+        "stepCaching": cache is not None,
+        "cacheBackend": cache_backend,
+        "sparseAttention": sparse is not None,
+        "sparseAttentionAlgorithm": sparse_algorithm,
+        "sparseAttentionSparsity": _bounded_fraction(sparse_sparsity),
+        "quantizedAttention": attention.quant_attention_config is not None,
+        "attentionBackend": attention_backend,
+        "cudaGraphs": visual_gen_args.cuda_graph_config.enable is True,
+        "torchCompile": visual_gen_args.torch_compile_config.enable is True,
+        "quantizedWeights": bool(quantized_components),
+    }
+
+
 def _background_reporter(
     llm_args: Any,
     pretrained_config: Any,
@@ -737,6 +842,81 @@ def _background_reporter(
         _finish_background_reporter()
 
 
+def _visual_gen_background_reporter(
+    visual_gen_args: Any,
+    metadata: dict[str, Any],
+    usage_context: str = "",
+) -> None:
+    """Send the VisualGen initial report and periodic liveness snapshots."""
+    try:
+        session = _get_session()
+        if session is None:
+            return
+        session_id = session.session_id
+        trtllm_version = session.trtllm_version
+        system_info = _collect_system_info()
+        gpu_info = _collect_gpu_info()
+        try:
+            config_json, config_meta_json = _collect_visual_gen_config_payloads(visual_gen_args)
+        except Exception:
+            config_json, config_meta_json = _failure_visual_gen_config_payloads(
+                args_class="VisualGenArgs"
+            )
+
+        event_snapshot = _event_snapshot(usage_context)
+        static_fields = _visual_gen_initial_fields(visual_gen_args, metadata)
+        initial_event = schema.TrtllmVisualGenInitialReport(
+            trtllmVersion=_clamp_str(trtllm_version or "", schema._SHORT_STR),
+            platform=_clamp_str(system_info.get("platform") or "", schema._LONG_STR),
+            pythonVersion=_clamp_str(system_info.get("python_version") or "", schema._SHORT_STR),
+            cpuArchitecture=_clamp_str(
+                system_info.get("cpu_architecture") or "", schema._SHORT_STR
+            ),
+            cpuCount=_bounded_uint(system_info.get("cpu_count")),
+            gpuCount=_bounded_uint(gpu_info.get("gpu_count")),
+            gpuName=_clamp_str(gpu_info.get("gpu_name") or "", schema._LONG_STR),
+            gpuMemoryMB=_bounded_uint(gpu_info.get("gpu_memory_mb")),
+            cudaVersion=_clamp_str(gpu_info.get("cuda_version") or "", schema._SHORT_STR),
+            visualGenConfigJson=config_json,
+            visualGenConfigMetaJson=config_meta_json,
+            **static_fields,
+            **_visual_gen_session_event_fields(event_snapshot),
+        )
+        payload = schema.build_gxt_payload(
+            event=initial_event,
+            session_id=session_id,
+            trtllm_version=trtllm_version,
+        )
+        if not session.claim_initial():
+            return
+        _send_if_session_active(session, payload)
+
+        heartbeat_interval = _get_heartbeat_interval()
+        for seq in range(_MAX_HEARTBEATS):
+            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
+                return
+            try:
+                event_snapshot = _event_snapshot(usage_context)
+                heartbeat_event = schema.TrtllmVisualGenHeartbeat(
+                    seq=seq,
+                    nWorkers=static_fields["nWorkers"],
+                    gpuCount=_bounded_uint(gpu_info.get("gpu_count")),
+                    **_visual_gen_session_event_fields(event_snapshot),
+                )
+                heartbeat_payload = schema.build_gxt_payload(
+                    event=heartbeat_event,
+                    session_id=session_id,
+                    trtllm_version=trtllm_version,
+                )
+                _send_if_session_active(session, heartbeat_payload)
+            except (urllib.error.URLError, OSError, ValueError, TypeError):
+                pass
+    except Exception:
+        pass
+    finally:
+        _finish_background_reporter()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -778,12 +958,18 @@ class _TelemetrySession:
         self.lifecycle_phase = lifecycle_phase
         self.observed_signal = 0
         self.observed_outcome: Optional[TerminalOutcome] = None
+        self.runtime_kind: schema.RuntimeKind = "unknown"
 
         self.llm_initialization_attempts = 0
         self.llm_instances_created = 0
         self.active_llm_instances = 0
         self.max_concurrent_llm_instances = 0
         self.llm_initialization_failures = 0
+
+        self.visual_gen_initialization_attempts = 0
+        self.visual_gen_instances_created = 0
+        self.active_visual_gen_instances = 0
+        self.visual_gen_initialization_failures = 0
 
         self.disabled = False
         self.initial_reported = False
@@ -809,6 +995,12 @@ class _TelemetrySession:
         ):
             self.component = "disagg_worker"
 
+    def _observe_runtime_unlocked(self, runtime_kind: schema.RuntimeKind) -> None:
+        if self.runtime_kind == "unknown":
+            self.runtime_kind = runtime_kind
+        elif self.runtime_kind != runtime_kind:
+            self.runtime_kind = "mixed"
+
     def refresh_metadata(self) -> None:
         """Promote correlation fields that become known after early startup."""
         with self.lock:
@@ -830,7 +1022,10 @@ class _TelemetrySession:
                 "unknown",
             ):
                 self.usage_context = usage_context
-            if self.component == "unknown" and component is not None:
+            if component is not None and (
+                self.component == "unknown"
+                or (component == "visual_gen" and self.runtime_kind == "unknown")
+            ):
                 self.component = component
             if lifecycle_phase is not None:
                 self.lifecycle_phase = lifecycle_phase
@@ -842,6 +1037,7 @@ class _TelemetrySession:
             if self.disabled or self.terminal_reported:
                 return False
             self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            self._observe_runtime_unlocked("llm")
             self.lifecycle_phase = "model_initialization"
             if self.component == "unknown":
                 self.component = "llm"
@@ -873,6 +1069,45 @@ class _TelemetrySession:
         with self.lock:
             if not self.disabled and self.active_llm_instances > 0:
                 self.active_llm_instances -= 1
+
+    def record_visual_gen_initialization_attempt(self) -> bool:
+        """Increment the attempt counter and enter VisualGen initialization."""
+        with self.lock:
+            if self.disabled or self.terminal_reported:
+                return False
+            if self.runtime_kind == "unknown" and self.component in ("unknown", "llm"):
+                self.component = "visual_gen"
+            self._observe_runtime_unlocked("visual_gen")
+            self.visual_gen_initialization_attempts = self._increment(
+                self.visual_gen_initialization_attempts
+            )
+            self.lifecycle_phase = "model_initialization"
+            self._refresh_metadata_unlocked()
+            return True
+
+    def record_visual_gen_initialization_failure(self) -> None:
+        """Increment the VisualGen initialization failure counter."""
+        with self.lock:
+            if not self.disabled and not self.terminal_reported:
+                self.visual_gen_initialization_failures = self._increment(
+                    self.visual_gen_initialization_failures
+                )
+
+    def record_visual_gen_initialized(self) -> bool:
+        """Record a successfully constructed and active VisualGen object."""
+        with self.lock:
+            if self.disabled or self.terminal_reported:
+                return False
+            self.visual_gen_instances_created = self._increment(self.visual_gen_instances_created)
+            self.active_visual_gen_instances = self._increment(self.active_visual_gen_instances)
+            self.lifecycle_phase = "serving"
+            return True
+
+    def record_visual_gen_shutdown(self) -> None:
+        """Decrement the VisualGen active gauge without underflowing."""
+        with self.lock:
+            if not self.disabled and self.active_visual_gen_instances > 0:
+                self.active_visual_gen_instances -= 1
 
     def set_lifecycle_phase(self, lifecycle_phase: schema.LifecyclePhase) -> None:
         """Update the best-known process lifecycle phase."""
@@ -920,6 +1155,11 @@ class _TelemetrySession:
             "activeLlmInstances": self.active_llm_instances,
             "maxConcurrentLlmInstances": self.max_concurrent_llm_instances,
             "llmInitializationFailures": self.llm_initialization_failures,
+            "visualGenInitializationAttempts": self.visual_gen_initialization_attempts,
+            "visualGenInstancesCreated": self.visual_gen_instances_created,
+            "activeVisualGenInstances": self.active_visual_gen_instances,
+            "visualGenInitializationFailures": self.visual_gen_initialization_failures,
+            "runtimeKind": self.runtime_kind,
             "lifecyclePhase": self.lifecycle_phase,
             "component": self.component,
             "observedSignal": self.observed_signal,
@@ -1049,6 +1289,11 @@ def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
         "activeLlmInstances": 0,
         "maxConcurrentLlmInstances": 0,
         "llmInitializationFailures": 0,
+        "visualGenInitializationAttempts": 0,
+        "visualGenInstancesCreated": 0,
+        "activeVisualGenInstances": 0,
+        "visualGenInitializationFailures": 0,
+        "runtimeKind": "unknown",
         "lifecyclePhase": "unknown",
         "component": "unknown",
         "observedSignal": 0,
@@ -1062,7 +1307,7 @@ def _event_snapshot(usage_context: str = "") -> dict[str, Any]:
 
 
 def _session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Select correlation and lifecycle counters shared by all events."""
+    """Select correlation and LLM counters for LLM events."""
     return {
         "ingressPoint": snapshot["ingressPoint"],
         "disaggRole": snapshot["disaggRole"],
@@ -1073,6 +1318,30 @@ def _session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
         "maxConcurrentLlmInstances": snapshot["maxConcurrentLlmInstances"],
         "llmInitializationFailures": snapshot["llmInitializationFailures"],
     }
+
+
+def _visual_gen_session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Select ingress and VisualGen counters for VisualGen events."""
+    return {
+        "ingressPoint": snapshot["ingressPoint"],
+        "visualGenInitializationAttempts": snapshot["visualGenInitializationAttempts"],
+        "visualGenInstancesCreated": snapshot["visualGenInstancesCreated"],
+        "activeVisualGenInstances": snapshot["activeVisualGenInstances"],
+        "visualGenInitializationFailures": snapshot["visualGenInitializationFailures"],
+    }
+
+
+def _exit_session_event_fields(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Select correlation and all runtime counters for terminal events."""
+    fields = _session_event_fields(snapshot)
+    fields.update(
+        runtimeKind=snapshot["runtimeKind"],
+        visualGenInitializationAttempts=snapshot["visualGenInitializationAttempts"],
+        visualGenInstancesCreated=snapshot["visualGenInstancesCreated"],
+        activeVisualGenInstances=snapshot["activeVisualGenInstances"],
+        visualGenInitializationFailures=snapshot["visualGenInitializationFailures"],
+    )
+    return fields
 
 
 def _validated_usage_context(value: Any) -> str:
@@ -1265,6 +1534,46 @@ def record_llm_shutdown() -> None:
     _session_call(lambda session: session.record_llm_shutdown(), None)
 
 
+def record_visual_gen_initialization_attempt(
+    telemetry_config: Any = None,
+    *,
+    default_usage_context: str = "visual_gen_class",
+) -> bool:
+    """Start local tracking and record entry into a VisualGen constructor."""
+    if not apply_usage_session_config(
+        telemetry_config,
+        default_usage_context=default_usage_context,
+        component="visual_gen",
+        lifecycle_phase="model_initialization",
+    ):
+        return False
+    return _session_call(
+        lambda session: session.record_visual_gen_initialization_attempt(),
+        False,
+    )
+
+
+def record_visual_gen_initialization_failure() -> None:
+    """Record a handled Python exception from VisualGen construction."""
+    _session_call(
+        lambda session: session.record_visual_gen_initialization_failure(),
+        None,
+    )
+
+
+def record_visual_gen_initialized() -> bool:
+    """Record one successfully constructed VisualGen object."""
+    return _session_call(
+        lambda session: session.record_visual_gen_initialized(),
+        False,
+    )
+
+
+def record_visual_gen_shutdown() -> None:
+    """Mark one successfully tracked VisualGen object inactive."""
+    _session_call(lambda session: session.record_visual_gen_shutdown(), None)
+
+
 def set_lifecycle_phase(lifecycle_phase: schema.LifecyclePhase) -> None:
     """Update the best-known phase for an outer process boundary."""
     _session_call(lambda session: session.set_lifecycle_phase(lifecycle_phase), None)
@@ -1382,6 +1691,7 @@ def report_exit(
             outcome.termination_kind == "clean"
             and snapshot["lifecyclePhase"] in ("cli_parsing", "config_validation")
             and snapshot["llmInitializationAttempts"] == 0
+            and snapshot["visualGenInitializationAttempts"] == 0
         ):
             return True
 
@@ -1406,7 +1716,7 @@ def report_exit(
             lifecyclePhase=lifecycle_phase or snapshot["lifecyclePhase"],
             component=outcome.component or snapshot["component"],
             reportingSource=outcome.reporting_source,
-            **_session_event_fields(snapshot),
+            **_exit_session_event_fields(snapshot),
         )
         payload = schema.build_gxt_payload(
             event=event,
@@ -1447,28 +1757,17 @@ def report_exit(
         return claimed
 
 
-def report_usage(
-    llm_args: Any = None,
-    pretrained_config: Any = None,
-    telemetry_config: Any = None,
+def _start_background_usage_reporter(
+    target: Callable[..., None],
+    reporter_args: tuple[Any, ...],
+    telemetry_config: Any,
+    thread_name: str,
 ) -> None:
-    """Start background usage telemetry reporting.
-
-    Call this once after model initialization. It spawns a daemon thread
-    that sends an initial report and periodic heartbeats. Subsequent calls
-    are no-ops (only one reporter thread per process).
-
-    This function is fail-silent -- it will never raise an exception or
-    block the calling thread.
-
-    Args:
-        llm_args: The LlmArgs object from BaseLLM (for config extraction).
-        pretrained_config: The pretrained model config (for architecture name).
-        telemetry_config: TelemetryConfig object (opt-out + usage context).
-    """
+    """Start the process's single fail-silent usage reporter."""
     global _PENDING_TERMINAL
     global _REPORTER_ACTIVE
     global _REPORTER_STARTED
+    claimed = False
     try:
         _, usage_context = _telemetry_settings(telemetry_config)
         if not apply_usage_session_config(telemetry_config):
@@ -1483,18 +1782,19 @@ def report_usage(
                 return
             _REPORTER_STARTED = True
             _REPORTER_ACTIVE = True
+            claimed = True
 
         _show_usage_notification()
-
         thread = threading.Thread(
-            target=_background_reporter,
-            args=(llm_args, pretrained_config, usage_context),
+            target=target,
+            args=(*reporter_args, usage_context),
             daemon=True,
-            name="trtllm-usage-stats",
+            name=thread_name,
         )
         thread.start()
-
     except Exception:
+        if not claimed:
+            return
         pending = None
         with _REPORTER_LOCK:
             _REPORTER_STARTED = False
@@ -1503,3 +1803,38 @@ def report_usage(
             _PENDING_TERMINAL = None
         if pending is not None:
             pending.completion.set()
+
+
+def report_usage(
+    llm_args: Any = None,
+    pretrained_config: Any = None,
+    telemetry_config: Any = None,
+) -> None:
+    """Start the LLM initial and heartbeat reporter after model startup."""
+    _start_background_usage_reporter(
+        _background_reporter,
+        (llm_args, pretrained_config),
+        telemetry_config,
+        "trtllm-usage-stats",
+    )
+
+
+def report_visual_gen_usage(
+    visual_gen_args: Any,
+    metadata: Optional[dict[str, Any]] = None,
+    telemetry_config: Any = None,
+) -> None:
+    """Start VisualGen initial and heartbeat reporting after pipeline startup.
+
+    ``metadata`` must already contain only sanitized, bounded, allowlisted values.
+    """
+    try:
+        reporter_metadata = dict(metadata or {})
+    except Exception:
+        return
+    _start_background_usage_reporter(
+        _visual_gen_background_reporter,
+        (visual_gen_args, reporter_metadata),
+        telemetry_config,
+        "trtllm-visual-gen-usage-stats",
+    )

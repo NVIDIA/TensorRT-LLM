@@ -473,7 +473,8 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     out = tmp_path / "telemetry.md"
     generator.generate_telemetry_reference(_repo_root(), out)
     text = out.read_text()
-    assert "## LLM API Configuration Fields" in text
+    assert "## Runtime Configuration Fields" in text
+    assert "### `VisualGenArgs`" in text
     assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
     assert "`backend`" in text  # a known captured key renders

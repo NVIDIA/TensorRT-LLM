@@ -7,17 +7,23 @@
             "$ref": "#/definitions/events/trtllm_heartbeat"
         },
         {
+            "$ref": "#/definitions/events/trtllm_visual_gen_initial_report"
+        },
+        {
+            "$ref": "#/definitions/events/trtllm_visual_gen_heartbeat"
+        },
+        {
             "$ref": "#/definitions/events/trtllm_exit_report"
         }
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.7",
+        "schemaVersion": "0.8",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
     },
-    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level deployment data (GPU type, parallelism config, model architecture class) with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
+    "description": "TensorRT-LLM usage telemetry events. Collects anonymous session-level LLM and VisualGen deployment data with opt-out via TRTLLM_NO_USAGE_STATS=1. Auto-disabled in CI/test environments.",
     "definitions": {
         "types": {
             "ShortString": {
@@ -34,6 +40,11 @@
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 4294967295
+            },
+            "Fraction": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
             }
         },
         "events": {
@@ -117,7 +128,7 @@
                     },
                     "llmApiConfigJson": {
                         "type": "string",
-                        "description": "JSON-serialized sanitized, opt-in subset of effective LLM API configuration"
+                        "description": "JSON-serialized sanitized, type-driven subset of effective LLM API configuration"
                     },
                     "llmApiConfigMetaJson": {
                         "type": "string",
@@ -230,6 +241,303 @@
                     "llmInitializationFailures"
                 ]
             },
+            "trtllm_visual_gen_initial_report": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM VisualGen initial session report with bounded pipeline, topology, feature, and sanitized configuration details. No prompts, outputs, model paths, or request data are collected."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "trtllmVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "platform": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pythonVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuArchitecture": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "cpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "gpuMemoryMB": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "cudaVersion": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "runtimeKind": {
+                        "type": "string",
+                        "enum": [
+                            "visual_gen"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "modelId": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "pipelineClassName": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "resolvedPipelineClass": {
+                        "$ref": "#/definitions/types/LongString"
+                    },
+                    "modality": {
+                        "type": "string",
+                        "enum": [
+                            "image",
+                            "video",
+                            "video_audio",
+                            "layered_image",
+                            "mixed",
+                            "unknown"
+                        ]
+                    },
+                    "launchMode": {
+                        "type": "string",
+                        "enum": [
+                            "local_spawn",
+                            "torchrun",
+                            "slurm",
+                            "unknown"
+                        ]
+                    },
+                    "nodeCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "nWorkers": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "quantizationAlgo": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "dynamicWeightQuant": {
+                        "type": "boolean"
+                    },
+                    "quantizedComponentsJson": {
+                        "type": "string",
+                        "description": "JSON-serialized allowlisted VisualGen component names with enabled weight quantization"
+                    },
+                    "cfgSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "ulyssesSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "asyncUlysses": {
+                        "type": "boolean"
+                    },
+                    "ringSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "attn2dRowSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "attn2dColSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "tensorParallelSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "parallelVaeSize": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "parallelVaeSplitDim": {
+                        "type": "string",
+                        "enum": [
+                            "width",
+                            "height"
+                        ]
+                    },
+                    "parallelVae": {
+                        "type": "boolean"
+                    },
+                    "stepCaching": {
+                        "type": "boolean"
+                    },
+                    "cacheBackend": {
+                        "type": "string",
+                        "enum": [
+                            "teacache",
+                            "cache_dit",
+                            "none"
+                        ]
+                    },
+                    "sparseAttention": {
+                        "type": "boolean"
+                    },
+                    "sparseAttentionAlgorithm": {
+                        "type": "string",
+                        "enum": [
+                            "skip_softmax",
+                            "vsa",
+                            "none"
+                        ]
+                    },
+                    "sparseAttentionSparsity": {
+                        "$ref": "#/definitions/types/Fraction"
+                    },
+                    "quantizedAttention": {
+                        "type": "boolean"
+                    },
+                    "attentionBackend": {
+                        "type": "string",
+                        "enum": [
+                            "VANILLA",
+                            "TRTLLM",
+                            "FA4",
+                            "CUTEDSL"
+                        ]
+                    },
+                    "cudaGraphs": {
+                        "type": "boolean"
+                    },
+                    "torchCompile": {
+                        "type": "boolean"
+                    },
+                    "quantizedWeights": {
+                        "type": "boolean"
+                    },
+                    "visualGenConfigJson": {
+                        "type": "string",
+                        "description": "JSON-serialized sanitized, type-driven subset of effective VisualGen configuration"
+                    },
+                    "visualGenConfigMetaJson": {
+                        "type": "string",
+                        "description": "JSON-serialized metadata for VisualGen configuration capture"
+                    },
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "trtllmVersion",
+                    "platform",
+                    "pythonVersion",
+                    "cpuArchitecture",
+                    "cpuCount",
+                    "gpuCount",
+                    "gpuName",
+                    "gpuMemoryMB",
+                    "cudaVersion",
+                    "runtimeKind",
+                    "ingressPoint",
+                    "modelId",
+                    "pipelineClassName",
+                    "resolvedPipelineClass",
+                    "modality",
+                    "launchMode",
+                    "nodeCount",
+                    "nWorkers",
+                    "quantizationAlgo",
+                    "dynamicWeightQuant",
+                    "quantizedComponentsJson",
+                    "cfgSize",
+                    "ulyssesSize",
+                    "asyncUlysses",
+                    "ringSize",
+                    "attn2dRowSize",
+                    "attn2dColSize",
+                    "tensorParallelSize",
+                    "parallelVaeSize",
+                    "parallelVaeSplitDim",
+                    "parallelVae",
+                    "stepCaching",
+                    "cacheBackend",
+                    "sparseAttention",
+                    "sparseAttentionAlgorithm",
+                    "sparseAttentionSparsity",
+                    "quantizedAttention",
+                    "attentionBackend",
+                    "cudaGraphs",
+                    "torchCompile",
+                    "quantizedWeights",
+                    "visualGenConfigJson",
+                    "visualGenConfigMetaJson",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures"
+                ]
+            },
+            "trtllm_visual_gen_heartbeat": {
+                "eventMeta": {
+                    "service": "telemetry",
+                    "gdpr": {
+                        "category": "functional",
+                        "description": "TRT-LLM VisualGen periodic heartbeat with bounded topology and aggregate lifecycle counters."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "properties": {
+                    "seq": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "runtimeKind": {
+                        "type": "string",
+                        "enum": [
+                            "visual_gen"
+                        ]
+                    },
+                    "ingressPoint": {
+                        "$ref": "#/definitions/types/ShortString"
+                    },
+                    "nWorkers": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "gpuCount": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    }
+                },
+                "required": [
+                    "seq",
+                    "runtimeKind",
+                    "ingressPoint",
+                    "nWorkers",
+                    "gpuCount",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures"
+                ]
+            },
             "trtllm_exit_report": {
                 "eventMeta": {
                     "service": "telemetry",
@@ -275,6 +583,7 @@
                         "type": "string",
                         "enum": [
                             "llm",
+                            "visual_gen",
                             "server",
                             "engine_worker",
                             "disagg_worker",
@@ -312,6 +621,27 @@
                     },
                     "llmInitializationFailures": {
                         "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationAttempts": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInstancesCreated": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "activeVisualGenInstances": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "visualGenInitializationFailures": {
+                        "$ref": "#/definitions/types/PositiveInt"
+                    },
+                    "runtimeKind": {
+                        "type": "string",
+                        "enum": [
+                            "llm",
+                            "visual_gen",
+                            "mixed",
+                            "unknown"
+                        ]
                     }
                 },
                 "required": [
@@ -329,7 +659,12 @@
                     "llmInstancesCreated",
                     "activeLlmInstances",
                     "maxConcurrentLlmInstances",
-                    "llmInitializationFailures"
+                    "llmInitializationFailures",
+                    "visualGenInitializationAttempts",
+                    "visualGenInstancesCreated",
+                    "activeVisualGenInstances",
+                    "visualGenInitializationFailures",
+                    "runtimeKind"
                 ]
             }
         }

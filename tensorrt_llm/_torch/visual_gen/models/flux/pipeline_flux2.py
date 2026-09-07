@@ -97,6 +97,8 @@ def format_input(prompts: List[str], system_message: str) -> List[List[dict]]:
     "Flux2Pipeline",
     hf_ids=["black-forest-labs/FLUX.2-dev"],
     doc="Black Forest Labs FLUX.2 family (text-to-image and reference-image generation).",
+    modality="image",
+    telemetry_safe=True,
 )
 class Flux2Pipeline(BasePipeline):
     """FLUX.2 text-to-image and reference-image pipeline.

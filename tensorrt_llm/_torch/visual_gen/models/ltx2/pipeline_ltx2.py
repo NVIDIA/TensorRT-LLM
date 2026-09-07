@@ -616,6 +616,8 @@ def _load_component_weights(
         "``distilled_lora_path`` are not ``None``, either set by the "
         "user or auto-discovered from the checkpoint."
     ),
+    modality="video_audio",
+    telemetry_safe=True,
 )
 class LTX2Pipeline(BasePipeline):
     """Pipeline for text-to-video generation with audio using LTX2 model.

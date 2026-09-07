@@ -251,7 +251,7 @@ class TestSchemaConstants:
         [
             ("CLIENT_ID", "616561816355034"),
             ("EVENT_PROTOCOL", "1.6"),
-            ("EVENT_SCHEMA_VER", "0.7"),
+            ("EVENT_SCHEMA_VER", "0.8"),
             ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
         ],
     )
@@ -364,6 +364,7 @@ class TestUsageContextEnum:
             "cli_bench",
             "cli_eval",
             "disaggregated",
+            "visual_gen_class",
         }
         actual = {ctx.value for ctx in _llm_args_mod.UsageContext}
         assert actual == expected
@@ -422,13 +423,15 @@ class TestSchemaCompliance:
         sms_schema = self._load_sms_schema()
         assert sms_schema["$schema"] == "http://json-schema.org/draft-07/schema#"
 
-    def test_schema_has_three_events(self):
+    def test_schema_has_five_events(self):
         """SMS schema defines exactly the supported telemetry events."""
         sms_schema = self._load_sms_schema()
         events = sms_schema["definitions"]["events"]
         assert set(events.keys()) == {
             "trtllm_initial_report",
             "trtllm_heartbeat",
+            "trtllm_visual_gen_initial_report",
+            "trtllm_visual_gen_heartbeat",
             "trtllm_exit_report",
         }
 
@@ -437,6 +440,8 @@ class TestSchemaCompliance:
         [
             ("trtllm_initial_report", schema.TrtllmInitialReport),
             ("trtllm_heartbeat", schema.TrtllmHeartbeat),
+            ("trtllm_visual_gen_initial_report", schema.TrtllmVisualGenInitialReport),
+            ("trtllm_visual_gen_heartbeat", schema.TrtllmVisualGenHeartbeat),
             ("trtllm_exit_report", schema.TrtllmExitReport),
         ],
     )
@@ -497,7 +502,13 @@ class TestSchemaCompliance:
 
     @pytest.mark.parametrize(
         "event_name",
-        ["trtllm_initial_report", "trtllm_heartbeat", "trtllm_exit_report"],
+        [
+            "trtllm_initial_report",
+            "trtllm_heartbeat",
+            "trtllm_visual_gen_initial_report",
+            "trtllm_visual_gen_heartbeat",
+            "trtllm_exit_report",
+        ],
     )
     def test_all_event_fields_are_required_and_closed(self, event_name):
         """Every SMS event requires its declared fields and rejects extras."""
@@ -551,12 +562,7 @@ class TestSchemaCompliance:
     def test_events_have_gdpr_metadata(self):
         """Every event has GDPR metadata in eventMeta."""
         sms_schema = self._load_sms_schema()
-        for event_name in (
-            "trtllm_initial_report",
-            "trtllm_heartbeat",
-            "trtllm_exit_report",
-        ):
-            event = sms_schema["definitions"]["events"][event_name]
+        for event_name, event in sms_schema["definitions"]["events"].items():
             assert "eventMeta" in event, f"{event_name} missing eventMeta"
             assert "gdpr" in event["eventMeta"], f"{event_name} missing gdpr in eventMeta"
             gdpr = event["eventMeta"]["gdpr"]
@@ -623,73 +629,71 @@ class TestSchemaCompliance:
 
     # --- JSON schema validation (from collapsed TestSchemaDriftDetection) ---
 
-    def test_initial_report_validates_against_json_schema(self):
-        """A fully-populated TrtllmInitialReport must validate against the JSON schema."""
+    @pytest.mark.parametrize(
+        ("event_name", "event"),
+        [
+            (
+                "trtllm_initial_report",
+                schema.TrtllmInitialReport(
+                    trtllmVersion="1.0",
+                    platform="Linux",
+                    pythonVersion="3.10",
+                    cpuArchitecture="x86_64",
+                    cpuCount=8,
+                    gpuCount=1,
+                    gpuName="H100",
+                    gpuMemoryMB=81920,
+                    cudaVersion="12.0",
+                    architectureClassName="LlamaForCausalLM",
+                    backend="pytorch",
+                    tensorParallelSize=1,
+                    pipelineParallelSize=1,
+                    contextParallelSize=1,
+                    moeExpertParallelSize=0,
+                    moeTensorParallelSize=0,
+                    dtype="float16",
+                    quantizationAlgo="",
+                    kvCacheDtype="",
+                    ingressPoint="llm_class",
+                    featuresJson='{"lora":false}',
+                    llmApiConfigJson='{"tensor_parallel_size":1}',
+                    llmApiConfigMetaJson='{"capture_succeeded":true}',
+                    disaggRole="",
+                    deploymentId="",
+                ),
+            ),
+            ("trtllm_heartbeat", schema.TrtllmHeartbeat(seq=0)),
+            (
+                "trtllm_visual_gen_initial_report",
+                schema.TrtllmVisualGenInitialReport(),
+            ),
+            (
+                "trtllm_visual_gen_heartbeat",
+                schema.TrtllmVisualGenHeartbeat(seq=0),
+            ),
+            (
+                "trtllm_exit_report",
+                schema.TrtllmExitReport(
+                    exitCodeKnown=True,
+                    exitCode=130,
+                    signalNumber=2,
+                    terminationKind="signal",
+                    lifecyclePhase="serving",
+                    component="server",
+                    reportingSource="self",
+                    ingressPoint="cli_serve",
+                ),
+            ),
+        ],
+    )
+    def test_events_validate_against_json_schema(self, event_name, event):
+        """Pydantic event payloads satisfy their SMS event definitions."""
         import jsonschema
 
         sms_schema = json.loads(schemas.SMS_SCHEMA_PATH.read_text())
-        report = schema.TrtllmInitialReport(
-            trtllmVersion="1.0",
-            platform="Linux",
-            pythonVersion="3.10",
-            cpuArchitecture="x86_64",
-            cpuCount=8,
-            gpuCount=1,
-            gpuName="H100",
-            gpuMemoryMB=81920,
-            cudaVersion="12.0",
-            architectureClassName="LlamaForCausalLM",
-            backend="pytorch",
-            tensorParallelSize=1,
-            pipelineParallelSize=1,
-            contextParallelSize=1,
-            moeExpertParallelSize=0,
-            moeTensorParallelSize=0,
-            dtype="float16",
-            quantizationAlgo="",
-            kvCacheDtype="",
-            ingressPoint="llm_class",
-            featuresJson='{"lora":false}',
-            llmApiConfigJson='{"tensor_parallel_size":1}',
-            llmApiConfigMetaJson='{"capture_succeeded":true}',
-            disaggRole="",
-            deploymentId="",
-        )
-        payload = report.model_dump(by_alias=True)
-        initial_schema = sms_schema["definitions"]["events"]["trtllm_initial_report"].copy()
-        initial_schema["definitions"] = sms_schema["definitions"]
-        jsonschema.validate(instance=payload, schema=initial_schema)
-
-    def test_heartbeat_validates_against_json_schema(self):
-        """A TrtllmHeartbeat must validate against the JSON schema."""
-        import jsonschema
-
-        sms_schema = json.loads(schemas.SMS_SCHEMA_PATH.read_text())
-        heartbeat = schema.TrtllmHeartbeat(seq=0)
-        payload = heartbeat.model_dump(by_alias=True)
-        hb_schema = sms_schema["definitions"]["events"]["trtllm_heartbeat"].copy()
-        hb_schema["definitions"] = sms_schema["definitions"]
-        jsonschema.validate(instance=payload, schema=hb_schema)
-
-    def test_exit_report_validates_against_json_schema(self):
-        """A TrtllmExitReport must validate against the JSON schema."""
-        import jsonschema
-
-        sms_schema = json.loads(schemas.SMS_SCHEMA_PATH.read_text())
-        report = schema.TrtllmExitReport(
-            exitCodeKnown=True,
-            exitCode=130,
-            signalNumber=2,
-            terminationKind="signal",
-            lifecyclePhase="serving",
-            component="server",
-            reportingSource="self",
-            ingressPoint="cli_serve",
-        )
-        payload = report.model_dump(by_alias=True)
-        exit_schema = sms_schema["definitions"]["events"]["trtllm_exit_report"].copy()
-        exit_schema["definitions"] = sms_schema["definitions"]
-        jsonschema.validate(instance=payload, schema=exit_schema)
+        event_schema = sms_schema["definitions"]["events"][event_name].copy()
+        event_schema["definitions"] = sms_schema["definitions"]
+        jsonschema.validate(instance=event.model_dump(by_alias=True), schema=event_schema)
 
 
 # ---------------------------------------------------------------------------

@@ -135,6 +135,8 @@ def _retrieve_latents(
         "Use VisualGen.default_params or VisualGen.extra_param_specs to set request knobs "
         "such as extra_params['layers'] and extra_params['resolution']."
     ),
+    modality="layered_image",
+    telemetry_safe=True,
 )
 class QwenImageLayeredPipeline(BasePipeline):
     """Qwen-Image-Layered image decomposition pipeline."""
