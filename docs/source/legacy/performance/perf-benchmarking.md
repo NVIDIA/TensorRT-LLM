@@ -711,65 +711,25 @@ The valid values for `kv_cache_dtype` are `auto`, `fp8`, and `nvfp4`.
 
 ## Low Latency Benchmark
 
-The low latency benchmark follows a similar workflow to the [throughput benchmark](#max-throughput-benchmark)
-but requires building the engine separately from `trtllm-bench`. Low latency benchmarks has the following modes:
+The low latency benchmark follows a similar workflow to the [throughput benchmark](#max-throughput-benchmark).
+With the PyTorch backend (the default), you do **not** need a separate engine-build step — `trtllm-bench latency` loads the Hugging Face checkpoint directly.
 
-- A single-request low-latency engine
-
-### Low Latency TensorRT-LLM Engine for Llama-3 70B
-
-To build a low-latency engine for the latency benchmark, run the following quantize and build commands.
-The `$checkpoint_dir` is the path to the [meta-llama/Meta-Llama-3-70B](https://huggingface.co/meta-llama/Meta-Llama-3-70B) Hugging Face checkpoint in your cache or downloaded to a specific location with the [huggingface-cli](https://huggingface.co/docs/huggingface_hub/en/guides/cli).
-To prepare a dataset, follow the same process as specified in [](#preparing-a-dataset).
-
-#### Benchmarking a Low Latency Engine
-
-To quantize the checkpoint:
-
-```shell
-cd tensorrt_llm/examples/models/core/llama
-python ../quantization/quantize.py \
-    --model_dir $checkpoint_dir \
-    --dtype bfloat16 \
-    --qformat fp8 \
-    --kv_cache_dtype fp8 \
-    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/checkpoint \
-    --calib_size 512 \
-    --tp_size $tp_size
+```{tip}
+The legacy TensorRT engine path that used per-model `quantize.py` + `trtllm-build` was removed with the TensorRT backend. Use the PyTorch command below.
 ```
 
-then build,
+### Benchmarking Low Latency (PyTorch)
+
+Prepare a dataset as in [](#preparing-a-dataset), then run:
 
 ```shell
-trtllm-build \
-    --checkpoint_dir /tmp/meta-llama/Meta-Llama-3-70B/checkpoint \
-    --use_fused_mlp enable \
-    --gpt_attention_plugin bfloat16 \
-    --output_dir /tmp/meta-llama/Meta-Llama-3-70B/engine \
-    --max_batch_size 1 \
-    --max_seq_len $(($isl+$osl)) \
-    --reduce_fusion enable \
-    --gemm_plugin fp8 \
-    --workers $tp_size \
-    --use_fp8_context_fmha enable \
-    --max_num_tokens $isl \
-    --use_paged_context_fmha disable \
-    --multiple_profiles enable
-```
-
-After the engine is built, run the low-latency benchmark:
-
-```shell
-env TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG=1 \
-  TRTLLM_MMHA_KERNEL_BLOCK_SIZE=256 \
-  TRTLLM_MMHA_BLOCKS_PER_SEQUENCE=32 \
-  FORCE_MULTI_BLOCK_MODE=ON \
-  TRTLLM_ENABLE_PDL=1 \
-  trtllm-bench --model meta-llama/Meta-Llama-3-70B \
+trtllm-bench --model meta-llama/Meta-Llama-3-70B \
   latency \
   --dataset $DATASET_PATH \
-  --engine_dir /tmp/meta-llama/Meta-Llama-3-70B/engine
+  --backend pytorch
 ```
+
+Optional: pass `--model_path /path/to/local/checkpoint` when using a locally stored Hugging Face checkpoint (keep `--model` for reporting / heuristics).
 
 ## Summary
 
@@ -780,8 +740,8 @@ The following table summarizes the commands needed for running benchmarks:
 | Dataset | Preparation | `python benchmarks/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
 | Throughput | Build | `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH` |
 | Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
-| Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |
-| Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
+| Latency | Build | Not required for the PyTorch flow (default) |
+| Latency | Benchmark | `trtllm-bench --model $HF_MODEL latency --dataset $DATASET_PATH --backend pytorch` |
 
 where,
 
