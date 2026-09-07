@@ -205,13 +205,22 @@ def test_pipeline_keeps_torch_compile_enabled(
             torch_compile=torch_compile,
         )
 
-    implicit = _config(TorchCompileConfig())
-    MiniMaxH3Pipeline(implicit)
-    assert implicit.torch_compile.enable
+    # The contract is the asymmetry: MiniMax-H3 rejects CUDA graphs and caching
+    # but accepts torch.compile, and never quietly turns it off. Asserting the
+    # config default alone would only exercise TorchCompileConfig.
+    for torch_compile in (TorchCompileConfig(), TorchCompileConfig(enable=True)):
+        config = _config(torch_compile)
+        MiniMaxH3Pipeline(config)
+        assert config.torch_compile.enable, "pipeline disabled torch.compile"
 
-    explicit = _config(TorchCompileConfig(enable=True))
-    MiniMaxH3Pipeline(explicit)
-    assert explicit.torch_compile.enable
+    disabled = _config(TorchCompileConfig(enable=False))
+    MiniMaxH3Pipeline(disabled)
+    assert not disabled.torch_compile.enable, "pipeline force-enabled torch.compile"
+
+    rejected = _config(TorchCompileConfig(enable=True))
+    rejected.cuda_graph = SimpleNamespace(enable=True)
+    with pytest.raises(NotImplementedError, match="CUDA graphs"):
+        MiniMaxH3Pipeline(rejected)
 
 
 def test_modular_manifest_discovers_h3_pipeline_and_transformer_config(tmp_path: Path) -> None:

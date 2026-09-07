@@ -51,7 +51,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `zai-org/GLM-Image` | Text-to-Image |
 
 
-Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
+Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json` (or `modular_model_index.json` for modular pipelines); LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
 ### Feature Matrix
 

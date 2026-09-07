@@ -100,12 +100,15 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
     An all-zero or non-finite velocity yields an all-zero latent, which decodes
     to a black frame (and silent audio) without raising anywhere.
     """
-    if not torch.isfinite(velocity).all():
+    # Reduce both conditions on device and read them back together, so the
+    # check costs one sync per call rather than one per condition.
+    finite, nonzero = torch.stack([torch.isfinite(velocity).all(), velocity.any()]).tolist()
+    if not finite:
         raise RuntimeError(
             f"MiniMax-H3 {name} velocity is not finite at denoising step {step}; "
             "refusing to emit a corrupt result."
         )
-    if not velocity.any():
+    if not nonzero:
         raise RuntimeError(
             f"MiniMax-H3 {name} velocity is all zeros at denoising step {step}; "
             "this decodes to a blank output, so the result is rejected."
@@ -431,6 +434,8 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise ValueError("MiniMax-H3 keyframe anchors must be 'first' or 'last'.")
         prepared = []
         for index, image in enumerate(keyframes):
+            # Deliberate deviation: the Diffusers reference does no EXIF
+            # handling, so an EXIF-rotated input will not match a golden.
             image = ImageOps.exif_transpose(image).convert("RGB")
             prepared.append(
                 prepare_keyframe_image(
@@ -722,6 +727,15 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        # The denoise loop indexes both schedules with one counter, and
+        # set_timesteps collapses float32 duplicates, so unequal lengths would
+        # silently truncate a stream instead of failing.
+        if len(self.scheduler.timesteps) != len(self.audio_scheduler.timesteps):
+            raise RuntimeError(
+                "MiniMax-H3 video and audio schedules disagree: "
+                f"{len(self.scheduler.timesteps)} vs "
+                f"{len(self.audio_scheduler.timesteps)} steps."
+            )
         row_timestep_plan = [
             tuple(
                 tensor.to(self.device)

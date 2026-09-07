@@ -45,6 +45,9 @@ MINIMAX_H3_AUDIO_TAG = 2
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_SHORT_EDGE = 768
 MINIMAX_H3_MAX_PIXELS = 768 * 1344
+# vae spatial compression (2*2*2*2 = 16) * patch_size[2] (2). The reference
+# derives this from the loaded configs; it is pinned here because the packed
+# layout is built before the VAE is consulted. Revisit if either changes.
 MINIMAX_H3_CANVAS_MULTIPLE = 32
 MINIMAX_H3_MIN_ASPECT_RATIO = 1 / 4
 MINIMAX_H3_MAX_ASPECT_RATIO = 4

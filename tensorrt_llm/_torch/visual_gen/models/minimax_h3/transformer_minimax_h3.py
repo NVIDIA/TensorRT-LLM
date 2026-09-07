@@ -43,9 +43,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 MINIMAX_H3_MODALITY_NUM = 3
-MINIMAX_H3_VIDEO_TAG = 0
-MINIMAX_H3_TEXT_TAG = 1
-MINIMAX_H3_AUDIO_TAG = 2
 
 
 @dataclass
@@ -179,6 +176,19 @@ class MiniMaxH3Attention(Attention):
         return self.to_out[0](hidden_states)
 
 
+def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Apply an RMSNorm over a packed ``[B, S, D]`` tensor.
+
+    FlashInfer reads a 3-D input as ``(batch, heads, head_dim)`` and dispatches
+    the per-head QK-norm kernel, which runs one warp per row.  Flattening to
+    ``[B * S, D]`` keeps the CTA-per-row kernel, matching how the feed-forward
+    call sites already reshape.  The reduction is over the last dim either way,
+    so the result is unchanged.
+    """
+    shape = hidden_states.shape
+    return norm(hidden_states.reshape(-1, shape[-1])).view(shape)
+
+
 def _rms_norm(hidden_size: int, eps: float, dtype: torch.dtype) -> RMSNorm:
     return RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True)
 
@@ -242,7 +252,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         timestep_indices: torch.Tensor,
     ) -> torch.Tensor:
         shift, scale = self.linear(F.silu(temb).to(self.linear.dtype)).chunk(2, dim=-1)
-        hidden_states = self.norm(hidden_states)
+        hidden_states = _norm_2d(self.norm, hidden_states)
         return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
             0, timestep_indices
         )
@@ -284,9 +294,9 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states))
+        hidden_states = hidden_states + self.attn(_norm_2d(self.norm1, hidden_states))
         residual = hidden_states
-        hidden_states = self.norm2(hidden_states)
+        hidden_states = _norm_2d(self.norm2, hidden_states)
         hidden_states = self.ff(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(
             hidden_states
         )
@@ -328,7 +338,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for block in self.refiner_blocks:
             hidden_states = block(hidden_states)
-        return self.final_norm(hidden_states)
+        return _norm_2d(self.final_norm, hidden_states)
 
 
 class MiniMaxH3TransformerBlock(nn.Module):
@@ -384,7 +394,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
         residual = hidden_states
-        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = _norm_2d(self.norm1, hidden_states)
         norm_hidden_states = norm_hidden_states * (
             1.0 + scale_msa.index_select(0, adaln_indices)
         ) + shift_msa.index_select(0, adaln_indices)
@@ -396,7 +406,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         )
 
         residual = hidden_states
-        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = _norm_2d(self.norm2, hidden_states)
         norm_hidden_states = norm_hidden_states * (
             1.0 + scale_mlp.index_select(0, adaln_indices)
         ) + shift_mlp.index_select(0, adaln_indices)
@@ -719,7 +729,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
-                    f"{self._attn_backend} backend ignores it. Use VANILLA or FA4."
+                    f"{self._attn_backend} backend cannot express it. Use "
+                    f"{', '.join(sorted(_KEY_PADDING_MASK_BACKENDS))}."
                 )
             key_padding_mask = (
                 (token_tags >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
