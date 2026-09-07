@@ -80,6 +80,7 @@ def test_commit_all_stages_everything_but_respects_gitignore(repo):
     new_head = gitops.commit_all(repo, "perf-optimize: opt-001 accepted")
 
     assert new_head != base
+    assert "diff --git a/src.py b/src.py" in gitops.format_patch(repo, base, new_head)
     assert gitops.worktree_clean(repo) is True
     assert _git(repo, "log", "-1", "--pretty=%s") == "perf-optimize: opt-001 accepted"
     committed = _git(repo, "show", "--name-only", "--pretty=format:", "HEAD").split()
@@ -135,6 +136,30 @@ def test_discard_uncommitted_spares_gitignored_artifacts(repo):
     # ... but gitignored build artifacts survive (clean -fd without -x).
     assert (repo / "build" / "lib.so").is_file()
     assert gitops.worktree_clean(repo) is True
+
+
+def test_worktree_reset_and_fast_forward(repo, tmp_path):
+    base = gitops.rev_parse_head(repo)
+    gitops.create_branch(repo, "perf-optimize/campaign")
+    item_worktree = tmp_path / "item-worktree"
+    gitops.create_worktree(
+        repo,
+        item_worktree,
+        "perf-optimize/campaign-round-1-item-opt-001",
+        base,
+    )
+    (item_worktree / "src.py").write_text("x = 2\n", encoding="utf-8")
+    candidate = gitops.commit_all(item_worktree, "candidate")
+    assert candidate != base
+
+    gitops.fast_forward(repo, "perf-optimize/campaign-round-1-item-opt-001")
+    assert (repo / "src.py").read_text(encoding="utf-8") == "x = 2\n"
+
+    (item_worktree / "src.py").write_text("broken\n", encoding="utf-8")
+    gitops.reset_to(item_worktree, candidate)
+    assert (item_worktree / "src.py").read_text(encoding="utf-8") == "x = 2\n"
+    gitops.remove_worktree(repo, item_worktree)
+    assert not item_worktree.exists()
 
 
 def test_git_errors_raise_with_context(repo):
@@ -218,15 +243,18 @@ def test_use_cluster_routes_every_command_through_ssh(repo, monkeypatch):
         gitops.subprocess, "run", lambda cmd, **kw: (seen.append(cmd), _Result())[1]
     )
     gitops.use_cluster("me@login-01")
+    remote_worktree = repo.parent / "remote-only" / "item"
     try:
         gitops.rev_parse_head(repo)
         gitops.discard_uncommitted(repo)
+        gitops.create_worktree(repo, remote_worktree, "candidate", "deadbeef")
     finally:
         # Restore, or the module-level host leaks into every later test in the
         # session and they pass for the wrong reason.
         gitops.use_cluster("")
 
-    assert len(seen) == 3, seen  # rev-parse + reset --hard + clean -fd
+    assert not remote_worktree.parent.exists()
+    assert len(seen) == 4, seen  # rev-parse + reset --hard + clean -fd + worktree add
     for cmd in seen:
         assert cmd[0] == "ssh" and "me@login-01" in cmd, cmd
         # The whole git command is ONE argument, so ssh's own shell cannot re-split
