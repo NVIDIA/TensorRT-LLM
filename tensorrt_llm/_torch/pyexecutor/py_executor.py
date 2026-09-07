@@ -4570,7 +4570,8 @@ class PyExecutor:
             self._active_control_id = None
             return
         self.control_request_barrier.set()
-        self.control_action_done.wait()
+        with self.hang_detector.pause():
+            self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
         logger.debug("[control_action] control request finished")

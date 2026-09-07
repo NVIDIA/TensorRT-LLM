@@ -103,6 +103,7 @@ def _register_fake():
         return None
 
     @torch.library.register_fake("trtllm::allreduce_pg")
+    @torch.library.register_fake("trtllm::allreduce_pg_by_name")
     def _(
         input: torch.Tensor,
         residual: Optional[torch.Tensor],
@@ -225,6 +226,7 @@ def _register_fake():
         return input.new_empty(output_shape)
 
     @torch.library.register_fake("trtllm::allgather_pg")
+    @torch.library.register_fake("trtllm::allgather_pg_by_name")
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
@@ -1197,6 +1199,7 @@ def _register_fake():
         return [create_output_tensor(i) for i in input_list]
 
     @torch.library.register_fake("trtllm::allgather_list_pg")
+    @torch.library.register_fake("trtllm::allgather_list_pg_by_name")
     def _(input_list, sizes, group, process_group):
         return allgather_list(input_list, sizes, group)
 
@@ -1215,6 +1218,29 @@ def _register_fake():
     @torch.library.register_fake("trtllm::reducescatter_pg")
     def _(input, sizes, group, process_group):
         return reducescatter(input, sizes, group)
+
+    @torch.library.register_fake("trtllm::reducescatter_pg_by_name")
+    def _(input, sizes, group, rank, group_name):
+        shape = list(input.shape)
+        shape[0] = input.shape[0] // len(
+            group) if sizes is None else sizes[rank]
+        return input.new_empty(shape)
+
+    @torch.library.register_fake("trtllm::reducescatter_list")
+    @torch.library.register_fake("trtllm::reducescatter_list_pg")
+    def _(input_list, sizes, group, process_group=None):
+        return [reducescatter(value, sizes, group) for value in input_list]
+
+    @torch.library.register_fake("trtllm::reducescatter_list_pg_by_name")
+    def _(input_list, sizes, group, rank, group_name):
+
+        def create_output(value):
+            shape = list(value.shape)
+            shape[0] = (value.shape[0] //
+                        len(group) if sizes is None else sizes[rank])
+            return value.new_empty(shape)
+
+        return [create_output(value) for value in input_list]
 
     @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
