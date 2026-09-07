@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from math import isfinite
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -48,15 +49,22 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    sigmoid_f32,
     silu_f32,
 )
 
-SUPPORTED_ACTIVATION_TYPES = (ActivationType.Swiglu, ActivationType.Relu2)
+SUPPORTED_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.Relu2,
+    ActivationType.SiTu,
+)
 SUPPORTED_SWIGLU_COMPUTE_DTYPES = (
     cutlass.Float32,
     cutlass.Float16,
     cutlass.BFloat16,
 )
+FLOAT32_MAX = 3.4028234663852886e38
+FLOAT16_MAX = 65504.0
 
 
 @dsl_user_op
@@ -113,6 +121,37 @@ def validate_swiglu_compute_dtype(
     return swiglu_compute_dtype
 
 
+def validate_situ_config(
+    activation_type: ActivationType,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Validate the codegen-time SiTU softcap constants."""
+    if activation_type != ActivationType.SiTu:
+        if situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError("SiTU beta parameters require activation_type=ActivationType.SiTu")
+        return None, None
+
+    if situ_beta is None or situ_linear_beta is None:
+        raise ValueError("SiTU requires both situ_beta and situ_linear_beta")
+
+    situ_beta = float(situ_beta)
+    situ_linear_beta = float(situ_linear_beta)
+    if not isfinite(situ_beta) or not isfinite(situ_linear_beta):
+        raise ValueError(
+            f"SiTU beta parameters must be finite, got {situ_beta} and {situ_linear_beta}"
+        )
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError(
+            f"SiTU beta parameters must be positive, got {situ_beta} and {situ_linear_beta}"
+        )
+    for name, value in (("situ_beta", situ_beta), ("situ_linear_beta", situ_linear_beta)):
+        derived_constants = (value, 2.0 * value, 2.0 / value)
+        if any(not isfinite(constant) or constant > FLOAT32_MAX for constant in derived_constants):
+            raise ValueError(f"{name} and its derived constants must be representable as Float32")
+    return situ_beta, situ_linear_beta
+
+
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM with gather and activation
 fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
@@ -120,6 +159,7 @@ fusion example for the NVIDIA Blackwell architecture using CUTE DSL.
 Supported fused activations (selected at construction via ``activation_type``):
     - ActivationType.Swiglu: C = up * silu(gate), where up/gate come from interleaved weight matrix B
     - ActivationType.Relu2:  C = relu(alpha * x)^2
+    - ActivationType.SiTu:   C = softcap(up) * softcap(gate) * sigmoid(gate)
 
 Any other ``ActivationType`` value raises an assertion at construction time.
 
@@ -128,6 +168,7 @@ This kernel performs FC1 layer computation with fused activation:
 2. Activation:
      - Swiglu: C = up * silu(gate), up/gate extracted from interleaved acc (granularity=64)
      - Relu2:  C = relu(acc)^2
+     - SiTu:   C = softcap(up, linear_beta) * softcap(gate, beta) * sigmoid(gate)
 3. Optional Quant: When c_dtype is Float4E2M1FN, generates scale factor C and quantizes output
 
 - Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
@@ -229,17 +270,18 @@ CUDA Graph Support:
 
 class BlockScaledContiguousGatherGroupedGemmKernel:
     """This class implements contiguous grouped matrix multiplication with gather operation and a
-    fused activation (selected via ``activation_type``: SwiGLU or Relu2) for FC1 layer computation.
+    fused activation (selected via ``activation_type``) for FC1 layer computation.
 
     The computation flow:
     1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
     2. Activation (selected via ``activation_type``):
          - ActivationType.Swiglu: C = up * silu(gate), from interleaved acc with granularity=64
          - ActivationType.Relu2:  C = relu(acc)^2
+         - ActivationType.SiTu:   C = softcap(up) * softcap(gate) * sigmoid(gate)
        Any other ``ActivationType`` value raises an assertion in ``__init__``.
     3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
-    Note: Output C has N/2 columns for Swiglu (pairs of up/gate collapsed), N columns for Relu2.
+    Note: Output C has N/2 columns for gated activations, N columns for Relu2.
 
     Key Features:
     - Uses LDGSTS instructions for loading A and SFA matrices with gather/permutation capability
@@ -325,13 +367,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: cutlass.Float32 = float("inf"),
         swiglu_compute_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
 
         ``activation_type`` accepts a value from ``ActivationType``; only
-        ``ActivationType.Swiglu`` (gated path) and ``ActivationType.Relu2``
-        (non-gated path) are currently supported.
+        ``ActivationType.Swiglu`` and ``ActivationType.SiTu`` use the gated
+        path; ``ActivationType.Relu2`` uses the non-gated path.
 
         This configuration includes several key aspects:
 
@@ -365,11 +409,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param topk: Number of experts selected per token (used for token ID mapping).
         :type topk: cutlass.Int64
         :param activation_type: Fused activation. Must be ``ActivationType.Swiglu``
-            (gated, default) or ``ActivationType.Relu2`` (non-gated).
+            (gated, default), ``ActivationType.SiTu`` (gated), or
+            ``ActivationType.Relu2`` (non-gated).
         :type activation_type: ActivationType
-        :param swiglu_compute_dtype: Register compute type used after loading FP32
-            accumulators from TMEM. Must be Float32, Float16, or BFloat16.
+        :param swiglu_compute_dtype: Gated activation register compute type used after
+            loading FP32 accumulators from TMEM. SwiGLU accepts Float32, Float16,
+            or BFloat16; SiTU accepts Float32 or Float16.
         :type swiglu_compute_dtype: Type[cutlass.Numeric]
+        :param situ_beta: Gate softcap for SiTU. Must be finite and positive.
+        :type situ_beta: Optional[float]
+        :param situ_linear_beta: Up/linear softcap for SiTU. Must be finite and positive.
+        :type situ_linear_beta: Optional[float]
         """
 
         self.sf_vec_size = sf_vec_size
@@ -378,6 +428,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.is_gated = is_gated_activation(self.activation_type)
         self.acc_dtype = cutlass.Float32
         self.swiglu_compute_dtype = validate_swiglu_compute_dtype(swiglu_compute_dtype)
+        self.situ_beta, self.situ_linear_beta = validate_situ_config(
+            self.activation_type, situ_beta, situ_linear_beta
+        )
+        if self.activation_type == ActivationType.SiTu:
+            if self.swiglu_compute_dtype not in (cutlass.Float32, cutlass.Float16):
+                raise ValueError("SiTU currently supports only Float32 or Float16 compute")
+            if self.swiglu_compute_dtype == cutlass.Float16:
+                for name, value in (
+                    ("situ_beta", self.situ_beta),
+                    ("situ_linear_beta", self.situ_linear_beta),
+                ):
+                    derived_constants = (value, 2.0 * value, 2.0 / value)
+                    if any(constant > FLOAT16_MAX for constant in derived_constants):
+                        raise ValueError(
+                            f"{name} and its derived constants must be representable as Float16"
+                        )
+            if vectorized_f32:
+                raise ValueError("SiTU currently supports only non-vectorized compute")
         self.epilogue_compute_dtype = self.swiglu_compute_dtype if self.is_gated else self.acc_dtype
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -463,6 +531,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             swiglu_limit = float("inf")
         self.swiglu_limit = swiglu_limit
         self.has_swiglu_limit = swiglu_limit != float("inf")
+        if self.activation_type == ActivationType.SiTu and self.has_swiglu_limit:
+            raise ValueError("SiTU does not support swiglu_limit")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -679,6 +749,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         1. GEMM: acc = alpha * (SFA * A[token_ids]) * (SFB * B)
         2. Activation (selected by ``activation_type`` at construction):
              - ActivationType.Swiglu: C = up * silu(gate), up/gate from interleaved acc (granularity=64)
+             - ActivationType.SiTu: C = softcap(up) * softcap(gate) * sigmoid(gate)
              - ActivationType.Relu2:  C = relu(acc)^2
         3. Optional Quant: When c_dtype is Float4E2M1FN, generates SFC and quantizes output
 
@@ -707,7 +778,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param b: Input tensor B (NxKxL), L is the number of experts/groups; gated mode uses
                   interleaved up/gate weights, non-gated uses plain weights.
         :type b: cute.Tensor
-        :param c: Output tensor C; last dim is N/2 for gated (SwiGLU), N for non-gated (Relu2).
+        :param c: Output tensor C; last dim is N/2 for gated activations, N for Relu2.
         :type c: cute.Tensor
         :param sfa: Scale factor tensor A, will be gathered using token_id_mapping
         :type sfa: cute.Tensor
@@ -2442,11 +2513,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if cutlass.const_expr(self.swiglu_compute_dtype != cutlass.Float32):
                             acc_vec_gate = acc_vec_gate.to(self.swiglu_compute_dtype)
                         self._apply_swiglu_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
+                    elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
+                        acc_vec_gate = tTR_rAcc_gate.load()
+                        if cutlass.const_expr(self.swiglu_compute_dtype != cutlass.Float32):
+                            acc_vec_gate = acc_vec_gate.to(self.swiglu_compute_dtype)
+                        self._apply_situ_epilogue(acc_vec_up, acc_vec_gate, alpha_val, tCompute)
                     elif cutlass.const_expr(self.activation_type == ActivationType.Relu2):
                         self._apply_relu2_epilogue(acc_vec_up, alpha_val, tCompute)
 
                     if cutlass.const_expr(self.generate_sfc):
-                        # Keep SwiGLU arithmetic in the requested 16-bit dtype,
+                        # Keep gated activation arithmetic in the requested 16-bit dtype,
                         # then widen its rounded result for the canonical NVFP4
                         # scale computation and Float32-to-E2M1 conversion.
                         tQuantCompute = tCompute
@@ -2659,8 +2735,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     #      alpha_val, tCompute)`` decorated with ``@cute.jit`` — writing into
     #      ``tCompute`` in place. The decorator is required so the method body
     #      is AST-preprocessed (``cutlass.range_constexpr`` relies on this).
-    #      Provide both a ``vectorized_f32`` (packed f32x2) path and a scalar
-    #      path.
+    #      Add the explicitly supported scalar/vectorized compute paths.
     #   3. Extend the ``__call__`` dispatch with another ``elif`` branch.
     #   4. If the new activation is gated, also handle the two-subtile TMEM
     #      load path in ``__call__`` (mirror the existing Swiglu branch).
@@ -2764,6 +2839,80 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 sigmoid = compute_dtype(sigmoid_f32_value)
                 silu = compute_dtype(acc_vec_gate_alpha * sigmoid)
                 tCompute[i] = compute_dtype(acc_vec_up_alpha * silu)
+
+    @cute.jit
+    def _apply_situ_epilogue(
+        self,
+        acc_vec_up: cute.Tensor,
+        acc_vec_gate: cute.Tensor,
+        alpha_val,
+        tCompute: cute.Tensor,
+    ):
+        """Apply scalar FP32 or FP16 SiTU to interleaved accumulators.
+
+        ``softcap(x, beta) = beta * tanh(x / beta)`` and
+        ``tanh(z) = 2 * sigmoid(2 * z) - 1``.
+        """
+        if cutlass.const_expr(self.swiglu_compute_dtype == cutlass.Float32):
+            inv_gate_softcap = cutlass.Float32(2.0 / self.situ_beta)
+            twice_gate_softcap = cutlass.Float32(2.0 * self.situ_beta)
+            gate_softcap = cutlass.Float32(self.situ_beta)
+            inv_linear_softcap = cutlass.Float32(2.0 / self.situ_linear_beta)
+            twice_linear_softcap = cutlass.Float32(2.0 * self.situ_linear_beta)
+            linear_softcap = cutlass.Float32(self.situ_linear_beta)
+
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                up = acc_vec_up[i] * cutlass.Float32(alpha_val)
+                gate = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                softcapped_gate = (
+                    twice_gate_softcap * sigmoid_f32(gate * inv_gate_softcap, fastmath=True)
+                    - gate_softcap
+                )
+                softcapped_up = (
+                    twice_linear_softcap * sigmoid_f32(up * inv_linear_softcap, fastmath=True)
+                    - linear_softcap
+                )
+                situ_gate = softcapped_gate * sigmoid_f32(gate, fastmath=True)
+                tCompute[i] = situ_gate * softcapped_up
+        else:
+            compute_dtype = self.swiglu_compute_dtype
+            alpha_compute = compute_dtype(alpha_val)
+            gate_softcap = compute_dtype(self.situ_beta)
+            twice_gate_softcap = compute_dtype(2.0 * self.situ_beta)
+            inv_gate_softcap = compute_dtype(2.0 / self.situ_beta)
+            linear_softcap = compute_dtype(self.situ_linear_beta)
+            twice_linear_softcap = compute_dtype(2.0 * self.situ_linear_beta)
+            inv_linear_softcap = compute_dtype(2.0 / self.situ_linear_beta)
+            neg_log2_e = compute_dtype(-1.4426950408889634)
+
+            for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
+                up = compute_dtype(acc_vec_up[i] * alpha_compute)
+                gate = compute_dtype(acc_vec_gate[i] * alpha_compute)
+
+                gate_tanh_input = compute_dtype(gate * inv_gate_softcap)
+                gate_tanh_exp = _ex2_approx_f16(compute_dtype(gate_tanh_input * neg_log2_e))
+                gate_tanh_sigmoid = compute_dtype(
+                    cute.arch.rcp_approx(cutlass.Float32(1.0) + cutlass.Float32(gate_tanh_exp))
+                )
+                softcapped_gate = compute_dtype(
+                    compute_dtype(twice_gate_softcap * gate_tanh_sigmoid) - gate_softcap
+                )
+
+                up_tanh_input = compute_dtype(up * inv_linear_softcap)
+                up_tanh_exp = _ex2_approx_f16(compute_dtype(up_tanh_input * neg_log2_e))
+                up_tanh_sigmoid = compute_dtype(
+                    cute.arch.rcp_approx(cutlass.Float32(1.0) + cutlass.Float32(up_tanh_exp))
+                )
+                softcapped_up = compute_dtype(
+                    compute_dtype(twice_linear_softcap * up_tanh_sigmoid) - linear_softcap
+                )
+
+                gate_exp = _ex2_approx_f16(compute_dtype(gate * neg_log2_e))
+                gate_sigmoid = compute_dtype(
+                    cute.arch.rcp_approx(cutlass.Float32(1.0) + cutlass.Float32(gate_exp))
+                )
+                situ_gate = compute_dtype(softcapped_gate * gate_sigmoid)
+                tCompute[i] = compute_dtype(situ_gate * softcapped_up)
 
     @cute.jit
     def _apply_relu2_epilogue(
