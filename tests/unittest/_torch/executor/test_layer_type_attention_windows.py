@@ -11,10 +11,19 @@ caller's ``KvCacheConfig`` untouched.
 """
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.pyexecutor._util import _derive_layer_type_attention_windows
+import tensorrt_llm._torch.pyexecutor._util as util
+from tensorrt_llm._torch.pyexecutor._util import (
+    _create_kv_cache_manager,
+    _derive_layer_type_attention_windows,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -136,3 +145,141 @@ def test_missing_num_hidden_layers_returns_none(num_hidden_layers):
 def test_invalid_sliding_window_falls_back_to_default():
     """``sliding_window=0`` is rejected by the per-layer resolver."""
     assert _derive_layer_type_attention_windows(_config(sliding_window=0), MAX_SEQ_LEN) is None
+
+
+# ---------------------------------------------------------------------------
+# Integration coverage: the derived vector reaching ``_create_kv_cache_manager``.
+#
+# The tests above exercise the pure helper. These drive the real
+# ``_create_kv_cache_manager`` with the heavy manager construction replaced by a
+# recording stub, so they assert on the ``KvCacheConfig`` that would reach the
+# constructed manager without touching a GPU or allocating any KV cache. They
+# are still CPU-only: the ``torch`` import above is already an implicit
+# dependency of ``_util`` (the module under test imports it at load time).
+# ---------------------------------------------------------------------------
+
+_FAMILY_PREDICATES = (
+    "is_gemma4_hybrid",
+    "is_kimi_linear",
+    "is_mla",
+    "is_nemotron_hybrid",
+    "is_qwen3_hybrid",
+    "is_qwen4_exp",
+)
+
+
+def _make_recording_manager(base):
+    """A ``base`` subclass whose constructor records its config and does no work.
+
+    ``base`` is ``KVCacheManagerV2`` or ``KVCacheManager`` so the ``issubclass``
+    dispatch inside ``_create_kv_cache_manager`` (which decides whether to derive
+    per-layer windows) sees the real class hierarchy. ``__init__`` deliberately
+    skips ``super().__init__`` so no pools are allocated; the two abstract
+    ``BaseResourceManager`` methods are stubbed only so the class is
+    instantiable.
+    """
+    captured = {}
+
+    class _Recording(base):
+        def __init__(self, kv_cache_config, *args, **kwargs):
+            captured["kv_cache_config"] = kv_cache_config
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def get_max_resource_count(self):
+            return 0
+
+        def get_needed_resource_to_completion(self, request):
+            return 0
+
+    return _Recording, captured
+
+
+def _pretrained_config(**overrides):
+    config = {
+        "num_hidden_layers": 4,
+        "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+        "sliding_window": SLIDING_WINDOW,
+        "hidden_size": 64,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "vocab_size": 1000,
+    }
+    config.update(overrides)
+    return SimpleNamespace(**config)
+
+
+def _run_create_kv_cache_manager(
+    monkeypatch, manager_cls, kv_cache_config, *, is_draft, config_overrides=None
+):
+    # Force the generic (non-hybrid-family) construction path so the recording
+    # stub is what gets built; the derivation under test runs before this
+    # dispatch and is independent of the model family.
+    for name in _FAMILY_PREDICATES:
+        monkeypatch.setattr(util, name, lambda _config: False)
+
+    pretrained_config = _pretrained_config(**(config_overrides or {}))
+    model_config = SimpleNamespace(pretrained_config=pretrained_config, quant_config=None)
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=manager_cls,
+        mapping=MagicMock(),
+        kv_cache_config=kv_cache_config,
+        tokens_per_block=32,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=8,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=MAX_SEQ_LEN,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.float16,
+        is_draft=is_draft,
+    )
+
+
+def test_derived_windows_reach_v2_manager(monkeypatch):
+    """(a) Mixed schedule + unset window + V2 -> derived vector is installed."""
+    manager_cls, captured = _make_recording_manager(KVCacheManagerV2)
+    kv_cache_config = KvCacheConfig()
+    assert kv_cache_config.max_attention_window is None
+
+    _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=False)
+
+    installed = captured["kv_cache_config"].max_attention_window
+    assert installed == [SLIDING_WINDOW] * 3 + [MAX_SEQ_LEN]
+    # The caller's config is left untouched: derivation copies before writing.
+    assert kv_cache_config.max_attention_window is None
+
+
+def test_explicit_window_is_left_unchanged(monkeypatch):
+    """(b) An explicit user window disables derivation and is passed through."""
+    manager_cls, captured = _make_recording_manager(KVCacheManagerV2)
+    explicit = [4096]
+    kv_cache_config = KvCacheConfig(max_attention_window=explicit)
+
+    _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=False)
+
+    assert captured["kv_cache_config"].max_attention_window == explicit
+
+
+def test_v1_manager_skips_derivation(monkeypatch):
+    """(c) V1 manager -> no derivation, window stays unset."""
+    manager_cls, captured = _make_recording_manager(KVCacheManager)
+    assert not issubclass(manager_cls, KVCacheManagerV2)
+    kv_cache_config = KvCacheConfig()
+
+    _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=False)
+
+    assert captured["kv_cache_config"].max_attention_window is None
+
+
+def test_draft_manager_skips_derivation(monkeypatch):
+    """(d) is_draft=True -> derivation skipped even on a V2 manager (Change A)."""
+    manager_cls, captured = _make_recording_manager(KVCacheManagerV2)
+    kv_cache_config = KvCacheConfig()
+
+    _run_create_kv_cache_manager(monkeypatch, manager_cls, kv_cache_config, is_draft=True)
+
+    assert captured["kv_cache_config"].max_attention_window is None
