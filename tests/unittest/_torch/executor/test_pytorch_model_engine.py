@@ -876,7 +876,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids, None, False)
+                                                     promoted_ids, None, False,
+                                                     None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 

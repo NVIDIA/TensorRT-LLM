@@ -833,8 +833,12 @@ class CUDAGraphRunner:
         new_batch_size = batch_size
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
+            # Padding only agrees on eligibility and batch size; the tier slot
+            # is unused here. It is still sent so both per-iteration exchanges
+            # share one fixed-size payload, and a constant keeps this path from
+            # resolving a tier for a batch it is about to change.
             graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph)
+                batch, can_run_cuda_graph, SampleType.FULL)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:
