@@ -8,7 +8,7 @@ from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
 from tensorrt_llm._torch.speculative.interface import (

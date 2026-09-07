@@ -325,10 +325,10 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 
 | Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | Vanilla |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer `trtllm_bf16_moe`)§ | N | N | N | N | N | Y (SM90, BF16) | N | Y |
+| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer `trtllm_bf16_moe`)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N‡ | N | N | N | N | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
@@ -348,6 +348,23 @@ degrades to Cutlass with `DEP_MISSING` recorded in `degraded_from`, where the
 pre-resolver code raised `RuntimeError` instead. The same path also requires
 `intermediate_size_per_partition % 128 == 0` (`Bf16MoeLauncher::check_moe`);
 a non-aligned shard is `SHAPE_UNALIGNED` and falls back to Cutlass.
+
+¶ `CuteDslFusedMoE` on SM107 needs `MoEDep.CUTEDSL_RUBIN` (the installed CuTe DSL
+exposes the Rubin helpers) and carries three constraints the other SMs do not:
+
+- **Fused finalize is mandatory.** There is no unfused FC2 — NVFP4 has no plain
+  grouped GEMM there, and the BF16 op fuses finalize unconditionally. Disabling
+  finalize fusion, explicitly or by configuring LoRA, is
+  `FINALIZE_FUSION_REQUIRED` rather than a late `NotImplementedError`.
+- **Unquantized is SwiGLU-only.** `cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin`
+  takes no activation argument, so any other activation is
+  `ACTIVATION_UNSUPPORTED`. NVFP4 forwards `activation_type` and serves Relu2 too.
+- **Locality domain excludes EPLB and DWDP.** Localized weight shards are built
+  once from the loaded weights, so they cannot follow expert migration
+  (`EPLB_UNSUPPORTED`) or parameter rebinding. DWDP is not an error: with
+  `uses_locality_domain` true, `_should_enable_dwdp` simply returns False.
+  Both locality-domain kernels also fuse SwiGLU, so `plan_moe` declines any other
+  activation: an NVFP4 Relu2 layer runs unpartitioned rather than being rejected.
 
 Cutlass covers `W4A16 NVFP4` on a wider SM range than plain `NVFP4` because the
 two run different kernels: `W4A16NVFP4CutlassFusedMoEMethod` dequantizes the FP4
