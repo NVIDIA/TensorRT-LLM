@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -46,10 +61,10 @@ class LayerRange:
 class KVSlice:
     """KV-cache blocks for one request transfer slice.
 
-    Monolithic transfers omit ``token_range`` and cover ``prompt_len``.
-    Pipelined transfers use a block-aligned ``token_range`` and mark only the
-    final chunk with ``is_last_slice``. Block lists may omit cached or evicted
-    prefixes.
+    Every transfer states its ``token_range``; a monolithic one covers the whole
+    prompt. Pipelined transfers use a block-aligned ``token_range`` and mark only
+    the final chunk with ``is_last_slice``. Block lists may omit cached or
+    evicted prefixes.
     """
 
     layer_range: Optional[LayerRange] = None
@@ -58,6 +73,11 @@ class KVSlice:
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     token_range: Optional[TokenRange] = None
+    # One chunk of a pipelined session, even when the prompt fit in a single
+    # chunk. A whole-prompt chunk is indistinguishable from a monolithic slice
+    # by token_range alone, and context parallelism has to be refused for the
+    # session rather than for whichever chunk happens to be short.
+    pipelined: bool = False
 
 
 class SessionStatus(Enum):
@@ -81,6 +101,19 @@ class SessionStatus(Enum):
     FULLY_TRANSFERRED = "FULLY_TRANSFERRED"
     ERROR = "ERROR"
     CANCELLED = "CANCELLED"
+
+    # Asked as questions rather than spelled out at each site: a hand-written
+    # tuple has to be found and edited whenever a value is added, and the one
+    # that was missed left its session in no bucket at all, never closed.
+    @property
+    def is_failure(self) -> bool:
+        """A fault or a cancel. Back off; do not simply retry."""
+        return self in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+
+    @property
+    def is_delivered(self) -> bool:
+        """KV has landed; auxiliary data may still be in flight."""
+        return self in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED)
 
 
 class WaitResult(Enum):

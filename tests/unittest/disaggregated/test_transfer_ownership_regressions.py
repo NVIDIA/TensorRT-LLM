@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -1768,6 +1769,8 @@ def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> Non
     rid = 100
     sender = _make_owned_sender()
     sender._num_threads = 1
+    sender._device_id = 0
+    sender._thread_local = threading.local()
     sender._send_task_queues = [queue.Queue()]
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
@@ -1797,23 +1800,35 @@ def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> Non
     }
     build = Mock(side_effect=RuntimeError("descriptor build failed"))
     monkeypatch.setattr(sender, "_build_kv_write_meta", build)
+    dealer = Mock()
+    monkeypatch.setattr(sender, "_get_or_connect_thread_dealer", Mock(return_value=dealer))
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", lambda *_: None)
+    monkeypatch.setattr(transfer_mod, "CUASSERT", lambda *_: None)
+    monkeypatch.setattr(transfer_mod, "cudart", SimpleNamespace(cudaSetDevice=lambda *_: None))
 
-    with pytest.raises(RuntimeError, match="descriptor build failed"):
-        sender.dispatch_task(task, peers)
+    sender.dispatch_task(task, peers)
+    # The write plan is built on the send worker, so that is where a build
+    # failure has to retire the operation and settle the peer that asked.
+    sender._send_task_queues[0].put(None)  # sentinel: leave the worker loop
+    sender._process_task_queue(0)
 
-    build.assert_called_once_with(task, peers[1])
+    assert build.call_args_list == [call(task, peers[1]), call(task, peers[2])]
     assert task.resources_drained
     assert {rank: operation.state for rank, operation in task._physical_operations.items()} == {
         1: transfer_mod._PhysicalOperationState.NOT_SUBMITTED,
         2: transfer_mod._PhysicalOperationState.NOT_SUBMITTED,
     }
-    results = [sender._send_task_queues[0].get_nowait() for _ in peers]
+    # Settled on the wire, not parked back on the queue this same thread drains:
+    # the sentinel is already past, so a re-queued frame would never be sent.
     assert sender._send_task_queues[0].empty()
-    assert {endpoint for endpoint, _ in results} == {"receiver"}
-    assert {transfer_mod._KV_RESULT_PREFIX.unpack(message[1])[2] for _, message in results} == {
-        1,
-        2,
-    }
+    assert sender._get_or_connect_thread_dealer.call_args_list == [
+        call("receiver"),
+        call("receiver"),
+    ]
+    assert {
+        transfer_mod._KV_RESULT_PREFIX.unpack(message[1])[2]
+        for (message,), _ in dealer.send.call_args_list
+    } == {1, 2}
 
 
 @pytest.mark.cpu_only
@@ -2520,3 +2535,64 @@ def test_fp4_mla_bridge_rejects_requests_outside_qualified_protocol() -> None:
     )
     transceiver.request_and_receive_async(req)
     assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+def _sweep_only_sender(local_ttl_s: float) -> transfer_mod.Sender:
+    """A Sender carrying only what recording and sweeping a demand read."""
+    sender = transfer_mod.Sender.__new__(transfer_mod.Sender)
+    sender._init_stale_sweep(local_ttl_s)
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    return sender
+
+
+def _unclaimed_demand(rid: int) -> transfer_mod.RecvReqInfo:
+    return transfer_mod.RecvReqInfo(
+        sender_req_id=rid,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+    )
+
+
+@pytest.mark.cpu_only
+def test_a_short_transfer_timeout_does_not_shorten_the_demand_lease() -> None:
+    """The waiter sits on the other side, and its deadline never reaches this one.
+
+    Sweeping on this worker's transfer timeout drops a demand the generation side
+    is still waiting on, and nothing re-sends REQUEST_DATA -- that side finds out
+    only when its own, longer, deadline expires. The floor is what prevents it.
+    """
+    sender = _sweep_only_sender(10.0)  # this context worker gives up after 10s
+    assert sender._stale_req_info_ttl_s == transfer_mod.Sender._STALE_REQ_INFO_TTL_S
+    for rid, age_s in ((1, 20.0), (2, 130.0)):
+        sender._add_req_info(rid, 0, _unclaimed_demand(rid))
+        sender._peer_requests_timestamps[rid] = time.monotonic() - age_s
+    sender._next_stale_sweep_at = 0.0
+
+    sender.sweep_stale_req_infos()
+
+    assert 1 in sender._peer_requests  # past this worker's 10s, inside the 120s floor
+    assert 2 not in sender._peer_requests
+    assert 2 not in sender._peer_requests_timestamps  # the sweep leaves nothing behind
+
+
+@pytest.mark.cpu_only
+def test_a_transfer_timeout_longer_than_the_floor_still_sets_the_lease() -> None:
+    """It floors the lease, it does not pin it: a longer timeout still lengthens it."""
+    sender = _sweep_only_sender(300.0)
+    sender._add_req_info(1, 0, _unclaimed_demand(1))
+    sender._peer_requests_timestamps[1] = time.monotonic() - 200.0
+    sender._next_stale_sweep_at = 0.0
+
+    sender.sweep_stale_req_infos()
+    assert 1 in sender._peer_requests
+
+    sender._peer_requests_timestamps[1] = time.monotonic() - 400.0
+    sender._next_stale_sweep_at = 0.0
+    sender.sweep_stale_req_infos()
+    assert 1 not in sender._peer_requests

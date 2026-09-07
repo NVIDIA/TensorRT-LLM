@@ -37,7 +37,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class TestAlignKvBlocks:
-    """Verify Sender._align_kv_blocks handles src/dst token starts correctly."""
+    """Verify Sender._align_kv_blocks handles src/dst block starts correctly."""
 
     TPB = 64
 
@@ -45,9 +45,8 @@ class TestAlignKvBlocks:
         return Sender._align_kv_blocks(
             np.array(src, dtype=np.int64),
             np.array(dst, dtype=np.int64),
-            src_token_start=src_start,
-            dst_token_start=dst_start,
-            tokens_per_block=self.TPB,
+            src_start_block=src_start // self.TPB,
+            dst_start_block=dst_start // self.TPB,
         )
 
     def test_no_offset(self):
@@ -185,6 +184,7 @@ class TestPackedBeamBlockLayout:
         assert Sender._beam0_block_count(block_ids, total_blocks=3, beam_width=1) == 3
 
     def test_align_packed_single_block_prompt_keeps_all_beam_blocks(self):
+        """A one-block prompt packs every beam into that block; none may be cut."""
         src_block_ids = np.array([10, 10, 10, 10], dtype=np.int64)
         dst_block_ids = np.array([20, 21, 22, 23], dtype=np.int64)
         total_blocks = 1
@@ -195,9 +195,8 @@ class TestPackedBeamBlockLayout:
         src, dst = Sender._align_kv_blocks(
             src_block_ids,
             dst_block_ids,
-            src_token_start=src_start,
-            dst_token_start=dst_start,
-            tokens_per_block=tpb,
+            src_start_block=src_start // tpb,
+            dst_start_block=dst_start // tpb,
         )
 
         np.testing.assert_array_equal(src, [10, 10, 10, 10])
@@ -261,6 +260,33 @@ class TestPackedBeamBlockLayout:
 # ---------------------------------------------------------------------------
 
 
+def test_alignment_is_expressed_in_global_block_ordinals():
+    """The starts are block ordinals, so a start cannot be spelled off-grid.
+
+    Token starts said the same thing only because every one they were handed
+    was block-aligned; one that was not floored silently and paired the two
+    lists a block apart.
+    """
+    src = np.array([10, 11, 12, 13], dtype=np.int64)
+    dst = np.array([20, 21, 22], dtype=np.int64)
+
+    # Receiver already holds one block: its list starts one ordinal later.
+    a, b = Sender._align_kv_blocks(src, dst, src_start_block=0, dst_start_block=1)
+    np.testing.assert_array_equal(a, [11, 12, 13])
+    np.testing.assert_array_equal(b, [20, 21, 22])
+
+    # Sender holds the later span: the receiver's head is skipped instead.
+    a, b = Sender._align_kv_blocks(src, dst, src_start_block=2, dst_start_block=0)
+    np.testing.assert_array_equal(a, [10])
+    np.testing.assert_array_equal(b, [22])
+
+    # No overlap: the slice ends before the receiver's list begins.
+    a, b = Sender._align_kv_blocks(
+        np.array([10], dtype=np.int64), dst, src_start_block=0, dst_start_block=5
+    )
+    assert a.size == 0 and b.size == 0
+
+
 class TestTrimReceiverWindowHead:
     """Sender._trim_receiver_window_head drops the receiver's extra head blocks.
 
@@ -282,9 +308,11 @@ class TestTrimReceiverWindowHead:
         np.testing.assert_array_equal(trimmed, [21])
 
     def test_trimmed_receiver_maps_onto_the_last_prompt_block(self):
-        # Regression: trimming the tail leaves [20], which _align_kv_blocks then
-        # pairs with src block 10 -- one block early, so the last prompt block
-        # is never written.
+        """The trim takes the receiver's head, so its tail still lands last.
+
+        Trimming the tail instead leaves [20], which then pairs with src block
+        10 -- one block early, and the last prompt block is never written.
+        """
         src_block_ids = np.array([10], dtype=np.int64)
         dst_block_ids = np.array([20, 21], dtype=np.int64)
         total_blocks = 1225
@@ -299,9 +327,8 @@ class TestTrimReceiverWindowHead:
         src, dst = Sender._align_kv_blocks(
             src_block_ids,
             dst_block_ids,
-            src_token_start=src_start,
-            dst_token_start=dst_start,
-            tokens_per_block=tpb,
+            src_start_block=src_start // tpb,
+            dst_start_block=dst_start // tpb,
         )
 
         np.testing.assert_array_equal(src, [10])
@@ -770,9 +797,8 @@ class TestSenderTokenStarts:
         return Sender._align_kv_blocks(
             np.array(src, dtype=np.int64),
             np.array(dst, dtype=np.int64),
-            src_token_start=src_start,
-            dst_token_start=dst_start,
-            tokens_per_block=self.TPB,
+            src_start_block=src_start // self.TPB,
+            dst_start_block=dst_start // self.TPB,
         )
 
     def test_full_prompt_no_cache(self):

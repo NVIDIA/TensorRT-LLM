@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import copy
 import random
@@ -809,6 +824,340 @@ async def test_kv_cache_aware_router_finish_request_decrements_on_poll_error(
 
     assert router._server_state[servers[0]].num_active_requests() == 0
     assert id(request) not in router._req_routing_table
+
+
+def test_the_reporting_rank_is_read_off_the_envelope_the_serializer_writes():
+    """Every other test builds the index by calling `add_blocks` directly.
+
+    That is why reading the rank from the wrong nesting level survived: the
+    serializer puts `attention_dp_rank` beside `"data"`, not inside it, so a
+    body read yields None for every event, the per-rank index is never written,
+    and every prefix matches nobody. Nothing else here goes through the parser.
+    """
+    state = KvCacheAwareServerState("server-dp", tokens_per_block=4)
+
+    # Shaped as KVCacheEventSerializer.to_json_str writes it. Each rank runs
+    # its own cache manager, so each numbers its own events from zero.
+    state.update_with_events([
+        {
+            "event_id": 0,
+            "hash_algo": KV_CACHE_HASH_ALGO_V1,
+            "attention_dp_rank": 3,
+            "data": {
+                "type": "stored",
+                "blocks": [{
+                    "block_hash": 11
+                }, {
+                    "block_hash": 12
+                }]
+            },
+        },
+        {
+            "event_id": 0,
+            "hash_algo": KV_CACHE_HASH_ALGO_V1,
+            "attention_dp_rank": 4,
+            "data": {
+                "type": "stored",
+                "blocks": [{
+                    "block_hash": 11
+                }]
+            },
+        },
+    ])
+
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {11, 12}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[11] == (1 << 3 | 1 << 4)
+
+    # Two ranks back block 11, so a removal that dropped it outright would pass
+    # a single-owner check while losing a prefix rank 4 can still serve.
+    state.update_with_events([
+        {
+            "event_id": 1,
+            "hash_algo": KV_CACHE_HASH_ALGO_V1,
+            "attention_dp_rank": 3,
+            "data": {
+                "type": "removed",
+                "block_hashes": [11]
+            },
+        },
+    ])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {11, 12}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[11] == 1 << 4
+
+
+def test_block_index_keeps_the_reporting_dp_rank():
+    """The rank the event carried is retained, and matching is unaffected."""
+    state = KvCacheAwareServerState("server-dp", tokens_per_block=4)
+    state.set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    state.add_blocks([1, 2],
+                     hash_algo=KV_CACHE_HASH_ALGO_V1,
+                     attention_dp_rank=0)
+    state.add_blocks([2, 3],
+                     hash_algo=KV_CACHE_HASH_ALGO_V1,
+                     attention_dp_rank=1)
+
+    # Membership is unchanged: any rank holding a block puts it in the index.
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {1, 2, 3}
+    assert asyncio.run(state.matched_tokens([[1, 2]],
+                                            KV_CACHE_HASH_ALGO_V1)) == 8
+
+    # Both ranks report block 2; only rank 1 reports block 3.
+    owners = state._block_owners(KV_CACHE_HASH_ALGO_V1)
+    assert owners[2] == 0b11
+    assert owners[3] == 0b10
+
+
+def test_one_rank_evicting_does_not_empty_the_index():
+    """A block leaves the server's index only when no rank still reports it."""
+    state = KvCacheAwareServerState("server-evict", tokens_per_block=4)
+    state.set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+    state.add_blocks([7], hash_algo=KV_CACHE_HASH_ALGO_V1, attention_dp_rank=0)
+    state.add_blocks([7], hash_algo=KV_CACHE_HASH_ALGO_V1, attention_dp_rank=1)
+
+    state.remove_blocks([7],
+                        hash_algo=KV_CACHE_HASH_ALGO_V1,
+                        attention_dp_rank=0)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {7}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[7] == 0b10
+
+    state.remove_blocks([7],
+                        hash_algo=KV_CACHE_HASH_ALGO_V1,
+                        attention_dp_rank=1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == set()
+
+
+def test_unstamped_events_leave_the_index_rank_blind():
+    """Unstamped events teach the router nothing, and say so with an empty set."""
+    state = KvCacheAwareServerState("server-blind", tokens_per_block=4)
+    state.set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+    state.add_blocks([1, 2], hash_algo=KV_CACHE_HASH_ALGO_V1)
+
+    assert asyncio.run(state.matched_tokens([[1, 2]],
+                                            KV_CACHE_HASH_ALGO_V1)) == 8
+    # Nothing stamped, so nothing indexed -- and removal then falls back to
+    # dropping the hash outright, which is what a rank-blind server must do.
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1) == {}
+    state.remove_blocks([1], hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {2}
+
+
+def _stored_event(event_id, rank, block_hashes):
+    """One `stored` envelope, shaped as KVCacheEventSerializer writes it."""
+    return {
+        "event_id": event_id,
+        "hash_algo": KV_CACHE_HASH_ALGO_V1,
+        "attention_dp_rank": rank,
+        "data": {
+            "type": "stored",
+            "blocks": [{
+                "block_hash": h
+            } for h in block_hashes]
+        },
+    }
+
+
+def _removed_event(event_id, rank, block_hashes):
+    """One `removed` envelope, shaped as KVCacheEventSerializer writes it."""
+    return {
+        "event_id": event_id,
+        "hash_algo": KV_CACHE_HASH_ALGO_V1,
+        "attention_dp_rank": rank,
+        "data": {
+            "type": "removed",
+            "block_hashes": list(block_hashes)
+        },
+    }
+
+
+def _created_event(event_id, rank):
+    """The one event a cache manager emits at construction."""
+    return {
+        "event_id": event_id,
+        "hash_algo": KV_CACHE_HASH_ALGO_V1,
+        "attention_dp_rank": rank,
+        "data": {
+            "type": "created",
+            "num_blocks_per_cache_level": [16, 0]
+        },
+    }
+
+
+def test_a_restarted_rank_stops_answering_for_what_it_lost():
+    """`created` is a generation marker: event ids rewind, the cache does not.
+
+    A restarted rank's hashes would otherwise sit in the index forever, since
+    the removals that would have retired them died with the old process.
+    """
+    state = KvCacheAwareServerState("server-restart", tokens_per_block=4)
+    state.update_with_events([
+        _created_event(0, 0),
+        _created_event(0, 1),
+        _stored_event(1, 0, [21, 22]),
+        _stored_event(1, 1, [22, 23]),
+    ])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {21, 22, 23}
+
+    # Rank 0 restarts. Block 21 was its alone and goes; 22 is still rank 1's.
+    # Its id carries on from the old stream, so `created` is the only thing
+    # that can retire those blocks here -- a rewound id is a case of its own.
+    state.update_with_events([_created_event(2, 0)])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {22, 23}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[22] == 0b10
+
+    # A rank-blind server reports as one stream, so its restart voids all of it.
+    blind = KvCacheAwareServerState("server-blind-restart", tokens_per_block=4)
+    blind.update_with_events([_stored_event(0, None, [31])])
+    assert blind._block_table(KV_CACHE_HASH_ALGO_V1) == {31}
+    blind.update_with_events([_created_event(1, None)])
+    assert blind._block_table(KV_CACHE_HASH_ALGO_V1) == set()
+
+
+def test_a_lost_removal_does_not_leave_a_rank_holding_a_block_it_dropped():
+    """A cache manager discards its oldest events when its buffer overflows.
+
+    Lose one rank's `removed` and its bit never clears, so the last rank that
+    really evicts the block cannot retire it and the router keeps offering a
+    prefix no rank can serve. The gap in that rank's numbering is the only
+    warning we get.
+    """
+    state = KvCacheAwareServerState("server-lossy", tokens_per_block=4)
+    state.update_with_events(
+        [_stored_event(0, 0, [41]),
+         _stored_event(0, 1, [41])])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {41}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[41] == 0b11
+
+    # Rank 1's removal of block 41 (its id 1) died in the manager's buffer.
+    state.update_with_events([_stored_event(2, 1, [99])])
+    owners = state._block_owners(KV_CACHE_HASH_ALGO_V1)
+    # Only rank 1 is retired, and the event in hand is applied on top of that.
+    assert owners[41] == 0b01
+    assert owners[99] == 0b10
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {41, 99}
+
+    state.update_with_events([_removed_event(1, 0, [41])])
+    assert 41 not in state._block_table(KV_CACHE_HASH_ALGO_V1)
+    assert 41 not in state._block_owners(KV_CACHE_HASH_ALGO_V1)
+    assert asyncio.run(state.matched_tokens([[41]], KV_CACHE_HASH_ALGO_V1)) == 0
+
+
+def test_a_rewound_event_id_stream_retires_the_ranks_blocks():
+    """A restart whose `created` event was itself discarded still shows up.
+
+    `created` is the oldest event a rank ever emits, so an overflowing buffer
+    drops it first; the rewound numbering is what is left to notice by.
+    """
+    state = KvCacheAwareServerState("server-rewound", tokens_per_block=4)
+    state.update_with_events(
+        [_stored_event(0, 0, [51]),
+         _stored_event(1, 0, [52])])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {51, 52}
+
+    state.update_with_events([_stored_event(0, 0, [53])])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {53}
+
+
+def test_a_contiguous_event_stream_is_never_retired():
+    """Each rank numbers its own events, so ranks interleave at the router.
+
+    Tracked as one sequence, rank 1's first event would read as a rewind of
+    rank 0's and wipe a view that lost nothing.
+    """
+    batches = [
+        [_stored_event(0, 0, [61, 62]),
+         _stored_event(0, 1, [62, 63])],
+        [_removed_event(1, 0, [61]),
+         _stored_event(1, 1, [64])],
+        [_stored_event(2, 0, [65]),
+         _removed_event(2, 1, [63])],
+    ]
+    state = KvCacheAwareServerState("server-contiguous", tokens_per_block=4)
+    for batch in batches:
+        state.update_with_events(batch)
+
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {62, 64, 65}
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1) == {
+        62: 0b11,
+        64: 0b10,
+        65: 0b01
+    }
+
+    # An unnumbered producer is trusted as before, so the two agree exactly.
+    unnumbered = KvCacheAwareServerState("server-unnumbered",
+                                         tokens_per_block=4)
+    for batch in batches:
+        stripped = copy.deepcopy(batch)
+        for event in stripped:
+            del event["event_id"]
+        unnumbered.update_with_events(stripped)
+
+    assert unnumbered._block_table(KV_CACHE_HASH_ALGO_V1) == state._block_table(
+        KV_CACHE_HASH_ALGO_V1)
+    assert unnumbered._block_owners(
+        KV_CACHE_HASH_ALGO_V1) == state._block_owners(KV_CACHE_HASH_ALGO_V1)
+
+
+def test_a_rank_that_stops_reporting_stops_answering():
+    """A gone rank never breaks its own numbering, so nothing else catches it.
+
+    Its blocks would keep drawing requests to a server that cannot serve them,
+    and the miss only shows up as a full prefill after the routing decision.
+    """
+    state = KvCacheAwareServerState("server-silent", tokens_per_block=4)
+    state.update_with_events(
+        [_stored_event(0, 0, [71, 72]),
+         _stored_event(0, 1, [72, 73])])
+
+    for i in range(state._SILENT_BATCHES_BEFORE_FORGET - 1):
+        state.update_with_events([_stored_event(i + 1, 0, [74])])
+    assert 73 in state._block_table(KV_CACHE_HASH_ALGO_V1)  # rank 1 still counted
+
+    state.update_with_events([_stored_event(state._SILENT_BATCHES_BEFORE_FORGET,
+                                            0, [75])])
+    # 72 was both ranks' and stays on rank 0's word alone; 73 was rank 1's only.
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {71, 72, 74, 75}
+    assert 1 not in state._next_event_id
+
+
+def test_a_quiet_server_does_not_retire_the_ranks_that_are_merely_idle():
+    """An empty poll says nothing about any rank; only another rank's word does.
+
+    Polling is periodic, so a server with no traffic delivers empty batches
+    indefinitely -- counting those would wipe a perfectly good view.
+    """
+    state = KvCacheAwareServerState("server-idle", tokens_per_block=4)
+    state.update_with_events([_stored_event(0, 0, [81]), _stored_event(0, 1, [82])])
+
+    for _ in range(state._SILENT_BATCHES_BEFORE_FORGET * 2):
+        state.update_with_events([])
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {81, 82}
+
+    # And a rank that speaks again starts its count over.
+    for i in range(state._SILENT_BATCHES_BEFORE_FORGET - 1):
+        state.update_with_events([_stored_event(i + 1, 0, [83])])
+    state.update_with_events([_stored_event(1, 1, [84])])
+    for i in range(state._SILENT_BATCHES_BEFORE_FORGET - 1):
+        state.update_with_events([_stored_event(i + 16, 0, [85])])
+
+    assert 82 in state._block_table(KV_CACHE_HASH_ALGO_V1)
+
+
+def test_owner_index_holds_a_rank_past_the_width_of_a_machine_word():
+    """Attention-DP rank is the global rank, which is not bounded by 64."""
+    state = KvCacheAwareServerState("server-wide", tokens_per_block=4)
+    state.set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+    state.add_blocks([5], hash_algo=KV_CACHE_HASH_ALGO_V1, attention_dp_rank=0)
+    state.add_blocks([5],
+                     hash_algo=KV_CACHE_HASH_ALGO_V1,
+                     attention_dp_rank=200)
+
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[5] == (1 | 1 << 200)
+    state.remove_blocks([5],
+                        hash_algo=KV_CACHE_HASH_ALGO_V1,
+                        attention_dp_rank=200)
+    assert state._block_owners(KV_CACHE_HASH_ALGO_V1)[5] == 1
+    assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {5}
 
 
 def test_kv_cache_aware_server_state_add_blocks_set_update_fast_path():
