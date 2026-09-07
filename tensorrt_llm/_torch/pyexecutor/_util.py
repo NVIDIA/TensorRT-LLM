@@ -495,8 +495,6 @@ def _derive_layer_type_attention_windows(
             "Unable to derive per-layer attention windows from layer_types "
             f"({error}); falling back to the single-window default.")
         return None
-    if not any(window is not None for window in windows):
-        return None
     resolved = _normalize_attention_windows(
         [max_seq_len if window is None else window for window in windows],
         max_seq_len)
