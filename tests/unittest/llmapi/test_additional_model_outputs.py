@@ -6,7 +6,7 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \

@@ -35,6 +35,8 @@ _TEMPORAL_GVR_IMPLEMENTATIONS = {
     TopKImplementation.CUTE_DSL_GVR,
 }
 _MAX_RADIX_BLOCKS_PER_ROW = 10
+# One 16-byte vector per copy, matching the Blackwell prefill op's contract.
+_CUTE_DSL_PREFILL_COPY_BITS = 128
 
 
 class TopK(nn.Module):
@@ -142,6 +144,17 @@ class TopK(nn.Module):
                 row_ends,
                 output_indices,
             )
+        if self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
+            # Keep the op's reread policy default; only its copy width is tuned.
+            torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                scores,
+                row_starts,
+                row_ends,
+                output_indices,
+                self.top_k,
+                _CUTE_DSL_PREFILL_COPY_BITS,
+            )
+            return output_indices
         if self.prefill_implementation != TopKImplementation.CUDA_RADIX:
             raise NotImplementedError(
                 f"{self.prefill_implementation.value} does not support prefill Top-K"

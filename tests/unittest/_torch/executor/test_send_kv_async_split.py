@@ -17,7 +17,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 

@@ -408,11 +408,11 @@ class RequestBroadcaster:
             return request_count
 
         if not self.dist.has_pp:
-            return self.dist.broadcast(request_count, root=0)
+            return int(self.dist.broadcast_int64([request_count], root=0)[0])
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):
-                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+                request_count = int(self.dist.tp_cp_broadcast_int64([request_count], root=0)[0])
 
         tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
 

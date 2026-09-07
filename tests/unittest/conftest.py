@@ -37,6 +37,7 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm._utils import print_all_stacks
 
+# Bootstrap: makes common utilities under tests/ importable.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
 # Dispatched explicitly (not via pytest_plugins, which pytest forbids in a

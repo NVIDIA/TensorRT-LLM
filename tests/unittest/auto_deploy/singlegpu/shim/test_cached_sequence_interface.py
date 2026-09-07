@@ -46,7 +46,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     UnpagedResourceHandler,
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 # =============================================================================
