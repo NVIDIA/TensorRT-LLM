@@ -77,21 +77,35 @@ its own scoring or transform kernels. Compression can affect accuracy and output
 quality; the exact trade-off depends on the method, its settings, and the
 workload, and must be validated before deployment.
 
-`KvCacheCompressionConfig` selects the compression method and its
-algorithm-specific policy. It is used alongside two related but distinct
+`KvCacheCompressionConfig` selects a lifecycle-managed compression method and
+its algorithm-specific policy. It is used alongside two related but distinct
 configurations: `KvCacheConfig` controls cache capacity, levels, reuse,
-offloading, and Page lifetime, while `SparseAttentionConfig` controls how
-Attention selects or processes KV during computation. Neither configuration
-selects a compression method. A concrete compression method must understand the
-cache layout it transforms; it can preserve unsupported or non-Attention state
-losslessly, or reject a layout that it cannot handle.
+offloading, Page lifetime, and the active KV dtype, while
+`SparseAttentionConfig` controls how Attention selects or processes KV during
+computation. These configurations select distinct execution paths. A concrete
+compression method must understand the cache layout it transforms; it can
+preserve unsupported or non-Attention state losslessly, or reject a layout that
+it cannot handle.
 
 ## When Compression Runs
 
-Compression methods use one or both integration models. Iteration-driven
-methods run from PyExecutor's request and iteration lifecycle. Storage-bound
-methods run only when KVCM migrates a Page across a hot/cold representation
-boundary. A method implements only the integration models and stages it needs.
+TensorRT-LLM supports KV cache compression both during and outside model forward
+computation. During a forward pass, [Sparse Attention](sparse-attention.md) can
+reduce KV-cache storage or computation through token eviction, token selection,
+and masking or skipping low-contribution work. Active KV-cache quantization
+stores KV in a lower-precision format selected by `KvCacheConfig(dtype=...)`;
+see [Quantization](quantization.md).
+
+For other KV cache compression techniques that operate outside model forward
+computation, TensorRT-LLM provides the lifecycle-managed framework described on
+this page. It invokes compression at stable boundaries between forward steps or
+when a Page moves across cache tiers.
+
+Within this framework, compression methods use one or both integration models.
+Iteration-driven methods run from PyExecutor's request and iteration lifecycle.
+Storage-bound methods run when KVCM migrates a Page across a hot/cold
+representation boundary. A method implements only the integration models and
+stages it needs.
 
 ### Iteration-Driven Methods
 

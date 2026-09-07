@@ -16,10 +16,9 @@ storage ABI, page-index lifetime, staging, and migration transaction, see the
 [KVCM V2 Cold-Page Codec Design](kv-cache-cold-page-codec.md).
 
 - [Architecture](#architecture)
-- [Configuration contract](#configuration-contract)
-- [Configuration, construction, and binding](#configuration-construction-and-binding)
+- [Configuration and construction](#configuration-and-construction)
 - [Iteration-driven methods](#iteration-driven-methods)
-- [Storage-bound codec providers](#storage-bound-codec-providers)
+- [Storage-bound methods](#storage-bound-methods)
 - [Ownership and failure boundaries](#ownership-and-failure-boundaries)
 - [Calibration and offline artifacts](#calibration-and-offline-artifacts)
 - [Adding a compression method](#adding-a-compression-method)
@@ -64,10 +63,19 @@ a representation boundary.
 Keep the two mechanisms separate. Do not add migration policy to an iteration
 hook, and do not make a cold-page provider allocate or publish KVCM Pages.
 
-## Configuration contract
+## Configuration and construction
 
-Compression configurations expose attributes and compatibility methods that
-the framework uses during construction.
+Public method configurations inherit from `KvCacheCompressionConfig` in
+`tensorrt_llm/llmapi/llm_args.py`. The `algorithm` field selects a concrete
+configuration and manager. Method-specific options remain on the concrete
+configuration rather than the common base.
+
+`create_kv_cache_compression_manager()` in
+`tensorrt_llm/_torch/pyexecutor/_util.py` validates the selected configuration
+and creates the concrete manager before model execution or storage migration.
+
+To support construction and compatibility checks, compression configurations
+expose the following contract.
 
 | Member | Type | Purpose |
 |---|---|---|
@@ -86,19 +94,6 @@ only when it cannot preserve the reusable prefix or its mapping contract.
 Compatibility methods are admission predicates, not runtime fallbacks. A method
 may still impose narrower mode, backend, or model-layout checks in the common
 compatibility validator or its construction path.
-
-## Configuration, construction, and binding
-
-Public method configurations inherit from `KvCacheCompressionConfig` in
-`tensorrt_llm/llmapi/llm_args.py`. The `algorithm` field selects a concrete
-configuration and manager. Method-specific options remain on the concrete
-configuration rather than the common base.
-
-`create_kv_cache_compression_manager()` in
-`tensorrt_llm/_torch/pyexecutor/_util.py` performs admission checks and creates
-the concrete manager. Validate unsupported combinations here, before model
-execution or storage migration. This includes backend, GPU architecture, block
-reuse, speculative-decoding mode, and other method-level restrictions.
 
 The factory runs before KVCM construction because a storage-bound manager must
 be available as a codec provider while KVCM builds its cold layout. The two
@@ -165,7 +160,7 @@ compression manager and invokes the corresponding hooks. Developers only need
 to subclass `KVCacheCompressionManager` and implement the hooks their method
 uses; the framework handles registration and callback wiring.
 
-## Storage-bound codec providers
+## Storage-bound methods
 
 Cold-page compression is a storage-bound method that encodes KV Pages into a
 compressed format during offloading and decodes them during onboarding. Each
