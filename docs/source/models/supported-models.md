@@ -91,7 +91,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | MTP                        | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No                         | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No                         | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear)           | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.

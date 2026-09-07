@@ -187,9 +187,12 @@ def test_msa_metadata_rejects_undersized_max_score_buffer():
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     # Flat backing store sized for 4 heads * 8 k-tiles * 2 batch = 64 elements,
-    # too small for the plan's required 4 * 16 * 2 = 128.
+    # too small for the plan's required 4 * 16 * 2 = 128. One query token per
+    # decode row, so the token bound equals the batch here.
     metadata.msa_max_score = torch.zeros(4 * 8 * 2)
     metadata.kv_cache_manager = None
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 2
 
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata._ensure_msa_decode_scratch_buffers(
@@ -297,6 +300,31 @@ def test_msa_paged_hnd_input_materializes_unaligned_outer_stride() -> None:
     assert prepared.is_contiguous()
     assert prepared.data_ptr() != view.data_ptr()
     torch.testing.assert_close(prepared, view)
+
+
+def test_per_token_valid_blocks_multi_token_decode():
+    """Spec-verify decode rows get one entry per query token, following the causal
+    ladder inside the verify window.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    # One request verifying 4 tokens against kv_len 10 (offset 6): token t
+    # attends 7 + t positions; with 2-token blocks that is ceil((7+t)/2).
+    qo = torch.tensor([4], dtype=torch.int32)
+    kv = torch.tensor([10], dtype=torch.int32)
+    off = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    # Mixed batch: an ordinary decode row (qo=1) alongside a verify row.
+    qo = torch.tensor([1, 3], dtype=torch.int32)
+    kv = torch.tensor([9, 6], dtype=torch.int32)
+    off = kv - qo
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
+    # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
+    assert n_valid.tolist() == [3, 1, 2, 2]
 
 
 def test_msa_index_k_uses_hnd_cache_view_and_writer():
@@ -732,3 +760,185 @@ def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
     )
     for b, slot in enumerate(padded.out_cache_loc.tolist()):
         assert slot in req_to_token[b].tolist()
+
+
+def test_msa_scratch_sizing_covers_spec_verify_tokens():
+    """With Eagle3 a decode step has 1 + draft_len query tokens per request, so the
+    proxy scratch must be sized by tokens, not by batch.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = None
+    # 2 sequences, 4 tokens each (draft_len=3): 8 decode tokens per step.
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    # Store sized for batch-only sizing (4 heads * 16 k-tiles * 2), which is
+    # too small once tokens are accounted for (4 * 16 * 8).
+    metadata.msa_max_score = torch.zeros(4 * 16 * 2)
+
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata._ensure_msa_decode_scratch_buffers(
+            num_index_heads=4,
+            max_batch=2,
+            capture_graph=False,
+            required_max_k_tiles=16,
+        )
+
+
+def _kv_lens_update_metadata(monkeypatch, *, qo_lens, kv_staged, kv_corrected, page_size):
+    """Metadata with just enough staged state for on_update_kv_lens: two requests
+    with several query tokens each, optimistic kv_lens from prepare(), then the
+    corrected kv_lens. Everything lives on the host.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
+
+    # The base hook only touches MLA caches this metadata never builds.
+    monkeypatch.setattr(msa_backend.TrtllmAttentionMetadata, "on_update_kv_lens", lambda self: None)
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    qo = torch.tensor(qo_lens, dtype=torch.int32)
+    batch = int(qo.shape[0])
+    total_q = int(qo.sum())
+    metadata._seq_lens = qo
+    metadata._seq_lens_cuda = qo.clone()
+    metadata._num_tokens = total_q
+    metadata.kv_lens_cuda = torch.tensor(kv_corrected, dtype=torch.int32)
+    metadata.msa_kv_lens_staged = torch.tensor(kv_staged, dtype=torch.int32)
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=page_size)
+    # Slot table: request b holds slot 100 * b + position.
+    width = 16
+    metadata.msa_req_to_token = torch.arange(width, dtype=torch.int32).unsqueeze(
+        0
+    ) + 100 * torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+    qo_long = qo.to(torch.long)
+    metadata.msa_q_batch_row = torch.repeat_interleave(
+        torch.arange(batch, dtype=torch.int32), qo_long
+    )
+    starts = torch.cumsum(qo_long, 0) - qo_long
+    metadata.msa_q_intra = (
+        torch.arange(total_q, dtype=torch.int64) - torch.repeat_interleave(starts, qo_long)
+    ).to(torch.int32)
+    metadata._msa_q_token_starts = (0, *torch.cumsum(qo_long, 0).tolist())
+    metadata.msa_out_cache_loc = torch.full((total_q + 3,), -1, dtype=torch.int32)
+    metadata.msa_n_valid_blocks = torch.zeros(total_q + 3, dtype=torch.int32)
+    metadata._msa_eager_n_valid_blocks = None
+    metadata._msa_proxy_plan = None
+    metadata._msa_gqa_plan = None
+    metadata._msa_dense_plan = None
+    metadata._msa_eager_proxy_plan = None
+    metadata._msa_eager_gqa_plan = None
+    metadata._msa_eager_dense_plan = None
+    metadata._msa_fields_ready = True
+    metadata._msa_kv_lens_dynamic = True
+    return metadata
+
+
+def test_on_update_kv_lens_rederives_slots_counts_and_plan_lengths(monkeypatch):
+    """Request 0 loses one rejected draft token (staged 9 -> corrected 8), request 1
+    is unchanged. Slots, valid-block counts and the plans' length rows must
+    follow, per request or per query token depending on the row count.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
+    )
+    # Proxy plan: one row per request, dense length keys. Sparse GQA plan:
+    # row-expanded per query token, tagged "MM-SA-Nv" with seqused_k.
+    proxy_sub = {
+        "kv_segment_lens": torch.zeros(2, dtype=torch.int32),
+        "qo_offset": torch.zeros(2, dtype=torch.int32),
+    }
+    gqa_sub = {"MM-SA-Nv": True, "seqused_k": torch.zeros(5, dtype=torch.int32)}
+    metadata._msa_proxy_plan = SimpleNamespace(plan=(False, 2, 2, proxy_sub, None))
+    metadata._msa_gqa_plan = SimpleNamespace(plan=(False, 2, 2, gqa_sub, None))
+
+    metadata.on_update_kv_lens()
+
+    # Token positions: request 0 attends 8 tokens with 2 queries -> 6, 7;
+    # request 1 attends 12 with 3 queries -> 9, 10, 11.
+    assert metadata.msa_out_cache_loc[:5].tolist() == [6, 7, 109, 110, 111]
+    assert metadata.msa_out_cache_loc[5:].tolist() == [-1, -1, -1]
+    # ceil((pos + 1) / 4) per token.
+    assert metadata.msa_n_valid_blocks[:5].tolist() == [2, 2, 3, 3, 3]
+    assert proxy_sub["kv_segment_lens"].tolist() == [8, 12]
+    assert proxy_sub["qo_offset"].tolist() == [6, 9]
+    assert gqa_sub["seqused_k"].tolist() == [7, 8, 10, 11, 12]
+
+
+def test_on_update_kv_lens_clamps_to_the_staged_lens(monkeypatch):
+    """A correction can only shrink lengths; anything above the staged value is
+    clamped.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(5, 7), kv_corrected=(9, 7), page_size=4
+    )
+    dense_sub = {
+        "kv_segment_lens": torch.zeros(2, dtype=torch.int32),
+        "qo_offset": torch.zeros(2, dtype=torch.int32),
+    }
+    metadata._msa_eager_dense_plan = (False, 2, 2, dense_sub, None)
+
+    metadata.on_update_kv_lens()
+
+    assert dense_sub["kv_segment_lens"].tolist() == [5, 7]
+    assert dense_sub["qo_offset"].tolist() == [4, 6]
+    assert metadata.msa_out_cache_loc[:2].tolist() == [4, 106]
+
+
+def test_on_update_kv_lens_patches_mixed_plans_per_sub_plan(monkeypatch):
+    """A mixed plan has two sub-plans over rows [0, split) and [split, batch); each is
+    patched over its own rows, per request or per query token.
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 3), kv_staged=(6, 12), kv_corrected=(6, 11), page_size=4
+    )
+    decode_sub = {
+        "kv_segment_lens": torch.zeros(1, dtype=torch.int32),
+        "qo_offset": torch.zeros(1, dtype=torch.int32),
+    }
+    prefill_sub = {
+        "kv_segment_lens": torch.zeros(3, dtype=torch.int32),
+        "qo_offset": torch.zeros(3, dtype=torch.int32),
+    }
+    metadata._msa_eager_gqa_plan = (True, 1, 2, decode_sub, prefill_sub)
+
+    metadata.on_update_kv_lens()
+
+    assert decode_sub["kv_segment_lens"].tolist() == [6]
+    assert decode_sub["qo_offset"].tolist() == [5]
+    # Request 1 attends 11 tokens with 3 queries: positions 8, 9, 10.
+    assert prefill_sub["kv_segment_lens"].tolist() == [11, 11, 11]
+    assert prefill_sub["qo_offset"].tolist() == [8, 9, 10]
+
+
+def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
+    """Without speculative decoding the patch and its staging are skipped. The gate
+    also sees max_total_draft_tokens, set by update_spec_dec_param, which
+    covers draft_len=1 under trtllm-gen (no extra KV tokens, linear-tree spec
+    decoding reported disabled).
+    """
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(4, 6), kv_corrected=(3, 5), page_size=4
+    )
+    metadata.max_total_draft_tokens = None
+    metadata.draft_kv_cache_manager = None
+    metadata.is_spec_decoding_enabled = False
+    metadata.kv_cache_params = SimpleNamespace(num_extra_kv_tokens=0)
+    metadata.runtime_features = None
+    assert metadata._msa_kv_lens_may_change() is False
+    metadata.max_total_draft_tokens = 1
+    assert metadata._msa_kv_lens_may_change() is True
+    metadata.max_total_draft_tokens = None
+    metadata.kv_cache_params = SimpleNamespace(num_extra_kv_tokens=2)
+    assert metadata._msa_kv_lens_may_change() is True
+
+    metadata._msa_kv_lens_dynamic = False
+    dense_sub = {
+        "kv_segment_lens": torch.zeros(2, dtype=torch.int32),
+        "qo_offset": torch.zeros(2, dtype=torch.int32),
+    }
+    metadata._msa_eager_dense_plan = (False, 2, 2, dense_sub, None)
+
+    metadata.on_update_kv_lens()
+
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 5
+    assert dense_sub["kv_segment_lens"].tolist() == [0, 0]
