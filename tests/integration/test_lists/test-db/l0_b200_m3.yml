@@ -22,6 +22,7 @@ l0_b200_m3:
   - unittest/_torch/executor/test_mooncake_store_connector.py
   - unittest/_torch/executor/test_mooncake_store_donor.py
   - unittest/_torch/executor/test_mooncake_store_master.py
+  - unittest/_torch/executor/test_seq_slot_sizing.py
   - unittest/_torch/models/test_minimax_m3.py
   - unittest/_torch/models/checkpoints/hf/test_minimaxm3_weight_mapper.py
   - unittest/_torch/thop/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py
