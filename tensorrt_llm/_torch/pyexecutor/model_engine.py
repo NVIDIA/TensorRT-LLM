@@ -749,7 +749,6 @@ class PyTorchModelEngine(ModelEngine):
             'max_num_streams'].default
 
         self._torch_compile_enabled = torch_compile_enabled
-        self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
         self._phase_selective_forward: Optional[_PhaseSelectiveForward] = None
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
@@ -1137,7 +1136,7 @@ class PyTorchModelEngine(ModelEngine):
             lora=self._lora,
             # Do not retain the engine through a bound method.
             model_forward=functools.partial(
-                type(self).model_forward, weakref.proxy(self)),
+                type(self)._runner_model_forward, weakref.proxy(self)),
         )
         runner_config = NoKVCacheRunnerConfig(
             max_batch_size=self.batch_size,
@@ -1389,13 +1388,11 @@ class PyTorchModelEngine(ModelEngine):
             request.py_mrope_delta_cache_slot = request.py_seq_slot
 
     @contextmanager
-    def _without_torch_compile(self):
+    def _maybe_bypass_torch_compile(self, bypass: bool = True):
         """
-        When compile_only_piecewise_graphs is enabled in TorchCompileConfig,
-        this ctxt manager bypasses torch.compile invocation anywhere outside
-        of piecewise CUDA graph capture and warmup.
+        Bypass torch.compile for forwards in this context when requested.
         """
-        if self._phase_selective_forward is None:
+        if self._phase_selective_forward is None or not bypass:
             yield
             return
         with self._phase_selective_forward.bypass():
@@ -1565,18 +1562,19 @@ class PyTorchModelEngine(ModelEngine):
         self._prewarm_cute_dsl_indexer_q()
         log_mem_snapshot("warmup/after_cute_dsl_indexer_q")
         if not is_enc_dec:
-            with self._without_torch_compile():
+            with self._maybe_bypass_torch_compile():
                 self._run_attention_warmup(resource_manager,
                                            can_run_general_warmup)
 
         if can_run_general_warmup:
-            # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
+            # Specialize torch.compile graphs for piecewise-graph-eligible
+            # input shapes before CUDA graph capture.
             warmup_requests_configs = self._agree_warmup_shapes(
                 self._get_full_general_warmup_requests(resource_manager))
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
-                # Do not bypass torch.compile if compile_only_piecewise_graphs
-                # is enabled, to allow for correct piecewise graph specialization
+                # Per-forward eligibility selects compiled execution for
+                # piecewise graph shapes and eager execution for graph misses.
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Release C++ MoE workspace buffers so the autotuner can
                 # reclaim the memory.  They will be re-allocated on next use.
@@ -1590,7 +1588,7 @@ class PyTorchModelEngine(ModelEngine):
         # Helix CP is decode-only and runs into issues with the
         # autotuner warmup's context requests.
         if not is_enc_dec and not self.mapping.has_cp_helix():
-            with self._without_torch_compile():
+            with self._maybe_bypass_torch_compile():
                 self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
@@ -1598,7 +1596,7 @@ class PyTorchModelEngine(ModelEngine):
             # since MambaHybridCacheManager skips _general_warmup and the
             # default autotuner shape is single-seq / no-initstates. Safe
             # no-op for non-Mamba models.
-            with self._without_torch_compile():
+            with self._maybe_bypass_torch_compile():
                 self._run_mamba_hybrid_warmup(resource_manager)
             log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
@@ -1647,7 +1645,7 @@ class PyTorchModelEngine(ModelEngine):
             # enabled, torch.compile can be safely bypassed here.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
-            with self._without_torch_compile():
+            with self._maybe_bypass_torch_compile():
                 self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
@@ -7281,11 +7279,18 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event.record()
 
             breakable_runner = self.breakable_cuda_graph_runner
+            # _prepare_inputs records the group-uniform prefill graph decision.
+            # An ordinary CUDA graph takes precedence; its capture must use the
+            # eager decoder when compilation is restricted to piecewise graphs.
+            use_compiled_forward = (not can_run_graph and
+                                    get_per_request_prefill_cuda_graph_flag())
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
                 def forward_step():
-                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                    with self._maybe_bypass_torch_compile(
+                            bypass=not use_compiled_forward
+                    ), MoeLoadBalancerIterContext(moe_load_balancer):
                         return self._forward_step(
                             inputs,
                             gather_ids=gather_ids,
@@ -7313,7 +7318,9 @@ class PyTorchModelEngine(ModelEngine):
                     if needs_capture:
 
                         def capture_forward_fn(inputs: Dict[str, Any]):
-                            with MoeLoadBalancerIterContext(moe_load_balancer):
+                            with self._maybe_bypass_torch_compile(
+                                    bypass=not use_compiled_forward
+                            ), MoeLoadBalancerIterContext(moe_load_balancer):
                                 return self._forward_step(
                                     inputs,
                                     gather_ids=gather_ids,
@@ -7358,6 +7365,12 @@ class PyTorchModelEngine(ModelEngine):
             self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
+
+    def _runner_model_forward(self, **kwargs):
+        use_compiled_forward = get_per_request_prefill_cuda_graph_flag()
+        with self._maybe_bypass_torch_compile(
+                bypass=not use_compiled_forward):
+            return self.model_forward(**kwargs)
 
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
