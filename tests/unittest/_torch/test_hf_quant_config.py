@@ -13,10 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,9 +71,12 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
 
 
-def _mixed_precision_quant_cfg(tmp_path, quantized_layers, exclude_modules=None):
-    import json
-
+def _mixed_precision_quant_cfg(
+    tmp_path: Path,
+    quantized_layers: dict[str, dict[str, str]],
+    exclude_modules: list[str] | None = None,
+) -> dict[str, object]:
+    """Write the checkpoint's per-layer ModelOpt recipes."""
     inner = {"quant_algo": "MIXED_PRECISION", "kv_cache_quant_algo": None}
     if exclude_modules is not None:
         inner["exclude_modules"] = exclude_modules
@@ -82,56 +92,84 @@ def _mixed_precision_quant_cfg(tmp_path, quantized_layers, exclude_modules=None)
     return inner
 
 
-def test_mixed_precision_excludes_fp8_block_scaled_kv_b_proj(tmp_path):
+def test_mixed_precision_excludes_only_fp8_mla_projections(tmp_path: Path) -> None:
+    """Exclusions preserve mixed algorithms across layers and projection types."""
+    recipes = {
+        "model.layers.0.self_attn.kv_b_proj": "FP8_BLOCK_SCALES",
+        "model.layers.0.self_attn.k_b_proj": "NVFP4",
+        "model.layers.0.eh_proj": "W4A8_AWQ",
+        "model.layers.1.self_attn.kv_b_proj": "NVFP4",
+        "model.layers.1.self_attn.k_b_proj": "FP8_BLOCK_SCALES",
+        "model.layers.1.eh_proj": "FP8_BLOCK_SCALES",
+        "model.layers.2.self_attn.kv_b_proj": "W4A8_AWQ",
+        "model.layers.3.self_attn.q_proj": "FP8_BLOCK_SCALES",
+        "model.layers.3.mlp.experts": "W4A8_AWQ",
+    }
+    expected_exclusions = {
+        "model.layers.0.self_attn.kv_b_proj",
+        "model.layers.1.self_attn.k_b_proj",
+        "model.layers.1.eh_proj",
+    }
     inner = _mixed_precision_quant_cfg(
-        tmp_path,
-        {
-            "model.layers.0.self_attn.fused_a": {"quant_algo": "FP8_BLOCK_SCALES"},
-            "model.layers.0.self_attn.kv_b_proj": {"quant_algo": "FP8_BLOCK_SCALES"},
-            "model.layers.3.mlp.experts": {"quant_algo": "W4A8_AWQ"},
-        },
+        tmp_path, {name: {"quant_algo": algo} for name, algo in recipes.items()}
     )
     quant_config, layer_quant_config = ModelConfig._build_modelopt_quant_config(
         inner, str(tmp_path), "CUTLASS"
     )
-
     assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-    assert layer_quant_config["model.layers.3.mlp.experts"].quant_algo == QuantAlgo.W4A8_AWQ
-    for pattern in ("*kv_b_proj*", "*k_b_proj*", "*eh_proj"):
-        assert pattern in quant_config.exclude_modules
-    assert quant_config.is_module_excluded_from_quantization("model.layers.0.self_attn.kv_b_proj")
-    assert quant_config.is_module_excluded_from_quantization("kv_b_proj")
+    assert set(quant_config.exclude_modules) == expected_exclusions
+    assert not quant_config.is_module_excluded_from_quantization("kv_b_proj")
+    assert not quant_config.is_module_excluded_from_quantization(
+        "model.layers.4.self_attn.kv_b_proj"
+    )
+    # Exercise the actual assignment/exclusion order, not just the config list.
+    modules = {}
+    for name in recipes:
+        module = Linear(
+            128,
+            128,
+            bias=False,
+            dtype=torch.bfloat16,
+            quant_config=QuantConfig(),
+            skip_create_weights_in_init=True,
+        )
+        modules[name] = module
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quant_config=quant_config, quant_config_dict=layer_quant_config
+        ),
+        named_modules=lambda: modules.items(),
+    )
+    DecoderModelForCausalLM.apply_layerwise_quant_config(model)
+    DecoderModelForCausalLM.apply_quant_config_exclude_modules(model)
+    for name, algo in recipes.items():
+        assert layer_quant_config[name].quant_algo == QuantAlgo(algo)
+        expected = None if name in expected_exclusions else QuantAlgo(algo)
+        assert modules[name].quant_config.quant_algo == expected
 
 
-def test_mixed_precision_keeps_user_exclusions_and_skips_non_mla(tmp_path):
+@pytest.mark.parametrize("exclusion", ["model.layers.0.self_attn.kv_b_proj", "*kv_b_proj*"])
+def test_mixed_precision_keeps_user_exclusions(tmp_path: Path, exclusion: str) -> None:
+    """Preserve exact or wildcard user exclusions without redundant entries."""
     inner = _mixed_precision_quant_cfg(
         tmp_path,
-        {
-            "model.layers.0.self_attn.kv_b_proj": {"quant_algo": "FP8_BLOCK_SCALES"},
-        },
-        exclude_modules=["lm_head", "*kv_b_proj*"],
+        {"model.layers.0.self_attn.kv_b_proj": {"quant_algo": "FP8_BLOCK_SCALES"}},
+        exclude_modules=["lm_head", exclusion],
     )
     quant_config, _ = ModelConfig._build_modelopt_quant_config(inner, str(tmp_path), "CUTLASS")
-    assert quant_config.exclude_modules.count("*kv_b_proj*") == 1
-    assert "lm_head" in quant_config.exclude_modules
+    assert quant_config.exclude_modules == ["lm_head", exclusion]
 
-    non_mla = _mixed_precision_quant_cfg(
-        tmp_path,
-        {
-            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8_BLOCK_SCALES"},
-            "model.layers.0.mlp.experts": {"quant_algo": "W4A8_AWQ"},
-        },
-    )
-    quant_config, _ = ModelConfig._build_modelopt_quant_config(non_mla, str(tmp_path), "CUTLASS")
-    assert not quant_config.exclude_modules
 
-    nvfp4_kv_b_proj = _mixed_precision_quant_cfg(
-        tmp_path,
-        {
-            "model.layers.0.self_attn.kv_b_proj": {"quant_algo": "NVFP4"},
-        },
-    )
-    quant_config, _ = ModelConfig._build_modelopt_quant_config(
-        nvfp4_kv_b_proj, str(tmp_path), "CUTLASS"
-    )
+@pytest.mark.parametrize(
+    ("name", "algo"),
+    [
+        ("model.layers.0.self_attn.q_proj", "FP8_BLOCK_SCALES"),
+        ("model.layers.0.self_attn.kv_b_proj", "NVFP4"),
+        ("model.layers.0.self_attn.kv_b_proj", "W4A8_AWQ"),
+    ],
+)
+def test_mixed_precision_skips_non_fp8_mla(tmp_path: Path, name: str, algo: str) -> None:
+    """Unrelated projection types and non-FP8 recipes gain no exclusions."""
+    inner = _mixed_precision_quant_cfg(tmp_path, {name: {"quant_algo": algo}})
+    quant_config, _ = ModelConfig._build_modelopt_quant_config(inner, str(tmp_path), "CUTLASS")
     assert not quant_config.exclude_modules

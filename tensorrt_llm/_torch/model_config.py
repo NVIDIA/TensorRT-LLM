@@ -597,21 +597,20 @@ class ModelConfig(Generic[TConfig]):
                 mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
 
-            # Mirror load_hf_quant_config: on DeepSeek-style MLA checkpoints
-            # the FP8 128x128 block boundaries do not necessarily align with
-            # the per-head split of kv_b_proj (e.g. GLM-5 has
-            # qk_nope_head_dim=192), so an FP8 block-scaled kv_b_proj must go
-            # through the dequant path instead of the per-head scale split.
-            has_fp8_kv_b_proj = any(
-                name.endswith(".self_attn.kv_b_proj")
-                and cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-                for name, cfg in mixed_quant_configs.items())
-            if has_fp8_kv_b_proj:
-                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
+            # FP8 block boundaries may cross MLA head boundaries. Exclude only
+            # the FP8 projections named in the checkpoint: a global wildcard
+            # would overwrite other layers' explicit mixed-precision recipes.
+            fp8_mla_projections = [
+                name for name, cfg in mixed_quant_configs.items()
+                if cfg.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                and name.endswith((".self_attn.kv_b_proj",
+                                   ".self_attn.k_b_proj", ".eh_proj"))
+            ]
+            if fp8_mla_projections:
                 existing = list(quant_config.exclude_modules or [])
                 quant_config.exclude_modules = existing + [
-                    pattern
-                    for pattern in default_exclude if pattern not in existing
+                    name for name in fp8_mla_projections if
+                    not quant_config.is_module_excluded_from_quantization(name)
                 ]
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
