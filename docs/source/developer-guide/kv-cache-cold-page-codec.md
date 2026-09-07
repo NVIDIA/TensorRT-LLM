@@ -110,6 +110,11 @@ The methods have these contracts:
 - GPU-accessible data base pointers may be used by work enqueued on the supplied stream, but must not be retained beyond
   that work.
 
+Storage-bound KV cache compression reuses this cold-page codec ABI through the
+C++ `NativeColdPageCodec` adapter. For the compression-provider lifecycle and
+extension interface, see the
+[KV Cache Compression Development Guide](kv-cache-compression-development.md).
+
 ## Storage Layout and Grouping
 
 `LifeCycleId` is the stable semantic key. Pool groups are physical allocation equivalence classes and are specific to
