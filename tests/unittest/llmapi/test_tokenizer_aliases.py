@@ -21,6 +21,7 @@ unresolved alias reached ``rsplit('.', 1)`` and raised "not enough values to
 unpack".
 """
 
+import importlib
 import sys
 import types
 
@@ -41,6 +42,51 @@ def test_every_alias_maps_to_a_module_and_a_class():
         module_path, _, class_name = import_path.rpartition(".")
         assert module_path, f"alias {alias!r} has no module part: {import_path!r}"
         assert class_name, f"alias {alias!r} has no class part: {import_path!r}"
+
+
+@pytest.mark.parametrize("alias, import_path", sorted(TOKENIZER_ALIASES.items()))
+def test_every_alias_target_is_really_importable(alias, import_path):
+    """Import each alias target for real so a typo fails CI, not at runtime.
+
+    A typo in ``TOKENIZER_ALIASES`` would otherwise only blow up inside
+    ``load_custom_tokenizer``. The structural test above only checks the string
+    shape of the import path;
+    the ``stub_tokenizer_modules`` fixture shadows every module in
+    ``sys.modules``, so a nonexistent module or class would still pass there.
+    This test resolves the module and the class object without any stubbing.
+
+    CPU-only: it never instantiates a tokenizer or loads any weights. If a
+    target needs an optional third-party dependency that is not installed, the
+    test skips with a clear reason; a genuine typo in the aliased module (or one
+    of its parent packages) still fails.
+    """
+    module_path, _, class_name = import_path.rpartition(".")
+    assert module_path and class_name, (
+        f"alias {alias!r} has a malformed import path: {import_path!r}"
+    )
+
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        # The aliased module itself (or one of its parent packages) is missing:
+        # that is exactly the typo this test must catch, so let it fail.
+        if module_path == missing or module_path.startswith(f"{missing}."):
+            raise
+        # Otherwise an optional dependency of the target is unavailable in this
+        # CPU-only environment, which is not what this test guards.
+        pytest.skip(
+            f"alias {alias!r} target {import_path!r} needs optional dependency "
+            f"{missing!r}, which is not importable in this environment"
+        )
+
+    assert hasattr(module, class_name), (
+        f"alias {alias!r} module {module_path!r} has no attribute "
+        f"{class_name!r} (declared in TOKENIZER_ALIASES as {import_path!r})"
+    )
+    assert isinstance(getattr(module, class_name), type), (
+        f"alias {alias!r} target {import_path!r} is not a class"
+    )
 
 
 class _StubTokenizer:
