@@ -2292,9 +2292,26 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         args = TorchLlmArgs(model=llama_model_path,
                             torch_compile_config=TorchCompileConfig(
                                 enable_piecewise_cuda_graph=True,
+                                compile_only_piecewise_graphs=True,
                                 capture_num_tokens=[128, 256]))
         assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
         assert args.prefill_capture_num_tokens == [256, 128]
+        assert args.torch_compile_config.compile_only_piecewise_graphs
+
+    def test_compile_only_piecewise_graphs_requires_piecewise_backend(self):
+        with pytest.raises(ValueError, match="requires.*piecewise"):
+            TorchLlmArgs(model=llama_model_path,
+                         torch_compile_config=TorchCompileConfig(
+                             compile_only_piecewise_graphs=True))
+
+    def test_compile_only_piecewise_graphs_rejects_attention_dp(self):
+        with pytest.raises(ValueError, match="does not support attention DP"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                enable_attention_dp=True,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                torch_compile_config=TorchCompileConfig(
+                    compile_only_piecewise_graphs=True))
 
     def test_explicit_new_buckets_with_legacy_piecewise_enable(self):
         args = TorchLlmArgs(model=llama_model_path,
