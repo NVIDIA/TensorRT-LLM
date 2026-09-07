@@ -2360,11 +2360,13 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        if not self.eagle3_one_model:
+        if self.eagle3_one_model is False:
             raise ValueError(
                 "eagle3_one_model=False is no longer supported: the two-model "
                 "Eagle3 path has been removed. Omit the field or set it to "
                 "True.")
+        # None kept its historical meaning: fall through to the one-model path.
+        self.eagle3_one_model = True
         self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
@@ -2837,7 +2839,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
 
-        if not self.mtp_eagle_one_model:
+        if self.mtp_eagle_one_model is False:
             raise ValueError(
                 "mtp_eagle_one_model=False is no longer supported: the "
                 "two-model MTP path has been removed. Omit the field or set "
