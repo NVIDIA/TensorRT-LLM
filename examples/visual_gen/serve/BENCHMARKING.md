@@ -101,8 +101,9 @@ A prompt file is read in three shapes:
 
 | file contents | prompt sent |
 |---|---|
-| JSON object with a `prompt` key | that field |
-| JSON object without one | the whole object, serialized |
+| JSON object whose `prompt` is text | that field |
+| JSON object whose `prompt` is an object | that field, serialized — the shape the Cosmos3 action prompts ship |
+| JSON object with no `prompt` key | the whole object, serialized |
 | anything that is not JSON | the text |
 
 #### Spelling the document on the CLI

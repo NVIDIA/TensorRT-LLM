@@ -325,6 +325,24 @@ def test_structured_caption_is_serialized(tmp_path):
     assert json.loads(_workload(prompt_file=str(path)).requests[0].prompt) == caption
 
 
+def test_a_caption_under_the_prompt_key_is_serialized(tmp_path):
+    """The shape the Cosmos3 action prompts ship: the caption nested under 'prompt'."""
+    caption = {"cinematography": {"framing": "ego"}, "fps": 5.0}
+    path = tmp_path / "action.json"
+    path.write_text(json.dumps({"model_mode": "video2video", "prompt": caption}))
+
+    assert json.loads(_workload(prompt_file=str(path)).requests[0].prompt) == caption
+
+
+def test_a_prompt_that_is_neither_text_nor_caption_fails_at_load(tmp_path):
+    """The message names the type, so the file is what gets fixed."""
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"prompt": 42}))
+
+    with pytest.raises(ValueError, match="int 'prompt'"):
+        _workload(prompt_file=str(path))
+
+
 def test_prompt_file_records_where_the_prompt_came_from(tmp_path):
     """The document cites a file, so the record has to name it, not just its text."""
     path = tmp_path / "p.txt"

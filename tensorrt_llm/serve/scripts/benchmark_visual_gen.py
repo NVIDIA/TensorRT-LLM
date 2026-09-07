@@ -414,13 +414,14 @@ def _resize_requests(
 
 
 def _resolve_prompt_file(reference: Any, base_dir: Path, index: int) -> tuple[str, str]:
-    """Read a prompt file, in the three shapes Cosmos3's prompt files come in.
+    """Read a prompt file, in the shapes Cosmos3's prompt files come in.
 
-    A JSON object carrying ``prompt`` yields that field; one without it is a
-    structured caption and goes out serialized, which is what the example does
-    with the ``*_prompt.json`` a checkpoint ships; anything that is not JSON is
-    plain text. Reading here rather than at dispatch means a missing or empty
-    file fails before the run starts.
+    A JSON object carrying ``prompt`` yields that field, serialized when it is
+    itself an object: the action prompts hold the trained caption there, as
+    nested ``cinematography`` / ``actions`` / canvas keys. An object without a
+    ``prompt`` key is that caption on its own and goes out serialized; anything
+    that is not JSON is plain text. Reading here rather than at dispatch means a
+    missing or empty file fails before the run starts.
     """
     if not isinstance(reference, str):
         raise ValueError(f"requests[{index}]: prompt_file must be a path string.")
@@ -436,7 +437,9 @@ def _resolve_prompt_file(reference: Any, base_dir: Path, index: int) -> tuple[st
     except json.JSONDecodeError:
         payload = raw.strip()
     if isinstance(payload, dict):
-        prompt = payload["prompt"] if "prompt" in payload else json.dumps(payload)
+        prompt = payload["prompt"] if "prompt" in payload else payload
+        if isinstance(prompt, dict):
+            prompt = json.dumps(prompt)
     elif isinstance(payload, str):
         prompt = payload
     else:
@@ -444,7 +447,12 @@ def _resolve_prompt_file(reference: Any, base_dir: Path, index: int) -> tuple[st
             f"requests[{index}]: prompt_file {str(path)!r} must hold a JSON object or "
             f"text, got {type(payload).__name__}."
         )
-    if not isinstance(prompt, str) or not prompt.strip():
+    if not isinstance(prompt, str):
+        raise ValueError(
+            f"requests[{index}]: prompt_file {str(path)!r} carries a "
+            f"{type(prompt).__name__} 'prompt'; it must be text or a JSON object."
+        )
+    if not prompt.strip():
         raise ValueError(f"requests[{index}]: prompt_file {str(path)!r} yields an empty prompt.")
     return str(path.resolve()), prompt
 
