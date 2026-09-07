@@ -47,6 +47,13 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_chunk_indices: torch.Tensor | None = None
         self.kda_varlen_is_aligned: bool | None = None
         self.kda_single_sequence_length: int | None = None
+        # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
+        # Keep the backing allocation stable so metadata preparation remains
+        # safe for CUDA graph capture and replay.
+        self._generation_state_indices = torch.empty(
+            max_batch_size, dtype=torch.int32, device="cuda"
+        )
+        self.generation_state_indices: torch.Tensor | None = None
 
     def prepare(self, attn_metadata: AttentionMetadata) -> None:
         context_lengths = attn_metadata.seq_lens[: attn_metadata.num_contexts].tolist()
@@ -55,6 +62,20 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         )
 
         super().prepare(attn_metadata)
+
+        self.generation_state_indices = None
+        batch_size = attn_metadata.seq_lens.shape[0]
+        generation_state_indices = self.state_indices[attn_metadata.num_contexts : batch_size]
+        if (
+            getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update", False)
+            and generation_state_indices.numel() > 0
+            and generation_state_indices.data_ptr() % 16
+        ):
+            aligned_state_indices = self._generation_state_indices[
+                : generation_state_indices.shape[0]
+            ]
+            aligned_state_indices.copy_(generation_state_indices)
+            self.generation_state_indices = aligned_state_indices
 
         self.kda_varlen_is_aligned = (
             all(length % KDA_PREFILL_CHUNK_SIZE == 0 for length in context_lengths)
