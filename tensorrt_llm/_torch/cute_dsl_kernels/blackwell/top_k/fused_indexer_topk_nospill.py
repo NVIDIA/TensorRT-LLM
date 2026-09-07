@@ -2088,8 +2088,9 @@ def _config(B, MAXB, NPAGES, KTOP):
     mode = os.environ.get("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "auto")
     S_gm = min(nsm // B, ntile) if 2 * B <= nsm else 1
     # measured (real rows): the split wins on long rows at any small batch, on rows of
-    # 512+ tiles once 8 rows share the chip and at 16+ rows regardless of length; 1-4 rows
-    # of up to 512 tiles and 8 rows of up to 256 tiles stay on one cluster each.
+    # 512+ tiles once 8 rows share the chip and on rows of 256+ tiles at 16+ rows; 1-4 rows
+    # of up to 512 tiles, 8 rows of up to 256 and 16 rows of up to 128 stay on one cluster each
+    # (random-token 4k-64k rows at B=16: split 14-19 us vs cluster 10-14).
     # It also wins wherever it places >= 1.2x the cluster path's CTAs with >= 64 tiles
     # each: batches off the power-of-two grid (19-29, 33-49, 65-74) otherwise leave a
     # third to half of the SMs idle (262k tokens B=70: 481 -> 262 us).
@@ -2098,7 +2099,10 @@ def _config(B, MAXB, NPAGES, KTOP):
         if (
             mode == "1"
             or wide
-            or (S_gm >= 8 and (ntile >= 1024 or (B >= 8 and ntile >= 512) or B >= 16))
+            or (
+                S_gm >= 8
+                and (ntile >= 1024 or (B >= 8 and ntile >= 512) or (B >= 16 and ntile >= 256))
+            )
         ):
             GM = 1
             CS = S_gm
