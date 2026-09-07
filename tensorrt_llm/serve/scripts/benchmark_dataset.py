@@ -730,6 +730,9 @@ class CustomDataset(BenchmarkDataset):
 
         If output_len is provided, it overrides the per-sample "max_tokens"
         from the dataset, which then becomes optional.
+
+        If the file holds fewer than num_requests lines, the samples are
+        oversampled to reach num_requests.
         """
         # Collect all prompts and metadata
         prompts = []
@@ -768,6 +771,7 @@ class CustomDataset(BenchmarkDataset):
                     expected_output_len=max_tokens,
                 ))
 
+        self.maybe_oversample_requests(samples, num_requests)
         return samples
 
 
