@@ -14,6 +14,7 @@
 # limitations under the License.
 """PyExecutor construction ownership tests for DWDP."""
 
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,22 +23,54 @@ from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager, set_global_dwdp_manager
 
 
+@contextmanager
+def _restore_global_dwdp_manager():
+    """Keep the process-global manager from leaking into later tests."""
+    previous = get_global_dwdp_manager()
+    try:
+        yield
+    finally:
+        set_global_dwdp_manager(previous)
+
+
 def test_create_py_executor_rolls_back_new_dwdp_manager_on_error():
-    set_global_dwdp_manager(None)
-    manager = MagicMock()
-    manager.__exit__.side_effect = lambda *_args: set_global_dwdp_manager(None)
+    with _restore_global_dwdp_manager():
+        set_global_dwdp_manager(None)
+        manager = MagicMock()
+        manager.__exit__.side_effect = lambda *_args: set_global_dwdp_manager(None)
 
-    def fail_after_registration(**_kwargs):
-        set_global_dwdp_manager(manager)
-        raise RuntimeError("construction failed")
+        def fail_after_registration(**_kwargs):
+            set_global_dwdp_manager(manager)
+            raise RuntimeError("construction failed")
 
-    with patch.object(
-        py_executor_creator,
-        "_create_py_executor_impl",
-        side_effect=fail_after_registration,
-    ):
-        with pytest.raises(RuntimeError, match="construction failed"):
-            py_executor_creator.create_py_executor(llm_args=MagicMock())
+        with patch.object(
+            py_executor_creator,
+            "_create_py_executor_impl",
+            side_effect=fail_after_registration,
+        ):
+            with pytest.raises(RuntimeError, match="construction failed"):
+                py_executor_creator.create_py_executor(llm_args=MagicMock())
 
-    manager.__exit__.assert_called_once_with(None, None, None)
-    assert get_global_dwdp_manager() is None
+        manager.__exit__.assert_called_once_with(None, None, None)
+        assert get_global_dwdp_manager() is None
+
+
+def test_create_py_executor_leaves_a_pre_existing_dwdp_manager_alone():
+    """The wrapper only tears down a manager it created, not one it inherited."""
+    with _restore_global_dwdp_manager():
+        existing = MagicMock()
+        set_global_dwdp_manager(existing)
+
+        def fail_without_registering(**_kwargs):
+            raise RuntimeError("construction failed")
+
+        with patch.object(
+            py_executor_creator,
+            "_create_py_executor_impl",
+            side_effect=fail_without_registering,
+        ):
+            with pytest.raises(RuntimeError, match="construction failed"):
+                py_executor_creator.create_py_executor(llm_args=MagicMock())
+
+        existing.__exit__.assert_not_called()
+        assert get_global_dwdp_manager() is existing

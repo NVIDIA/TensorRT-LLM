@@ -107,7 +107,7 @@ changes only remote-copy submission: it uses a cached, peer-interleaved
 
 The currently supported activation path is NVFP4 + CuTeDSL, TP=1 per context
 worker, an MPI worker launch, overlap scheduling disabled, and no EPLB on the
-same MoE path. Rubin SM107 also requires fused finalize. Treat these as
+same MoE path. Rubin SM107 also requires `use_fused_finalize`. Treat these as
 supported-path constraints; the CuTeDSL/NVFP4 activation predicate is not a
 comprehensive early-validation layer for every incompatible feature.
 
