@@ -121,8 +121,7 @@ def pytest_configure(config):
                 "this check."
             )
             _write_banner(config, "PYTHONPATH check failed", message)
-            # TODO: enable separately after magic import is merged.
-            # raise pytest.UsageError(message)
+            raise pytest.UsageError("PYTHONPATH contains entries that are not absolute paths")
 
 
 def pytest_plugin_registered(plugin, manager):
@@ -273,6 +272,5 @@ def pytest_sessionfinish(session, exitstatus):
         "needs the import instead -- see test_common/magic_import.py."
     )
     _write_banner(session.config, "sys.path check failed", message)
-    # TODO: enable separately after magic import is merged.
-    # if exitstatus == pytest.ExitCode.OK:
-    #     session.exitstatus = pytest.ExitCode.USAGE_ERROR
+    if exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.USAGE_ERROR

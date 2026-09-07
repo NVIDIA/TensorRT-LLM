@@ -66,6 +66,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "glm_5_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
+    "qwen3.6_35b_a3b_fp4_mtp",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_nano_12b_v2",
@@ -99,6 +100,7 @@ SPEC_DEC_MODELS = {
     "qwen3_235b_a22b_fp4_eagle3",
     "gpt_oss_120b_eagle3",
     "gpt_oss_120b_eagle3_throughput",
+    "qwen3.6_35b_a3b_fp4_mtp",
     *SPEC_DEC_REAL_DATASET_MODELS,
 }
 
