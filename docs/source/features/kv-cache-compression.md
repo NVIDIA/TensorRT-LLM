@@ -106,43 +106,28 @@ Unlike Sparse Attention and active KV-cache quantization, which run during model
 forward computation, the KV cache compression framework unifies methods that
 run at stable cache-lifecycle boundaries outside model forward computation. It
 currently supports two integration models:
-iteration-driven methods run from PyExecutor's request and iteration lifecycle,
-while storage-bound methods run when KVCM migrates a Page across a hot/cold
-representation boundary. A method can use one or both integration models and
-implements only the stages it needs.
+iteration-driven methods run between model iterations, while storage-bound
+methods run when a Page moves across a hot/cold representation boundary. A
+method can use one or both integration models and implements only the stages it
+needs.
 
 ### Iteration-Driven Methods
 
-PyExecutor dispatches semantic lifecycle hooks through
-`KVCacheCompressionManager`. TriAttention uses the generation-end hook to run
-periodic, budget-triggered token eviction.
-
-| Trigger | Manager method | Purpose |
-| --- | --- | --- |
-| A request enters its first prefill chunk | `on_request_init()` | Initialize request-local compression state |
-| A request finishes its final prefill chunk | `on_context_step_end()` | Run optional context-bound compression |
-| Before each scheduled forward iteration | `on_generation_step_begin()` | Inspect or prepare the generation cohort when required |
-| After each scheduled forward iteration and the native KVCM update | `on_generation_step_end()` | Process the generation cohort, such as periodic TriAttention eviction |
-| A request finishes or aborts | `on_request_finish()` | Release request-local compression state |
+Iteration-driven methods run between model forward steps. After prefill builds
+the initial KV state, compression can run before generation begins or between
+successive generation iterations. Each later forward step consumes the updated
+KV state. TriAttention follows this flow and applies budget-triggered token
+eviction periodically during generation.
 
 ### Storage-Bound Methods
 
-KVCM calls a storage-bound codec provider only when migration changes the Page
-representation. NVFP4 cold-page quantization implements these two batched
-operations and does not register for per-iteration callbacks.
-
-At the native storage boundary, KVCM invokes `IKvCacheColdPageCodec::encode()`
-or `IKvCacheColdPageCodec::decode()`. A codec backed by a Python compression
-provider delegates those operations to the provider hooks shown below.
-
-| Trigger | Native codec method | Python provider hook | Purpose |
-| --- | --- | --- | --- |
-| A hot Page moves to a cold tier | `encode()` | `encode_cold_pages()` | Encode and transfer a batch of Pages to cold storage |
-| A cold Page returns to the GPU | `decode()` | `decode_cold_pages()` | Transfer and restore a batch of Pages to the runtime layout |
-
-KVCM still decides when Pages migrate and owns their Slots, streams, completion
-ordering, rollback, and mapping publication. For method signatures and
-ownership rules, see the
+Storage-bound methods run when KV Pages move across cache tiers. During
+offloading, a hot GPU Page is encoded into a compressed representation as it
+moves to Host or Disk storage. During onboarding, the cold Page is transferred
+back and decoded into the runtime GPU representation before it is reused.
+The cache manager continues to manage Page migration and storage, while the
+compression method defines the representation transform. For extension APIs
+and ownership rules, see the
 [KV Cache Compression Development Guide](../developer-guide/kv-cache-compression-development.md).
 
 ## Compression Methods
@@ -153,7 +138,7 @@ each LLM instance.
 
 | Method | When it runs | What it changes | Primary benefit |
 | --- | --- | --- | --- |
-| Cold-page quantization | When Pages move between the GPU and a Host or Disk cache tier | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
+| Cold-page quantization (NVFP4) | When Pages move between the GPU and a Host or Disk cache tier | The stored representation of cold Attention KV | More KV Pages per cold-tier byte and fewer bytes transferred |
 | TriAttention | Periodically during generation | The set of KV tokens retained in the cache | Lower KV-cache memory usage and Attention work for long generation |
 
 ### Cold-Page Quantization
