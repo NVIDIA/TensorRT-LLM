@@ -79,17 +79,17 @@ workload, and must be validated before deployment.
 
 TensorRT-LLM exposes three related but distinct KV-cache paths.
 
-The [Sparse Attention](sparse-attention.md) framework (configured through
-`SparseAttentionConfig`) supports token eviction, token selection, and masking
-or skipping low-contribution work. These operations run within prefill or
-generation forward computation and change which KV entries Attention retains or
-processes.
-
 Active KV-cache management (configured through `KvCacheConfig`) controls cache
 capacity, levels, reuse, offloading, Page lifetime, and the active KV dtype.
 Selecting a lower-precision dtype enables active KV-cache quantization, which
 keeps the GPU KV cache in that format and reads or writes it as part of each
 forward step; see [Quantization](quantization.md).
+
+The [Sparse Attention](sparse-attention.md) framework (configured through
+`SparseAttentionConfig`) supports token eviction, token selection, and masking
+or skipping low-contribution work. These operations run within prefill or
+generation forward computation and change which KV entries Attention retains or
+processes.
 
 The KV cache compression framework (configured through
 `KvCacheCompressionConfig`) selects a compression method and its
