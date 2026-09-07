@@ -71,11 +71,11 @@ import yaml
 # loads these modules by path with `agent_flow` itself unimportable, and
 # only the submodule form resolves from the sys.modules cache.
 from agent_flow.workflows.perf_optimize.bench_cli import (
+    IBC_BENCH,
     BenchCliError,
-    frontier_show,
-    operating_point,
+    frontier_points,
+    gen_only_points,
     operating_points,
-    status,
 )
 
 SOL_TRACK_FIELD = "sol_track"
@@ -98,13 +98,15 @@ TRACK_METRICS: dict[str, str] = {
     GEN_TRACK: "throughput_per_user",
 }
 
-#: What a frontier snapshot's ``points[].metrics`` calls the gen metric.
+#: The gen metric, as the frontier CSV already spells it. Kept as a
+#: mapping because the ctx track reads a different file for a different
+#: key, and the dispatch in :func:`collect` is on the track.
 #: Only the gen track has one: ``frontier build`` selects ``stage == GEN``
 #: and refuses outright when a workspace holds none, because a snapshot
 #: *is* the rate-matched generation curve. The ctx side enters it as the
 #: anchor, never as a point — so there is no snapshot key to read a ctx
 #: campaign's score out of. See :func:`collect`.
-SNAPSHOT_METRICS: dict[str, str] = {GEN_TRACK: "tps_per_user"}
+SNAPSHOT_METRICS: dict[str, str] = {GEN_TRACK: "throughput_per_user"}
 
 #: Written per operating point under the stage's result directory, so a
 #: measurement made by ``bench-disagg`` is discoverable by every part of
@@ -288,90 +290,97 @@ def load_sweep(path: Path) -> dict[str, Any]:
     return dict(data)
 
 
-#: What a stage config needs before a source change can reach the workers.
-#: Either names something for the harness to install: a repo it builds in
-#: the job, or a wheel someone already built.
-BUILD_SOURCE_KEYS = ("trtllm_repo", "trtllm_wheel_path")
+#: The rungs of the harness' escalation ladder, cheapest first. A sweep
+#: that names none of them runs whatever the image already ships.
+BUILD_SOURCE_KEYS = ("trtllm_patch", "trtllm_install")
 
 
-def build_source(stage: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The stage's ``trtllm_install`` block, if it names one."""
-    install = stage.get("trtllm_install")
-    if not isinstance(install, Mapping):
-        return None
-    if not any(str(install.get(key) or "").strip() for key in BUILD_SOURCE_KEYS):
-        return None
-    return dict(install)
+def build_source(sweep: Mapping[str, Any]) -> dict[str, Any] | None:
+    """How a source change reaches the workers, if the sweep says.
+
+    ``trtllm_patch`` is single-file overlays applied inside the container
+    before the workers start -- seconds, no rebuild, sha256-manifested per
+    node. ``trtllm_install`` is the two rungs above it: an editable
+    install from a repo (minutes) or a full wheel build.
+    """
+    for key in BUILD_SOURCE_KEYS:
+        block = sweep.get(key)
+        if key == "trtllm_patch" and block:
+            return {key: block}
+        if isinstance(block, Mapping) and any(
+            str(block.get(k) or "").strip() for k in ("trtllm_repo", "trtllm_wheel_path")
+        ):
+            return {key: dict(block)}
+    return None
 
 
 def require_build_source(task_data: Mapping[str, Any], approaches: Any) -> None:
     """Refuse a source-changing campaign whose sweep installs nothing.
 
-    ``bench-disagg`` runs whatever the image already has unless the stage
-    config's ``trtllm_install`` names a repo to build or a wheel to
-    install. So with ``approach: code`` and no such block, the optimizer
+    The harness runs whatever the image already has unless the sweep says
+    otherwise. So with ``approach: code`` and no such block, the optimizer
     edits ``trtllm_repo_path``, the job measures the image, the number
     comes back at the baseline, and the evaluator rejects an untested
-    change as "no gain" — having spent a full allocation to learn nothing
-    about it.
-
-    Nothing downstream can catch that: the run succeeds, the number is
-    plausible, and the only trace is that ``code_id`` did not move. So it
-    is refused here, before an agent exists.
+    change as "no gain" -- a full allocation spent learning nothing about
+    it, with nothing anywhere reporting an error.
     """
-    wanted = [a for a in (approaches or []) if a == "code"]
-    if not wanted:
+    if "code" not in (approaches or []):
         return
     track = track_name(task_data)
     sweep_file = sweep_path(task_data)
     if track not in TRACKS or sweep_file is None or not sweep_file.is_file():
         return
-    stage_config = stage_config_path(load_sweep(sweep_file), str(track), sweep_file)
-    if stage_config is None or not stage_config.is_file():
-        return
-    if build_source(load_sweep(stage_config)) is None:
+    if build_source(load_sweep(sweep_file)) is None:
         raise SolTrackError(
-            f"'optimize.approaches' includes 'code', but {stage_config} names no "
-            f"'trtllm_install' with {' or '.join(BUILD_SOURCE_KEYS)}. The harness "
-            f"runs whatever the image ships unless one is given, so a source change "
-            f"would never reach the workers: the measurement would come back at the "
-            f"baseline and the change would be rejected as 'no gain' without having "
-            f"been tested. Add to the stage config:\n"
-            f"    trtllm_install:\n"
+            f"'optimize.approaches' includes 'code', but {sweep_file} names neither "
+            f"'trtllm_patch' nor 'trtllm_install'. The harness runs whatever the "
+            f"image ships unless one is given, so a source change would never reach "
+            f"the workers: the measurement would come back at the baseline and the "
+            f"change would be rejected as 'no gain' without having been tested. "
+            f"Take the cheapest rung that fits the change:\n"
+            f"    trtllm_patch:            # single files, seconds, no rebuild\n"
+            f"      files:\n"
+            f"        - src: patches/<file>.py\n"
+            f"          dst: tensorrt_llm/_torch/.../<file>.py\n"
+            f"    trtllm_install:          # python-only editable install, minutes\n"
             f"      trtllm_repo: <this campaign's trtllm_repo_path>\n"
+            f"    trtllm_install:          # full C++ rebuild\n"
+            f"      trtllm_repo: ...\n"
             f"      build_wheel: true\n"
             f"or drop 'code' from approaches."
         )
 
 
 def stage_config_path(sweep: Mapping[str, Any], track: str, sweep_file: Path) -> Path | None:
-    """The stage config for ``track``, resolved relative to the sweep file.
+    """Where this track's overlay goes: the sweep file itself.
 
-    The sweep's own convention: "Paths resolve relative to THIS file."
+    There is no stage indirection any more. An `ibc-bench` sweep is one
+    file per (model, workload, mode) -- a gen sweep carries `gen_configs`
+    and the ctx worker it deploys beside them, a ctx config carries
+    `benchmarks`. So the file the campaign points at IS the file its
+    overlay belongs in, and the signature is kept only because callers
+    read better naming the concept than the path.
     """
-    stages = sweep.get("stages")
-    stage = stages.get(track) if isinstance(stages, Mapping) else None
-    if not isinstance(stage, Mapping):
-        return None
-    value = stage.get("config")
-    if not isinstance(value, str) or not value.strip():
-        return None
-    path = Path(value.strip())
-    return path if path.is_absolute() else (sweep_file.parent / path)
+    return sweep_file if sweep_file.is_file() else None
 
 
 def sweep_accept_rate(sweep: Mapping[str, Any]) -> str | None:
-    """The frozen acceptance length from the sweep's ``options``.
+    """The frozen acceptance length the sweep carries.
 
-    It lives there rather than in ``task.yaml`` because it belongs to the
-    measurement, not to the campaign: ``frontier build`` requires it and
-    refuses to infer one, on the grounds that a wrong value tilts the
-    whole curve with no symptom.
+    Top-level ``accept_rate: {rate, source}`` since harness v0.4.7, and
+    the harness archives the sweep verbatim at submit so every
+    post-processing entry point reads the rate back out of the run rather
+    than being handed one. It is required here for the same reason it is
+    required there: with `mtp > 0` cases and no rate, post-processing
+    stops rather than falling back on a built-in table -- a table that
+    was measured, worst case, 15 % high, and which multiplies the metric
+    linearly with no symptom.
     """
-    options = sweep.get("options")
-    if not isinstance(options, Mapping):
-        return None
-    value = options.get("accept_rate")
+    block = sweep.get("accept_rate")
+    if isinstance(block, Mapping):
+        value = block.get("rate")
+    else:
+        value = block
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
@@ -606,6 +615,11 @@ def apply_plan(task_data: dict[str, Any], plan: Mapping[str, Any], user_set: set
     if anchor is not None and anchor.is_file():
         unverified = require_matching_anchor(anchor, plan)
         notes.append(unverified or f"ctx anchor {anchor} measured this campaign's isl")
+    elif anchor is None and track == GEN_TRACK:
+        # Said once, here, where the resolved spec records it -- so a
+        # reader who never opens a result still learns which half of the
+        # deployment this campaign can see.
+        notes.append(NO_E2E_VIEW)
 
     # TODO: derive the nsys window from the baseline instead of taking it
     # from the spec. ``profile.nsys_iter_range`` is a dead field on both
@@ -742,49 +756,38 @@ def target_metric(task_data: Mapping[str, Any]) -> str:
     return TRACK_METRICS[track]
 
 
-def elasticity(
-    metrics: Mapping[str, Any], config: Mapping[str, Any], concurrency: int
-) -> float | None:
+def elasticity(metrics: Mapping[str, Any], gpus: Mapping[str, Any]) -> float | None:
     """How much of a gen improvement survives into the e2e frontier.
 
     The two numbers a gen campaign holds are not the same objective. The
-    gate scores ``tps_per_user``, which is anchor-free; the deployment is
-    judged on ``tps_per_gpu``, which is not::
+    gate scores ``throughput_per_user``, which is anchor-free; the
+    deployment is judged on ``output_tput_per_gpu``, which is not::
 
-        tps_per_gpu = tps_per_user * concurrency / (ctx_gpus * ctx_per_gen + ep_rank)
+        otpg = output_throughput / (ctx_gpus * ctx_per_gen + gen_gpus)
 
-    and ``ctx_per_gen`` rises with ``tps_per_user`` — a faster generation
-    side consumes prefill faster, so it needs proportionally more context
-    GPUs behind it. Differentiating, a 1 % gain in the gate's metric is
-    worth ``ep_rank / denominator`` per cent at the frontier, which
-    approaches zero as the context side becomes the wall.
+    and ``ctx_per_gen`` rises with the generation side's own speed -- a
+    faster decode consumes prefill faster, so it needs proportionally more
+    context GPUs behind it. Differentiating, a 1 % gain in the gate's
+    metric is worth ``gen_gpus / denominator`` per cent at the frontier,
+    approaching zero as the context side becomes the wall.
 
-    On this branch's own campaign that ratio is **0.97 at concurrency 1**
-    and **0.70 at 32** — so the same measured +1 % means materially
-    different things at the two ends of one curve, and nothing in the
-    report said so. Recorded rather than applied: the gate stays the
-    track's own metric, and the evaluator is handed the exchange rate.
+    On the campaign this one is compared against, that ratio was **0.97 at
+    concurrency 1** and **0.70 at 32** -- the same measured +1 % meaning
+    materially different things at two ends of one curve, with nothing
+    saying so. Recorded rather than applied: the gate stays the track's
+    own metric, and the evaluator is handed the exchange rate.
 
-    The denominator is recovered from the snapshot rather than assumed:
-    ``ctx_gpus`` is not in a gen case's config, but the ratio of the two
-    metrics is exactly it.
+    Nothing is assumed: the postprocessor reports both GPU counts and the
+    ratio itself, so all three terms are read rather than re-derived.
     """
-    per_user = metrics.get("tps_per_user")
-    per_gpu = metrics.get("tps_per_gpu")
-    gen_num = config.get("gen_num", 1)
-    tp_size = config.get("tp_size")
-    for value in (per_user, per_gpu, tp_size):
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+    ctx_gpus = gpus.get("ctx")
+    gen_gpus = gpus.get("gen")
+    ratio = metrics.get("ctx_gen_inst_ratio")
+    for value in (ctx_gpus, gen_gpus, ratio):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             return None
-    if not isinstance(gen_num, int) or isinstance(gen_num, bool) or gen_num < 1:
-        gen_num = 1
-    denominator = per_user * concurrency / per_gpu
-    gen_gpus = tp_size * gen_num
-    if denominator < gen_gpus:
-        # The identity says the denominator is `ctx_gpus * ctx_per_gen +
-        # gen_gpus` with both terms positive, so this cannot happen unless
-        # the shape changed. Silence beats a ratio above 1, which would read
-        # as "a gen gain is worth MORE at the frontier".
+    denominator = ctx_gpus * ratio + gen_gpus
+    if denominator <= 0 or gen_gpus <= 0:
         return None
     return gen_gpus / denominator
 
@@ -809,202 +812,215 @@ def _place(written: dict[int, Path], cases: dict[int, str], concurrency: int, ca
         )
 
 
+#: Where a stage submits, relative to where it collects. One path, so
+#: the two cannot be given different answers.
+RUN_SUBDIR = "run"
+
+
+def run_dir(into: Path) -> Path:
+    """The harness run directory whose score belongs in ``into``.
+
+    Submission and collection are derived from one path on purpose. The
+    run directory the harness creates is named
+    ``bm_<prefix>-<mode>-<isl>-<osl>-<date>-<gpu>`` and **carries no code
+    identity**, so two attempts of one campaign on one day compute the
+    same name: submit them into the same work dir and the second
+    overwrites the first's case directories, with the post-processor then
+    averaging across whatever survived. Nothing reports that.
+
+    Tying the work dir to the result dir removes the choice. A stage
+    submits with ``-w <result-dir>/run`` and collects with ``--collect
+    <result-dir>``; there is no second path to get wrong, and every
+    attempt is isolated because its result directory already was.
+    """
+    root = Path(into) / RUN_SUBDIR
+    found = sorted(p for p in root.glob("bm_*") if p.is_dir())
+    if not found:
+        raise SolTrackError(
+            f"no bm_* run directory under {root}. A stage submits with "
+            f"`{IBC_BENCH} submit sweep -c <sweep> -w {root}` and collects from the "
+            f"same place; if the submit ran, check that it was given this -w."
+        )
+    if len(found) > 1:
+        raise SolTrackError(
+            f"{root} holds {len(found)} run directories "
+            f"({', '.join(p.name for p in found)}). One per attempt: two of them "
+            f"means the score cannot say which run it came from."
+        )
+    return found[0]
+
+
 def collect(task_data: Mapping[str, Any], into: Path, *, snapshot: str = "latest") -> list[Path]:
     """Write this attempt's score where perf-optimize looks for a result.
 
-    The other half of :func:`apply_overlay`, and the same argument. The
-    overlay is how a campaign's tuning reaches ``bench-disagg``; this is
-    how ``bench-disagg``'s answer comes back. Between them the CLI owns
-    the measurement entirely and this workflow owns none of it.
+    The other half of :func:`apply_overlay`. The overlay is how a
+    campaign's tuning reaches the harness; this is how the harness'
+    answer comes back, in the shape every later stage already reads:
+    ``optimize.target_metric`` in a JSON under ``concurrency_<c>/``.
+    Without it the flow's own baseline gate rejects a measurement that
+    succeeded, which looks exactly like the failure it was built to catch.
 
-    It exists because the two sides name the same quantity differently and
-    keep it in different places. Every stage of perf-optimize — starting
-    with the baseline gate, which stops a campaign that measured nothing
-    rather than replaying a broken config once per stage — reads
-    ``optimize.target_metric`` out of a JSON under ``concurrency_<c>/``.
-    Without this the flow's own gate rejects a measurement that succeeded,
-    which is the worst of the failures available: it looks exactly like
-    the failure it was built to catch.
+    The two tracks are read from different files, because the harness
+    writes them to different files:
 
-    The two tracks are read from different places, because the CLI reports
-    them from different places:
+    - **gen** — with a declared ctx anchor, the CSV `ibc-bench process
+      frontier` scores, whose ``throughput_per_user`` column is already
+      the name `task.yaml` carries; without one, the ``gen_only_perf.csv``
+      the anchor-free extractor writes;
+    - **ctx** — the ``run_*.json`` a ctx case leaves in its work dir,
+      whose ``performance.request_throughput_req_s`` is the field the
+      harness itself validates the case on.
 
-    - **gen** — from the frontier snapshot, whose ``tps_per_user`` becomes
-      ``throughput_per_user``. The snapshot is *checked against this
-      attempt* first (see :func:`_require_attempt_snapshot`).
-    - **ctx** — from ``sweep status``, whose ``result`` is the very
-      ``run_*.json`` the backend validated the case on. No snapshot exists
-      to read: ``frontier build`` selects ``stage == GEN`` and refuses a
-      workspace holding none, taking the ctx side as its anchor.
+    Which gen reader applies is decided by what `task.yaml` **declares**,
+    not by which file happens to be on disk. A frontier found in a
+    campaign that named no anchor is refused rather than read: the
+    anchor's input length is the one thing :func:`require_matching_anchor`
+    checks, and an undeclared anchor was checked against nothing.
 
-    Returns the files written, one per operating point.
+    ``snapshot`` is accepted and ignored; it belonged to a CLI that kept
+    frontier snapshots, and the signature is kept so a caller that still
+    passes it does not break.
     """
     track = track_name(task_data)
     if track not in TRACKS:
         raise SolTrackError(f"unknown sol_track track {track!r}, expected one of {list(TRACKS)}")
-    workspace = workspace_name(task_data)
-    if workspace is None:
-        raise SolTrackError(f"'{SOL_TRACK_FIELD}.{WORKSPACE_KEY}' is required")
     metric = target_metric(task_data)
+    directory = run_dir(into)
     if track == GEN_TRACK:
-        return _collect_gen(task_data, workspace, into, metric, snapshot)
-    return _collect_ctx(workspace, into, metric)
+        return _collect_gen(directory, into, metric, anchored=ctx_json_path(task_data) is not None)
+    return _collect_ctx(directory, into, metric)
 
 
-def _require_attempt_snapshot(view: Mapping[str, Any], task_data: Mapping[str, Any]) -> None:
-    """Refuse a snapshot that was not built from this attempt's overlay.
-
-    ``--snapshot latest`` resolves whatever complete snapshot the
-    workspace holds, and nothing about that says it is *this* attempt's.
-    An agent that skipped the build, or whose build failed, still gets a
-    successful collect writing the PREVIOUS attempt's numbers into this
-    attempt's directory. The evaluator then measures a delta of zero and
-    rejects a change that was never run — spending the attempt budget to
-    learn nothing, and recording a verdict about code nobody benchmarked.
-
-    The check costs no extra call: a snapshot carries the
-    ``worker_overrides`` each of its measurements ran under, and the live
-    tuning file is the overlay this attempt asked for. If they differ, the
-    snapshot predates the overlay.
-    """
-    track = track_name(task_data)
-    tuning = _live_overlay(task_data)
-    if tuning is None:
-        return
-    key = TRACK_OVERLAY_KEYS[str(track)]
-    detail = (view.get("code") or {}).get("detail") or {}
-    seen = [dict((entry.get("worker_overrides") or {}).get(key) or {}) for entry in detail.values()]
-    if seen and not any(overlay == tuning for overlay in seen):
-        raise SolTrackError(
-            f"snapshot {view.get('snapshot_id')!r} was built from measurements whose "
-            f"'{key}' is {seen!r}, but this attempt's tuning file asks for {tuning!r}. "
-            f"The snapshot predates the overlay, so scoring it would book the "
-            f"previous attempt's numbers against this one. Run `bench-disagg "
-            f"frontier build` after the submit that carried this overlay."
-        )
+#: Why a gen result carries no e2e columns. Written into the result
+#: itself, because "this campaign cannot see the frontier" and "this
+#: campaign saw a flat frontier" must not read alike to whoever opens the
+#: file next -- including the reporter, which quotes it.
+NO_E2E_VIEW = (
+    "no sol_track.ctx_json: this campaign declares no ctx measurement, so the "
+    "rate match that turns a decode rate into a deployment number has no other "
+    "half. output_tput_per_gpu, ctx_gen_inst_ratio and frontier_elasticity are "
+    "ABSENT, not zero and not unchanged -- nothing here says what a gain at this "
+    "point is worth end to end. The gate's own metric is unaffected: it is "
+    "accept_rate / avg_iteration_time, which has no context term."
+)
 
 
-def _live_overlay(task_data: Mapping[str, Any]) -> dict[str, Any] | None:
-    """This attempt's overlay, read back off the stage config it was written to."""
-    track = track_name(task_data)
-    sweep_file = sweep_path(task_data)
-    if track not in TRACKS or sweep_file is None or not sweep_file.is_file():
-        return None
-    stage_config = stage_config_path(load_sweep(sweep_file), str(track), sweep_file)
-    if stage_config is None or not stage_config.is_file():
-        return None
-    value = load_sweep(stage_config).get(TRACK_OVERLAY_KEYS[str(track)])
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _collect_gen(
-    task_data: Mapping[str, Any], workspace: str, into: Path, metric: str, snapshot: str
-) -> list[Path]:
-    view = frontier_show(workspace, snapshot)
-    _require_attempt_snapshot(view, task_data)
-    code = view.get("code") or {}
+def _collect_gen(directory: Path, into: Path, metric: str, *, anchored: bool) -> list[Path]:
     written: dict[int, Path] = {}
     cases: dict[int, str] = {}
     skipped: list[str] = []
 
-    for point in view.get("points") or []:
+    try:
+        points = frontier_points(directory) if anchored else gen_only_points(directory)
+    except BenchCliError as exc:
+        raise SolTrackError(str(exc)) from exc
+
+    for point in points:
         case = str(point.get("case") or "?")
-        metrics = point.get("metrics")
-        metrics = dict(metrics) if isinstance(metrics, Mapping) else {}
-        config = dict(point.get("config") or {})
+        metrics = dict(point.get("metrics") or {})
         value = metrics.get(SNAPSHOT_METRICS[GEN_TRACK])
-        concurrency = operating_point(config)
-        if concurrency is None or not isinstance(value, (int, float)) or isinstance(value, bool):
+        # The CSV row carries the point, not the sweep row, so the
+        # per-generation-server product is already folded in.
+        concurrency = point.get("concurrency")
+        if not isinstance(concurrency, int) or not isinstance(value, (int, float)):
             skipped.append(case)
             continue
         _place(written, cases, concurrency, case)
+        payload: dict[str, Any] = {
+            # First, and under the name `optimize.target_metric`
+            # carries: this key is the whole point of the file.
+            metric: float(value),
+            "concurrency": concurrency,
+            "case": case,
+            "shape": point.get("name"),
+            "run_dir": str(directory),
+            "source_csv": point.get("source_csv"),
+        }
+        if anchored:
+            payload["frontier_elasticity"] = elasticity(metrics, point.get("gpus") or {})
+            payload["frontier_metrics"] = metrics
+        else:
+            payload["e2e_view"] = None
+            payload["e2e_view_absent"] = NO_E2E_VIEW
+            payload["gen_only_metrics"] = metrics
         written[concurrency] = _write_result(
-            into / f"concurrency_{concurrency}" / SOL_RESULT_NAME,
-            {
-                # First, and under the name `optimize.target_metric`
-                # carries: this key is the whole point of the file.
-                metric: float(value),
-                "concurrency": concurrency,
-                "case": case,
-                "on_frontier": point.get("frontier"),
-                "samples": point.get("samples"),
-                "config_id": point.get("config_id"),
-                "code_id": point.get("code_id"),
-                "snapshot_id": view.get("snapshot_id"),
-                # `best` and `latest` are different questions, and a number
-                # read without knowing which was asked is not comparable to
-                # the one beside it.
-                "select": view.get("select"),
-                # The prompt tells the evaluator a `code.mixed` curve is not
-                # evidence. Recorded rather than refused: the mixing is a
-                # property of the CURVE, while this point's own `code_id` is
-                # definite and already checked -- so the fact belongs in the
-                # file, and the judgement belongs to the reader.
-                "code_mixed": code.get("mixed"),
-                "code_ids": code.get("ids"),
-                # What a per-cent here is worth at the frontier.
-                "frontier_elasticity": elasticity(metrics, config, concurrency),
-                "snapshot_metrics": metrics,
-            },
+            into / f"concurrency_{concurrency}" / SOL_RESULT_NAME, payload
         )
         cases[concurrency] = case
 
     if not written:
+        source = "the frontier" if anchored else "the gen-only extractor"
         raise SolTrackError(
-            f"snapshot {view.get('snapshot_id')!r} of workspace {workspace!r} scored no "
-            f"usable point" + (f" (skipped: {', '.join(skipped)})" if skipped else "") + ". "
-            f"`bench-disagg frontier show --workspace {workspace}` is the snapshot as "
-            f"built; `bench-disagg sweep status --workspace {workspace} --cases` says "
-            f"whether the cases behind it measured."
+            f"{source} under {directory} scored no usable point"
+            + (f" (skipped: {', '.join(skipped)})" if skipped else "")
+            + f". `{IBC_BENCH} jobs check -f {directory}/job_status.csv --summary` "
+            f"says whether the cases behind it measured."
         )
     return [written[key] for key in sorted(written)]
 
 
-#: Where a validated ctx measurement keeps its number. This is the key the
-#: backend itself requires before it will call a ctx case successful, so a
-#: case reported as `success` is a case that has it.
+#: Where a validated ctx measurement keeps its number. This is the field
+#: the harness itself requires before it will call a ctx case successful.
 CTX_RESULT_PATH = ("performance", "request_throughput_req_s")
 
 
-def _collect_ctx(workspace: str, into: Path, metric: str) -> list[Path]:
+def _collect_ctx(directory: Path, into: Path, metric: str) -> list[Path]:
     written: dict[int, Path] = {}
     cases: dict[int, str] = {}
     skipped: list[str] = []
 
-    for case in status(workspace).get("cases") or []:
-        name = str(case.get("case") or "?")
-        if case.get("stage") != CTX_TRACK:
+    for result in sorted(directory.rglob("run_*.json")):
+        if result.name.endswith("_timing.json"):
             continue
-        result = case.get("result")
-        concurrency = operating_point(case.get("config") or {})
-        value = _read_ctx_result(result) if isinstance(result, str) else None
-        if concurrency is None or value is None:
-            skipped.append(f"{name} ({case.get('state')})")
+        value = _read_ctx_result(str(result))
+        if value is None:
+            skipped.append(result.name)
             continue
-        _place(written, cases, concurrency, name)
+        # `<run>/ctx_<isl>_<osl>_ratio<r>_<max_batch>_<mnt>_<par>_MTP<n>_testN/`
+        # -- the batch is the in-flight request count of a prefill-only run.
+        concurrency = _ctx_concurrency(result.parent.name)
+        if concurrency is None:
+            skipped.append(f"{result.parent.name} (no batch in the dir name)")
+            continue
+        _place(written, cases, concurrency, result.parent.name)
         written[concurrency] = _write_result(
             into / f"concurrency_{concurrency}" / SOL_RESULT_NAME,
             {
                 metric: value,
                 "concurrency": concurrency,
-                "case": name,
-                "config": dict(case.get("config") or {}),
-                "state": case.get("state"),
-                "result": result,
-                "workdir": case.get("workdir"),
+                "case": result.parent.name,
+                "run_dir": str(directory),
+                "source_run_json": str(result),
+                "source_field": ".".join(CTX_RESULT_PATH),
             },
         )
-        cases[concurrency] = name
+        cases[concurrency] = result.parent.name
 
     if not written:
         raise SolTrackError(
-            f"workspace {workspace!r} holds no validated ctx measurement to score"
-            + (f" (skipped: {'; '.join(skipped)})" if skipped else "")
-            + f". `bench-disagg sweep status --workspace {workspace} --cases` reports "
-            f"whether the jobs are queued, failed, or produced artifacts that did not "
-            f"validate."
+            f"no validated ctx measurement under {directory}"
+            + (f" (skipped: {', '.join(skipped)})" if skipped else "")
+            + f". `{IBC_BENCH} jobs check -f {directory}/job_status.csv --summary` "
+            f"reports whether the jobs are queued, failed, or produced artifacts "
+            f"that did not validate."
         )
     return [written[key] for key in sorted(written)]
+
+
+def _ctx_concurrency(case_dir: str) -> int | None:
+    """The in-flight request count from a ctx case directory name.
+
+    `ctx_1024_1_ratio1_16_16640_dep4_MTP3_test2` -- isl, osl, ratio, then
+    **max_batch**, then max_num_tokens. The batch is the fourth field, and
+    reading it positionally rather than by pattern is deliberate: a name
+    this workflow cannot parse should stop the collect rather than pick
+    whichever number matched.
+    """
+    parts = case_dir.split("_")
+    if len(parts) < 5 or parts[0] != "ctx":
+        return None
+    batch = parts[4]
+    return int(batch) if batch.isdigit() else None
 
 
 def _read_ctx_result(path: str) -> float | None:
