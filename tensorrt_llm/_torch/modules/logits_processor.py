@@ -17,7 +17,17 @@ class LogitsProcessor(nn.Module):
                 hidden_states: torch.Tensor,
                 lm_head: Linear,
                 attn_metadata: AttentionMetadata,
-                return_context_logits: bool = False) -> torch.Tensor:
+                return_context_logits: bool = False,
+                *,
+                upcast_to_float: bool = True) -> torch.Tensor:
+        """Project hidden states through the LM head.
+
+        ``upcast_to_float`` materializes an fp32 copy of the whole
+        ``[tokens, vocab]`` tensor. That is what almost every consumer expects
+        (logprobs, penalties, softmax-based sampling), so it stays the default;
+        a caller whose only consumer is an argmax -- which is invariant under
+        the widening cast -- can pass False and keep the head's own dtype.
+        """
 
         if not return_context_logits:
             if attn_metadata is not None:
@@ -31,5 +41,6 @@ class LogitsProcessor(nn.Module):
                 hidden_states = hidden_states[-1]
 
         logits = lm_head(hidden_states)
-        logits = logits.float()
+        if upcast_to_float:
+            logits = logits.float()
         return logits
