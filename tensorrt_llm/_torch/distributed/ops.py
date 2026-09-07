@@ -310,7 +310,7 @@ def _allgather(
     input: Union[torch.Tensor, List[torch.Tensor]],
     group: List[int],
     rank: int,
-    group_boxed: Optional[object] = None,
+    group_name: Optional[str] = None,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
@@ -321,7 +321,7 @@ def _allgather(
         input (Union[Tensor, List[Tensor]]): The input tensor or tensor list.
         group (List[int]): The list of ranks to participate in the all-gather.
         rank (int): The rank of the current process.
-        group_boxed (object): The boxed ProcessGroup object for the list of ranks, if available.
+        group_name (str): The registered ProcessGroup name, if available.
         dim (int): Gather along given dimension. By default -1.
         sizes(Optional[List[int]]): An optional list indicating 'input.shape[dim]' in all ranks. By default None.
     Returns:
@@ -342,7 +342,7 @@ def _allgather(
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_pg
+            torch_op = torch.ops.trtllm.allgather_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather
 
@@ -351,7 +351,7 @@ def _allgather(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.allgather_list_pg
+            torch_op = torch.ops.trtllm.allgather_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.allgather_list
 
@@ -362,7 +362,7 @@ def _allgather(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, group, group_boxed)
+        output = torch_op(input, sizes, group, group_name)
     else:
         output = torch_op(input, sizes, group)
 
@@ -420,9 +420,9 @@ def allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_boxed,
-                      dim, sizes)
+    group_name = mapping.tp_group_name if mpi_disabled() else None
+    return _allgather(input, mapping.tp_group, mapping.tp_rank, group_name, dim,
+                      sizes)
 
 
 def cp_allgather(
@@ -444,9 +444,9 @@ def cp_allgather(
     Returns:
         The gathered tensor or tensor list.
     '''
-    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
-    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_boxed,
-                      dim, sizes)
+    group_name = mapping.cp_group_name if mpi_disabled() else None
+    return _allgather(input, mapping.cp_group, mapping.cp_rank, group_name, dim,
+                      sizes)
 
 
 def alltoall_helix(
@@ -600,7 +600,7 @@ def reducescatter(
 
     if isinstance(input, torch.Tensor):
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_pg
+            torch_op = torch.ops.trtllm.reducescatter_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
@@ -608,7 +608,7 @@ def reducescatter(
     else:
         input, valid = filter_valid_input(input)
         if mpi_disabled():
-            torch_op = torch.ops.trtllm.reducescatter_list_pg
+            torch_op = torch.ops.trtllm.reducescatter_list_pg_by_name
         else:
             torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
@@ -618,8 +618,8 @@ def reducescatter(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, mapping.tp_group,
-                          mapping.tp_group_pg.boxed())
+        output = torch_op(input, sizes, mapping.tp_group, mapping.tp_rank,
+                          mapping.tp_group_name)
     else:
         output = torch_op(input, sizes, mapping.tp_group)
 
@@ -880,8 +880,11 @@ class AllReduce(nn.Module):
         self.mnnvl_allreduce = None
         self.symm_mem_allreduce = None
         self._disable_mpi = mpi_disabled()
+        self._group_name = (mapping.tp_group_name if self._disable_mpi
+                            and mapping.tp_size > 1 else None)
 
-        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
+        self.all_reduce_op = (torch.ops.trtllm.allreduce_pg_by_name if
+                              self._disable_mpi else torch.ops.trtllm.allreduce)
 
         # Propagate model-level prealloc config to AllReduceRunner once per
         # process.  extra_attrs is only active during model __init__, so we
@@ -1057,12 +1060,10 @@ class AllReduce(nn.Module):
 
         additional_args = {}
         if self._disable_mpi:
-            # Get ProcessGroup from mapping
-            pg = self.mapping.tp_group_pg
-            assert pg is not None, "TP ProcessGroup not initialised"
+            assert self._group_name, "TP ProcessGroup name not initialised"
             additional_args = {
                 "rank": torch.distributed.get_rank(),
-                "pg": pg.boxed(),
+                "group_name": self._group_name,
             }
 
         # In case that AutoTuner brings potential perf regression

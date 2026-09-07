@@ -36,7 +36,13 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.llmapi import (
+    CudaGraphConfig,
+    KvCacheConfig,
+    MoeConfig,
+    SamplingParams,
+    TorchCompileConfig,
+)
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 # Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
@@ -442,6 +448,70 @@ class Qwen35_35BTP8WorkerExtension(WorkerExtension):
             weight_group,
             torch.device("cuda", self.device_id),
         )
+        device_uuid = get_device_uuid(self.device_id)
+        handles = {
+            device_uuid: [
+                (
+                    name,
+                    (
+                        _return_local_weight,
+                        (weight, None, None, None, None, None, None),
+                    ),
+                )
+                for name, weight in local_weights
+            ]
+        }
+        WorkerExtension.update_weights.__wrapped__(self, handles)
+
+    @control_action_decorator
+    def update_mxfp8_weights_from_local_checkpoint(
+        self, model_dir: str, weight_group: Optional[str] = None
+    ) -> None:
+        """Load and quantize a worker-local MXFP8 bucket."""
+        if weight_group is None:
+            WorkerExtension.update_weights.__wrapped__(self, None)
+            return
+
+        checkpoint_weights = _qwen35_35b_load_checkpoint_group(
+            model_dir,
+            weight_group,
+            torch.device("cuda", self.device_id),
+        )
+        local_weights = []
+        for name, weight in checkpoint_weights:
+            match = re.fullmatch(
+                r"(?P<prefix>.*\.mlp\.experts)\.(?P<projection>gate_up_proj|down_proj)",
+                name,
+            )
+            if match is None:
+                local_weights.append((name, weight))
+                continue
+
+            prefix = match.group("prefix")
+            projection = match.group("projection")
+            for start in range(0, weight.shape[0], 8):
+                end = min(start + 8, weight.shape[0])
+                if projection == "gate_up_proj":
+                    intermediate_size = weight.shape[1] // 2
+                    projections = (
+                        ("gate_proj", weight[start:end, :intermediate_size]),
+                        ("up_proj", weight[start:end, intermediate_size:]),
+                    )
+                else:
+                    projections = (("down_proj", weight[start:end]),)
+
+                for projection_name, projection_weight in projections:
+                    data, scale = RefQwen35MXFP8ModelWithIPCHandles._quantize_2d(projection_weight)
+                    for offset, expert_id in enumerate(range(start, end)):
+                        weight_name = f"{prefix}.{expert_id}.{projection_name}.weight"
+                        local_weights.append((weight_name, data[offset]))
+                        local_weights.append(
+                            (
+                                weight_name.removesuffix(".weight") + ".weight_scale_inv",
+                                scale[offset],
+                            )
+                        )
+
         device_uuid = get_device_uuid(self.device_id)
         handles = {
             device_uuid: [
@@ -1073,8 +1143,7 @@ class RefQwen35MXFP8ModelWithIPCHandles(RefQwen35_35BModelWithIPCHandles):
         """MXFP8-quantize a [..., K] tensor; blocks run along the last dim."""
         flat = w.reshape(-1, w.shape[-1]).to(torch.bfloat16)
         q, s = quant_bf16_to_mxfp8(flat, cls.MXFP8_BLOCK_SIZE)
-        return (q.reshape(w.shape),
-                s.reshape(*w.shape[:-1], w.shape[-1] // cls.MXFP8_BLOCK_SIZE))
+        return (q.reshape(w.shape), s.reshape(*w.shape[:-1], w.shape[-1] // cls.MXFP8_BLOCK_SIZE))
 
     def _emit_expert_projection(self, out, prefix, expert_id, leaf, tensor):
         """Emit one per-expert projection in NeMo-RL refit naming.
@@ -1110,10 +1179,11 @@ class RefQwen35MXFP8ModelWithIPCHandles(RefQwen35_35BModelWithIPCHandles):
         with torch.no_grad():
             for name, parameter in self.model.named_parameters():
                 lowered = name.lower()
-                is_expert = (".mlp.experts." in lowered
-                             and parameter.dim() == 3
-                             and not any(p in lowered
-                                         for p in self.EXCLUDE_PATTERNS))
+                is_expert = (
+                    ".mlp.experts." in lowered
+                    and parameter.dim() == 3
+                    and not any(p in lowered for p in self.EXCLUDE_PATTERNS)
+                )
                 if not is_expert:
                     source_weights.append((name, parameter.detach()))
                     continue
@@ -1126,16 +1196,18 @@ class RefQwen35MXFP8ModelWithIPCHandles(RefQwen35_35BModelWithIPCHandles):
                     if leaf == "gate_up_proj":
                         half = per_expert.shape[0] // 2
                         gate = self._emit_expert_projection(
-                            source_weights, prefix, expert_id, "gate_proj",
-                            per_expert[:half])
+                            source_weights, prefix, expert_id, "gate_proj", per_expert[:half]
+                        )
                         up = self._emit_expert_projection(
-                            source_weights, prefix, expert_id, "up_proj",
-                            per_expert[half:])
+                            source_weights, prefix, expert_id, "up_proj", per_expert[half:]
+                        )
                         rebuilt.append(torch.cat((gate, up), dim=0))
                     else:
-                        rebuilt.append(self._emit_expert_projection(
-                            source_weights, prefix, expert_id, "down_proj",
-                            per_expert))
+                        rebuilt.append(
+                            self._emit_expert_projection(
+                                source_weights, prefix, expert_id, "down_proj", per_expert
+                            )
+                        )
                 # Put the dequantized values back so the reference logits carry
                 # the same MXFP8 rounding as the engine's.
                 parameter.copy_(torch.stack(rebuilt, dim=0).to(parameter.dtype))
@@ -1186,9 +1258,9 @@ def _qwen35_mxfp8_model_kwargs() -> dict:
     return kwargs
 
 
-def _run_qwen35_mxfp8_update(partial: bool,
-                             tp_size: int = 4,
-                             model_dir: Optional[str] = None) -> None:
+def _run_qwen35_mxfp8_update(
+    partial: bool, tp_size: int = 4, model_dir: Optional[str] = None
+) -> None:
     """MXFP8 refit of the Qwen3.5 MoE test shape against a BF16 reference."""
     model_dir = model_dir or _mxfp8_base_model_dir()
     if not os.path.isdir(model_dir):
@@ -1219,6 +1291,8 @@ def _run_qwen35_mxfp8_update(partial: bool,
             ),
             "model_kwargs": _qwen35_mxfp8_model_kwargs(),
             "moe_config": MoeConfig(backend="CUTLASS"),
+            "torch_compile_config": TorchCompileConfig(enable_piecewise_cuda_graph=True),
+            "disable_mm_encoder": True,
         },
         sampling_params=SamplingParams(temperature=0, return_generation_logits=True, max_tokens=8),
         partial=partial,
@@ -1242,8 +1316,7 @@ def _mxfp8_generate_with_stats(llm, hf_model, prompts, sampling_params):
     expected by construction. A high cosine with flipped argmax means precision;
     a low cosine means the weights themselves are wrong.
     """
-    llm_logits, ref_logits = _run_generate_qwen35_35b(
-        llm, hf_model, prompts, sampling_params)
+    llm_logits, ref_logits = _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params)
     for i, (a, b) in enumerate(zip(llm_logits, ref_logits)):
         x = a.float().flatten()
         y = b.float().to(x.device).flatten()
@@ -1251,12 +1324,98 @@ def _mxfp8_generate_with_stats(llm, hf_model, prompts, sampling_params):
         x, y = x[:n], y[:n]
         cos = torch.nn.functional.cosine_similarity(x, y, dim=0).item()
         rel = ((x - y).norm() / y.norm().clamp_min(1e-6)).item()
-        top1 = (x.reshape(a.shape[0], -1).argmax(-1)
-                == y.reshape(a.shape[0], -1).argmax(-1)).float().mean().item()
-        print(f"[MXFP8DBG] logits prompt{i}: cosine={cos:.4f} rel_err={rel:.4f} "
-              f"top1_match={top1:.2%} finite={bool(torch.isfinite(x).all())}",
-              flush=True)
+        top1 = (
+            (x.reshape(a.shape[0], -1).argmax(-1) == y.reshape(a.shape[0], -1).argmax(-1))
+            .float()
+            .mean()
+            .item()
+        )
+        print(
+            f"[MXFP8DBG] logits prompt{i}: cosine={cos:.4f} rel_err={rel:.4f} "
+            f"top1_match={top1:.2%} finite={bool(torch.isfinite(x).all())}",
+            flush=True,
+        )
     return llm_logits, ref_logits
+
+
+def _run_qwen35_397b_mxfp8_tp8_multinode(
+    torch_compile_config: Optional[TorchCompileConfig],
+) -> List[torch.Tensor]:
+    """Refit TP8 and return short generation logits."""
+    model_dir = _mxfp8_397b_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
+    del tokenizer
+    sampling_params = SamplingParams(
+        temperature=0,
+        return_generation_logits=True,
+        max_tokens=4,
+    )
+
+    llm_kwargs = {}
+    if torch_compile_config is not None:
+        llm_kwargs["torch_compile_config"] = torch_compile_config
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls=_QWEN35_35B_TP8_EXTENSION,
+        tensor_parallel_size=_QWEN35_35B_TP8,
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        max_batch_size=2,
+        max_seq_len=256,
+        max_num_tokens=256,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.05,
+            mamba_ssm_cache_dtype="float32",
+        ),
+        model_kwargs=_qwen35_mxfp8_model_kwargs(),
+        moe_config=MoeConfig(backend="CUTLASS"),
+        enable_chunked_prefill=True,
+        disable_mm_encoder=True,
+        **llm_kwargs,
+    ) as llm:
+        # Match RL by capturing the dummy model before refit.
+        llm.generate(prompts, sampling_params)
+        for group in groups:
+            llm._collective_rpc(
+                "update_mxfp8_weights_from_local_checkpoint",
+                (model_dir, group),
+            )
+        llm._collective_rpc(
+            "update_mxfp8_weights_from_local_checkpoint",
+            (model_dir, None),
+        )
+        return [
+            output.outputs[0].generation_logits.detach().cpu()
+            for output in llm.generate(prompts, sampling_params)
+        ]
+
+
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_mxfp8_tp8_piecewise_cuda_graph(
+    monkeypatch,
+):
+    """Compare TP8 refit logits with and without PWCG."""
+    _attach_to_tp8_ray_cluster(monkeypatch)
+    eager_logits = _run_qwen35_397b_mxfp8_tp8_multinode(None)
+    piecewise_logits = _run_qwen35_397b_mxfp8_tp8_multinode(
+        TorchCompileConfig(enable_piecewise_cuda_graph=True)
+    )
+    assert all(torch.isfinite(logits).all() for logits in eager_logits)
+    assert all(torch.isfinite(logits).all() for logits in piecewise_logits)
+    compare_logits(piecewise_logits, eager_logits)
 
 
 @pytest.mark.high_cuda_memory
@@ -1269,8 +1428,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8_tp1():
     routed experts is the remaining difference. If this passes, TP is the
     trigger; if it fails, the trigger is elsewhere in the full-model path.
     """
-    _run_qwen35_mxfp8_update(
-        partial=False, tp_size=1, model_dir=_mxfp8_397b_model_dir())
+    _run_qwen35_mxfp8_update(partial=False, tp_size=1, model_dir=_mxfp8_397b_model_dir())
 
 
 @pytest.mark.gpu4
@@ -1285,8 +1443,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8():
     If the MXFP8 refit fails here, the trigger is the shape; if it passes, the
     trigger is the 8-way split.
     """
-    _run_qwen35_mxfp8_update(
-        partial=False, tp_size=4, model_dir=_mxfp8_397b_model_dir())
+    _run_qwen35_mxfp8_update(partial=False, tp_size=4, model_dir=_mxfp8_397b_model_dir())
 
 
 @pytest.mark.gpu4
@@ -1294,8 +1451,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8():
 @skip_pre_blackwell
 def test_llm_partial_update_weights_qwen35_397b_mxfp8():
     """Bucketed variant of the 397B-shape refit at TP4."""
-    _run_qwen35_mxfp8_update(
-        partial=True, tp_size=4, model_dir=_mxfp8_397b_model_dir())
+    _run_qwen35_mxfp8_update(partial=True, tp_size=4, model_dir=_mxfp8_397b_model_dir())
 
 
 @pytest.mark.gpu8
@@ -1305,8 +1461,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8_tp8():
     """397B shapes at TP8: reproduces the width, expert count and MoE EP split
     of the 16-node recipe on two nodes, so an MXFP8 refit failure that only
     appears at 397B scale can be chased without an e2e allocation."""
-    _run_qwen35_mxfp8_update(
-        partial=False, tp_size=8, model_dir=_mxfp8_397b_model_dir())
+    _run_qwen35_mxfp8_update(partial=False, tp_size=8, model_dir=_mxfp8_397b_model_dir())
 
 
 @pytest.mark.gpu8
@@ -1314,8 +1469,7 @@ def test_llm_update_weights_qwen35_397b_mxfp8_tp8():
 @skip_pre_blackwell
 def test_llm_partial_update_weights_qwen35_397b_mxfp8_tp8():
     """Bucketed variant of the 397B-shape refit."""
-    _run_qwen35_mxfp8_update(
-        partial=True, tp_size=8, model_dir=_mxfp8_397b_model_dir())
+    _run_qwen35_mxfp8_update(partial=True, tp_size=8, model_dir=_mxfp8_397b_model_dir())
 
 
 @pytest.mark.part5

@@ -1336,6 +1336,35 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertTrue(engine.is_multimodal)
         engine._validate_breakable_cuda_graph_compatibility()
 
+    def test_piecewise_refit_recapture_preserves_padding_dummy_requests(
+            self) -> None:
+        padding_dummy = object()
+        padding_dummy_requests = {0: padding_dummy}
+        cuda_graph_runner = SimpleNamespace(
+            padding_dummy_requests=padding_dummy_requests,
+            allow_capture=lambda: nullcontext(),
+        )
+        model_engine = SimpleNamespace(
+            _torch_compile_enabled=True,
+            _torch_compile_piecewise_cuda_graph=True,
+            _torch_compile_backend=object(),
+            torch_compile_config=SimpleNamespace(enable_fullgraph=False),
+            cuda_graph_runner=cuda_graph_runner,
+            _apply_torch_compile=Mock(),
+            _capture_piecewise_cuda_graphs=Mock(),
+        )
+        recapture = PyTorchModelEngine.recapture_piecewise_cuda_graphs_after_refit
+        recapture_core = recapture.__wrapped__.__wrapped__
+
+        with patch("torch.compiler.reset"), patch("gc.collect"):
+            recapture_core(model_engine, resource_manager=object())
+
+        self.assertIs(cuda_graph_runner.padding_dummy_requests,
+                      padding_dummy_requests)
+        self.assertIs(cuda_graph_runner.padding_dummy_requests[0],
+                      padding_dummy)
+        model_engine._capture_piecewise_cuda_graphs.assert_called_once()
+
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
         request = LlmRequest(
