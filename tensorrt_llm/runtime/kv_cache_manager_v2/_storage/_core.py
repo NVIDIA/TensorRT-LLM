@@ -763,6 +763,8 @@ class CacheLevelStorage:
 
         Returns (num_slots, grains_consumed).
         """
+        if granularity <= 0 or any(slot_size <= 0 for slot_size in slot_size_list):
+            raise ValueError("Cache slot sizes and granularity must be positive")
         num_pools = typed_len(slot_size_list)
         min_pool_grains = typed_map(slot_size_list, lambda s: div_up(s, granularity))
         if pg_grains < sum(min_pool_grains):

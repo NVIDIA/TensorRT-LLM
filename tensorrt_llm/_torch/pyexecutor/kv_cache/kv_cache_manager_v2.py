@@ -72,6 +72,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     ReuseScope,
+    SsmLayerConfig,
     SwaScratchReuseConfig,
     TokenIdExt,
     _cpp_introspection,
@@ -1251,6 +1252,7 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        config = self._remove_zero_size_buffers(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -2194,6 +2196,51 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Exclude empty buffers before creating the runtime storage pools."""
+        if config.layers and all(
+            layer.buffers and all(buffer.size != 0 for buffer in layer.buffers)
+            for layer in config.layers
+        ):
+            return config
+
+        # Inspect the final buffers: a layer with no attention KV heads can
+        # still own recurrent-state or other buffers added by a subclass.
+        layers: list[AttentionLayerConfig | SsmLayerConfig] = []
+        retained_layer_ids = []
+        for layer in config.layers:
+            buffers = [buffer for buffer in layer.buffers if buffer.size != 0]
+            if buffers:
+                retained_layer_ids.append(int(layer.layer_id))
+                layer_id = LayerId(len(layers))
+                if isinstance(layer, AttentionLayerConfig):
+                    layers.append(
+                        AttentionLayerConfig(
+                            layer_id=layer_id,
+                            buffers=buffers,
+                            sliding_window_size=layer.sliding_window_size,
+                            num_sink_tokens=layer.num_sink_tokens,
+                        )
+                    )
+                else:
+                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+
+        if not layers:
+            raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
+
+        # Runtime layer IDs are local offsets. Compact every per-layer view
+        # together while preserving the model's global layer IDs and count.
+        self.pp_layers = [self.pp_layers[i] for i in retained_layer_ids]
+        self.num_local_layers = len(self.pp_layers)
+        self.layer_offsets = {layer_id: offset for offset, layer_id in enumerate(self.pp_layers)}
+        self.num_kv_heads_per_layer = [self.num_kv_heads_per_layer[i] for i in retained_layer_ids]
+        self.head_dim_per_layer = [self.head_dim_per_layer[i] for i in retained_layer_ids]
+        self.max_attention_window_vec = [
+            self.max_attention_window_vec[i] for i in retained_layer_ids
+        ]
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+        return replace(config, layers=layers)
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the configured typical sequence length, if any."""
