@@ -516,6 +516,39 @@ def test_keyframes_decode_resolved_reference_bytes() -> None:
     assert all(image.mode == "RGB" for image in keyframes)
 
 
+@pytest.mark.parametrize(
+    ("roles", "expected_anchors"),
+    [
+        ((), ()),
+        (("first_frame",), ("first",)),
+        (("last_frame",), ("last",)),
+        (("first_frame", "last_frame"), ("first", "last")),
+        # Declaration order must not change the emitted anchor order: the first
+        # keyframe is stretched and the rest cropped (`stretch=index == 0`).
+        (("last_frame", "first_frame"), ("first", "last")),
+    ],
+)
+def test_every_supported_keyframe_combination(
+    roles: tuple[str, ...], expected_anchors: tuple[str, ...]
+) -> None:
+    """T2VA, first-only, last-only and first+last are all reachable."""
+    payload = _png_bytes()
+    req = SimpleNamespace(
+        prompt="a test prompt",
+        params=SimpleNamespace(
+            image_reference=[
+                SimpleNamespace(content=payload, format="bytes", role=role) for role in roles
+            ]
+            or None,
+            extra_params=None,
+        ),
+    )
+    keyframes, anchors = _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
+
+    assert anchors == expected_anchors
+    assert len(keyframes) == len(expected_anchors)
+
+
 def test_keyframe_reference_requires_an_explicit_role() -> None:
     """Both roles are optional, so upstream validation cannot infer one.
 
