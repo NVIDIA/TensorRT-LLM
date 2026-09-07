@@ -6199,6 +6199,17 @@ class TorchLlmArgs(BaseLlmArgs):
             if not buckets_are_explicit and legacy_buckets is not None:
                 self.prefill_capture_num_tokens = list(legacy_buckets)
 
+        if (compile_config is not None
+                and compile_config.compile_only_piecewise_graphs):
+            if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.PIECEWISE:
+                raise ValueError(
+                    "torch_compile_config.compile_only_piecewise_graphs requires "
+                    "prefill_cuda_graph_backend='piecewise'")
+            if self.enable_attention_dp:
+                raise ValueError(
+                    "torch_compile_config.compile_only_piecewise_graphs does not "
+                    "support attention DP")
+
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
             if self.prefill_capture_num_tokens is None:
                 self.prefill_capture_num_tokens = list(
