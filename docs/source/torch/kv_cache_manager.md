@@ -51,23 +51,11 @@ There are also interfaces for warming up `PyTorchModelEngine`, especially when u
 ## Customize KV Cache Manager
 
 To customize `KVCacheManager`, implement all the necessary interfaces.
-Then, integrate it into the `PyExecutor`. For the PyTorch backend, the relevant code is in [pytorch_model_registry.py](../../../tensorrt_llm/_torch/pyexecutor/backend_registries/pytorch_model_registry.py).
-In the `create_pytorch_model_based_executor` function, the `KVCacheManager` is instantiated as follows:
+Then, integrate it into the `PyExecutor`. For the PyTorch backend, see
+[`create_py_executor`](../../../tensorrt_llm/_torch/pyexecutor/py_executor_creator.py),
+which builds the cache manager through
+[`KvCacheCreator`](../../../tensorrt_llm/_torch/pyexecutor/_util.py).
 
-```python
-    kv_cache_manager = KVCacheManager(
-        executor_config.kv_cache_config,
-        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-        num_layers=model_engine.model.config.num_hidden_layers,
-        num_kv_heads=model_engine.model.config.num_key_value_heads,
-        head_dim=head_dim,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        max_batch_size=max_num_requests,
-        mapping=mapping,
-        dtype=kv_cache_dtype,
-    )
-```
-
-For local testing or proof of concept, update these lines to use your implementation.
-Then, test it to ensure the `PyExecutor` runs with your customized `KVCacheManager`.
+For local testing or proof of concept, update the cache-manager construction
+path to use your implementation, then test that `PyExecutor` runs with your
+customized `KVCacheManager`.
