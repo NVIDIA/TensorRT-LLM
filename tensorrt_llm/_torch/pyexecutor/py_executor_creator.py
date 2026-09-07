@@ -500,7 +500,9 @@ def create_py_executor(
         # drafters, which it stranded on their private max_seq_len-dense arena.
         is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
                                  or spec_config.spec_dec_mode.is_dspark())
-        if cache_transceiver_config is not None and not is_standalone_drafter:
+        # MiniMax-M3 always shares the target KV cache with its Eagle3 drafter.
+        if ((cache_transceiver_config is not None and not is_standalone_drafter)
+                or is_minimax_m3(m3_sparse_config)):
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla

@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Optional
 from unittest import mock
 
@@ -8913,3 +8914,281 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
+
+    def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
+                                 attention_dp, overlap_scheduler, use_msa,
+                                 cuda_graph):
+        """Disaggregated arm of test_nvfp4_eagle3.
+
+        Context TP2 -> generation TP2 over NIXL on one 4-GPU node, block reuse
+        on the context server. GSM8K through the router plus a chat-GSM8K
+        acceptance probe, since accuracy alone does not notice a corrupted
+        drafter KV (rejected drafts are re-verified).
+        """
+        if not (overlap_scheduler and cuda_graph and use_msa):
+            pytest.skip("the disagg arm pins the production serving shape "
+                        "(overlap scheduler + CUDA graphs + MSA)")
+        import requests
+
+        from .test_disaggregated_serving import launch_disaggregated_llm
+        speculative_config = {
+            "decoding_type": "Eagle3",
+            "max_draft_len": max_draft_len,
+            "speculative_model": f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+            "eagle3_one_model": True,
+        }
+        common_config = {
+            "speculative_config": speculative_config,
+            "sparse_attention_config": {
+                "algorithm": "minimax_m3",
+                "implementation": "msa",
+                "indexer_kv_dtype": "fp8",
+            },
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+                "kv_cache_bounce_size_mb": 0,
+                "kv_transfer_timeout_ms": 600000,
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            },
+            "scheduler_config": {
+                "capacity_scheduler_policy": "MAX_UTILIZATION"
+            },
+            "max_seq_len": 4096,
+            "trust_remote_code": True,
+        }
+        kv_cache_common = {
+            "dtype": "fp8",
+            "tokens_per_block": 128,
+            "use_kv_cache_manager_v2": True,
+            "event_buffer_max_size": 0,
+            "free_gpu_memory_fraction": 0.7,
+        }
+        ctx_server_config = {
+            **common_config,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "enable_attention_dp": False,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": True
+            },
+            "max_batch_size": 4,
+            "max_num_tokens": 8192,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": not overlap_scheduler,
+            "enable_attention_dp": attention_dp,
+            "kv_cache_config": {
+                **kv_cache_common, "enable_block_reuse": False
+            },
+            "max_batch_size": 16,
+            # Decode-only token budget: (1 + draft_len) verify tokens per
+            # request x max_batch_size.
+            "max_num_tokens": (1 + max_draft_len) * 16,
+            "enable_iter_perf_stats": True,
+            # Keep the whole acceptance-probe window: the default buffers
+            # retain only their latest 1000 iterations.
+            "max_stats_len": 5000,
+            "iter_stats_max_iterations": 5000,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": [1, 2, 4, 8, 16],
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      model_path,
+                                      server_waiting_timeout=1800) as llm:
+            # The launcher's args only carry the model name (it guesses NVFP4
+            # from it); fill in what this arm actually runs so the same
+            # reference row as the aggregated arm is used.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            llm.args.speculative_config = Eagle3DecodingConfig(
+                max_draft_len=max_draft_len,
+                speculative_model=speculative_config["speculative_model"])
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+            # Acceptance probe: 200 chat-format GSM8K questions, greedy, 512
+            # tokens, read from the generation worker's /metrics (the disagg
+            # fixture has no get_stats).
+            info = requests.get(f"{llm.router_url}/cluster_info",
+                                timeout=30).json()
+            gen_worker = info["current_workers"]["generation_servers"][0]
+            metrics_url = f'http://{gen_worker["host"]}:{gen_worker["port"]}/metrics'
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            # Let the background stats collector drain before reading /metrics.
+            time.sleep(1)
+            requests.get(metrics_url, timeout=120).raise_for_status()
+            probe_params = SamplingParams(max_tokens=512, temperature=0)
+            for future in [
+                    llm.generate_async(prompt, probe_params)
+                    for prompt in chat_prompts
+            ]:
+                future.result()
+            time.sleep(1)
+            response = requests.get(metrics_url, timeout=120)
+            response.raise_for_status()
+            drafted = accepted = steps = 0
+            for record in response.json():
+                stats = record.get("specDecodingStats") or {}
+                drafted += stats.get("numDraftTokens", 0)
+                accepted += stats.get("numAcceptedTokens", 0)
+                steps += stats.get("numRequestsWithDraftTokens", 0)
+            assert steps > 0, "no speculative iterations in /metrics"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            print(f"MiniMax-M3 Eagle3 disagg chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: " \
+                f"{chat_rate:.3f} (threshold 0.80, reference 0.839 from " \
+                f"the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("disagg", [False, True])
+    @parametrize_with_ids("cuda_graph", [True])
+    @parametrize_with_ids("use_msa", [True])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
+    @parametrize_with_ids("attention_dp", [False, True])
+    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
+    def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
+                          overlap_scheduler, use_msa, cuda_graph, disagg):
+        # One-model Eagle3 on the MSA backend; the GQA drafter shares the
+        # target KV cache. MMLU + GSM8K plus a chat-GSM8K acceptance probe,
+        # since accuracy alone does not notice a corrupted drafter KV.
+        if use_msa:
+            from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import \
+                msa_package_available
+            if not msa_package_available():
+                pytest.skip("MSA kernels (fmha_sm100) not available")
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        max_draft_len = 3
+        if disagg:
+            self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
+                                          attention_dp, overlap_scheduler,
+                                          use_msa, cuda_graph)
+            return
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=max_draft_len,
+            speculative_model=f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA",
+        )
+        # The MSA path runs an FP8 KV cache, as in test_nvfp4.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+                                        enable_block_reuse=False,
+                                        dtype="fp8" if use_msa else "auto")
+        with LLM(
+                model_path,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    implementation="msa" if use_msa else "triton",
+                    indexer_kv_dtype="fp8" if use_msa else "bf16"),
+                moe_config=MoeConfig(backend="CUTLASS"),
+                max_seq_len=4096,
+                # fmha_sm100 caps total_q x heads at 65536; with 4 verify
+                # tokens per row that is 512 (256 with unsharded heads).
+                max_batch_size=256 if attention_dp else 512,
+                speculative_config=spec_config,
+                # CUDA graphs + spec decoding needs the MSA path.
+                cuda_graph_config=CudaGraphConfig(
+                    enable_padding=True,
+                    max_batch_size=64 if attention_dp else 128,
+                ) if cuda_graph else None,
+                disable_overlap_scheduler=not overlap_scheduler,
+                enable_attention_dp=attention_dp,
+                enable_iter_perf_stats=True,
+                # Keep the whole acceptance probe: the default buffer holds
+                # only the latest 1000 iterations.
+                max_stats_len=5000,
+                trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+
+            def drain_spec_stats(llm):
+                drafted = accepted = steps = 0
+                for s in llm.get_stats(timeout=2):
+                    s = json.loads(s) if isinstance(s, str) else s
+                    sd = s.get("specDecodingStats") or {}
+                    drafted += sd.get("numDraftTokens", 0)
+                    accepted += sd.get("numAcceptedTokens", 0)
+                    steps += sd.get("numRequestsWithDraftTokens", 0)
+                return drafted, accepted, steps
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+            # Acceptance probe: 200 chat-format GSM8K questions, greedy, 512 tokens.
+            questions = [
+                r["question"]
+                for r in load_dataset(GSM8K.DATASET_DIR, "main", split="test")
+            ][:200]
+            chat_prompts = [
+                llm.tokenizer.apply_chat_template([{
+                    "role": "user",
+                    "content": q
+                }],
+                                                  tokenize=False,
+                                                  add_generation_prompt=True)
+                for q in questions
+            ]
+            drain_spec_stats(llm)
+            llm.generate(chat_prompts,
+                         SamplingParams(max_tokens=512, temperature=0))
+            drafted, accepted, steps = drain_spec_stats(llm)
+            assert steps > 0, "no speculative iterations recorded"
+            chat_rate = accepted / drafted
+            chat_length = 1 + accepted / steps
+            # Reference: the MHA drafter card (Inferact/MiniMax-M3-EAGLE3)
+            # reports 0.839 / 3.518; the GQA head measures 0.838 / 3.515 here.
+            print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
+                  f"{chat_rate:.3f}, mean acceptance length="
+                  f"{chat_length:.3f} ({steps} spec iterations)")
+            assert chat_rate > 0.80, \
+                f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
+                f"(threshold 0.80, reference 0.839 from the drafter card)"
+            assert chat_length > 3.4, \
+                f"Eagle3 chat-GSM8K acceptance length too low: " \
+                f"{chat_length:.3f} (threshold 3.4, reference 3.518 from " \
+                f"the drafter card)"
