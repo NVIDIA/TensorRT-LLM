@@ -29,6 +29,7 @@
 #if ENABLE_MULTI_DEVICE
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #endif // ENABLE_MULTI_DEVICE
 
@@ -285,6 +286,26 @@ std::vector<torch::Tensor> allgather_list_pg(torch::TensorList input_list, torch
 #endif // ENABLE_MULTI_DEVICE
 }
 
+torch::Tensor allgather_pg_by_name(torch::Tensor input, torch::optional<torch::List<int64_t>> sizes,
+    torch::List<int64_t> group, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return allgather_pg(std::move(input), std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input;
+#endif
+}
+
+std::vector<torch::Tensor> allgather_list_pg_by_name(torch::TensorList input_list,
+    torch::optional<torch::List<int64_t>> sizes, torch::List<int64_t> group, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    return allgather_list_pg(input_list, std::move(sizes), std::move(group), c10d::resolve_process_group(group_name));
+#else
+    return input_list.vec();
+#endif
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -295,16 +316,20 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "allgather_pg(Tensor input, SymInt[]? sizes, int[] group, __torch__.torch.classes.c10d.ProcessGroup "
         "process_group) -> Tensor");
+    m.def("allgather_pg_by_name(Tensor input, SymInt[]? sizes, int[] group, str group_name) -> Tensor");
     m.def("allgather_list(Tensor[] input_list, SymInt[]? sizes, int[] group) -> Tensor[]");
     m.def(
         "allgather_list_pg(Tensor[] input_list, SymInt[]? sizes, int[] group, "
         "__torch__.torch.classes.c10d.ProcessGroup process_group) -> Tensor[]");
+    m.def("allgather_list_pg_by_name(Tensor[] input_list, SymInt[]? sizes, int[] group, str group_name) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("allgather", &tensorrt_llm::torch_ext::allgather);
     m.impl("allgather_pg", &tensorrt_llm::torch_ext::allgather_pg);
+    m.impl("allgather_pg_by_name", &tensorrt_llm::torch_ext::allgather_pg_by_name);
     m.impl("allgather_list", &tensorrt_llm::torch_ext::allgather_list);
     m.impl("allgather_list_pg", &tensorrt_llm::torch_ext::allgather_list_pg);
+    m.impl("allgather_list_pg_by_name", &tensorrt_llm::torch_ext::allgather_list_pg_by_name);
 }

@@ -85,6 +85,36 @@ class PgOpTest:
 
         return True
 
+    def run_compiled_collective(self,
+                                op_name: str,
+                                test_tensor,
+                                expected_result,
+                                sizes: Optional[list[int]] = None):
+        from tensorrt_llm._torch.distributed import (AllReduce, allgather,
+                                                     reducescatter)
+
+        assert self.mapping.tp_group_name
+        if op_name == "allreduce":
+            collective = AllReduce(self.mapping,
+                                   strategy=AllReduceStrategy.NCCL)
+
+            def run(value):
+                return collective(value)
+        else:
+            collective = allgather if op_name == "allgather" else reducescatter
+
+            def run(value):
+                return collective(value, self.mapping, dim=0, sizes=sizes)
+
+        compiled = torch.compile(run, backend="eager", fullgraph=True)
+        test_input = ([value.cuda() for value in test_tensor] if isinstance(
+            test_tensor, list) else test_tensor.cuda())
+        expected = ([value.cuda() for value in expected_result] if isinstance(
+            expected_result, list) else expected_result.cuda())
+        output = compiled(test_input)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        return True
+
 
 @pytest.mark.part0
 @pytest.mark.parametrize("hidden_size", [128, 1024],
@@ -260,6 +290,88 @@ def test_allreduce_pg_op(setup_ray_cluster, seq_len, hidden_size):
         assert r is True
 
 
+@pytest.mark.part2
+@pytest.mark.parametrize(
+    ("op_name", "var_len", "as_list"),
+    [
+        pytest.param("allreduce", False, False),
+        pytest.param("allgather", False, False),
+        pytest.param("allgather", True, False),
+        pytest.param("allgather", False, True),
+        pytest.param("reducescatter", False, False),
+        pytest.param("reducescatter", True, False),
+        pytest.param("reducescatter", False, True),
+    ],
+)
+def test_compiled_pg_collectives(setup_ray_cluster, op_name, var_len, as_list):
+    """Run ProcessGroup collectives under full-graph compilation."""
+    torch.manual_seed(42)
+    world_size = 2
+    seq_len = 8
+    hidden_size = 16
+    sizes = [seq_len * (rank + 1)
+             for rank in range(world_size)] if var_len else None
+
+    runtime_env = ray.runtime_env.RuntimeEnv()
+    runtime_env["env_vars"] = os.environ.copy()
+    runtime_env["env_vars"].update({
+        "TLLM_DISABLE_MPI": "1",
+        "MASTER_ADDR": "127.0.0.1",
+    })
+    workers = [
+        PgOpTest.options(runtime_env=runtime_env).remote(rank, world_size)
+        for rank in range(world_size)
+    ]
+    ray.get([worker.__ray_ready__.remote() for worker in workers])
+    port = ray.get(workers[0].setup_tcp_store.remote())
+    ray.get([worker.setup_distributed_env.remote(port) for worker in workers])
+
+    if op_name == "allreduce":
+        inputs = [
+            torch.full((seq_len, hidden_size), rank, dtype=torch.bfloat16)
+            for rank in range(world_size)
+        ]
+        expected = torch.full_like(inputs[0], sum(range(world_size)))
+        expected_results = [expected] * world_size
+    elif op_name == "allgather":
+        if sizes is None:
+            inputs = [
+                torch.full((seq_len, hidden_size), rank, dtype=torch.bfloat16)
+                for rank in range(world_size)
+            ]
+        else:
+            inputs = [
+                torch.full((sizes[rank], hidden_size),
+                           rank,
+                           dtype=torch.bfloat16) for rank in range(world_size)
+            ]
+        expected = torch.cat(inputs, dim=0)
+        expected_results = [expected] * world_size
+    else:
+        total_seq_len = sum(
+            sizes) if sizes is not None else seq_len * world_size
+        value = torch.arange(total_seq_len * hidden_size,
+                             dtype=torch.bfloat16).reshape(
+                                 total_seq_len, hidden_size)
+        inputs = [value] * world_size
+        split_sizes = sizes or [seq_len] * world_size
+        expected_results = [
+            chunk * world_size for chunk in value.split(split_sizes, dim=0)
+        ]
+
+    if as_list:
+        inputs = [[value, value + 10] for value in inputs]
+        output_shift = 10 if op_name == "allgather" else 10 * world_size
+        expected_results = [[value, value + output_shift]
+                            for value in expected_results]
+
+    results = ray.get([
+        worker.run_compiled_collective.remote(op_name, value, expected, sizes)
+        for worker, value, expected in zip(workers, inputs, expected_results)
+    ])
+    assert all(results)
+
+
 @ray.remote(num_gpus=1)
 class CpBroadcastTest:
     """Test worker for cp_broadcast operations with context parallelism."""
@@ -352,6 +464,25 @@ class CpBroadcastTest:
         # After broadcast, all TP and CP ranks should have the same object.
         return result == root_obj
 
+    def run_compiled_cp_allgather(self):
+        from tensorrt_llm._torch.distributed import cp_allgather
+
+        assert self.mapping.cp_group_name
+
+        def run(value):
+            return cp_allgather(value, self.mapping, dim=0)
+
+        local = torch.full((4, 8),
+                           self.mapping.cp_rank,
+                           dtype=torch.bfloat16,
+                           device="cuda")
+        output = torch.compile(run, backend="eager", fullgraph=True)(local)
+        expected = torch.cat([
+            torch.full_like(local, rank) for rank in range(self.mapping.cp_size)
+        ])
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        return True
+
 
 @pytest.mark.part3
 @pytest.mark.parametrize("hidden_size", [128, 512], ids=lambda x: f"hidden:{x}")
@@ -392,6 +523,10 @@ def test_cp_broadcast_tensor(setup_ray_cluster, seq_len, hidden_size):
     ])
     for r in results:
         assert r is True, "Tensor broadcast from root=0 failed"
+    results = ray.get(
+        [test.run_compiled_cp_allgather.remote() for test in remote_tests])
+    for r in results:
+        assert r is True, "Compiled CP all-gather failed"
 
 
 @pytest.mark.part4

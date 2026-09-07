@@ -912,6 +912,9 @@ class TorchDist(Distributed):
         from tensorrt_llm._utils import set_torch_comm
         set_torch_comm(self)  # Set as global instance
         mapping.build_mesh()
+        # Resolve group names before Dynamo tracing.
+        mapping.tp_group_name
+        mapping.cp_group_name
 
         self.setup_local_comm()
         self.default_store = torch.distributed.distributed_c10d._get_default_store(
