@@ -802,6 +802,21 @@ def _tool_output_content(output):
     return str(output)
 
 
+# `developer` is OpenAI's rename of `system`. Chat templates written before
+# that rename dispatch on role and simply have no branch for it -- GLM-5.3
+# ends its dispatch after `system` with no fallback -- so a developer message
+# renders to nothing and the client's instructions never reach the model.
+# Every template understands `system`.
+_ROLE_ALIASES = {"developer": "system"}
+
+
+def _chat_role(role: Optional[str]) -> str:
+    """The role to hand a chat template, as that template will understand it."""
+    if not role:
+        return "assistant"
+    return _ROLE_ALIASES.get(role, role)
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem]
 ) -> Optional[ChatCompletionMessageParam]:
@@ -814,6 +829,7 @@ def _response_output_item_to_chat_completion_message(
         case "":
             if "role" not in item:
                 raise ValueError(f"Invalid input message item: {item}")
+            item = {**item, "role": _chat_role(item.get("role"))}
             content = item.get("content")
             if isinstance(content, list):
                 # An item with a role and no `type` is the API's
@@ -867,8 +883,7 @@ def _response_output_item_to_chat_completion_message(
             # template markup rather than an answer. Clients that send
             # structured input items (Codex CLI, the OpenAI SDK) always set a
             # role; a plain string input never reaches this function.
-            role = item.get("role") or "assistant"
-            return {"role": role, "content": text}
+            return {"role": _chat_role(item.get("role")), "content": text}
         case "function_call":
             # An assistant message carrying tool_calls, which is how the chat
             # completions path represents a call and what chat templates

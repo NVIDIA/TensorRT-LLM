@@ -50,7 +50,13 @@ def _message_item(role, *texts, item_id=None):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("role", ["user", "assistant", "system", "developer"])
+# `developer` is deliberately not in this list: it is aliased to `system`
+# because chat templates written before OpenAI renamed the role have no branch
+# for it and drop the message entirely. See
+# test_a_developer_message_is_rendered_as_system for that case. The point of
+# the test below -- that a role is never silently replaced by "assistant" --
+# still holds for it.
+@pytest.mark.parametrize("role", ["user", "assistant", "system"])
 def test_item_role_is_preserved(role):
     """Regression: the role was hardcoded to "assistant".
 
@@ -711,3 +717,52 @@ def test_a_missing_custom_tool_result_stays_empty():
     )
 
     assert msg["content"] == ""
+
+
+def test_a_developer_message_is_rendered_as_system():
+    """Codex puts its whole operating brief in `developer` messages.
+
+    GLM-5.3's template dispatches on role with branches for user, assistant,
+    tool and system and no fallback, so a developer message rendered to
+    nothing: the model was asked to drive an agent harness it had never been
+    told about, and improvised -- shell into a JavaScript sandbox, invented
+    cell ids, sub-agents spawned into the same confusion.
+
+    `developer` is OpenAI's rename of `system`, and every template knows
+    `system`.
+    """
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "You are Codex."}],
+        }
+    )
+
+    assert msg == {"role": "system", "content": "You are Codex."}
+
+
+def test_a_developer_message_without_a_type_is_also_rendered():
+    """The same brief arrives without `type` when the client omits it."""
+    msg = _response_output_item_to_chat_completion_message(
+        {
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "You are Codex."}],
+        }
+    )
+
+    assert msg["role"] == "system"
+    assert msg["content"] == [{"type": "text", "text": "You are Codex."}]
+
+
+def test_other_roles_are_left_alone():
+    """Only the alias is rewritten."""
+    for role in ("user", "assistant", "system", "tool"):
+        msg = _response_output_item_to_chat_completion_message(
+            {
+                "type": "message",
+                "role": role,
+                "content": [{"type": "input_text", "text": "x"}],
+            }
+        )
+        assert msg["role"] == role
