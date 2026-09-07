@@ -49,6 +49,11 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
+  # The one OpenEngine test needing a GPU: it builds a real LLM, because a
+  # stubbed engine would accept whatever its fake generate_async accepts and so
+  # would agree with an advertisement the real engine rejects. Any GPU will do
+  # -- the model is TinyLlama-1.1B -- so it sits with the other gateway tests.
+  - unittest/grpc/openengine/test_capability_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
