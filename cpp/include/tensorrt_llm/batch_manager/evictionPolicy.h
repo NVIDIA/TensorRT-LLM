@@ -46,6 +46,14 @@ public:
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
     /// @brief Get the amount of free blocks in the primary memory pool
     virtual SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) = 0;
+
+    /// @brief True when the block currently sits in a free queue (evictable right now).
+    /// Conservative default preserves prior behavior for policies that do not track it.
+    [[nodiscard]] virtual bool isEnqueued(BlockPtr const& block)
+    {
+        return true;
+    }
+
     /// @brief Claim a free block. Called when the cache manager allocates or reuses a new block
     virtual void claimBlock(BlockPtr block) = 0;
     virtual void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
@@ -84,6 +92,7 @@ public:
     void releaseBlock(BlockPtr block, bool toFront) override;
 
     SizeType32 getNumFreeBlocks(SizeType32 cacheLevel) override;
+    [[nodiscard]] bool isEnqueued(BlockPtr const& block) override;
 
     void claimBlock(BlockPtr block) override;
     void claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
