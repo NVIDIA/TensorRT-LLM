@@ -2508,12 +2508,12 @@ def _create_kv_cache_manager(
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["kv_events_config"] = kv_events_config
+        manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
     elif kv_events_config is not None and kv_events_config.enable_kv_cache_events:
         logger.warning(
             "kv_cache_config.kv_events_config is set but streaming KV event "
             "publishing requires KV cache manager V2; events will not be "
             f"published for {kv_cache_manager_cls.__name__}.")
-        manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
