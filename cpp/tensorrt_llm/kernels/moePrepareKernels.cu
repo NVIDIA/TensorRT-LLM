@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -272,13 +272,23 @@ __global__ void computeCumsumDevice(int* sendCountsCumsum, int* recvCountsCumsum
 #endif
 
     int tid = threadIdx.x;
-    int threadData = tid < rankCount ? inputOutputPtr[tid] : 0;
-    __syncthreads();
-
-    BlockScan(temp_storage).InclusiveSum(threadData, threadData);
-    if (tid < rankCount)
+    // Scan rankCount entries in CUMSUM_THREADS_PER_BLOCK-wide tiles, carrying the
+    // running total across tiles so any rank count is supported.
+    int carry = 0;
+    for (int base = 0; base < rankCount; base += CUMSUM_THREADS_PER_BLOCK)
     {
-        inputOutputPtr[tid] = threadData;
+        int idx = base + tid;
+        int threadData = idx < rankCount ? inputOutputPtr[idx] : 0;
+        __syncthreads();
+
+        int tileAggregate = 0;
+        BlockScan(temp_storage).InclusiveSum(threadData, threadData, tileAggregate);
+        if (idx < rankCount)
+        {
+            inputOutputPtr[idx] = threadData + carry;
+        }
+        carry += tileAggregate;
+        __syncthreads();
     }
 }
 
