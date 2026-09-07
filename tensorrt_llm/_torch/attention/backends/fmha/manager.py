@@ -124,6 +124,11 @@ _FMHA_CACHE_SANITY_CHECK_ENV = "TRTLLM_FMHA_CACHE_SANITY_CHECK"
 
 
 class _FmhaCacheKey(NamedTuple):
+    """Inputs that may vary between requests and change FMHA selection.
+
+    Values invariant for a model or layer within one LLM instance must be excluded.
+    """
+
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int

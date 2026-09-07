@@ -29,11 +29,13 @@ def _install_msa_cutlass_compatibility() -> None:
     except ImportError:
         return
 
-    # MSA has not yet migrated these two aliases to their CUTLASS DSL 4.6
+    # MSA has not yet migrated these aliases to their newer CUTLASS DSL
     # names. Keep this shim local to the MSA import path and remove it once the
-    # packaged sources use cute.ThrMma and cute.make_rmem_tensor directly.
-    if not hasattr(cute.core, "ThrMma"):
-        setattr(cute.core, "ThrMma", cute.ThrMma)
+    # packaged sources use the top-level thread classes and
+    # cute.make_rmem_tensor directly.
+    for thread_class_name in ("ThrCopy", "ThrMma"):
+        if not hasattr(cute.core, thread_class_name):
+            setattr(cute.core, thread_class_name, getattr(cute, thread_class_name))
     if not hasattr(cute, "make_fragment"):
         setattr(cute, "make_fragment", cute.make_rmem_tensor)
 
