@@ -50,7 +50,9 @@ build_config = BuildConfig(
 )
 ```
 
-If you are using the [CLI flow for building engines](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) pass `--max_batch_size <int>` to `trtllm-build` to tune max batch size.
+The legacy `trtllm-build --max_batch_size` CLI path has been removed with the
+TensorRT backend; use `BuildConfig` as shown above, or see
+[TensorRT Backend Removal](../../tensorrt-backend-removal.md).
 
 ### Tuning Case Study
 
@@ -80,7 +82,9 @@ build_config = BuildConfig(
 )
 ```
 
-If you are using the [CLI flow for building engines](./benchmarking-default-performance.md#building-and-saving-engines-via-cli) pass `--max_num_tokens <int>` to `trtllm-build` to tune max_num_tokens.
+The legacy `trtllm-build --max_num_tokens` CLI path has been removed with the
+TensorRT backend; use `BuildConfig` as shown above, or see
+[TensorRT Backend Removal](../../tensorrt-backend-removal.md).
 
 ### Tuning Case Study
 
