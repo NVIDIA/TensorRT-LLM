@@ -1,4 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -88,6 +92,15 @@ class LMHead(Linear):
         self.out_features = local_out_features
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        self._enable_derived_nvfp4_m1 = os.getenv(
+            "TLLM_EXPERIMENTAL_DERIVED_NVFP4_LM_HEAD", "0") == "1"
+        self.register_buffer("_derived_nvfp4_weight", None, persistent=False)
+        self.register_buffer("_derived_nvfp4_weight_scale",
+                             None,
+                             persistent=False)
+        self.register_buffer("_derived_nvfp4_weight_scale_2",
+                             None,
+                             persistent=False)
 
         if self.has_any_quant:
             # Keep the quantized weights created by Linear (e.g. NVFP4 packed
@@ -126,6 +139,75 @@ class LMHead(Linear):
         else:
             return self.out_features
 
+    def _supports_derived_nvfp4_m1(self) -> bool:
+        if not self._enable_derived_nvfp4_m1 or self.has_any_quant:
+            return False
+        if (self.tp_size != 1
+                or self.tp_mode not in (None, TensorParallelMode.COLUMN)
+                or self.padding_size != 0):
+            return False
+        if (self.weight.device.type != "cuda"
+                or self.weight.dtype != torch.bfloat16
+                or not self.weight.is_contiguous() or self.in_features % 16 != 0
+                or self.out_features % 128 != 0):
+            return False
+        return torch.cuda.get_device_capability(self.weight.device) in ((10, 0),
+                                                                        (10, 3))
+
+    def _can_use_derived_nvfp4_m1(self, input: torch.Tensor) -> bool:
+        if not self._supports_derived_nvfp4_m1():
+            return False
+        return (input.device == self.weight.device
+                and input.dtype == torch.bfloat16 and input.is_contiguous()
+                and input.numel() == self.in_features)
+
+    @torch.no_grad()
+    def _build_derived_nvfp4_weight(self) -> bool:
+        if not self._supports_derived_nvfp4_m1():
+            return False
+        if self._derived_nvfp4_weight is not None:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            return False
+
+        nvfp4_max = 448.0 * 6.0
+        weight_amax = torch.amax(torch.abs(self.weight)).float()
+        weight_scale = nvfp4_max / weight_amax
+        weight, block_scale = torch.ops.trtllm.fp4_quantize(
+            self.weight.detach(), weight_scale, 16, False)
+        self._derived_nvfp4_weight = weight
+        self._derived_nvfp4_weight_scale = block_scale
+        self._derived_nvfp4_weight_scale_2 = weight_amax / nvfp4_max
+        logger.info(
+            "Enabled derived NVFP4 M=1 LMHead path for dense BF16 weight "
+            f"shape {tuple(self.weight.shape)}")
+        return True
+
+    def _derived_nvfp4_m1_forward(
+            self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self._can_use_derived_nvfp4_m1(input):
+            return None
+        if not self._build_derived_nvfp4_weight():
+            return None
+
+        nvfp4_max = 448.0 * 6.0
+        input_2d = input.reshape(1, self.in_features)
+        input_amax = torch.amax(torch.abs(input_2d)).float()
+        input_scale = nvfp4_max / input_amax
+        alpha = (input_amax / nvfp4_max) * self._derived_nvfp4_weight_scale_2
+        input_fp4, input_block_scale = torch.ops.trtllm.fp4_quantize(
+            input_2d, input_scale, 16, False)
+        output = torch.ops.trtllm.nvfp4_gemm(
+            input_fp4,
+            self._derived_nvfp4_weight,
+            input_block_scale,
+            self._derived_nvfp4_weight_scale,
+            alpha,
+            torch.bfloat16,
+            allowed_backends="cutedsl",
+        )
+        return output.reshape(input.shape[:-1] + (self.out_features, ))
+
     def forward(
         self,
         input: torch.Tensor,
@@ -134,17 +216,22 @@ class LMHead(Linear):
         mapping_lm_head_tp: Optional[Mapping] = None,
         is_spec_decoding_head: bool = False,
     ) -> torch.Tensor:
-        if is_spec_decoding_head and self.enable_lm_head_tp_in_adp:
-            # For LM head TP in ADP, we need to slice the weight for the LM head
-            tp_rank = mapping_lm_head_tp.tp_rank
-            tp_size = mapping_lm_head_tp.tp_size
-            slice_width = ceil_div(self.out_features, tp_size)
-            slice_start = tp_rank * slice_width
-            slice_end = min((tp_rank + 1) * slice_width, self.out_features)
-            output = F.linear(input, self.weight[slice_start:slice_end, :],
-                              None)
-        else:
-            output = super().forward(input, all_reduce_params=all_reduce_params)
+        output = None
+        if not is_spec_decoding_head:
+            output = self._derived_nvfp4_m1_forward(input)
+        if output is None:
+            if is_spec_decoding_head and self.enable_lm_head_tp_in_adp:
+                # For LM head TP in ADP, we need to slice the weight for the LM head
+                tp_rank = mapping_lm_head_tp.tp_rank
+                tp_size = mapping_lm_head_tp.tp_size
+                slice_width = ceil_div(self.out_features, tp_size)
+                slice_start = tp_rank * slice_width
+                slice_end = min((tp_rank + 1) * slice_width, self.out_features)
+                output = F.linear(input, self.weight[slice_start:slice_end, :],
+                                  None)
+            else:
+                output = super().forward(input,
+                                         all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
                 and self.padding_size > 0):
             output = output[..., :-self.padding_size]
@@ -175,6 +262,9 @@ class LMHead(Linear):
 
         if original_weight is not None:
             self.weight.data = original_weight
+
+        if self._enable_derived_nvfp4_m1:
+            self._build_derived_nvfp4_weight()
 
 
 def get_masked_input_and_mask(
