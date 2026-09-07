@@ -78,23 +78,24 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
                           make_lora_model_config)
+from .engine.metadata import build_attention_metadata, update_spec_metadata
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
 from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              get_padding_params, get_position_id_offset,
                              get_top_level_model, prepare_multimodal_indices,
-                             resolve_runner,
+                             resolve_runner_type,
                              set_spec_metadata_all_rank_num_tokens,
                              ship_multimodal_indices)
-from .engine.runners.interface import RunnerDeps
+from .engine.runners.interface import ModelRunner, RunnerDeps
+from .engine.runners.no_cache import NoCacheRunner, NoCacheRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -934,121 +935,8 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
 
-        # Create the encoder runner first. For encoder-decoder models it derives
-        # every reachable startup capture key through get_graph_key().
-        encoder_graph_batch_sizes = self._encoder_cuda_graph_batch_sizes
-        encoder_graph_max_batch_size = (encoder_graph_batch_sizes[-1]
-                                        if encoder_graph_batch_sizes else 0)
-        # Feature mode's graph shapes follow from the batch sizes alone, so its
-        # token budget is one fixed-length encoder output per request; the
-        # token path uses the configured num_tokens buckets.
-        feature_shape = self._encoder_feature_shape
-        feature_dtype = self._encoder_feature_dtype
-        fixed_seq_len = self._encoder_fixed_seq_len
-        encoder_graph_max_num_tokens = (encoder_graph_max_batch_size *
-                                        fixed_seq_len
-                                        if feature_shape is not None else
-                                        self._max_cuda_graph_num_tokens)
-
-        encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
-            use_cuda_graph=use_encoder_cuda_graph,
-            cuda_graph_padding_enabled=(
-                self._encoder_cuda_graph_padding_enabled),
-            cuda_graph_batch_sizes=encoder_graph_batch_sizes,
-            cuda_graph_num_tokens=self._cuda_graph_num_tokens,
-            cuda_graph_seq_lens=self._cuda_graph_seq_lens,
-            max_cuda_graph_batch_size=encoder_graph_max_batch_size,
-            max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
-            max_num_tokens=self.encoder_max_num_tokens,
-            max_seq_len=self.max_seq_len,
-            # The encoder runner must never be handed the decoder's pool:
-            # encoder replay runs on `encoder_stream`, device-concurrent with
-            # decoder replay, and torch's pool-sharing contract assumes
-            # replays from a shared pool are not concurrent.
-            #
-            # Literal None rather than `self._cuda_graph_mem_pool` states that
-            # as a requirement instead of leaving it to a coincidence. The
-            # engine attribute is None for the engine's whole life (nothing
-            # assigns it after its declaration), so each runner already
-            # created its own pool at its first capture and this allocates
-            # nothing new — but reading it here would silently start sharing
-            # the day someone gives that attribute a value.
-            cuda_graph_mem_pool=None,
-            is_encoder_decoder=self._is_encoder_decoder_model(),
-            use_fixed_sequence_slots=(self._is_encoder_decoder_model()
-                                      and hasattr(
-                                          pretrained_config,
-                                          "relative_attention_num_buckets")),
-            feature_shape=feature_shape,
-            feature_dtype=feature_dtype,
-            fixed_seq_len=fixed_seq_len,
-        )
-        self.encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
-            encoder_cuda_graph_runner_config)
-        if feature_shape is not None:
-            logger.info(
-                f"Feature-mode encoder CUDA graphs enabled for batch sizes "
-                f"{encoder_graph_batch_sizes} (fixed_seq_len={fixed_seq_len}, "
-                f"feature_shape={tuple(feature_shape)}).")
-
-        # Once encoder CUDA graphs are usable, enable mixed decoder graphs by
-        # default unless the user explicitly opts out.
-        encoder_decoder_cuda_graph_enabled = (
-            self.encoder_cuda_graph_runner.enabled
-            and self.encoder_cuda_graph_runner.is_encoder_decoder
-            and bool(self.encoder_cuda_graph_runner.capture_keys))
-        enable_encoder_decoder_mixed_cuda_graph = (
-            encoder_decoder_cuda_graph_enabled
-            and self.cuda_graph_config is not None
-            and self.llm_args.enable_encoder_decoder_mixed_cuda_graph)
-
-        # Create decoder CUDA graph config and runner.
-        cuda_graph_runner_config = CUDAGraphRunnerConfig(
-            use_cuda_graph=(not self._is_encode_only
-                            and self.cuda_graph_config is not None),
-            cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
-            cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
-            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
-            max_beam_width=self.max_beam_width,
-            spec_config=self.spec_config,
-            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
-            dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
-            max_num_tokens=self.max_num_tokens,
-            use_mrope=self.use_mrope,
-            original_max_draft_len=self.original_max_draft_len,
-            original_max_total_draft_tokens=self.
-            original_max_total_draft_tokens,
-            is_draft_model=self.is_draft_model,
-            enable_attention_dp=self.enable_attention_dp,
-            is_encoder_decoder=self._is_encoder_decoder_model(),
-            batch_size=self.batch_size,
-            mapping=self.mapping,
-            dist=self.dist,
-            kv_cache_manager_key=self.kv_cache_manager_key,
-            sparse_attention_config=self.sparse_attention_config,
-            enable_encoder_decoder_mixed_cuda_graph=(
-                enable_encoder_decoder_mixed_cuda_graph),
-        )
-        self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
-        self.breakable_cuda_graph_runner = None
-        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
-            decoder_model = (self.model if isinstance(
-                self.model, DecoderModelForCausalLM) else getattr(
-                    self.model, "llm", None))
-            if not isinstance(decoder_model, DecoderModelForCausalLM):
-                raise ValueError(
-                    "breakable prefill CUDA graph requires a decoder model body"
-                )
-            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
-                decoder_model.model)
-
-        # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
-        # Every LoRA parameter decision lives in engine/lora.py. The builder
-        # holds no model and no manager: `enable_spec_decode` and
-        # `runtime_draft_len` are rewritten during capture, so they -- and the
-        # manager the two `_util.py` hooks below install -- are passed per call.
         self._lora = LoraParamBuilder(spec_config=self.spec_config,
                                       attn_backend=self.attn_backend)
 
@@ -1062,6 +950,105 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
+        runner_cls = resolve_runner_type(self.model, self.llm_args)
+        self._runner = self._initialize_runner(runner_cls)
+
+        self.encoder_cuda_graph_runner = None
+        if self._runner is None:
+            encoder_graph_batch_sizes = self._encoder_cuda_graph_batch_sizes
+            encoder_graph_max_batch_size = (encoder_graph_batch_sizes[-1]
+                                            if encoder_graph_batch_sizes else 0)
+            feature_shape = self._encoder_feature_shape
+            feature_dtype = self._encoder_feature_dtype
+            fixed_seq_len = self._encoder_fixed_seq_len
+            encoder_graph_max_num_tokens = (encoder_graph_max_batch_size *
+                                            fixed_seq_len
+                                            if feature_shape is not None else
+                                            self._max_cuda_graph_num_tokens)
+
+            encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
+                use_cuda_graph=use_encoder_cuda_graph,
+                cuda_graph_padding_enabled=(
+                    self._encoder_cuda_graph_padding_enabled),
+                cuda_graph_batch_sizes=encoder_graph_batch_sizes,
+                cuda_graph_num_tokens=self._cuda_graph_num_tokens,
+                cuda_graph_seq_lens=self._cuda_graph_seq_lens,
+                max_cuda_graph_batch_size=encoder_graph_max_batch_size,
+                max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
+                max_num_tokens=self.encoder_max_num_tokens,
+                max_seq_len=self.max_seq_len,
+                # Encoder replay can run concurrently with decoder replay, so
+                # it must own a separate CUDA graph memory pool.
+                cuda_graph_mem_pool=None,
+                is_encoder_decoder=self._is_encoder_decoder_model(),
+                use_fixed_sequence_slots=(
+                    self._is_encoder_decoder_model() and hasattr(
+                        pretrained_config, "relative_attention_num_buckets")),
+                feature_shape=feature_shape,
+                feature_dtype=feature_dtype,
+                fixed_seq_len=fixed_seq_len,
+            )
+            self.encoder_cuda_graph_runner = EncoderCUDAGraphRunner(
+                encoder_cuda_graph_runner_config)
+            if feature_shape is not None:
+                logger.info(
+                    f"Feature-mode encoder CUDA graphs enabled for batch sizes "
+                    f"{encoder_graph_batch_sizes} (fixed_seq_len={fixed_seq_len}, "
+                    f"feature_shape={tuple(feature_shape)}).")
+
+        # Once encoder CUDA graphs are usable, enable mixed decoder graphs by
+        # default unless the user explicitly opts out.
+        encoder_decoder_cuda_graph_enabled = (
+            self.encoder_cuda_graph_runner is not None
+            and self.encoder_cuda_graph_runner.enabled
+            and self.encoder_cuda_graph_runner.is_encoder_decoder
+            and bool(self.encoder_cuda_graph_runner.capture_keys))
+        enable_encoder_decoder_mixed_cuda_graph = (
+            encoder_decoder_cuda_graph_enabled
+            and self.cuda_graph_config is not None
+            and self.llm_args.enable_encoder_decoder_mixed_cuda_graph)
+
+        self.cuda_graph_runner = None
+        self.breakable_cuda_graph_runner = None
+        if self._runner is None:
+            cuda_graph_runner_config = CUDAGraphRunnerConfig(
+                use_cuda_graph=(not self._is_encode_only
+                                and self.cuda_graph_config is not None),
+                cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
+                cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
+                max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
+                max_beam_width=self.max_beam_width,
+                spec_config=self.spec_config,
+                cuda_graph_mem_pool=self._cuda_graph_mem_pool,
+                dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
+                max_num_tokens=self.max_num_tokens,
+                use_mrope=self.use_mrope,
+                original_max_draft_len=self.original_max_draft_len,
+                original_max_total_draft_tokens=self.
+                original_max_total_draft_tokens,
+                is_draft_model=self.is_draft_model,
+                enable_attention_dp=self.enable_attention_dp,
+                is_encoder_decoder=self._is_encoder_decoder_model(),
+                batch_size=self.batch_size,
+                mapping=self.mapping,
+                dist=self.dist,
+                kv_cache_manager_key=self.kv_cache_manager_key,
+                sparse_attention_config=self.sparse_attention_config,
+                enable_encoder_decoder_mixed_cuda_graph=(
+                    enable_encoder_decoder_mixed_cuda_graph),
+            )
+            self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
+            if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+                decoder_model = (self.model if isinstance(
+                    self.model, DecoderModelForCausalLM) else getattr(
+                        self.model, "llm", None))
+                if not isinstance(decoder_model, DecoderModelForCausalLM):
+                    raise ValueError(
+                        "breakable prefill CUDA graph requires a decoder model body"
+                    )
+                self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
+                    decoder_model.model)
+
         self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
@@ -1072,27 +1059,53 @@ class PyTorchModelEngine(ModelEngine):
         self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
         self._cross_attn_stable_request_ids: Optional[List[int]] = None
 
-        self._runner = resolve_runner(
-            RunnerDeps(
-                dist=self.dist,
-                mapping=self.mapping,
-                enable_attention_dp=self.enable_attention_dp,
-                max_num_tokens=self.max_num_tokens,
-                max_seq_len=self.max_seq_len,
-                prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
-                prefill_cuda_graph_num_tokens=self.
-                _prefill_cuda_graph_num_tokens,
-                mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
-                input_ids_cuda=self.input_ids_cuda,
-                position_ids_cuda=self.position_ids_cuda,
-                gather_ids_cuda=getattr(self, "gather_ids_cuda", None),
-                draft_tokens_cuda=getattr(self, "draft_tokens_cuda", None),
-                lora=self._lora,
-                forward_step=self._forward_step,
-            ),
-            self.model,
-            self.llm_args,
+    def _initialize_runner(
+            self,
+            runner_cls: Optional[Type[ModelRunner]]) -> Optional[ModelRunner]:
+        if runner_cls is None:
+            return None
+        if issubclass(runner_cls, NoCacheRunner):
+            return self._initialize_no_cache_runner(runner_cls)
+        raise TypeError(f"No runner initializer registered for "
+                        f"{runner_cls.__module__}.{runner_cls.__qualname__}")
+
+    def _initialize_no_cache_runner(
+            self, runner_cls: Type[NoCacheRunner]) -> NoCacheRunner:
+        runner_deps = RunnerDeps(
+            dist=self.dist,
+            mapping=self.mapping,
+            input_ids_cuda=self.input_ids_cuda,
+            position_ids_cuda=self.position_ids_cuda,
+            gather_ids_cuda=getattr(self, "gather_ids_cuda", None),
+            draft_tokens_cuda=getattr(self, "draft_tokens_cuda", None),
+            cache_indirection=self.cache_indirection_attention
+            if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
+            lora=self._lora,
+            model_forward=self.model_forward,
         )
+        runner_config = NoCacheRunnerConfig(
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_seq_len=self.max_seq_len,
+            max_beam_width=self.max_beam_width,
+            without_logits=self.without_logits,
+            enable_attention_dp=self.enable_attention_dp,
+            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
+            attention_backend=self.attn_backend,
+            attention_runtime_features=self.attn_runtime_features,
+            mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            spec_config=self.spec_config,
+            is_draft_model=self.is_draft_model,
+            num_seq_slots=(self.max_num_seq_slots if
+                           self._enable_disagg_adp_overlap_headroom else None),
+            original_max_draft_len=self.original_max_draft_len,
+            original_max_total_draft_tokens=(
+                self.original_max_total_draft_tokens),
+            spec_dec_max_total_draft_tokens=(
+                self._spec_dec_max_total_draft_tokens),
+        )
+        return runner_cls(self.model, runner_deps, runner_config)
 
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
@@ -1122,7 +1135,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
-        if self.cuda_graph_runner.enabled:
+        if (self.cuda_graph_runner is not None
+                and self.cuda_graph_runner.enabled):
             # For spec decode, each generation request contributes
             # max_draft_len + 1 tokens per forward pass.
             max_tokens_per_seq = (self.original_max_draft_len +
@@ -1238,6 +1252,9 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
+        if self.cuda_graph_runner is None:
+            yield
+            return
         _run_cuda_graphs = self.cuda_graph_runner.enabled
         self.cuda_graph_runner.enabled = False
         try:
@@ -1408,22 +1425,23 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
-        # Ahead of the early returns below, since it holds regardless of why
-        # warmup is skipped: only the advanced-sampling CUDA graph capture pass
-        # exercises the non-greedy sampler, so with cuda_graph_config=None
-        # flashinfer's sampling kernels would be JIT-built mid-serving.
-        warmup_sampling_module()
-
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-
-        if kv_cache_manager is None:
-            assert self._runner is not None, (
-                "no KV cache manager, but resolve_runner did not choose a no-cache runner"
-            )
+        if self._runner is not None:
+            if isinstance(self._runner, NoCacheRunner):
+                assert kv_cache_manager is None, (
+                    "a no-cache runner was initialized, but a KV cache manager was allocated"
+                )
             self._runner.warmup(resource_manager)
             self._runner.capture_graphs(resource_manager)
             return
+        assert kv_cache_manager is not None, (
+            "the legacy runner requires a KV cache manager")
+
+        # Only the advanced-sampling CUDA graph capture pass exercises the
+        # non-greedy sampler. Without this warmup, flashinfer's sampling kernels
+        # would be JIT-built mid-serving when cuda_graph_config is None.
+        warmup_sampling_module()
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
@@ -3478,75 +3496,28 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_attn_metadata(
         self,
-        kv_cache_manager: Optional[Union[KVCacheManager, KVCacheManagerV2]],
+        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
         draft_kv_cache_manager: Optional[Union[KVCacheManager,
                                                KVCacheManagerV2]] = None):
-        enable_context_mla_with_cached_kv = is_mla(
-            self.model.model_config.pretrained_config) and (
-                self.attn_runtime_features.cache_reuse
-                or self.attn_runtime_features.chunked_prefill)
-        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
-        config = self.model.model_config.pretrained_config
-
-        num_attention_heads = getattr(config, 'num_attention_heads', None)
-        num_key_value_heads = getattr(config, 'num_key_value_heads', None)
-
-        # Calculate the number of attention heads per KV head (GQA ratio)
-        if isinstance(num_key_value_heads, (list, tuple)):
-            # Filter out invalid KV heads, default to 0 if no valid KV heads are found
-            num_key_value_heads = min(
-                (kv for kv in num_key_value_heads if kv and kv > 0), default=0)
-        if num_attention_heads and num_key_value_heads:
-            num_heads_per_kv = num_attention_heads // num_key_value_heads
-        else:
-            num_heads_per_kv = 1
-
-        metadata_cls = self.attn_backend.Metadata
-        sparse_metadata_params = (
-            self.sparse_attention_config.to_sparse_metadata_params(
-                pretrained_config=config)
-            if self.sparse_attention_config is not None else None)
-
-        if kv_cache_manager is None:
-            # Cache the no-cache metadata.
-            if self.encoder_attn_metadata is not None:
-                return self.encoder_attn_metadata
-            self.encoder_attn_metadata = metadata_cls(
-                max_num_requests=self.batch_size,
-                max_num_tokens=self.max_num_tokens,
-                max_num_sequences=self.batch_size * self.max_beam_width,
-                kv_cache_manager=None,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_context_mla_with_cached_kv=
-                enable_context_mla_with_cached_kv,
-                cache_indirection=cache_indirection,
-                num_heads_per_kv=num_heads_per_kv,
-                sparse_metadata_params=sparse_metadata_params)
-            self.encoder_attn_metadata.block_ids_per_seq = None
-            self.encoder_attn_metadata.kv_block_ids_per_seq = None
-            return self.encoder_attn_metadata
-
         if self.attn_metadata is not None:
             # This assertion can be relaxed if needed: just create a new metadata
             # object if it changes.
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        self.attn_metadata = metadata_cls(
-            max_num_requests=self.batch_size,
+        config = self.model.model_config.pretrained_config
+        self.attn_metadata = build_attention_metadata(
+            self.model.model_config,
+            max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
-            max_num_sequences=self.batch_size * self.max_beam_width,
+            max_beam_width=self.max_beam_width,
+            attention_backend=self.attn_backend,
+            attention_runtime_features=self.attn_runtime_features,
+            mapping=self.mapping,
+            cache_indirection=self.cache_indirection_attention
+            if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
-            mapping=self.mapping,
-            runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
-            cache_indirection=cache_indirection,
-            num_heads_per_kv=num_heads_per_kv,
-            sparse_metadata_params=sparse_metadata_params,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             self.attn_metadata.mamba_chunk_size = getattr(
@@ -3555,6 +3526,26 @@ class PyTorchModelEngine(ModelEngine):
             self.model)
 
         return self.attn_metadata
+
+    def _set_up_encoder_attn_metadata(self) -> AttentionMetadata:
+        if self.encoder_attn_metadata is not None:
+            return self.encoder_attn_metadata
+
+        self.encoder_attn_metadata = build_attention_metadata(
+            self.model.model_config,
+            max_batch_size=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_beam_width=self.max_beam_width,
+            attention_backend=self.attn_backend,
+            attention_runtime_features=self.attn_runtime_features,
+            mapping=self.mapping,
+            cache_indirection=self.cache_indirection_attention
+            if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
+            kv_cache_manager=None,
+        )
+        self.encoder_attn_metadata.block_ids_per_seq = None
+        self.encoder_attn_metadata.kv_block_ids_per_seq = None
+        return self.encoder_attn_metadata
 
     @property
     def is_multimodal(self) -> bool:
@@ -3592,26 +3583,13 @@ class PyTorchModelEngine(ModelEngine):
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
     def _set_up_spec_metadata(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            no_cache=False):
+            self, spec_resource_manager: Optional[BaseResourceManager]):
         spec_config = self.spec_config if self.enable_spec_decode else None
         # The disaggregated attention-DP overlap path opts into larger metadata
         # buffers. Passing None preserves the established max_num_requests
         # fallback for other configurations, including PP.
         num_seq_slots = (self.max_num_seq_slots
                          if self._enable_disagg_adp_overlap_headroom else None)
-        if no_cache:
-            return get_spec_metadata(
-                spec_config,
-                self.model.config,
-                self.batch_size,
-                max_num_tokens=self.max_num_tokens,
-                spec_resource_manager=spec_resource_manager,
-                is_draft_model=self.is_draft_model,
-                max_seq_len=self.max_seq_len,
-                num_seq_slots=num_seq_slots)
-
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
@@ -6631,7 +6609,7 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 position_ids_t = position_ids
 
-            attn_metadata = self._set_up_attn_metadata(kv_cache_manager=None)
+            attn_metadata = self._set_up_encoder_attn_metadata()
             attn_metadata.seq_lens = torch.tensor(seq_lens, dtype=torch.int)
             attn_metadata.num_contexts = batch_size
             attn_metadata.max_seq_len = self.max_seq_len
@@ -6866,9 +6844,9 @@ class PyTorchModelEngine(ModelEngine):
         batch_size = len(inputs['seq_lens'])
         with self.encoder_cuda_graph_runner.pad_batch(
                 inputs, batch_size) as padded_inputs:
-            attn_metadata = self._set_up_attn_metadata(
-                kv_cache_manager=None
-            ) if self.encoder_attn_metadata is None else self.encoder_attn_metadata
+            attn_metadata = (self._set_up_encoder_attn_metadata()
+                             if self.encoder_attn_metadata is None else
+                             self.encoder_attn_metadata)
             graph_attn_metadata, key = self.encoder_cuda_graph_runner.maybe_get_cuda_graph(
                 padded_inputs, attn_metadata)
             # Unpad seq_lens when fallback to eager path.
@@ -6945,9 +6923,20 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         if self._runner is not None:
-            assert kv_cache_manager is None, (
-                "resolve_runner chose a no-cache runner, but a KV cache manager was allocated"
+            if isinstance(self._runner, NoCacheRunner):
+                assert kv_cache_manager is None, (
+                    "a no-cache runner was initialized, but a KV cache manager was allocated"
+                )
+            return self._runner.forward(
+                scheduled_requests,
+                resource_manager=resource_manager,
+                cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+                runtime_draft_len=self.runtime_draft_len,
+                moe_load_balancer=self.moe_load_balancer,
+                gather_context_logits=gather_context_logits,
             )
+        assert kv_cache_manager is not None, (
+            "the legacy runner requires a KV cache manager")
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
             resource_manager)
 
@@ -6962,71 +6951,29 @@ class PyTorchModelEngine(ModelEngine):
             if spec_resource_manager is not None and hasattr(
                     spec_resource_manager, 'spec_tree_manager'):
                 spec_tree_manager = spec_resource_manager.spec_tree_manager
-            spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
-                                                       no_cache=kv_cache_manager
-                                                       is None)
-            # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
-            is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
-                self.is_draft_model, self.attn_backend)
-            # Propagate runtime_draft_len (already set on self by py_executor)
-            # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
-            spec_metadata.runtime_draft_len = self.runtime_draft_len
-            spec_metadata.runtime_tokens_per_gen_step = (
-                self.get_runtime_tokens_per_gen_step(self.runtime_draft_len))
-
-            # Parallel-draft modes advertise a per-gen-step width via
-            # tokens_per_gen_step (PARD: 2K, DFlash: K+1).  Pass
-            # (tokens_per_gen_step - 1) so generation_lengths = tokens_per_gen_step
-            # and the XQA kernel computes the correct past_kv_len.
-            if spec_metadata.spec_dec_mode.is_parallel_draft():
-                sd_max_draft_len = self.original_max_total_draft_tokens
-                sd_max_total = self.original_max_total_draft_tokens
-            else:
-                sd_max_draft_len = self.original_max_draft_len
-                sd_max_total = self._spec_dec_max_total_draft_tokens
-
-            # Fill slot-ID buffer for update_spec_dec_param
-            if (spec_tree_manager is not None
-                    and spec_tree_manager.use_dynamic_tree
-                    and not self.is_draft_model):
-                spec_tree_manager.slot_storage.fill_all_slot_ids(
-                    scheduled_requests.context_requests,
-                    scheduled_requests.generation_requests,
-                )
-
-            attn_metadata.update_spec_dec_param(
-                batch_size=scheduled_requests.batch_size,
-                is_spec_decoding_enabled=is_spec_dec_mode,
-                is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
-                is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
-                max_draft_len=sd_max_draft_len,
-                max_total_draft_tokens=sd_max_total,
-                spec_metadata=spec_metadata,
+            spec_metadata = self._set_up_spec_metadata(spec_resource_manager)
+            assert spec_metadata is not None
+            update_spec_metadata(
+                spec_metadata,
+                scheduled_requests,
+                attn_metadata,
                 spec_tree_manager=spec_tree_manager,
-                num_contexts=scheduled_requests.num_context_requests)
+                runtime_draft_len=self.runtime_draft_len,
+                runtime_tokens_per_gen_step=(
+                    self.get_runtime_tokens_per_gen_step(
+                        self.runtime_draft_len)),
+                is_draft_model=self.is_draft_model,
+                attention_backend=self.attn_backend,
+                original_max_draft_len=self.original_max_draft_len,
+                original_max_total_draft_tokens=(
+                    self.original_max_total_draft_tokens),
+                spec_dec_max_total_draft_tokens=(
+                    self._spec_dec_max_total_draft_tokens))
         else:
             spec_resource_manager = None
             spec_metadata = None
 
         moe_load_balancer = self.moe_load_balancer
-        if kv_cache_manager is None:
-            # Startup dispatch decided the family; this asserts the runtime
-            # fact still agrees while both routing mechanisms coexist.
-            assert self._runner is not None, (
-                "no KV cache manager, but resolve_runner did not choose a no-cache runner"
-            )
-            return self._runner.forward(
-                scheduled_requests,
-                attn_metadata,
-                spec_metadata=spec_metadata,
-                resource_manager=resource_manager,
-                enable_spec_decode=self.enable_spec_decode,
-                cuda_graph_lora_manager=self.cuda_graph_lora_manager,
-                runtime_draft_len=self.runtime_draft_len,
-                moe_load_balancer=moe_load_balancer,
-                gather_context_logits=gather_context_logits,
-            )
-
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
         # Non-linear tree input preparation expands runtime_draft_len to the
@@ -7292,23 +7239,18 @@ class PyTorchModelEngine(ModelEngine):
         if len(sequence_lengths) != len(request_ids):
             raise ValueError("Encoder sequence lengths and request IDs must "
                              "have the same length.")
-        sparse_metadata_params = (
-            self.sparse_attention_config.to_sparse_metadata_params(
-                pretrained_config=self.model.model_config.pretrained_config)
-            if self.sparse_attention_config is not None else None)
-        encoder_attn_metadata = self.attn_backend.Metadata(
-            max_num_requests=self.encoder_batch_size,
+        encoder_attn_metadata = build_attention_metadata(
+            self.model.model_config,
+            max_batch_size=self.encoder_batch_size,
             max_num_tokens=self.encoder_max_num_tokens,
-            max_num_sequences=self.encoder_batch_size * self.max_beam_width,
-            kv_cache_manager=None,
+            max_beam_width=self.max_beam_width,
+            attention_backend=self.attn_backend,
+            attention_runtime_features=self.attn_runtime_features,
             mapping=self.mapping,
-            runtime_features=self.attn_runtime_features,
-            enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_context_mla_with_cached_kv=False,
             cache_indirection=None,
-            sparse_metadata_params=sparse_metadata_params,
-            num_heads_per_kv=1,
-        )
+            kv_cache_manager=None,
+            enable_context_mla_with_cached_kv=False,
+            num_heads_per_kv=1)
         assert isinstance(
             encoder_attn_metadata,
             (VanillaAttentionMetadata, TrtllmAttentionMetadata)

@@ -25,7 +25,7 @@ from .mm_encoder import MultimodalEncoderRunner
 from .pooling import PoolingRunner
 
 if TYPE_CHECKING:
-    from .interface import ModelRunner, RunnerDeps
+    from .interface import ModelRunner
 
 __all__ = [
     "apply_position_id_offset",
@@ -34,26 +34,25 @@ __all__ = [
     "get_position_id_offset",
     "get_top_level_model",
     "prepare_multimodal_indices",
-    "resolve_runner",
+    "resolve_runner_type",
     "set_spec_metadata_all_rank_num_tokens",
     "ship_multimodal_indices",
 ]
 
 
-def resolve_runner(
-    deps: RunnerDeps,
+def resolve_runner_type(
     model: nn.Module,
     llm_args: TorchLlmArgs,
-) -> ModelRunner | None:
-    """Resolve a runner from startup facts, returning ``None`` until its family migrates."""
+) -> type[ModelRunner] | None:
+    """Resolve the startup runner class without constructing its dependencies."""
     if llm_args.encode_only and not llm_args.mm_encoder_only:
         return None  # Encoder-only execution uses the existing encoder path.
 
     if llm_args.mm_encoder_only:
-        return MultimodalEncoderRunner(model, deps)
+        return MultimodalEncoderRunner
 
     if not model.model_config.is_generation:
-        return PoolingRunner(model, deps)
+        return PoolingRunner
 
     if model.model_config.is_encoder_decoder:
         return None  # Encoder-decoder execution uses the existing engine path.

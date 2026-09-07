@@ -24,6 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import NoCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
@@ -190,17 +191,20 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        model_engine._runner = Mock()
+        model_engine._runner = Mock(spec=NoCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
 
-        with patch("tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"):
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.model_engine.warmup_sampling_module"
+        ) as warmup_sampling:
             model_engine.warmup(resource_manager)
 
         self.assertEqual(
             model_engine._runner.method_calls,
             [call.warmup(resource_manager), call.capture_graphs(resource_manager)],
         )
+        warmup_sampling.assert_not_called()
 
     def test_encoder_decoder_encoder_warmup_is_deferred_and_uses_two_passes(self):
         """Enc-dec encoder warmup is deferred and runs as two passes."""

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners import \
     prepare_multimodal_indices
+from tensorrt_llm._torch.pyexecutor.engine.runners.no_cache import NoCacheRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -297,6 +298,27 @@ def _make_forward_only_engine(
 
     resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
+
+
+def test_runner_initializer_dispatches_no_cache_runner_explicitly() -> None:
+    engine = object.__new__(PyTorchModelEngine)
+    expected = Mock(spec=NoCacheRunner)
+    engine._initialize_no_cache_runner = Mock(return_value=expected)
+
+    assert engine._initialize_runner(NoCacheRunner) is expected
+    engine._initialize_no_cache_runner.assert_called_once_with(NoCacheRunner)
+
+
+def test_runner_initializer_rejects_unregistered_runner_type() -> None:
+
+    class UnregisteredRunner:
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+
+    with unittest.TestCase().assertRaisesRegex(
+            TypeError, "No runner initializer registered"):
+        engine._initialize_runner(UnregisteredRunner)
 
 
 def create_model_engine_and_kvcache(
@@ -878,7 +900,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                          (graph_attn_metadata, graph_spec_metadata, key))
 
     def test_no_cache_forward_delegates_to_resolved_runner(self) -> None:
-        engine, _, _, attn_metadata, _ = _make_forward_only_engine(None)
+        engine, _, _, _, _ = _make_forward_only_engine(None)
         engine._runner = Mock(return_value=None)
         expected_outputs = {"logits": object()}
         engine._runner.forward.return_value = expected_outputs
@@ -891,25 +913,25 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(actual_outputs, expected_outputs)
         engine._runner.forward.assert_called_once_with(
             batch,
-            attn_metadata,
-            spec_metadata=None,
             resource_manager=resource_manager,
-            enable_spec_decode=False,
             cuda_graph_lora_manager=None,
             runtime_draft_len=0,
             moe_load_balancer=None,
             gather_context_logits=False,
         )
+        engine._set_up_attn_metadata.assert_not_called()
+        engine._set_up_spec_metadata.assert_not_called()
+        engine._get_draft_kv_cache_manager.assert_not_called()
         engine._prepare_inputs.assert_not_called()
 
     def test_forward_rejects_kv_manager_with_no_cache_runner(self) -> None:
         engine, _, resource_manager, _, _ = _make_forward_only_engine(None)
-        engine._runner = Mock()
+        engine._runner = Mock(spec=NoCacheRunner)
         batch = ScheduledRequests()
 
         with self.assertRaisesRegex(
                 AssertionError,
-                "no-cache runner, but a KV cache manager was allocated",
+                "no-cache runner was initialized, but a KV cache manager was allocated",
         ):
             engine.forward(batch, resource_manager)
 
