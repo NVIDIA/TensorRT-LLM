@@ -35,7 +35,6 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
-#include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
@@ -44,6 +43,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/kvCacheCompression/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
@@ -55,7 +55,6 @@
 #include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace nb = nanobind;
@@ -72,14 +71,6 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_NB_MODULE)
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
-
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
@@ -138,6 +129,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalBatchManagerKvCacheV2
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2", "KV Cache Manager V2 bindings");
+    auto mInternalKvCacheCompression
+        = mInternal.def_submodule("kv_cache_compression", "KV cache compression internal bindings");
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
@@ -145,6 +138,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
     tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::nanobind::kv_cache_compression::initBindings(mInternalKvCacheCompression);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
@@ -389,78 +383,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("pipeline_parallelism") = nb::none(), nb::arg("context_parallelism") = nb::none(),
             nb::arg("device_ids") = nb::none(), nb::arg("enable_attention_dp") = false);
 
-    auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> nb::tuple
-    {
-        return nb::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
-            config.presencePenalty, config.frequencyPenalty, config.promptIgnoreLength, config.topK, config.topP,
-            config.randomSeed, config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate,
-            config.lengthPenalty, config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences,
-            config.minP, config.beamWidthArray);
-    };
-    auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t)
-    {
-        if (t.size() != 20)
-        {
-            throw std::runtime_error("Invalid SamplingConfig state!");
-        }
-
-        tr::SamplingConfig config;
-        config.beamWidth = nb::cast<SizeType32>(t[0]);
-        config.temperature = nb::cast<OptVec<float>>(t[1]);
-        config.minLength = nb::cast<OptVec<SizeType32>>(t[2]);
-        config.repetitionPenalty = nb::cast<OptVec<float>>(t[3]);
-        config.presencePenalty = nb::cast<OptVec<float>>(t[4]);
-        config.frequencyPenalty = nb::cast<OptVec<float>>(t[5]);
-        config.promptIgnoreLength = nb::cast<OptVec<SizeType32>>(t[6]);
-        config.topK = nb::cast<OptVec<SizeType32>>(t[7]);
-        config.topP = nb::cast<OptVec<float>>(t[8]);
-        config.randomSeed = nb::cast<OptVec<uint64_t>>(t[9]);
-        config.topPDecay = nb::cast<OptVec<float>>(t[10]);
-        config.topPMin = nb::cast<OptVec<float>>(t[11]);
-        config.topPResetIds = nb::cast<OptVec<TokenIdType>>(t[12]);
-        config.beamSearchDiversityRate = nb::cast<OptVec<float>>(t[13]);
-        config.lengthPenalty = nb::cast<OptVec<float>>(t[14]);
-        config.earlyStopping = nb::cast<OptVec<SizeType32>>(t[15]);
-        config.noRepeatNgramSize = nb::cast<OptVec<SizeType32>>(t[16]);
-        config.numReturnSequences = nb::cast<SizeType32>(t[17]);
-        config.minP = nb::cast<OptVec<float>>(t[18]);
-        config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[19]);
-
-        new (&self) tr::SamplingConfig(config);
-    };
-
-    nb::class_<tr::SamplingConfig>(m, "SamplingConfig")
-        .def(nb::init<SizeType32>(), nb::arg("beam_width") = 1)
-        .def(nb::init<tle::SamplingConfig, std::optional<tle::ExternalDraftTokensConfig>>(),
-            nb::arg("executor_sample_config"), nb::arg("external_draft_tokens_config") = std::nullopt)
-        .def_rw("beam_width", &tr::SamplingConfig::beamWidth)
-        .def_rw("temperature", &tr::SamplingConfig::temperature)
-        .def_rw("min_length", &tr::SamplingConfig::minLength)
-        .def_rw("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
-        .def_rw("presence_penalty", &tr::SamplingConfig::presencePenalty)
-        .def_rw("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
-        .def_rw("prompt_ignore_length", &tr::SamplingConfig::promptIgnoreLength)
-        .def_rw("top_k", &tr::SamplingConfig::topK)
-        .def_rw("top_p", &tr::SamplingConfig::topP)
-        .def_rw("random_seed", &tr::SamplingConfig::randomSeed)
-        .def_rw("top_p_decay", &tr::SamplingConfig::topPDecay)
-        .def_rw("top_p_min", &tr::SamplingConfig::topPMin)
-        .def_rw("top_p_reset_ids", &tr::SamplingConfig::topPResetIds)
-        .def_rw("beam_search_diversity_rate", &tr::SamplingConfig::beamSearchDiversityRate)
-        .def_rw("length_penalty", &tr::SamplingConfig::lengthPenalty)
-        .def_rw("early_stopping", &tr::SamplingConfig::earlyStopping)
-        .def_rw("no_repeat_ngram_size", &tr::SamplingConfig::noRepeatNgramSize)
-        .def_rw("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
-        .def_rw("min_p", &tr::SamplingConfig::minP)
-        .def_rw("beam_width_array", &tr::SamplingConfig::beamWidthArray)
-        .def_rw("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
-        .def("__getstate__", SamplingConfigGetState)
-        .def("__setstate__", SamplingConfigSetState)
-        .def("__eq__", &tr::SamplingConfig::operator==);
-
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
-
-    m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
+    // `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type that wrapped
+    // every executor sampling parameter in a one-element vector for the batched C++ decoder.
+    // That decoder is gone and LlmRequest now holds an executor::SamplingConfig directly, so
+    // the name is kept as an alias to avoid breaking `from tensorrt_llm.bindings import SamplingConfig`.
+    m.attr("SamplingConfig") = mExecutor.attr("SamplingConfig");
 
     nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
         .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -514,7 +441,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
-    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);

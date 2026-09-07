@@ -29,6 +29,7 @@ import torch
 import triton
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
@@ -37,7 +38,6 @@ from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...modules.top_k import TopK, TopKImplementation
-from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
 from ...utils import next_positive_power_of_2
@@ -150,12 +150,10 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
     def __init__(
         self,
         config: "TriAttentionKvCacheCompressionConfig",
-        kv_cache_manager: KVCacheManagerV2,
-        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         *,
         pretrained_config: "PretrainedConfig",
     ) -> None:
-        super().__init__(config, kv_cache_manager, draft_kv_cache_manager)
+        super().__init__(config)
         self.budget = config.budget
         self.beta = config.beta
         self.eviction_mode = config.eviction_mode
@@ -168,6 +166,14 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         self._load_calibration()
 
         self._prepared_generation_batch: Optional["ScheduledRequests"] = None
+
+    def bind_kv_cache_managers(
+        self,
+        kv_cache_manager: KVCacheManagerV2,
+        draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    ) -> None:
+        """Finalize state whose geometry is owned by the constructed KVCMs."""
+        super().bind_kv_cache_managers(kv_cache_manager, draft_kv_cache_manager)
         # Manager-lifetime constants.
         self._num_extra_kv_tokens = int(kv_cache_manager.num_extra_kv_tokens)
         self._protected_tail_capacity = (
@@ -420,7 +426,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
                 # this request (pre-launch) instead of failing the batch.
                 continue
             draft_cache = None
-            if self.draft_kv_cache_manager is not None:
+            if self.has_independent_draft_kv_cache:
                 # A missing draft cache is a wiring bug: keep the precise KeyError.
                 draft_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
                 if not draft_cache.is_active:
@@ -600,7 +606,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         if self._swa_window is not None:
             swa_offsets = cumulative_offsets([self._swa_window + tail for tail in tails])
         draft_offsets = None
-        if self.draft_kv_cache_manager is not None:
+        if self.has_independent_draft_kv_cache:
             draft_offsets = cumulative_offsets(
                 [self.budget + self._draft_protected_tail_capacity] * len(eviction_requests)
             )
@@ -681,7 +687,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         """Create manager-lifetime state once."""
         target_layout = self._create_kv_layout()
         draft_layout = (
-            self._create_kv_layout(draft=True) if self.draft_kv_cache_manager is not None else None
+            self._create_kv_layout(draft=True) if self.has_independent_draft_kv_cache else None
         )
         self._target_layout = target_layout
         self._draft_layout = draft_layout

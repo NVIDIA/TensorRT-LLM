@@ -29,7 +29,7 @@ from torch import nn
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:

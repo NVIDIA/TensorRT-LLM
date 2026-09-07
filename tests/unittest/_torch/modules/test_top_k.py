@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the reusable sparse index-selection Top-K module."""
 
+import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS, TopK, TopKImplementation
 
 
 def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
@@ -201,19 +203,140 @@ def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
     assert gvr.call_args.kwargs["order_row"] is row_order
 
 
-def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
-    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
-    prior_indices = torch.zeros(3, 2, dtype=torch.int32)
+def _install_fake_selfsampling_runner(monkeypatch) -> Mock:
+    """Replace the lazily imported self-sampling varlen entry with a Mock."""
+    runner = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k",
+        SimpleNamespace(selfsampling_topk_run_varlen=runner),
+    )
+    return runner
 
+
+def _run_gvr_v2_decode(top_k: TopK, out_width: int = 2) -> None:
+    scores = torch.randn(1, 8)  # satisfies the V2 hardware-format gate
+    top_k(
+        scores,
+        torch.empty(1, out_width, dtype=torch.int32),
+        is_prefill=False,
+        sequence_lengths=torch.tensor([32], dtype=torch.int32),
+        scan_lengths=torch.tensor([8], dtype=torch.int32),
+        next_n=1,
+        max_seq_len=16,
+    )
+
+
+def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        compress_ratio=4,
+    )
+
+    _run_gvr_v2_decode(top_k)
+
+    args, kwargs = runner.call_args
+    assert len(args) == 3
+    assert args[0].shape == (1, 8)
+    assert args[1].tolist() == [32]
+    assert args[2].shape == (1, 2)
+    assert kwargs == {"next_n": 1, "compress_ratio": 4, "max_seq_len": 64}
+    assert not top_k.needs_gvr_prior
+
+
+def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        compress_ratio=4,
+    )
+    scores = torch.randn(1, 8, dtype=torch.bfloat16)
+    lengths = torch.tensor([32], dtype=torch.int32)
+    output = torch.empty(1, 2, dtype=torch.int32)
+
+    top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=torch.tensor([8], dtype=torch.int32),
+        max_seq_len=16,
+    )
+
+    runner.assert_not_called()
+    decode.assert_called_once_with(
+        scores,
+        lengths,
+        output,
+        1,
+        2,
+        pre_idx=None,
+        heuristic_scratch=None,
+        compress_ratio=4,
+        radix_aux_indices=None,
+        radix_aux_logits=None,
+    )
+
+
+def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
+    """Hint-free k derives from the output width; a scratch wider than
+    top_k must be rejected before launch, not silently become the k."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2,
+        compress_ratio=4,
+    )
+    with pytest.raises(AssertionError):
+        _run_gvr_v2_decode(top_k, out_width=3)
+
+    runner.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+        ),
+    ],
+)
+def test_update_gvr_prior_from_prefill_uses_last_request_rows(device) -> None:
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device)
+    prior_indices = torch.zeros(3, 2, dtype=torch.int32, device=device)
+
+    # Production passes the device seq_lens twin so the row gather stays async.
     top_k.update_gvr_prior_from_prefill(
         prefill_indices,
-        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([2, 1], dtype=torch.int32, device=device),
         prior_indices,
         request_offset=1,
     )
 
     assert prior_indices.tolist() == [[0, 0], [2, 3], [4, 5]]
+    assert top_k.needs_gvr_prior
+
+
+def test_gvr_v2_does_not_update_prior_from_prefill() -> None:
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR_V2)
+    prior_indices = torch.zeros(1, 2, dtype=torch.int32)
+
+    top_k.update_gvr_prior_from_prefill(
+        torch.tensor([[4, 5]], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+        prior_indices,
+    )
+
+    assert prior_indices.tolist() == [[0, 0]]
+    assert not top_k.needs_gvr_prior
 
 
 def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:
@@ -317,8 +440,43 @@ def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
     assert prior_indices.tolist() == [[0, 0]]
 
 
-def test_unsupported_prefill_implementation_raises() -> None:
+def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
+    prefill = Mock()
+    # The op is registered only when CUTLASS DSL is available, so patch
+    # without requiring a pre-existing attribute.
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_indexer_topk_prefill_blackwell",
+        prefill,
+        raising=False,
+    )
     top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_RADIX)
+    scores = torch.ones(1, 1)
+    output = torch.empty(1, 1, dtype=torch.int32)
+    row_starts = torch.zeros(1, dtype=torch.int32)
+    row_ends = torch.ones(1, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=True,
+        row_starts=row_starts,
+        row_ends=row_ends,
+    )
+
+    assert result is output
+    prefill.assert_called_once_with(
+        scores,
+        row_starts,
+        row_ends,
+        output,
+        1,
+        _CUTE_DSL_PREFILL_COPY_BITS,
+    )
+
+
+def test_unsupported_prefill_implementation_raises() -> None:
+    top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
 
     with pytest.raises(NotImplementedError, match="does not support prefill Top-K"):
         top_k(
@@ -328,3 +486,33 @@ def test_unsupported_prefill_implementation_raises() -> None:
             row_starts=torch.zeros(1, dtype=torch.int32),
             row_ends=torch.ones(1, dtype=torch.int32),
         )
+
+
+def test_gvr_emission_reset_parks_reused_slots(monkeypatch) -> None:
+    """Cold-started rows must carry non-finite lines.
+
+    Slot turnover under continuous batching can hand a request another
+    request's emission state. Exactness never rides on the lines - the
+    consumer admits on the counts the emitter measures for the current
+    query - but a reset row must park onto the stock path rather than
+    inherit finite thresholds, so the closed loop restarts cleanly.
+    """
+    gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
+    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
+    prior_indices = torch.zeros(4, 2, dtype=torch.int32)
+
+    top_k.prepare_gvr_emission(4, 1 << 17, 148, prior_indices)
+    state = top_k._gvr_emission_state
+    # emulate a warmed closed loop: every slot carries finite lines
+    state.xstate[:, 0] = 1.0
+    state.seed_row[:, :3] = torch.tensor([1.0, 2.0, 3.0])
+
+    top_k.reset_gvr_emission_rows(slice(1, 3))
+    top_k.prepare_gvr_emission(4, 1 << 17, 148, prior_indices)
+
+    lines = state.seed_row[:, 0]
+    assert torch.isinf(lines[1:3]).all(), "reset rows must park on non-finite lines"
+    assert torch.isfinite(lines[0]) and torch.isfinite(lines[3]), (
+        "untouched slots must keep their closed-loop state"
+    )
