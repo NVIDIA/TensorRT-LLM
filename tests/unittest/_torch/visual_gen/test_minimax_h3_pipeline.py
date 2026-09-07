@@ -326,8 +326,10 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
         params=SimpleNamespace(
             negative_prompt=None,
             num_images_per_prompt=1,
-            image_reference=None,
-            extra_params={"last_image": "/tmp/last.png"},
+            image_reference=[
+                SimpleNamespace(content="/tmp/last.png", format="path", role="last_frame")
+            ],
+            extra_params=None,
             seed=42,
             height=768,
             width=1344,
@@ -340,7 +342,6 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
     assert pipeline.infer(request) == "output"
     assert captured["keyframes"] == [marker]
     assert captured["keyframe_anchors"] == ("last",)
-    assert pipeline.extra_param_specs["last_image"].type == "str"
 
 
 def test_infer_unwraps_the_executor_single_prompt_list() -> None:
@@ -386,10 +387,12 @@ def test_prepare_request_derives_default_canvas_from_last_only_keyframe(
     monkeypatch.setattr(h3_pipeline, "load_image", _return_last_frame)
     request = SimpleNamespace(
         params=SimpleNamespace(
-            image_reference=None,
+            image_reference=[
+                SimpleNamespace(content="/tmp/portrait.png", format="path", role="last_frame")
+            ],
             height=None,
             width=None,
-            extra_params={"last_image": "/tmp/portrait.png"},
+            extra_params=None,
         ),
         prepared_inputs={},
     )
@@ -502,6 +505,39 @@ def test_keyframes_decode_resolved_reference_bytes() -> None:
     assert anchors == ("first", "last")
     assert [image.size for image in keyframes] == [(64, 64), (64, 64)]
     assert all(image.mode == "RGB" for image in keyframes)
+
+
+def test_keyframe_reference_requires_an_explicit_role() -> None:
+    """Both roles are optional, so upstream validation cannot infer one.
+
+    There is no positional fallback: an unroled reference is rejected rather
+    than silently treated as the first frame.
+    """
+    req = SimpleNamespace(
+        prompt="a test prompt",
+        params=SimpleNamespace(
+            image_reference=[SimpleNamespace(content=_png_bytes(), format="bytes", role=None)],
+            extra_params=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="requires role"):
+        _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
+
+
+def test_keyframe_reference_rejects_a_duplicate_role() -> None:
+    payload = _png_bytes()
+    req = SimpleNamespace(
+        prompt="a test prompt",
+        params=SimpleNamespace(
+            image_reference=[
+                SimpleNamespace(content=payload, format="bytes", role="last_frame"),
+                SimpleNamespace(content=payload, format="bytes", role="last_frame"),
+            ],
+            extra_params=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="single last_frame"):
+        _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
 
 
 def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:

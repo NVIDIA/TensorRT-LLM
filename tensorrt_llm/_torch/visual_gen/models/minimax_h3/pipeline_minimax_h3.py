@@ -30,12 +30,7 @@ from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qw
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import (
-    BasePipeline,
-    ExtraParamSchema,
-    RefSlotSpec,
-    RoleSpec,
-)
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
@@ -208,19 +203,6 @@ class MiniMaxH3Pipeline(BasePipeline):
         }
 
     @property
-    def extra_param_specs(self) -> dict[str, ExtraParamSchema]:
-        return {
-            "last_image": ExtraParamSchema(
-                type="str",
-                default=None,
-                description=(
-                    "Optional last-frame path. It may be used alone or together "
-                    "with image for MiniMax-H3 FL2VA generation."
-                ),
-            )
-        }
-
-    @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(768, 1344)]
 
@@ -322,7 +304,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         self,
         req: Any,
     ) -> tuple[list[Image.Image], tuple[str, ...]]:
-        """Load first/last keyframes and preserve their temporal anchors."""
+        """Load first/last keyframes and preserve their temporal anchors.
+
+        Both keyframe roles are optional, so ``validate_visual_gen_params``
+        cannot infer one and requires callers to name it; there is deliberately
+        no positional fallback.
+        """
 
         refs = req.params.image_reference or []
         if not isinstance(refs, list):
@@ -332,45 +319,25 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "MiniMax-H3 FL2VA accepts at most two images: first frame, then last frame."
             )
 
-        # ``role`` disambiguates the two keyframe slots.  It is optional on
-        # MediaRef, so an unroled reference keeps the positional reading:
-        # first reference is the first frame, second is the last frame.
-        first_image = None
-        last_image = None
-        for position, ref in enumerate(refs):
-            role = getattr(ref, "role", None) or ("last_frame" if position else "first_frame")
+        by_role: dict[str, Any] = {}
+        for ref in refs:
+            role = getattr(ref, "role", None)
             if role not in ("first_frame", "last_frame"):
                 raise ValueError(
-                    f"MiniMax-H3 image_reference accepts role 'first_frame' or "
+                    "MiniMax-H3 image_reference requires role 'first_frame' or "
                     f"'last_frame', got {role!r}."
                 )
-            target = "first" if role == "first_frame" else "last"
-            if target == "first" and first_image is not None:
-                raise ValueError("MiniMax-H3 accepts a single first-frame image.")
-            if target == "last" and last_image is not None:
-                raise ValueError("MiniMax-H3 accepts a single last-frame image.")
-            if target == "first":
-                first_image = ref.content
-            else:
-                last_image = ref.content
-
-        extra = req.params.extra_params or {}
-        extra_last_image = extra.get("last_image")
-        if last_image is not None and extra_last_image is not None:
-            raise ValueError(
-                "Pass the last frame either as a last_frame image_reference or "
-                "extra_params.last_image, not both."
-            )
-        last_image = last_image if last_image is not None else extra_last_image
+            if role in by_role:
+                raise ValueError(f"MiniMax-H3 accepts a single {role} image.")
+            by_role[role] = ref.content
 
         keyframes = []
         keyframe_anchors = []
-        if first_image is not None:
-            keyframes.append(_load_keyframe_image(first_image))
-            keyframe_anchors.append("first")
-        if last_image is not None:
-            keyframes.append(_load_keyframe_image(last_image))
-            keyframe_anchors.append("last")
+        for role, anchor in (("first_frame", "first"), ("last_frame", "last")):
+            content = by_role.get(role)
+            if content is not None:
+                keyframes.append(_load_keyframe_image(content))
+                keyframe_anchors.append(anchor)
         return keyframes, tuple(keyframe_anchors)
 
     def prepare_request(self, req: Any) -> None:
