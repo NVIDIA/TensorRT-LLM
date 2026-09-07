@@ -179,9 +179,9 @@ How the media comes back, both inside the measured window.
 
 ### Metrics
 
-Printed after the run, and written to the result JSON by `--save-result`. Each is
-`{mean, median, std, min, max, percentiles}` over the run's requests — **one sample per
-request**. A series nothing reported is `null`.
+Written to the result JSON by `--save-result`. Each is `{mean, median, std, min, max,
+percentiles}` over the run's requests — **one sample per request**. A series nothing reported
+is `null`. The run prints the summary scalars and a table of `e2e_latency` and `gen_latency`.
 
 #### Client-side
 
@@ -227,8 +227,9 @@ gen_latency = server_gen  + network + client_poll_interval
 e2e_latency = gen_latency + server_media_encode + client_fetch_result
 ```
 
-`gen_latency`, `e2e_latency` and `server_gen` are reported; the other terms name spans
-nothing measures on its own, and their prefix says which side spends them.
+`e2e_latency` and `gen_latency` are the printed metrics and `server_gen` is a
+`--save-detailed` timing; the other terms name spans nothing measures on its own, and their
+prefix says which side spends them.
 
 Under `--response-format path` the fetch returns a path rather than the bytes, so
 `e2e_latency` minus `gen_latency` is essentially `server_media_encode`.
@@ -238,7 +239,7 @@ finished within one `--poll-interval`.
 
 ### Result JSON
 
-`--save-result` writes the printed metrics plus `date`, `duration`, and `config` — the run's
+`--save-result` writes the metrics above plus `date`, `duration`, and `config` — the run's
 `num_requests`, `num_gpus`, `max_concurrency`, `request_rate`, `burstiness`, `response_format`,
 `format`, `output_media_dir` and, for video, `poll_interval`.
 
