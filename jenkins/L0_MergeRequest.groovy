@@ -507,6 +507,10 @@ def mergeWaiveList(pipeline, globalVars)
         }
         globalVars[MAINTENANCE_ENTRIES] = []
     } else {
+        if (!fileExists(maintenanceSource) &&
+            getMergeRequestChangedFileList(pipeline, globalVars).contains(MAINTENANCE_CONFIG_PATH)) {
+            error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
+        }
         def maintenanceDiff = ""
         try {
             def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
