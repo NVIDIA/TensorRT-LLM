@@ -2474,7 +2474,6 @@ def _create_kv_cache_manager(
         attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
         num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
                                        None) or num_key_value_heads)
-        sliding_window = getattr(config, 'sliding_window', None)
         head_dim_list = []
         kv_heads_list = []
         for lt in layer_types:
@@ -2490,31 +2489,20 @@ def _create_kv_cache_manager(
         head_dim = head_dim_list
         num_key_value_heads = kv_heads_list
 
-        # Set per-layer max_attention_window so V2 creates separate pool
-        # groups for sliding vs full attention layers (different page sizes).
-        # Sliding layers use the model's sliding_window; full layers use
-        # max_seq_len.  V2 uses this to evict old blocks when kv_len >
-        # window, saving memory (only ~ceil(sliding_window/page_size)
-        # blocks per sequence for sliding layers, vs the full kv_len for
-        # full attention layers).  FlashInfer's prepare() reads the
-        # currently-allocated block IDs per pool from the V2 manager,
-        # so the smaller sliding-pool block count after eviction is
-        # picked up automatically.
-        if (kv_cache_config.max_attention_window is None
-                and sliding_window is not None):
-            kv_cache_config = copy.copy(kv_cache_config)
-            kv_cache_config.max_attention_window = [
-                int(sliding_window)
-                if lt == "sliding_attention" else int(max_seq_len)
-                for lt in layer_types
-            ]
-    elif (kv_cache_config.max_attention_window is None
-          and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
-        # Same derivation for any model that publishes a mixed sliding/full
-        # `layer_types` schedule plus a single `sliding_window`: without it V2
-        # would put every layer in one full-context pool, so the bounded
-        # layers would keep blocks they can never read. A user-supplied
-        # max_attention_window always wins.
+    # Derive per-layer max_attention_window for any model that publishes a
+    # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2
+    # creates separate pool groups for sliding vs full-attention layers;
+    # otherwise every layer lands in one full-context pool and the bounded
+    # layers keep blocks they can never read.  Sliding layers get the model's
+    # `sliding_window`, full layers `max_seq_len`; V2 then evicts old blocks
+    # once kv_len exceeds the window (only ~ceil(sliding_window/page_size)
+    # blocks per sequence for sliding layers), and FlashInfer's prepare()
+    # picks up the smaller per-pool block count automatically.  Gemma4 hybrid
+    # always resolves to KVCacheManagerV2 (see _non_hybrid_kv_cache_manager_cls),
+    # so the V2 guard never excludes it.  A user-supplied max_attention_window
+    # always wins.
+    if (kv_cache_config.max_attention_window is None
+            and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
         derived_windows = _derive_layer_type_attention_windows(
             config, max_seq_len)
         if derived_windows is not None:
