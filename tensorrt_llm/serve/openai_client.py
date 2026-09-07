@@ -82,7 +82,27 @@ MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 # returned object to the type the caller asked for, so a mismatch is a type
 # error rather than an Any that silently propagates.
 class _SerializableRequest(Protocol):
-    def model_dump(self, *, mode: str = ..., exclude_unset: bool = ...) -> dict: ...
+    def model_dump(
+        self, *, mode: str = ..., exclude_unset: bool = ..., by_alias: bool = ...
+    ) -> dict: ...
+
+
+def _encode_request_body(request: _SerializableRequest) -> bytes:
+    """Encode a request forwarded to a worker, under its wire field names.
+
+    Where a field carries an alias the internal and wire names differ, and
+    the worker validates the wire name. ``schema`` is the case that bites:
+    pydantic cannot hold a field of that name, so the model declares
+    ``schema_`` aliased to ``schema``. Without ``by_alias`` a Responses
+    ``text.format`` JSON schema reached the worker as ``schema_``, every
+    member of the format union failed validation, and the request came back
+    400 -- every structured-output call made through a disaggregated server.
+    The workers set ``populate_by_name=True``, so either spelling is accepted;
+    the alias is the one that is correct on the wire.
+    """
+    return _msgpack_encoder.encode(
+        request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+    )
 
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
@@ -253,7 +273,7 @@ class OpenAIHttpClient(OpenAIClient):
         # same way -- hence the same msgpack transport as _send_request. The
         # worker decodes it because _MsgspecRoute is the app's route_class, so
         # it covers every route rather than just the completion ones.
-        body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+        body = _encode_request_body(request)
         headers = dict(MSGPACK_HEADERS)
         async with self._session.post(url, data=body, headers=headers) as response:
             if response.status >= 400:
@@ -373,7 +393,7 @@ class OpenAIHttpClient(OpenAIClient):
             # Serialize once on the orchestrator's single event-loop thread.
             # Content-Type stays application/json so FastAPI still routes the
             # body through Request.json(); the header picks the decoder.
-            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            body = _encode_request_body(request)
             headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"

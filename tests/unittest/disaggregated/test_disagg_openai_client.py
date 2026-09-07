@@ -28,13 +28,14 @@ from tensorrt_llm.serve.disagg_auth import (
     validate_internal_disagg_request,
     validate_subagent_affinity,
 )
-from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
     ConversationParams,
     DisaggregatedParams,
+    ResponsesRequest,
     UsageInfo,
 )
 from tensorrt_llm.serve.perf_metrics import (
@@ -1145,3 +1146,39 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
+    """`schema` must not reach a worker spelled `schema_`.
+
+    pydantic cannot hold a field called `schema` -- it shadows
+    `BaseModel.schema` -- so the model declares `schema_` with `schema` as its
+    alias. Serialising without `by_alias` sends the internal name, every
+    member of the format union fails to validate on the worker, and the
+    request comes back 400. That was 43 of 195 Responses requests in one
+    campaign round: every structured-output call the agents made.
+
+    Only disaggregated serving re-serialises a request, so only it is
+    affected. The body is decoded exactly as the worker decodes it.
+    """
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "m",
+            "input": "hi",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_output",
+                    "schema": {"type": "object"},
+                    "strict": True,
+                }
+            },
+        }
+    )
+
+    body = msgspec.msgpack.decode(_encode_request_body(request))
+
+    assert body["text"]["format"]["schema"] == {"type": "object"}
+    assert "schema_" not in body["text"]["format"]
+    # And the worker can rebuild the request from what it was sent.
+    assert ResponsesRequest.model_validate(body).text.format.schema_ == {"type": "object"}
