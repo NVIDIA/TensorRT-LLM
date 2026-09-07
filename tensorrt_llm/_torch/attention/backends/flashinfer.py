@@ -1382,15 +1382,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         ``BatchDecodeWithPagedKVCacheWrapper.plan()``, flashinfer rebuilds
         it with a per-request loop whose slice bounds are GPU scalars —
         one cudaStreamSynchronize + one scalar D2H read per generation
-        request per plan.  Instead, build the ``[num_gens, max_n]`` table
-        here with one vectorized pass over the host mirror of the active
-        pool's flat page indices (no GPU reads) and push it with a single
-        async H2D into a persistent device buffer held by ``wrappers``.
-        Under CUDA-graph metadata the buffer is allocated once at full
-        capacity width and never moves, so captured decode kernels keep
-        reading valid memory while prepare() refreshes the contents in
-        place; the eager path re-plans every step and may grow its buffer
-        geometrically.
+        request per plan.  Instead, build the active ``[num_gens, max_n]``
+        rectangle here with one vectorized pass over the host mirror of the
+        active pool's flat page indices (no GPU reads) and push it with a
+        single async H2D into a persistent device buffer held by ``wrappers``.
+        Under ordinary single-token CUDA-graph metadata, return the full
+        ``[max_num_requests, max_num_blocks_per_seq]`` buffer required by the
+        wrapper's frozen graph shape.  Batch-specific speculative and draft
+        wrappers receive only their active rows.  The graph buffer never
+        moves, so captured decode kernels keep reading valid memory while
+        prepare() refreshes its contents in place; the eager path re-plans
+        every step and may grow its buffer geometrically.
 
         Returns None when the host data (or memory for the buffer) is
         unavailable; the caller then falls back to flashinfer's own
@@ -1442,9 +1444,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # rebuild rather than failing the forward.
                 return None
             wrappers.decode_block_tables = block_tables
+        update_rows = min(
+            block_tables.size(0),
+            max(num_gens, wrappers.decode_block_table_active_rows))
+        update_width = min(block_tables.size(1),
+                           max(max_n, wrappers.decode_block_table_active_width))
         host_block_tables = wrappers.host_decode_block_tables
-        if host_block_tables is None or host_block_tables.size(1) < max_n:
-            host_width = min(max(64, 1 << (max_n - 1).bit_length()),
+        if (host_block_tables is None
+                or host_block_tables.size(1) < update_width):
+            host_width = min(max(64, 1 << (update_width - 1).bit_length()),
                              block_tables.size(1))
             host_block_tables = torch.zeros((self.max_num_requests, host_width),
                                             dtype=torch.int32,
@@ -1453,20 +1461,25 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         start = self.num_context_blocks
         decode_flat = host_paged_kv_indices.numpy()[start:start +
                                                     int(gen_num_blocks.sum())]
+        host_block_tables[:update_rows, :update_width].zero_()
         table = host_block_tables.numpy()[:num_gens, :max_n]
-        table[:] = 0
         table[np.arange(max_n)[None, :] < gen_num_blocks[:, None]] = \
             decode_flat
         # Rewriting the host buffer is safe: _plan_with_params synchronizes
         # the stream before planning, so the previous plan's H2D has
         # completed.
-        block_tables[:num_gens, :max_n].copy_(
-            host_block_tables[:num_gens, :max_n], non_blocking=True)
+        block_tables[:update_rows, :update_width].copy_(
+            host_block_tables[:update_rows, :update_width], non_blocking=True)
         # Seed the extent used by `prepare()` to clear entries if the first graph replay has fewer
         # requests or a narrower block table.
         wrappers.decode_block_table_active_rows = num_gens
         wrappers.decode_block_table_active_width = max_n
-        return block_tables[:num_gens]
+        # FlashInfer CUDA-graph wrappers freeze their batch size from the
+        # constructor buffers.  Keep that fixed shape when a later replay has
+        # fewer live requests; the padded rows above remain empty.
+        use_full_graph_batch = (self.is_cuda_graph
+                                and plan_params.num_generations == 0)
+        return block_tables if use_full_graph_batch else block_tables[:num_gens]
 
     def _clean_cached_plans(self, *, defer_plan: bool):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
@@ -1667,12 +1680,24 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                   self.page_size)
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
+        if (self.is_cuda_graph and self.num_contexts == 0
+                and self.num_generations < self.max_num_requests):
+            self._paged_kv_last_page_len[self.num_generations:self.
+                                         max_num_requests].zero_()
 
         # Ragged page table, see https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout
         # For decoding, this MUST be allocated ahead of time (for CUDA graphs).
         # Prefill is prepared here as well just for the sake of consistency.
-        paged_kv_indptr_decode = _to_int32_tensor(
-            np.concatenate([[0], np.cumsum(num_blocks[self.num_contexts:])]))
+        paged_kv_indptr_decode_host = np.concatenate(
+            [[0], np.cumsum(num_blocks[self.num_contexts:])])
+        if (self.is_cuda_graph and paged_kv_indptr_decode_host.size
+                < self.max_num_requests + 1):
+            paged_kv_indptr_decode_host = np.pad(
+                paged_kv_indptr_decode_host,
+                (0,
+                 self.max_num_requests + 1 - paged_kv_indptr_decode_host.size),
+                constant_values=paged_kv_indptr_decode_host[-1])
+        paged_kv_indptr_decode = _to_int32_tensor(paged_kv_indptr_decode_host)
         self.paged_kv_indptr_decode[:paged_kv_indptr_decode.size(0)].copy_(
             paged_kv_indptr_decode, non_blocking=True)
         # Retain the host copy: decode plans hand it to flashinfer so that
@@ -1687,9 +1712,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # This paged_kv_indptr attribute has both prefill and decode information in it.
         # It's for the append_paged_kv_cache kernel.
         if self.num_contexts == 0:
-            self.paged_kv_indptr = self.paged_kv_indptr_decode[:
-                                                               paged_kv_indptr_decode
-                                                               .size(0)]
+            # Append and position helpers operate on live requests only.  The
+            # padded host mirror is reserved for fixed-batch graph planning.
+            self.paged_kv_indptr = self.paged_kv_indptr_decode[:self.
+                                                               num_generations +
+                                                               1]
         elif self.num_generations == 0:
             self.paged_kv_indptr = self.paged_kv_indptr_prefill[:
                                                                 paged_kv_indptr_prefill
@@ -2014,16 +2041,30 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             wrappers = FlashInferWrappers(is_planned=False)
             self._plan_params_to_wrappers[plan_params] = wrappers
 
+        if self.is_cuda_graph:
+            wrapper_batch_size = (plan_params.num_generations
+                                  or self.max_num_requests)
+            prefill_qo_indptr = self.qo_indptr[:wrapper_batch_size + 1]
+            prefill_kv_indptr = self.paged_kv_indptr_prefill[
+                :wrapper_batch_size + 1]
+            prefill_last_page_len = self._paged_kv_last_page_len[
+                :wrapper_batch_size]
+        else:
+            wrapper_batch_size = self.num_generations
+            prefill_qo_indptr = self.qo_indptr
+            prefill_kv_indptr = self.paged_kv_indptr_prefill
+            prefill_last_page_len = self._paged_kv_last_page_len
+
         if wrappers.prefill_wrapper is None:
             wrappers.prefill_wrapper = \
                 flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace_buffer,
                     self.kv_layout,
                     backend=flashinfer_backend,
-                    qo_indptr_buf=self.qo_indptr,
-                    paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
+                    qo_indptr_buf=prefill_qo_indptr,
+                    paged_kv_indptr_buf=prefill_kv_indptr,
                     paged_kv_indices_buf=self._paged_kv_indices,
-                    paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                    paged_kv_last_page_len_buf=prefill_last_page_len,
                     use_cuda_graph=self.is_cuda_graph)
         prefill_wrapper = wrappers.prefill_wrapper
 
@@ -2072,9 +2113,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     self.workspace_buffer,
                     self.kv_layout,
                     use_cuda_graph=self.is_cuda_graph,
-                    paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
+                    paged_kv_indptr_buffer=self.paged_kv_indptr_decode[
+                        :wrapper_batch_size + 1],
                     paged_kv_indices_buffer=self._paged_kv_indices,
-                    paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
+                    paged_kv_last_page_len_buffer=self.
+                    _paged_kv_last_page_len[:wrapper_batch_size],
                     use_tensor_cores=use_tensor_cores or use_graph_tensor_cores
                     or flashinfer_backend == "trtllm-gen",
                     backend=flashinfer_backend
@@ -2104,9 +2147,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables = self._build_decode_block_tables(
                     plan_params, wrappers)
             decode_wrapper.plan(
-                paged_kv_indptr[:self.num_generations + 1],
+                paged_kv_indptr[:wrapper_batch_size + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
-                self.paged_kv_last_page_len[self.num_contexts:],
+                self.
+                _paged_kv_last_page_len[self.num_contexts:self.num_contexts +
+                                        wrapper_batch_size],
                 plan_params.num_heads,
                 plan_params.num_kv_heads,
                 plan_params.head_dim,

@@ -2718,6 +2718,8 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         reserved_page_counts: list[int] | None = None,
         max_pages: int = 64,
         manager_batch_size: int | None = None,
+        graph_batch_size: int | None = None,
+        query_len_per_req: int = 1,
     ) -> tuple[
         "KVCacheManagerV2",
         list["FlashInferAttention"],
@@ -2732,6 +2734,8 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             reserved_page_counts = initial_page_counts
         if manager_batch_size is None:
             manager_batch_size = batch_size
+        if graph_batch_size is None:
+            graph_batch_size = batch_size
 
         config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
         kv_cache_manager = self._get_kv_cache_manager(
@@ -2747,7 +2751,8 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         requests = kv_cache_manager.add_dummy_requests(
             request_ids,
             token_nums=[
-                (count - 1) * _TRTLLM_GEN_TOKENS_PER_BLOCK + 1 for count in reserved_page_counts
+                (count - 1) * _TRTLLM_GEN_TOKENS_PER_BLOCK + query_len_per_req
+                for count in reserved_page_counts
             ],
         )
         if requests is None:
@@ -2775,7 +2780,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
             queries.append(
                 torch.randn(
-                    batch_size,
+                    batch_size * query_len_per_req,
                     config.num_attention_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
@@ -2783,7 +2788,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
             keys.append(
                 torch.randn(
-                    batch_size,
+                    batch_size * query_len_per_req,
                     config.num_key_value_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
@@ -2791,7 +2796,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
             values.append(
                 torch.randn(
-                    batch_size,
+                    batch_size * query_len_per_req,
                     config.num_key_value_heads * head_dim,
                     dtype=config.torch_dtype,
                     device="cuda",
@@ -2802,7 +2807,9 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             self.assertIsNotNone(kv_buffer)
             torch.nn.init.normal_(kv_buffer)
 
-        seq_lens = torch.ones(batch_size, dtype=torch.int)
+        seq_lens = torch.full(
+            (batch_size,), query_len_per_req, dtype=torch.int
+        )
         metadata = FlashInferAttentionMetadata(
             seq_lens=seq_lens,
             num_contexts=0,
@@ -2816,8 +2823,8 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             workspace_buffer=torch.empty(
                 _FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"
             ),
-            max_num_requests=batch_size,
-            max_num_tokens=batch_size,
+            max_num_requests=graph_batch_size,
+            max_num_tokens=graph_batch_size * query_len_per_req,
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
         )
@@ -2954,6 +2961,29 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 )
                 self.assertEqual(wrappers.decode_block_table_active_rows, len(new_page_counts))
                 self.assertEqual(wrappers.decode_block_table_active_width, max(new_page_counts))
+
+    @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_cuda_graph_trtllm_gen_multi_token_uses_active_batch_shape(self) -> None:
+        """Batch-specific multi-token wrappers do not include empty graph rows."""
+        _, _, metadata, _, _, _ = self._make_trtllm_gen_decode_case(
+            [2, 2],
+            manager_batch_size=4,
+            graph_batch_size=4,
+            query_len_per_req=2,
+        )
+
+        for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+            with self.subTest(head_dim=plan_params.head_dim):
+                self.assertEqual(plan_params.q_len_per_req, 2)
+                self.assertEqual(plan_params.num_generations, 2)
+                self.assertEqual(wrappers.prefill_wrapper._fixed_batch_size, 2)
+                self.assertEqual(wrappers.decode_wrapper._fixed_batch_size, 2)
+                self.assertEqual(wrappers.decode_wrapper._batch_size, 2)
+                self.assertEqual(wrappers.decode_wrapper._block_tables.size(0), 2)
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()

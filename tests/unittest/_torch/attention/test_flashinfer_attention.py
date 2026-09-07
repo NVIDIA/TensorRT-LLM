@@ -1307,6 +1307,27 @@ class TestFlashInferAttention(unittest.TestCase):
 
         graph.replay()
 
+        if batch_size > 1:
+            active_batch_size = batch_size // 2
+            # Keep the captured buffers at graph capacity while refreshing
+            # FA2 plans from a smaller active request set.
+            attn_metadata_cuda_graph._seq_lens = torch.ones(
+                (active_batch_size,), dtype=torch.int
+            )
+            attn_metadata_cuda_graph.on_update()
+            attn_metadata_cuda_graph.request_ids = request_ids[:active_batch_size]
+            attn_metadata_cuda_graph.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=refreshed_past_seen_tokens[
+                    :active_batch_size
+                ],
+            )
+            attn_metadata_cuda_graph.prepare()
+
+            for wrappers in attn_metadata_cuda_graph._plan_params_to_wrappers.values():
+                self.assertEqual(wrappers.decode_wrapper._fixed_batch_size, batch_size)
+                self.assertEqual(wrappers.decode_wrapper._batch_size, batch_size)
+
         for result_actual, result_ref in zip(results_actual, results_ref):
             torch.testing.assert_close(result_actual,
                                        result_ref,
