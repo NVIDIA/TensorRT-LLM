@@ -651,10 +651,11 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 }
 
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-    typename InputT = float>
+    typename InputT = float, bool useRaggedKvLens = false>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
-    int* outIndices, int stride0, int stride1, int const topK, int next_n, int compressRatio,
-    float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr)
+    int* outIndices, int stride0, int stride1, int numColumns, int const topK, int next_n, int compressRatio,
+    float* outLogits = nullptr, int const numBlocksToMerge = 0, int const* indices = nullptr,
+    int const* rowKvLens = nullptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -664,9 +665,43 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
 
     // The range of logits within the row.
     int rowStart = 0;
-    int seq_len = seqLens[rowIdx / next_n];
-    int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
-    int rowEnd = actual_kv_len / compressRatio;
+    int rowEnd = 0;
+    // The merge kernel consumes only the bounded partial Top-K workspace. It
+    // must not reinterpret the original request-indexed sequence metadata.
+    if constexpr (mergeBlocks)
+    {
+        rowEnd = numBlocksToMerge * topK;
+    }
+    // Two ways to learn how far back this query row may attend.
+    //
+    // Uniform (rowKvLens == nullptr): every request contributes exactly next_n
+    // rows, so the request index and the row's offset inside its verify window
+    // both fall out of integer division, and the causal extent is the request's
+    // sequence length walked back to this offset.
+    //
+    // Ragged (rowKvLens != nullptr): requests contribute different numbers of
+    // rows, so neither rowIdx / next_n nor rowIdx % next_n means anything. The
+    // caller precomputes the extent per row -- it is the only quantity this
+    // kernel ever derived from next_n, which is why one array is enough.
+    else if constexpr (useRaggedKvLens)
+    {
+        int const actualKvLen = rowKvLens[rowIdx];
+        int const compressedKvLen = actualKvLen / compressRatio;
+        // rowKvLens is device-produced and may change between graph replays,
+        // so a host-side value check would synchronize the hot path and bake
+        // stale values into capture. Validate at the point of use instead. An
+        // invalid extent becomes an empty row: topKPerRowJob writes -1 (and
+        // -FLT_MAX for split-work scratch), preventing an out-of-bounds read
+        // while failing closed under eager execution and graph replay.
+        bool const validExtent = actualKvLen >= 0 && compressedKvLen <= numColumns;
+        rowEnd = validExtent ? compressedKvLen : 0;
+    }
+    else
+    {
+        int seq_len = seqLens[rowIdx / next_n];
+        int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+        rowEnd = actual_kv_len / compressRatio;
+    }
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -683,7 +718,6 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     }
     else if constexpr (mergeBlocks)
     {
-        rowEnd = numBlocksToMerge * topK;
         indices += static_cast<int64_t>(rowIdx) * numBlocksToMerge * topK;
         outIndices += static_cast<int64_t>(rowIdx) * topK;
     }
@@ -890,9 +924,17 @@ int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitW
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, int const compressRatio, cudaStream_t const stream)
+    int const preIdxCount, float* heuristicScratch, int const compressRatio, int const* rowKvLens,
+    cudaStream_t const stream)
 {
     constexpr int kNumThreadsPerBlock = 512;
+    // GVR consumes previous-step Top-K hints indexed by request, which it also
+    // recovers from next_n. Ragged batches therefore cannot take that path; the
+    // caller is expected to have disabled the hint, and this makes the
+    // requirement explicit rather than letting a stale preIdx through.
+    TLLM_CHECK_WITH_INFO(rowKvLens == nullptr || preIdx == nullptr,
+        "indexer TopK decode: ragged rowKvLens is incompatible "
+        "with the GVR preIdx hint");
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
     // ========================================================================
@@ -977,7 +1019,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         if (sDebug)
         {
             fprintf(stderr,
-                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
+                "[Scheme X] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d "
+                "kBsLarge=%d kSeqSmall=%d smCount=%d "
                 "L2=%dMB -> %s path%s\n",
                 numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, bounds.smCount,
                 bounds.l2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
@@ -1004,8 +1047,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         // Single block per row. Below kSortingAlgorithmThreshold use insertion sort,
         // above use the histogram-radix path.
         bool const useRadixSort = numColumns >= kSortingAlgorithmThreshold;
-        auto* kernel_instance = useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true>
-                                             : &topKPerRowDecode<kNumThreadsPerBlock, false>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? (useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true, false, false, float, true>
+                            : &topKPerRowDecode<kNumThreadsPerBlock, false, false, false, float, true>)
+            : (useRadixSort ? &topKPerRowDecode<kNumThreadsPerBlock, true>
+                            : &topKPerRowDecode<kNumThreadsPerBlock, false>);
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -1015,13 +1061,15 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else
     {
         // Split each row across `blocksPerRow` blocks, then merge with a second pass.
-        auto* kernel_instance_part1 = &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
+        auto* kernel_instance_part1 = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, true, true, false, float, true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, true, true>;
         cudaLaunchConfig_t config_part1;
         config_part1.gridDim = dim3(numRows, blocksPerRow);
         config_part1.blockDim = kNumThreadsPerBlock;
@@ -1030,8 +1078,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part1.numAttrs = 1;
         config_part1.attrs = attrs;
 
-        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
-            next_n, compressRatio, outLogitsAux, 0, nullptr);
+        cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1,
+            numColumns, topK, next_n, compressRatio, outLogitsAux, 0, nullptr, rowKvLens);
 
         constexpr int kNumThreadsPerBlockMerge = 1024;
         auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
@@ -1043,8 +1091,10 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part2.numAttrs = 1;
         config_part2.attrs = attrs;
 
+        // The merge specialization ignores request metadata and reads only the
+        // bounded partial Top-K workspace.
         cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices, blocksPerRow * topK, 1,
-            topK, next_n, 1, nullptr, blocksPerRow, outIndicesAux);
+            blocksPerRow * topK, topK, next_n, 1, nullptr, blocksPerRow, outIndicesAux, nullptr);
     }
     sync_check_cuda_error(stream);
 }
@@ -1079,10 +1129,15 @@ template <typename InputT>
 void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch, int const compressRatio,
-    cudaStream_t const stream)
+    int const* rowKvLens, cudaStream_t const stream)
 {
     static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
         "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
+    // See the fp32 entry: GVR's hint is request-indexed via next_n, so it and a
+    // ragged row map cannot both be live.
+    TLLM_CHECK_WITH_INFO(rowKvLens == nullptr || preIdx == nullptr,
+        "indexer TopK decode: ragged rowKvLens is incompatible "
+        "with the GVR preIdx hint");
 
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
@@ -1108,8 +1163,11 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     else if (numColumns < kSortingAlgorithmThreshold)
     {
         // Insertion sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT, /*useRaggedKvLens=*/true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/false, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -1122,14 +1180,17 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
         // Radix sort path — InputT propagated; histogram/sort run on float keys.
-        auto* kernel_instance = &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true,
-            /*multipleBlocksPerRow=*/false, /*mergeBlocks=*/false, InputT>;
+        auto* kernel_instance = rowKvLens != nullptr
+            ? &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT, /*useRaggedKvLens=*/true>
+            : &topKPerRowDecode<kNumThreadsPerBlock, /*useRadixSort=*/true, /*multipleBlocksPerRow=*/false,
+                /*mergeBlocks=*/false, InputT>;
 
         cudaLaunchConfig_t config;
         config.gridDim = numRows;
@@ -1142,15 +1203,18 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
-            compressRatio, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, numColumns, topK,
+            next_n, compressRatio, nullptr, 0, nullptr, rowKvLens);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(false,
-            "indexer_topk_decode bf16/fp16 path does not support numColumns >= splitWorkThreshold "
-            "(split-work path requires float aux buffers not exposed in the bf16/fp16 entry). "
-            "Got numColumns=%d splitWorkThreshold=%d. Use the fp32 entry for this regime.",
+            "indexer_topk_decode bf16/fp16 path does not support "
+            "numColumns >= splitWorkThreshold "
+            "(split-work path requires float aux buffers not "
+            "exposed in the bf16/fp16 entry). "
+            "Got numColumns=%d splitWorkThreshold=%d. Use the "
+            "fp32 entry for this regime.",
             numColumns, effectiveSplitWorkThreshold);
     }
 
@@ -1162,19 +1226,20 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, int const compressRatio, cudaStream_t const stream)
+    __nv_bfloat16* heuristicScratch, int const compressRatio, int const* rowKvLens, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
-        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
+        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, rowKvLens,
+        stream);
 }
 
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch, int const compressRatio,
-    cudaStream_t const stream)
+    int const* rowKvLens, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, rowKvLens, stream);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,

@@ -97,11 +97,14 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
-def _make_worker():
+def _make_worker(enable_confidence_scheduling=False):
     cfg = types.SimpleNamespace(
         max_draft_len=5,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-        confidence_threshold=0.5,
+        enable_confidence_scheduling=enable_confidence_scheduling,
+        enable_fused_confidence_scheduler=False,
+        confidence_sps_table_path=None,
+        confidence_sts_path=None,
     )
     from tensorrt_llm.mapping import Mapping
 
@@ -445,7 +448,11 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     target rows by their runtime width rather than the configured K+1 width."""
     worker = _make_worker()
     draft_model = _RecordingDraftModel()
-    metadata = types.SimpleNamespace(max_num_requests=2)
+    metadata = types.SimpleNamespace(
+        max_num_requests=2,
+        qo_indptr=None,
+        verify_lens=None,
+    )
     worker._lazy_init(draft_model, metadata)
 
     slots = [worker._assign_slot(1000, reset=False), worker._assign_slot(1001, reset=False)]
@@ -775,6 +782,7 @@ def _routing_config(embedded):
         draft_is_embedded_in_target=embedded,
         attention_backend="TRTLLM",
         confidence_threshold=0.5,
+        enable_confidence_scheduling=False,
         _use_shared_kv_cache=False,
         _allow_separate_draft_kv_cache=True,
     )
@@ -824,3 +832,72 @@ def test_dspark_worker_policies_come_from_the_drafter():
     # No Markov head -> the backbone logits pass through untouched.
     logits = torch.randn(2, 3, 8, device="cuda")
     assert worker._refine_block_logits(legacy, logits, {}, None) is logits
+
+
+def test_ragged_draft_gathers_each_requests_hidden_state():
+    worker = _make_worker()
+    draft_model = _RecordingDraftModel()
+    metadata = types.SimpleNamespace(
+        max_num_requests=2,
+        qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda"),
+        verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
+    )
+    worker._lazy_init(draft_model, metadata)
+    worker._batch_to_slot[:2] = torch.tensor([0, 1], device="cuda")
+    captured = torch.stack(
+        [torch.full((HIDDEN * NCAP,), float(index), device="cuda") for index in range(6)]
+    )
+    metadata.get_hidden_states = lambda _num_tokens: captured
+    accepted = torch.zeros((2, 6), dtype=torch.int32, device="cuda")
+
+    worker._draft_gen_block_batched(
+        draft_model,
+        metadata,
+        types.SimpleNamespace(num_ctx_tokens=0),
+        accepted,
+        torch.ones(2, dtype=torch.int32, device="cuda"),
+        num_contexts=0,
+        batch_size=2,
+        total_target_tokens=6,
+        position_ids=torch.arange(6, device="cuda").unsqueeze(0),
+    )
+
+    assert draft_model.forward_calls[-1]["main_hidden"][:, 0].tolist() == [0.0, 4.0]
+
+
+def test_confidence_rows_are_slot_indexed_and_fail_open():
+    worker = _make_worker(enable_confidence_scheduling=True)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    buffer = worker.staged_confidence_buffer()
+    assert buffer is not None
+    neutral = worker.confidence_row_for(12345)
+    assert neutral == worker._neutral_conf_row
+    assert neutral > worker._scratch_slot
+    assert torch.sigmoid(buffer[neutral]).min().item() > 0.999
+
+    worker._req_to_slot = {100: 5, 101: 2, 102: 7}
+    for slot in range(worker._scratch_slot):
+        buffer[slot] = float(slot)
+    rows = [worker.confidence_row_for(request_id) for request_id in (100, 101, 102)]
+    assert rows == [5, 2, 7]
+    assert buffer[rows, 0].tolist() == [5.0, 2.0, 7.0]
+
+
+def test_recycled_confidence_slot_is_reset_to_neutral():
+    worker = _make_worker(enable_confidence_scheduling=True)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+    worker._confidence_logits[: worker._scratch_slot] = -20.0
+
+    slot = worker._assign_slot(100, reset=False)
+
+    assert torch.sigmoid(worker._confidence_logits[slot]).min().item() > 0.999
+
+
+def test_confidence_state_is_absent_when_scheduling_is_disabled():
+    worker = _make_worker(enable_confidence_scheduling=False)
+    worker._lazy_init(_fake_draft_model(), _make_metadata(max_num_requests=8))
+
+    assert worker.staged_confidence_buffer() is None
+    assert worker.confidence_stamp_buffer() is None
+    assert worker.verify_planner is None

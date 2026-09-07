@@ -36,11 +36,26 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     torch::Tensor kv_lens,                               // [bsz] int32
     torch::Tensor cu_seq_lens,                           // [bsz+1] int32
     torch::Tensor cu_kv_comp,                            // [bsz+1] int32
-    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t next_n)
+    int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t next_n,
+    std::optional<torch::Tensor> const& new_tokens_per_seq)
 {
     constexpr int64_t kMinNextN = 1;
     constexpr int64_t kMaxNextN = 8;
     TORCH_CHECK(next_n >= kMinNextN && next_n <= kMaxNextN, "next_n must be in [1, 8], got ", next_n);
+
+    // Ragged batches pass the batch maximum as next_n and the real per-request
+    // counts here; the kernel then treats next_n purely as a loop bound.
+    int32_t const* new_tokens_ptr = nullptr;
+    if (new_tokens_per_seq.has_value())
+    {
+        auto const& t = new_tokens_per_seq.value();
+        TORCH_CHECK(t.is_cuda(), "new_tokens_per_seq must be a CUDA tensor");
+        TORCH_CHECK(t.is_contiguous(), "new_tokens_per_seq must be contiguous");
+        TORCH_CHECK(t.scalar_type() == torch::kInt32, "new_tokens_per_seq must be int32");
+        TORCH_CHECK(
+            t.dim() == 1 && t.size(0) >= batch_size, "new_tokens_per_seq must be 1D with at least batch_size entries");
+        new_tokens_ptr = t.data_ptr<int32_t>();
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream();
     int kv_score_eb = static_cast<int>(kv_score.element_size());
@@ -54,7 +69,7 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
         kv_lens.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(),
         static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
         static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(next_n), kv_score_eb, state_eb,
-        out_eb, stream);
+        out_eb, new_tokens_ptr, stream);
 }
 
 // Prefill kernel: bulk compression with state update
@@ -135,7 +150,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "
-        "int next_n) -> ()");
+        "int next_n, Tensor? new_tokens_per_seq=None) -> ()");
 
     m.def(
         "compressor_prefill_reduction("
