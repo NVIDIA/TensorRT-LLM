@@ -1309,7 +1309,7 @@ Write one ledger per round into this round's `analysis/` directory. Its
 exact shape:
 
 ```yaml
-version: 3
+version: 1
 source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct

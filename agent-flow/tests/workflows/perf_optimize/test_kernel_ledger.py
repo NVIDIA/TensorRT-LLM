@@ -52,7 +52,7 @@ def _row(kernel: str = "gdn_bf16_state", share: float = 60.0, **overrides) -> di
 
 def _ledger(**overrides) -> dict:
     data = {
-        "version": 3,
+        "version": kernel_ledger.LEDGER_VERSION,
         "source": "rounds/round_1/analysis/nsys_stats.txt",
         "coverage": {
             "enumerated_share_pct": 96.0,

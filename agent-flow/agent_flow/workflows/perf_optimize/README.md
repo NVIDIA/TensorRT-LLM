@@ -354,7 +354,11 @@ Fresh runs only: on resume the checkpoint wins and the flag is ignored
 with a warning. Note that a run whose `profile.kernel_coverage` contract
 is on does **not** enforce the per-kernel ledger for a reused round that
 carries none, nor for a replan-only round (neither ran ncu); every round
-the analyzer actually profiles is still bound by it.
+the analyzer actually profiles is still bound by it. A reused round that
+*did* import a ledger is held to the contract, but one this campaign
+cannot satisfy — an older schema, or `item` refs naming the source
+campaign's roadmap ids — is waived with a warning rather than aborted,
+since the plan-only round never writes a ledger a retry could repair.
 
 ## Usage
 

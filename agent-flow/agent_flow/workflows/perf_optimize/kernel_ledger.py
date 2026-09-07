@@ -38,7 +38,7 @@ could not run, ``kern_sum`` is the honest fallback — say so in
 
 Shape::
 
-    version: 3
+    version: 1
     source: rounds/round_1/analysis/nsys_analysis   # the decomposition enumerated
     coverage:
       enumerated_share_pct: 96.8    # sum of kernels[].share_pct
@@ -110,7 +110,7 @@ from typing import Any, Mapping
 
 import yaml
 
-LEDGER_VERSION = 3
+LEDGER_VERSION = 1
 LEDGER_FILENAME = "kernel_ledger.yaml"
 
 DISPOSITIONS = ("item", "dismissed")
