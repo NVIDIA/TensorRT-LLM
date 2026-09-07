@@ -251,6 +251,7 @@ void KvCache::activate()
 
 bool KvCache::resume(std::optional<CUstream> stream)
 {
+    KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
@@ -492,6 +493,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
 bool KvCache::prefetch(CacheLevel target)
 {
+    KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
@@ -530,6 +532,7 @@ bool KvCache::prefetch(CacheLevel target)
 
 void KvCache::suspend()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(_checkSanity());
@@ -571,6 +574,11 @@ void KvCache::suspend()
 
 void KvCache::close()
 {
+    // Disposal, not work -- see KvCacheManager::shutdown().
+    if (Poison::poisoned())
+    {
+        return;
+    }
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(_checkSanity());
     if (mStatus == Status::CLOSED)
@@ -605,6 +613,7 @@ void KvCache::close()
 
 KVCacheStatsDelta KvCache::commitPendingStats()
 {
+    KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
     if (!_shouldRecordStats())
     {
@@ -626,6 +635,7 @@ KVCacheStatsDelta KvCache::commitPendingStats()
 
 void KvCache::discardPendingStats()
 {
+    KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
     mPendingStats.clear();
     mManager->clearStatsDirty(id);
@@ -1046,6 +1056,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
 
 bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength)
 {
+    KVCM2_API_GUARD();
     auto const lock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
@@ -1719,6 +1730,7 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 
 void KvCache::commit(TokenSpan tokens, bool isEnd)
 {
+    KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
     if (mBeamWidth != BeamIndex{1})
@@ -1800,6 +1812,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
 void KvCache::stopCommitting()
 {
+    KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
     TLLM_CHECK_DEBUG(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
@@ -1912,6 +1925,7 @@ PlannedDropHandle::~PlannedDropHandle()
 
 std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
 {
+    KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
     if (mCommitState != CommitState::USER_STOP)
         throw LogicError("plan_committed_block_drop() requires stop_committing()");
@@ -2531,6 +2545,7 @@ std::optional<ScratchDesc> KvCache::getScratchDesc(LayerGroupId lgId) const
 
 void KvCache::setEnableSwaScratchReuse(bool enable)
 {
+    KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
     if (enable == mEnableSwaScratchReuse)
         return;
@@ -2558,6 +2573,7 @@ bool KvCache::textOnly() const noexcept
 
 void KvCache::setTextOnly(bool textOnly)
 {
+    KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
     // A text-only deployment is a hard guarantee: a request may not opt out.
     if (!textOnly && mManager->textOnly())

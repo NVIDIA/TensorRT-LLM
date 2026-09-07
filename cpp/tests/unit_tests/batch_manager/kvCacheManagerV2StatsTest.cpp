@@ -26,6 +26,7 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include "kvCacheManagerV2PoisonCheck.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -334,7 +335,7 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
         storage.excludeFromEviction(*page);
         targets.push_back({page, kDefaultBeamIndex, ordinal, lifeCycle});
     }
-    storage.batchedMigrateToGpu(targets, *cache, migrationRecorder);
+    storage.batchedMigrateToGpu(targets, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)

@@ -17,12 +17,10 @@
 
 #pragma once
 
-#include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/poison.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
 
 #include <cuda.h>
 #include <exception>
@@ -148,6 +146,60 @@ private:
     }
 };
 
+// KVCM2 detected a broken invariant and is refusing to do further work. The cache cannot be
+// recovered; the message names the original violation, not this call.
+class CorruptedError : public std::runtime_error
+{
+public:
+    explicit CorruptedError(std::string const& msg)
+        : std::runtime_error(msg)
+    {
+    }
+};
+
+// Throws CorruptedError if KVCM2 has been poisoned. Called on entry to and exit from public API
+// methods: on entry so a poisoned cache is never used, and on exit so the call that caused the
+// poisoning is the one that reports it rather than some later, unrelated call.
+inline void rejectIfPoisoned(char const* context)
+{
+    if (TLLM_UNLIKELY(Poison::poisoned()))
+    {
+        throw CorruptedError(std::string(context) + ": KV cache manager is unusable. "
+            + Poison::reason().value_or("<no reason recorded>"));
+    }
+}
+
+// Checks for poisoning again when a public API call returns, so the call that caused the damage is
+// the one that reports it rather than some later, unrelated call.
+//
+// The destructor throws, hence noexcept(false), but only on the success path: if the scope is
+// being unwound by another exception, that exception is the more informative one and is left to
+// propagate. Only ever use this as a local in a function that is not noexcept.
+class PoisonExitCheck
+{
+public:
+    explicit PoisonExitCheck(char const* context) noexcept
+        : mContext(context)
+        , mUncaught(std::uncaught_exceptions())
+    {
+    }
+
+    PoisonExitCheck(PoisonExitCheck const&) = delete;
+    PoisonExitCheck& operator=(PoisonExitCheck const&) = delete;
+
+    ~PoisonExitCheck() noexcept(false)
+    {
+        if (std::uncaught_exceptions() == mUncaught)
+        {
+            rejectIfPoisoned(mContext);
+        }
+    }
+
+private:
+    char const* mContext;
+    int mUncaught;
+};
+
 // A resource (e.g., a page lock) is still in use.
 class ResourceBusyError : public std::runtime_error
 {
@@ -201,6 +253,19 @@ inline void cuCheck(CUresult result)
 
 // Runs cleanup that must not throw. On failure, or if KVCM2 is already poisoned, the callable is
 // abandoned and the cache is marked unusable. Variadic so the callable may contain commas.
+// Rejects the call if KVCM2 has been poisoned. For public API entry points.
+#define KVCM2_REJECT_IF_POISONED()                                                                                     \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::rejectIfPoisoned(__PRETTY_FUNCTION__)
+
+// As above, and checks again when the call returns normally. For the entry points that do enough
+// work to poison the cache themselves.
+#define KVCM2_API_GUARD()                                                                                              \
+    KVCM2_REJECT_IF_POISONED();                                                                                        \
+    ::tensorrt_llm::batch_manager::kv_cache_manager_v2::PoisonExitCheck kvcm2PoisonExitCheck_                          \
+    {                                                                                                                  \
+        __PRETTY_FUNCTION__                                                                                            \
+    }
+
 #define KVCM2_POISON_ON_EXCEPT(...)                                                                                    \
     ::tensorrt_llm::batch_manager::kv_cache_manager_v2::poisonOnExcept(__PRETTY_FUNCTION__, __VA_ARGS__)
 

@@ -117,9 +117,7 @@ public:
 
     void shutdown();
 
-    // Number of constructed, not-yet-destroyed managers in this process. Poison::clear() is only
-    // safe when this is zero: a poisoned manager skipped its cleanup, so clearing the latch under
-    // one would re-enable a cache whose structures are known to be inconsistent.
+    // Number of constructed, not-yet-destroyed managers in this process.
     [[nodiscard]] static uint32_t numLiveManagers() noexcept;
 
     // Clear all reusable (committed) blocks from the radix tree.

@@ -18,7 +18,6 @@
 #pragma once
 
 #include <atomic>
-#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -36,9 +35,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // The latch is process-wide because the objects that detect violations — Slot, SlotAllocator,
 // the singleton pools — have no route back to an owning manager.
 //
-// Clearing is deliberately a separate, unconditional operation: whether it is safe to clear is a
-// question about live managers, which this class knows nothing about. The caller decides — see
-// KvCacheManager::numLiveManagers().
+// Clearing is reachable only through takePoison(), declared below the class. Whether it is safe
+// to clear is a question about live managers, which this class deliberately knows nothing about —
+// hence the friendship rather than a check here.
 class Poison
 {
 public:
@@ -54,12 +53,19 @@ public:
     // The first recorded violation, or nullopt. Never clears, so it is safe to poll.
     [[nodiscard]] static std::optional<std::string> reason();
 
-    // Drops the latch and the recorded reason. Only safe once nothing that skipped its cleanup
-    // is still reachable; callers gate this on there being no live manager.
+private:
+    // Drops the latch and the recorded reason. Private because it is only safe once nothing that
+    // skipped its cleanup is still reachable; takePoison() enforces that.
+    friend std::optional<std::string> takePoison() noexcept;
     static void clear() noexcept;
 
-private:
     static std::atomic<bool> sPoisoned;
 };
+
+// Reports the recorded violation and clears the latch, but only once no manager is alive: such a
+// manager skipped its own cleanup when it was poisoned, so re-enabling it would resume work on
+// structures known to be inconsistent. The reason is returned either way; when it cannot be
+// cleared the latch stays set, so a following Poison::reason() still reports it.
+std::optional<std::string> takePoison() noexcept;
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
