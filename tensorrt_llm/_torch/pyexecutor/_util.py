@@ -2440,10 +2440,9 @@ def should_enable_disagg_adp_overlap_headroom(
         cache_transceiver_config: Optional[CacheTransceiverConfig],
         disable_overlap_scheduler: bool) -> bool:
     """Gate extra sequence slots to non-PP disaggregated attention-DP."""
-    is_disagg = (cache_transceiver_config is not None
-                 and cache_transceiver_config.backend is not None)
-    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
-            and not disable_overlap_scheduler)
+    return (mapping.enable_attention_dp
+            and is_disagg_enabled(cache_transceiver_config)
+            and not mapping.has_pp() and not disable_overlap_scheduler)
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
