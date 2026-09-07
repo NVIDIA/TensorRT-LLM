@@ -793,7 +793,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
+    [("VANILLA", True), ("FA4", False), ("TRTLLM", False), ("CUTEDSL", False)],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
@@ -859,6 +859,22 @@ def test_attention_backends_match_vanilla(backend: str) -> None:
     torch.testing.assert_close(
         outputs[backend].audio_sample, outputs["VANILLA"].audio_sample, rtol=0, atol=0
     )
+
+
+def test_excluded_modules_lose_their_quant_config() -> None:
+    """An excluded Linear must not keep a quantized config.
+
+    Otherwise it builds quantized buffers while the loader hands it a
+    high-precision weight.
+    """
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    quant_config.exclude_modules = ["*audio_proj_in*"]
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(quant_config=quant_config, dynamic_weight_quant=True)
+    )
+
+    assert model.audio_proj_in.quant_config.quant_algo is None
+    assert model.proj_in.quant_config.quant_algo == QuantAlgo.FP8
 
 
 def test_released_checkpoint_mixed_dtype_contract() -> None:

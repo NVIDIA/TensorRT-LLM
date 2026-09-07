@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 MINIMAX_H3_MODALITY_NUM = 3
@@ -279,6 +280,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             dtype=model_config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -362,6 +364,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             dtype=model_config.torch_dtype,
             config=model_config,
             layer_idx=layer_idx,
+            reduce_output=model_config.mapping.tp_size > 1,
         )
         self.adaln_proj = MiniMaxH3AdaLayerNormModulation(
             time_embed_dim=time_embed_dim,
@@ -420,11 +423,14 @@ _DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.FP8, QuantAlgo.NVFP4})
 _FORCE_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.NVFP4})
 
 
-# Only the vanilla and FA4 attention backends honour ``key_padding_mask``.  The
-# TRTLLM and CUTEDSL backends accept it through ``**kwargs`` and silently drop
-# it, which would corrupt results rather than fail, so padded packed sequences
-# have to be rejected up front.
-_KEY_PADDING_MASK_BACKENDS = frozenset({"VANILLA", "FA4"})
+# Only the vanilla backend can express this model's padding.  TRTLLM and CUTEDSL
+# accept ``key_padding_mask`` through ``**kwargs`` and silently drop it.  FA4
+# accepts it but reduces it to ``seqused_k = mask.sum(dim=1)``, which assumes the
+# valid positions form a prefix; MiniMax-H3 pads text rows, which sit at the
+# start of the packed sequence, so its valid set is never a prefix and FA4 would
+# keep the pads while dropping real media rows.  Either way the result would be
+# wrong rather than loud, so padded sequences are rejected up front.
+_KEY_PADDING_MASK_BACKENDS = frozenset({"VANILLA"})
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -580,6 +586,27 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self.audio_proj_out = Linear(
             hidden_size, audio_in_channels, bias=True, **fp32_linear_kwargs
         )
+
+        self.apply_quant_config_exclude_modules()
+
+    def apply_quant_config_exclude_modules(self) -> None:
+        """Drop quantization from Linears the quant config excludes.
+
+        Every Linear is constructed with the model-wide ``quant_config``, so
+        without this an excluded module still builds quantized buffers while
+        ``DynamicLinearWeightLoader`` hands it a high-precision weight -- an FP8
+        buffer left at its default scale of 1.0, or an NVFP4 shape mismatch.
+        """
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                if quant_config.is_module_excluded_from_quantization(name):
+                    if getattr(module, "quant_config", None) is not None:
+                        module.quant_config = no_quant_config
 
     @property
     def device(self) -> torch.device:

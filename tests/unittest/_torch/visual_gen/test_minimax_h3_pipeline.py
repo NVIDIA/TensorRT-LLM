@@ -200,6 +200,7 @@ def test_pipeline_keeps_torch_compile_enabled(
             mapping=SimpleNamespace(world_size=1),
             attention=SimpleNamespace(backend="VANILLA"),
             cache=None,
+            cpu_offload_config=SimpleNamespace(enable=False),
             cuda_graph=SimpleNamespace(enable=False),
             torch_compile=torch_compile,
         )
@@ -464,3 +465,54 @@ def test_denoise_step_rejects_unusable_velocity(velocity: torch.Tensor, match: s
 
 def test_denoise_step_accepts_a_normal_velocity() -> None:
     h3_pipeline._check_denoise_step(torch.randn(1, 4, 2), "video", 3)
+
+
+def _png_bytes(color: tuple[int, int, int] = (10, 20, 30)) -> bytes:
+    """A real PNG payload, matching what prepare_reference_slots hands a worker."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (64, 64), color).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_keyframes_decode_resolved_reference_bytes() -> None:
+    """References reach the worker as bytes, not paths.
+
+    ``prepare_reference_slots`` rewrites every reference to ``format="bytes"``
+    before the request is broadcast, so decoding must not route through the
+    URL/path loader.  This deliberately does not patch ``load_image``.
+    """
+    payload = _png_bytes()
+    req = SimpleNamespace(
+        prompt="a test prompt",
+        params=SimpleNamespace(
+            image_reference=[
+                SimpleNamespace(content=payload, format="bytes", role="first_frame"),
+                SimpleNamespace(content=payload, format="bytes", role="last_frame"),
+            ],
+            extra_params=None,
+        ),
+    )
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    keyframes, anchors = pipeline._load_request_keyframes(req)
+
+    assert anchors == ("first", "last")
+    assert [image.size for image in keyframes] == [(64, 64), (64, 64)]
+    assert all(image.mode == "RGB" for image in keyframes)
+
+
+def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:
+    req = SimpleNamespace(
+        prompt="a test prompt",
+        params=SimpleNamespace(
+            image_reference=[
+                SimpleNamespace(content=_png_bytes(), format="bytes", role="reference")
+            ],
+            extra_params=None,
+        ),
+    )
+    with pytest.raises(ValueError, match="first_frame"):
+        _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)

@@ -18,6 +18,7 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA checkpoints."""
 
 import time
+from io import BytesIO
 from typing import Any, Optional
 
 import numpy as np
@@ -74,12 +75,28 @@ def _component_skipped(
     return component in skip_components or component.value in skip_components
 
 
-# Every one of these reproduces VANILLA bit-for-bit on the packed MiniMax-H3
-# layout (max |diff| = 0 on sm_100, the architecture this build targets); see
-# test_attention_backends_match_vanilla.  Measured on sm_89 the TRTLLM result
-# diverges, but that is an artifact of running outside the targeted
-# architectures rather than a property of the model.
+# All four backends produce sound output on sm_100, the architecture this build
+# targets.  test_attention_backends_match_vanilla pins them bit-identical, but
+# only on a 1-layer model over a 4-row packed sequence; a full 50-layer bf16 run
+# differs slightly because kernel reduction order does.  Measured on sm_89 the
+# TRTLLM result diverges badly, which is an artifact of running outside the
+# targeted architectures rather than a property of the model.
 _VALIDATED_ATTENTION_BACKENDS = frozenset({"VANILLA", "FA4", "TRTLLM", "CUTEDSL"})
+
+
+def _load_keyframe_image(content: Any) -> Image.Image:
+    """Decode one keyframe reference into RGB.
+
+    ``prepare_reference_slots`` resolves every reference to raw bytes before the
+    request reaches a worker, so bytes are the canonical form here; ``load_image``
+    would try to ``urlparse`` them.  Strings and PIL images are still accepted so
+    the pipeline stays usable when driven directly.
+    """
+    if isinstance(content, Image.Image):
+        return content.convert("RGB")
+    if isinstance(content, (bytes, bytearray, memoryview)):
+        return Image.open(BytesIO(bytes(content))).convert("RGB")
+    return load_image(content, format="pil")
 
 
 def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
@@ -150,6 +167,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         if pipeline_config.cache is not None:
             raise NotImplementedError(
                 "TeaCache and Cache-DiT are not quality-validated for MiniMax-H3."
+            )
+        if getattr(pipeline_config.cpu_offload_config, "enable", False):
+            raise NotImplementedError(
+                "MiniMax-H3 does not implement CPU offloading; the pipeline never "
+                "enters the offload context, so staged components would be used "
+                "directly on the wrong device."
             )
         if pipeline_config.cuda_graph.enable:
             raise NotImplementedError(
@@ -316,6 +339,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         last_image = None
         for position, ref in enumerate(refs):
             role = getattr(ref, "role", None) or ("last_frame" if position else "first_frame")
+            if role not in ("first_frame", "last_frame"):
+                raise ValueError(
+                    f"MiniMax-H3 image_reference accepts role 'first_frame' or "
+                    f"'last_frame', got {role!r}."
+                )
             target = "first" if role == "first_frame" else "last"
             if target == "first" and first_image is not None:
                 raise ValueError("MiniMax-H3 accepts a single first-frame image.")
@@ -338,10 +366,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes = []
         keyframe_anchors = []
         if first_image is not None:
-            keyframes.append(load_image(first_image, format="pil"))
+            keyframes.append(_load_keyframe_image(first_image))
             keyframe_anchors.append("first")
         if last_image is not None:
-            keyframes.append(load_image(last_image, format="pil"))
+            keyframes.append(_load_keyframe_image(last_image))
             keyframe_anchors.append("last")
         return keyframes, tuple(keyframe_anchors)
 
