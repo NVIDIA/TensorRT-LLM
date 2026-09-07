@@ -223,8 +223,9 @@ class PeriodicJUnitXML:
         # save unfinished test nodeid to output-dir/unfinished_test.txt
         if self.save_unfinished_test and report.when == "setup":
             try:
-                # Create directory if it doesn't exist
-                os.makedirs(output_dir, exist_ok=True)
+                # Create the directory actually being written to, not output_dir --
+                # they differ when self.unfinished_test_path redirects elsewhere.
+                os.makedirs(os.path.dirname(unfinished_test_path), exist_ok=True)
                 with open(unfinished_test_path, "a", encoding="utf-8") as f:
                     f.write(report.nodeid + "\n")
             except Exception as e:
