@@ -4060,8 +4060,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"State-index batch size {n} exceeds max_batch_size "
             f"{self._host_state_indices.shape[0]}")
         self._host_state_indices.zero_()
+        base_indices = []
         if n > 0:
-            for i, req in enumerate(requests):
+            for req in requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
                     raise RuntimeError(
@@ -4072,14 +4073,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     raise RuntimeError(
                         f"Invalid SSM state block index {base_index} for "
                         f"request {req.py_request_id}")
-                self._host_state_indices[i] = base_index
+                base_indices.append(base_index)
+            # Bulk write instead of a scalar tensor store per request: this
+            # runs on the per-step critical path between graph replays, where
+            # a per-request round trip through Python tensor indexing costs
+            # several dispatches each. base_indices is a small Python list, so
+            # the torch.tensor() conversion is O(n) at C level.
+            self._host_state_indices[:n].copy_(
+                torch.tensor(base_indices,
+                             dtype=self._host_state_indices.dtype))
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
-        state_values = self._host_state_indices[:n].tolist()
-        for req, value, dummy in zip(requests, state_values, is_dummy):
+        # base_indices holds exactly what reading the host buffer back would
+        # return, so no second pass over it is needed.
+        for req, value, dummy in zip(requests, base_indices, is_dummy):
             self._request_id_to_state_index[req.py_request_id] = value
             self._request_id_to_is_dummy[req.py_request_id] = dummy
 
