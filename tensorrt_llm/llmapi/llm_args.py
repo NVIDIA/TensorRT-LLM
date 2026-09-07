@@ -5641,11 +5641,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "irrespective of confidential compute state.",
         status="prototype")
 
-    enable_fast_sampler: bool = Field(
+    enable_in_graph_sampling: bool = Field(
         default=False,
-        description="Opt-in CUDA graph sampler fast path: capture part of the "
+        description="Opt-in in-graph sampling: capture part of the "
         "sampling work into the model's CUDA graph and run it there, instead "
-        "of eagerly after the forward. Batches whose sampling cannot be "
+        "of eagerly after the forward. The sampler itself is unchanged; only "
+        "where its work runs differs. Batches whose sampling cannot be "
         "captured are unaffected and keep the eager path. This captures an "
         "additional set of CUDA graphs at startup, which makes warmup "
         "noticeably slower and costs extra memory, in exchange for lower "

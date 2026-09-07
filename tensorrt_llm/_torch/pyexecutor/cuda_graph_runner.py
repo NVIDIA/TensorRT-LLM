@@ -47,7 +47,7 @@ class KeyType(NamedTuple):
     is_all_greedy_sample: bool = True
     # Sampling tier captured into this graph. FULL means the graph carries no
     # sampling at all and the sampler runs eagerly after the forward, which is
-    # what every graph holds unless enable_fast_sampler is set; FAST means the
+    # what every graph holds unless enable_in_graph_sampling is set; FAST means the
     # sampling kernels are part of the graph. The two record different kernel
     # sequences, so they cannot share a graph.
     sample_type: SampleType = SampleType.FULL
@@ -132,7 +132,7 @@ class CUDAGraphRunnerConfig:
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
     enable_encoder_decoder_mixed_cuda_graph: bool = False
-    enable_fast_sampler: bool = False
+    enable_in_graph_sampling: bool = False
 
 
 class CUDAGraphRunner:
@@ -159,8 +159,8 @@ class CUDAGraphRunner:
         self.is_encoder_decoder = config.is_encoder_decoder
         self.enable_encoder_decoder_mixed_cuda_graph = (
             config.enable_encoder_decoder_mixed_cuda_graph)
-        self.enable_fast_sampler = config.enable_fast_sampler
-        # Set by the engine while capturing a fast-sampler tier pass.
+        self.enable_in_graph_sampling = config.enable_in_graph_sampling
+        # Set by the engine while capturing an in-graph sampling tier pass.
         self._capture_sample_type: Optional[SampleType] = None
         # Resolves a runtime batch to its tier; registered by the engine so the
         # graph runner does not need to know about the sampler.
@@ -441,7 +441,7 @@ class CUDAGraphRunner:
     ) -> SampleType:
         """Sampling tier the graph for this batch must contain.
 
-        FULL when the fast sampler is off, so the key -- and the graphs it
+        FULL when in-graph sampling is off, so the key -- and the graphs it
         selects -- match the pre-tier engine.
 
         Only resolves; the buffers the in-graph step reads are staged later, by
@@ -449,7 +449,7 @@ class CUDAGraphRunner:
         tier has to be known here because it is part of the key that decides
         which graph is replayed.
         """
-        if not self.config.enable_fast_sampler or self._sample_type_resolver is None:
+        if not self.config.enable_in_graph_sampling or self._sample_type_resolver is None:
             return SampleType.FULL
         # A promoted final-context row is a generation request in the execution
         # view but not in the batch the sampler is handed, so those steps are

@@ -468,8 +468,8 @@ class PyTorchModelEngine(ModelEngine):
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
         # overhead should not pay.
-        self.enable_fast_sampler = bool(
-            getattr(llm_args, "enable_fast_sampler", False))
+        self.enable_in_graph_sampling = bool(
+            getattr(llm_args, "enable_in_graph_sampling", False))
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
@@ -546,13 +546,13 @@ class PyTorchModelEngine(ModelEngine):
         # emit the wrong token, silently. The LM head gathers by default, but
         # the draft models of some speculation modes turn that off, so refuse
         # the fast path rather than sample a sharded row.
-        if self.enable_fast_sampler and not getattr(
+        if self.enable_in_graph_sampling and not getattr(
                 self.model.model_config, "lm_head_gather_output", True):
             logger.warning(
-                "Disabling enable_fast_sampler: this model's LM head does not "
+                "Disabling enable_in_graph_sampling: this model's LM head does not "
                 "gather its output, so the logits are sharded across tensor "
                 "parallel ranks and cannot be sampled in-graph.")
-            self.enable_fast_sampler = False
+            self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
         self._enable_scheduler_aware_adp_dummy = (
@@ -1053,7 +1053,7 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
             enable_encoder_decoder_mixed_cuda_graph=(
                 enable_encoder_decoder_mixed_cuda_graph),
-            enable_fast_sampler=self.enable_fast_sampler,
+            enable_in_graph_sampling=self.enable_in_graph_sampling,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
         self.breakable_cuda_graph_runner = None
@@ -1077,7 +1077,7 @@ class PyTorchModelEngine(ModelEngine):
         # manager the two `_util.py` hooks below install -- are passed per call.
         self._lora = LoraParamBuilder(spec_config=self.spec_config,
                                       attn_backend=self.attn_backend)
-        # Sampling tier pinned during a fast-sampler capture pass; None outside
+        # Sampling tier pinned during an in-graph sampling capture pass; None outside
         # capture, where the tier comes from the batch instead.
         self._capture_sample_type: Optional[SampleType] = None
 
@@ -1431,7 +1431,7 @@ class PyTorchModelEngine(ModelEngine):
         # exercises the non-greedy sampler, so with cuda_graph_config=None
         # flashinfer's sampling kernels would be JIT-built mid-serving.
         warmup_sampling_module()
-        if self.enable_fast_sampler:
+        if self.enable_in_graph_sampling:
             # The fast tier samples inside the captured graph via a
             # torch.compile'd op; compile it now so capture does not.
             warmup_sample_from_logits_op(self.model.config.vocab_size,
@@ -2836,12 +2836,12 @@ class PyTorchModelEngine(ModelEngine):
             _capture_variant("advanced sampling", force_non_greedy=True)
         else:
             # TorchSampler branch: FULL carries no sampling in the graph and is
-            # what every batch replays unless the fast sampler is enabled, so it
+            # what every batch replays unless in-graph sampling is enabled, so it
             # is always captured. FAST adds the in-graph sampling kernels and is
             # captured only when opted in, since it costs extra warmup time and
             # memory.
             _capture_variant("full", sample_type=SampleType.FULL)
-            if self.enable_fast_sampler:
+            if self.enable_in_graph_sampling:
                 # Give the warmup requests real non-greedy sampling params:
                 # dummies otherwise carry none, resolve to greedy, and the
                 # capture would record argmax rather than the fast tier's

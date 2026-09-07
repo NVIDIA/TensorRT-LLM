@@ -472,13 +472,13 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
-        # Opt-in fast sampler: let the engine sample inside its forward CUDA
+        # Opt-in in-graph sampling: let the engine sample inside its forward CUDA
         # graph. The sampler resolves each batch to a tier and stages the
         # buffers the in-graph step reads; the engine keys its graph cache on
         # the tier and calls back at the tail of the forward. Both hooks stay
         # unregistered (and the engine unchanged) unless the sampler implements
         # the protocol and the feature is enabled.
-        if (getattr(model_engine, "enable_fast_sampler", False)
+        if (getattr(model_engine, "enable_in_graph_sampling", False)
                 and hasattr(sampler, "resolve_in_graph_sample_type")):
             model_engine.register_sample_type_resolver(
                 sampler.resolve_in_graph_sample_type,

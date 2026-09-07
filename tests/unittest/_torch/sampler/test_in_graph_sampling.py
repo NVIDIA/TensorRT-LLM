@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tier selection for in-graph sampling (``enable_fast_sampler``).
+"""Tier selection for in-graph sampling (``enable_in_graph_sampling``).
 
 A batch may only be sampled inside the model's forward CUDA graph when nothing
 it depends on happens outside that graph. Two classes of request must therefore

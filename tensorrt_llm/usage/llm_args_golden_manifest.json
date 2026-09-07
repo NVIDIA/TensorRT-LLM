@@ -428,7 +428,7 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
-      "path": "enable_fast_sampler"
+      "path": "enable_in_graph_sampling"
     },
     {
       "allowed_values": [],
