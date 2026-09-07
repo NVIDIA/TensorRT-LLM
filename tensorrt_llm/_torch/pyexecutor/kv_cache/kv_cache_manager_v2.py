@@ -3055,17 +3055,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 pool_groups_by_window[window_size].add(pool_group_id)
         return pool_groups_by_window
 
-    def _get_and_reset_iteration_peak_block_stats(self, cache_level: CacheLevel):
-        get_peak_stats = getattr(self.impl, "get_and_reset_iteration_peak_block_stats", None)
+    def _get_and_reset_iteration_peak_block_stats_by_level(self, num_cache_levels: int):
+        """Peak block stats for every cache level, drained in one call.
+
+        The core already tracks them as a single per-level record, so there is no reason to take
+        that record apart one level at a time.
+        """
+        get_peak_stats = getattr(
+            self.impl, "get_and_reset_iteration_peak_block_stats_by_level", None
+        )
         if get_peak_stats is not None:
-            return get_peak_stats(cache_level)
+            return get_peak_stats()
         return [
-            PoolGroupPeakBlockStats(
-                available=stats.available,
-                unavailable=stats.total - stats.available,
-                evictable=stats.evictable,
-            )
-            for stats in self._get_storage_statistics(cache_level)
+            [
+                PoolGroupPeakBlockStats(
+                    available=stats.available,
+                    unavailable=stats.total - stats.available,
+                    evictable=stats.evictable,
+                )
+                for stats in self._get_storage_statistics(CacheLevel(level))
+            ]
+            for level in range(num_cache_levels)
         ]
 
     @staticmethod
@@ -3457,12 +3467,12 @@ class KVCacheManagerV2(BaseResourceManager):
         suspended_requests, resumed_requests = (
             self.impl.get_and_reset_iteration_suspend_resume_stats()
         )
-        primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
-        secondary_peak_stats_by_level = [
-            self._get_and_reset_iteration_peak_block_stats(CacheLevel(level))
-            for level in range(1, num_cache_levels)
-        ]
+        peak_stats_by_level = self._get_and_reset_iteration_peak_block_stats_by_level(
+            num_cache_levels
+        )
+        primary_peak_stats = peak_stats_by_level[GPU_LEVEL]
+        secondary_peak_stats_by_level = list(peak_stats_by_level[GPU_LEVEL + 1 :])
         (
             reuse_deltas_by_window,
             reuse_deltas_by_life_cycle,

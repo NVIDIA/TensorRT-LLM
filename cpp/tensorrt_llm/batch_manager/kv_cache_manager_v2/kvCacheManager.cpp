@@ -645,6 +645,14 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
     return peak;
 }
 
+PeakBlockStatsByCacheLevel KvCacheManager::getAndResetIterationPeakBlockStatsByLevel()
+{
+    _updateIterationPeakNumBlocks();
+    PeakBlockStatsByCacheLevel peak = mIterationPeakNumBlocksByCacheLevel;
+    _resetIterationPeakNumBlocks();
+    return peak;
+}
+
 void KvCacheManager::markStatsDirty(std::optional<RequestIdType> kvCacheId)
 {
     if (kvCacheId.has_value())

@@ -229,6 +229,9 @@ public:
     KVCacheStatsDelta getCommittedStats() const;
     IterationStatsByLifeCycle getAndResetIterationStats();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
+    // Drain every level at once. The peaks are already tracked as one per-level record, so a
+    // caller that wants all of them should not take that record apart one level at a time.
+    PeakBlockStatsByCacheLevel getAndResetIterationPeakBlockStatsByLevel();
 
     void commitSsmSnapshotIterationStats(SsmSnapshotIterationStatsByLifeCycle const& statsByLifeCycle);
     SsmSnapshotIterationStatsByLifeCycle getAndResetSsmSnapshotIterationStats();

@@ -2348,6 +2348,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager& self, int cacheLevel)
             { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
             nb::arg("cache_level"))
+        .def("get_and_reset_iteration_peak_block_stats_by_level",
+            [](kv::KvCacheManager& self)
+            {
+                nb::list result;
+                for (auto const& statsByPoolGroup : self.getAndResetIterationPeakBlockStatsByLevel())
+                {
+                    result.append(castPeakBlockStats(statsByPoolGroup));
+                }
+                return result;
+            })
         .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
         .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
         .def("get_dirty_stats_kv_cache_ids",

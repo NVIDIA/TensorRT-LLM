@@ -746,6 +746,19 @@ class KVCacheManager:
         self._reset_iteration_peak_num_blocks(cache_level)
         return peak
 
+    def get_and_reset_iteration_peak_block_stats_by_level(
+        self,
+    ) -> TypedIndexList[CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]]:
+        """Drain every level at once.
+
+        The peaks are already tracked as one per-level record, so a caller that wants all of them
+        should not take that record apart one level at a time.
+        """
+        self._update_iteration_peak_num_blocks()
+        peak = self._iteration_peak_num_blocks_by_cache_level
+        self._reset_iteration_peak_num_blocks()
+        return peak
+
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
         if kv_cache_id is not None:
             self._dirty_stats_kv_cache_ids.add(kv_cache_id)

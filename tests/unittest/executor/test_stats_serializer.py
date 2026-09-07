@@ -572,3 +572,55 @@ class TestStatsSerializer:
         assert [stats.available for stats in secondary_peak] == [4, 5]
         assert [stats.unavailable for stats in secondary_peak] == [1, 0]
         assert [stats.evictable for stats in secondary_peak] == [1, 0]
+
+    def test_v2_peak_block_stats_by_level_matches_per_level_drain(self):
+        """One by-level drain reports and resets exactly what the per-level drains would."""
+        from tensorrt_llm.runtime.kv_cache_manager_v2._common import CacheLevel
+        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache_manager import KVCacheManager
+
+        def make_manager():
+            storage = _FakePeakStorage()
+            manager = object.__new__(KVCacheManager)
+            manager._storage = storage
+            manager._radix_tree = SimpleNamespace(clear=lambda: [])
+            manager._reset_iteration_peak_num_blocks()
+            # Same gauge movement as the per-level test above: rise, then fall before drain.
+            storage.primary_stats[0].available = 5
+            storage.primary_stats[0].evictable = 3
+            storage.primary_stats[1].available = 6
+            storage.primary_stats[1].evictable = 4
+            storage.secondary_stats[0].available = 2
+            storage.secondary_stats[0].evictable = 2
+            manager._update_iteration_peak_num_blocks()
+            storage.primary_stats[0].available = 7
+            storage.primary_stats[0].evictable = 1
+            storage.secondary_stats[0].available = 4
+            storage.secondary_stats[0].evictable = 1
+            return manager
+
+        def as_tuples(stats_by_pool_group):
+            return [
+                (stats.available, stats.unavailable, stats.evictable)
+                for stats in stats_by_pool_group
+            ]
+
+        per_level = make_manager()
+        expected = [
+            as_tuples(per_level.get_and_reset_iteration_peak_block_stats(CacheLevel(level)))
+            for level in range(_FakePeakStorage.num_cache_levels)
+        ]
+        expected_after_reset = [
+            as_tuples(per_level.get_and_reset_iteration_peak_block_stats(CacheLevel(level)))
+            for level in range(_FakePeakStorage.num_cache_levels)
+        ]
+
+        by_level = make_manager()
+        assert [
+            as_tuples(stats)
+            for stats in by_level.get_and_reset_iteration_peak_block_stats_by_level()
+        ] == expected
+        # Draining every level at once must also reset every level.
+        assert [
+            as_tuples(stats)
+            for stats in by_level.get_and_reset_iteration_peak_block_stats_by_level()
+        ] == expected_after_reset

@@ -1081,7 +1081,9 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() 
     )
     manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
     manager._storage_pool_groups_by_window = lambda: {}
-    manager._get_and_reset_iteration_peak_block_stats = lambda _level: [None, None]
+    manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
+        [None, None] for _ in range(num_levels)
+    ]
     manager._get_storage_statistics = lambda _level: [object(), object()]
     manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
 
