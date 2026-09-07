@@ -45,12 +45,14 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 
 
 class QuantAttentionConfig(StrictBaseModel):
-    """Attention quantization recipe (TRTLLM / CUTEDSL backends).
+    """Attention quantization recipe (TRTLLM / FLASHINFER / CUTEDSL backends).
 
     Specifies Q/K and V quantization formats and their optional block sizes.
 
-    Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
-    Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
+    Bare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is
+    backend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V
+    on SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected
+    by AttentionConfig's validator with a ValueError.
     """
 
     qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
@@ -61,10 +63,13 @@ class QuantAttentionConfig(StrictBaseModel):
             "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
         ),
     )
-    v_dtype: Literal["fp8"] = Field(
+    v_dtype: Literal["fp8", "nvfp4"] = Field(
         "fp8",
         status="prototype",
-        description="V quantization dtype. The current kernels always load V in FP8 (e4m3).",
+        description=(
+            "V quantization dtype. The current kernels always load V in FP8 (e4m3) "
+            "or block-scaled NVFP4."
+        ),
     )
     q_block_size: int = Field(
         0,
@@ -98,16 +103,16 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "FA4", "CUTEDSL"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "FLASHINFER", "FA4", "CUTEDSL"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4, CUTEDSL",
+        description=("Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FLASHINFER, FA4, CUTEDSL"),
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
         status="prototype",
         description=(
-            "Quantized-attention recipe (TRTLLM / CUTEDSL backends). "
+            "Quantized-attention recipe (TRTLLM / FLASHINFER / CUTEDSL backends). "
             "Set to a QuantAttentionConfig instance to enable quantized "
             "attention; leave as None to disable."
         ),
@@ -137,6 +142,11 @@ class AttentionConfig(StrictBaseModel):
             ("mxfp8", "fp8", (0, 0, 1)),
             ("nvfp4", "fp8", (0, 0, 0)),
             ("nvfp4", "fp8", (0, 0, 1)),
+        }
+        FLASHINFER_RECIPES = {
+            ("mxfp8", "fp8", (0, 0, 0)),
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "nvfp4", (0, 0, 0)),
         }
 
         if self.quant_attention_config is None:
@@ -171,9 +181,17 @@ class AttentionConfig(StrictBaseModel):
                     f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
                     f"{sorted(CUTEDSL_RECIPES)}."
                 )
+        elif self.backend == "FLASHINFER":
+            if recipe not in FLASHINFER_RECIPES:
+                raise ValueError(
+                    f"Unsupported quant_attention_config={self.quant_attention_config!r} "
+                    f"for backend='FLASHINFER'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(FLASHINFER_RECIPES)}."
+                )
         else:
             raise ValueError(
-                f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
+                f"quant_attention_config requires backend in ('TRTLLM', 'FLASHINFER', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
             )

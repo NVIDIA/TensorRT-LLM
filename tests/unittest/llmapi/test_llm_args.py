@@ -2382,30 +2382,39 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             PyTorchModelEngine
 
-        class FakeDist:
+        class NoExchangeDist:
+            """Fails on any collective.
 
-            def __init__(self, decisions):
-                self.decisions = decisions
+            The all-rank decision is derived from the already-gathered
+            per-rank counts, so no further exchange may be issued.
+            """
 
-            def tp_allgather(self, value, *, small_payload: bool = False):
-                del value, small_payload
-                return self.decisions
+            def __getattr__(self, name):
+                raise AssertionError(f"unexpected collective {name}")
 
         engine = object.__new__(PyTorchModelEngine)
         engine.enable_attention_dp = True
         engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
         engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
-        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+        engine.dist = NoExchangeDist()
 
+        # A peer rank holds the only context request: every rank pads.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
         all_rank_num_tokens = [1, 129, 1, 1]
-        engine.dist = FakeDist([True, True, True, True])
         assert engine._get_padding_params(1, 0,
                                           all_rank_num_tokens) == (256, True,
                                                                    [256] * 4)
 
-        engine.dist = FakeDist([True, False, True, True])
+        # No rank has a context request: nobody runs the prefill graph.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 0, 0, 0]
         assert engine._get_padding_params(
             1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+
+        # A peer exceeds the largest captured size: nobody runs it either.
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+        too_long = [1, 513, 1, 1]
+        assert engine._get_padding_params(1, 0,
+                                          too_long) == (1, False, too_long)
 
     def test_torch_compile_config_does_not_populate_legacy_capture_buckets(
             self):
