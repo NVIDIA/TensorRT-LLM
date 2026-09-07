@@ -213,7 +213,7 @@ By default, `strict=True` raises when adapter tensors cannot be matched, have un
 
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen exposes two **attention-level** quantization presets that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and can be enabled independently with any linear layer configuration.  See [VisualGen Quantized Attention](../visual-gen/features/quantized-attention.md) for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.
+In addition to linear-layer quantization, VisualGen exposes multiple backend-specific **quantized-attention** recipes that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and can be enabled independently with any linear layer configuration.  See [VisualGen Quantized Attention](../visual-gen/features/quantized-attention.md) for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.
 
 ### CUDA Graphs
 

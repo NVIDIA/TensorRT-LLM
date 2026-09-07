@@ -9,7 +9,7 @@ This page is an unindexed draft until the VisualGen documentation hub is introdu
   - [Configuration Surface](#configuration-surface)
 - [QK16PV8 (CUTEDSL)](#qk16pv8-cutedsl)
 - [SageAttention (TRTLLM)](#sageattention-trtllm)
-- [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8-nvfp4-cutedsl)
+- [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8--nvfp4-cutedsl--flashinfer)
 - [Interaction With Other Features](#interaction-with-other-features)
 
 ## Overview
@@ -47,7 +47,7 @@ Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards t
 
 ## QK16PV8 (CUTEDSL)
 
-**What it does.** Q and K stay in BF16 (or FP16), so BMM1 runs at full input precision. Only V is quantized to FP8 e4m3, so BMM2 runs on FP8 Tensor Cores.
+**What it does.** Q and K stay in BF16, so BMM1 runs at full input precision. Only V is quantized to FP8 e4m3, so BMM2 runs on FP8 Tensor Cores.
 
 **Configuration.**
 
