@@ -17,7 +17,6 @@ import json
 
 import jsonschema
 import pytest
-import torch
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate import JsonModeEval as JsonModeEvaluator
@@ -32,34 +31,9 @@ from tensorrt_llm.llmapi import (
     SchedulingParams,
 )
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.sampling_params import LogitsProcessor
 
 from ..conftest import llm_models_root, parametrize_with_ids, skip_pre_blackwell, skip_ray
-from .accuracy_core import GSM8K, JsonModeEval, LlmapiAccuracyTestHarness
-
-
-class _ForceTokenLogitsProcessor(LogitsProcessor):
-    def __init__(self, forced_token_id: int) -> None:
-        self._forced_token_id = forced_token_id
-
-    def __call__(
-        self,
-        req_id: int,
-        logits: torch.Tensor,
-        token_ids: list[list[int]],
-        stream_ptr: int | None,
-        client_id: int | None,
-    ) -> None:
-        del req_id, token_ids, client_id
-        if stream_ptr is None:
-            self._force_token(logits)
-            return
-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
-            self._force_token(logits)
-
-    def _force_token(self, logits: torch.Tensor) -> None:
-        logits.fill_(float("-inf"))
-        logits[..., self._forced_token_id] = 0
+from .accuracy_core import GSM8K, ForceTokenLogitsProcessor, JsonModeEval, LlmapiAccuracyTestHarness
 
 
 class _JsonModeGrammarEval(JsonModeEvaluator):
@@ -413,7 +387,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 max_tokens=output_length,
                 temperature=0,
                 end_id=-1,
-                logits_processor=_ForceTokenLogitsProcessor(forced_token_id),
+                logits_processor=ForceTokenLogitsProcessor(forced_token_id),
             ),
             use_tqdm=False,
         )

@@ -4022,9 +4022,9 @@ class MambaStateConfig(StrictBaseModel):
         "Snapshot the Mamba recurrent state where a request's content "
         "diverges from the prefix cache, so that later requests sharing the "
         "same prefix can reuse up to the fork instead of being truncated to "
-        "an earlier snapshot. The prompt end is always snapshotted as well. "
-        "Independent of periodic_snapshot_interval. Requires KV cache "
-        "manager V2.")
+        "an earlier snapshot. If no periodic or additional snapshot point "
+        "applies to the prompt, the prompt end is snapshotted as a fallback. "
+        "Requires KV cache manager V2.")
 
 
 class BlockReuseConfig(StrictBaseModel):

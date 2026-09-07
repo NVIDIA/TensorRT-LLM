@@ -909,9 +909,64 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(kv2.num_committed_tokens, len(prompt))
         kv2.close()
 
-    def test_planned_drop_handle(self) -> None:
+    def test_reuse_match_backoff_trims_the_tail_of_every_match(self) -> None:
+        """A pool holding state that reads D tokens ahead cannot use the last D.
+
+        Set for a one-model speculative decoding draft pool, whose KV at position
+        i is a function of tokens [0, i + D]: a match of m tokens only describes
+        the first m - D positions. Applied inside match(), so probe_reuse and the
+        claim agree and neither needs a second tree walk. Commit is untouched --
+        the blocks are stored in full; only what a later match may use shrinks.
+        """
+        tokens_per_block = 8
+        backoff = 3
+        prompt = [TokenId(i) for i in range(tokens_per_block * 4)]
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=tokens_per_block,
+                cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+                layers=[
+                    AttentionLayerConfig(
+                        layer_id=LayerId(0),
+                        buffers=[
+                            BufferConfig(role=Role.KEY, size=1024),
+                            BufferConfig(role=Role.VALUE, size=1024),
+                        ],
+                    )
+                ],
+                reuse_match_backoff=backoff,
+            )
+        )
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            kv = self.manager.create_kv_cache()
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(len(prompt), len(prompt)))
+            kv.commit(prompt)
+            self.assertEqual(kv.num_committed_tokens, len(prompt))
+            kv.close()
+        stream_holder.take_finish_event().synchronize()
+
+        # Every other test in this file runs with the default backoff of 0 and
+        # matches the full prompt, so the delta here is the backoff alone. The
+        # trim crosses a block boundary rather than stopping at one.
+        self.assertEqual(self.manager.probe_reuse(None, prompt), len(prompt) - backoff)
+
+        # A match shorter than the backoff collapses to nothing, not negative.
+        self.assertEqual(self.manager.probe_reuse(None, prompt[: backoff - 1]), 0)
+
+        # The claim agrees with the probe: same trim, no second tree walk.
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt) - backoff)
+        kv2.close()
+
+    @parameterized.expand([("backoff_0", 0), ("backoff_1", 1)])
+    def test_planned_drop_handle(self, _case: str, reuse_match_backoff: int) -> None:
         window_size = 8
-        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)
+        self.cfg = create_config(8, 16 << 20, 0, 0, 2, window_size, 0)
+        self.cfg.reuse_match_backoff = reuse_match_backoff
+        self.manager = KVCacheManager(self.cfg)
         long_tokens = [self.next_token() for _ in range(24)]
         short_tokens = long_tokens[:8]
 
@@ -935,11 +990,17 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         long_handle = plan_drop(long_tokens)
         short_handle = plan_drop(short_tokens)
-        self.assertEqual(self.manager.probe_reuse(None, short_tokens), len(short_tokens))
+        self.assertEqual(
+            self.manager.probe_reuse(None, short_tokens),
+            len(short_tokens) - reuse_match_backoff,
+        )
 
         short_handle.drop()
         self.assertEqual(self.manager.probe_reuse(None, short_tokens), 0)
-        self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
+        self.assertEqual(
+            self.manager.probe_reuse(None, long_tokens),
+            len(long_tokens) - reuse_match_backoff,
+        )
 
         long_handle.drop()
         # The SWA window is dropped, while older full-attention blocks remain reusable.
@@ -4502,7 +4563,12 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
     TOKENS_PER_BLOCK = 32
     WINDOW_SIZE = 16
 
-    def prepare_partial(self, gpu_quota: int = 64 << 20, window_size: int | None = None) -> None:
+    def prepare_partial(
+        self,
+        gpu_quota: int = 64 << 20,
+        window_size: int | None = None,
+        reuse_match_backoff: int = 0,
+    ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
         self.cfg = KVCacheManagerConfig(
@@ -4527,6 +4593,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             ],
             enable_partial_reuse=True,
             commit_min_snapshot=True,
+            reuse_match_backoff=reuse_match_backoff,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -4733,6 +4800,21 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         # historical SWA block is active. The partial SWA page must not constrain the full
         # attention lifecycle's reusable prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(boundary))
+
+    def test_reuse_backoff_rechecks_swa_coverage_at_final_endpoint(self) -> None:
+        self.prepare_partial(window_size=33, reuse_match_backoff=1)
+        base = [TokenId(i) for i in range(48)]
+        boundary = base + [TokenId(i) for i in range(1000, 1048)]
+
+        self.assertEqual(self.run_turn(base, refcheck=True), 0)
+        self.run_turn(boundary)
+        self.assertEqual(self._tail_coverage(base, self._swa_lc_id), 16)
+
+        # Backing off from 96 to 95 makes block 1's partial SWA page active, but
+        # it only covers 16 of the required 32 tokens. The maximal safe endpoint
+        # is the previously committed 48-token prefix.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=boundary), len(base))
+        self.assertEqual(self.run_turn(boundary, refcheck=True), len(base))
 
     def test_page_coverage_only_grows(self) -> None:
         self.prepare_partial()
