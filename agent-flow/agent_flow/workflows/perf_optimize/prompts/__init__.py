@@ -196,6 +196,7 @@ def build_perf_optimize_prompts(
             analyzer=DISAGG_CAMPAIGN,
             optimizer=DISAGG_CAMPAIGN,
             evaluator=DISAGG_CAMPAIGN,
+            integrator=DISAGG_CAMPAIGN,
             qa=DISAGG_CAMPAIGN,
         )
     if kernel_coverage is not None:

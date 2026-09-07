@@ -1684,10 +1684,9 @@ def test_tuning_edit_in_code_only_run_is_auto_rejected(tmp_path, fake_git):
 
     # Both attempts were auto-rejected before the evaluator; nothing was
     # accepted, so the campaign reports without a final verification.
-    # The trailing analyzer profiles: although both attempts only violated
-    # the tuning restriction in this stub, they were code-approach turns,
-    # so the orchestrator conservatively assumes ignored build output may
-    # have changed. There is no evaluator verdict for it to read.
+    # The trailing analyzer replans from the standing profile. Both rejected
+    # attempts ran in isolated worktrees, so neither changed the campaign
+    # checkout; there is no evaluator verdict for it to read.
     assert trace == [
         "benchmarker",
         "projector",
@@ -1769,8 +1768,8 @@ def test_code_edit_in_config_only_run_is_auto_rejected(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    # The trailing analyzer profiles: the disallowed checkout edit may
-    # have rebuilt a gitignored runtime artifact before it was reverted.
+    # The trailing analyzer replans from the standing profile because the
+    # rejected checkout edit was confined to an isolated worktree.
     assert trace == [
         "benchmarker",
         "projector",
@@ -2387,7 +2386,7 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
     workflow.analyzer = recorder
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        # Two items were attempted last round and all of them reverted.
+        # Two items were attempted last round and both were rejected.
         for item in ("item_1_opt-001", "item_2_opt-002"):
             (ws / "rounds" / "round_1" / item).mkdir(parents=True)
         workflow._run_analyzer(_analyzer_state(ws))
@@ -2396,11 +2395,12 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         assert "**replan only**" in message
         assert "accepted **nothing**" in message
         assert "Its 2 attempted items are" in message
-        # The stronger premise behind the mode: no code attempt could
-        # have left a rebuilt ignored artifact behind, so the standing
-        # analysis still describes the runtime.
-        assert "None was a code attempt" in message
-        assert "runtime remains the state" in message
+        # The stronger premise behind the mode: rejected attempts were
+        # isolated from the campaign state, so the standing analysis still
+        # describes the runtime.
+        assert "isolated worktree" in message
+        assert "campaign checkout and accepted tuning config remain unchanged" in message
+        assert "runtime is still the state" in message
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
@@ -2883,8 +2883,8 @@ def test_accept_survives_installed_precommit_hook(tmp_path):
 
     Regression: TRT-LLM checkouts have `pre-commit install`ed hooks that
     reformat files and exit non-zero; the orchestrator's accept commit
-    aborted mid-`_accept_attempt`, crashing the run right after the
-    evaluator's APPROVE — before the roadmap/state advanced to QA.
+    aborted while accepting the candidate, crashing the run right after
+    the evaluator's APPROVE — before the roadmap/state advanced to QA.
     """
     repo = _init_real_repo(tmp_path)
     hook = repo / ".git" / "hooks" / "pre-commit"

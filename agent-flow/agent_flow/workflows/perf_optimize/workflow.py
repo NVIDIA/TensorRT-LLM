@@ -34,7 +34,6 @@ from . import gitops, kernel_ledger, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
 from .progress import (
     EVALUATOR_DECISIONS,
-    EVALUATOR_REASON_CATEGORIES,
     INTEGRATOR_DECISIONS,
     OPTIMIZATION_STAGE,
     ProgressContext,
@@ -174,12 +173,11 @@ class PerfOptimizeWorkflow:
     optimizer with feedback, bounded by ``max_attempts_per_item`` — so
     every item keeps its own measured gain, verdict, and revert). No
     agent decides when to stop, and none decides what a round costs
-    either. A round that accepted work is re-profiled, as is one whose
-    reverted code attempt may have left gitignored build output behind.
-    Otherwise it opens **replan-only** — the analyzer re-plans from the
-    standing profile and the failed items' evidence without launching a
-    server, because the orchestrator knows the runtime has not been
-    invalidated since that profile. The loop
+    either. A round that accepted work is re-profiled. When every candidate
+    was rejected, its isolated worktree is removed without changing the
+    campaign checkout, so the next round opens **replan-only** — the analyzer
+    re-plans from the standing profile and the failed items' evidence without
+    launching a server. The loop
     runs the full round budget unless a deterministic break fires — an
     analyzer turn leaves the roadmap with no actionable pending item (a
     roadmap that runs dry *between* items earns one more round first, so
@@ -375,10 +373,8 @@ class PerfOptimizeWorkflow:
                     # Sessions are scoped to each role's unit of work: the
                     # judges (evaluator, qa) are stateless so every verdict
                     # gets fresh eyes, uninfluenced by earlier attempts' /
-                    # rounds' conclusions; the optimizer's persistent
-                    # session is additionally reset at item boundaries
-                    # (see ``_advance_after_item``); the analyzer keeps
-                    # campaign-long memory of the roadmap it authored.
+                    # rounds' conclusions; the analyzer keeps campaign-long
+                    # memory of the roadmap it authored.
                     session_mode=(
                         "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
                     ),
@@ -1503,175 +1499,7 @@ class PerfOptimizeWorkflow:
         state.stage = STAGE_ANALYZER
         self._checkpoint(state)
 
-    # ------------------------------------------------------------ accept/reject
-
-    def _attempt_uses_code(self, state: WorkflowState) -> bool:
-        """Whether the current roadmap item may rebuild ignored artifacts.
-
-        The roadmap is schema-validated before an item is dispatched, so
-        lookup failure is an inconsistent-state edge. Treat it as code
-        conservatively: one unnecessary profile is safer than re-planning
-        from traces that may no longer describe the runtime binary.
-        """
-        try:
-            roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-            item = roadmap_schema.find_item(roadmap, state.current_item_id)
-        except RoadmapError:
-            return True
-        return item is None or item.get("approach") == "code"
-
-    def _guard_reverted_code_artifacts(
-        self, state: WorkflowState, *, code_violation: bool = False
-    ) -> None:
-        """Require a profile if a reverted attempt may have rebuilt code.
-
-        ``git reset --hard`` + ``clean -fd`` restores source state but
-        intentionally preserves gitignored output. A code attempt can
-        therefore leave a rebuilt extension or JIT/AOT cache behind even
-        after rejection. Record the conservative profile decision before
-        the revert so a crash cannot lose it.
-        """
-        if state.profile_required or not (code_violation or self._attempt_uses_code(state)):
-            return
-        state.profile_required = True
-        self._checkpoint(state)
-
-    def _accept_attempt(self, state: WorkflowState, attempt_no: int, log) -> None:
-        """Evaluator APPROVEd: commit, snapshot config, advance the roadmap."""
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        gain = self._latest_evaluator_measured_gain()
-        value = self._latest_evaluator_measured_value()
-        target_metric = str(self._optimize_block()["target_metric"])
-
-        # The optimizer has already changed the live build/config by the
-        # time the evaluator approves it. Persist that the standing
-        # profile is stale *before* the commit/copy operations: a crash in
-        # either one must resume onto the profiling path, not assert that
-        # the old analysis is current.
-        state.profile_required = True
-        self._checkpoint(state)
-
-        # Config-only items leave the checkout untouched — commit only
-        # when the attempt actually changed tracked/untracked files.
-        if not gitops.worktree_clean(repo):
-            gain_str = f"{gain:+.2f}%" if gain is not None else "n/a"
-            gitops.commit_all(
-                repo,
-                f"perf-optimize: {item_id} accepted ({gain_str} {target_metric}) "
-                f"[round {state.round_index + 1}]",
-            )
-        shutil.copyfile(self.tuning_config_path, self.tuning_accepted_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="accepted",
-            attempts=attempt_no,
-            measured_gain_pct=gain,
-        )
-        if value is not None:
-            curve = self._latest_evaluator_curve()
-            if curve is None and self._curve_mode():
-                print_message(
-                    "[yellow]evaluator APPROVE carried no per-point curve — "
-                    "current_best degrades to scalar; the next gate compares "
-                    "means[/yellow]",
-                    log,
-                )
-            # ``source`` is workspace-relative per the roadmap spec (like the
-            # analyzer's ``baseline/benchmark_results.md``) — prefixing the
-            # workspace here would double up when it is later re-joined.
-            roadmap_schema.set_current_best(
-                self.roadmap_path,
-                value,
-                str((self._attempt_dir(state) / "evaluation.md").relative_to(self.workspace)),
-                curve=curve,
-            )
-        # The accept-evidence capture (when the evaluator produced one) is
-        # now the freshest trace of the accepted state.
-        self._record_nsys_capture(state, self._attempt_dir(state) / "profile")
-        print_message(
-            f"[bold green]✔ evaluator APPROVE — {item_id} accepted "
-            f"(measured {gain if gain is not None else 'n/a'}% on {target_metric})"
-            f"[/bold green]",
-            log,
-        )
-        self._advance_after_item(state, log)
-
-    def _reject_attempt(
-        self, state: WorkflowState, attempt_no: int, decision: str | None, log
-    ) -> None:
-        """Terminal outcome: revert everything and fail the item.
-
-        Reached on an explicit evaluator REJECT (the item's premise is
-        broken — no retry would help), or when a PUSH_BACK / missing
-        decision lands on the item's final attempt.
-        """
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        reason = self._latest_evaluator_reason()
-
-        # Drop the attempt's code edits and restore the last accepted
-        # tuning config, so the campaign continues from the last accepted
-        # tracked state. A code attempt may have rebuilt gitignored output;
-        # preserve that uncertainty across the revert and profile it next
-        # round instead of re-planning from stale traces.
-        self._guard_reverted_code_artifacts(state)
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="failed",
-            attempts=attempt_no,
-            measured_gain_pct=self._latest_evaluator_measured_gain(),
-        )
-        label = decision or "missing decision"
-        if decision != "REJECT":
-            label += ", retries exhausted"
-        print_message(
-            f"[bold yellow]✗ evaluator {label} — {item_id} failed after "
-            f"{attempt_no} attempt(s) ({reason or 'no reason recorded'}) — "
-            f"reverted[/bold yellow]",
-            log,
-        )
-        # The checkout is back at the last accepted state, so the round
-        # continues with the next item exactly as if this one had never
-        # been attempted.
-        self._advance_after_item(state, log)
-
-    def _pushback_attempt(
-        self, state: WorkflowState, attempt_no: int, decision: str | None, log
-    ) -> None:
-        """Evaluator PUSH_BACK (or missing decision) with retries left: revert and retry."""
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        reason = self._latest_evaluator_reason()
-
-        # Drop the attempt's edits so the retry starts from the last
-        # accepted tracked state, with the evaluator's feedback as its
-        # brief. Preserve the same ignored-build uncertainty as a terminal
-        # reject; a later retry does not prove those artifacts disappeared.
-        self._guard_reverted_code_artifacts(state)
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        roadmap_schema.apply_evaluation(
-            self.roadmap_path,
-            item_id,
-            status="in_progress",
-            attempts=attempt_no,
-        )
-        print_message(
-            f"[bold yellow]↻ evaluator {decision or 'missing'} "
-            f"({reason or 'no reason recorded'}) — retrying {item_id}[/bold yellow]",
-            log,
-        )
-        state.attempt_index += 1
-        state.stage = STAGE_OPTIMIZER
-        self._checkpoint(state)
+    # ------------------------------------------------------------ approach guard
 
     def _detect_approach_violation(self, state: WorkflowState | None = None) -> str | None:
         """Return why the attempt violates ``optimize.approaches``, or ``None``.
@@ -1702,179 +1530,17 @@ class PerfOptimizeWorkflow:
                 )
         return None
 
-    def _reject_approach_violation(
-        self, state: WorkflowState, attempt_no: int, violation: str, log
-    ) -> None:
-        """Orchestrator auto-reject: the attempt used a disallowed approach.
-
-        The deterministic counterpart of the
-        :meth:`_pushback_attempt` / :meth:`_reject_attempt` pair, applied
-        before the evaluator ever runs: revert everything, count the
-        attempt, and either retry (carrying the violation as feedback in
-        place of evaluator feedback) or fail the item.
-        """
-        repo = self._trtllm_repo_path()
-        item_id = state.current_item_id
-        # In a config-only campaign, reaching this branch means the
-        # checkout changed despite code being disallowed. In a code item,
-        # even a tuning-only violation may have rebuilt ignored output
-        # earlier in the optimizer turn. Both require a real profile.
-        self._guard_reverted_code_artifacts(
-            state, code_violation="code" not in self._allowed_approaches()
-        )
-        gitops.discard_uncommitted(repo)
-        shutil.copyfile(self.tuning_accepted_path, self.tuning_config_path)
-
-        if attempt_no >= state.max_attempts_per_item:
-            roadmap_schema.apply_evaluation(
-                self.roadmap_path,
-                item_id,
-                status="failed",
-                attempts=attempt_no,
-            )
-            print_message(
-                f"[bold yellow]✗ {item_id} failed after {attempt_no} attempt(s) "
-                f"(approach violation: {violation}) — reverted[/bold yellow]",
-                log,
-            )
-            self._advance_after_item(state, log)
-        else:
-            roadmap_schema.apply_evaluation(
-                self.roadmap_path,
-                item_id,
-                status="in_progress",
-                attempts=attempt_no,
-            )
-            print_message(
-                f"[bold yellow]↻ auto-reject without evaluation "
-                f"(approach violation: {violation}) — retrying {item_id}[/bold yellow]",
-                log,
-            )
-            state.approach_violation = violation
-            state.attempt_index += 1
-            state.stage = STAGE_OPTIMIZER
-            self._checkpoint(state)
-
-    def _advance_after_item(self, state: WorkflowState, log) -> None:
-        """Route the loop after an item's terminal outcome (accepted/failed).
-
-        In order: conclude the loop when the optional improvement target
-        is met on the roadmap ledger; on a dry roadmap spend one more
-        round re-planning against what this round measured (profiling
-        first when accepts are outstanding) unless the round budget is
-        spent; dispatch the next item while the per-round item budget has
-        room; otherwise close the round — into the next round's analyzer,
-        or into the final verification when the round budget is spent. No
-        agent decides any of this: every break is deterministic.
-
-        A dry roadmap is never the conclusion here. The campaign ends on
-        it at the top of the loop instead, where the analyzer has just
-        planned against the round's verdicts — the difference between
-        "the plan ran out" and "there is nothing left to plan".
-        """
-        # The optimizer's session is scoped to the item that just reached
-        # a terminal status: its retry attempts shared the session, but
-        # the next item starts fresh — earlier items' exploration is
-        # stale context, not useful memory. (A crash/resume gets a fresh
-        # process anyway; the reset makes in-process behavior match.)
-        self.optimizer.reset_session()
-        state.current_item_id = ""
-        state.attempt_index = 0
-        state.approach_violation = ""
-        state.item_index += 1
-
-        met, cumulative = self._target_met()
-        if met:
-            state.round_index += 1
-            state.item_index = 0
-            self._conclude_round_loop(
-                state,
-                f"target_improvement_pct reached (cumulative "
-                f"{cumulative:+.2f}% on the roadmap ledger)",
-                log,
-            )
-            return
-
-        roadmap = roadmap_schema.load_roadmap(self.roadmap_path)
-        noise_floor = float(self._optimize_block()["noise_floor_pct"])
-        item = roadmap_schema.top_pending_item(roadmap, noise_floor, self._allowed_approaches())
-        if item is None:
-            state.round_index += 1
-            state.item_index = 0
-            if state.round_index < state.max_rounds:
-                # The roadmap ran dry mid-round — against a plan the
-                # analyzer wrote before this round's measurements existed.
-                # Open one more round rather than concluding here: what
-                # ends the campaign is the break at the top of the loop,
-                # which fires on a plan made *against* those measurements.
-                #
-                # Neither shape of that round is waste. When the standing
-                # profile is stale, the build the campaign would close on
-                # has never been analyzed — because of accepts or because a
-                # reverted code attempt may have changed ignored build
-                # output — so the round profiles. Otherwise it opens
-                # replan-only: no server, no profiler, no GPU time, and the
-                # verdicts it mines are the case a REJECT makes for the item
-                # nobody planned.
-                if state.profile_required:
-                    print_message(
-                        "[dim]roadmap exhausted without a current runtime "
-                        "profile — re-profiling before closing[/dim]",
-                        log,
-                    )
-                else:
-                    print_message(
-                        "[dim]roadmap exhausted on an unchanged build — one "
-                        "replan round (no GPU time) against this round's "
-                        "verdicts before closing[/dim]",
-                        log,
-                    )
-                state.stage = STAGE_ANALYZER
-                self._checkpoint(state)
-                return
-            reason = "roadmap has no actionable pending items; round budget exhausted"
-            if state.profile_required:
-                reason += " before the potentially changed runtime could be re-profiled"
-            self._conclude_round_loop(state, reason, log)
-            return
-
-        if state.item_index < state.max_items_per_round:
-            # Same ordering as the analyzer branch: checkpoint the pick
-            # before flipping the item to ``in_progress``.
-            state.current_item_id = str(item["id"])
-            state.stage = STAGE_OPTIMIZER
-            self._checkpoint(state)
-            roadmap_schema.mark_in_progress(self.roadmap_path, item["id"])
-            print_message(
-                f"[bold cyan]→ next roadmap item ({state.item_index + 1}/"
-                f"{state.max_items_per_round} this round): {item['id']} — "
-                f"{item['title']}[/bold cyan]",
-                log,
-            )
-            return
-
-        # The round's item budget is spent with actionable items remaining.
-        state.round_index += 1
-        state.item_index = 0
-        if state.round_index >= state.max_rounds:
-            self._conclude_round_loop(state, "round budget exhausted", log)
-            return
-        state.stage = STAGE_ANALYZER
-        self._checkpoint(state)
-
     def _replan_only(self, state: WorkflowState) -> bool:
         """Whether the round about to open should re-plan instead of re-profile.
 
         True exactly when the standing profile is known to remain current:
-        nothing was accepted, no reverted code attempt could have left a
-        rebuilt gitignored artifact behind, and this campaign has produced
-        a real profile to plan from. Rejected config attempts are
-        hard-reverted (``git reset --hard`` + ``clean -fd`` + the last
-        accepted tuning config), so their runtime state is the one the
-        standing analysis already describes. What *has* changed is the
-        evidence — a batch of items now measured dead — so the round still
-        runs an analyzer turn; it just plans from the standing profile and
-        those verdicts rather than re-deriving the same traces.
+        nothing was accepted and this campaign has produced a real profile
+        to plan from. Rejected attempts run in isolated worktrees that are
+        reset and removed, so the campaign checkout and accepted config still
+        match the standing analysis. What *has* changed is the evidence — a
+        batch of items now measured dead — so the round still runs an analyzer
+        turn; it just plans from the standing profile and those verdicts
+        rather than re-deriving the same traces.
 
         Round 1 (nothing profiled yet), the ``--reuse-analysis`` import
         turn, and a resumed pre-field checkpoint (whose profile currency
@@ -2289,13 +1955,6 @@ class PerfOptimizeWorkflow:
             return None
         d = str(entry.get("decision", "")).strip().upper()
         return d if d in EVALUATOR_DECISIONS else None
-
-    def _latest_evaluator_reason(self, path: Path | None = None) -> str | None:
-        entry = latest_entry(path or self.progress_path, "evaluator")
-        if entry is None:
-            return None
-        reason = str(entry.get("reason_category", "")).strip().lower()
-        return reason if reason in EVALUATOR_REASON_CATEGORIES else None
 
     def _latest_evaluator_measured_gain(self, path: Path | None = None) -> float | None:
         entry = latest_entry(path or self.progress_path, "evaluator")
@@ -2778,12 +2437,12 @@ class PerfOptimizeWorkflow:
     def _run_replan_analyzer(self, state: WorkflowState) -> None:
         """Replan-only analyzer turn: no server, no profiler (see ``_replan_only``).
 
-        Opens after a round that accepted nothing and made no code attempt
-        capable of leaving ignored build output behind. Its config edits
-        were hard-reverted, so the standing analysis still describes the
-        runtime and re-deriving it would buy the campaign nothing. What the
-        round *did* produce is verdicts — items now measured dead — and
-        turning those into roadmap edits is this turn's whole job.
+        Opens after a round that accepted nothing. Every attempt ran in an
+        isolated worktree that was reset and removed, so the standing
+        analysis still describes the campaign runtime and re-deriving it
+        would buy the campaign nothing. What the round *did* produce is
+        verdicts — items now measured dead — and turning those into roadmap
+        edits is this turn's whole job.
         """
         round_no = state.round_index + 1
         analysis_dir = self._analysis_dir(state)
@@ -2819,11 +2478,11 @@ class PerfOptimizeWorkflow:
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
-            f"{attempted_note}, and the orchestrator hard-reverted every one "
-            f"of them (`git reset --hard` plus the last accepted tuning "
-            f"config). None was a code attempt that could leave rebuilt "
-            f"gitignored output behind, so the runtime remains the state the "
-            f"analysis in `{profiled_dir}` describes. Do **not** launch "
+            f"{attempted_note}; each ran in an isolated worktree that the "
+            f"orchestrator reset and removed. The campaign checkout and "
+            f"accepted tuning config remain unchanged, so the runtime is "
+            f"still the state the analysis in `{profiled_dir}` describes. "
+            f"Do **not** launch "
             f"`trtllm-serve`, "
             f"do **not** run nsys / ncu / the torch profiler, and do **not** "
             f"run the benchmark: a fresh profile of an unchanged build "
