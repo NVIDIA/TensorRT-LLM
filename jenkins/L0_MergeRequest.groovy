@@ -425,51 +425,6 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
 }
 
-def parseMaintenanceConfig(String content, String source)
-{
-    def entries = [:]
-    content.readLines().eachWithIndex { rawLine, index ->
-        def line = rawLine.trim()
-        if (!line || line.startsWith('#')) {
-            return
-        }
-        def fields = line.split(/\|/, 2).collect { field -> field.trim() }
-        if (fields.size() != 2 || !fields[0] || !fields[1]) {
-            error "Invalid maintenance entry at ${source}:${index + 1}; " +
-                  "expected '<stage-or-pattern> | <reason>'."
-        }
-        if (entries.containsKey(fields[0])) {
-            echo "WARNING: Duplicate maintenance pattern '${fields[0]}' at " +
-                 "${source}:${index + 1}; " +
-                 "the first entry is used."
-        } else {
-            entries[fields[0]] = [pattern: fields[0], reason: fields[1]]
-        }
-    }
-    return entries
-}
-
-def mergeMaintenanceConfig(String totContent, String currentContent, String diff)
-{
-    def effective = parseMaintenanceConfig(totContent, "target TOT")
-    def current = parseMaintenanceConfig(currentContent, "PR file")
-    def additions = parseMaintenanceConfig(diff.readLines().findAll { line ->
-        line.startsWith('+') && !line.startsWith('+++')
-    }.collect { line -> line.substring(1) }.join('\n'), "PR additions")
-    def deletions = parseMaintenanceConfig(diff.readLines().findAll { line ->
-        line.startsWith('-') && !line.startsWith('---')
-    }.collect { line -> line.substring(1) }.join('\n'), "PR deletions")
-
-    (deletions.keySet() - additions.keySet()).each { pattern -> effective.remove(pattern) }
-    additions.keySet().each { pattern ->
-        if (!current.containsKey(pattern)) {
-            error "Maintenance pattern '${pattern}' was added in the diff but is missing from the PR file."
-        }
-        effective[pattern] = current[pattern]
-    }
-    return effective.values().toList()
-}
-
 def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputFile)
 {
     if (targetCommit) {
@@ -544,19 +499,13 @@ def mergeWaiveList(pipeline, globalVars)
     def maintenanceSource = "${LLM_ROOT}/${MAINTENANCE_CONFIG_PATH}"
     def isGetTOTMaintenanceConfig = checkoutTargetBranchFile(
         targetBranch, targetBranchTOTCommit, MAINTENANCE_CONFIG_PATH, maintenanceTot)
-    def maintenanceCurrent = fileExists(maintenanceSource) ? readFile(maintenanceSource) : ""
     if (!isGetTOTMaintenanceConfig) {
-        if (!fileExists(maintenanceSource)) {
-            error "Failed to get maintenance config from the target branch or PR checkout."
-        }
         catchError(
             buildResult: 'SUCCESS',
             stageResult: 'UNSTABLE') {
-            error "Failed to get target maintenance config. " +
-                  "Fallback to the PR checkout, which may not reflect the latest target branch."
+            error "Failed to get target maintenance config. No maintenance stages will be skipped."
         }
-        globalVars[MAINTENANCE_ENTRIES] = parseMaintenanceConfig(
-            maintenanceCurrent, "PR fallback").values().toList()
+        globalVars[MAINTENANCE_ENTRIES] = []
     } else {
         def maintenanceDiff = ""
         try {
@@ -573,11 +522,17 @@ def mergeWaiveList(pipeline, globalVars)
             echo "WARNING: Failed to get maintenance config diff. " +
                  "Using target TOT entries. Error: ${e.toString()}"
         }
-        if (!fileExists(maintenanceSource) && maintenanceDiff) {
-            error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
-        }
-        globalVars[MAINTENANCE_ENTRIES] = mergeMaintenanceConfig(
-            readFile(maintenanceTot), maintenanceCurrent, maintenanceDiff)
+        writeFile file: 'diff_content.txt', text: maintenanceDiff
+        sh """
+            python3 mergeWaiveList.py \
+            --maintenance-config \
+            --cur-waive-list=${maintenanceSource} \
+            --latest-waive-list=${maintenanceTot} \
+            --diff-file=diff_content.txt \
+            --output-file=maintenance_entries.json
+        """
+        globalVars[MAINTENANCE_ENTRIES] = readJSON(
+            file: 'maintenance_entries.json', returnPojo: true)
     }
     echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
 
