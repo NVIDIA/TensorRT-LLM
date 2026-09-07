@@ -137,25 +137,55 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="rand
     }
 
 
-def _reference(inp, k_top):
-    kvf = inp["kv_cache"].reshape(inp["kv_cache"].shape[0], -1)
-    kvp = kvf[:, : PAGE * 64].reshape(-1, 64)
-    kvs = kvf[:, PAGE * 64 :].contiguous().view(torch.int32).reshape(-1)
-    k = _dequant_fp4(kvp, kvs).reshape(-1, PAGE, 128)
+def _dequant_q(inp):
     batch = inp["q_fp4"].shape[0]
-    q = _dequant_fp4(
+    return _dequant_fp4(
         inp["q_fp4"][:, 0].reshape(batch * 64, 64), inp["sf_q"][:, 0].reshape(batch * 64)
     ).view(batch, 64, 128)
-    vals = []
-    for i in range(batch):
-        length = int(inp["context_lens"][i])
-        nb = (length + PAGE - 1) // PAGE
-        kx = k[inp["block_table"][i, :nb].long()].reshape(nb * PAGE, 128)
-        s = torch.relu(q[i] @ kx.t())
-        s = (s * inp["weights"][i].unsqueeze(1)).sum(dim=0)
-        s[length:] = float("-inf")
-        vals.append(torch.topk(s, k_top).values)
-    return torch.stack(vals)
+
+
+def _row_scores(inp, i, q):
+    """fp32 reference scores of row i over its context; only its own pages are dequantized."""
+    kvf = inp["kv_cache"].reshape(inp["kv_cache"].shape[0], -1)
+    length = int(inp["context_lens"][i])
+    nb = (length + PAGE - 1) // PAGE
+    pages = inp["block_table"][i, :nb].long()
+    codes = kvf[pages, : PAGE * 64].reshape(nb * PAGE, 64)
+    sf = kvf[pages, PAGE * 64 :].contiguous().view(torch.int32).reshape(nb * PAGE)
+    kx = _dequant_fp4(codes, sf)
+    s = torch.relu(q[i] @ kx.t())
+    s = (s * inp["weights"][i].unsqueeze(1)).sum(dim=0)
+    s[length:] = float("-inf")
+    return s
+
+
+def _reference_indices(inp, k_top):
+    """Full fp32 score rows (the reference for indices, values and the fp32 boundary)."""
+    q = _dequant_q(inp)
+    return [_row_scores(inp, i, q) for i in range(inp["q_fp4"].shape[0])]
+
+
+def _check_rows(inp, indices, values, k_top, scores=None):
+    """Every row: indices in window and unique, each value is the fp32 score of its own index
+    (fp16 rounding), and the value multiset equals the exact fp32 top-K."""
+    if scores is None:
+        scores = _reference_indices(inp, k_top)
+    for i in range(indices.shape[0]):
+        row = indices[i]
+        assert int(row.min()) >= 0
+        assert int(row.max()) < int(inp["context_lens"][i])
+        assert row.unique().numel() == k_top, f"row {i}: duplicate indices"
+        own = scores[i][row.long()]
+        dp = (values[i] - own).abs()
+        assert bool((dp <= 1e-2 + 1e-3 * own.abs()).all()), (
+            f"row {i}: value does not belong to its index, max err {float(dp.max()):.4f}"
+        )
+        got, _ = torch.sort(values[i], descending=True)
+        want, _ = torch.sort(torch.topk(scores[i], k_top).values, descending=True)
+        dv = (got - want).abs()
+        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
+            f"row {i}: max value err {float(dv.max()):.4f}"
+        )
 
 
 @skip_not_sm100
@@ -180,20 +210,10 @@ def test_fused_indexer_topk_nospill(batch, n_comp, k_top, weight_mode):
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices"
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        dv = (got - want).abs()
-        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
-            f"row {i}: max value err {float(dv.max()):.4f}"
-        )
+    _check_rows(inp, indices, values, k_top)
 
 
+@skip_not_sm100
 @pytest.mark.parametrize("batch", [4, 16])
 @pytest.mark.parametrize("k_top", [512, 1024])
 def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
@@ -260,11 +280,8 @@ def test_fused_indexer_topk_nospill_cuda_graph(batch, k_top):
     graph.replay()
     torch.cuda.synchronize()
 
+    _check_rows(inp, indices, values, k_top)
     for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices after replay"
         got, _ = torch.sort(values[i], descending=True)
         want, _ = torch.sort(eager_vals[i], descending=True)
         dv = (got - want).abs()
@@ -297,19 +314,9 @@ def test_fused_indexer_topk_nospill_split(batch, n_comp, k_top, monkeypatch):
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices"
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        dv = (got - want).abs()
-        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
-            f"row {i}: max value err {float(dv.max()):.4f}"
-        )
-    _check_fp32_boundary(inp, indices, k_top)
+    scores = _reference_indices(inp, k_top)
+    _check_rows(inp, indices, values, k_top, scores)
+    _check_fp32_boundary(inp, indices, k_top, scores=scores)
 
 
 @skip_not_sm100
@@ -394,18 +401,7 @@ def test_fused_indexer_topk_nospill_long_context(batch, n_comp, k_top):
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices"
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        dv = (got - want).abs()
-        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
-            f"row {i}: max value err {float(dv.max()):.4f}"
-        )
+    _check_rows(inp, indices, values, k_top)
 
 
 @skip_not_sm100
@@ -435,18 +431,7 @@ def test_fused_indexer_topk_nospill_filtered(pattern, batch, k_top, monkeypatch)
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices"
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        dv = (got - want).abs()
-        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
-            f"row {i}: max value err {float(dv.max()):.4f}"
-        )
+    _check_rows(inp, indices, values, k_top)
 
 
 def _reference_indices(inp, k_top):
@@ -499,8 +484,9 @@ def test_fused_indexer_topk_nospill_fp32_boundary(batch, n_comp, k_top, monkeypa
     _check_fp32_boundary(inp, indices, k_top)
 
 
-def _check_fp32_boundary(inp, indices, k_top, tie_cap=2048):
-    scores = _reference_indices(inp, k_top)
+def _check_fp32_boundary(inp, indices, k_top, tie_cap=2048, scores=None):
+    if scores is None:
+        scores = _reference_indices(inp, k_top)
     for i in range(indices.shape[0]):
         s = scores[i]
         ref = torch.topk(s, k_top).indices
@@ -528,6 +514,7 @@ def _check_fp32_boundary(inp, indices, k_top, tie_cap=2048):
         )
 
 
+@skip_not_sm100
 @pytest.mark.parametrize("pattern", ["random", "monotone", "giantbin"])
 @pytest.mark.parametrize("k_top", [512, 1024])
 def test_fused_indexer_topk_nospill_fp32_boundary_filtered(pattern, k_top, monkeypatch):
@@ -619,14 +606,7 @@ def test_fused_indexer_topk_nospill_mixed_lengths(batch, split, monkeypatch):
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0 and int(row.max()) < int(lens[i])
-        assert row.unique().numel() == k_top
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        assert bool(((got - want).abs() <= 1e-2 + 1e-3 * want.abs()).all()), f"row {i}"
+    _check_rows(inp, indices, values, k_top)
 
 
 @skip_not_sm100
@@ -655,15 +635,4 @@ def test_fused_indexer_topk_nospill_split_skewed_winners(monkeypatch):
         values,
     )
     torch.cuda.synchronize()
-    ref_vals = _reference(inp, k_top)
-    for i in range(batch):
-        row = indices[i]
-        assert int(row.min()) >= 0
-        assert int(row.max()) < int(inp["context_lens"][i])
-        assert row.unique().numel() == k_top, "duplicate indices"
-        got, _ = torch.sort(values[i], descending=True)
-        want, _ = torch.sort(ref_vals[i], descending=True)
-        dv = (got - want).abs()
-        assert bool((dv <= 1e-2 + 1e-3 * want.abs()).all()), (
-            f"row {i}: max value err {float(dv.max()):.4f}"
-        )
+    _check_rows(inp, indices, values, k_top)
