@@ -28,9 +28,16 @@ environment variable as follows:
 | 1                               | Affinity is unconditionally auto-configured.                                                                                 |
 | 0 or any other value            | Affinity remains as configured by the user and/or environment                                                                |
 
-The affinity is applied to every thread of the worker process, including
-threads created before the configuration point (for example by MPI or
-communication libraries).
+The affinity is applied to every thread that exists at the configuration
+point, including threads created earlier (for example by MPI or communication
+libraries). Threads created afterwards inherit the affinity of the thread that
+creates them.
+
+In deployments where the worker shares a process with caller code -- a
+single-process TP1 worker, an externally supplied MPI communicator session, or
+the leader process of a multi-node launch -- every thread of that process is
+affected, including threads that do not belong to the worker. Set
+`TLLM_NUMA_AWARE_WORKER_AFFINITY=0` to leave the affinity untouched.
 
 ## Other environmental considerations
 

@@ -637,10 +637,16 @@ def get_numa_aware_cpu_affinity(device_id):
 
 
 def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
-    """Bind every thread of this process to `cpus`.
+    """Bind every thread that exists when this is called to `cpus`.
 
     sched_setaffinity(pid) only binds the main thread, so threads created
     earlier (MPI, communication and I/O helpers) would keep their old mask.
+
+    `/proc/self/task` is a snapshot, so the guarantee is bounded: a thread
+    created during the walk by a thread that has not been rebound yet keeps
+    the old mask and is never visited. Threads created after the walk inherit
+    the mask of the thread that creates them, so they are covered once their
+    creator is bound.
 
     Args:
         cpus: The logical CPU ids to bind to. Must not be empty.
@@ -649,7 +655,7 @@ def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
         `(bound, attempted)`: the number of threads that were successfully
         bound, and the number of live threads the call was attempted on.
         Threads that exit while `/proc/self/task` is being walked count
-        towards neither.
+        towards neither, so `(0, 0)` means nothing was rebound.
     """
     if not cpus:
         # sched_setaffinity() rejects an empty mask with EINVAL, so silently
@@ -665,10 +671,19 @@ def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
         psutil.Process().cpu_affinity(cpus)
         return 1, 1
 
+    try:
+        tids = os.listdir("/proc/self/task")
+    except OSError as e:
+        # isdir() succeeding does not guarantee the listing succeeds. Affinity
+        # is a performance knob, so degrade instead of failing worker startup.
+        logger.warning(f"Could not enumerate /proc/self/task ({e}). The CPU "
+                       f"affinity of this process is left unchanged.")
+        return 0, 0
+
     bound = 0
     attempted = 0
     failures = collections.Counter()
-    for tid in os.listdir("/proc/self/task"):
+    for tid in tids:
         try:
             os.sched_setaffinity(int(tid), cpus)
         except ProcessLookupError:
@@ -697,9 +712,12 @@ def configure_cpu_affinity(device_id: int) -> None:
         device_id: The CUDA device ID to determine optimal CPU affinity.
 
     Note:
-        The affinity is applied to every thread of the process, not only the
-        main thread. If the process already has constrained affinity, a warning
-        is logged. Configuration is handled as follows:
+        The affinity is applied to every thread that exists at this point, not
+        only the main thread; threads created afterwards inherit the mask of
+        the thread that creates them. Where the worker shares a process with
+        caller code, that includes threads which do not belong to the worker.
+        If the process already has constrained affinity, a warning is logged.
+        Configuration is handled as follows:
             TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
                 -> Affinity is automatically configured if it is unconstrained,
                    and deleted if it is constrained externally by the user.
