@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
     {
         "sparse_backend_args",  # consumed by sparse prediction before the attention op
+        "block_sparse_inputs",  # consumed by the selected FMHA library
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
@@ -81,8 +82,9 @@ class FallbackFmha(Fmha):
         del k, v, phase
         if q is not None and q.dtype == torch.float8_e4m3fn:
             return False
-        return forward_args.attention_mask != CustomAttentionMask.CUSTOM and (
-            forward_args.update_kv_cache or metadata.is_cross
+        return forward_args.block_sparse_inputs is None and (
+            forward_args.attention_mask != CustomAttentionMask.CUSTOM
+            and (forward_args.update_kv_cache or metadata.is_cross)
         )
 
     def forward(

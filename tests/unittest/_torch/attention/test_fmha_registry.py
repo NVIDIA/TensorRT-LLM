@@ -14,10 +14,13 @@
 # limitations under the License.
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.attention.backends.fmha import registry
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha
 
 PRIMS_TS = "prims_ts"
+PRIMS_TS_BLOCK_SPARSE = "prims_ts_block_sparse"
 
 
 def _canonical_names() -> tuple[str, ...]:
@@ -39,8 +42,25 @@ def test_default_fmha_libs_exclude_prims_ts(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
 
     assert PRIMS_TS not in registry.DEFAULT_FMHA_LIBS
+    assert PRIMS_TS_BLOCK_SPARSE in registry.DEFAULT_FMHA_LIBS
     assert set(registry.DEFAULT_FMHA_LIBS) <= set(registry.FMHA_LIBS)
     assert _enabled_names() == registry.DEFAULT_FMHA_LIBS
+
+
+@pytest.mark.parametrize("name", [PRIMS_TS, "fallback"])
+def test_dense_fmhas_reject_unconsumed_block_sparse_inputs(name: str) -> None:
+    attention = type("Attention", (), {})()
+    fmha = object.__new__(registry.FMHA_LIBS[name])
+    Fmha.__init__(fmha, attention)
+    forward_args = type("ForwardArgs", (), {"block_sparse_inputs": object()})()
+
+    assert not fmha.is_supported(
+        torch.empty((1, 4), dtype=torch.bfloat16),
+        None,
+        None,
+        object(),
+        forward_args,
+    )
 
 
 @pytest.mark.parametrize("value", ["", "   ", ", ,"])
