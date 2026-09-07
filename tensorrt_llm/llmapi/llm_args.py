@@ -2356,15 +2356,24 @@ class EagleDecodingConfig(DecodingBaseConfig):
                     )
         return v
 
-    @model_validator(mode='after')
-    def validate_eagle_config(self) -> 'EagleDecodingConfig':
-        if self.max_draft_len is None or self.max_draft_len == 0:
-            raise ValueError("max_draft_len must be > 0 for Eagle")
-        if self.eagle3_one_model is False:
+    @field_validator("eagle3_one_model")
+    @classmethod
+    def _reject_two_model_eagle3(cls, value: Optional[bool]) -> Optional[bool]:
+        # A field validator rather than a check inside the model validator: it
+        # also runs on assignment when the model is configured for it, so
+        # `config.eagle3_one_model = False` after construction cannot leave a
+        # value that telemetry reports but the runtime ignores.
+        if value is False:
             raise ValueError(
                 "eagle3_one_model=False is no longer supported: the two-model "
                 "Eagle3 path has been removed. Omit the field or set it to "
                 "True.")
+        return value
+
+    @model_validator(mode='after')
+    def validate_eagle_config(self) -> 'EagleDecodingConfig':
+        if self.max_draft_len is None or self.max_draft_len == 0:
+            raise ValueError("max_draft_len must be > 0 for Eagle")
         # None kept its historical meaning: fall through to the one-model path.
         self.eagle3_one_model = True
         self.num_eagle_layers = self.max_draft_len
@@ -2621,6 +2630,16 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
         "Called to prepare/free resources before/after target model forward passes."
     )  # Type is Optional[ResourceManager]
 
+    @field_validator("mtp_eagle_one_model")
+    @classmethod
+    def _reject_two_model_mtp(cls, value: bool) -> bool:
+        if value is False:
+            raise ValueError(
+                "mtp_eagle_one_model=False is no longer supported: the "
+                "two-model MTP path has been removed. Omit the field or set "
+                "it to True.")
+        return value
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len  # Current UserProvided only supports linear tree
@@ -2838,12 +2857,6 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.max_draft_len is not None:
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
-
-        if self.mtp_eagle_one_model is False:
-            raise ValueError(
-                "mtp_eagle_one_model=False is no longer supported: the "
-                "two-model MTP path has been removed. Omit the field or set "
-                "it to True.")
 
         # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
         # dynamic_tree_max_topK alone does not turn it on.
