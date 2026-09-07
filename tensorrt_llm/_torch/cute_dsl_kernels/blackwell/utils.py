@@ -474,3 +474,19 @@ def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def div_full_f32(a, b, *, loc=None, ip=None):
+    """Full-range approximate fp32 division (~2 ulp) via div.full.f32 PTX instruction."""
+    args = [
+        cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(b).ir_value(loc=loc, ip=ip),
+    ]
+    res = llvm.inline_asm(
+        cutlass.Float32.mlir_type,
+        args,
+        "div.full.f32 $0, $1, $2;",
+        "=f,f,f",
+    )
+    return cutlass.Float32(res)

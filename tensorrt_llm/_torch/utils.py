@@ -213,6 +213,10 @@ class Fp4QuantizedTensor:
     # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
     # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
     unquantized_hidden_states: Optional[torch.Tensor] = None
+    # Reciprocal activation scale (max_raw / 448.0) carried from deferred
+    # dynamic NVFP4 producers for consumer GEMM alpha derivation:
+    # alpha = reciprocal_scale * weight_scale_2.
+    reciprocal_scale: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
