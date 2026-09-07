@@ -1008,6 +1008,7 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
         hidden_size: int,
         max_num_requests: int,
         sa_manager: object = None,
+        num_seq_slots: Optional[int] = None,
     ) -> object:
         captured.update(
             config=config,
@@ -1015,6 +1016,7 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
             hidden_size=hidden_size,
             max_num_requests=max_num_requests,
             sa_manager=sa_manager,
+            num_seq_slots=num_seq_slots,
         )
         return captured
 
@@ -1044,6 +1046,9 @@ def test_dynamic_tree_resource_uses_full_qwen_hc_width(monkeypatch) -> None:
     assert utils.get_spec_resource_manager(model_engine) is captured
     assert captured["hidden_size"] == 512
     assert captured["max_num_requests"] == 16
+    # This engine stub does not opt into the attention-DP overlap seq-slot
+    # headroom, so the manager must fall back to the max_num_requests sizing.
+    assert captured["num_seq_slots"] is None
 
 
 def test_logits_processor_borrows_target_mixer_but_mtp_head_owns_one() -> None:
