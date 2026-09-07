@@ -56,6 +56,8 @@ _KV_CACHE_DTYPE_MAP = {
     "nvfp4": KVCacheDtype.NVFP4_BLOCKWISE,
 }
 
+NVFP4_COMPRESS_RESIDUAL_DIM = 64
+
 
 def resolve_kv_cache_dtype(kv_cache_dtype: Union[str, KVCacheDtype]) -> KVCacheDtype:
     if isinstance(kv_cache_dtype, str):
@@ -76,6 +78,7 @@ class Compressor(nn.Module):
         dtype: Data type for computation
         kv_cache_dtype: Cache preset string or KVCacheDtype.
         rotate_activation: Whether to apply Hadamard transform in postprocessing (False to skip)
+        nvfp4_global_scale: Second-level scale used for NVFP4 cache quantization.
     """
 
     def __init__(
@@ -107,6 +110,14 @@ class Compressor(nn.Module):
         # Cache config
         self.layer_idx = layer_idx
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
+        self.nvfp4_residual_dim = (
+            self.rope_head_dim if self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE else 0
+        )
+        if self.nvfp4_residual_dim != 0 and self.nvfp4_residual_dim != NVFP4_COMPRESS_RESIDUAL_DIM:
+            raise ValueError(
+                "DeepSeek-V4 NVFP4 COMPRESS residual quantization requires "
+                f"rope_head_dim={NVFP4_COMPRESS_RESIDUAL_DIM}, got {self.rope_head_dim}."
+            )
         self.nvfp4_global_scale = nvfp4_global_scale
         self.is_indexer = is_indexer
         self.rotate_activation = rotate_activation
@@ -318,6 +329,7 @@ class Compressor(nn.Module):
             compress_tokens_per_block,
             int(self.kv_cache_dtype),
             self.nvfp4_global_scale,
+            self.nvfp4_residual_dim,
             self.rotate_activation,
             quant_output,
             scale_output,

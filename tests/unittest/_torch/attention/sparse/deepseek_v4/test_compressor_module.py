@@ -1917,6 +1917,7 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         tokens_per_block,
         cache_dtype,
         nvfp4_global_scale,
+        nvfp4_residual_dim,
         rotate_activation,
         quant_output,
         scale_output,
@@ -1927,6 +1928,7 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         seen["cache_dtype"] = cache_dtype
         seen["kv_cache_scale"] = kv_cache_scale
         seen["nvfp4_global_scale"] = nvfp4_global_scale
+        seen["nvfp4_residual_dim"] = nvfp4_residual_dim
         if kv_out is not None:
             kv_out.fill_(0.5)
         if quant_output is not None:
