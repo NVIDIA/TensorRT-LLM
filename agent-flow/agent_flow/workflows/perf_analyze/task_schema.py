@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import yaml
@@ -70,18 +70,18 @@ SLURM_REQUIRED_FIELDS: tuple[str, ...] = (
 
 # Optional ssh alias for the cluster's login node, e.g. ``user@login-01``.
 #
-# Its presence means THIS PROCESS IS NOT ON THE CLUSTER: the workflow runs
-# somewhere with no slurm client and no shared filesystem, so everything
-# that touches the cluster — git on the checkout, existence checks on
-# ``checkpoint_path``/``trtllm_repo_path``, and the agents' own ``srun`` —
-# has to travel over ssh. The repo, the workspace and every artifact live
-# on the cluster; only ssh commands cross the boundary.
+# Its presence means THIS PROCESS IS NOT ON THE CLUSTER. Runtime paths such
+# as ``checkpoint_path`` and ``docker_image`` live remotely, while the
+# workflow workspace, TensorRT-LLM checkout, and retained artifacts stay
+# local. Agents copy the required source and inputs to the cluster, run
+# Slurm through ssh, and pull the required outputs back.
 #
 # Optional, and absent is the historical behaviour: "these paths are local
 # and ``srun`` works here". Every existing ``task.yaml`` is written that
 # way and so are the workflow's own tests, so requiring it would invalidate
 # all of them to describe a deployment most runs do not use.
 SLURM_CLUSTER_SSH_FIELD = "cluster_ssh"
+REMOTE_RUN_ROOT_FIELD = "remote_run_root"
 
 # SOL-projection block. The workflow runs the projector stage
 # (benchmarker -> projector -> analyzer -> reporter), which follows the
@@ -165,7 +165,9 @@ KNOWN_BENCHMARK_KEYS: frozenset[str] = frozenset(
     _BENCHMARK_INT_FIELDS + _BENCHMARK_STR_FIELDS + ("concurrency", "num_prompts", "request_rate")
 )
 KNOWN_PROFILE_KEYS: frozenset[str] = frozenset({"methods", "nsys_iter_range"})
-KNOWN_SLURM_KEYS: frozenset[str] = frozenset(SLURM_REQUIRED_FIELDS + (SLURM_CLUSTER_SSH_FIELD,))
+KNOWN_SLURM_KEYS: frozenset[str] = frozenset(
+    SLURM_REQUIRED_FIELDS + (SLURM_CLUSTER_SSH_FIELD, REMOTE_RUN_ROOT_FIELD)
+)
 KNOWN_SOL_KEYS: frozenset[str] = frozenset(SOL_FIELDS)
 KNOWN_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     REQUIRED_PATH_FIELDS
@@ -408,10 +410,11 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
 
     errors: list[str] = []
 
-    # Decided once, from the spec, before any path is looked at. Every other check
-    # in this function runs either way — this suppresses existence, and only
-    # existence. See :func:`paths_are_local`.
+    # Decided once, from the spec, before any path is looked at. In remote mode
+    # the checkpoint is remote, but the checkout and optional tuning YAML remain
+    # local inputs and are resolved relative to the task file.
     check_paths = paths_are_local(data)
+    task_dir = task_path.expanduser().resolve().parent
 
     for field in REQUIRED_PATH_FIELDS:
         if field not in data:
@@ -421,7 +424,15 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
         if not isinstance(value, str) or not value.strip():
             errors.append(f"'{field}' must be a non-empty string, got {type(value).__name__}")
             continue
-        if check_paths and not Path(value).exists():
+        if not check_paths and field == "trtllm_repo_path":
+            resolved = Path(value).expanduser()
+            if not resolved.is_absolute():
+                resolved = task_dir / resolved
+            resolved = resolved.resolve()
+            data[field] = str(resolved)
+            if not resolved.is_dir():
+                errors.append(f"'{field}' is not a local directory: {resolved}")
+        elif check_paths and not Path(value).exists():
             errors.append(
                 f"'{field}' points to a non-existent path: {value} "
                 f"(checked on {os.uname().nodename}, the host running this workflow)"
@@ -436,11 +447,19 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
                 f"'{EXTRA_LLM_API_OPTIONS_FIELD}' must be a non-empty string, "
                 f"got {type(extra).__name__}"
             )
-        elif check_paths and not Path(extra).exists():
-            errors.append(
-                f"'{EXTRA_LLM_API_OPTIONS_FIELD}' points to a non-existent path: {extra} "
-                f"(checked on {os.uname().nodename}, the host running this workflow)"
-            )
+        else:
+            resolved_extra = Path(extra).expanduser()
+            if not check_paths:
+                if not resolved_extra.is_absolute():
+                    resolved_extra = task_dir / resolved_extra
+                resolved_extra = resolved_extra.resolve()
+                data[EXTRA_LLM_API_OPTIONS_FIELD] = str(resolved_extra)
+            if not resolved_extra.is_file():
+                errors.append(
+                    f"'{EXTRA_LLM_API_OPTIONS_FIELD}' points to a non-existent path: "
+                    f"{resolved_extra} (checked on {os.uname().nodename}, the host running "
+                    "this workflow)"
+                )
 
     benchmark = _validate_mapping_block(data, "benchmark", errors)
     _validate_int_fields(benchmark, "benchmark", _BENCHMARK_INT_FIELDS, errors)
@@ -499,13 +518,27 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             # into every ssh command the run issues, so a non-string here would
             # surface as a mangled shell command tens of minutes later rather
             # than as a spec error now.
-            cluster_ssh = slurm_environment.get(SLURM_CLUSTER_SSH_FIELD)
-            if cluster_ssh is not None and (
-                not isinstance(cluster_ssh, str) or not cluster_ssh.strip()
+            ssh_target = slurm_environment.get(SLURM_CLUSTER_SSH_FIELD)
+            if ssh_target is not None and (
+                not isinstance(ssh_target, str) or not ssh_target.strip()
             ):
                 errors.append(
                     f"'{SLURM_ENVIRONMENT_FIELD}.{SLURM_CLUSTER_SSH_FIELD}' must be a "
-                    f"non-empty string when set, got {type(cluster_ssh).__name__}"
+                    f"non-empty string when set, got {type(ssh_target).__name__}"
+                )
+            remote_root = slurm_environment.get(REMOTE_RUN_ROOT_FIELD)
+            if (
+                ssh_target
+                and remote_root is not None
+                and (
+                    not isinstance(remote_root, str)
+                    or not remote_root.strip()
+                    or not PurePosixPath(remote_root).is_absolute()
+                )
+            ):
+                errors.append(
+                    f"'{SLURM_ENVIRONMENT_FIELD}.{REMOTE_RUN_ROOT_FIELD}' must be a "
+                    "non-empty absolute POSIX path when set"
                 )
 
     if _RENAMED_SOL_FIELD in data:
@@ -598,12 +631,11 @@ def has_slurm_environment(data: Mapping[str, Any]) -> bool:
 
 
 def paths_are_local(data: Mapping[str, Any]) -> bool:
-    """Whether ``checkpoint_path`` & co. name files THIS process could open.
+    """Whether the task's runtime paths name files this process could open.
 
-    They do not when the spec carries ``slurm-environment.cluster_ssh``, whose
-    whole meaning is "this process is not on the cluster". A ``Path(...).exists()``
-    then answers about the wrong machine: it reports False for a checkpoint that is
-    perfectly present, and the run is refused for a defect it does not have.
+    They do not when the spec carries ``slurm-environment.cluster_ssh``: the
+    checkpoint and Slurm image live remotely. The TensorRT-LLM checkout and
+    optional tuning YAML remain local and are validated separately.
 
     The spec is asked rather than the caller told, because the spec is the thing
     that knows. An earlier version of this took a ``--paths-prevalidated`` flag on
@@ -612,11 +644,9 @@ def paths_are_local(data: Mapping[str, Any]) -> bool:
     failed on correct input because nobody passed it, and it was a CLI flag that
     had quietly become a cross-version contract.
 
-    Skipping is the whole of it — nothing here reaches for the cluster. Validation
-    stays local, instant, and free of a network call that could turn "your spec is
-    wrong" into "the cluster is unreachable". The check is not lost, it is
-    relocated: ``service/adapter/preflight.py:check_repo`` runs it over ssh on the
-    host that owns the paths, and more thoroughly than this ever did.
+    Nothing here reaches for the cluster. Validation stays local, instant, and
+    free of a network call that could turn "your spec is wrong" into "the cluster
+    is unreachable". The agent checks remote inputs before submitting work.
 
     NOTE FOR THE SERVICE: `flow_version` greps a pinned checkout for this
     function's *name* to decide whether that commit can be driven from off-cluster.
@@ -639,6 +669,16 @@ def cluster_ssh(data: Mapping[str, Any]) -> str:
     if not isinstance(block, Mapping):
         return ""
     return str(block.get(SLURM_CLUSTER_SSH_FIELD) or "").strip()
+
+
+def remote_run_root(data: Mapping[str, Any], campaign_name: str) -> str:
+    """Return the configured campaign root, or a remote-home default."""
+    slurm = data.get(SLURM_ENVIRONMENT_FIELD)
+    if isinstance(slurm, Mapping):
+        value = slurm.get(REMOTE_RUN_ROOT_FIELD)
+        if isinstance(value, str) and value.strip():
+            return value.rstrip("/")
+    return f"~/agent_flow_workspace/{campaign_name}"
 
 
 def sol_enabled(data: Mapping[str, Any]) -> bool:
@@ -732,6 +772,7 @@ __all__ = [
     "BENCHMARK_DEFAULTS",
     "EXTRA_LLM_API_OPTIONS_FIELD",
     "PROFILE_DEFAULTS",
+    "REMOTE_RUN_ROOT_FIELD",
     "REQUIRED_PATH_FIELDS",
     "SERVE_BACKEND",
     "SERVE_HOST",
@@ -753,5 +794,6 @@ __all__ = [
     "is_curve_mode",
     "load_and_validate_task_yaml",
     "num_prompts_per_point",
+    "remote_run_root",
     "sol_enabled",
 ]

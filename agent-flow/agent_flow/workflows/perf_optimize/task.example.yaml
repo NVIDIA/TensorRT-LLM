@@ -5,21 +5,22 @@
 #         --task path/to/your/task.yaml \
 #         --workspace workspace/perf-optimize/<model-name>
 #
-# Required: the two source paths below. The workflow refuses to start if
-# either is missing or does not point at an existing path.
+# Required paths. Without `cluster_ssh`, both belong to the machine running
+# the CLI. With `cluster_ssh`, the checkpoint is remote but the TRT-LLM
+# checkout remains local.
 #
 # NOTE: perf-optimize MUTATES the TRT-LLM checkout — it must be a git
 # repo with a clean worktree; work happens on a dedicated
 # perf-optimize/<workspace>-<timestamp> branch (one commit per accepted
-# optimization). Source-level (`approach: code`) optimizations only take
-# effect when the checkout is the installed tensorrt_llm package
-# (editable install).
+# optimization). In local execution, code changes require an editable
+# install; in remote execution, agents sync the changed source into each job.
 
-checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>
-trtllm_repo_path: /path/to/TensorRT-LLM
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>  # remote when using SSH
+trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 # Optional: the starting server tuning. It seeds the workspace's live
 # tuning config (tuning/extra_llm_api_options.yaml), which the optimizer
-# then evolves; omit to start from an empty ({}) config.
+# then evolves; this path is always local. Omit to start from an empty ({})
+# config.
 # extra_llm_api_options: /path/to/extra_llm_api_options.yaml
 
 # Optional: the benchmark operating point(s) driven by
@@ -135,10 +136,14 @@ profile:
 
 # Optional: include this section only when the servers + benchmarks must
 # run through Slurm (otherwise everything runs locally on the current
-# node). When present, both fields are required.
+# node). `cluster_ssh` makes only the Slurm jobs remote; source editing,
+# Git, workflow state, and retained artifacts stay local. The run root is
+# optional and defaults to ~/agent_flow_workspace/<workspace-name> remotely.
 # slurm-environment:
 #   slurm_partition: <partition>
-#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+#   docker_image: /remote/path/to/trtllm-pytorch-<version>.sqsh
+#   cluster_ssh: user@login-host       # enables remote execution
+#   remote_run_root: /remote/path/to/perf-optimize/my-campaign
 
 # Optional: the one-shot analytical SOL-projection stage between the
 # baseline benchmark and round 1 (benchmarker -> projector ->

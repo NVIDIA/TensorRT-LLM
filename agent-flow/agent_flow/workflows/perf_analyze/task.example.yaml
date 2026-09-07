@@ -5,12 +5,12 @@
 #         --task path/to/your/task.yaml \
 #         --workspace workspace/perf-analyze/<model-name>
 #
-# Required: the two source paths below. The workflow refuses to start if
-# either is missing or does not point at an existing path.
+# Required paths. With remote execution the checkpoint is remote, while
+# the TensorRT-LLM checkout and optional tuning YAML remain local.
 
-checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>
-trtllm_repo_path: /path/to/TensorRT-LLM
-# extra_llm_api_options: /path/to/extra_llm_api_options.yaml
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>  # remote when using SSH
+trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
+# extra_llm_api_options: /local/path/to/extra_llm_api_options.yaml
 
 # Optional: the benchmark operating point(s) driven by
 # benchmark_serving.py.
@@ -45,10 +45,13 @@ profile:
 
 # Optional: include this section only when the server + benchmark must run
 # through Slurm (otherwise everything runs locally on the current node).
-# When present, both fields are required.
+# `cluster_ssh` enables remote execution. `remote_run_root` is optional;
+# it defaults to ~/agent_flow_workspace/<campaign-name> on that host.
 # slurm-environment:
 #   slurm_partition: <partition>
-#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+#   docker_image: /remote/path/to/trtllm-pytorch-<version>.sqsh
+#   cluster_ssh: user@login-host
+#   remote_run_root: /remote/path/to/perf-analyze/my-campaign
 
 # Optional: the analytical SOL-projection stage (benchmarker ->
 # projector -> analyzer -> reporter) runs **by default**, so this section

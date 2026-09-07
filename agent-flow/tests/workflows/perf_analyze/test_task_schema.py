@@ -15,6 +15,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     is_curve_mode,
     load_and_validate_task_yaml,
     num_prompts_per_point,
+    remote_run_root,
     sol_enabled,
 )
 
@@ -770,14 +771,16 @@ def test_a_local_run_still_has_its_paths_checked(tmp_path):
         )
 
 
-def test_a_remote_run_does_not_have_them_checked_here(tmp_path):
-    """Same absent paths, plus `cluster_ssh` — they are on the other machine."""
+def test_a_remote_run_checks_local_repo_but_not_remote_checkpoint(tmp_path):
+    """Only runtime paths move to the SSH host."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
     data = load_and_validate_task_yaml(
         _write(
             tmp_path,
             {
                 "checkpoint_path": "/lustre/ckpt",
-                "trtllm_repo_path": "/lustre/repo",
+                "trtllm_repo_path": str(repo),
                 "slurm-environment": {
                     "slurm_partition": "p",
                     "docker_image": "i",
@@ -787,6 +790,24 @@ def test_a_remote_run_does_not_have_them_checked_here(tmp_path):
         )
     )
     assert data["checkpoint_path"] == "/lustre/ckpt"
+
+
+def test_a_remote_run_rejects_a_missing_local_repo(tmp_path):
+    with pytest.raises(TaskSchemaError, match="not a local directory"):
+        load_and_validate_task_yaml(
+            _write(
+                tmp_path,
+                {
+                    "checkpoint_path": "/lustre/ckpt",
+                    "trtllm_repo_path": "missing-repo",
+                    "slurm-environment": {
+                        "slurm_partition": "p",
+                        "docker_image": "i",
+                        "cluster_ssh": "me@login-01",
+                    },
+                },
+            )
+        )
 
 
 def test_skipping_existence_does_not_skip_anything_else(tmp_path):
@@ -835,13 +856,17 @@ def test_a_missing_required_path_is_still_missing_when_remote(tmp_path):
 
 
 def test_extra_llm_api_options_follows_the_same_rule(tmp_path):
-    """The third path, which is easy to forget because it is optional."""
+    """Remote execution still consumes the optional tuning YAML locally."""
     from agent_flow.workflows.perf_analyze.task_schema import paths_are_local
 
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    options = tmp_path / "opts.yaml"
+    options.write_text("{}\n", encoding="utf-8")
     remote = {
         "checkpoint_path": "/lustre/ckpt",
-        "trtllm_repo_path": "/lustre/repo",
-        "extra_llm_api_options": "/lustre/opts.yaml",
+        "trtllm_repo_path": "repo",
+        "extra_llm_api_options": "opts.yaml",
         "slurm-environment": {
             "slurm_partition": "p",
             "docker_image": "i",
@@ -849,14 +874,33 @@ def test_extra_llm_api_options_follows_the_same_rule(tmp_path):
         },
     }
     assert paths_are_local(remote) is False
-    load_and_validate_task_yaml(_write(tmp_path, remote))  # must not raise
+    data = load_and_validate_task_yaml(_write(tmp_path, remote))
+    assert data["trtllm_repo_path"] == str(repo.resolve())
+    assert data["extra_llm_api_options"] == str(options.resolve())
 
-    ckpt, repo = _paths(tmp_path)
-    local = {**remote, "checkpoint_path": ckpt, "trtllm_repo_path": repo}
-    local.pop("slurm-environment")
-    assert paths_are_local(local) is True
-    with pytest.raises(TaskSchemaError, match="extra_llm_api_options"):
-        load_and_validate_task_yaml(_write(tmp_path, local))
+
+def test_remote_run_root_is_optional_and_can_be_explicit(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = {
+        "checkpoint_path": "/lustre/ckpt",
+        "trtllm_repo_path": str(repo),
+        "slurm-environment": {
+            "slurm_partition": "p",
+            "docker_image": "/image.sqsh",
+            "cluster_ssh": "me@login-01",
+        },
+    }
+    data = load_and_validate_task_yaml(_write(tmp_path, task))
+    assert remote_run_root(data, "campaign") == "~/agent_flow_workspace/campaign"
+
+    task["slurm-environment"]["remote_run_root"] = "/scratch/runs/campaign"
+    data = load_and_validate_task_yaml(_write(tmp_path, task))
+    assert remote_run_root(data, "ignored") == "/scratch/runs/campaign"
+
+    task["slurm-environment"]["remote_run_root"] = "relative/run"
+    with pytest.raises(TaskSchemaError, match="remote_run_root"):
+        load_and_validate_task_yaml(_write(tmp_path, task))
 
 
 def test_a_malformed_slurm_block_does_not_decide_the_question(tmp_path):
