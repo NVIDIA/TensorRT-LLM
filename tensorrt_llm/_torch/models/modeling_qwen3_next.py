@@ -52,7 +52,8 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.low_m_gemm import apply_direct_low_m_gemm
+from ..modules.low_m_gemm import (apply_direct_low_m_gemm,
+                                  apply_direct_low_m_gemm_with_input_quant)
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -177,6 +178,18 @@ class Qwen3NextGate(nn.Module):
         logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
             hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
         return logits
+
+    def forward_with_input_quant(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+        """Return router logits and reusable FP8 block-scale input when eligible."""
+        if self.out_dtype == hidden_states.dtype:
+            result = apply_direct_low_m_gemm_with_input_quant(
+                hidden_states, self.weight, None)
+            if result is not None:
+                logits, quantized_input, input_scale = result
+                return logits, (quantized_input, input_scale)
+        return self(hidden_states), None
 
     def load_weights(self,
                      weights: List[Dict],
@@ -341,7 +354,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 "do_finalize == False is not supported yet")
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            supports_prequantized_input = getattr(
+                self.experts,
+                "supports_prequantized_fp8_block_scale_input",
+                None,
+            )
+            if supports_prequantized_input is not None and supports_prequantized_input(
+            ):
+                router_logits, prequantized_input = self.gate.forward_with_input_quant(
+                    hidden_states)
+            else:
+                router_logits = self.gate(hidden_states)
+                prequantized_input = None
             final_hidden_states = self.experts(
                 hidden_states,
                 router_logits,
@@ -349,6 +373,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
+                prequantized_input=prequantized_input,
             )
 
             return final_hidden_states

@@ -91,6 +91,7 @@ class MoEScheduler(ABC):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor: ...
 
 
@@ -132,6 +133,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         moe = self.moe
 
@@ -188,6 +190,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # mutation of ``moe.comm`` from a scheduler.
         moe.determine_communication_method(all_rank_num_tokens_padded, num_chunks)
 
+        # The side output describes the unsplit local tensor. Communication
+        # or chunking changes that tensor's layout, so those paths retain the
+        # backend-owned quantization step.
+        if moe.comm is not None or num_chunks != 1:
+            prequantized_input = None
+
         # ========== Step 3: Execute MoE computation ==========
         if num_chunks == 1:
             outputs = self._forward_single_chunk(
@@ -199,6 +207,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 do_finalize,
                 input_ids,
                 lora_params=lora_params,
+                prequantized_input=prequantized_input,
             )
         else:
             outputs = self._forward_multiple_chunks(
@@ -316,6 +325,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         do_finalize: bool = True,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -335,6 +345,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             workspace=workspace,
             input_ids=input_ids,
             lora_params=lora_params,
+            prequantized_input=prequantized_input,
         )
 
     def _forward_chunk_impl(
@@ -350,6 +361,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         workspace: Optional[dict] = None,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -556,7 +568,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         else:
             # No comm: just quantize
             if not used_fused_route_quant:
-                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                if prequantized_input is None:
+                    x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                else:
+                    x, x_sf = prequantized_input
 
         # ========== Step 6: MoE computation ==========
         # If EPLB is enabled, token_selected_slots is slot ids; otherwise expert ids.
@@ -900,6 +915,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor],
         lora_params: Optional[Dict] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -910,6 +926,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        del prequantized_input  # The fused-comm backend owns its input quantization.
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert
         # MoE LoRA is supported only on the CUTLASS backend. Reject rather than
