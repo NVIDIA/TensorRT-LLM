@@ -5408,18 +5408,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
-        }
-
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
-            error "Some tests terminated unexpectedly, please check the test report."
-        }
-
-        if (hasUnrerunFailure) {
-            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
-        }
-
+        // catchError just lets "Create Perf Report" still run; the real
+        // failure is raised via perfRegressionExitCode after perfMode below.
+        def perfRegressionExitCode = null
         if (perfMode) {
             // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
             basePerfFilename = "base_perf_pytorch.csv"
@@ -5434,7 +5425,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     returnStatus: true
                 )
                 if (perfCheckResult != 0) {
-                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                    perfRegressionExitCode = perfCheckResult
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
+                    }
                 }
             }
             stage("Create Perf Report") {
@@ -5449,6 +5443,25 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     echo "No perf script test results to create report"
                 }
             }
+        }
+
+        // Checked after perfMode so perf artifacts are generated first.
+        // Unguarded error() on purpose -- catchError here would swallow the
+        // throw that cacheErrorAndUploadResult relies on to fail the build.
+        if (rerunFailed) {
+            error "Some tests still failed after rerun attempts, please check the test report."
+        }
+
+        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+            error "Some tests terminated unexpectedly, please check the test report."
+        }
+
+        if (hasUnrerunFailure) {
+            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+        }
+
+        if (perfRegressionExitCode != null) {
+            error "Performance regression detected and failing the build (exit code: ${perfRegressionExitCode})"
         }
     }
 
