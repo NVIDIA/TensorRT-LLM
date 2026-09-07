@@ -71,6 +71,7 @@ void CreditScheduler::dropFromRing(std::string const& flow)
     {
         mDrainFlow.reset();
     }
+    mDrainAbandonWarnedFlows.erase(flow); // flow gone: a re-created key warns again
     auto it = std::find(mRing.begin(), mRing.end(), flow);
     if (it != mRing.end())
     {
@@ -130,12 +131,6 @@ void CreditScheduler::maybeActivateDrain()
     if (mDrainFlow)
     {
         mDrainSince = mClock(); // start the drain time-box
-        // A NEW drain episode (different flow than the last abandoned one) gets its first abandon
-        // logged as a WARNING again; re-latching the same permanently blocked head stays at DEBUG.
-        if (*mDrainFlow != mLastAbandonedFlow)
-        {
-            mDrainAbandonWarned = false;
-        }
     }
 }
 
@@ -204,17 +199,14 @@ std::vector<Grant> CreditScheduler::schedule()
                 // from being re-latched on the very next sweep.
                 // Flow keys are "peer\x1f rid": print the separator as '/' so the log is readable. A
                 // permanently blocked head repeats this every mDrainTimeout, so only the first abandon
-                // per drain episode is a WARNING: re-abandons of the same head with no other flow
-                // latching in between stay at DEBUG; an episode ends when a DIFFERENT flow latches
-                // (see maybeActivateDrain).
-                mLastAbandonedFlow = *mDrainFlow;
+                // per flow lifetime is a WARNING; later abandons of the same key stay at DEBUG (the key
+                // is forgotten in dropFromRing).
                 std::string readable = *mDrainFlow;
                 std::replace(readable.begin(), readable.end(), '\x1f', '/');
                 auto const waitedMs
                     = static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count());
-                if (!mDrainAbandonWarned)
+                if (mDrainAbandonWarnedFlows.insert(*mDrainFlow).second)
                 {
-                    mDrainAbandonWarned = true;
                     TLLM_LOG_WARNING(
                         "CreditScheduler: abandoning drain for flow %s (want=%u bytes) after %lld ms "
                         "without room; resuming round-robin grants (further abandons logged at DEBUG)",

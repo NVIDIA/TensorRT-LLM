@@ -1583,7 +1583,8 @@ bool BounceSender::drainOrphanGather()
             // A non-NotReady error here is most likely a sticky async kernel fault, which
             // cudaGetLastError cannot clear (the clear only helps a non-sticky one): the WARNING is the
             // signal. The region is recycled only because the request already failed — nothing
-            // consumes its content.
+            // consumes its content. For a sticky launch failure this WARNING duplicates the one
+            // pumpRequest already emitted (acceptable: this second one names the region).
             (void) cudaGetLastError();
             TLLM_LOG_WARNING("BounceTransport(%s): orphaned gather rid=%llu ended with CUDA error %s",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid), cudaGetErrorString(st));
@@ -1704,8 +1705,8 @@ void BounceSender::failAll()
     // reliably cancel a posted NIXL write (UCX's release issues ucp_request_cancel, which acts only on
     // tag-matching receives, and returns success regardless; libfabric's release is a no-op), so an
     // outbound write may still be READING the arena when ~NixlBounceState frees it. The only
-    // protection is to wait for those writes to reach a terminal state — bounded by
-    // min(requestTimeoutMs, 5 s) so a dead peer cannot hang teardown — and warn once if some are
+    // protection is to wait for those writes to reach a terminal state — bounded by a fixed
+    // kShutdownWriteDrainMs so a dead peer cannot hang teardown — and warn once if some are
     // still in flight past the deadline. The once-retry of failed releases below is kept only as a
     // cheap guard for other backends. This bounded wait runs while NixlTransferAgent::shutdown holds
     // mLock, which is acceptable at teardown. It covers OUTBOUND writes only: inbound writes into
@@ -1731,10 +1732,11 @@ void BounceSender::failAll()
                 inFlight.push_back(o.xfer.get());
             }
         }
-        // 5 s is long enough for an in-flight chunk to land on a live link; a dead peer's write never
-        // completes, so waiting longer buys nothing.
-        auto const deadline
-            = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(mCtx.cfg.requestTimeoutMs, 5000));
+        // Fixed, independent of requestTimeoutMs: a dead peer's write never completes, so waiting
+        // longer buys nothing; on a live link a default 32 MiB chunk lands well within 5 s; and a tiny
+        // request_timeout_ms must not shorten a legitimate in-flight write.
+        constexpr int kShutdownWriteDrainMs = 5000;
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kShutdownWriteDrainMs);
         while (!inFlight.empty())
         {
             inFlight.erase(std::remove_if(inFlight.begin(), inFlight.end(),
@@ -1968,19 +1970,17 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
         || handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes
         || handshake.requestTimeoutMs != mCtx.cfg.requestTimeoutMs)
     {
-        // The chunk cap is clamped to each side's usable arena capacity, so differing caps with equal
-        // configured max_chunk_size usually mean different kv_cache_bounce_size_mb on the two sides.
-        char const* hint = handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes ? " (arena sizes differ?)" : "";
+        // The chunk cap is clamped to each side's usable arena capacity; both capacities are printed so
+        // an arena-induced mismatch is visible without a separate hint.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): peer %s bounce handshake incompatible (wireVersion %u vs %u, controlKind "
-            "%u vs %u, maxChunkSizeBytes %llu vs %zu%s, requestTimeoutMs %d vs %d, peer arenaUsableCapacityBytes "
+            "%u vs %u, maxChunkSizeBytes %llu vs %zu, requestTimeoutMs %d vs %d, peer arenaUsableCapacityBytes "
             "%llu vs %zu) -> bounce disabled for this peer (NIXL fallback)",
             mCtx.selfName.c_str(), peer.c_str(), static_cast<unsigned>(handshake.wireVersion),
             static_cast<unsigned>(kBounceVersion), static_cast<unsigned>(handshake.controlKind),
             static_cast<unsigned>(localControlKind), static_cast<unsigned long long>(handshake.maxChunkSizeBytes),
-            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), hint, handshake.requestTimeoutMs,
-            mCtx.cfg.requestTimeoutMs, static_cast<unsigned long long>(handshake.arenaUsableCapacityBytes),
-            mCtx.scheduler.arenaCapacity());
+            static_cast<std::size_t>(mCtx.cfg.maxChunkSizeBytes), handshake.requestTimeoutMs, mCtx.cfg.requestTimeoutMs,
+            static_cast<unsigned long long>(handshake.arenaUsableCapacityBytes), mCtx.scheduler.arenaCapacity());
         return false;
     }
     // Peer input must never throw out of the metadata-exchange path (loadRemoteAgent): an empty or

@@ -315,7 +315,8 @@ public:
     /// (drives the IO loop's 0ms busy-poll). Called on the IO thread.
     [[nodiscard]] bool busy() const
     {
-        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty() || !mOrphanGather.empty();
+        // No mOrphanGather term: a parked gather still holds its region, so localHeldCount() > 0 covers it.
+        return mCtx.scheduler.localHeldCount() > 0 || !mOrphanLocal.empty();
     }
 
 private:
@@ -413,7 +414,9 @@ private:
     // cudaStreamQuery(ctx->stream) is no longer NotReady — drainOrphanGather() polls it (non-blocking)
     // and only then returns the exec context + region. Parking (instead of a cudaStreamSynchronize in
     // failRequest) keeps the IO thread off the GPU on the NACK path. A never-completing gather keeps
-    // busy() true (0 ms poll with the 50 us backoff) until process exit. IO-thread-only (no lock).
+    // busy() true (0 ms poll with the 50 us backoff) until process exit. It also pins one of the
+    // copy_stream_count ExecCtxs permanently; copy_stream_count such parks make tryAcquire() fail for
+    // every request and surface as requestTimeoutMs failures. IO-thread-only (no lock).
     struct OrphanGather
     {
         ExecCtx* ctx{nullptr};

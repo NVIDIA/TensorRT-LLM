@@ -168,12 +168,12 @@ enum class BounceControlKind : std::uint8_t
 /// the standard per-desc NIXL path instead of waiting for requestTimeoutMs.
 /// Compatibility is strict equality of wireVersion, controlKind, effective maxChunkSizeBytes and
 /// requestTimeoutMs. Worker/stream counts, the zero-copy-argument path, allocation granularity and
-/// configured arena size are local settings and are not compared. The arena size still matters
-/// indirectly: the effective chunk cap is min(max_chunk_size, the arena's usable capacity =
-/// kv_cache_bounce_size_mb rounded down to a power of two) and is compared strictly, so two sides
-/// whose arenas round to different capacities (or straddle max_chunk_size) fall back to standard
-/// NIXL; keep kv_cache_bounce_size_mb identical on both sides. The usable arena capacity is carried
-/// for diagnostics.
+/// configured arena size are local settings and are not compared. The compared chunk cap is the
+/// EFFECTIVE one, min(max_chunk_size, the arena's usable capacity = kv_cache_bounce_size_mb rounded
+/// down to a power of two): arena sizes only matter when one side's usable capacity is below
+/// max_chunk_size (it then clamps that side's cap and the pair falls back to standard NIXL unless the
+/// other side clamps to the same value); otherwise arena sizes are local and may differ. The usable
+/// arena capacity is carried for diagnostics.
 struct BounceHandshake
 {
     std::uint16_t wireVersion{kBounceVersion};              // control-message codec version; must match exactly

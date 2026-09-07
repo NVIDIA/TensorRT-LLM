@@ -157,7 +157,7 @@ struct BounceConfig
     // descriptors; head-matched layouts (MLA, symmetric TP) collapse to one ~1-2 MiB descriptor per
     // block and stay on standard NIXL unless max_average_descriptor_size is raised (e.g. 4MB) and
     // min_descriptor_count lowered. max_average_descriptor_size = 0 routes EVERY write to standard
-    // NIXL (kill switch, not "no limit") — but it disables OUTBOUND routing only: the arena is still
+    // NIXL (an outbound gate off switch, not "no limit") — it disables OUTBOUND routing only: the arena is still
     // allocated and registered, the handshake still advertised, and inbound grants/scatter still
     // served; to turn the feature off use agent_bounce_buffer_enable=false. min_descriptor_count = 0
     // means no minimum.

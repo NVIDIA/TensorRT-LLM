@@ -189,6 +189,14 @@ bool waitGrant(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::millise
         });
 }
 
+// Wait up to `budget` for a NACK for `rid`.
+bool waitNack(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget)
+{
+    return pumpChannel(ch, budget,
+        [&](b::BounceMsgHeader const& h, std::string const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kNACK && h.requestId == rid; });
+}
+
 // Count ACKs for `rid` over the FULL `budget` window (a negative-assertion helper: always runs to
 // the deadline so extra/duplicate ACKs have time to show up).
 int countAcks(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, std::uint64_t rid)
@@ -264,8 +272,9 @@ TEST(BounceTransportFailure, WriteFailureFailsRequest)
 
 // A receiver that KNOWS a request cannot complete NACKs it, so the sender fails right away
 // (kPeerNack) instead of waiting out requestTimeoutMs (kNoProgressTimeout). Provoked via the WANT
-// chunk-size rejection: the sender's chunk cap exceeds the receiver's, so the single 8 KiB chunk is
-// outside the receiver's (0, 4 KiB]. The cap-equality handshake gate lives in
+// chunk-size rejection — the request-level NACK source (a rejected WANT): the sender's chunk cap
+// exceeds the receiver's, so the single 8 KiB chunk is outside the receiver's (0, 4 KiB]. The
+// cap-equality handshake gate lives in
 // NixlTransferAgent::shouldUseBounce, which BounceTransport::submit never consults (wirePair only does
 // loadRemoteAgent + addPeer), so the mismatched WANT reaches onWant directly.
 TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
@@ -295,11 +304,11 @@ TEST(BounceTransportFailure, ReceiverNackFailsSenderBeforeTimeout)
 
     // The eager gather of the failed chunk holds an ExecCtx + staging region until failRequest (or,
     // for a still-running gather, the IO loop's drainOrphanGather()) releases both in one step. The
-    // ExecCtx returning to the pool guards against a ctx leak in any failRequest path; it cannot
-    // tell the parked (Gathering) branch from the immediate (Gathered) one — an 8 KiB eager gather
-    // finishes before the ZMQ round trip, and if the NACK wins the race nothing was posted at all —
-    // so the parked-gather branch is not deterministically exercised here (it would need a
-    // gather-stall hook).
+    // ctx assertion is a leak guard, not parked-branch coverage: it cannot tell the parked
+    // (Gathering) branch from the immediate (Gathered) one — an 8 KiB eager gather finishes before
+    // the ZMQ round trip, and if the NACK wins the race nothing was posted at all — so the
+    // parked-gather branch is not deterministically exercised here (it would need a gather-stall
+    // hook).
     auto const releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     while (A->exec->freeCount() != execBaseline && std::chrono::steady_clock::now() < releaseDeadline)
     {
@@ -739,7 +748,9 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
 
     auto const start = std::chrono::steady_clock::now();
     sender->tx->shutdown();
-    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
+    // A write that never completes is drained for the fixed kShutdownWriteDrainMs (5 s) — intended
+    // teardown behaviour — so the bound only asserts "bounded, no hang", not "instant".
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(10));
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
@@ -824,6 +835,86 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
 
     A->tx->shutdown();
     B->tx->shutdown();
+}
+
+// forget() must drop the gone peer's flows BEFORE freeing the orphaned regions of its queued (not yet
+// started) scatter jobs: freeOrphanRegion() runs schedule(), so with free-first the region is
+// granted straight back to a pending flow of the very peer being forgotten, and the reclaim that
+// follows then quarantines it (quarantineMs) instead of returning it to the arena. Setup: the
+// receiver's ExecPool is drained from the test so the single scatter worker spins in tryAcquire on
+// job A while job B stays queued (mScattering set for both); a cancel flags both regions orphaned; a
+// second WANT from the same peer is left pending (arena full); then forgetPeer. Correct order: the
+// pending flow is gone before region B is freed, so a second peer's WANT gets it at once. Old order:
+// region B goes to the forgotten peer's pending flow and is quarantined for 30 s, so the second peer
+// starves (and the forgotten peer sees a GRANT after forgetPeer).
+TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/30000);
+    c.scatterWorkerCount = 1;                     // exactly one job can be dequeued; the other must stay in mJobs
+    c.quarantineMs = 30000;                       // the old-order symptom: the mis-granted region is parked this long
+    capRegions(c, c.maxInflightChunksPerRequest); // arena holds exactly TWO regions
+    b::ZmqControlChannel gone("fgGone");
+    b::ZmqControlChannel other("fgOther");
+    auto receiver = bounce_test::makeNode("fgReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(gone.addPeer("fgReceiver", receiver->ch->localEndpoint()));
+    ASSERT_TRUE(other.addPeer("fgReceiver", receiver->ch->localEndpoint()));
+    // A zero-size WANT is NACKed inline by dispatch(); on the same DEALER it proves every earlier
+    // message was processed, and the tick that dispatched it runs drainForgets() before recv()ing again.
+    auto syncReactor = [&](std::uint64_t rid)
+    {
+        gone.sendTo("fgReceiver", b::encodeWant(rid, {0}, gone.localEndpoint()));
+        return waitNack(gone, rid, std::chrono::seconds(5));
+    };
+
+    std::vector<b::ExecCtx*> heldExecContexts;
+    while (auto* ctx = receiver->exec->tryAcquire())
+    {
+        heldExecContexts.push_back(ctx);
+    }
+    ASSERT_EQ(heldExecContexts.size(), receiver->exec->size());
+
+    auto const chunk = static_cast<std::uint32_t>(c.maxChunkSizeBytes);
+    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/1, {chunk, chunk}, gone.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    while (credits.size() < 2)
+    {
+        std::vector<b::BounceCreditEntry> more;
+        ASSERT_TRUE(waitGrant(gone, 1, std::chrono::seconds(5), more));
+        credits.insert(credits.end(), more.begin(), more.end());
+    }
+    ASSERT_EQ(credits.size(), 2u);
+
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
+    for (std::uint32_t i = 0; i < 2; ++i)
+    {
+        gone.sendTo("fgReceiver", b::encodeData(/*rid=*/1, i, /*numChunks=*/2, credits[i].regionHandle, {run}));
+    }
+    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/1, {}, gone.localEndpoint()));             // cancel -> orphans
+    gone.sendTo("fgReceiver", b::encodeWant(/*rid=*/2, {chunk, chunk}, gone.localEndpoint())); // pending: arena full
+    ASSERT_TRUE(syncReactor(/*rid=*/3)) << "cancel / pending WANT not processed";
+
+    receiver->tx->forgetPeer("fgGone");
+    ASSERT_TRUE(syncReactor(/*rid=*/4)) << "forget not applied"; // also re-adds fgGone's DEALER: a mis-grant is visible
+
+    other.sendTo("fgReceiver", b::encodeWant(/*rid=*/10, {chunk}, other.localEndpoint()));
+    std::vector<b::BounceCreditEntry> otherCredits;
+    EXPECT_TRUE(waitGrant(other, 10, std::chrono::seconds(2), otherCredits))
+        << "orphaned region not returned to the arena by forgetPeer (granted back to the forgotten peer?)";
+    std::vector<b::BounceCreditEntry> stray;
+    EXPECT_FALSE(waitGrant(gone, 2, std::chrono::milliseconds(200), stray)) << "forgotten peer was granted a region";
+
+    for (auto* ctx : heldExecContexts)
+    {
+        receiver->exec->release(ctx);
+    }
+    receiver->tx->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
 // One sender -> TWO receivers sharing ONE small outgoing arena, deliberately oversubscribed: B and C

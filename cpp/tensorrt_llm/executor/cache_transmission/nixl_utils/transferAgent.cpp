@@ -102,7 +102,9 @@ public:
     [[nodiscard]] bool isCompleted() const override
     {
         // Success only (TransferStatus contract, mirrors NixlTransferStatus): a failed transfer never
-        // reports completed; callers poll wait()/getLastStatusStr for the outcome.
+        // reports completed; callers poll wait()/getLastStatusStr for the outcome. get() cannot throw:
+        // the promise is only ever resolved with set_value, and every erase/shutdown path resolves it
+        // first, so broken_promise is unreachable.
         return mFut.valid() && mFut.wait_for(std::chrono::seconds(0)) == std::future_status::ready
             && mFut.get().state == TransferState::kSUCCESS;
     }
@@ -237,7 +239,7 @@ void NixlTransferAgent::maybeInitBounce(
         // capacity — the one advertised in the handshake) next to the configured one.
         TLLM_LOG_INFO(
             "NixlTransferAgent(%s): bounce v2 enabled (arenaSizeBytes=%zu arenaAllocationGranularityBytes=%zu "
-            "maxChunkSizeBytes(effective)=%zu (agent-side value before the arena capacity clamp: %zu) "
+            "maxChunkSizeBytes(effective)=%zu (before the buddy usable-capacity clamp: %zu) "
             "maxInflightChunksPerRequest=%u "
             "copyStreamCount=%u scatterWorkerCount=%u minDescriptorCount=%zu maxAverageDescriptorSizeBytes=%zu "
             "requestTimeoutMs=%d receiverFlowTimeoutMs=%d quarantineMs=%d disableFabricMemory=%d "
@@ -317,7 +319,7 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
         }
         totalBytes += len;
     }
-    // max_average_descriptor_size = 0 is the kill switch: reject unconditionally (an all-zero-length
+    // max_average_descriptor_size = 0 disables outbound routing (gate off): reject unconditionally (an all-zero-length
     // request would otherwise pass "avg > 0").
     std::uint64_t const avg = totalBytes / srcs.size();
     if (cfg.maxAverageDescriptorSizeBytes == 0 || avg > cfg.maxAverageDescriptorSizeBytes)
