@@ -967,14 +967,10 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
-        # Set when a generation transfer completes during benchmark fill. The
-        # gate consumes this signal to retry immediately instead of adding an
-        # unnecessary polling delay after transfer progress.
-        self._disagg_gen_transfer_made_progress = False
         self._benchmark_transfer_progress_global = False
-        # A completion can surface through a status ID or request-state
-        # mutation. Credit each logical request once across both signals so it
-        # cannot reset the benchmark fill watchdog more than once.
+        # Generation transfers already credited as fill progress, so a request
+        # that stays in TRANS_COMPLETE across gate checks resets the fill
+        # watchdog only once.
         self._benchmark_completed_gen_transfer_ids: set[int] = set()
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
@@ -3934,7 +3930,6 @@ class PyExecutor:
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
-        self._disagg_gen_transfer_made_progress = False
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -4218,8 +4213,8 @@ class PyExecutor:
             the caller should ``continue`` to the next loop iteration.
         """
         if not self.is_warmup and not can_forward:
-            transfer_made_progress = self._disagg_gen_transfer_made_progress
-            self._disagg_gen_transfer_made_progress = False
+            transfer_made_progress = self._benchmark_gen_transfer_made_progress(
+            )
             can_forward = self._is_benchmark_disagg_fill_complete(
                 scheduled_batch, transfer_made_progress)
             transfer_made_progress = self._benchmark_transfer_progress_global
@@ -4240,6 +4235,24 @@ class PyExecutor:
                 self._fail_if_fill_gate_stalled(transfer_made_progress)
                 return can_forward, True
         return can_forward, False
+
+    def _benchmark_gen_transfer_made_progress(self) -> bool:
+        """Whether a generation KV transfer completed since the last gate check.
+
+        Both transceiver runtimes leave a completed receive in
+        DISAGG_GENERATION_TRANS_COMPLETE until the gate opens and the request
+        is promoted to generation, so scanning request state here observes
+        every completion regardless of how the runtime reported it.
+        """
+        completed_ids = {
+            get_unique_rid(req)
+            for req in self.active_requests
+            if req.is_disagg_generation_transmission_complete
+        }
+        new_completed_ids = (completed_ids -
+                             self._benchmark_completed_gen_transfer_ids)
+        self._benchmark_completed_gen_transfer_ids.update(new_completed_ids)
+        return bool(new_completed_ids)
 
     def _fail_if_fill_gate_stalled(self, made_progress: bool) -> None:
         """Give the fill gate's retry loop a deadline.
@@ -7746,8 +7759,6 @@ class PyExecutor:
             # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
-                    self._disagg_gen_transfer_made_progress = True
             self._check_cache_transfer_errors("generation requests")
             return
 
@@ -7957,38 +7968,8 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        # Python transceivers report completed IDs, while the C++ runtime only
-        # mutates request state. Capture both forms of completion so the fill
-        # watchdog remains independent of the selected transceiver runtime.
-        tracked_requests = ()
-        track_benchmark_fill_progress = (self.is_benchmark_disagg
-                                         and not self.is_warmup
-                                         and self._dist_size(
-                                             self.dist, "pp_size") == 1
-                                         and self._benchmark_fill_phase_active)
-        if track_benchmark_fill_progress:
-            tracked_requests = tuple(
-                req for req in self.active_requests
-                if req.is_disagg_generation_transmission_in_progress)
-
         gen_status = self.kv_cache_transceiver.check_gen_transfer_status(
             atLeastNum)
-        if track_benchmark_fill_progress:
-            completed_request_ids = set(gen_status.completed_request_ids)
-            for req in tracked_requests:
-                if (req.state
-                        != LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
-                    continue
-                request_id = get_unique_rid(req)
-                if request_id is not None:
-                    completed_request_ids.add(request_id)
-            new_completed_request_ids = (
-                completed_request_ids -
-                self._benchmark_completed_gen_transfer_ids)
-            if new_completed_request_ids:
-                self._benchmark_completed_gen_transfer_ids.update(
-                    new_completed_request_ids)
-                self._disagg_gen_transfer_made_progress = True
         if gen_status.cancelled_requests:
             user_canceled_set = set(self.canceled_req_ids)
             for req in gen_status.cancelled_requests:
