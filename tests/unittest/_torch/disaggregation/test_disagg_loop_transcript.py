@@ -20,14 +20,24 @@ executed-batch/lifecycle transcripts of PR-5.
 
 import inspect
 import queue
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    CtxTransferStatus,
+    GenTransferStatus,
+)
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
+    DisaggLoopDelegates,
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
+)
+from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
+    PyExecutorEffects,
+    PyExecutorRequestRegistry,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
@@ -301,3 +311,78 @@ def test_pp_ranks_issue_the_same_collective_sensitive_calls(monkeypatch) -> None
 
     assert _collective_calls(first) == _collective_calls(other)
     assert _collective_calls(first)  # the comparison is not vacuous
+
+
+# -- timeout-consensus collective under attention DP -------------------------
+
+
+def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExecutor:
+    """Idle executor on a two-rank ADP group with the coordinator the executor
+    would really build: the no-op one without a transceiver, otherwise a real
+    one whose CS-1 paths run against a quiet transceiver (the still-delegated
+    entry points are stubbed)."""
+    executor = _idle_executor(monkeypatch, calls)
+    executor.enable_attention_dp = True
+    executor.dist = Mock(rank=rank, tp_size=2, world_size=2)
+    executor.dist.tp_allgather_int64.return_value = Mock(any=lambda: False)
+    executor.kv_cache_transceiver = transceiver
+    del executor._disagg_coordinator
+    if transceiver is not None:
+        executor._disagg_coordinator = DisaggTransferCoordinator(
+            transceiver=transceiver,
+            transfer_manager=executor.async_transfer_manager,
+            kv_cache_manager=None,
+            dist=executor.dist,
+            effects=PyExecutorEffects(executor),
+            registry=PyExecutorRequestRegistry(executor),
+            enable_attention_dp=True,
+            force_terminate_ctx_for_partial_reuse=False,
+            delegates=DisaggLoopDelegates(
+                **{f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
+            ),
+        )
+    return executor
+
+
+def _quiet_transceiver() -> Mock:
+    transceiver = Mock()
+    transceiver.kv_transfer_timeout_ms = None
+    transceiver.supports_inflight_request_cancellation.return_value = False
+    transceiver.check_gen_transfer_status.return_value = GenTransferStatus([], [], [])
+    transceiver.check_context_transfer_status.return_value = CtxTransferStatus([], [])
+    return transceiver
+
+
+def test_adp_ranks_without_a_transceiver_skip_the_timeout_consensus_symmetrically(
+    monkeypatch,
+) -> None:
+    """Intentional behavior change of the coordinator extraction: with the
+    transceiver disabled, no rank enters the per-iteration timeout-consensus
+    allgather. Transceiver enablement is rank-uniform within a collective
+    group (both ranks build the no-op coordinator here), so the skip is
+    symmetric, and the iteration still reaches its other ADP boundary."""
+    transcripts = []
+    for rank in (0, 1):
+        calls = []
+        executor = _adp_executor(monkeypatch, calls, rank=rank, transceiver=None)
+        PyExecutor._executor_loop(executor)
+        assert isinstance(executor.disagg, NoopDisaggCoordinator)
+        executor.dist.tp_allgather_int64.assert_not_called()
+        transcripts.append(calls)
+
+    assert transcripts[0] == transcripts[1]
+    assert ("flush_pending_transfer_responses",) in transcripts[0]
+
+
+def test_adp_ranks_with_a_transceiver_still_vote_on_timeouts_once_per_iteration(
+    monkeypatch,
+) -> None:
+    """The enabled-disagg path is unchanged: every rank enters the timeout
+    consensus exactly once per completed iteration, before the response flush."""
+    for rank in (0, 1):
+        calls = []
+        executor = _adp_executor(monkeypatch, calls, rank=rank, transceiver=_quiet_transceiver())
+        PyExecutor._executor_loop(executor)
+
+        executor.dist.tp_allgather_int64.assert_called_once_with([False])
+        assert ("flush_pending_transfer_responses",) in calls
