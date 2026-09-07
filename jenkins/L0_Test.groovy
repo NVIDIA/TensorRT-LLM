@@ -561,7 +561,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                         error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
                     }
-                } else if (fileExists("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
                     // Same duration/no-signature gap as the regular-test path: this
                     // finished but failed, and was never actually rerun, so
                     // results_isolated_${i}.xml still carries the original
@@ -4400,6 +4400,12 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
+// generate_rerun_tests_list opens rerun_0/1/2.txt eagerly but removes any that
+// end up empty, so this also guards against a future change to that cleanup.
+def fileHasContent(path) {
+    return fileExists(path) && readFile(path).trim()
+}
+
 // Return true means the test rerun also fails. Return false otherwise.
 def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
@@ -5346,7 +5352,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
-                        } else if (fileExists("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                        } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
                             // Failures that finished (not a timeout) but were never
                             // rerun because duration > 10 min and no known failure
                             // signature matched: results.xml still carries their
