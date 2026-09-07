@@ -1510,7 +1510,9 @@ def _fp8_kernel(
         ntie = sCtl[10]
         nvt = I32(0)
         if last:
-            if (ntie > r2) and (ntie <= TIECAP):
+            # the zero class (fp16 key 0x8000) needs no rescoring: relu-weighted sums that round
+            # to fp16 zero are exact fp32 zeros, so its members tie in fp32 too
+            if (ntie > r2) and (ntie <= TIECAP) and ((b1 * NFINE + b2) != 0x8000):
                 nvt = (ntie + 3) // 4
         sTS = cute.make_tensor(cute.recast_ptr(sCand.iterator, dtype=F32), cute.make_layout(CAP))
         sPG = cute.make_tensor(sTot.iterator, cute.make_layout(TIECAP))
