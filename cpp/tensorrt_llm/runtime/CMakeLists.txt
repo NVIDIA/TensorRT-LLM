@@ -25,7 +25,6 @@ set(SRCS
     loraUtils.cpp
     loraModule.cpp
     loraCache.cpp
-    gptJsonConfig.cpp
     iBuffer.cpp
     iTensor.cpp
     ipcUtils.cpp

@@ -1387,8 +1387,7 @@ class ModelConfig(Generic[TConfig]):
     ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
-        Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
-        that an engine has been created.
+        Currently it assumes that an engine has been created.
 
         Args:
             tokens_per_block: The number of tokens per block. Please note that in PyTorch flow tokens_per_block is not available in the model config, instead it is defined in the executor config.
