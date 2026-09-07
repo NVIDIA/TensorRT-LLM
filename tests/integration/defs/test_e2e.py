@@ -975,7 +975,6 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
-        "--use_one_model",
     ])
 
 
@@ -1226,7 +1225,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         "--relaxed_topk=10",
         "--relaxed_delta=0.5",
         "--enable_attention_dp",
-        "--use_one_model",
         "--moe_backend",
         "DEEPGEMM" if is_blackwell else "CUTLASS",
     ])

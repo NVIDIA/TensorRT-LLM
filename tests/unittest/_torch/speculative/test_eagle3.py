@@ -786,7 +786,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
+@pytest.mark.parametrize("eagle3_one_model", [True])
 def test_eagle3_spec_decoding_stats(eagle3_one_model):
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
     models_path = llm_models_root()
@@ -1028,7 +1028,7 @@ def test_deepseek_mla_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [True, False])
+@pytest.mark.parametrize("use_one_model", [True])
 def test_multi_eagle3(use_one_model: bool):
     use_cuda_graph = True
     attn_backend = "TRTLLM"

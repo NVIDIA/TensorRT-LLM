@@ -3510,11 +3510,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
-            # Base coverage: eagle3_one_model x enable_chunked_prefill.
+            # Base coverage: enable_chunked_prefill on/off.
             (True, True, False, False),
             (True, False, False, False),
-            (False, True, False, False),
-            (False, False, False, False),
             # Test max_concurrency control and draft_len_schedule.
             (True, False, False, True),
             (True, False, True, False),
