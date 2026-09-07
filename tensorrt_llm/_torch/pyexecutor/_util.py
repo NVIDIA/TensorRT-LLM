@@ -498,8 +498,10 @@ def _derive_layer_type_attention_windows(
     resolved = _normalize_attention_windows(
         [max_seq_len if window is None else window for window in windows],
         max_seq_len)
-    if resolved is None or len(resolved) == 1:
-        # Uniform schedule: the single-window default already covers it.
+    if resolved is None or not uses_vswa_kv_cache_layout(resolved):
+        # A schedule with <2 distinct positive windows can't select a VSWA
+        # (multi-pool) layout, so a derived vector would only reshape the single
+        # shared pool. Leave it to the single-window default.
         return None
     return resolved
 
@@ -2501,11 +2503,21 @@ def _create_kv_cache_manager(
     # always resolves to KVCacheManagerV2 (see _non_hybrid_kv_cache_manager_cls),
     # so the V2 guard never excludes it.  A user-supplied max_attention_window
     # always wins.
-    if (kv_cache_config.max_attention_window is None
+    # Skip derivation for the one-model draft manager: (1) in one-model
+    # spec-decode the KV memory budget is already split between target and
+    # draft, so VSWA sizing here would size each window pool from the unsplit
+    # free-memory budget; (2) draft layers live at global indices past the
+    # target's num_hidden_layers, so _project_max_attention_window_vec would
+    # wrap them back onto pattern[0]. The draft config sets
+    # max_attention_window=None to opt out, not to request derivation.
+    if (kv_cache_config.max_attention_window is None and not is_draft
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
         derived_windows = _derive_layer_type_attention_windows(
             config, max_seq_len)
         if derived_windows is not None:
+            assert uses_vswa_kv_cache_layout(derived_windows), (
+                "derived per-layer windows must select a VSWA layout; a non-VSWA "
+                "vector would reshape the single pool instead of splitting it")
             kv_cache_config = copy.copy(kv_cache_config)
             kv_cache_config.max_attention_window = derived_windows
 
