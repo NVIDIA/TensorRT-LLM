@@ -73,7 +73,6 @@ class _Harness:
             kv_transfer_timeout_ms=kv_transfer_timeout_ms,
             supports_inflight_cancellation=supports_inflight_cancellation,
         )
-        self.transceiver.pipeline_transfer_enabled = False
         self.transceiver.has_retired_send_session = lambda req: False
         self.kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
         self.kv_cache_manager.store_blocks_for_reuse.side_effect = lambda req, _: req.py_request_id

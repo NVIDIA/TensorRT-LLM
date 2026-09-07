@@ -328,6 +328,9 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
     executor.kv_cache_transceiver = transceiver
     del executor._disagg_coordinator
     if transceiver is not None:
+        # admit is the one delegate whose return value the loop unpacks.
+        delegates = {f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
+        delegates["admit"] = lambda fitting: (fitting, False)
         executor._disagg_coordinator = DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=executor.async_transfer_manager,
@@ -337,9 +340,7 @@ def _adp_executor(monkeypatch, calls: list, *, rank: int, transceiver) -> PyExec
             registry=PyExecutorRequestRegistry(executor),
             enable_attention_dp=True,
             force_terminate_ctx_for_partial_reuse=False,
-            delegates=DisaggLoopDelegates(
-                **{f.name: (lambda *a, **k: None) for f in fields(DisaggLoopDelegates)}
-            ),
+            delegates=DisaggLoopDelegates(**delegates),
         )
     return executor
 
