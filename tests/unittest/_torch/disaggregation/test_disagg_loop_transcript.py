@@ -47,12 +47,12 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "poll_progress_when_idle",  # ctx transfer status consensus
     "receive_gen_init",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
+    "handle_timeouts_synced",  # tp_allgather_int64 under ADP
 }
 # Executor-owned per-iteration collectives that must stay in lockstep with the
 # coordinator calls under ADP.
 _COLLECTIVE_EXECUTOR_EVENTS = {
     "flush_pending_transfer_responses",  # tp_gather in _enqueue_responses
-    "handle_kv_transfer_timeouts_synced",  # tp_allgather
 }
 _COLLECTIVE_SENSITIVE = _COLLECTIVE_COORDINATOR_CALLS | _COLLECTIVE_EXECUTOR_EVENTS
 
@@ -71,8 +71,8 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
     coordinator = NoopDisaggCoordinator()
     for name in _entry_points():
 
-        def record(*args, _name=name):
-            calls.append((_name, *args))
+        def record(*args, _name=name, **kwargs):
+            calls.append((_name, *args, *(f"{key}={value}" for key, value in kwargs.items())))
 
         setattr(coordinator, name, record)
 
@@ -99,9 +99,6 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor._disagg_coordinator = _recording_coordinator(calls)
     executor._flush_pending_transfer_responses = lambda: calls.append(
         ("flush_pending_transfer_responses",)
-    )
-    executor._handle_kv_transfer_timeouts_synced = lambda: calls.append(
-        ("handle_kv_transfer_timeouts_synced",)
     )
     executor.kv_cache_transceiver = Mock()
     executor.async_transfer_manager = Mock()
@@ -223,7 +220,8 @@ def test_executor_loop_transcript(monkeypatch) -> None:
     PyExecutor._executor_loop(executor)
 
     idle_pass = _SCHEDULE_HEAD + [
-        ("handle_kv_transfer_timeouts_synced",),
+        ("handle_timeouts_synced",),
+        ("check_transfer_timeouts", "only_with_context_sends=True"),
         ("flush_pending_transfer_responses",),
         ("pace_idle",),
     ]
@@ -242,7 +240,8 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
 
     idle_pass = _SCHEDULE_HEAD + [
         ("flush_pending_transfer_responses",),
-        ("handle_kv_transfer_timeouts_synced",),
+        ("handle_timeouts_synced",),
+        ("check_transfer_timeouts", "only_with_context_sends=True"),
         ("pace_idle",),
     ]
     assert calls == idle_pass + _SHUTDOWN_PASS

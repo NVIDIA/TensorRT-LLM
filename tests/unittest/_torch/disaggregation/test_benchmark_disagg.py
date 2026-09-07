@@ -91,6 +91,24 @@ def _make_v2_kv_cache_manager() -> Mock:
     return manager
 
 
+def _stub_transfer_entry_points(ex) -> None:
+    """Mock the coordinator's transfer polls once the executor builds it.
+
+    The build stays lazy so a test can still swap delegated executor methods
+    (admission, gen init, idle progress) before the first ``ex.disagg`` use.
+    """
+    build = ex._build_disagg_coordinator
+
+    def build_and_stub():
+        coordinator = build()
+        coordinator.poll_gen_transfers = Mock()
+        coordinator.check_transfer_timeouts = Mock()
+        coordinator.reap_context_sends = Mock()
+        return coordinator
+
+    ex._build_disagg_coordinator = build_and_stub
+
+
 class MockBenchmarkExecutor:
     """Minimal stub mirroring benchmark-fill PyExecutor attributes.
 
@@ -859,9 +877,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         mock_fetch = Mock(return_value=[])
         ex._fetch_and_activate_new_requests = mock_fetch
         ex._check_disagg_ctx_schedulable_status = Mock()
-        ex._check_disagg_gen_transfer_status = Mock()
-        ex._check_kv_transfer_timeout = Mock()
-        ex._check_disagg_ctx_cache_transfer_status = Mock()
+        _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         ex._prepare_disagg_gen_init = Mock()
@@ -1254,10 +1270,7 @@ class TestFailFastDuringBenchmarkFill:
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._check_disagg_ctx_schedulable_status = Mock()
-        ex._check_disagg_gen_transfer_status = Mock()
-        ex._check_disagg_gen_cache_transfer_status = Mock()
-        ex._check_kv_transfer_timeout = Mock()
-        ex._check_disagg_ctx_cache_transfer_status = Mock()
+        _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
@@ -1341,7 +1354,7 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
         ex._prepare_disagg_gen_init.assert_called_once_with([])
-        ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1533,9 +1546,7 @@ class TestFillPhaseEndToEnd:
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._check_disagg_ctx_schedulable_status = Mock()
-        ex._check_disagg_gen_transfer_status = Mock()
-        ex._check_kv_transfer_timeout = Mock()
-        ex._check_disagg_ctx_cache_transfer_status = Mock()
+        _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()

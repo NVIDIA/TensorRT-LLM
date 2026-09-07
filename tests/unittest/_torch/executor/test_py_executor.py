@@ -21,9 +21,12 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
+from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -697,9 +700,42 @@ def _make_request(complete_state, transmission_state):
     return req
 
 
+def _make_transfer_coordinator(
+    *,
+    active_requests=None,
+    canceled_request_ids=(),
+    force_terminate_ctx_for_partial_reuse: bool = False,
+    tp_size: int = 1,
+):
+    """Coordinator over mocked services; returns (coordinator, transceiver, effects)."""
+    transceiver = Mock()
+    transceiver.kv_transfer_timeout_ms = None
+    transceiver.supports_inflight_request_cancellation.return_value = False
+    transceiver.check_gen_transfer_status.return_value = GenTransferStatus([], [], [])
+    effects = Mock(spec=ExecutorEffects)
+    active = active_requests if active_requests is not None else []
+    coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=Mock(),
+        kv_cache_manager=None,
+        dist=Mock(rank=0, tp_size=tp_size, world_size=tp_size),
+        effects=effects,
+        registry=types.SimpleNamespace(
+            active_requests=lambda: tuple(active),
+            contains=lambda request: request in active,
+            remove=active.remove,
+            canceled_request_ids=lambda: list(canceled_request_ids),
+        ),
+        enable_attention_dp=False,
+        force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
+        delegates=Mock(),
+    )
+    return coordinator, transceiver, effects
+
+
 class TestDisaggTerminationGuard:
     """Verify _handle_responses does not double-terminate DISAGG_CONTEXT_COMPLETE
-    requests that were already cleaned up by _check_disagg_ctx_cache_transfer_status
+    requests that were already cleaned up by the coordinator's context reap
     (nvbug/5961736)."""
 
     def test_normal_path_skips_context_complete(self):
@@ -751,41 +787,35 @@ class TestDisaggTerminationGuard:
     def test_pp_gt_1_terminates_on_transfer_complete(self):
         """PP>1: the early path leaves the request out of requests_to_terminate
         AND out of new_active_requests, so it is removed from active_requests
-        but retained by AsyncTransferManager. The real
-        _end_transfer_and_maybe_terminate must then terminate it exactly once
-        when the transfer completes (force_terminate_ctx_for_partial_reuse=False)."""
+        but retained by AsyncTransferManager. The coordinator's release must
+        then terminate it exactly once when the transfer completes
+        (force_terminate_ctx_for_partial_reuse=False)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
+        coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # already removed by _handle_responses
-            async_transfer_manager=Mock(),
             force_terminate_ctx_for_partial_reuse=False,
-            _terminate_request=Mock(),
         )
-        executor.async_transfer_manager.end_transfer.return_value = True
+        coordinator._transfers.end_transfer.return_value = True
 
-        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+        coordinator.release_transfer(req)
 
-        executor._terminate_request.assert_called_once_with(req)
+        effects.terminate_request.assert_called_once_with(req)
 
     def test_pp1_does_not_double_terminate_on_transfer_complete(self):
         """PP=1: the early path already terminated the request (and removed it
-        from active_requests). The real _end_transfer_and_maybe_terminate must
-        skip re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
+        from active_requests). The coordinator's release must skip
+        re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
         avoid a double free_resources (nvbug/5961736)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
+        coordinator, _, effects = _make_transfer_coordinator(
             active_requests=[],  # already removed + terminated by early path
-            async_transfer_manager=Mock(),
             force_terminate_ctx_for_partial_reuse=True,
-            _terminate_request=Mock(),
         )
-        executor.async_transfer_manager.end_transfer.return_value = True
+        coordinator._transfers.end_transfer.return_value = True
 
-        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+        coordinator.release_transfer(req)
 
-        executor._terminate_request.assert_not_called()
+        effects.terminate_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1095,66 +1125,62 @@ class TestDisaggTransferAdmissionController:
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferIdleProgress:
     def test_gen_transfer_status_polls_active_transfers(self):
-        executor = object.__new__(PyExecutor)
-        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
-        executor._check_disagg_gen_cache_transfer_status = Mock()
+        coordinator, transceiver, _ = _make_transfer_coordinator(
+            active_requests=[_make_disagg_transfer_request(1, 32, in_progress=True)]
+        )
 
-        PyExecutor._check_disagg_gen_transfer_status(executor)
+        coordinator.poll_gen_transfers()
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        transceiver.check_gen_transfer_status.assert_called_once_with(0)
 
     def test_gen_transfer_status_enters_without_local_active_transfers(self):
-        executor = object.__new__(PyExecutor)
-        executor.active_requests = []
-        executor._check_disagg_gen_cache_transfer_status = Mock()
+        """The status poll is a rank consensus; a rank with nothing in flight
+        must still enter it."""
+        coordinator, transceiver, _ = _make_transfer_coordinator(active_requests=[])
 
-        PyExecutor._check_disagg_gen_transfer_status(executor)
+        coordinator.poll_gen_transfers()
 
-        executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(0)
+        transceiver.check_gen_transfer_status.assert_called_once_with(0)
 
     def test_gen_transfer_status_skips_sync_mode(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
-        executor = object.__new__(PyExecutor)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
+        coordinator, transceiver, _ = _make_transfer_coordinator()
 
-        PyExecutor._check_disagg_gen_transfer_status(executor)
+        coordinator.poll_gen_transfers()
 
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        transceiver.check_gen_transfer_status.assert_not_called()
 
     def test_polls_context_transfers_without_blocking(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
 
     def test_does_not_repeat_gen_status_polled_by_loop_head(self):
         """The loop head already polls GEN status every iteration."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
 
     def test_idle_poll_enters_no_extra_collective(self):
         """The context poll is rank-symmetric, so no gating collective is needed."""
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=4, world_size=16)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
         executor.dist.tp_cp_allgather.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
 
     def test_gen_only_no_context_benchmark_polls_context_when_idle(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1162,14 +1188,13 @@ class TestDisaggTransferIdleProgress:
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
 
     def test_sync_transfer_skips_idle_progress_collectives(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1179,16 +1204,15 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor.async_transfer_manager = Mock()
         executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
         executor.dist.tp_cp_allgather.assert_not_called()
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
+        executor._disagg_coordinator.reap_context_sends.assert_not_called()
 
     def test_sync_single_rank_ctx_skips_poll_without_inflight_transfer(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1214,22 +1238,21 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
         executor.async_transfer_manager = Mock()
         executor.async_transfer_manager.has_any_inflight_requests.return_value = True
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
         executor.dist.allreduce.assert_not_called()
         executor.dist.tp_allreduce.assert_not_called()
         executor.dist.tp_cp_allgather.assert_not_called()
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
+        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
+        executor._disagg_coordinator.reap_context_sends.assert_called_once_with(0)
 
     def test_sync_receive_does_not_poll_async_status(self, monkeypatch):
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
-        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
         executor._check_cache_transfer_errors = Mock()
         requests = [
             Mock(state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE),
@@ -1243,7 +1266,7 @@ class TestDisaggTransferIdleProgress:
             for call in executor.kv_cache_transceiver.request_and_receive_sync.call_args_list
         ] == requests
         executor.kv_cache_transceiver.request_and_receive_async.assert_not_called()
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
         executor._check_cache_transfer_errors.assert_called_once_with("generation requests")
 
     def test_sync_receive_drains_batch_before_rank_aligned_error_vote(self, monkeypatch):
@@ -1335,14 +1358,16 @@ class TestIdleDisaggLoopPacing:
         expect_sleep: bool,
     ) -> None:
         sleep = Mock()
-        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep", sleep)
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.disaggregation.orchestration.coordinator.time.sleep", sleep
+        )
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock() if has_transceiver else None
         executor.async_transfer_manager = Mock()
         executor.async_transfer_manager.has_any_inflight_requests.return_value = ctx_inflight
         executor.active_requests = [self._make_request(**request_kwargs)]
 
-        PyExecutor._pace_idle_disagg_loop(executor)
+        executor.disagg.pace_idle()
 
         assert sleep.called is expect_sleep
 
@@ -2903,7 +2928,10 @@ def _make_disagg_err_stub(
         kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
         kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     stub.kv_cache_transceiver = kv_cache_transceiver
-    stub._disagg_inflight_cancel_unsupported_logged = False
+    stub.disagg = types.SimpleNamespace(
+        inflight_cancel_active=lambda: False,
+        take_pending_context_failures=set,
+    )
     stub.active_requests = active_requests if active_requests is not None else []
     stub.dist = Mock()
     stub.dist.world_size = world_size
@@ -2923,7 +2951,6 @@ def _make_disagg_err_stub(
     stub._request_vote_id = PyExecutor._request_vote_id
     for helper in (
         "_handle_disagg_cache_errors_synced",
-        "_is_disagg_inflight_cancel_active",
         "_is_disagg_error_cleanup_blocked",
         "_get_disagg_reqs_in_error_state",
         "_check_cache_transfer_errors",
@@ -3208,7 +3235,6 @@ class TestPendingTransferResponseFlush:
         executor.kv_connector_manager = None
         executor._revert_gen_alloc = Mock()
         executor._finalize_adp_dummy_allocation = Mock()
-        executor._handle_kv_transfer_timeouts_synced = Mock()
         executor.kv_cache_transceiver = None
         executor._kv_connector_terminate_requests = Mock()
         executor._flush_iter_stats_synced = Mock()
@@ -3341,9 +3367,6 @@ class TestOneModelMTPDraftTokenScheduling:
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._check_disagg_ctx_schedulable_status = Mock()
-        ex._check_disagg_gen_transfer_status = Mock()
-        ex._check_kv_transfer_timeout = Mock()
-        ex._check_disagg_ctx_cache_transfer_status = Mock()
         ex._pad_attention_dp_dummy_request = Mock()
         ex._prefetch_for_context_requests = Mock()
         ex._prepare_disagg_gen_init = Mock()

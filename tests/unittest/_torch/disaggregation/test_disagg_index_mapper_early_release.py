@@ -80,9 +80,9 @@ class _FakeExecutor(PyExecutor):
         self.disable_overlap_scheduler = True
         self.previous_batch = None
         self.canceled_req_ids = []
-
-    def _check_disagg_ctx_cache_transfer_status(self, _):
-        return None
+        # The send leg is real; the reap is not under test here.
+        self._disagg_coordinator = self._build_disagg_coordinator()
+        self._disagg_coordinator.reap_context_sends = lambda at_least=0: None
 
 
 class TestSendKvAsyncReleasesIndexSlot:
