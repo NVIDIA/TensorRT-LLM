@@ -718,3 +718,20 @@ index 306b416..a564d47 100644
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
+index e3473fb..dc4cfb0 100644
+--- a/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
++++ b/python/fmha_sm100/cute/src/common/cute_dsl_utils.py
+@@ -128,10 +128,8 @@ if os.getenv("MINIMAX_LOG_COMPILE", "0") == "1":
+     logger.setLevel(logging.DEBUG)
+ 
+ 
+-# Monkey-patch cute.compile so every JIT compile across the repo gets timed
+-# without touching individual call sites.  Idempotent: only patches once.
+-if cute.compile is not cute_compile_patched:
+-    cute.compile = cute_compile_patched
++# TensorRT-LLM shares CUTLASS across attention backends, so importing MSA must
++# not replace the process-global cute.compile callable.
+ 
+ 
+ def assume_strides_aligned(t):

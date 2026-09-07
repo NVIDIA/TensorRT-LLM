@@ -1,6 +1,9 @@
 #!/bin/bash
 set -ex
 
+# Authenticate the github.com clones below; no-op when no token is available.
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
 MOONCAKE_VERSION="v0.3.7.post2"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"

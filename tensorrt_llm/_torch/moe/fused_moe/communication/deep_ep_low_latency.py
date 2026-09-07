@@ -48,7 +48,7 @@ class DeepEPLowLatency(Communication):
     Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
     """
 
-    MAX_TOP_K: int = 9
+    MAX_TOP_K: int = 16
     """int: Compile-time top-k cap of the low-latency kernels.
 
     ``kNumMaxTopK``/``kNumMaxTopk`` in internode_ll.cu (dispatch and combine)

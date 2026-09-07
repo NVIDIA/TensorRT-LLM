@@ -442,6 +442,11 @@ class ConfigurableMoE(MoE):
         if not self.backend.capabilities.supports_dwdp:
             return False
 
+        # DWDP rebinds the backend parameters, which would strand the localized
+        # weight shards. Not enabling it is the correct outcome, not an error.
+        if self.backend.uses_locality_domain:
+            return False
+
         quant_config = getattr(self.backend, "quant_config", None)
         if quant_config is None:
             quant_config = getattr(self.model_config, "quant_config", None)

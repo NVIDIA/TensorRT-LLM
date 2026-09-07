@@ -10,7 +10,7 @@ from unittest.mock import Mock, call
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm._torch.modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS, TopK, TopKImplementation
 
 
 def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
@@ -298,14 +298,25 @@ def test_gvr_v2_decode_rejects_output_width_mismatch(monkeypatch) -> None:
     runner.assert_not_called()
 
 
-def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+        ),
+    ],
+)
+def test_update_gvr_prior_from_prefill_uses_last_request_rows(device) -> None:
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
-    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
-    prior_indices = torch.zeros(3, 2, dtype=torch.int32)
+    prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32, device=device)
+    prior_indices = torch.zeros(3, 2, dtype=torch.int32, device=device)
 
+    # Production passes the device seq_lens twin so the row gather stays async.
     top_k.update_gvr_prior_from_prefill(
         prefill_indices,
-        torch.tensor([2, 1], dtype=torch.int32),
+        torch.tensor([2, 1], dtype=torch.int32, device=device),
         prior_indices,
         request_offset=1,
     )
@@ -429,8 +440,43 @@ def test_cuda_gvr_reserves_workspace_during_capture(monkeypatch) -> None:
     assert prior_indices.tolist() == [[0, 0]]
 
 
-def test_unsupported_prefill_implementation_raises() -> None:
+def test_cute_dsl_prefill_dispatches_to_blackwell_kernel(monkeypatch) -> None:
+    prefill = Mock()
+    # The op is registered only when CUTLASS DSL is available, so patch
+    # without requiring a pre-existing attribute.
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_indexer_topk_prefill_blackwell",
+        prefill,
+        raising=False,
+    )
     top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_RADIX)
+    scores = torch.ones(1, 1)
+    output = torch.empty(1, 1, dtype=torch.int32)
+    row_starts = torch.zeros(1, dtype=torch.int32)
+    row_ends = torch.ones(1, dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=True,
+        row_starts=row_starts,
+        row_ends=row_ends,
+    )
+
+    assert result is output
+    prefill.assert_called_once_with(
+        scores,
+        row_starts,
+        row_ends,
+        output,
+        1,
+        _CUTE_DSL_PREFILL_COPY_BITS,
+    )
+
+
+def test_unsupported_prefill_implementation_raises() -> None:
+    top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
 
     with pytest.raises(NotImplementedError, match="does not support prefill Top-K"):
         top_k(

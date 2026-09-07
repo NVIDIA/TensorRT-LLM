@@ -44,7 +44,6 @@ set(SRCS
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
     sequenceSlotManager.cpp
-    utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp

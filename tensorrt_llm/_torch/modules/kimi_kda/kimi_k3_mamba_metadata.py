@@ -4,7 +4,7 @@
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 
 KDA_PREFILL_CHUNK_SIZE = 64

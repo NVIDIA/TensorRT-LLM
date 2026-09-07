@@ -50,6 +50,13 @@ CUBLAS_VERSION     ?=
 GIT_COMMIT         ?= $(shell git rev-parse HEAD)
 TRT_LLM_VERSION    ?= $(shell grep '^__version__' ../tensorrt_llm/version.py | grep -o '=.*' | tr -d '= "')
 GITHUB_MIRROR      ?=
+# Optional GitHub token used to authenticate the github.com clones performed
+# during the build (see docker/common/github_auth.sh). Usually inherited from the
+# environment, never passed as a build arg -- build-arg values stay readable in
+# `docker history`. Empty means anonymous, rate-limited access.
+GITHUB_CLONE_TOKEN ?=
+COMMA              := ,
+GITHUB_SECRET_ARG  := $(if $(GITHUB_CLONE_TOKEN),--secret id=github_clone_token$(COMMA)env=GITHUB_CLONE_TOKEN)
 PYTHON_VERSION     ?=
 NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
@@ -87,6 +94,7 @@ base_pull:
 	@echo "Building docker image: $(IMAGE_WITH_TAG)"
 	docker buildx build $(DOCKER_BUILD_OPTS) $(DOCKER_BUILD_ARGS) \
 		--progress $(DOCKER_PROGRESS) \
+		$(GITHUB_SECRET_ARG) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
