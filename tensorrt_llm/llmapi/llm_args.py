@@ -5461,10 +5461,11 @@ class TorchCompileConfig(StrictBaseModel):
 
     compile_only_piecewise_graphs: bool = Field(
         default=False,
-        description="Compile only context and mixed-batch execution graphs. "
-        "When enabled, generation-only and auxiliary kernel warmup forwards "
-        "use eager execution, while dedicated context/mixed compilation and "
-        "piecewise CUDA graph warmup and capture remain compiled.",
+        description="Compile only context and mixed-batch execution graphs, "
+        "while generation-only and auxiliary kernel warmup forwards "
+        "remain eager. Enabling this will speed up startup, but might "
+        "lead to degraded performance or inconsistent output in "
+        "specific configurations.",
         status="prototype")
 
     enable_inductor: bool = Field(
