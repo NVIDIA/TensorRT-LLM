@@ -13,19 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
-
 import pytest
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import similar
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig, NGramDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
-from utils.util import similar
 
 
 # # ============================================================================

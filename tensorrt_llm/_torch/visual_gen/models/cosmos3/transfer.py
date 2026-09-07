@@ -223,7 +223,7 @@ def resolve_transfer_config(
             raise ValueError(
                 f"Cosmos3 transfer hint '{key}' must carry encoded control bytes, not a path "
                 f"({raw!r}); read the file client-side (Path(control).read_bytes()), as the "
-                "'video' extra param does."
+                "typed video reference does."
             )
         if not isinstance(raw, Mapping):
             # ValueError, not TypeError: the worker's error classifier maps
