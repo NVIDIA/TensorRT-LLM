@@ -119,6 +119,7 @@ def _run_disagg_sol(args) -> None:
 
     import yaml
 
+    from . import spawn
     from .disagg_sol import DisaggSolError, supervise
 
     raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
@@ -133,6 +134,15 @@ def _run_disagg_sol(args) -> None:
             label=block.get("label") or root.name,
             incumbent=block.get("incumbent"),
             dry_run=bool(getattr(args, "dry_run", False)),
+            # Only when the spec says where the skill lives. Without it the
+            # design stays an input and an unestablished one is refused --
+            # which is the safer default for a step that costs an order of
+            # magnitude more than the campaigns it enables.
+            designer=(
+                (lambda instruction: spawn.design(instruction, cwd=Path(block["config_repo"])))
+                if block.get("config_repo")
+                else None
+            ),
         )
     except DisaggSolError as exc:
         print(f"error: {exc}", file=sys.stderr)
