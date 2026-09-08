@@ -385,6 +385,8 @@ def test_cutedsl_rejects_direct_metadata_without_fused_finalize() -> None:
 
 def test_cutedsl_direct_metadata_request_fails_without_fused_finalize() -> None:
     backend = CuteDslFusedMoE.__new__(CuteDslFusedMoE)
+    backend.activation_type = ActivationType.Swiglu
+    backend._locality_domain_runtime = None
     backend.use_fused_finalize = False
     backend.hidden_size = 4
     backend._weights_created = True
