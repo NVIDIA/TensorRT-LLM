@@ -87,8 +87,6 @@ Here are some examples:
 
 The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, ``trtllm-eval`` runs the model with the PyTorch backend.
 
-Alternatively, the ``--model`` argument also accepts a local path to pre-built TensorRT engines. In this case, you should pass the Hugging Face tokenizer path to the ``--tokenizer`` argument.
-
 For more details, see ``trtllm-eval --help`` and ``trtllm-eval <task> --help``.
 
 .. include:: ../_includes/note_sections.rst
