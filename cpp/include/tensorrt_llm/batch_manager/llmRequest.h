@@ -144,7 +144,6 @@ public:
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
         bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
@@ -200,7 +199,6 @@ public:
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
-        , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
@@ -227,7 +225,6 @@ public:
         std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
-        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : mRequestId(requestId)
@@ -260,7 +257,6 @@ public:
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mContextPhaseParams(contextPhaseParams)
-        , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSalt(std::move(cacheSalt))
     {
         if (mEncoderTokens.has_value())
@@ -298,7 +294,6 @@ public:
         , mContextPhaseParams(req.getContextPhaseParams())
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
-        , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSalt(req.getCacheSalt())
     {
@@ -1822,23 +1817,9 @@ public:
         return mPerfMetrics.kvCacheMetrics.numReusedBlocks;
     }
 
-    [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const
-    {
-        return mLanguageAdapterUid;
-    }
-
     [[nodiscard]] std::optional<std::string> getCacheSalt() const
     {
         return mCacheSalt;
-    }
-
-    std::vector<SizeType32> getLanguageAdapterRouting(
-        SizeType32 const reqNumLanguages, SizeType32 const inputLength) const
-    {
-        auto const reqLanguageAdapterUid = getLanguageAdapterUid().value();
-        TLLM_CHECK_WITH_INFO(reqLanguageAdapterUid < reqNumLanguages, "Language adapter uid is out of range.\n");
-        // Copy the same routing info for all the tokens in this request
-        return std::vector<SizeType32>(inputLength, reqLanguageAdapterUid);
     }
 
     /// @brief mark all beams as finished by the given reason. Marks only unfinished beams.
@@ -2083,8 +2064,6 @@ protected:
     // Guided decoding params.
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
 
-    std::optional<SizeType32> mLanguageAdapterUid{std::nullopt};
-
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
@@ -2256,7 +2235,6 @@ public:
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
@@ -2294,8 +2272,8 @@ public:
             llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams,
-            arrivalTime, std::move(agent_hierarchy),
+            returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs, contextPhaseParams, arrivalTime,
+            std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
