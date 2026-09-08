@@ -2455,10 +2455,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
-    // Scope boundaries change allocator ownership associated with tensor storage. Mutable aliases
-    // make that side effect visible to the dispatcher.
-    m.def("begin_nccl_window_tensor_scope(Tensor(a!)[] inputs) -> ()");
-    m.def("end_nccl_window_tensor_scope(Tensor(a!)[] inputs, Tensor(b!)[] outputs, bool failed) -> ()");
+    // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.
+    // Python registers them as ordered effects so AOT preserves their runtime order.
+    m.def("begin_nccl_window_tensor_scope(Tensor[] inputs) -> ()");
+    m.def("end_nccl_window_tensor_scope(Tensor[] inputs, Tensor[] outputs, bool failed) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
