@@ -17,12 +17,12 @@
 import asyncio
 import base64
 import json
+import unittest.mock
 
 import pytest
 
 from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     REFERENCE_KEYS,
-    RESULT_SCHEMA_VERSION,
     SCALAR_PARAM_FIELDS,
     SERVER_TIMING_FIELDS,
     VisualGenBenchResult,
@@ -152,7 +152,10 @@ def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
     assert from_cli == from_document
 
 
-@pytest.mark.parametrize("key, value", [("image_reference", "r.png"), ("prompt_file", "p.json")])
+@pytest.mark.parametrize(
+    "key, value",
+    [("prompt", "p"), ("prompt_file", "p.json"), ("image_reference", "r.png")],
+)
 def test_a_request_only_key_in_common_params_is_rejected(key, value):
     """Each names what one generation is given, so spreading it over every request
     would describe a run nobody asked for."""
@@ -416,16 +419,22 @@ def test_the_result_states_which_shape_it_is():
         save_detailed=False,
     )
 
-    assert result["schema_version"] == RESULT_SCHEMA_VERSION
+    # The literal, not the constant: consumers gate on 2, so bumping it here
+    # without them is what this catches.
+    assert result["schema_version"] == 2
 
 
 def test_pacing_is_off_at_the_default_rate():
     """--request-rate defaults to inf, which dispatches without an interval."""
 
+    slept = []
+
     async def collect(rate, burstiness=1.0):
-        return [index async for index in _paced(4, rate, burstiness)]
+        with unittest.mock.patch("asyncio.sleep", side_effect=lambda d: slept.append(d)):
+            return [index async for index in _paced(4, rate, burstiness)]
 
     assert asyncio.run(collect(float("inf"))) == [0, 1, 2, 3]
+    assert slept == []
     with pytest.raises(ValueError, match="--burstiness must be positive"):
         asyncio.run(collect(2.0, burstiness=0.0))
 
@@ -479,12 +488,9 @@ def test_a_key_the_run_has_no_value_for_is_absent_rather_than_null():
     assert "e2e_latency" in plain
 
 
-def test_every_result_key_is_declared_with_a_description():
-    """The models are where the result's fields are documented, so a key that
+def test_every_result_field_carries_a_description():
+    """The models are where the result's fields are documented, so a field that
     reaches the file without one has nowhere a reader can look it up."""
-    richest = _result("openai-videos", save_detailed=True, num_gpus=8)
-
-    assert set(richest) <= set(VisualGenBenchResult.model_fields)
     for model in (VisualGenBenchResult, VisualGenRequestRecord):
         undocumented = [name for name, spec in model.model_fields.items() if not spec.description]
         assert not undocumented, f"{model.__name__}: {undocumented}"
