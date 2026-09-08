@@ -461,7 +461,10 @@ class MTPWorker(SpecWorkerBase):
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+        with self.draft_kv_cache_context(
+                attn_metadata,
+                draft_kv_cache_manager,
+                enable_draft_locality_domain_forkjoin=True):
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
                 if self.guided_decoder is not None:
