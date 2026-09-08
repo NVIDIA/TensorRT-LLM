@@ -302,14 +302,14 @@ class VisualGenRequestRecord(StrictBaseModel):
     server_e2e: Optional[float] = Field(
         default=None,
         description="Server-measured seconds from request arrival to the finished artifact: "
-        "the encoded file on the video route, the encoded image in the body on the image "
-        "routes.",
+        "the encoded file on the video backend, the encoded image in the body on the image "
+        "backends.",
     )
     server_gen: Optional[float] = Field(
         default=None,
         description="Server-measured seconds in the engine's inference call, what "
         "VisualGen.generate() costs, before any encoding or persistence. It excludes "
-        "network and poll granularity, which makes it the series to watch for regressions.",
+        "network and poll granularity, which makes it the metric to watch for regressions.",
     )
     server_pre_denoise: Optional[float] = Field(
         default=None,
@@ -670,7 +670,7 @@ def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
     if backend is None:
         raise ValueError(
             "backend is required: set 'backend' in --workload, or pass --backend. There is "
-            "no default, because it selects the route and so what the run measures: a "
+            "no default, because it selects the endpoint and so what the run measures: a "
             "checkpoint serving both modes answers the wrong one without complaining."
         )
     if backend not in WORKLOAD_MODEL:
@@ -716,7 +716,7 @@ def _validate_edit_reference(workload: VisualGenBenchWorkload) -> None:
             raise ValueError(
                 f"requests[{index}]: 'openai-image-edits' takes a single base64 image, so "
                 "image_reference must be a local path or one {content, format: base64} "
-                "object; /v1/images/edits does not accept the video route's list form."
+                "object; /v1/images/edits does not accept the video backend's list form."
             )
 
 
@@ -1298,7 +1298,7 @@ def _record_json(record: VisualGenRequestRecord) -> dict[str, Any]:
 _STATS_SHAPE = (
     "{mean, median, std, min, max, percentiles} over the run's requests, one sample per "
     "request, with the percentiles --metric-percentiles asked for. Null when nothing "
-    "reported the series."
+    "reported the metric."
 )
 
 
@@ -1317,7 +1317,7 @@ class VisualGenBenchResult(StrictBaseModel):
         "config lived in flags and its latency keys carried other names."
     )
     date: str = Field(description="When the run finished, as YYYYmmdd-HHMMSS local time.")
-    backend: str = Field(description="The route measured.")
+    backend: str = Field(description="Which endpoint the run measured.")
     model: str = Field(description="The model id the requests carried.")
     duration: float = Field(description="Seconds from the first send to the last finish.")
     config: dict[str, Any] = Field(
@@ -1332,10 +1332,10 @@ class VisualGenBenchResult(StrictBaseModel):
         description="Completed requests over the run's duration, in req/s."
     )
     frames_per_second: Optional[float] = Field(
-        default=None, description="Frames produced over the run's duration. Video routes."
+        default=None, description="Frames produced over the run's duration. Video backends."
     )
     images_per_second: Optional[float] = Field(
-        default=None, description="Images produced over the run's duration. Image routes."
+        default=None, description="Images produced over the run's duration. Image backends."
     )
     e2e_latency: Optional[dict[str, Any]] = Field(
         default=None,
@@ -1353,7 +1353,7 @@ class VisualGenBenchResult(StrictBaseModel):
     )
     timings: Optional[dict[str, Any]] = Field(
         default=None,
-        description="The server-measured series, one per server_* field of a request record, "
+        description="The server-measured metrics, one per server_* field of a request record, "
         f"read from the Server-Timing response header. {_STATS_SHAPE}",
     )
     requests: Optional[list[dict[str, Any]]] = Field(
@@ -1554,7 +1554,7 @@ def build_arg_parser() -> FlexibleArgumentParser:
         type=str,
         default=None,
         choices=list(BACKEND_ENDPOINTS),
-        help="The route to measure. Supplies the document's 'backend' key when it omits "
+        help="Which endpoint to measure. Supplies the document's 'backend' key when it omits "
         "one, and disagreeing with it is an error; required from one of the two. A "
         "checkpoint serving both modes answers the wrong one without complaining.",
     )
@@ -1630,7 +1630,7 @@ def build_arg_parser() -> FlexibleArgumentParser:
         default=0.1,
         help=f"Job status poll interval in seconds for {VIDEO_BACKEND} "
         "(default: %(default)s). It is the granularity of gen_latency and e2e_latency; "
-        "the image routes are synchronous and ignore it.",
+        "the image backends are synchronous and ignore it.",
     )
     exec_group.add_argument(
         "--request-timeout",
@@ -1644,7 +1644,7 @@ def build_arg_parser() -> FlexibleArgumentParser:
         type=str,
         default="path",
         help="How the server returns media (default: %(default)s): 'path' returns a "
-        "locator, the others return the bytes. The routes otherwise accept 'file' "
+        "locator, the others return the bytes. The backends otherwise accept 'file' "
         "(video, its own default) and 'url' / 'b64_json' (images, default 'url'). "
         "Run-level: mixing transport modes within one run makes the aggregate latency "
         "incomparable.",
@@ -1667,7 +1667,7 @@ def build_arg_parser() -> FlexibleArgumentParser:
     results_group.add_argument(
         "--save-detailed",
         action="store_true",
-        help="Add the timings.server_* series and a per-request record to the result "
+        help="Add the timings.server_* metrics and a per-request record to the result "
         "JSON. A heterogeneous run cannot be attributed without them.",
     )
     results_group.add_argument(

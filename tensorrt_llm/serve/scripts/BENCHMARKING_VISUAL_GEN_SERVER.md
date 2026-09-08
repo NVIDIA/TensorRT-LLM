@@ -1,7 +1,7 @@
 # Benchmarking a VisualGen server
 
 `tensorrt_llm.serve.scripts.benchmark_visual_gen` drives a running `trtllm-serve` VisualGen
-server over its OpenAI-compatible routes and reports latency and throughput.
+server over its OpenAI-compatible endpoints and reports latency and throughput.
 
 ```bash
 python -m tensorrt_llm.serve.scripts.benchmark_visual_gen \
@@ -15,7 +15,7 @@ This page repeats no field description. Each lives with its definition:
 |---|---|
 | every flag, with its default | `--help` |
 | what a generation parameter means | `VisualGenParams` in [`visual_gen/params.py`](../../visual_gen/params.py) |
-| which route validates which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`openai_protocol.py`](../openai_protocol.py) |
+| which backend accepts which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`openai_protocol.py`](../openai_protocol.py) |
 | what a result-JSON key holds | `VisualGenBenchResult` and `VisualGenRequestRecord` in [`benchmark_visual_gen.py`](benchmark_visual_gen.py) |
 
 ## Benchmarking args
@@ -54,13 +54,13 @@ requests:
     height: 1280
 ```
 
-`backend` sits at the top level and selects the route, and so what the run measures.
+`backend` sits at the top level and picks the endpoint, and so what the run measures.
 Everything else is a `VisualGenParams` field, `prompt`, `prompt_file`, or `extra_params`.
 
-#### Route matrix
+#### Fields per backend
 
-Derived at load from the request model the route validates against, so naming a field the
-route cannot carry is an error rather than a request the server ignores.
+Derived at load from the request model that backend validates against, so naming a field it
+cannot carry is an error rather than a request the server ignores.
 
 | field | `openai-videos` | `openai-images` | `openai-image-edits` |
 |---|:---:|:---:|:---:|
@@ -97,12 +97,12 @@ the shapes a prompt file is read in.
 
 ## Result
 
-`--save-result` writes the JSON, `--save-detailed` adds the server-side series and the
+`--save-result` writes the JSON, `--save-detailed` adds the server-side metrics and the
 per-request records, and the run prints the summary scalars with a table of `e2e_latency` and
-`gen_latency`. Every series is `{mean, median, std, min, max, percentiles}` over the run's
+`gen_latency`. Every metric is `{mean, median, std, min, max, percentiles}` over the run's
 requests — **one sample per request**.
 
-### Series relationships
+### Latency breakdown
 
 ```
 gen_latency = server_gen  + network + client_poll_interval
