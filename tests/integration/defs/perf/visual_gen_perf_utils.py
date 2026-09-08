@@ -197,8 +197,11 @@ def build_visual_gen_db_entry(
         "s_generation_mode": _infer_generation_mode(client_config),
         "s_backend": str(client_config.get("backend")),
         "s_size": str(client_config.get("size")),
-        "l_num_frames": int(client_config.get("num_frames")),
-        "l_fps": int(client_config.get("fps")),
+        # An image config states neither: the document rejects num_frames on an
+        # image route, so the config cannot carry it. Both stay match keys, and
+        # 1 keeps an image case in the bucket its baselines were recorded under.
+        "l_num_frames": int(client_config.get("num_frames") or 1),
+        "l_fps": int(client_config.get("fps") or 1),
         "l_num_inference_steps": int(client_config.get("num_inference_steps")),
         "l_max_concurrency": int(client_config.get("max_concurrency")),
         "s_test_case_name": f"{server_name}-{client_name}",
