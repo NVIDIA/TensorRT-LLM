@@ -5621,19 +5621,6 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
-        # Mark retiring generation requests here too, not only on the last
-        # pipeline stage (_executor_loop_pp). The predicate is pure arithmetic on
-        # token counts (LlmRequest::willCompleteNextIteration) and those counts are
-        # replicated to every stage in the same iteration: the last stage's sample
-        # state is ring-broadcast (_ring_broadcast_sample_state) and applied on all
-        # ranks by _handle_executed_batch, with the per-iteration batch count
-        # itself ring-broadcast from rank 0. Without this call the stages disagree
-        # about which requests are retiring, and ADPRouter's admission correction
-        # -- which subtracts them from each rank's load -- would let the stages
-        # admit different numbers of requests and diverge.
-        if not self.disable_overlap_scheduler:
-            self._update_generation_requests_that_will_complete_next_iteration(
-                scheduled_batch.generation_requests)
         sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
             requests=sampling_requests,
