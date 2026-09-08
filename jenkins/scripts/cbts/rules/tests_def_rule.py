@@ -17,9 +17,9 @@ Handles any path under `tests/` whose first component (after the
 `tests/integration/defs/` strip) appears in some YAML entry's namespace.
 For `test_*.py` files, AST scope mapping yields function-level anchors
 (`file::TestC::test_m`) when every changed line lands in a pytest scope;
-otherwise file-level. For non-test_*.py paths (conftest, helpers, data
-files like `references/*.yaml` or `disaggregated/test_configs/*.yaml`),
-`find_match_for_path` walks up enclosing directories to the narrowest
+otherwise file-level. For Python helpers, direct static imports identify
+their test-file consumers. Ambiguous helpers and other non-test paths
+(conftest and data files) walk up enclosing directories to the narrowest
 YAML-covered ancestor.
 
 Paths matched by `out_of_scope_rule.is_out_of_scope` (QA / dev test
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import ast
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from blocks import Stage, YAMLIndex
@@ -55,14 +55,138 @@ BLAST_RADIUS_FRACTION = 0.8
 
 ACCURACY_REFS_PREFIX = "tests/integration/defs/accuracy/references/"
 ACCURACY_DIR = "tests/integration/defs/accuracy"
+DEFS_GIT_PREFIX = "tests/integration/defs/"
 
 _CLASS_RE = re.compile(r"class\s+(\w+)")
 # `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
 # by HF model name, unlike every other reference YAML.
 _TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
-_DIRECT_TEST_CONSUMERS: dict[str, tuple[str, ...]] = {
-    "tests/integration/defs/perf/pytorch_model_config.py": ("perf/test_perf.py",),
-}
+
+
+def _defs_module_name(relative_path: str) -> str:
+    parts = list(PurePosixPath(relative_path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _normalize_defs_module(module: str) -> str:
+    for prefix in ("tests.integration.defs.", "defs."):
+        if module.startswith(prefix):
+            return module.removeprefix(prefix)
+    return module
+
+
+def _imported_modules(
+    node: ast.Import | ast.ImportFrom,
+    importer: str,
+) -> set[str]:
+    if isinstance(node, ast.Import):
+        return {alias.name for alias in node.names}
+
+    importer_module = _defs_module_name(importer)
+    if PurePosixPath(importer).name == "__init__.py":
+        package = importer_module
+    else:
+        package = importer_module.rpartition(".")[0]
+    if node.level:
+        package_parts = package.split(".") if package else []
+        parents = node.level - 1
+        if parents > len(package_parts):
+            return set()
+        base_parts = package_parts[: len(package_parts) - parents]
+        if node.module:
+            base_parts.extend(node.module.split("."))
+        base = ".".join(base_parts)
+    else:
+        base = node.module or ""
+
+    modules = {base} if base else set()
+    for alias in node.names:
+        if alias.name != "*":
+            modules.add(f"{base}.{alias.name}" if base else alias.name)
+    return modules
+
+
+def _module_import_relation(
+    module: str,
+    target_module: str,
+    target_parent: str,
+    importer_parent: str,
+) -> bool | None:
+    normalized = _normalize_defs_module(module)
+    if normalized == target_module:
+        return True
+    target_stem = target_module.rsplit(".", 1)[-1]
+    if normalized != target_stem or "." not in target_module:
+        return False
+    return True if importer_parent == target_parent else None
+
+
+def _is_dynamic_import_call(node: ast.Call) -> bool:
+    if isinstance(node.func, ast.Name):
+        return node.func.id in {"__import__", "import_module"}
+    return isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
+
+
+def _direct_test_importers(repo_root: Path, git_path: str) -> list[str] | None:
+    """Return direct static test importers or None for directory fallback."""
+    if not git_path.startswith(DEFS_GIT_PREFIX) or not git_path.endswith(".py"):
+        return None
+    target = git_path.removeprefix(DEFS_GIT_PREFIX)
+    target_name = PurePosixPath(target).name
+    if target_name.startswith("test_") or target_name in {"__init__.py", "conftest.py"}:
+        return None
+
+    defs_root = repo_root / DEFS_GIT_PREFIX
+    if not (defs_root / target).is_file():
+        return None
+    target_module = _defs_module_name(target)
+    target_parent = PurePosixPath(target).parent.as_posix()
+    target_stem = PurePosixPath(target).stem
+    consumers: list[str] = []
+
+    for source_path in sorted(defs_root.rglob("*.py")):
+        importer = source_path.relative_to(defs_root).as_posix()
+        if importer == target:
+            continue
+        try:
+            source = source_path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+            return None
+
+        importer_parent = PurePosixPath(importer).parent.as_posix()
+        imports_target = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for module in _imported_modules(node, importer):
+                    relation = _module_import_relation(
+                        module,
+                        target_module,
+                        target_parent,
+                        importer_parent,
+                    )
+                    if relation is None:
+                        return None
+                    imports_target = imports_target or relation
+            elif isinstance(node, ast.Call) and _is_dynamic_import_call(node):
+                if (
+                    not node.args
+                    or not isinstance(node.args[0], ast.Constant)
+                    or not isinstance(node.args[0].value, str)
+                    or target_stem in node.args[0].value
+                ):
+                    return None
+
+        if target_stem in source and not imports_target:
+            return None
+        if not imports_target:
+            continue
+        if not PurePosixPath(importer).name.startswith("test_"):
+            return None
+        consumers.append(importer)
+    return sorted(consumers) or None
 
 
 def _scope_start_line(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> int:
@@ -247,15 +371,18 @@ class TestsDefRule(Rule):
     def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
         """Return lookup anchors for one file.
 
-        File-level fallback when no diff, file unreadable or not UTF-8
-        (e.g. binary fixtures), AST parse fails, or any line is module-
-        level. accuracy/references/*.yaml diffs are refined to per-test-
-        class anchors via the model-name mapping in
-        `_compute_accuracy_reference_anchors`.
+        Python helpers use direct static, L0-covered test importers when safe.
+        Other files fall back to file-level when no diff, file unreadable
+        or not UTF-8, AST parse fails, or any line is module-level.
+        accuracy/references/*.yaml diffs are refined to per-test-class
+        anchors via the model-name mapping.
         """
-        direct_consumers = _DIRECT_TEST_CONSUMERS.get(git_path)
-        if direct_consumers is not None:
-            return list(direct_consumers)
+        import_consumers = _direct_test_importers(self._repo_root, git_path)
+        if (
+            import_consumers is not None
+            and lookup_paths_into_block_filters(self.yaml_index, import_consumers)[0]
+        ):
+            return import_consumers
         if git_path.startswith(ACCURACY_REFS_PREFIX) and git_path.endswith((".yaml", ".yml")):
             return self._compute_accuracy_reference_anchors(git_path, yaml_path, diff)
         if not diff:

@@ -32,6 +32,7 @@ from rules.base import PRInputs  # noqa: E402
 from rules.tests_def_rule import (  # noqa: E402
     ACCURACY_DIR,
     ACCURACY_REFS_PREFIX,
+    _direct_test_importers,
     _py_class_scopes_from_deletions,
     _scope_start_line,
     _yaml_top_keys_from_deletions,
@@ -45,7 +46,13 @@ def _make_rule(repo_root: Path) -> CbtsTestsDefRule:
     return CbtsTestsDefRule(YAMLIndex(), {}, repo_root)
 
 
-def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -> None:
+def _write_defs_file(tmp_path: Path, relative_path: str, content: str) -> None:
+    path = tmp_path / "tests/integration/defs" / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _make_perf_rule(tmp_path: Path) -> CbtsTestsDefRule:
     test_db_dir = tmp_path / "test-db"
     test_db_dir.mkdir()
     (test_db_dir / "l0_perf.yml").write_text(
@@ -56,14 +63,92 @@ def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -
         "l0_b200:\n- tests:\n  - perf/test_perf_sanity.py::test_e2e[case]\n",
         encoding="utf-8",
     )
-    yaml_index = YAMLIndex.load(test_db_dir)
+    (test_db_dir / "l0_other.yml").write_text(
+        "l0_other:\n- tests:\n  - other/test_other.py::test_other\n",
+        encoding="utf-8",
+    )
     stages = {
         "H100_PCIe-PyTorch-Perf-1": Stage("H100_PCIe-PyTorch-Perf-1", "l0_perf", "x86_64", 1, 1),
         "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
     }
-    rule = CbtsTestsDefRule(yaml_index, stages, tmp_path)
+    return CbtsTestsDefRule(YAMLIndex.load(test_db_dir), stages, tmp_path)
 
-    result = rule.apply(
+
+@pytest.mark.parametrize(
+    "import_statement",
+    (
+        "from .helper import VALUE",
+        "from defs.perf.helper import VALUE",
+        "import helper",
+    ),
+)
+def test_direct_test_importers_resolve_static_imports(
+    tmp_path: Path,
+    import_statement: str,
+) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/test_consumer.py", f"{import_statement}\n")
+    _write_defs_file(tmp_path, "perf/test_other.py", "VALUE = 2\n")
+
+    assert _direct_test_importers(tmp_path, "tests/integration/defs/perf/helper.py") == [
+        "perf/test_consumer.py"
+    ]
+
+
+def test_direct_test_importers_fall_back_for_transitive_imports(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/bridge.py", "from .helper import VALUE\n")
+    _write_defs_file(tmp_path, "perf/test_consumer.py", "from .bridge import VALUE\n")
+
+    assert _direct_test_importers(tmp_path, "tests/integration/defs/perf/helper.py") is None
+
+
+def test_direct_test_importers_fall_back_for_pytest_plugins(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "disaggregated/plugin.py", "VALUE = 1\n")
+    _write_defs_file(
+        tmp_path,
+        "disaggregated/test_consumer.py",
+        "pytest_plugins = ['plugin']\n",
+    )
+
+    assert (
+        _direct_test_importers(tmp_path, "tests/integration/defs/disaggregated/plugin.py") is None
+    )
+
+
+def test_direct_test_importers_fall_back_for_conftest_import(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/conftest.py", "from .helper import VALUE\n")
+
+    assert _direct_test_importers(tmp_path, "tests/integration/defs/perf/helper.py") is None
+
+
+def test_direct_test_importers_fall_back_for_dynamic_import(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(
+        tmp_path,
+        "perf/test_consumer.py",
+        "import importlib\nmodule_name = '.helper'\nimportlib.import_module(module_name)\n",
+    )
+
+    assert _direct_test_importers(tmp_path, "tests/integration/defs/perf/helper.py") is None
+
+
+def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/pytorch_model_config.py", "VALUE = 1\n")
+    _write_defs_file(
+        tmp_path,
+        "perf/test_perf.py",
+        "from .pytorch_model_config import VALUE\n",
+    )
+    _write_defs_file(tmp_path, "perf/test_perf_sanity.py", "VALUE = 2\n")
+    _write_defs_file(
+        tmp_path,
+        "conftest.py",
+        "from .perf.test_perf import generate_perf_tests\n",
+    )
+
+    result = _make_perf_rule(tmp_path).apply(
         PRInputs(
             changed_files=["tests/integration/defs/perf/pytorch_model_config.py"],
             diffs={},
@@ -73,6 +158,48 @@ def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -
     assert result is not None
     assert result.affected_stages == {"H100_PCIe-PyTorch-Perf-1"}
     assert set(result.block_filters) == {("l0_perf", 0)}
+
+
+def test_conftest_import_keeps_directory_fallback(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(tmp_path, "perf/conftest.py", "from .helper import VALUE\n")
+
+    result = _make_perf_rule(tmp_path).apply(
+        PRInputs(
+            changed_files=["tests/integration/defs/perf/helper.py"],
+            diffs={},
+        )
+    )
+
+    assert result is not None
+    assert result.affected_stages == {
+        "DGX_B200-PyTorch-1",
+        "H100_PCIe-PyTorch-Perf-1",
+    }
+    assert set(result.block_filters) == {("l0_b200", 0), ("l0_perf", 0)}
+
+
+def test_uncovered_import_consumers_keep_directory_fallback(tmp_path: Path) -> None:
+    _write_defs_file(tmp_path, "perf/helper.py", "VALUE = 1\n")
+    _write_defs_file(
+        tmp_path,
+        "other/test_consumer.py",
+        "from defs.perf.helper import VALUE\n",
+    )
+
+    result = _make_perf_rule(tmp_path).apply(
+        PRInputs(
+            changed_files=["tests/integration/defs/perf/helper.py"],
+            diffs={},
+        )
+    )
+
+    assert result is not None
+    assert result.affected_stages == {
+        "DGX_B200-PyTorch-1",
+        "H100_PCIe-PyTorch-Perf-1",
+    }
+    assert set(result.block_filters) == {("l0_b200", 0), ("l0_perf", 0)}
 
 
 def test_scope_start_line_includes_decorators() -> None:
