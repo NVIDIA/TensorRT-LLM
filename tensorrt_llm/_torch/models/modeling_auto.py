@@ -33,12 +33,6 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
 
-        if model_arch in (
-                "DeepseekV3ForCausalLM", "Glm4MoeForCausalLM",
-                "ExaoneMoEForCausalLM"
-        ) and config.spec_config is not None and config.spec_config.max_draft_len == 0:
-            model_arch = "MTPDraftModelForCausalLM"
-
         return get_registered_model_class(model_arch)
 
     @staticmethod

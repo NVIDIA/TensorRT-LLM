@@ -722,8 +722,8 @@ class ModelLoader:
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
         # Preferences follow the checkpoint's original architecture:
-        # _resolve_class may rewrite it to an execution class (e.g.
-        # MTPDraftModelForCausalLM), which must not drop the target model's
+        # _resolve_class may rewrite it to an execution class (e.g. the EAGLE3
+        # prefixing above), which must not drop the target model's
         # preferences.
         preference_cls = model_cls
         architectures = getattr(config.pretrained_config, 'architectures', None)
