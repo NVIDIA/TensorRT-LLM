@@ -172,6 +172,22 @@ def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
     }
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_utils import (
+        _resolve_kv_cache_manager_v2_auto,
+        _resolve_swa_scratch_reuse_auto,
+        apply_model_defaults_to_llm_args,
+    )
+
+    for config, expected in (
+        (KvCacheConfig(), True),
+        (KvCacheConfig(enable_swa_scratch_reuse=False), False),
+    ):
+        args = TorchLlmArgs(model="/tmp/dummy_model", attn_backend="TRTLLM", kv_cache_config=config)
+        apply_model_defaults_to_llm_args(args, defaults)
+        _resolve_kv_cache_manager_v2_auto(args, DeepseekV4ForCausalLM)
+        assert _resolve_swa_scratch_reuse_auto(args, DeepseekV4ForCausalLM) is expected
+
 
 def test_deepseek_v4_hopper_uses_fp8_ds_mla_defaults(monkeypatch) -> None:
     monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.get_sm_version", lambda: 90)

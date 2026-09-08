@@ -406,7 +406,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
         .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes)
         .def_rw("iter_host_dropped_blocks", &tbk::KvCacheIterationStats::iterHostDroppedBlocks)
-        .def_rw("iter_host_dropped_bytes", &tbk::KvCacheIterationStats::iterHostDroppedBytes);
+        .def_rw("iter_host_dropped_bytes", &tbk::KvCacheIterationStats::iterHostDroppedBytes)
+        .def_rw("iter_scratch_blocks", &tbk::KvCacheIterationStats::iterScratchBlocks)
+        .def_rw("iter_scratch_slots_in_use", &tbk::KvCacheIterationStats::iterScratchSlotsInUse);
 
     nb::class_<tbk::BlockKey>(m, "BlockKey")
         .def(nb::init<>())

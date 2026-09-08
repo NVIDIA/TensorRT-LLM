@@ -142,7 +142,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
 | `kv_cache_config.enable_kv_pool_rebalance` | `bool` | `value` |  |
 | `kv_cache_config.enable_partial_reuse` | `bool` | `value` |  |
-| `kv_cache_config.enable_swa_scratch_reuse` | `bool` | `value` |  |
+| `kv_cache_config.enable_swa_scratch_reuse` | `bool\|literal` | `categorical` | `auto` |
 | `kv_cache_config.event_buffer_max_size` | `int` | `value` |  |
 | `kv_cache_config.fp8_context_mla_kv_len_cap` | `int\|none` | `value` |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `float\|none` | `value` |  |
