@@ -7699,8 +7699,13 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    def _build_llm(self, model_path: str, tensor_parallel_size: int,
-                   moe_backend: str, max_draft_len: Optional[int]) -> LLM:
+    def _build_llm(self,
+                   model_path: str,
+                   tensor_parallel_size: int,
+                   moe_backend: str,
+                   max_draft_len: Optional[int],
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False,
@@ -7712,7 +7717,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         return LLM(model_path,
                    trust_remote_code=True,
                    tensor_parallel_size=tensor_parallel_size,
-                   moe_expert_parallel_size=1,
+                   moe_expert_parallel_size=moe_expert_parallel_size,
+                   enable_attention_dp=enable_attention_dp,
                    max_num_tokens=self.MAX_NUM_TOKENS,
                    enable_chunked_prefill=True,
                    max_batch_size=self.MAX_BATCH_SIZE,
@@ -7721,17 +7727,27 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    moe_config=MoeConfig(backend=moe_backend),
                    speculative_config=mtp_config)
 
-    def _run_evals(self, model_path: str, tensor_parallel_size: int,
-                   moe_backend: str, max_draft_len: Optional[int],
+    def _run_evals(self,
+                   model_path: str,
+                   tensor_parallel_size: int,
+                   moe_backend: str,
+                   max_draft_len: Optional[int],
                    expected_quant_algo: Optional[QuantAlgo],
-                   monkeypatch: pytest.MonkeyPatch, mocker) -> None:
+                   monkeypatch: pytest.MonkeyPatch,
+                   mocker,
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
-        with self._build_llm(model_path, tensor_parallel_size, moe_backend,
-                             max_draft_len) as llm:
+        with self._build_llm(model_path,
+                             tensor_parallel_size,
+                             moe_backend,
+                             max_draft_len,
+                             moe_expert_parallel_size=moe_expert_parallel_size,
+                             enable_attention_dp=enable_attention_dp) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
@@ -7743,49 +7759,75 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(142000)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_bf16_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
-                              mocker) -> None:
-        """BF16 TP2, no MTP, PLE offloaded to pinned host memory."""
+    def test_bf16_tep4_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                               mocker) -> None:
+        """BF16 TEP4, no MTP, PLE offloaded to pinned host memory."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
-                        tensor_parallel_size=2,
+                        tensor_parallel_size=4,
                         moe_backend="CUTLASS",
                         max_draft_len=None,
                         expected_quant_algo=None,
                         monkeypatch=monkeypatch,
-                        mocker=mocker)
+                        mocker=mocker,
+                        moe_expert_parallel_size=4)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
     @pytest.mark.skip_less_host_memory(98304)
-    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self,
+    def test_fp8_adp4_mtp3_trtllm_ple_offload(self,
                                               monkeypatch: pytest.MonkeyPatch,
                                               mocker) -> None:
-        """Block-FP8 on one GPU with MTP3 and the PLE table offloaded to host."""
+        """Block-FP8 on four GPUs with attention DP, MTP3 and PLE offload."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
-                        tensor_parallel_size=1,
+                        tensor_parallel_size=4,
                         moe_backend="TRTLLM",
                         max_draft_len=3,
                         expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
                         monkeypatch=monkeypatch,
-                        mocker=mocker)
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_mtp3_trtllm_ple_offload(self,
+                                                monkeypatch: pytest.MonkeyPatch,
+                                                mocker) -> None:
+        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(
-            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
-        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
-        self._run_evals(
-            f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",
-            tensor_parallel_size=1,
-            moe_backend="CUTEDSL",
-            max_draft_len=3,
-            expected_quant_algo=QuantAlgo.NVFP4,
-            monkeypatch=monkeypatch,
-            mocker=mocker)
+    def test_nvfp4_1gpu_cutedsl_ple_offload(self,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            mocker) -> None:
+        """NVFP4 on one GPU without MTP and the PLE table offloaded to host.
+
+        CuteDSL serves NVFP4 but not the FP8 block scales of the MTP layer's
+        experts, so this checkpoint only fits the backend without MTP.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=1,
+                        moe_backend="CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
