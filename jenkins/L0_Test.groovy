@@ -1153,7 +1153,10 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 if (cluster.fatBuilderArgs != null) {
                     timeout(time: 30, unit: 'MINUTES') {
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+                        // -O so a retry after a partial download overwrites it. Without it
+                        // wget saves the second attempt as ${tarName}.1 and the tar below
+                        // unpacks the truncated first one.
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
                     }
                     sh "cd ${llmPath} && tar -zxf ${tarName}"
 
