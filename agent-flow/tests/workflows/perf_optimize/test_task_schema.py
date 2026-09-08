@@ -31,6 +31,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
         "max_rounds": 5,
         "max_attempts_per_item": 3,
         "max_items_per_round": 3,
+        "item_execution": "parallel",
         "approaches": ["config", "code"],
         "accept_fraction": 0.5,
         "noise_floor_pct": 1.0,
@@ -74,6 +75,19 @@ def test_user_approaches_value_wins_over_default(tmp_path):
         task = _write_task(tmp_path, {"optimize": {"approaches": value}})
         data = task_schema.load_and_validate_task_yaml(task)
         assert data["optimize"]["approaches"] == value
+
+
+def test_item_execution_accepts_serial_and_parallel(tmp_path):
+    for value in task_schema.ITEM_EXECUTIONS:
+        task = _write_task(tmp_path, {"optimize": {"item_execution": value}})
+        data = task_schema.load_and_validate_task_yaml(task)
+        assert data["optimize"]["item_execution"] == value
+
+
+def test_invalid_item_execution_rejected(tmp_path):
+    task = _write_task(tmp_path, {"optimize": {"item_execution": "threads"}})
+    with pytest.raises(task_schema.TaskSchemaError, match="optimize.item_execution"):
+        task_schema.load_and_validate_task_yaml(task)
 
 
 def test_invalid_approaches_rejected(tmp_path):
@@ -428,6 +442,59 @@ def test_kernel_coverage_accessor_defends_against_malformed_specs():
     assert merged == {"min_share_pct": 2.0, "coverage_target_pct": 95.0}
 
 
+def test_remote_run_root_is_optional_and_can_be_explicit(tmp_path):
+    task = _write_task(
+        tmp_path,
+        {
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+            }
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert task_schema.remote_run_root(data, "campaign") == "~/agent_flow_workspace/campaign"
+
+    explicit = _write_task(
+        tmp_path,
+        {
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+                "remote_run_root": "/scratch/runs/campaign",
+            }
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(explicit)
+    assert task_schema.remote_run_root(data, "ignored") == "/scratch/runs/campaign"
+
+    data["slurm-environment"]["remote_run_root"] = "relative/run"
+    explicit.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(task_schema.TaskSchemaError, match="remote_run_root"):
+        task_schema.load_and_validate_task_yaml(explicit)
+
+
+def test_remote_source_and_tuning_paths_resolve_next_to_task(tmp_path):
+    (tmp_path / "options.yaml").write_text("{}\n", encoding="utf-8")
+    task = _write_task(
+        tmp_path,
+        {
+            "trtllm_repo_path": "repo",
+            "extra_llm_api_options": "options.yaml",
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+            },
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert data["trtllm_repo_path"] == str((tmp_path / "repo").resolve())
+    assert data["extra_llm_api_options"] == str((tmp_path / "options.yaml").resolve())
+
+
 @pytest.mark.parametrize("field", ["max_rounds", "max_attempts_per_item", "max_items_per_round"])
 def test_a_valueless_budget_key_degrades_to_the_documented_default(tmp_path, field):
     """`max_items_per_round:` with nothing after it is YAML for ``None``.
@@ -518,6 +585,7 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
                 "max_rounds": 2,
                 "max_items_per_round": 1,
                 "max_attempts_per_item": 1,
+                "item_execution": "serial",
                 "approaches": ["config"],
                 "accept_fraction": 0.5,
                 "noise_floor_pct": 1.0,

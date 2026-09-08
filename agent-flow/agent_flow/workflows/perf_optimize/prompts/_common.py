@@ -32,6 +32,7 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     PROFILE_FINDINGS_CONTRACT,
     PROFILING_KNOB_VERIFICATION,
     PROFILING_RUNS_REFERENCE,
+    REMOTE_SLURM_EXECUTION,
     SERVE_FLAGS_REFERENCE,
     SERVER_LIFECYCLE,
     SOL_CORRELATION_METHOD,
@@ -60,6 +61,7 @@ __all__ = [
     "PROFILING_KNOB_VERIFICATION",
     "PROFILING_RUNS_REFERENCE",
     "ROADMAP_SPEC",
+    "REMOTE_SLURM_EXECUTION",
     "SERVE_FLAGS_REFERENCE",
     "SERVER_LIFECYCLE",
     "SOL_ANALYZER_CONTEXT",
@@ -187,15 +189,18 @@ reverts rejected attempts with `git reset --hard` + `git clean -fd`:
   say itself — the non-obvious constraint, the why of a chosen value —
   in the repo's own terms; the provenance story belongs in
   `optimization_summary.md`, not in the source.
-- **Before ANY source edit, verify the checkout is the installed
-  package** (verify before asserting):
+- **Before any source edit or server launch, identify the active runtime
+  checkout from the turn instructions.** Inside the same Slurm container
+  and shell that will launch `trtllm-serve`, prepend that exact checkout
+  to `PYTHONPATH`, then verify:
   ```bash
   python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"
   ```
-  The printed path must resolve **under `trtllm_repo_path`** (an editable
-  install). On a mismatch, source edits will not take effect in the
-  served process — record that as a blocker in your output file and do
-  not pretend the change was applied.
+  The printed path must resolve under the active runtime checkout. If it
+  does not, stop and record a blocker; do not benchmark or claim that the
+  change was exercised. `task.yaml`'s `trtllm_repo_path` is the campaign
+  checkout. It may differ from the active runtime checkout when an item
+  or integration worktree is in use.
 - The review basis for an attempt is
   `git -C <trtllm_repo_path> diff` (plus `--stat`) — uncommitted changes
   on the optimization branch. New files the attempt added show up with
@@ -487,23 +492,24 @@ worst point −0.40% ≥ −1.0% ✓ → the perf axis passes.
 # --------------------------------------------------------------------------- #
 
 TUNING_CONFIG_NOTE = """\
-## The live tuning config (supersedes the `extra_llm_api_options` guidance above)
+## The active tuning config (supersedes the `extra_llm_api_options` guidance above)
 
 In this workflow the server tuning is **owned by the workspace**, not by
-`task.yaml`: `trtllm-serve` **always** passes
-`--extra_llm_api_options <workspace>/tuning/extra_llm_api_options.yaml` —
-the live working copy ( `{}` when no tuning applies, which is valid).
+`task.yaml`. The turn instructions name the exact **active tuning config**;
+that path supersedes shorthand references to
+`tuning/extra_llm_api_options.yaml` elsewhere in the prompt.
+`trtllm-serve` **always** passes `--extra_llm_api_options` with that exact
+path (whose content is `{}` when no tuning applies, which is valid).
 Ignore the earlier instruction to pass the flag only when `task.yaml`
-sets the key: here the flag is always present and always points at the
-tuning file, so config optimizations take effect by editing that one
-file and relaunching.
+sets the key: here the flag is always present, so config optimizations
+take effect by editing the active tuning config and relaunching.
 
-- Only the **optimizer** edits `tuning/extra_llm_api_options.yaml`; every
-  other role treats it as read-only and serves with it as-is.
-- `tuning/extra_llm_api_options.accepted.yaml` is the
-  orchestrator-managed snapshot of the last accepted config — never edit
-  it; the orchestrator restores the live file from it when an attempt is
-  rejected.
+- Only the **optimizer** edits the active tuning config; every other role
+  treats it as read-only and serves with it as-is.
+- The turn instructions also name the orchestrator-managed accepted
+  config snapshot when the role needs it. Never edit that snapshot; the
+  orchestrator restores the active tuning config from it when an attempt
+  is rejected.
 """
 
 
@@ -531,7 +537,7 @@ runs it for you, with the same flags.
 - **harness config** (`task.yaml`'s `disagg.config`) — cluster,
   environment, measurement conditions. Read-only.
 - **`task.yaml`** — the campaign knobs (`optimize`). Read-only.
-- **`<workspace>/tuning/extra_llm_api_options.yaml`** — the harness
+- **active tuning config named in the turn instructions** — the harness
   config's `worker_config`, i.e. `{ctx: {...}, gen: {...}}`. Only the
   **optimizer** edits it, under the rules above.
 
@@ -1083,12 +1089,13 @@ kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
     share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
-    ncu:                                # from your capture passes, or the string
-      duration_us: 41.2                 # "unavailable: <reason>"
+    ncu:                                # metrics mapping (or the string below)
+      duration_us: 41.2
       sm_sol_pct: 12.1
       mem_sol_pct: 78.5
-      occupancy_pct: 62.0
-      bound: memory                     # compute | memory | latency | balanced
+      occupancy_pct: null               # a metric the capture did not yield is null
+      bound: memory                     # compute | memory | latency | balanced | comm
+      note: "occupancy section empty: replay stalled"   # required by that null
     faster:
       disposition: item                 # item | dismissed
       ref: opt-003                      # roadmap item id | evidence-backed dismissal
@@ -1096,6 +1103,18 @@ kernels:                        # descending share_pct; one row per kernel/group
       disposition: dismissed
       neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)"
       ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (torch_trace)"
+  - kernel: allreduce_fusion            # a collective: never goes under ncu at all
+    full_name: "void tensorrt_llm::kernels::ar_fusion::..."
+    share_pct: 9.2
+    ncu: "unavailable: collective — kernel replay deadlocks the ranks"
+    bound: comm                         # with the string form, `bound` sits here
+    faster:
+      disposition: dismissed
+      ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
+    fusion:
+      disposition: dismissed
+      neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
+      ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
 ```
 
 Rules:
@@ -1108,6 +1127,17 @@ Rules:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
   above, citing the artifact (an ncu row, the torch trace, a source
   file, a failed item's `evaluation.md`).
+- **Say "not measured", never guess it.** A collective never goes under
+  `ncu` — kernel replay deadlocks it — so disposition an allreduce from
+  its nsys share and the source, give `ncu` the `unavailable: <reason>`
+  string, and record `bound: comm` **on the row, beside `ncu`**. When a
+  pass reaches a kernel but a section comes back empty, null that metric
+  and say why in `note`, rather than fabricating a percentage or
+  throwing away the numbers you did measure. `bound` is the one field
+  always owed, and the schema enforces it in both shapes: inside `ncu`
+  when `ncu` is a metrics mapping, on the row when `ncu` is the degrade
+  string. `neighbors` is the evidence a fusion *dismissal* rests on — a
+  fusion `item` carries its adjacency in the roadmap entry `ref` names.
 - **An unactionable item is not an answer.** Do not park a kernel on an
   item whose `expected_gain_pct` sits below `optimize.noise_floor_pct`
   (the orchestrator never dispatches it) — that is a
@@ -1120,8 +1150,11 @@ Rules:
   kernels that newly crossed the bar.
 - **Mirror it for humans**: add a `## Kernel disposition ledger` section
   to `profile_findings.md` — the same rows as a table (kernel, share,
-  bound, faster →, fusion →) with a one-line rationale each. The YAML
-  file is authoritative; the findings section carries the prose.
+  bound, faster →, fusion →) with a one-line rationale each, marking
+  every row whose `bound` did *not* come from an ncu capture (the
+  degrade string, or a null metric's `note`) so the table cannot be read
+  as more measured than it is. The YAML file is authoritative; the
+  findings section carries the prose.
 """
 
 
@@ -1165,6 +1198,15 @@ Rigor rules for this section:
 - **The final round's ledger is the coverage proof.** Earlier rounds'
   ledgers are history (cite one only to show how a disposition
   evolved); the guarantee the section attests is the final state's.
+- **Say how much of the table ncu actually measured.** A row whose `ncu`
+  is the `unavailable: <reason>` string, or whose metrics are null with
+  a `note` explaining the gap, was dispositioned from nsys and the SOL
+  correlation — not from a capture. Count those rows, state it in the
+  headline ("ncu contributed per-kernel metrics for 3 of 22 rows; the
+  rest carry the ledger's degrade reason"), and qualify each such
+  `bound` cell with the ledger's reason (`memory — no ncu: replay
+  stalled`). A coverage proof built on unmeasured rows must never render
+  like one built on measured rows.
 - If the final round's ledger is missing or invalid, say so plainly
   ("Kernel coverage ledger unavailable (<reason>)") — never reconstruct
   rows from memory.

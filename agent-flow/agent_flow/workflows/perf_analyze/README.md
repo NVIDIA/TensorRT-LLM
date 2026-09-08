@@ -80,12 +80,12 @@ Copy [`task.example.yaml`](./task.example.yaml) and fill it in.
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `checkpoint_path` | ✅ | Model checkpoint dir to serve (must exist). |
-| `trtllm_repo_path` | ✅ | TensorRT-LLM checkout providing `trtllm-serve` + `benchmark_serving.py` (must exist). |
+| `checkpoint_path` | ✅ | Model checkpoint dir to serve. Remote when `cluster_ssh` is set; otherwise local. |
+| `trtllm_repo_path` | ✅ | Local TensorRT-LLM checkout providing `trtllm-serve` + `benchmark_serving.py` (must exist). |
 | `extra_llm_api_options` | optional | Path to a YAML passed verbatim to `trtllm-serve --extra_llm_api_options` — the single place for all server tuning (parallelism, batch sizes, KV-cache fraction, CUDA-graph config, ...). Omit to use server defaults. The server always runs the `pytorch` backend on `127.0.0.1:8000`. |
 | `benchmark` | optional | Operating point: `dataset_name`, `random_input_len` (ISL), `random_output_len` (OSL), `num_prompts`, `concurrency`, `request_rate`, `dataset_path`. `concurrency` is a positive int (single operating point, default `64`) **or a non-empty list of them** — a list turns on **Pareto-curve mode**: the benchmarker runs `benchmark_serving.py` once per point (sorted ascending, deduplicated, over one server launch), the analyzer profiles at the largest point, and the report gains a measured Pareto curve (x = tok/s/user = `1000/mean_tpot_ms`, y = tok/s/gpu = `output_throughput/num_gpus`) with its own chart in the HTML companion. `num_prompts` is a positive int (same count at every point, default `200`) or — curve mode only — a list paired index-by-index with the `concurrency` list (each entry ≥ its point; sorted together with it), so low-concurrency points can run far fewer prompts. |
 | `profile` | optional | `methods` (subset of `[nsys, torch, ncu]`, default all three) and `nsys_iter_range` (default `"100-150"`, gating nsys/torch server-side and the ncu capture via `--profile-from-start off`). |
-| `slurm-environment` | optional | When present (`slurm_partition` + `docker_image`), the server + benchmark run inside a Slurm-launched container instead of locally. |
+| `slurm-environment` | optional | `slurm_partition` + `docker_image` run the workload in Slurm. Add `cluster_ssh: user@login-host` to run Slurm remotely; `remote_run_root` optionally selects its temporary campaign root (default `~/agent_flow_workspace/<campaign-name>`). |
 | `sol` | optional | Gates the projector stage (the SOL ceiling, per the `internal-perf-sol-analysis` skill), which runs **by default**. Every field is optional — `enabled` is the gate (default `true`) and `gpu` is the part-name hint for the skill's peaks calculator when the automatic mapping would guess wrong. Omit the block entirely to accept the defaults. |
 
 The spec is validated at the CLI boundary; defaults for the optional
@@ -121,6 +121,8 @@ workspace/perf-analyze/<name>/
 - **Local vs Slurm.** Without a `slurm-environment` block, the agents run
   `trtllm-serve` and `benchmark_serving.py` directly via `Bash` on the
   current node's GPUs. With it, they run inside a Slurm-launched container.
+  When `cluster_ssh` is set, workflow state and retained artifacts stay local;
+  agents sync only required inputs and outputs around remote Slurm jobs.
 - **Profiling knobs are verified at runtime.** Env-var names
   (`TLLM_PROFILE_START_STOP`, the torch-profiler dir var) differ across
   TensorRT-LLM versions, so the Analyzer greps the checkout in

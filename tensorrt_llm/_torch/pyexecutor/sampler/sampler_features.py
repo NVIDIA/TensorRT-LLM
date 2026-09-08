@@ -70,6 +70,7 @@ __all__ = [
     "handle_stop_criteria",
     "meet_max_token_stop_criteria",
     "meet_stop_token_criteria",
+    "scatter_new_tokens",
 ]
 
 
@@ -413,6 +414,25 @@ def apply_d2t(tokens: torch.Tensor, model_outputs: dict[str, Any]) -> None:
         tokens += d2t
 
 
+def scatter_new_tokens(
+    next_tokens: torch.Tensor,
+    new_tokens_cuda: torch.Tensor,
+    batch_dest_indices: torch.Tensor,
+    max_beam_width: int,
+) -> None:
+    """Scatter one sampled token per row into the new-tokens buffer, in place.
+
+    Every beam of a slot receives the same token: the tiers that use this sample
+    a single token per request, so the beam dimension is a broadcast rather than
+    a per-beam result. Pure device work, hence safe under CUDA graph capture.
+    """
+    batch_dest_indices_expanded = batch_dest_indices.unsqueeze(1).expand(-1, max_beam_width)
+    next_tokens_expanded = next_tokens.unsqueeze(1).expand(-1, max_beam_width)
+    new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
+        0, batch_dest_indices_expanded, next_tokens_expanded
+    )
+
+
 @nvtx_range("fast_greedy_sample_kernel")
 def fast_greedy_sample_kernel(
     logits_cuda: torch.Tensor,
@@ -434,11 +454,7 @@ def fast_greedy_sample_kernel(
         next_tokens += d2t[next_tokens]
 
     # Scatter tokens into output buffer
-    batch_dest_indices_expanded = batch_dest_indices.unsqueeze(1).expand(-1, max_beam_width)
-    next_tokens_expanded = next_tokens.unsqueeze(1).expand(-1, max_beam_width)
-    new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
-        0, batch_dest_indices_expanded, next_tokens_expanded
-    )
+    scatter_new_tokens(next_tokens, new_tokens_cuda, batch_dest_indices, max_beam_width)
     return next_tokens
 
 

@@ -414,8 +414,9 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     retrieve_parent_token: Optional[torch.Tensor] = None
 
     def __post_init__(self):
-        if self.spec_dec_mode.is_mtp_eagle_one_model():
-            self.allocate_context_prompt_lookahead()
+        # Every worker on this metadata drafts off the shift-by-1 context input
+        # ids (draft_prompt_lookahead == 1), so the chunk tail needs a prompt token.
+        self.allocate_context_prompt_lookahead()
         if self.layers_to_capture is None:
             if self.spec_dec_mode.is_mtp_eagle_one_model():
                 # MTP Eagle one-model feeds the target model's hidden_states
