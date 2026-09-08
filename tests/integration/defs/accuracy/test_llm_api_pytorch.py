@@ -3570,8 +3570,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
-        check_acceptance_length = (mtp_nextn == 1
-                                   and not disable_skip_indexer
+        check_acceptance_length = (mtp_nextn == 1 and not disable_skip_indexer
                                    and not enable_heuristic_topk
                                    and not use_cute_dsl_topk)
         stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
@@ -5041,7 +5040,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             max_draft_len=4,
             speculative_model=f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3",
             eagle3_one_model=True,
-            use_rejection_sampling=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(
@@ -7694,10 +7692,11 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
-        check_acceptance_length = (
-            expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-            and tensor_parallel_size == 1 and moe_backend == "TRTLLM"
-            and max_draft_len == 3)
+        check_acceptance_length = (expected_quant_algo
+                                   == QuantAlgo.FP8_BLOCK_SCALES
+                                   and tensor_parallel_size == 1
+                                   and moe_backend == "TRTLLM"
+                                   and max_draft_len == 3)
         with self._build_llm(model_path, tensor_parallel_size, moe_backend,
                              max_draft_len, check_acceptance_length) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
@@ -8869,7 +8868,6 @@ class TestLlama4SpeculativeDecoding(LlmapiAccuracyTestHarness):
             speculative_model=(
                 f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"),
             eagle3_one_model=True,
-            use_rejection_sampling=True,
         )
         if use_dynamic_tree:
             spec_config_kwargs.update(
@@ -8894,8 +8892,7 @@ class TestLlama4SpeculativeDecoding(LlmapiAccuracyTestHarness):
                 max_stats_len=-1,
                 enable_iter_perf_stats=True,
                 cuda_graph_config=None,
-                speculative_config=Eagle3DecodingConfig(
-                    **spec_config_kwargs),
+                speculative_config=Eagle3DecodingConfig(**spec_config_kwargs),
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

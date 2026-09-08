@@ -38,8 +38,7 @@ from .accuracy_core import (
     GSM8K,
     ForceTokenLogitsProcessor,
     LlmapiAccuracyTestHarness,
-    assert_acceptance_length,
-    compute_acceptance_length,
+    assert_acceptance_length_for_llm,
 )
 
 
@@ -152,19 +151,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             if mode in ("sa", "dspark"):
-                acceptance_length = compute_acceptance_length(llm)
-                print(
-                    f"[AL] TestKimiK3::test_w4a16_mxfp4[{mode}] "
-                    f"acceptance_length = {acceptance_length:.3f}"
-                )
-                test_key = (
-                    "TestKimiK3::test_w4a16_mxfp4"
-                    if mode == "sa"
-                    else "TestKimiK3::test_w4a16_mxfp4[dspark]"
-                )
-                assert_acceptance_length(
-                    test_key,
-                    acceptance_length,
+                assert_acceptance_length_for_llm(
+                    f"TestKimiK3::test_w4a16_mxfp4[{mode}]",
+                    llm,
                 )
 
     def _assert_checkpoint_routing(self) -> None:
@@ -387,9 +376,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = compute_acceptance_length(llm)
-            print(
-                f"[AL] TestKimiK3DSpark::test_gsm8k_tep8 "
-                f"acceptance_length = {acceptance_length:.3f}"
+            assert_acceptance_length_for_llm(
+                "TestKimiK3DSpark::test_gsm8k_tep8",
+                llm,
             )
-            assert_acceptance_length("TestKimiK3DSpark::test_gsm8k_tep8", acceptance_length)
