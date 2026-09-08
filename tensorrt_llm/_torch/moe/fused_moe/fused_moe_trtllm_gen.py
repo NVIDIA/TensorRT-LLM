@@ -423,17 +423,14 @@ class TRTLLMGenFusedMoE(MoEImplBase):
             # Intra-expert MoE TP: w1/w3 column-shard and w2 row-shard along
             # the intermediate dim (the stock MXFP4/NVFP4 quant-method loaders
             # slice the packed bytes and scales per rank). Require every rank
-            # to own whole scale groups. NVFP4 also requires its resolved
-            # physical alignment, while MXFP4 can pad a whole-group logical
-            # shard to the physical kernel alignment after slicing.
+            # to own whole scale groups. The padded NVFP4/MXFP4 loaders then
+            # pad each logical shard independently to the physical kernel
+            # alignment selected for that quantization method.
             if quant_algo == QuantAlgo.NVFP4:
-                # NVFP4 picks its alignment from the layer shape in
-                # create_weights (32 -> 128 or 256), which runs after this
-                # check. Ask for the resolved value: the class attribute is
-                # only the starting point, and validating against it would
-                # admit shards the loader cannot lay out.
-                alignment, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(
-                    self.hidden_size, self.intermediate_size_per_partition)
+                # NVFP4 uses group-16 scales. Its resolved physical alignment
+                # remains shape-dependent (32/128/256), but that is a local
+                # storage constraint rather than a logical TP constraint.
+                alignment = NVFP4TRTLLMGenFusedMoEMethod.scaling_vector_size
             else:
                 # MXFP4 TP shards only have to preserve whole group-32 scale
                 # groups. The loader pads each logical shard independently to
