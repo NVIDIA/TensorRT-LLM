@@ -1092,12 +1092,12 @@ class BaseWorker(GenerationExecutor):
         return startup_metrics
 
     @staticmethod
-    def _stats_serializer(stats) -> str:
+    def _stats_to_dict(stats) -> dict:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
-        # Already serialized on the producing rank via allgather — just emit.
+        # Already converted on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
-            return json.dumps(stats[1])
+            return stats[1]
 
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
@@ -1164,8 +1164,12 @@ class BaseWorker(GenerationExecutor):
         if scheduler_mode is not None:
             stats_dict["schedulerMode"] = scheduler_mode
 
-        # Convert back to JSON string
-        return json.dumps(stats_dict)
+        return stats_dict
+
+    @staticmethod
+    def _stats_serializer(stats) -> str:
+        """Serialize one stats row for compatibility with string consumers."""
+        return json.dumps(BaseWorker._stats_to_dict(stats))
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:
