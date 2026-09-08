@@ -65,31 +65,22 @@ MATCH_KEYS = [
 ]
 
 
-def latency_series(backend: str) -> str:
-    """The result series the gate calls latency, which the routes measure differently.
+def result_metric_paths() -> dict[str, str]:
+    """Where each gated metric lives in the result JSON.
 
-    The video route is asynchronous, so its e2e span also carries the /content
-    fetch and the encode; gen_latency stops at the postprocessing transition and
-    is the closer analogue of an image route's whole synchronous request, which
-    is what e2e_latency is there -- image routes report no gen_latency at all.
+    The latency series is ``e2e_latency`` on every route: it is the whole
+    request, which is what the gate is named for and what the pre-async video
+    route already reported. The generation series reads the Server-Timing
+    "generation" header rather than any client-side stopwatch, so it measures
+    engine wall clock without network or polling granularity, and it is the
+    series a regression is gated on. That header lives under --save-detailed.
     """
-    return "gen_latency" if backend == "openai-videos" else "e2e_latency"
-
-
-def result_metric_paths(backend: str) -> dict[str, str]:
-    """Where each gated metric lives in the result JSON, for one route.
-
-    The generation series reads the Server-Timing "generation" header rather
-    than the client-side gen_latency, so it measures engine wall clock without
-    network or polling granularity. That header lives under --save-detailed.
-    """
-    latency = latency_series(backend)
     return {
         "d_request_throughput": "request_throughput",
-        "d_mean_latency": f"{latency}.mean",
-        "d_median_latency": f"{latency}.median",
-        "d_p90_latency": f"{latency}.percentiles.p90",
-        "d_p99_latency": f"{latency}.percentiles.p99",
+        "d_mean_latency": "e2e_latency.mean",
+        "d_median_latency": "e2e_latency.median",
+        "d_p90_latency": "e2e_latency.percentiles.p90",
+        "d_p99_latency": "e2e_latency.percentiles.p99",
         "d_mean_generation": "timings.server_gen.mean",
         "d_median_generation": "timings.server_gen.median",
         "d_p90_generation": "timings.server_gen.percentiles.p90",
@@ -145,7 +136,7 @@ def extract_visual_gen_metrics(result_data: dict[str, Any]) -> dict[str, float]:
     metrics: dict[str, float] = {}
     missing_paths: list[str] = []
 
-    for metric_name, path in result_metric_paths(str(result_data["backend"])).items():
+    for metric_name, path in result_metric_paths().items():
         value = _get_nested_value(result_data, path)
         if value is None:
             missing_paths.append(path)

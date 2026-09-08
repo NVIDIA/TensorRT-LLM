@@ -42,7 +42,6 @@ from .visual_gen_perf_utils import (
     build_visual_gen_db_entry,
     get_visual_gen_match_keys,
     get_visual_gen_num_gpus_from_server_config,
-    latency_series,
 )
 
 DEFAULT_TIMEOUT = 5400
@@ -609,9 +608,8 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        latency = latency_series(str(client_config["backend"]))
         series = {
-            latency: result_data[latency],
+            "e2e_latency": result_data["e2e_latency"],
             "server_gen": result_data["timings"]["server_gen"],
         }
         for name, stats in series.items():
