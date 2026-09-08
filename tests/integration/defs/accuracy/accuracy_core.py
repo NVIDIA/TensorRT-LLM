@@ -72,7 +72,7 @@ def assert_guided_decoding_regex(llm: PyTorchLLM | AutoDeployLLM) -> None:
     """Verify that an initialized model applies a regex grammar end to end."""
     pattern = r"[0-9]{2}"
     prompt_token_ids = llm.tokenizer.encode(
-        "Return exactly two decimal digits:")
+        "Spell the word blue in lowercase letters. Do not use digits:")
     outputs = llm.generate(
         [prompt_token_ids],
         sampling_params=SamplingParams(

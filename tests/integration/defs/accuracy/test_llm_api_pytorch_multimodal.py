@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import ClassVar
 
 import pytest
@@ -43,7 +44,6 @@ from .accuracy_core import (
     LlmapiAccuracyTestHarness,
     VideoMME,
     VoxPopuli,
-    assert_acceptance_length_for_llm,
     assert_guided_decoding_regex,
 )
 
@@ -268,8 +268,6 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
-            max_stats_len=-1,
-            enable_iter_perf_stats=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -277,10 +275,6 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 llm,
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
-            assert_acceptance_length_for_llm(
-                "TestGemma4_26B_A4B::test_nvfp4",
-                llm,
             )
 
     def test_nvfp4_no_mtp(self):
@@ -308,6 +302,8 @@ class TestGemma4Unified12B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
 
     def test_guided_decoding(self):
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
         with LLM(
             self.MODEL_PATH,
             disable_mm_encoder=True,

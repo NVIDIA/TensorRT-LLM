@@ -38,7 +38,7 @@ _ARCHITECTURE_TESTS = {
         "accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype"
     ),
     "Glm4MoeForCausalLM": (
-        "accuracy/test_llm_api_pytorch.py::TestGlm4MoeSpeculativeDecoding::test_guided_decoding"
+        "accuracy/test_llm_api_pytorch.py::TestGlm4MoeGuidedDecoding::test_guided_decoding"
     ),
     "Qwen3MoeForCausalLM": (
         "accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]"
@@ -53,7 +53,7 @@ _ARCHITECTURE_TESTS = {
         "accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tp2_cutlass"
     ),
     "Llama4ForConditionalGeneration": (
-        "accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_guided_decoding"
+        "accuracy/test_llm_api_pytorch.py::TestLlama4GuidedDecoding::test_guided_decoding"
     ),
     "GptOssForCausalLM": ("accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_guided_decoding"),
     "KimiK3ForConditionalGeneration": (
@@ -70,12 +70,17 @@ _ARCHITECTURE_TESTS = {
         "accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4Unified12B::test_guided_decoding"
     ),
     "Step3p7ForConditionalGeneration": (
-        "accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_guided_decoding"
+        "accuracy/test_llm_api_pytorch.py::TestStep3p7GuidedDecoding::test_guided_decoding"
     ),
     "MiniMaxM3SparseForConditionalGeneration": (
         "accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False]"
     ),
 }
+
+# Qwen4 stays Untested in the matrix until its GB300 carrier passes in CI. The
+# carrier remains scheduled so the status can be promoted without adding a new
+# test later.
+_PENDING_CI_VALIDATION = {"Qwen4ExpForCausalLM"}
 
 
 def _guided_decoding_statuses() -> dict[str, str]:
@@ -132,14 +137,18 @@ def _assert_node_exists(nodeid: str) -> None:
     )
 
 
-def _scheduled_tests() -> str:
-    test_lists = []
+def _scheduled_tests() -> set[str]:
+    scheduled_tests = set()
     for path in _TEST_LISTS.rglob("*"):
-        if path.suffix not in {".txt", ".yaml", ".yml"}:
+        if path.name == "waives.txt" or path.suffix not in {".txt", ".yaml", ".yml"}:
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
-            test_lists.append(line.partition("#")[0])
-    return "\n".join(test_lists)
+            entry = line.partition("#")[0].strip()
+            if entry.startswith("- "):
+                entry = entry.removeprefix("- ").strip()
+            if entry:
+                scheduled_tests.add(entry.split(maxsplit=1)[0])
+    return scheduled_tests
 
 
 def _unconditionally_waived_tests() -> set[str]:
@@ -158,7 +167,10 @@ def test_guided_decoding_support_has_scheduled_architecture_coverage():
     documented_as_supported = {
         architecture for architecture, status in statuses.items() if status.startswith("Yes")
     }
-    assert documented_as_supported == set(_ARCHITECTURE_TESTS)
+    assert _PENDING_CI_VALIDATION <= set(_ARCHITECTURE_TESTS)
+    assert documented_as_supported == set(_ARCHITECTURE_TESTS) - _PENDING_CI_VALIDATION
+    for architecture in _PENDING_CI_VALIDATION:
+        assert statuses[architecture] == "Untested"
 
     scheduled_tests = _scheduled_tests()
     unconditionally_waived_tests = _unconditionally_waived_tests()
