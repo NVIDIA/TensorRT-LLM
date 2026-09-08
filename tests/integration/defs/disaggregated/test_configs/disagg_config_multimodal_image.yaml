@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+hostname: localhost
+model: Qwen3-VL-2B-Instruct
+backend: pytorch
+context_servers:
+  num_instances: 1
+  max_batch_size: 1
+  max_num_tokens: 8192
+  max_seq_len: 8192
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: DEFAULT
+generation_servers:
+  num_instances: 1
+  max_batch_size: 1
+  max_num_tokens: 8192
+  max_seq_len: 8192
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: DEFAULT

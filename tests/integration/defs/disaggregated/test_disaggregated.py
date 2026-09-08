@@ -48,6 +48,7 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 MAMBA_BS1_CONCURRENCY2_MODEL = "NVIDIA-Nemotron-Nano-9B-v2"
+MULTIMODAL_IMAGE_MODEL = "Qwen3-VL-2B-Instruct"
 
 
 @dataclass
@@ -426,6 +427,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
         "mamba_bs1_concurrency2":
         f"{test_configs_root}/disagg_config_mamba_bs1_concurrency2.yaml",
+        "multimodal_image":
+        f"{test_configs_root}/disagg_config_multimodal_image.yaml",
     }
 
     if test_desc not in config_map:
@@ -1196,6 +1199,73 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
         ctx_env=worker_env,
         gen_env=worker_env,
         share_gpu=True,
+        server_start_timeout=600,
+    )
+
+
+def _verify_multimodal_image_chat(server_url: str) -> None:
+    """Send one image through the router and require a usable answer.
+
+    The generation worker receives prompt_token_ids in which the context
+    worker already expanded the image placeholders, while the original
+    ``messages`` still carry the image part. A worker that rebuilds
+    multi_modal_data from those messages expands the placeholders a second
+    time and the router returns an error instead of an answer.
+    """
+    image_url = os.path.join(llm_models_root(), "multimodals", "test_data",
+                             "seashore.png")
+    assert os.path.exists(image_url), f"{image_url} does not exist"
+
+    content = [
+        {
+            "type": "text",
+            "text": "Describe the natural environment in the image."
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": image_url
+            }
+        },
+    ]
+    payload = {
+        "model": MULTIMODAL_IMAGE_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": content
+        }],
+        "max_tokens": 32,
+        "temperature": 0,
+    }
+
+    async def run() -> None:
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{server_url}/v1/chat/completions",
+                                    json=payload,
+                                    timeout=timeout) as response:
+                body = await response.json()
+                assert response.status == 200, body
+                assert body.get("choices"), body
+                answer = body["choices"][0]["message"]["content"]
+                assert answer and answer.strip(), body
+
+    asyncio.run(run())
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.timeout(900)
+def test_disaggregated_multimodal_image(disaggregated_example_root, llm_venv):
+    """Disaggregated serving of a chat request that carries an image."""
+    model_path = f"{llm_models_root()}/Qwen3/{MULTIMODAL_IMAGE_MODEL}"
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "multimodal_image",
+        num_iters=0,
+        env=llm_venv._new_env.copy(),
+        model_path=model_path,
+        cwd=llm_venv.get_working_directory(),
+        post_client_test=_verify_multimodal_image_chat,
         server_start_timeout=600,
     )
 

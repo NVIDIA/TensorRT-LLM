@@ -2231,6 +2231,15 @@ class OpenAIServer(_VideoRoutesMixin):
 
             if request.prompt_token_ids is not None:
                 mm_data, mm_embeddings = await mm_coroutines
+                if (disaggregated_params is not None and
+                        disaggregated_params.request_type == "generation_only"):
+                    # The context worker already expanded the media
+                    # placeholders into prompt_token_ids and the KV for those
+                    # positions arrives over the transceiver, so this worker
+                    # must not re-derive them. Re-attaching the media here
+                    # would send an already-expanded prompt through
+                    # placeholder expansion a second time.
+                    mm_data = None
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_embeddings:
