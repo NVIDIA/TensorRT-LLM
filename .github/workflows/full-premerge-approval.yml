@@ -133,6 +133,14 @@ jobs:
                 console.log(`PR #${pullNumber} is not open; skipping auto-labeling.`);
                 return;
               }
+              if (pullRequest.baseRefName !== 'main' &&
+                  !pullRequest.baseRefName.startsWith('release/')) {
+                console.log(
+                  `PR #${pullNumber} does not target main or a release branch; ` +
+                  'skipping auto-labeling.'
+                );
+                return;
+              }
               const latestOpinions = pullRequest.latestOpinionatedReviews?.nodes ?? [];
               const hasApproval = latestOpinions.some(
                 (review) => review.state === 'APPROVED'

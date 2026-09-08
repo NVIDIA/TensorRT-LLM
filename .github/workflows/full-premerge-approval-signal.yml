@@ -27,6 +27,8 @@ jobs:
   evaluate-full-approval:
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event.pull_request.base.ref == 'main' ||
+       startsWith(github.event.pull_request.base.ref, 'release/')) &&
       github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
