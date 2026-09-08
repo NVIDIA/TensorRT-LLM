@@ -267,7 +267,7 @@ BASE = {
     "disagg_sol": {"tracks": ["ctx", "gen"], "design": {"prefer": "interactive"}},
 }
 POINT = {
-    "shape": "tep_4_eplb0_mtp3",
+    "shape": "tep_4_eplb0_mtp0",
     "concurrency": 1,
     "prefer": "interactive",
     "ranked_on": "throughput_per_user",
@@ -302,7 +302,7 @@ def test_the_campaign_can_say_where_its_operating_point_came_from(tmp_path):
     )
     prov = spec["sol_track"]["point_provenance"]
     assert prov["design_dir"].endswith("design")
-    assert prov["selected"]["shape"] == "tep_4_eplb0_mtp3"
+    assert prov["selected"]["shape"] == "tep_4_eplb0_mtp0"
     assert "Absent, not flat" in prov["e2e_view_absent"]
 
 
@@ -319,10 +319,29 @@ def test_no_anchor_is_handed_to_the_gen_half(tmp_path):
     assert "ctx_json" not in spec["sol_track"]
 
 
+def _sweeps(tmp_path, *, gen_shape="tep", gen_tp=4, gen_conc="1", ctx_tp=4, ctx_batch=2):
+    """Real sweep files that contain (or deliberately miss) the selected point."""
+    import yaml as _yaml
+
+    g = tmp_path / "gen.yaml"
+    g.write_text(
+        _yaml.safe_dump(
+            {"gen_configs": [[1, 1, gen_tp, 64, 64, gen_shape == "dep", "0.9", 0, 0, gen_conc]]}
+        )
+    )
+    c = tmp_path / "ctx.yaml"
+    c.write_text(
+        _yaml.safe_dump(
+            {"benchmarks": [{"isl": 8192, "osl": 1, "max_batch": [ctx_batch], "tp_size": [ctx_tp]}]}
+        )
+    )
+    return {"ctx": c, "gen": g}
+
+
 def _plan(tmp_path, repos=None):
     return disagg_sol.launch_plan(
         BASE,
-        sweeps={"ctx": tmp_path / "ctx.yaml", "gen": tmp_path / "gen.yaml"},
+        sweeps=_sweeps(tmp_path, gen_shape="tep", gen_tp=4, gen_conc="1"),
         repos=repos or {"ctx": tmp_path / "trtllm-ctx", "gen": tmp_path / "trtllm-gen"},
         workspace_root=tmp_path,
         label="run1",
@@ -355,7 +374,7 @@ def test_a_track_with_no_sweep_or_no_checkout_is_refused_by_name(tmp_path):
     with pytest.raises(disagg_sol.DisaggSolError, match=r"sweep given for track\(s\) \['gen'\]"):
         disagg_sol.launch_plan(
             BASE,
-            sweeps={"ctx": tmp_path / "c.yaml"},
+            sweeps={"ctx": _sweeps(tmp_path)["ctx"]},
             repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
             workspace_root=tmp_path,
             label="x",
@@ -365,7 +384,7 @@ def test_a_track_with_no_sweep_or_no_checkout_is_refused_by_name(tmp_path):
     with pytest.raises(disagg_sol.DisaggSolError, match=r"trtllm_repo_path.*\['gen'\]"):
         disagg_sol.launch_plan(
             BASE,
-            sweeps={"ctx": tmp_path / "c.yaml", "gen": tmp_path / "g.yaml"},
+            sweeps=_sweeps(tmp_path, gen_tp=4, gen_conc="1"),
             repos={"ctx": tmp_path / "a"},
             workspace_root=tmp_path,
             label="x",
@@ -540,7 +559,7 @@ def test_a_dry_run_selects_and_writes_every_spec_without_starting_anything(tmp_p
     d, spec = _supervisable(tmp_path)
     record = disagg_sol.supervise(
         spec,
-        sweeps={"ctx": tmp_path / "c.yaml", "gen": tmp_path / "g.yaml"},
+        sweeps=_sweeps(tmp_path, gen_tp=4, gen_conc="1"),
         repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
         workspace_root=tmp_path / "ws",
         label="t",
@@ -558,7 +577,7 @@ def test_the_record_says_what_was_selected_and_against_what(tmp_path):
     d, spec = _supervisable(tmp_path)
     record = disagg_sol.supervise(
         spec,
-        sweeps={"ctx": tmp_path / "c.yaml", "gen": tmp_path / "g.yaml"},
+        sweeps=_sweeps(tmp_path, gen_tp=4, gen_conc="1"),
         repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
         workspace_root=tmp_path / "ws",
         label="t",
@@ -590,7 +609,7 @@ def test_a_half_that_is_ready_does_not_wait_on_one_that_is_not(tmp_path):
     }
     record = disagg_sol.supervise(
         spec,
-        sweeps={"ctx": tmp_path / "c.yaml"},
+        sweeps={"ctx": _sweeps(tmp_path)["ctx"]},
         repos={"ctx": tmp_path / "rc"},
         workspace_root=tmp_path / "ws",
         label="t",
@@ -609,9 +628,141 @@ def test_the_refusal_names_which_half_is_missing_what(tmp_path):
     with pytest.raises(disagg_sol.DisaggSolError, match=r"concurrency sweep.*for track 'gen'"):
         disagg_sol.supervise(
             spec,
-            sweeps={"ctx": tmp_path / "c", "gen": tmp_path / "g"},
+            sweeps=_sweeps(tmp_path),
             repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
             workspace_root=tmp_path / "ws",
             label="t",
             dry_run=True,
         )
+
+
+def test_a_sweep_that_does_not_contain_the_selected_point_is_refused(tmp_path):
+    """Without this the selection is a report, not a decision.
+
+    The chosen point goes into every campaign's `point_provenance` while the
+    campaign runs whatever its sweep says -- so a mismatched pair produces a
+    record claiming an operating point the run never used. That is worse than
+    not selecting at all: an untraceable point is at least honest about being
+    untraceable.
+    """
+    d, spec = _supervisable(tmp_path)
+    # the design measured tep_4 @ c=1; hand it a sweep for dep_16 @ c=64
+    with pytest.raises(disagg_sol.DisaggSolError, match="does not contain the selected point"):
+        disagg_sol.supervise(
+            spec,
+            sweeps=_sweeps(tmp_path, gen_shape="dep", gen_tp=16, gen_conc="64"),
+            repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+            workspace_root=tmp_path / "ws2",
+            label="t",
+            dry_run=True,
+        )
+
+
+def test_the_refusal_lists_what_the_sweep_does_contain(tmp_path):
+    """So the reader can see whether the sweep or the selection is wrong."""
+    d, spec = _supervisable(tmp_path)
+    with pytest.raises(disagg_sol.DisaggSolError, match=r"It expands to \[\('dep_16"):
+        disagg_sol.supervise(
+            spec,
+            sweeps=_sweeps(tmp_path, gen_shape="dep", gen_tp=16, gen_conc="64"),
+            repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+            workspace_root=tmp_path / "ws3",
+            label="t",
+            dry_run=True,
+        )
+
+
+def test_a_ctx_sweep_at_the_wrong_worker_shape_is_refused(tmp_path):
+    """The ctx point is (tp_size, max_batch); a sweep at another is a mismatch."""
+    d, spec = _supervisable(tmp_path)
+    spec = {**spec, FIELD: {**spec[FIELD], "tracks": ["ctx"]}}
+    with pytest.raises(disagg_sol.DisaggSolError, match="does not contain the selected point"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"ctx": _sweeps(tmp_path, ctx_tp=8, ctx_batch=16)["ctx"]},
+            repos={"ctx": tmp_path / "rc"},
+            workspace_root=tmp_path / "ws4",
+            label="t",
+            dry_run=True,
+        )
+
+
+def test_an_unestablished_design_is_run_rather_than_refused_when_one_can_be(tmp_path):
+    """An unestablished design is established rather than refused.
+
+    Treating it purely as an input degenerated into nobody running it once
+    already -- that is how the two campaigns this layer replaces came to
+    inherit an unmeasured row. When a designer is available the run
+    establishes what it needs and re-checks: not a fallback, a first step.
+    """
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    spec = {
+        "checkpoint_path": "/ckpt",
+        "optimize": {"approaches": ["code"]},
+        FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}},
+    }
+    seen: list[str] = []
+
+    def designer(instruction: str) -> None:
+        seen.append(instruction)
+        _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])  # now established
+
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"gen": _sweeps(tmp_path)["gen"]},
+        repos={"gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "wsd",
+        label="t",
+        dry_run=True,
+        designer=designer,
+    )
+    assert len(seen) == 1
+    assert "create-sweep" in seen[0]
+    assert record["gen_point"]["shape"] == "tep_4_eplb0_mtp0"
+
+
+def test_a_designer_that_did_not_establish_the_design_still_refuses(tmp_path):
+    """Running it is not the same as it having worked."""
+    d = _design(tmp_path)
+    spec = {FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}}}
+    with pytest.raises(disagg_sol.DisaggSolError, match="concurrency sweep"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"gen": _sweeps(tmp_path)["gen"]},
+            repos={"gen": tmp_path / "rg"},
+            workspace_root=tmp_path / "wse",
+            label="t",
+            dry_run=True,
+            designer=lambda instruction: None,
+        )
+
+
+def test_only_the_unready_halves_are_named_to_the_designer(tmp_path):
+    """No point re-establishing a half that is already measured."""
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    spec = {
+        "checkpoint_path": "/ckpt",
+        FIELD: {
+            "tracks": ["ctx", "gen"],
+            "design": {"design_dir": str(d), "prefer": "interactive"},
+        },
+    }
+    seen: list[str] = []
+
+    def designer(instruction: str) -> None:
+        seen.append(instruction)
+        _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])
+
+    disagg_sol.supervise(
+        spec,
+        sweeps=_sweeps(tmp_path),
+        repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
+        workspace_root=tmp_path / "wsf",
+        label="t",
+        dry_run=True,
+        designer=designer,
+    )
+    assert "['gen']" in seen[0]
+    assert "'ctx'" not in seen[0]

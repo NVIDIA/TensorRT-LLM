@@ -8,8 +8,10 @@ keeping exactly as strict as it is.
 
 This module is the second door, and it is narrow on purpose:
 
-- It starts **one kind of process**: ``perf-optimize`` itself. Not a
-  benchmark, not a harness command, not a shell. The argv is built from a
+- It starts **two kinds of process**, both of which this workflow owns:
+  ``perf-optimize`` itself (:func:`start`), and the agent that runs the
+  design skill (:func:`design`). Not a benchmark, not a harness command,
+  not a shell. For a campaign the argv is built from a
   :class:`.disagg_sol.CampaignLaunch`, which was already validated — its
   checkout is unshared, its workspace is its own — so by the time anything
   gets here there is no decision left to make.
@@ -105,3 +107,35 @@ def wait_all(started: Sequence[tuple[CampaignLaunch, subprocess.Popen]]) -> dict
     checkout behind with nothing tracking either.
     """
     return {launch.track: process.wait() for launch, process in started}
+
+
+#: The agent binary that runs skills. Named here rather than inlined so a
+#: site that installs it elsewhere has one place to look.
+AGENT = "claude"
+
+
+def design(instruction: str, *, cwd: Path, timeout: int | None = None) -> int:
+    """Run the design skill to completion, in the checkout that ships it.
+
+    ``cwd`` is not incidental: a skill is discovered from the agent's working
+    directory, so the design agent has to start inside the config repo or it
+    cannot invoke `create-sweep` at all — the failure being an agent that
+    improvises the phases from their names.
+
+    Blocking, unlike :func:`start`. The campaigns are independent of each
+    other and so are started and joined separately; the design is what every
+    campaign's operating point comes from, so there is nothing to overlap it
+    with.
+
+    Permissions are bypassed because this runs unattended for hours and the
+    skill's own submission gates are the review step -- they are what the
+    instruction tells it to honour.
+    """
+    return subprocess.run(  # noqa: S603 - argv is built, never a shell string
+        [AGENT, "--dangerously-skip-permissions", "--print", instruction],
+        cwd=str(cwd),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+        timeout=timeout,
+        check=False,
+    ).returncode
