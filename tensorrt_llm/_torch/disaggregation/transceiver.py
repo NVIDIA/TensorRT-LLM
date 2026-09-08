@@ -25,6 +25,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.agent import use_pure_python_transfer_agent
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
@@ -1069,6 +1070,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             kv_slice = self._create_kv_slice(req)
             req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                disagg_diagnostics.emit_event(
+                    "gen_receive_start",
+                    side="gen",
+                    request_id=rid,
+                    local_request_id=req.py_request_id,
+                    rank=self._mapping.rank,
+                    instance=self._instance_name,
+                    slice_id=0,
+                    transfer_bytes=req.py_kv_cache_xfer_bytes,
+                    tp_rank=self._mapping.tp_rank,
+                    pp_rank=self._mapping.pp_rank,
+                    cp_rank=self._mapping.cp_rank,
+                    dp_rank=self._dp_rank,
+                )
             session.receive(kv_slice)
         except Exception as error:
             if bridge_enabled:
@@ -1145,6 +1161,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled = [rid for rid in cancelled if rid in quiesced]
         failed = [rid for rid in failed if rid in quiesced]
 
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            for outcome, request_ids in (
+                ("cancelled", cancelled),
+                ("failed", failed),
+                ("completed", completed),
+            ):
+                for rid in request_ids:
+                    session = self._send_sessions[rid]
+                    req = self._send_reqs.get(rid)
+                    disagg_diagnostics.emit_event(
+                        "ctx_transfer_settled",
+                        side="ctx",
+                        request_id=rid,
+                        local_request_id=(req.py_request_id if req is not None else None),
+                        rank=self._mapping.rank,
+                        instance=self._instance_name,
+                        outcome=outcome,
+                        session_status=session.status.value,
+                        resources_drained=not session.has_transferring_tasks(),
+                        tp_rank=self._mapping.tp_rank,
+                        pp_rank=self._mapping.pp_rank,
+                        cp_rank=self._mapping.cp_rank,
+                        dp_rank=self._dp_rank,
+                    )
+
         for rid in cancelled:
             self._retire_send_session(rid, outcome="cancelled")
 
@@ -1217,6 +1258,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed
         )
+
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            for outcome, request_ids in (
+                ("cancelled", cancelled),
+                ("failed", failed),
+                ("completed", completed),
+            ):
+                for rid in request_ids:
+                    session = self._recv_sessions[rid]
+                    req = self._recv_reqs.get(rid)
+                    disagg_diagnostics.emit_event(
+                        "gen_transfer_settled",
+                        side="gen",
+                        request_id=rid,
+                        local_request_id=(req.py_request_id if req is not None else None),
+                        rank=self._mapping.rank,
+                        instance=self._instance_name,
+                        outcome=outcome,
+                        session_status=session.status.value,
+                        resources_drained=not session.has_transferring_tasks(),
+                        tp_rank=self._mapping.tp_rank,
+                        pp_rank=self._mapping.pp_rank,
+                        cp_rank=self._mapping.cp_rank,
+                        dp_rank=self._dp_rank,
+                    )
 
         cancelled_reqs = []
         for rid in cancelled:
@@ -1344,6 +1410,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)
+
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            for side, sessions in (
+                ("ctx", self._send_sessions),
+                ("gen", self._recv_sessions),
+            ):
+                if rid not in sessions:
+                    continue
+                disagg_diagnostics.emit_event(
+                    "transfer_cancel_requested",
+                    side=side,
+                    request_id=rid,
+                    local_request_id=req.py_request_id,
+                    rank=self._mapping.rank,
+                    instance=self._instance_name,
+                    session_status=sessions[rid].status.value,
+                    tp_rank=self._mapping.tp_rank,
+                    pp_rank=self._mapping.pp_rank,
+                    cp_rank=self._mapping.cp_rank,
+                    dp_rank=self._dp_rank,
+                )
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)
