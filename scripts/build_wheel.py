@@ -758,7 +758,8 @@ def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
                   exclude=("__pycache__", "*.pyc"))
     top_level_files = [
         "setup.py", "pyproject.toml", "requirements.txt",
-        "requirements-dev.txt", "constraints.txt", "LICENSE", "README.md"
+        "requirements-dev.txt", "requirements-openengine.txt",
+        "requirements-grpc-smg.txt", "constraints.txt", "LICENSE", "README.md"
     ]
     top_level_files += [
         f.name for f in project_dir.glob("ATTRIBUTIONS-CPP-*.md")
