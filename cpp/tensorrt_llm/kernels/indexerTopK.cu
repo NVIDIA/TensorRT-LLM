@@ -979,12 +979,9 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     else
     {
         TLLM_CHECK_WITH_INFO(false,
-            "indexer_topk_decode bf16/fp16 path does not support "
-            "numColumns >= splitWorkThreshold "
-            "(split-work path requires float aux buffers not "
-            "exposed in the bf16/fp16 entry). "
-            "Got numColumns=%d splitWorkThreshold=%d. Use the "
-            "fp32 entry for this regime.",
+            "indexer_topk_decode bf16/fp16 path does not support numColumns >= splitWorkThreshold "
+            "(split-work path requires float aux buffers not exposed in the bf16/fp16 entry). "
+            "Got numColumns=%d splitWorkThreshold=%d. Use the fp32 entry for this regime.",
             numColumns, effectiveSplitWorkThreshold);
     }
 

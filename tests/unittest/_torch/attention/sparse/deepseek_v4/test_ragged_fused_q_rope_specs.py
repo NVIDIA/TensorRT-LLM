@@ -8,7 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).parents[6]
-MODULE = ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "sparse" / "deepseek_v4" / "module.py"
+MODULE = (
+    ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "attention"
+    / "backends"
+    / "sparse"
+    / "deepseek_v4"
+    / "module.py"
+)
 METADATA = (
     ROOT
     / "tensorrt_llm"

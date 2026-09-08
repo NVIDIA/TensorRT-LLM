@@ -37,8 +37,7 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, int64_t compress_ratio, std::optional<th::Tensor> const& radix_aux_indices,
-    std::optional<th::Tensor> const& radix_aux_logits,
-    std::optional<th::Tensor> const& row_kv_lens)
+    std::optional<th::Tensor> const& radix_aux_logits, std::optional<th::Tensor> const& row_kv_lens)
 {
     TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
@@ -128,8 +127,7 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
             {
                 int64_t const needed_elts = static_cast<int64_t>(num_rows) * blocks_per_row * index_topk;
                 TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
-                    "radix_aux_{indices,logits} must hold at least "
-                    "num_rows*blocks_per_row*index_topk elements (got ",
+                    "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
                     ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
             }
             aux_indices_ptr = ai.data_ptr<int32_t>();
@@ -142,8 +140,7 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
             // blocksPerRow > 1 without caller-owned scratch is the original
             // G4 CUDA-Graph stale-pointer hazard — reject early.
             TORCH_CHECK(blocks_per_row == 1,
-                "radix_aux_{indices,logits} must be pre-allocated by the "
-                "caller when blocks_per_row > 1 "
+                "radix_aux_{indices,logits} must be pre-allocated by the caller when blocks_per_row > 1 "
                 "(got blocks_per_row=",
                 blocks_per_row, "). Required for CUDA Graph safety.");
         }
@@ -226,8 +223,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_prefill(Tensor logits, Tensor row_starts, Tensor "
-        "row_ends, Tensor indices, int "
+        "indexer_topk_prefill(Tensor logits, Tensor row_starts, Tensor row_ends, Tensor indices, int "
         "index_topk=2048) -> ()");
 }
 

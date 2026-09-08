@@ -63,14 +63,13 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 /// that regime must use the fp32 entry.
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
-    int const next_n, int const topK = 2048, int const compressRatio = 1,
-    int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
+    int const next_n, int const topK = 2048, int const compressRatio = 1, int const* rowKvLens = nullptr,
+    cudaStream_t const stream = 0);
 
 /// fp16 indexer TopK decode — see bf16 overload for dispatcher contract.
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
-    int const topK = 2048, int const compressRatio = 1, int const* rowKvLens = nullptr,
-    cudaStream_t const stream = 0);
+    int const topK = 2048, int const compressRatio = 1, int const* rowKvLens = nullptr, cudaStream_t const stream = 0);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,

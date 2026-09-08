@@ -514,9 +514,12 @@ def test_kv_len_update_refreshes_ragged_rows_only_when_enabled(enabled):
     metadata.refresh_ragged_row_kv_lens = Mock()
     metadata.refresh_token_major_gen_rows = Mock()
 
-    with patch.object(TrtllmAttentionMetadata, "on_update_kv_lens"), patch(
-        "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata._fused_dsa_meta_enabled",
-        return_value=False,
+    with (
+        patch.object(TrtllmAttentionMetadata, "on_update_kv_lens"),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata._fused_dsa_meta_enabled",
+            return_value=False,
+        ),
     ):
         metadata.on_update_kv_lens()
 

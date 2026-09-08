@@ -26,7 +26,6 @@ import torch
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
     AttentionInputType,
     MLAParams,
     PositionalEmbeddingParams,
@@ -38,7 +37,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import get_token_bytes
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest

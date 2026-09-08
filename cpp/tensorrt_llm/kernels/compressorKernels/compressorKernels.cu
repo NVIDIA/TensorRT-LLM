@@ -648,24 +648,19 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 
 // Per-axis fan-outs (used to keep the master list compact).
 #define FOREACH_DECODE_NN_1_4(F, HD, KV, ST, CR, NRW)                                                                  \
-    F(HD, KV, ST, CR, 1, NRW)                                                                                          \
-    F(HD, KV, ST, CR, 2, NRW) F(HD, KV, ST, CR, 3, NRW) F(HD, KV, ST, CR, 4, NRW)
+    F(HD, KV, ST, CR, 1, NRW) F(HD, KV, ST, CR, 2, NRW) F(HD, KV, ST, CR, 3, NRW) F(HD, KV, ST, CR, 4, NRW)
 #define FOREACH_DECODE_NN_5_8(F, HD, KV, ST, CR, NRW)                                                                  \
-    F(HD, KV, ST, CR, 5, NRW)                                                                                          \
-    F(HD, KV, ST, CR, 6, NRW) F(HD, KV, ST, CR, 7, NRW) F(HD, KV, ST, CR, 8, NRW)
+    F(HD, KV, ST, CR, 5, NRW) F(HD, KV, ST, CR, 6, NRW) F(HD, KV, ST, CR, 7, NRW) F(HD, KV, ST, CR, 8, NRW)
 #define FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW)                                                                       \
     FOREACH_DECODE_NN_1_4(F, HD, 2, 2, CR, NRW)                                                                        \
     FOREACH_DECODE_NN_1_4(F, HD, 2, 4, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_1_4(F, HD, 4, 2, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_1_4(F, HD, 4, 4, CR, NRW)
+    FOREACH_DECODE_NN_1_4(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_1_4(F, HD, 4, 4, CR, NRW)
 #define FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)                                                                       \
     FOREACH_DECODE_NN_5_8(F, HD, 2, 2, CR, NRW)                                                                        \
     FOREACH_DECODE_NN_5_8(F, HD, 2, 4, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_5_8(F, HD, 4, 2, CR, NRW)                                                                        \
-    FOREACH_DECODE_NN_5_8(F, HD, 4, 4, CR, NRW)
+    FOREACH_DECODE_NN_5_8(F, HD, 4, 2, CR, NRW) FOREACH_DECODE_NN_5_8(F, HD, 4, 4, CR, NRW)
 #define FOREACH_DECODE_DTYPE_1_8(F, HD, CR, NRW)                                                                       \
-    FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW)                                                                           \
-    FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)
+    FOREACH_DECODE_DTYPE_1_4(F, HD, CR, NRW) FOREACH_DECODE_DTYPE_5_8(F, HD, CR, NRW)
 
 // Master list. Order does not matter; the dispatcher walks linearly.
 // clang-format off
@@ -769,8 +764,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 #undef TRY_LAUNCH
 
     TLLM_THROW(
-        "pagedKvCompressLaunch: no matching instantiation for HD=%d, "
-        "kv_eb=%d, state_eb=%d, CR=%d, NN=%d, NRW=%d",
+        "pagedKvCompressLaunch: no matching instantiation for HD=%d, kv_eb=%d, state_eb=%d, CR=%d, NN=%d, NRW=%d",
         head_dim, kv_score_elem_bytes, state_elem_bytes, compress_ratio, next_n, num_red_warps);
 }
 
@@ -1111,10 +1105,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
         //   prev-segment (first head_dim,  kv_col=0)    from window (abs_idx-1)
         //   curr-segment (second head_dim, kv_col=HD)   from window abs_idx
         if (abs_idx > 0)
-            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0,
-                false); // prev window, first half
-        reduce_window(win_start, HEAD_DIM, HEAD_DIM,
-            false);     // curr window, second half
+            reduce_window((abs_idx - 1) * COMPRESS_RATIO, 0, 0, false); // prev window, first half
+        reduce_window(win_start, HEAD_DIM, HEAD_DIM, false);            // curr window, second half
     }
     else
     {
@@ -1209,8 +1201,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 
 #define INST_PREFILL_DTYPES(HD, CR, NRW)                                                                               \
     INST_PREFILL(HD, 2, 2, CR, NRW)                                                                                    \
-    INST_PREFILL(HD, 2, 4, CR, NRW)                                                                                    \
-    INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
+    INST_PREFILL(HD, 2, 4, CR, NRW) INST_PREFILL(HD, 4, 2, CR, NRW) INST_PREFILL(HD, 4, 4, CR, NRW)
 
 INST_PREFILL_DTYPES(128, 4, 1)
 INST_PREFILL_DTYPES(128, 128, 4)
@@ -1244,8 +1235,7 @@ void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_
         compress_ratio == 4 || compress_ratio == 128, "prefillReductionLaunch only supports compress_ratio 4 or 128");
     TLLM_CHECK_WITH_INFO(
         (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
-        "prefillReductionLaunch only supports bf16/fp32 "
-        "kv_score and paged state");
+        "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
     int const elem_bytes_for_vec = max(kv_score_elem_bytes, state_elem_bytes);
     int const vec = prefillVec(head_dim, elem_bytes_for_vec);
     int const nthrd_base = head_dim / vec;
