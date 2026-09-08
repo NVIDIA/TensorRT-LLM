@@ -162,7 +162,25 @@ else:
     CoalescedBuffer = _cpp.CoalescedBuffer
     CacheTier = _cpp.CacheTier
     DiskCacheTierConfig = _cpp.DiskCacheTierConfig
-    GpuCacheTierConfig = _cpp.GpuCacheTierConfig
+    _CppGpuCacheTierConfig = _cpp.GpuCacheTierConfig
+
+    class _GpuCacheTierConfigMeta(type):
+        """Shim for C++ GpuCacheTierConfig with Python-only enable_locality_domains."""
+
+        def __call__(cls, quota: int, enable_locality_domains: bool = False):
+            if enable_locality_domains:
+                raise NotImplementedError(
+                    "Locality domains require the Python KVCacheManagerV2 backend; "
+                    "set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python"
+                )
+            return _CppGpuCacheTierConfig(int(quota))
+
+        def __instancecheck__(cls, instance):
+            return isinstance(instance, _CppGpuCacheTierConfig)
+
+    class GpuCacheTierConfig(metaclass=_GpuCacheTierConfigMeta):
+        pass
+
     ExpandedBuffer = _cpp.ExpandedBuffer
     HostCacheTierConfig = _cpp.HostCacheTierConfig
     KVCacheDesc = _cpp.KVCacheDesc
@@ -172,6 +190,22 @@ else:
     KVCacheEventManager = _cpp.KVCacheEventManager
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
+    if not hasattr(KVCacheManager, "num_locality_domains"):
+
+        def _num_locality_domains(_self) -> int:
+            # Locality domains are implemented in the Python backend today.
+            return 1
+
+        KVCacheManager.num_locality_domains = property(_num_locality_domains)
+
+    if not hasattr(KVCacheManager, "get_per_locality_domain_free_slots"):
+
+        def _get_per_locality_domain_free_slots(self) -> list[int]:
+            peak_stats = self.get_and_reset_iteration_peak_block_stats(0)
+            return [sum(pg.available for pg in peak_stats)]
+
+        KVCacheManager.get_per_locality_domain_free_slots = _get_per_locality_domain_free_slots
+
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
     IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
     create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
@@ -259,25 +293,52 @@ else:
     CACHE_LEVEL1 = 1
     NDEBUG = os.environ.get("TLLM_DEBUG_MODE", "")[0:1] != "1"
 
-    class _RawRef:
-        def __init__(self, obj=None):
-            self._obj = obj
+    # Prefer the real C-extension rawref whenever it is available. conftest /
+    # tensorrt_llm.runtime import this package under the default C++ backend
+    # *before* localization tests can set TLLM_KV_CACHE_MANAGER_V2_BACKEND=python,
+    # and Python ``_core`` / StorageManager still need a contract-correct rawref
+    # (singleton via ``obj.__rawref__``, ``is_valid``). Fall back to a stub only
+    # when the extension cannot be loaded.
+    try:
+        from . import rawref as rawref  # noqa: F401
+    except ImportError:
 
-        def __call__(self):
-            return self._obj
+        class _RawRef:
+            """Minimal stand-in for the C-extension rawref used by Python modules."""
 
-        def invalidate(self) -> None:
-            self._obj = None
+            def __init__(self, obj=None):
+                self._obj = obj
 
-        @classmethod
-        def __class_getitem__(cls, _item):
-            return cls
+            def __call__(self):
+                return self._obj
 
-    rawref = ModuleType(f"{__name__}.rawref")
-    rawref.ReferenceType = _RawRef
-    rawref.ref = _RawRef
-    rawref.NULL = _RawRef()
-    sys.modules.setdefault(f"{__name__}.rawref", rawref)
+            @property
+            def is_valid(self) -> bool:
+                return self._obj is not None
+
+            def invalidate(self) -> None:
+                self._obj = None
+
+            @classmethod
+            def __class_getitem__(cls, _item):
+                return cls
+
+        def _rawref_ref(obj):
+            existing = getattr(obj, "__rawref__", None)
+            if isinstance(existing, _RawRef) and existing.is_valid:
+                return existing
+            ref = _RawRef(obj)
+            try:
+                setattr(obj, "__rawref__", ref)
+            except Exception:
+                pass
+            return ref
+
+        rawref = ModuleType(f"{__name__}.rawref")
+        rawref.ReferenceType = _RawRef
+        rawref.ref = _rawref_ref
+        rawref.NULL = _RawRef()
+        sys.modules.setdefault(f"{__name__}.rawref", rawref)
 
     class PageIndexMode(int):
         SHARED = 0
