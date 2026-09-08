@@ -606,6 +606,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         without this an excluded module still builds quantized buffers while
         ``DynamicLinearWeightLoader`` hands it a high-precision weight -- an FP8
         buffer left at its default scale of 1.0, or an NVFP4 shape mismatch.
+
+        Reassigning ``quant_config`` alone is not enough. ``Linear.create_weights``
+        caches ``quant_method`` and allocates the quantized parameters, and it
+        early-returns once ``_weights_created`` is set. With the default
+        ``skip_create_weights_in_init=False`` that has already happened by the time
+        this runs, so an excluded module would keep its quantized buffers and
+        method. Rebuild those modules so the layout matches the no-quant config.
         """
         quant_config = self.model_config.quant_config
         if quant_config is None or quant_config.exclude_modules is None:
@@ -617,6 +624,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 if quant_config.is_module_excluded_from_quantization(name):
                     if getattr(module, "quant_config", None) is not None:
                         module.quant_config = no_quant_config
+                        if getattr(module, "_weights_created", False):
+                            module._weights_created = False
+                            module._parameters.clear()
+                            module._buffers.clear()
+                            module.create_weights()
 
     @property
     def device(self) -> torch.device:

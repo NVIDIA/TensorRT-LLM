@@ -22,7 +22,17 @@ The FL2VA checkpoint runs one full-attention sequence laid out as
 audio coordinates share a 40-unit-per-second rotary clock, so the float64
 coordinate construction here is part of the checkpoint contract.
 
-This module is adapted from the Apache-2.0 MiniMax-H3 Diffusers implementation.
+The geometry helpers come from Diffusers 0.40, which exposes them at module
+scope: ``resolve_canvas_size``, ``align_num_frames``, ``video_latent_num_frames``
+and ``audio_latent_num_frames`` take the chunk and canvas parameters this model
+pins as constants, and ``patchify_video_latents`` is re-exported as-is.
+
+What remains here has no importable upstream counterpart. Diffusers builds the
+packed layout inside ``MiniMaxH3PrepareLayoutStep``, a modular-pipeline block, so
+``build_packed_sequence`` and ``build_row_timesteps`` cannot be called without
+standing up that machinery; the inverse transforms (``unpatchify_video_tokens``,
+``unpack_audio_tokens``) and the keyframe helpers have no upstream equivalent at
+all.
 """
 
 from __future__ import annotations
@@ -31,6 +41,21 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+    patchify_video_latents as _diffusers_patchify_video_latents,
+)
+from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+    align_num_frames as _diffusers_align_num_frames,
+)
+from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+    audio_latent_num_frames as _diffusers_audio_latent_num_frames,
+)
+from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+    resolve_canvas_size as _diffusers_resolve_canvas_size,
+)
+from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+    video_latent_num_frames as _diffusers_video_latent_num_frames,
+)
 from diffusers.utils.torch_utils import randn_tensor
 
 try:
@@ -86,56 +111,36 @@ class MiniMaxH3PackedSequence:
 
 def resolve_canvas_size(aspect_width: float, aspect_height: float) -> tuple[int, int]:
     """Resolve an aspect ratio to the H3 canvas, returned as ``(height, width)``."""
-    if aspect_width <= 0 or aspect_height <= 0:
-        raise ValueError(f"The aspect ratio must be positive, got {aspect_width}:{aspect_height}.")
-
-    ratio = aspect_width / aspect_height
-    if not MINIMAX_H3_MIN_ASPECT_RATIO <= ratio <= MINIMAX_H3_MAX_ASPECT_RATIO:
-        raise ValueError(
-            "MiniMax-H3 supports aspect ratios from 1:4 to 4:1, got "
-            f"{aspect_width}:{aspect_height} ({ratio:g})."
-        )
-
-    if ratio >= 1.0:
-        width = MINIMAX_H3_SHORT_EDGE * ratio
-        height = float(MINIMAX_H3_SHORT_EDGE)
-    else:
-        width = float(MINIMAX_H3_SHORT_EDGE)
-        height = MINIMAX_H3_SHORT_EDGE / ratio
-
-    area = width * height
-    if area > MINIMAX_H3_MAX_PIXELS:
-        scale = (MINIMAX_H3_MAX_PIXELS / area) ** 0.5
-        width, height = width * scale, height * scale
-
-    multiple = MINIMAX_H3_CANVAS_MULTIPLE
-    return (
-        max(multiple, round(height / multiple) * multiple),
-        max(multiple, round(width / multiple) * multiple),
+    return _diffusers_resolve_canvas_size(
+        aspect_width,
+        aspect_height,
+        MINIMAX_H3_CANVAS_MULTIPLE,
+        MINIMAX_H3_SHORT_EDGE,
+        MINIMAX_H3_MAX_PIXELS,
+        MINIMAX_H3_MIN_ASPECT_RATIO,
+        MINIMAX_H3_MAX_ASPECT_RATIO,
     )
 
 
 def align_num_frames(num_frames: int) -> int:
     """Snap upward to the next frame count of the form ``17 * n + 5``."""
-    if num_frames < 1:
-        raise ValueError(f"`num_frames` must be positive, got {num_frames}.")
-    while num_frames % MINIMAX_H3_FRAMES_PER_CHUNK != MINIMAX_H3_LATENTS_PER_CHUNK:
-        num_frames += 1
-    return num_frames
+    return _diffusers_align_num_frames(
+        num_frames, MINIMAX_H3_FRAMES_PER_CHUNK, MINIMAX_H3_LATENTS_PER_CHUNK
+    )
 
 
 def video_latent_num_frames(num_frames: int) -> int:
     """Return the number of video latent frames for an aligned pixel frame count."""
-    if num_frames % MINIMAX_H3_FRAMES_PER_CHUNK != MINIMAX_H3_LATENTS_PER_CHUNK:
-        raise ValueError(f"`num_frames` must be of the form 17 * n + 5, got {num_frames}.")
-    return (
-        num_frames - MINIMAX_H3_LATENTS_PER_CHUNK
-    ) // MINIMAX_H3_FRAMES_PER_CHUNK * MINIMAX_H3_LATENTS_PER_CHUNK + 2
+    return _diffusers_video_latent_num_frames(
+        num_frames, MINIMAX_H3_FRAMES_PER_CHUNK, MINIMAX_H3_LATENTS_PER_CHUNK
+    )
 
 
 def audio_latent_num_frames(num_frames: int) -> int:
     """Return the number of 40 Hz audio latents covering ``num_frames`` at 24 fps."""
-    return int(round(num_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_LATENTS_PER_SECOND))
+    return _diffusers_audio_latent_num_frames(
+        num_frames, MINIMAX_H3_FPS, MINIMAX_H3_AUDIO_LATENTS_PER_SECOND
+    )
 
 
 def prepare_keyframe_image(
@@ -166,30 +171,9 @@ def prepare_keyframe_image(
     return resized.crop((left, top, left + width, top + height))
 
 
-def patchify_video_latents(
-    latents: torch.Tensor,
-    patch_size: tuple[int, int, int],
-) -> torch.Tensor:
-    """Pack ``[B, C, T, H, W]`` video latents into frame-major rows."""
-    patch_t, patch_h, patch_w = patch_size
-    batch_size, channels, num_frames, height, width = latents.shape
-    if num_frames % patch_t or height % patch_h or width % patch_w:
-        raise ValueError(
-            f"Latents of shape {tuple(latents.shape)} are not divisible by patch {patch_size}."
-        )
-
-    latents = latents.reshape(
-        batch_size,
-        channels,
-        num_frames // patch_t,
-        patch_t,
-        height // patch_h,
-        patch_h,
-        width // patch_w,
-        patch_w,
-    )
-    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7)
-    return latents.reshape(-1, channels * patch_t * patch_h * patch_w).contiguous()
+# Byte-identical to the local implementation this replaces; verified over the
+# shapes and patch sizes H3 uses.
+patchify_video_latents = _diffusers_patchify_video_latents
 
 
 def unpatchify_video_tokens(
@@ -233,6 +217,11 @@ def unpack_audio_tokens(rows: torch.Tensor, num_audio_latents: int) -> torch.Ten
     return rows.permute(0, 2, 1).contiguous()
 
 
+# Kept local rather than imported: upstream these are private
+# (``_spatial_position_grid`` / ``_temporal_position_grid`` in
+# ``diffusers.modular_pipelines.minimax_h3.before_denoise``) and are only reached
+# from ``build_packed_sequence``, which stays here. Verified equal to the 0.40
+# implementations across the dims, patches and frame counts H3 uses.
 def _spatial_position_grid(dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
     ratio = dim / sqrt_area
     left = (1.0 - ratio) / 2.0

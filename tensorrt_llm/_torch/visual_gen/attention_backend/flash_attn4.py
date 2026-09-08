@@ -99,7 +99,7 @@ try:
     from flash_attn.cute.interface import _flash_attn_fwd
 
     _install_flash_attn_tile_scheduler_compatibility()
-except (ImportError, OSError, AttributeError) as e:
+except (ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
 

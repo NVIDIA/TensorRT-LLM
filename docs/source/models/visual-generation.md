@@ -87,11 +87,10 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### MiniMax-H3 Notes
 
+- Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
+  (Ref2VA) is not enabled yet.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
-- Dynamic FP8 and dynamic NVFP4 are experimental and visibly reduce output fidelity relative to
-  BF16. Validate quality before using them for quality-sensitive work.
-- Padded packed sequences require the `VANILLA` attention backend.
 
 ## Quick Start
 

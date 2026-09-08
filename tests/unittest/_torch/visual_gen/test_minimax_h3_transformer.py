@@ -861,11 +861,13 @@ def test_attention_backends_match_vanilla(backend: str) -> None:
     )
 
 
-def test_excluded_modules_lose_their_quant_config() -> None:
-    """An excluded Linear must not keep a quantized config.
+def test_excluded_modules_are_physically_unquantized() -> None:
+    """An excluded Linear must be rebuilt, not just reconfigured.
 
-    Otherwise it builds quantized buffers while the loader hands it a
-    high-precision weight.
+    ``Linear.create_weights`` caches ``quant_method`` and allocates the quantized
+    parameters during ``__init__``, so clearing ``quant_config`` afterwards leaves
+    the module physically quantized while the loader hands it a high-precision
+    weight. Assert the parameter layout, not just the config.
     """
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     quant_config.exclude_modules = ["*audio_proj_in*"]
@@ -873,8 +875,23 @@ def test_excluded_modules_lose_their_quant_config() -> None:
         _make_model_config(quant_config=quant_config, dynamic_weight_quant=True)
     )
 
-    assert model.audio_proj_in.quant_config.quant_algo is None
-    assert model.proj_in.quant_config.quant_algo == QuantAlgo.FP8
+    excluded = model.audio_proj_in
+    quantized = model.proj_in
+
+    assert excluded.quant_config.quant_algo is None
+    assert quantized.quant_config.quant_algo == QuantAlgo.FP8
+
+    # The excluded module must carry no FP8 scale parameters and no fp8 weight.
+    excluded_params = {name for name, _ in excluded.named_parameters(recurse=False)}
+    assert "weight_scale" not in excluded_params
+    assert "input_scale" not in excluded_params
+    assert excluded.weight.dtype is not torch.float8_e4m3fn
+    assert type(excluded.quant_method).__name__ == "UnquantizedLinearMethod"
+
+    # The quantized peer still is quantized, so the exclusion is targeted.
+    quantized_params = {name for name, _ in quantized.named_parameters(recurse=False)}
+    assert "weight_scale" in quantized_params
+    assert quantized.weight.dtype is torch.float8_e4m3fn
 
 
 def test_released_checkpoint_mixed_dtype_contract() -> None:
