@@ -22,7 +22,7 @@ import inspect
 import queue
 from dataclasses import fields
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 
@@ -215,6 +215,7 @@ _SCHEDULE_HEAD = [
     ("admit", []),
     ("receive_gen_init", []),
     ("poll_progress_when_idle",),
+    ("retire_transfer_only", ANY),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
@@ -273,6 +274,7 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("admit", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
+            ("retire_transfer_only", ANY),
             ("pace_idle",),
         ]
         + _PP_SHUTDOWN_PASS
@@ -294,6 +296,7 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("revert_deferred_gen_init", [], []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
+            ("retire_transfer_only", ANY),
             ("pace_idle",),
         ]
         + _PP_SHUTDOWN_PASS

@@ -2706,8 +2706,7 @@ class PyExecutor:
                 if scheduled_batch.encoder_requests:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
-                if self.kv_cache_transceiver:
-                    self._retire_transfer_only_requests(scheduled_batch)
+                self.disagg.retire_transfer_only(scheduled_batch)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if self._pp_rebalance_drain_iters is not None:
@@ -3675,6 +3674,7 @@ class PyExecutor:
                 receive_gen_init=self._prepare_disagg_gen_init,
                 poll_progress_when_idle=self.
                 _check_disagg_transfer_progress_when_idle,
+                retire_transfer_only=self._retire_transfer_only_requests,
                 prepare_transmission_completed=self.
                 _prepare_disagg_gen_transmission_complete,
                 check_transfer_errors=self._check_cache_transfer_errors,
@@ -4423,8 +4423,7 @@ class PyExecutor:
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
 
-                if self.kv_cache_transceiver:
-                    self._retire_transfer_only_requests(scheduled_batch)
+                self.disagg.retire_transfer_only(scheduled_batch)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
 
@@ -5235,8 +5234,7 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
-                if self.kv_cache_transceiver:
-                    self._retire_transfer_only_requests(scheduled_batch)
+                self.disagg.retire_transfer_only(scheduled_batch)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
