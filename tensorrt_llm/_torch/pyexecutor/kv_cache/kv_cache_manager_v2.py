@@ -3155,6 +3155,19 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             return tokens[chunk_start:chunk_end] if is_sliced else tokens
 
+        # Reached only with block reuse on, since every caller gates on it, and
+        # only for a multimodal request. Both augment helpers below mint synthetic
+        # ids above vocab_size, so a None here becomes a TypeError inside the key
+        # generator; name the fix instead.
+        if self.vocab_size is None:
+            raise ValueError(
+                "Block reuse needs vocab_size to build multimodal cache keys, but "
+                "it could not be resolved from the model config. Add this model's "
+                "text-config attribute name to resolve_vocab_size() in "
+                "tensorrt_llm/_torch/pyexecutor/config_utils.py, or disable block "
+                "reuse."
+            )
+
         # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
         # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
         # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
