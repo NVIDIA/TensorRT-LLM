@@ -523,10 +523,9 @@ def test_execute_single_request_skips_response_when_cancelled():
     "file:///etc/passwd",
     "relative/path.jpg",
     "ftp://example.com/a.jpg",
+    "data:image/png;base64,iVBORw0KGgo=",
 ])
-def test_validate_media_urls_rejects_local_and_unknown_schemes(url):
-    # image_url is client-controlled; a local path would make the server read
-    # its own filesystem with the Triton process's permissions.
+def test_validate_media_urls_rejects_non_web_urls(url):
     with pytest.raises(MockTritonModelException) as excinfo:
         validate_media_urls([url])
     assert "image_url" in str(excinfo.value)
@@ -535,9 +534,9 @@ def test_validate_media_urls_rejects_local_and_unknown_schemes(url):
 @pytest.mark.parametrize("url", [
     "http://images.example.com/a.jpg",
     "https://images.example.com/a.jpg",
-    "data:image/png;base64,iVBORw0KGgo=",
+    "HTTPS://images.example.com/a.jpg",
 ])
-def test_validate_media_urls_accepts_remote_and_inline(url):
+def test_validate_media_urls_accepts_web_urls(url):
     validate_media_urls([url])
 
 

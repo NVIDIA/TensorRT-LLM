@@ -51,14 +51,8 @@ input [
     data_type: TYPE_STRING
     dims: [ -1 ]
   },
-  ## Optional multimodal input, one entry per image. Only read when
+  ## Optional http(s) image URLs, one per image. Only read when
   ## `triton_config.multimodal` is set in model.yaml.
-  ##
-  ## Allowed scope of access: `http(s)://` URLs the server can reach, and
-  ## inline `data:` URIs. Local filesystem paths and `file://` URLs are
-  ## rejected: this input is client-controlled, so accepting them would let a
-  ## caller make the server read any image file its process can open. Widen
-  ## this only against an agreed allowlist for the deployment.
   {
     name: "image_url"
     data_type: TYPE_STRING

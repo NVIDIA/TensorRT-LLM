@@ -86,22 +86,17 @@ def get_model_config(filename, include_keys=None, exclude_keys=None):
     return engine_config
 
 
-# `image_url` is client-controlled, and the media loaders happily open local
-# paths and `file://` with the server process's permissions. Until the allowed
-# scope is agreed with the deployment owner, accept only remote fetches and
-# inline data, so a request cannot make the server read its filesystem.
-ALLOWED_MEDIA_SCHEMES = ("http", "https", "data")
+# `image_url` is client-controlled, so restrict it to web URLs for security.
+ALLOWED_MEDIA_SCHEMES = ("http", "https")
 
 
 def validate_media_urls(urls):
-    """Reject media references that would read the server's filesystem."""
+    """Reject anything that is not a web URL."""
     for url in urls:
         if urlparse(url).scheme not in ALLOWED_MEDIA_SCHEMES:
             raise pb_utils.TritonModelException(
                 f"Unsupported image_url {url!r}: only "
-                f"{', '.join(ALLOWED_MEDIA_SCHEMES)} are accepted. Local paths "
-                "and file:// URLs are rejected because the input is "
-                "client-controlled.")
+                f"{', '.join(ALLOWED_MEDIA_SCHEMES)} URLs are accepted.")
 
 
 def get_input_scalar_by_name(request,
@@ -503,9 +498,6 @@ class TritonPythonModel:
 
         # Unique request id used to identify each triton request
         triton_req_id = str(randint(0, sys.maxsize))
-        # Absence from `req_id_to_request_data` only means "cancelled" once the
-        # request has been added to it. Before that it just means preprocessing
-        # has not finished, and an error still has to be reported to the client.
         request_registered = False
 
         try:
