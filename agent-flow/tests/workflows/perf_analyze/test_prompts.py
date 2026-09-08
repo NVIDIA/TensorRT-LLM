@@ -245,6 +245,36 @@ def test_slurm_bundle_preserves_canonical_templates():
         assert flag in slurm.analyzer, flag
 
 
+def test_remote_execution_prompt_is_short_and_task_specific():
+    task = {
+        "checkpoint_path": "/models/gemma",
+        "slurm-environment": {
+            "slurm_partition": "batch",
+            "docker_image": "/images/trtllm.sqsh",
+            "cluster_ssh": "user@login",
+            "remote_run_root": "/scratch/runs/gemma-analyze",
+            "account": "acct",
+            "qos": "short",
+        },
+    }
+    bundle = build_perf_analyze_prompts(
+        include_slurm_environment=True,
+        remote_execution=task,
+        campaign_name="gemma-analyze",
+    )
+    for role in ("benchmarker", "projector", "analyzer"):
+        prompt = getattr(bundle, role)
+        compact = _norm(prompt)
+        assert "SSH target: user@login" in prompt
+        assert "Remote run root: /scratch/runs/gemma-analyze" in prompt
+        assert "Container image: /images/trtllm.sqsh" in prompt
+        assert "Model checkpoint: /models/gemma" in prompt
+        assert "partition=batch, account=acct, qos=short" in prompt
+        assert "rsync the required inputs and changed source" in compact
+        assert "Pull the role's required outputs and failure logs back" in compact
+    assert "SSH target:" not in bundle.reporter
+
+
 # --------------------------------------------------------------------------- #
 # SOL projector: the projection methodology is the internal-perf-sol-analysis
 # skill (peaks from its calculator, latency constants measured when a GPU is

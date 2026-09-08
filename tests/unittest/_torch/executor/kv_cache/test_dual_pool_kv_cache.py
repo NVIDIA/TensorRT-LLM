@@ -714,6 +714,7 @@ class TestKVCacheV2SchedulerCrossParam:
         mgr = Mock(spec=KVCacheManagerV2)
         mgr.tokens_per_block = tokens_per_block
         mgr._has_cp_helix = False
+        mgr.enable_joint_kv_cache_reuse = False
         return mgr
 
     def test_default_cross_is_none(self):

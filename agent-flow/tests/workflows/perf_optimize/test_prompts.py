@@ -178,6 +178,10 @@ def test_mutating_roles_carry_git_discipline():
     assert "Never run `git commit`" in block
     assert "orchestrator owns all git state" in block
     assert "only the current roadmap item's changes" in block
+    assert "active runtime checkout from the turn instructions" in block
+    assert "prepend that exact checkout to `PYTHONPATH`" in block
+    assert "may differ from the active runtime checkout" in block
+    assert "an editable install" not in block
 
 
 def test_code_edits_never_reference_run_internals():
@@ -389,12 +393,15 @@ def test_server_roles_carry_the_tuning_config_supersede_note():
     note = _norm(TUNING_CONFIG_NOTE)
     assert "supersedes" in note
     assert "**always** passes" in note
+    assert "turn instructions name the exact **active tuning config**" in note
+    assert "supersedes shorthand references" in note
+    assert "<workspace>/tuning/extra_llm_api_options.yaml" not in note
     for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
-        assert "The live tuning config" in _ALL_PROMPTS[role], role
+        assert "The active tuning config" in _ALL_PROMPTS[role], role
     # Only the optimizer may edit the live file; the snapshot is
     # orchestrator-managed.
-    assert "extra_llm_api_options.accepted.yaml" in note
-    assert "never edit" in note
+    assert "accepted config snapshot" in note
+    assert "Never edit" in note
 
 
 # ------------------------------------------------------------------------- qa
@@ -861,6 +868,60 @@ def test_slurm_bundle_preserves_canonical_templates():
         assert flag in slurm.analyzer, flag
 
 
+def test_remote_execution_prompt_is_short_and_task_specific():
+    task = {
+        "checkpoint_path": "/models/gemma",
+        "slurm-environment": {
+            "slurm_partition": "batch",
+            "docker_image": "/images/trtllm.sqsh",
+            "cluster_ssh": "user@login",
+            "remote_run_root": "/scratch/runs/gemma-serial",
+            "account": "acct",
+            "qos": "short",
+        },
+    }
+    bundle = build_perf_optimize_prompts(
+        include_slurm_environment=True,
+        remote_execution=task,
+        campaign_name="gemma-serial",
+    )
+    for role in (
+        "benchmarker",
+        "projector",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "qa",
+    ):
+        prompt = getattr(bundle, role)
+        compact = _norm(prompt)
+        assert "SSH target: user@login" in prompt
+        assert "Remote run root: /scratch/runs/gemma-serial" in prompt
+        assert "Container image: /images/trtllm.sqsh" in prompt
+        assert "Model checkpoint: /models/gemma" in prompt
+        assert "partition=batch, account=acct, qos=short" in prompt
+        assert "configured SSH target" in compact
+        assert "For each remote Slurm job" in compact
+        assert "isolated directory under the remote run root" in compact
+        assert "excluding `.git`, builds, and caches" in compact
+        assert "changed source" in compact
+        assert "wait for Slurm to finish" in compact
+        assert "role's required outputs and failure logs" in compact
+        assert "local inspection" in compact
+        assert "remove that remote job directory" in compact
+        assert "Prefer one allocation for related work" in compact
+        assert "retry only after a concrete correction" in compact
+        assert "or when another measurement is needed" in compact
+        for removed_detail in (
+            "Treat command output as noisy",
+            "probe, control, confirmation",
+            "harness failure",
+            "only Slurm submission",
+        ):
+            assert removed_detail not in compact
+    assert "SSH target:" not in bundle.reporter
+
+
 # --------------------------------------------------------- approach restriction
 
 
@@ -976,6 +1037,39 @@ def test_kernel_coverage_note_bounds_the_capture():
     assert 'ncu: "unavailable: <reason>"' in block
     # Unactionable below-noise-floor items are not a valid answer.
     assert "below-materiality` dismissal wearing an item costume" in block
+
+
+def test_kernel_coverage_template_never_shows_a_note_the_schema_rejects():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # `has_note` requires a non-empty string, so an empty exemplar would
+    # teach a copy-paste that the schema then rejects.
+    assert 'note: ""' not in block
+    # The template demonstrates the partial-capture shape it is teaching.
+    assert "occupancy_pct: null" in block
+    assert 'note: "occupancy section empty' in block
+
+
+def test_kernel_coverage_degrade_string_takes_bound_on_the_row():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    # A collective is excluded from every ncu pass, so `bound: comm` cannot
+    # live under `ncu`; the template and the rule must agree on where it goes.
+    assert "bound: comm" in block
+    assert "on the row, beside `ncu`" in block
+    assert "on the row when `ncu` is the degrade string" in block
+
+
+def test_kernel_coverage_note_requires_marking_unmeasured_rows():
+    block = _norm(kernel_coverage_analyzer_note(0.5, 95.0))
+    assert "did *not* come from an ncu capture" in block
+
+
+def test_kernel_coverage_reporter_discloses_how_much_ncu_measured():
+    block = _norm(KERNEL_COVERAGE_REPORTER_GUIDANCE)
+    # A ledger of degrade strings / null metrics is valid, so the reporter
+    # must say so — otherwise an unmeasured coverage proof renders exactly
+    # like a measured one.
+    assert "Say how much of the table ncu actually measured" in block
+    assert "must never render" in block
 
 
 def test_kernel_coverage_bundle_extends_analyzer_and_reporter_only():

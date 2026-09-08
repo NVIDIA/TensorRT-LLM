@@ -972,9 +972,10 @@ class TestDisaggTransferAdmissionController:
         assert admitted == [candidate]
         assert not wait_for_progress
 
-    def test_apply_missing_v2_flag_defaults_to_non_v2(self):
+    def test_apply_non_v2_does_not_revert_deferred_allocations(self):
         executor = object.__new__(PyExecutor)
         executor.kv_cache_transceiver = Mock()
+        executor._is_kv_manager_v2 = False
         executor._revert_ctx_alloc = Mock()
         executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=True)]
         executor._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
@@ -1315,6 +1316,7 @@ class TestIdleDisaggLoopPacing:
 class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_applies_gate_before_serializing(self):
         executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = False
         executor.dist = Mock(
             rank=0, is_first_pp_rank=True, is_last_pp_rank=True, tp_size=1, cp_size=1
         )
@@ -1379,6 +1381,7 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
         pass
 
     executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = False
     executor.dist = Mock(pp_rank=1, rank=1)
     executor.device_id = 0
     profiler = MagicMock()
@@ -2693,10 +2696,41 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
     scheduled_batch.generation_requests.append(real_gen_request)
 
     stub._is_kv_manager_v2 = True
+    stub.enable_joint_kv_cache_reuse = False
     PyExecutor._revert_gen_alloc(stub, scheduled_batch)
 
     reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
     assert reverted == [real_gen_request]
+
+
+def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
+    # The V2 scheduler grows both pools together, so a skipped batch hands both
+    # back. Attention DP keeps one unified pool and never reaches this pairing.
+    stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
+    stub.kv_cache_manager = Mock()
+    stub.draft_kv_cache_manager = Mock()
+    stub.enable_joint_kv_cache_reuse = True
+    gen_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=9)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests.append(gen_request)
+
+    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+
+    stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
+    stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
+
+
+def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
+    stub = object.__new__(PyExecutor)
+    stub.kv_cache_manager = Mock()
+    stub.draft_kv_cache_manager = Mock()
+    stub.enable_joint_kv_cache_reuse = True
+
+    PyExecutor.reset_prefix_cache(stub)
+
+    stub.kv_cache_manager.reset_reuse_state.assert_called_once_with()
+    stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -3332,3 +3366,40 @@ class TestAdpBalanceExcludesPadDummies:
         gathered = executor.dist.tp_allgather_int64.call_args[0][0]
         assert gathered[1] == 2, "scheduled count keeps counting the dummy"
         assert gathered[3] == 1, "real count must exclude the dummy"
+
+
+def _make_pp_relay_executor(*, pp_size: int, is_last_pp_rank: bool) -> PyExecutor:
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.dist = Mock(pp_size=pp_size, is_last_pp_rank=is_last_pp_rank)
+    executor.num_micro_batches = pp_size
+    executor.send_handles = [object() for _ in range(pp_size)]
+    executor.wait_on_pp_send_handles = Mock()
+    return executor
+
+
+@pytest.mark.parametrize("pp_size", [3, 4, 5])
+def test_last_pp_rank_drains_only_the_relay_send_whose_recv_is_due(pp_size):
+    """The first rank relays slot ``(m + 1 - pp_size) % n`` in iteration ``m``;
+    the last rank must wait on exactly that slot before its forward. Waiting on
+    the others blocks it on recvs the peer posts only after its next
+    top-of-loop collectives, which need this rank (pp>=4 disagg deadlock)."""
+    executor = _make_pp_relay_executor(pp_size=pp_size, is_last_pp_rank=True)
+
+    for microbatch_id in range(pp_size):
+        executor.wait_on_pp_send_handles.reset_mock()
+
+        executor._drain_relay_sends_before_forward(microbatch_id)
+
+        first_rank_relay_slot = (microbatch_id + 1 - pp_size) % pp_size
+        executor.wait_on_pp_send_handles.assert_called_once_with(
+            executor.send_handles, first_rank_relay_slot
+        )
+
+
+def test_non_last_pp_rank_drains_every_relay_send():
+    executor = _make_pp_relay_executor(pp_size=4, is_last_pp_rank=False)
+
+    executor._drain_relay_sends_before_forward(2)
+
+    waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
+    assert waited == [0, 1, 2, 3]

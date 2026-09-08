@@ -955,7 +955,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         py_beam_width=1,
         py_kv_send_session_retired=False,
         prepopulated_prompt_len=0,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         set_kv_cache_transfer_start=lambda _ts: None,
         state=LlmRequestState.CONTEXT_INIT,
     )

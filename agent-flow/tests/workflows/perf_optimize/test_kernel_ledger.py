@@ -112,11 +112,71 @@ def test_unknown_bound_rejected(tmp_path):
         load_ledger(_write(tmp_path, ledger))
 
 
+def test_comm_bound_class_is_accepted(tmp_path):
+    # Collectives are never put under ncu (kernel replay deadlocks them), so an
+    # allreduce row is dispositioned from nsys evidence and reports `comm`.
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = {
+        "duration_us": 88.0,
+        "sm_sol_pct": None,
+        "mem_sol_pct": None,
+        "occupancy_pct": None,
+        "bound": "comm",
+        "note": "collective — not captured under ncu (kernel replay deadlocks NCCL)",
+    }
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["ncu"]["bound"] == "comm"
+
+
+@pytest.mark.parametrize("shorthand", ["communication", "comm-bound", "NCCL", "Collective"])
+def test_comm_bound_shorthand_is_normalized(tmp_path, shorthand):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["bound"] = shorthand
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["ncu"]["bound"] == "comm"
+
+
 def test_ncu_degrade_string_is_allowed(tmp_path):
     ledger = _ledger()
     ledger["kernels"][0]["ncu"] = "unavailable: no pass captured this stem (3 passes exhausted)"
+    ledger["kernels"][0]["bound"] = "memory"
     data = load_ledger(_write(tmp_path, ledger))
     assert data["kernels"][0]["ncu"].startswith("unavailable")
+    assert data["kernels"][0]["bound"] == "memory"
+
+
+def test_ncu_degrade_string_still_owes_a_row_level_bound(tmp_path):
+    # A collective never goes under ncu, so the row-level `bound` beside the
+    # degrade string is the only bound class it will ever have.
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    with pytest.raises(LedgerError, match=r"kernels\[0\].bound"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_collective_row_records_comm_beside_the_degrade_string(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    ledger["kernels"][0]["bound"] = "comm"
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["bound"] == "comm"
+
+
+@pytest.mark.parametrize("shorthand", ["communication", "comm-bound", "NCCL", "Collective"])
+def test_row_level_bound_shorthand_is_normalized(tmp_path, shorthand):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: collective — replay deadlocks the ranks"
+    ledger["kernels"][0]["bound"] = shorthand
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["bound"] == "comm"
+
+
+def test_row_level_bound_must_be_a_known_class(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"] = "unavailable: no pass captured this stem"
+    ledger["kernels"][0]["bound"] = "quantum"
+    with pytest.raises(LedgerError, match=r"kernels\[0\].bound"):
+        load_ledger(_write(tmp_path, ledger))
 
 
 def test_empty_ncu_degrade_string_rejected(tmp_path):
@@ -129,6 +189,59 @@ def test_empty_ncu_degrade_string_rejected(tmp_path):
 def test_ncu_metrics_must_be_numbers(tmp_path):
     ledger = _ledger()
     ledger["kernels"][0]["ncu"]["mem_sol_pct"] = "high"
+    with pytest.raises(LedgerError, match="ncu.mem_sol_pct"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_null_ncu_metric_allowed_with_a_note(tmp_path):
+    # A partial capture keeps what it measured; the note says what it lost.
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["sm_sol_pct"] = None
+    ledger["kernels"][0]["ncu"]["occupancy_pct"] = None
+    ledger["kernels"][0]["ncu"]["note"] = "SOL section empty — replay stalled, 3 passes"
+    data = load_ledger(_write(tmp_path, ledger))
+    assert data["kernels"][0]["ncu"]["sm_sol_pct"] is None
+    assert data["kernels"][0]["ncu"]["duration_us"] == pytest.approx(41.2)
+
+
+def test_null_ncu_metric_without_a_note_rejected(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["mem_sol_pct"] = None
+    with pytest.raises(LedgerError, match="mem_sol_pct.*'note'"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_blank_note_does_not_excuse_a_null_metric(tmp_path):
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["duration_us"] = None
+    ledger["kernels"][0]["ncu"]["note"] = "   "
+    with pytest.raises(LedgerError, match="duration_us.*'note'"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_absent_ncu_metric_is_treated_as_null(tmp_path):
+    ledger = _ledger()
+    del ledger["kernels"][0]["ncu"]["occupancy_pct"]
+    with pytest.raises(LedgerError, match="occupancy_pct.*'note'"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_note_does_not_excuse_a_missing_bound(tmp_path):
+    # `bound` is required on a partial capture too — null a metric so this
+    # crosses that branch rather than the all-populated one.
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["sm_sol_pct"] = None
+    ledger["kernels"][0]["ncu"]["bound"] = None
+    ledger["kernels"][0]["ncu"]["note"] = "SOL sections came back empty"
+    with pytest.raises(LedgerError, match="ncu.bound"):
+        load_ledger(_write(tmp_path, ledger))
+
+
+def test_note_does_not_excuse_a_non_numeric_metric(tmp_path):
+    # The note licenses "not measured", not "measured, badly typed".
+    ledger = _ledger()
+    ledger["kernels"][0]["ncu"]["mem_sol_pct"] = "high"
+    ledger["kernels"][0]["ncu"]["note"] = "ncu printed a bare string"
     with pytest.raises(LedgerError, match="ncu.mem_sol_pct"):
         load_ledger(_write(tmp_path, ledger))
 
@@ -154,11 +267,20 @@ def test_empty_ref_rejected(tmp_path):
         load_ledger(_write(tmp_path, ledger))
 
 
-def test_fusion_requires_observed_neighbors(tmp_path):
-    ledger = _ledger()
+def test_fusion_dismissal_requires_observed_neighbors(tmp_path):
+    ledger = _ledger()  # the default fusion block is a dismissal
     del ledger["kernels"][0]["fusion"]["neighbors"]
     with pytest.raises(LedgerError, match="fusion.neighbors"):
         load_ledger(_write(tmp_path, ledger))
+
+
+def test_fusion_item_does_not_require_neighbors(tmp_path):
+    # A promoted fusion keeps its adjacency in the roadmap item `ref` names;
+    # only the dismissal owes the evidence here.
+    ledger = _ledger()
+    ledger["kernels"][0]["fusion"] = {"disposition": "item", "ref": "opt-001"}
+    data = load_ledger(_write(tmp_path, ledger))
+    assert "neighbors" not in data["kernels"][0]["fusion"]
 
 
 def test_duplicate_kernel_keys_rejected(tmp_path):

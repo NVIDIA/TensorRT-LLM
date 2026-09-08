@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> None:
         include_slurm_environment=has_slurm_environment(task_data),
         include_sol=sol_enabled(task_data),
         sol_methodology=methodology.name,
+        remote_execution=task_data,
+        campaign_name=args.workspace.resolve().name,
     )
     with PerfAnalyzeWorkflow(
         workspace=args.workspace,

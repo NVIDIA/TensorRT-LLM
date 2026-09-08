@@ -731,6 +731,24 @@ line and proceed — never block the run on it.
 
 
 # --------------------------------------------------------------------------- #
+# Remote execution boundary (appended with task-specific values by the CLI)
+# --------------------------------------------------------------------------- #
+
+REMOTE_SLURM_EXECUTION = """\
+## Remote Slurm execution
+
+Local files are the source of truth: edit code, run Git, and write reports
+locally. Use SSH for remote-only inputs. For each remote Slurm job, rsync the
+required inputs and changed source into an isolated directory under the remote
+run root, excluding `.git`, builds, and caches. Submit through the configured
+SSH target and wait for Slurm to finish. Pull the role's required outputs and
+failure logs back for local inspection, then remove that remote job directory.
+Prefer one allocation for related work; retry only after a concrete correction
+or when another measurement is needed.
+"""
+
+
+# --------------------------------------------------------------------------- #
 # Slurm execution (appended only when task.yaml has a slurm-environment block)
 # --------------------------------------------------------------------------- #
 
