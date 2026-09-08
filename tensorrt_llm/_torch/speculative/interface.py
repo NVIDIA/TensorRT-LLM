@@ -1070,16 +1070,24 @@ class SpecMetadata:
         self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
         self.draft_probs[slots, :draft_len, 0] = 1.0
 
-    def dp_num_tokens_hint(self, num_tokens: int, num_generations: int) -> int:
-        """Return the attention-DP token-count hint for ``num_tokens``.
+    def dp_num_tokens(self) -> int:
+        """Return the attention-DP token count for the current batch.
 
-        ``prepare()`` rewrites ``num_tokens`` into this shape, and the
-        attention-DP allgather in ``model_engine`` needs the same value before
-        ``prepare()`` runs. Subclasses that rewrite the count override this so
-        both callers derive it from one place and cannot drift apart. The base
-        metadata keeps the count as-is.
+        Some modes publish a count that differs from the scheduled
+        ``num_tokens`` (the draft-verification positions are excluded). Both
+        consumers read it from here so they cannot drift apart:
+        ``prepare()``, which rewrites ``self.num_tokens`` into this shape, and
+        the attention-DP allgather in ``model_engine``, which runs *before*
+        ``prepare()``. The allgathered value is what overrides
+        ``attn_metadata.all_rank_num_tokens`` on the step-0 draft forward,
+        which is why each mode's convention is load-bearing.
+
+        Contract: reads ``self.num_tokens`` and ``self.num_generations``, so
+        both must already be set for this batch, and it must be called before
+        ``prepare()`` rewrites ``num_tokens`` -- it is not idempotent for the
+        modes that subtract. The base metadata keeps the count as-is.
         """
-        return num_tokens
+        return self.num_tokens
 
     def prepare(self):
         """

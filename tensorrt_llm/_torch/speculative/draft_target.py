@@ -59,8 +59,8 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             device="cuda",
         )
 
-    def dp_num_tokens_hint(self, num_tokens: int, num_generations: int) -> int:
-        return num_tokens - num_generations * self.runtime_draft_len
+    def dp_num_tokens(self) -> int:
+        return self.num_tokens - self.num_generations * self.runtime_draft_len
 
     def prepare(self):
         """Prepare the metadata before model forward."""
@@ -71,7 +71,7 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
-        self.num_tokens = self.dp_num_tokens_hint(self.num_tokens, self.num_generations)
+        self.num_tokens = self.dp_num_tokens()
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
 

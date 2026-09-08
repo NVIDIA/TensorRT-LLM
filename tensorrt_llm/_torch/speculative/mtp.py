@@ -180,13 +180,13 @@ class MTPSpecMetadata(SpecMetadata):
         if self.spec_dec_mode.is_mtp_eagle_one_model():
             self.subseq_all_rank_num_tokens = value
 
-    def dp_num_tokens_hint(self, num_tokens: int, num_generations: int) -> int:
+    def dp_num_tokens(self) -> int:
         # MTP vanilla worker uses total max_draft_len input tokens in generation phase,
         # while MTP Eagle worker uses (max_draft_len + 1) input tokens in the 1st draft
         # forward and only one input token in the following draft forward.
         if self.spec_dec_mode.is_mtp_eagle_one_model():
-            return num_tokens
-        return num_tokens - num_generations
+            return self.num_tokens
+        return self.num_tokens - self.num_generations
 
     def prepare(self):
         assert self.request_ids is not None
@@ -199,8 +199,7 @@ class MTPSpecMetadata(SpecMetadata):
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         # This num_tokens is used to set the all_rank_num_tokens for attention dp.
-        self.num_tokens = self.dp_num_tokens_hint(self.num_tokens,
-                                                  self.num_generations)
+        self.num_tokens = self.dp_num_tokens()
 
         if self.mtp_hidden_states_manager is not None:  # MTP vanilla or use relaxed acceptance
             mtp_slot_ids = []

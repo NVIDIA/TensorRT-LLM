@@ -497,15 +497,15 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     def is_layer_capture(self, layer_id: int):
         return layer_id in self.layers_to_capture
 
-    def dp_num_tokens_hint(self, num_tokens: int, num_generations: int) -> int:
+    def dp_num_tokens(self) -> int:
         # The two modes use a different convention:
         #   - MTP Eagle: keep the 1st-iter shape (matches input_ids).
         #   - Eagle3: subtract to the subseq shape.
         if self.spec_dec_mode.is_mtp_eagle_one_model():
-            return num_tokens
+            return self.num_tokens
         per_seq = (self.max_total_draft_tokens
                    if self.is_spec_dec_tree else self.max_draft_len)
-        return num_tokens - num_generations * per_seq
+        return self.num_tokens - self.num_generations * per_seq
 
     def prepare(self):
         super().prepare()
@@ -524,8 +524,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         # rewritten to the attention-DP subseq shape and would otherwise drop the
         # draft-verification positions from the captured hidden states.
         self.num_capture_tokens = self.num_tokens
-        self.num_tokens = self.dp_num_tokens_hint(self.num_tokens,
-                                                  self.num_generations)
+        self.num_tokens = self.dp_num_tokens()
 
         if getattr(self.spec_resource_manager, "slot_manager",
                    None) is not None:
