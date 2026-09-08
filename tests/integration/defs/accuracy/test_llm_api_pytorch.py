@@ -1386,14 +1386,16 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_kv_cache_manager_v2(self):
-        # NOTE: Exercise the KVCacheManagerV2 path where per-layer attention
-        # windows are DERIVED from the model's layer_types instead of being
-        # passed explicitly. The other VSWA tests hand a max_attention_window
-        # vector to a V1 manager; here max_attention_window is left unset and
-        # use_kv_cache_manager_v2=True selects V2, which is what triggers the
-        # layer_types-driven derivation. This guards the reuse + sliding-window
-        # V2 layout that this change silently alters for every mixed
-        # sliding/full-attention model already on V2.
+        # NOTE: Exercise the path where per-layer attention windows are DERIVED
+        # from the model's layer_types instead of being passed explicitly. The
+        # other VSWA tests pass an explicit max_attention_window vector, which
+        # bypasses derivation (a user-supplied vector always wins); here it is
+        # left unset so the windows are derived from layer_types. Derivation
+        # only fires on KVCacheManagerV2 -- Gemma3 already resolves
+        # use_kv_cache_manager_v2="auto" to V2, so setting it True is redundant
+        # but keeps the test independent of the model's preference. This guards
+        # the reuse + sliding-window V2 layout that this change silently alters
+        # for every mixed sliding/full-attention model already on V2.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
             use_kv_cache_manager_v2=True,
