@@ -1,6 +1,9 @@
 """Lookup Jenkins stage names for integration tests and vice versa.
 
-This helper parses ``jenkins/L0_Test.groovy`` and the YAML files under
+This helper reads ``jenkins/scripts/test_stage_configs.json`` -- the single
+source of truth for sharded L0 test stage families, also consumed by
+``jenkins/L0_Test.groovy`` (via ``loadStageConfigSpecs`` /
+``buildStageConfigsFromSpecs``) -- and the YAML files under
 ``tests/integration/test_lists/test-db`` to provide a bidirectional mapping
 between test names and Jenkins stage names. When ``--tests`` or ``--test-list``
 options are used, each value is treated as a substring pattern. Any test whose
@@ -15,9 +18,9 @@ Example usage::
    python scripts/test_to_stage_mapping.py --stages \\
        A100X-PyTorch-Post-Merge-1
 
-Stage names passed to ``--stages`` must exactly match a key of the stage map in
-``jenkins/L0_Test.groovy``. Unrecognized names, and known names that map to no
-tests, are reported on stderr.
+Stage names passed to ``--stages`` must exactly match a stage name generated
+from ``jenkins/scripts/test_stage_configs.json``. Unrecognized names, and
+known names that map to no tests, are reported on stderr.
 
 Tests can also be provided via ``--test-list`` pointing to either a plain text
 file or a YAML list file. Quote individual test names on the command line so
@@ -26,8 +29,8 @@ the shell does not interpret ``[`` and ``]`` characters.
 
 import argparse
 import difflib
+import json
 import os
-import re
 import sys
 from collections import defaultdict
 from glob import glob
@@ -52,24 +55,6 @@ def _load_tests_file(path: str) -> List[str]:
     return tests
 
 
-# Regex to parse Jenkins stage configurations from Groovy files
-# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count, node_count, runWithSbatch]
-#
-# Pattern breakdown:
-#   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
-#   \s*:\s*               - Matches colon with optional whitespace
-#   \[                    - Matches opening bracket
-#   "[^"]+"              - Matches platform string in quotes (ignored)
-#   ,\s*                 - Matches comma with optional whitespace
-#   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
-#   (?:,\s*(?:\d+|true|false))* - Matches zero or more comma-separated numbers or
-#                          booleans (split_id, split_count, gpu_count, node_count, runWithSbatch)
-#   \s*\]                - Matches closing bracket with optional whitespace
-_STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*(?:\d+|true|false))*\s*\]'
-)
-
-
 def _extract_terms(entry):
     """Extract terms from either direct 'terms' or 'condition.terms'."""
     terms = entry.get('terms', {})
@@ -80,28 +65,41 @@ def _extract_terms(entry):
 
 class StageQuery:
 
-    def __init__(self, groovy_path: str, test_db_dir: str):
+    def __init__(self, stage_config_path: str, test_db_dir: str):
         self.stage_to_yaml, self.yaml_to_stages = self._parse_stage_mapping(
-            groovy_path)
+            stage_config_path)
         self.test_map, self.yaml_stage_tests = self._parse_tests(test_db_dir)
         # Build dynamic backend mapping from discovered data
         self._backend_keywords = self._discover_backend_keywords()
 
     @staticmethod
-    def _parse_stage_mapping(path):
+    def _parse_stage_mapping(stage_config_path):
+        """Expands jenkins/scripts/test_stage_configs.json.
+
+        the single source of truth for sharded L0 test stage families, also
+        consumed by jenkins/L0_Test.groovy (via loadStageConfigSpecs /
+        buildStageConfigsFromSpecs) -- into stage <-> YAML mappings.
+        """
         stage_to_yaml = {}
         yaml_to_stages = defaultdict(list)
-        with open(path, 'r') as f:
-            for line in f:
-                if line.lstrip().startswith('//'):
-                    continue
-                m = _STAGE_RE.search(line)
-                if m:
-                    stage = m.group('stage')
-                    yml = m.group('yml') + '.yml'
-                    stage_to_yaml[stage] = yml
-                    yaml_to_stages[yml].append(stage)
+        for stage, yml in StageQuery._expand_json_specs(stage_config_path):
+            stage_to_yaml[stage] = yml
+            yaml_to_stages[yml].append(stage)
         return stage_to_yaml, yaml_to_stages
+
+    @staticmethod
+    def _expand_json_specs(json_path):
+        """Mirrors buildStageConfigsFromSpecs in jenkins/L0_Test.groovy.
+
+        for each stage family spec, yields (stageName-k, yamlFile.yml) for k
+        in 1..splits.
+        """
+        with open(json_path, 'r') as f:
+            specs = json.load(f)['configs']
+        for spec in specs:
+            yml = spec['testDB'] + '.yml'
+            for k in range(1, spec['splits'] + 1):
+                yield f"{spec['name']}-{k}", yml
 
     def _parse_tests(self, db_dir):
         """Parse tests from YAML files, supporting both .yml and .yaml."""
@@ -251,10 +249,11 @@ def main():
                         help='Path to repository root')
     args = parser.parse_args()
 
-    groovy = os.path.join(args.repo_root, 'jenkins', 'L0_Test.groovy')
+    stage_config = os.path.join(args.repo_root, 'jenkins', 'scripts',
+                                'test_stage_configs.json')
     db_dir = os.path.join(args.repo_root, 'tests', 'integration', 'test_lists',
                           'test-db')
-    query = StageQuery(groovy, db_dir)
+    query = StageQuery(stage_config, db_dir)
 
     if args.tests or args.test_list:
         patterns = []
