@@ -568,3 +568,50 @@ def test_the_record_says_what_was_selected_and_against_what(tmp_path):
     assert record["gen_point"]["moved"] is False
     assert record["design_dir"] == str(d)
     assert "e2e_view_absent" in record["gen_point"]
+
+
+def test_a_half_that_is_ready_does_not_wait_on_one_that_is_not(tmp_path):
+    """The two halves are established by different artefacts.
+
+    Under a no-join scope neither waits on the other, so requiring both would
+    idle a ready half on a dependency the scope does not have. Found by
+    launching the flow: a ctx-only spec was refused for a generation sweep it
+    had not asked for.
+    """
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    assert disagg_sol.established(d, disagg_sol.CTX_TRACK) is True
+    assert disagg_sol.established(d, disagg_sol.GEN_TRACK) is False
+
+    spec = {
+        "checkpoint_path": "/ckpt",
+        "optimize": {"approaches": ["code"]},
+        FIELD: {"tracks": ["ctx"], "design": {"design_dir": str(d), "prefer": "interactive"}},
+    }
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"ctx": tmp_path / "c.yaml"},
+        repos={"ctx": tmp_path / "rc"},
+        workspace_root=tmp_path / "ws",
+        label="t",
+        dry_run=True,
+    )
+    assert record["ctx_point"]["ctx_gpus"] == 4
+    assert "gen_point" not in record
+
+
+def test_the_refusal_names_which_half_is_missing_what(tmp_path):
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    spec = {
+        FIELD: {"tracks": ["ctx", "gen"], "design": {"design_dir": str(d), "prefer": "interactive"}}
+    }
+    with pytest.raises(disagg_sol.DisaggSolError, match=r"concurrency sweep.*for track 'gen'"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"ctx": tmp_path / "c", "gen": tmp_path / "g"},
+            repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
+            workspace_root=tmp_path / "ws",
+            label="t",
+            dry_run=True,
+        )
