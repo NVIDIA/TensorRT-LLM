@@ -287,6 +287,11 @@ class GuidedDecoder:
                             logger.debug(
                                 f"Draft request {req.request_id} at slot {slot} reached a grammar state with no valid token."
                             )
+                            # Unlike the unacceptable-token path above, the
+                            # matcher did advance past new_token here, so the
+                            # drafting loop must still roll that advance back.
+                            self.num_advanced_draft_tokens[
+                                slot] += self.num_advanced_tokens[slot]
                             continue
                         # The request is about to be terminated, so exclude it
                         # from the rollback pass: the matcher advance made
