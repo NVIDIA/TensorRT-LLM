@@ -2157,6 +2157,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
         fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
         fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
+        fmhaParams.variableWindowTokenStartsPtr = params.variable_window_token_starts;
+        fmhaParams.variableWindowTokenEndsPtr = params.variable_window_token_ends;
         fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
         fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
         fmhaParams.scaleBmm2Ptr = workspaceViews.fmhaBmm2Scale;
@@ -3102,8 +3104,16 @@ int AttentionOp::initialize() noexcept
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
 
-        // setting attention mask type based on the mask type
-        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+        // Variable-window bounds are a context-only runtime feature. Generation
+        // continues to use the model's regular causal mask.
+        if (mUseVariableWindow)
+        {
+            fmhaParams.attentionMaskType = ContextAttentionMaskType::VARIABLE_WINDOW;
+        }
+        else
+        {
+            fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+        }
 
         if (isCrossAttention())
         {
