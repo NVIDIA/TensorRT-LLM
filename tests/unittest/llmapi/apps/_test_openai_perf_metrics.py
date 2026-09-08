@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 import tempfile
+import time
 
 import pytest
 import requests
@@ -137,11 +139,39 @@ def test_streaming_metrics_require_request_opt_in(server: RemoteOpenAIServer):
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text
 
 
+_REQUEST_SUCCESS_TOTAL = re.compile(
+    r"^trtllm_request_success_total(?:\{[^}]*\})?\s+(\S+)", re.MULTILINE)
+
+
+def _request_success_total(server: RemoteOpenAIServer) -> float:
+    """Sum every ``trtllm_request_success_total`` sample (all label sets)."""
+    response = requests.get(f"{server.url_root}/prometheus/metrics", timeout=30)
+    assert response.status_code == 200
+    return sum(float(v) for v in _REQUEST_SUCCESS_TOTAL.findall(response.text))
+
+
+def _wait_for_request_success_total(server: RemoteOpenAIServer,
+                                    expected: float,
+                                    timeout: float = 10.0) -> float:
+    """Poll the Prometheus counter until it reaches ``expected`` (or time out)."""
+    deadline = time.monotonic() + timeout
+    value = _request_success_total(server)
+    while value < expected and time.monotonic() < deadline:
+        time.sleep(0.1)
+        value = _request_success_total(server)
+    return value
+
+
 def test_responses_return_perf_metrics_and_jsonl_dump(
         server: RemoteOpenAIServer, perf_metrics_output_dir):
-    # /v1/responses has to feed the same per-request perf metrics pipeline as
-    # /v1/completions and /v1/chat/completions (GitHub issue #13949).
+    """Non-streaming /v1/responses populates per-request perf metrics.
+
+    Regression test for GitHub issue #13949: the Responses API has to feed the
+    same pipeline as /v1/completions and /v1/chat/completions, i.e. the
+    metrics headers, the JSONL record and the Prometheus request counter.
+    """
     num_existing_records = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
+    success_total_before = _request_success_total(server)
 
     response = requests.post(
         f"{server.url_root}/v1/responses",
@@ -178,9 +208,21 @@ def test_responses_return_perf_metrics_and_jsonl_dump(
     assert timing_metrics["first_token_time"] <= timing_metrics[
         "last_token_time"]
 
+    success_total_after = _wait_for_request_success_total(
+        server, expected=success_total_before + 1)
+    assert success_total_after == success_total_before + 1
+
 
 def test_responses_streaming_metrics_require_request_opt_in(
-        server: RemoteOpenAIServer):
+        server: RemoteOpenAIServer, perf_metrics_output_dir):
+    """Streaming /v1/responses persists perf metrics regardless of opt-in.
+
+    The JSONL record and the Prometheus request counter are always updated;
+    the ``trtllm.perf_metrics`` SSE event is only emitted when the request
+    opts in through the return-metrics header.
+    """
+    num_existing_records = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
+    success_total_before = _request_success_total(server)
     payload = {
         "model": "Server",
         "input": "Hello, my name is",
@@ -193,6 +235,8 @@ def test_responses_streaming_metrics_require_request_opt_in(
     assert response.status_code == 200
     assert "event: response.completed" in response.text
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" not in response.text
+    wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                expected_count=num_existing_records + 1)
 
     response = requests.post(
         f"{server.url_root}/v1/responses",
@@ -203,3 +247,12 @@ def test_responses_streaming_metrics_require_request_opt_in(
     assert response.status_code == 200
     assert "event: response.completed" in response.text
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text
+    expected_count = num_existing_records + 2
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                          expected_count=expected_count)
+    assert all(record["status"] == "complete"
+               for record in records[num_existing_records:])
+
+    success_total_after = _wait_for_request_success_total(
+        server, expected=success_total_before + 2)
+    assert success_total_after == success_total_before + 2
