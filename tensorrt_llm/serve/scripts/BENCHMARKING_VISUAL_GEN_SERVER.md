@@ -18,7 +18,7 @@ This page repeats no field description. Each lives with its definition:
 | which route validates which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`openai_protocol.py`](../openai_protocol.py) |
 | what a result-JSON key holds | `VisualGenBenchResult` and `VisualGenRequestRecord` in [`benchmark_visual_gen.py`](benchmark_visual_gen.py) |
 
-## The flags, by group
+## Benchmarking args
 
 `--help` lists them under five groups, each answering one question:
 
