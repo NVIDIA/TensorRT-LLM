@@ -4091,6 +4091,26 @@ class BlockReuseConfig(StrictBaseModel):
         "`policy` is 'per_conversation'.")
 
 
+# Attention backends that can address a scratch block. TRTLLM consumes
+# copy_batch_block_offsets, which carries separate K and V page indices;
+# FlashInfer builds a flat page table and uses the PER_LAYER addressing path.
+# Every other backend reads raw base page indices, where a scratch block --
+# which owns no per-block page -- appears as an invalid page. Defined here so
+# the 'auto' resolver in llm_utils and validate_swa_scratch_reuse below cannot
+# drift apart when a backend gains scratch-page addressing.
+SWA_SCRATCH_CAPABLE_ATTN_BACKENDS = ("TRTLLM", "FLASHINFER")
+
+# The subset 'auto' will turn on by itself. Narrower than the set above on
+# purpose: TRTLLM can address a scratch page for every phase it serves through
+# trtllm-gen, but a bidirectional multimodal mask goes to TritonCustomMaskFmha,
+# which cannot -- and no other FMHA library accepts a CUSTOM mask, so selection
+# raises instead of falling back. Gemma3/Gemma4 default to TRTLLM and take that
+# path on any image input, so 'auto' must not enable scratch reuse there.
+# Explicit True on TRTLLM stays supported for text-only deployments and is
+# still validated by validate_swa_scratch_reuse below.
+SWA_SCRATCH_AUTO_ATTN_BACKENDS = ("FLASHINFER", )
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4249,11 +4269,21 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "does not declare one.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    enable_swa_scratch_reuse: bool = Field(
-        default=False,
+    enable_swa_scratch_reuse: bool | Literal["auto"] = Field(
+        default="auto",
         status="prototype",
         description=
-        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill. "
+        "'auto' enables it wherever it is supported and can save memory: KV "
+        "cache manager v2, an attention backend that can address scratch "
+        "pages (TRTLLM or FlashInfer), and a model with sliding-window "
+        "layers. It is a no-op everywhere else.")
+
+    # Whether the caller named a value for enable_swa_scratch_reuse. Captured at
+    # construction because the resolver overwrites the field in place: by the
+    # time a manager is built, "auto that resolved to True" and "the user asked
+    # for True" are the same value, and only the second is worth a warning.
+    _swa_scratch_reuse_was_explicit: bool = PrivateAttr(default=False)
 
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
@@ -4387,6 +4417,21 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
             '"nvfp4", or valid torch.dtype string')
+
+    @model_validator(mode='after')
+    def record_explicit_swa_scratch_reuse(self) -> 'KvCacheConfig':
+        """Remember that the caller named a value, before the resolver eats it.
+
+        ``_resolve_swa_scratch_reuse_auto`` rewrites the field in place at
+        config-load time, and the manager version is not final until engine
+        build (``_validate_or_fallback_kv_cache_manager_v2`` can still demote V2
+        to V1 for a KV connector or beam search). Without this, a V1 manager
+        cannot tell a resolved True from a requested one, and warns at a user
+        who never asked.
+        """
+        self._swa_scratch_reuse_was_explicit = (self.enable_swa_scratch_reuse
+                                                != "auto")
+        return self
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -6688,6 +6733,49 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"The '{field_name}' knob is a '{status}' feature. "
                     "It is not recommended for production use and may change or be removed.",
                 )
+
+        return self
+
+    @model_validator(mode='after')
+    def validate_swa_scratch_reuse(self) -> 'TorchLlmArgs':
+        """Reject or warn on configurations SWA scratch reuse cannot serve.
+
+        Scratch blocks get no per-block KV page; their address is a rotating
+        sub-page inside a shared slot. Backends that consume
+        ``copy_batch_block_offsets`` get that for free. FlashInfer builds its
+        own flat page table and is supported through the PER_LAYER addressing
+        path, which additionally requires K and V to stay adjacent under the
+        rotation -- checked at first use, since only a flat table needs it.
+        Backends that read raw base page indices without either path are
+        rejected here.
+
+        Only an explicit ``True`` is rejected. The default ``'auto'`` resolves
+        to False on those backends instead, so enabling scratch reuse by
+        default never turns a working configuration into an error.
+        """
+        kv_cache_config = self.kv_cache_config
+        if kv_cache_config.enable_swa_scratch_reuse is not True:
+            return self
+
+        if self.attn_backend.upper() not in SWA_SCRATCH_CAPABLE_ATTN_BACKENDS:
+            raise ValueError(
+                "kv_cache_config.enable_swa_scratch_reuse is not supported with "
+                f"attn_backend={self.attn_backend!r}. Only 'TRTLLM' (via "
+                "copy_batch_block_offsets) and 'FLASHINFER' (via PER_LAYER page "
+                "indices) can address scratch blocks; other backends read raw base "
+                "page indices, where scratch blocks appear as invalid pages. Set "
+                "enable_swa_scratch_reuse=False for this backend.")
+
+        if (kv_cache_config.enable_block_reuse and
+                kv_cache_config.block_reuse_config.policy == "all_reusable"):
+            logger.warning(
+                "kv_cache_config.enable_swa_scratch_reuse is enabled together with "
+                "block_reuse_config.policy='all_reusable'. Under 'all_reusable' the "
+                "manager would otherwise commit out-of-window blocks for prefix "
+                "reuse, but scratch blocks use shared storage that is never "
+                "preserved, so only non-scratch blocks stay reusable. Use "
+                "block_reuse_config.policy='per_request' to avoid the reuse loss."
+            )
 
         return self
 
