@@ -3750,9 +3750,10 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=4,
                  moe_config=MoeConfig(backend="TRTLLM"),
                  enable_attention_dp=True,
+                 enable_chunked_prefill=True,
                  max_batch_size=DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
                  max_seq_len=4096,
-                 max_num_tokens=4096,
+                 max_num_tokens=512,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
