@@ -404,8 +404,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 # The latter is a host-known upper bound for the logical-token
                 # compaction workspace and avoids a device synchronization.
                 max_compressed_kv_tokens = total_raw_kv_tokens // self.compress_ratio
+                # Dynamic sparse FMHA may prefetch a full fixed-width Top-K
+                # tile even when only a short prefix is valid. Match the DSA
+                # context gather contract by keeping at least one index row's
+                # width addressable in the scratch pool.
                 scratch_capacity = max(
-                    1,
+                    compressed_indices.shape[1],
                     min(max_compressed_kv_tokens, compressed_indices.numel()),
                 )
                 scratch = torch.empty(
