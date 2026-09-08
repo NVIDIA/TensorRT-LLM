@@ -96,10 +96,10 @@ WIRE_ALIAS = {"num_images_per_prompt": "n", "image_reference": "image"}
 # and the read happens once, before the run. VisualGenParams rejects a bare path.
 # Read off the params rather than listed, so a slot the API gains is addressable.
 REFERENCE_KEYS = tuple(name for name in VisualGenParams.model_fields if name.endswith("_reference"))
-# The input key common_params carries, so one prompt can stand for the whole run.
-COMMON_INPUT_KEYS = ("prompt",)
-# Input keys a request carries alone, each naming what one generation is given.
-REQUEST_INPUT_KEYS = ("prompt_file", *REFERENCE_KEYS)
+# What one generation is given. common_params carries generation parameters, so
+# none of these belong there: spread over every request they would describe a run
+# nobody asked for.
+REQUEST_INPUT_KEYS = ("prompt", "prompt_file", *REFERENCE_KEYS)
 
 
 def _scalar_param_fields() -> dict[str, type]:
@@ -119,7 +119,7 @@ def _scalar_param_fields() -> dict[str, type]:
 
 SCALAR_PARAM_FIELDS = _scalar_param_fields()
 # One flag per common_params key, plus the two that carry a whole part of the document.
-CLI_KEYS = (*SCALAR_PARAM_FIELDS, *COMMON_INPUT_KEYS, "extra_params", "requests")
+CLI_KEYS = (*SCALAR_PARAM_FIELDS, "extra_params", "requests")
 
 STAT_FUNCS = {"mean": np.mean, "median": np.median, "std": np.std, "min": np.min, "max": np.max}
 STAT_COLUMNS = tuple(STAT_FUNCS)
@@ -198,7 +198,6 @@ def _document_model(
     return create_model(name, __base__=base, **kwargs, **fields)
 
 
-_COMMON_INPUT_FIELDS: dict[str, Any] = {key: (Optional[str], None) for key in COMMON_INPUT_KEYS}
 _REQUEST_INPUT_FIELDS: dict[str, Any] = {
     key: (Optional[str], None) for key in REQUEST_INPUT_KEYS if key not in REFERENCE_KEYS
 }
@@ -223,7 +222,7 @@ def _workload_model(backend: str) -> type[VisualGenBenchWorkload]:
     common = _document_model(
         f"{prefix}Common",
         backend,
-        _COMMON_INPUT_FIELDS,
+        {},
         __validators__={
             "_reject_request_only_key": model_validator(mode="before")(
                 classmethod(_reject_request_only_key)
@@ -233,7 +232,7 @@ def _workload_model(backend: str) -> type[VisualGenBenchWorkload]:
     request = _document_model(
         f"{prefix}Request",
         backend,
-        {**_COMMON_INPUT_FIELDS, **_REQUEST_INPUT_FIELDS, **_reference_fields(backend)},
+        {**_REQUEST_INPUT_FIELDS, **_reference_fields(backend)},
         base=VisualGenBenchRequest,
     )
     return create_model(
@@ -623,7 +622,7 @@ def _document_from_args(args: argparse.Namespace) -> dict[str, Any]:
     merge and every validation below have one implementation.
     """
     common: dict[str, Any] = {}
-    for key in (*SCALAR_PARAM_FIELDS, *COMMON_INPUT_KEYS):
+    for key in SCALAR_PARAM_FIELDS:
         value = getattr(args, key)
         if value is not None:
             common[key] = value
@@ -1542,8 +1541,9 @@ def build_arg_parser() -> FlexibleArgumentParser:
     workload_group = parser.add_argument_group(
         "Workload",
         "What the run sends. The document arrives one of two ways and never both: "
-        "--workload, or the field flags below spelling the same document out. "
-        "--backend and --num-requests apply to whichever way it arrived.",
+        "--workload, or the field flags below, which are its common_params, with "
+        "--requests carrying its requests list. --backend and --num-requests apply to "
+        "whichever way it arrived.",
     )
     workload_group.add_argument(
         "--workload",
@@ -1587,9 +1587,6 @@ def build_arg_parser() -> FlexibleArgumentParser:
             default=None,
             help=VisualGenParams.model_fields[name].description,
         )
-    workload_group.add_argument(
-        "--prompt", type=str, default=None, help="The prompt text every request carries."
-    )
     workload_group.add_argument(
         "--extra-params", type=str, default=None, help="Per-pipeline parameters, as a JSON object."
     )

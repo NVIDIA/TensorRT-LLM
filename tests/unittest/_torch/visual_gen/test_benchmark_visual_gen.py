@@ -76,14 +76,12 @@ def test_cli_fields_are_the_documents_common_params():
         _args(
             "--backend",
             "openai-videos",
-            "--prompt",
-            "p",
             "--width",
             "64",
             "--height",
             "64",
             "--requests",
-            "[{}]",
+            '[{"prompt": "p"}]',
         )
     )
     request = workload.requests[0]
@@ -122,7 +120,6 @@ def test_cli_requests_override_the_fields_per_key():
 def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
     """The CLI is another way to write the document, so both must land identically."""
     fields = {
-        "prompt": "a red fox",
         "width": 1280,
         "height": 720,
         "num_frames": 81,
@@ -134,7 +131,7 @@ def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
         "negative_prompt": "blurry",
         "extra_params": {"output_type": "video"},
     }
-    request = {"image_reference": str(reference_file)}
+    request = {"prompt": "a red fox", "image_reference": str(reference_file)}
     argv = ["--backend", "openai-videos", "--requests", json.dumps([request])]
     for key, value in fields.items():
         argv += [
@@ -171,7 +168,7 @@ def test_a_request_only_key_in_common_params_is_rejected(key, value):
 def test_cli_needs_its_requests_list_just_as_a_file_does():
     """The CLI is the same document, so it cannot skip the key a file must state."""
     with pytest.raises(ValueError, match="requests\n  Field required"):
-        load_workload(_args("--backend", "openai-videos", "--prompt", "p"))
+        load_workload(_args("--backend", "openai-videos", "--width", "64"))
 
 
 def test_document_and_cli_request_are_alternatives():
