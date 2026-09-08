@@ -118,7 +118,7 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -159,7 +159,6 @@ public:
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
-        , mPadId(padId)
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
@@ -220,7 +219,7 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -239,7 +238,6 @@ public:
         , mMaxNewTokens(maxNewTokens)
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
-        , mPadId(padId)
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
@@ -282,7 +280,6 @@ public:
         , mMaxNewTokens(req.getMaxTokens())
         , mSamplingConfig(req.getSamplingConfig())
         , mEndId(req.getEndId())
-        , mPadId(req.getPadId())
         , mClientId(req.getClientId())
         , mIsStreaming(req.getStreaming())
         , mOrigPromptLen(mPromptLen)
@@ -1975,7 +1972,6 @@ public:
     SizeType32 mMaxNewTokens;
     executor::SamplingConfig mSamplingConfig;
     std::optional<TokenIdType> mEndId{std::nullopt};
-    std::optional<TokenIdType> mPadId{std::nullopt};
     std::optional<SizeType32> mSeqSlot{std::nullopt};
     std::optional<RequestIdType> mClientId{std::nullopt};
 
@@ -2274,7 +2270,7 @@ public:
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt, std::optional<SizeType32> padId = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt,
         std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
@@ -2310,7 +2306,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, endId, padId,
+            samplingConfig, isStreaming, endId,
             positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
                                     : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             std::move(promptEmbeddingTable), promptVocabSize,
