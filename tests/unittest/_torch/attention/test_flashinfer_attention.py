@@ -96,7 +96,6 @@ class TestFlashInferAttention(unittest.TestCase):
             torch.tensor([BAD_PAGE_INDEX, 3], dtype=torch.int32),
         )
 
-
     def test_attention_layer_indices_ignore_zero_kv_layers(self) -> None:
 
         class FakeHybridManager:
