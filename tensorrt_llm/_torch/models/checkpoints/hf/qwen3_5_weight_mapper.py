@@ -9,6 +9,9 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.hf.compressed_tensors import (
+    normalize_compressed_tensors_nvfp4_names,
+)
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
@@ -437,9 +440,16 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         _SPLIT_PROJ_PATTERN packs them too, so their scalar scales would
         otherwise reach _pack_split_projections and hit that 0-d failure.
 
+        Rowwise FP8 (``FP8_PER_CHANNEL_PER_TOKEN``, what a compressed-tensors
+        "float-quantized" channel/token group parses to) is handled by the same
+        code: its ``weight_scale`` is ``[out, 1]``, which broadcasts against the
+        ``[out, in]`` weight, so the dequantized result is exact. Only the
+        requantize-onto-a-shared-scale path above is per-tensor-only.
+
         out_proj is intentionally left untouched: it keeps its name through
         packing, matches its FP8 quant config entry, and loads via the normal
-        FP8 path.
+        FP8 path (``FP8RowwiseLinearMethod.load_weights_vanilla`` flattens the
+        ``[out, 1]`` scale onto the 1-D ``weight_scale`` buffer).
         """
         target_dtype = getattr(self.config.pretrained_config, "torch_dtype", torch.bfloat16)
         if target_dtype is None:
@@ -659,6 +669,11 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
+        # llm-compressor (compressed-tensors) NVFP4 tensor names differ from the
+        # ModelOpt names every downstream loader here reads. Normalize before
+        # anything keys off a suffix (split-projection staging, the lm_head
+        # dequant, the dense-MLP re-path) so both producers take one code path.
+        normalized_weights = normalize_compressed_tensors_nvfp4_names(normalized_weights)
         if allow_partial_loading:
             normalized_weights = self._stage_partial_split_projections(
                 normalized_weights, quant_algo
