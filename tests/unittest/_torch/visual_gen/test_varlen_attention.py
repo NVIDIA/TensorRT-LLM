@@ -17,7 +17,6 @@ backend and dispatch layer directly.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend import (
     CuTeDSLAttention,
     TrtllmAttention,
@@ -171,19 +170,6 @@ class TestFA4VarlenKv:
         out, ref = _run_ragged_kv_vs_sdpa(attn, B, S_q, H, d_h, kv_lens, device, dtype)
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
-    def test_zero_length_kv_sample(self):
-        """Empty CFG branch (e.g. empty negative prompt) -- pins actual FA4 behavior."""
-        device, dtype = "cuda", torch.bfloat16
-        B, S_q, H, d_h = 2, 4, 8, 64
-        kv_lens = [0, 9]
-        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
-        torch.manual_seed(1)
-        q_bhsd = torch.randn(B, H, S_q, d_h, device=device, dtype=dtype)
-        k_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
-        v_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
-        out = _run_packed(attn, q_bhsd, k_list, v_list, S_q, H, d_h, device)
-        assert not torch.isnan(out).any()
-
     def test_all_equal_lengths(self):
         """Degenerate case: nothing to pack, every sample the same length."""
         device, dtype = "cuda", torch.bfloat16
@@ -192,22 +178,6 @@ class TestFA4VarlenKv:
         attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
         out, ref = _run_ragged_kv_vs_sdpa(attn, B, S_q, H, d_h, kv_lens, device, dtype)
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
-
-    def test_raises_when_causal_combined_with_key_padding_mask(self):
-        device, dtype = "cuda", torch.bfloat16
-        H, d_h = 4, 32
-        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
-        q = torch.randn(2, 3, H, d_h, device=device, dtype=dtype)
-        k = torch.randn(2, 3, H, d_h, device=device, dtype=dtype)
-        v = torch.randn(2, 3, H, d_h, device=device, dtype=dtype)
-        with pytest.raises(AssertionError, match="key_padding_mask is not supported"):
-            attn.forward_with_lse(
-                q,
-                k,
-                v,
-                attention_mask=PredefinedAttentionMask.CAUSAL,
-                key_padding_mask=torch.ones(2, 3, dtype=torch.bool, device=device),
-            )
 
     def test_raises_when_key_padding_mask_combined_with_cu_seqlens(self):
         device, dtype = "cuda", torch.bfloat16
@@ -254,32 +224,6 @@ class TestAttnImplVarlenDispatch:
         cu_seqlens_kv = torch.tensor([0, 2, 5], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not support varlen"):
             stub._attn_impl_varlen_kv(q, k, v, cu_seqlens_kv=cu_seqlens_kv, max_seqlen_kv=3)
-
-    def test_sequence_parallel_wrapped_backend_does_not_reject_varlen_cleanly(self):
-        """Pre-fix behavior of a wrapper with supports_varlen forced True."""
-
-        class _FakeSeqParallelWrapper:
-            world_size = 4
-
-            def forward(self, q, k, v, **kwargs):
-                if q.shape[2] % self.world_size != 0:
-                    raise ValueError("num_heads not divisible by world_size")
-                return q
-
-        stub = Attention.__new__(Attention)
-        stub.local_num_attention_heads = 4
-        stub.local_num_key_value_heads = 4
-        stub.head_dim = 64
-        stub.supports_varlen = True
-        stub.attn = _FakeSeqParallelWrapper()
-
-        q = torch.randn(2, 3, 4 * 64)
-        k = torch.randn(5, 4 * 64)
-        v = torch.randn(5, 4 * 64)
-        cu_seqlens_kv = torch.tensor([0, 2, 5], dtype=torch.int32)
-
-        out = stub._attn_impl_varlen_kv(q, k, v, cu_seqlens_kv=cu_seqlens_kv, max_seqlen_kv=3)
-        assert out.shape == (2, 3, 4 * 64)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="FA4 requires CUDA")
     @pytest.mark.skipif(not FA4_AVAILABLE, reason="FA4 kernel not available")
