@@ -37,7 +37,7 @@ Here some explanations on how these values affect the memory:
 
 1. Reduce build time max number of input tokens (`max_num_tokens`)
 
-   Most of the tensors inside a transformer network have a linear relationship with number of input tokens, so activation size will be close to `max number of input tokens * some constant factor`, the constant factor depends on the network structure and TRT internal optimization. The max number of input tokens is derived from build time arguments, one can change the parameters provided to the `prepare_inputs` function, like `PretrainedModel.prepare_inputs` to affect the memory usage, or one can change the command line options of the `trtllm-build` command used in the examples.
+   Most of the tensors inside a transformer network have a linear relationship with number of input tokens, so activation size will be close to `max number of input tokens * some constant factor`, the constant factor depends on the network structure and TRT internal optimization. The max number of input tokens is derived from build time arguments, one can change the parameters provided to the `prepare_inputs` function, like `PretrainedModel.prepare_inputs` to affect the memory usage.
 
    When using the [packed tensors](../advanced/gpt-attention.md#padded-and-packed-tensors) format and `max_num_tokens` is specified, reducing its value will also reduce activation memory size.
 
