@@ -181,7 +181,7 @@
 /tensorrt_llm/_torch/modules/linear.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
-/tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py @NVIDIA/trt-llm-models-devs
+/tests/integration/defs/accuracy/test_llm_api_pytorch_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-qa-function
 /tests/unittest/_torch/modeling @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/models @NVIDIA/trt-llm-models-devs
 /tests/unittest/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
