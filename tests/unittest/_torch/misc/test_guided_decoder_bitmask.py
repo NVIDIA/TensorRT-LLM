@@ -134,11 +134,17 @@ def _make_decoder(monkeypatch, max_num_draft_tokens: int) -> GuidedDecoder:
     )
 
 
-def _generation_request(*, is_draft: bool, draft_tokens: List[int]) -> GuidedRequest:
+def _generation_request(
+    *,
+    is_draft: bool,
+    draft_tokens: List[int],
+    request_id: int = 7,
+    seq_slot: int = _SLOT,
+) -> GuidedRequest:
     return GuidedRequest(
         guided_decoding_params=_GUIDED_PARAMS,
-        request_id=7,
-        seq_slot=_SLOT,
+        request_id=request_id,
+        seq_slot=seq_slot,
         is_generation_in_progress_state=True,
         new_token=11,
         is_draft=is_draft,
@@ -217,3 +223,33 @@ def test_build_draft_position_dead_end_stops_guiding(monkeypatch):
     assert decoder.num_guided_tokens[_SLOT] == 1
     # new_token plus the one accepted draft token.
     assert decoder.num_advanced_tokens[_SLOT] == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_build_dead_end_isolates_the_failing_request(monkeypatch):
+    """Only the dead-end request fails; the rest of the batch keeps decoding.
+
+    This is the property the fix exists for: before it, a single dead-end row
+    took down the whole deployment via the sampler's global NaN assert.
+    """
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matchers[0] = _ScriptedMatcher([False])
+    decoder.grammar_matchers[1] = _ScriptedMatcher([True])
+    requests = GuidedRequests(
+        [
+            _generation_request(is_draft=False, draft_tokens=[], request_id=7, seq_slot=0),
+            _generation_request(is_draft=False, draft_tokens=[], request_id=8, seq_slot=1),
+        ],
+        num_contexts=0,
+        num_generations=2,
+        max_num_draft_tokens=0,
+    )
+
+    failed_requests = decoder._build(requests)
+
+    assert [req_id for req_id, _ in failed_requests] == [7]
+    # The healthy request keeps its guided row and stays constrained.
+    assert decoder.token_mask_host[0].item() == 0
+    assert decoder.token_mask_host[1].item() == 1
+    assert decoder.num_guided_tokens[1] == 1
+    assert decoder.num_advanced_tokens[1] == 1
