@@ -155,6 +155,11 @@ TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
 these unified defaults. The configured values are forwarded to dynamically
 spawned MPI workers.
 
+Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
+`TRTLLM_CACHE_DIR`, also defaults `TRTLLM_DG_JIT_DUMP_CUBIN` to `1` so its
+NVRTC-generated cubins are persisted. An explicitly configured dump setting
+still takes precedence.
+
 When unified caching configures `FLASHINFER_WORKSPACE_BASE`, that value takes
 precedence over the automatic FlashInfer workspace isolation described below.
 Use distinct `TRTLLM_CACHE_DIR` values when concurrent processes must not share

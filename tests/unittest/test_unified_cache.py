@@ -17,6 +17,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture(autouse=True)
 def _clear_cache_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, raising=False)
+    monkeypatch.delenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, raising=False)
     for name in _bootstrap._UNIFIED_CACHE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
@@ -25,6 +26,40 @@ def test_unified_cache_is_disabled_without_root() -> None:
     _bootstrap._setup_unified_cache()
 
     assert all(name not in os.environ for name in _bootstrap._UNIFIED_CACHE_ENV_VARS)
+    assert _bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV not in os.environ
+
+
+def test_unified_cache_enables_trtllm_deep_gemm_cubin_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "unified"
+    monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, str(cache_root))
+
+    _bootstrap._setup_unified_cache()
+
+    assert os.environ[_bootstrap._TRTLLM_DG_CACHE_ENV] == str(cache_root / "trtllm_deep_gemm")
+    assert os.environ[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "1"
+
+
+def test_explicit_trtllm_deep_gemm_cache_enables_cubin_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(_bootstrap._TRTLLM_DG_CACHE_ENV, str(tmp_path / "deep_gemm"))
+
+    _bootstrap._setup_unified_cache()
+
+    assert os.environ[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "1"
+
+
+def test_explicit_trtllm_deep_gemm_dump_setting_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(_bootstrap._TRTLLM_DG_CACHE_ENV, str(tmp_path / "deep_gemm"))
+    monkeypatch.setenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, "0")
+
+    _bootstrap._setup_unified_cache()
+
+    assert os.environ[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "0"
 
 
 def test_unified_cache_respects_individual_overrides(
@@ -69,6 +104,7 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, "/cache")
     for name in _bootstrap._UNIFIED_CACHE_ENV_VARS:
         monkeypatch.setenv(name, f"/cache/{name.lower()}")
+    monkeypatch.setenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, "1")
     monkeypatch.setenv("UNRELATED_CACHE_DIR", "/not-forwarded")
     monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
     session = SimpleNamespace(mpi_pool=None, n_workers=1, _env_overrides={})
@@ -78,5 +114,6 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     worker_env = captured["env"]
     assert isinstance(worker_env, dict)
     assert worker_env[_bootstrap._UNIFIED_CACHE_ROOT_ENV] == "/cache"
+    assert worker_env[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "1"
     assert all(worker_env[name] == os.environ[name] for name in _bootstrap._UNIFIED_CACHE_ENV_VARS)
     assert "UNRELATED_CACHE_DIR" not in worker_env

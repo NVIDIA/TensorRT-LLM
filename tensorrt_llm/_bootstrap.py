@@ -46,6 +46,8 @@ os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 _inited = False
 
 _UNIFIED_CACHE_ROOT_ENV = "TRTLLM_CACHE_DIR"
+_TRTLLM_DG_CACHE_ENV = "TRTLLM_DG_CACHE_DIR"
+_TRTLLM_DG_DUMP_CUBIN_ENV = "TRTLLM_DG_JIT_DUMP_CUBIN"
 _UNIFIED_CACHE_ENV_VARS = (
     "TLLM_AUTOTUNER_CACHE_PATH",
     "TORCHINDUCTOR_CACHE_DIR",
@@ -54,7 +56,7 @@ _UNIFIED_CACHE_ENV_VARS = (
     "FLASHINFER_WORKSPACE_BASE",
     "CUTE_DSL_CACHE_DIR",
     "DG_JIT_CACHE_DIR",
-    "TRTLLM_DG_CACHE_DIR",
+    _TRTLLM_DG_CACHE_ENV,
     "CUDA_CACHE_PATH",
 )
 
@@ -70,19 +72,20 @@ def _unified_cache_defaults(cache_root: str) -> dict[str, str]:
         "FLASHINFER_WORKSPACE_BASE": os.path.join(cache_root, "flashinfer"),
         "CUTE_DSL_CACHE_DIR": os.path.join(cache_root, "cute_dsl"),
         "DG_JIT_CACHE_DIR": os.path.join(cache_root, "deep_gemm"),
-        "TRTLLM_DG_CACHE_DIR": os.path.join(cache_root, "trtllm_deep_gemm"),
+        _TRTLLM_DG_CACHE_ENV: os.path.join(cache_root, "trtllm_deep_gemm"),
         "CUDA_CACHE_PATH": os.path.join(cache_root, "cuda"),
     }
 
 
 def _setup_unified_cache() -> None:
-    """Point compiled-artifact caches under ``TRTLLM_CACHE_DIR`` when set."""
+    """Configure compiled-artifact cache defaults before framework imports."""
     cache_root = os.environ.get(_UNIFIED_CACHE_ROOT_ENV)
-    if not cache_root:
-        return
+    if cache_root:
+        for name, path in _unified_cache_defaults(cache_root).items():
+            os.environ.setdefault(name, path)
 
-    for name, path in _unified_cache_defaults(cache_root).items():
-        os.environ.setdefault(name, path)
+    if os.environ.get(_TRTLLM_DG_CACHE_ENV):
+        os.environ.setdefault(_TRTLLM_DG_DUMP_CUBIN_ENV, "1")
 
 
 def _add_trt_llm_dll_directory():
