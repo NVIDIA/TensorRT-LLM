@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
@@ -912,7 +913,7 @@ class PyExecutor:
         self._resource_governor_enabled = resource_governor_queue is not None
 
         self.stats_lock = threading.Lock()
-        self.stats = []
+        self.stats = deque()
         self._latest_kv_iter_stats = None
         self._last_kv_iter_stats_fetch_iter = None
         self._kv_iter_stats_interval = getattr(
@@ -1194,13 +1195,12 @@ class PyExecutor:
         if not rank_dicts:
             return
         with self.stats_lock:
-            if not _stats_buffer_is_unbounded(self.max_stats_len):
-                cap = self.max_stats_len * tp_size
-                overflow = max(0, len(self.stats) + len(rank_dicts) - cap)
-                if overflow:
-                    del self.stats[:overflow]
             for d in rank_dicts:
                 self.stats.append(("per_rank_dict", d))
+            if not _stats_buffer_is_unbounded(self.max_stats_len):
+                cap = self.max_stats_len * tp_size
+                while len(self.stats) > cap:
+                    self.stats.popleft()
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1638,10 +1638,10 @@ class PyExecutor:
         if self.enable_iter_perf_stats == False:
             return []
 
-        latest_stats = (IterationStats(), None)
+        latest_stats = []
         with self.stats_lock:
-            latest_stats = self.stats
-            self.stats = []
+            latest_stats = list(self.stats)
+            self.stats.clear()
         return latest_stats
 
     def get_kv_cache_capacity(self) -> dict:
@@ -2443,13 +2443,13 @@ class PyExecutor:
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
         with self.stats_lock:
-            if (not _stats_buffer_is_unbounded(self.max_stats_len)
-                    and len(self.stats) > self.max_stats_len):
-                self.stats.pop(0)
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
                  gpu_forward_time_ms))
+            if not _stats_buffer_is_unbounded(self.max_stats_len):
+                while len(self.stats) > self.max_stats_len:
+                    self.stats.popleft()
 
     def _process_iter_stats(
         self,

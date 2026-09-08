@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -3403,3 +3404,23 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
     waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
     assert waited == [0, 1, 2, 3]
+
+
+def test_iter_stats_buffer_evicts_oldest_entry_in_constant_time():
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = True
+    executor.max_stats_len = 2
+    executor.stats_lock = threading.Lock()
+    executor.stats = deque()
+    executor.dist = types.SimpleNamespace(pp_size=1, tp_size=1)
+    first, second, third = Mock(), Mock(), Mock()
+
+    executor._append_iter_stats(first)
+    executor._append_iter_stats(second)
+    executor._append_iter_stats(third)
+
+    assert isinstance(executor.stats, deque)
+    assert [entry[0] for entry in executor.stats] == [second, third]
+    assert [entry[0] for entry in executor.get_latest_iteration_stats()] == [second, third]
+    assert not executor.stats
