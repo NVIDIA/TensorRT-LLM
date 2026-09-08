@@ -373,6 +373,20 @@ class TestStatsSerializer:
         assert d["schedulerMode"] == "overlap"
         assert d["gpuForwardTimeMS"] == 4.25
 
+    def test_serializer_marks_and_omits_unsampled_rich_stats(self):
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, None, None, None, None, None, None, 10)
+        )
+        d = json.loads(result)
+
+        assert d["statsCollectionInterval"] == 10
+        assert not d["statsCollectionSampled"]
+        assert "gpuMemUsage" not in d
+        assert "cpuMemUsage" not in d
+        assert "pinnedMemUsage" not in d
+
     def test_serializer_with_v2_pool_group_stats(self):
         """KV cache manager V2 stats should include pool group breakdown."""
         iter_stats = _make_mock_iteration_stats()

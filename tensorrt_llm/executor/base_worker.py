@@ -1109,8 +1109,17 @@ class BaseWorker(GenerationExecutor):
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
         attention_dp_payload = stats[8] if len(stats) > 8 else None
+        stats_sample_interval = stats[9] if len(stats) > 9 else 1
 
         stats_dict = json.loads(iteration_stats.to_json_str())
+        rich_stats_sampled = stats_dict.get("iter",
+                                            0) % stats_sample_interval == 0
+        stats_dict["statsCollectionInterval"] = stats_sample_interval
+        stats_dict["statsCollectionSampled"] = rich_stats_sampled
+        if not rich_stats_sampled:
+            stats_dict.pop("gpuMemUsage", None)
+            stats_dict.pop("cpuMemUsage", None)
+            stats_dict.pop("pinnedMemUsage", None)
         # Always tag the row so Dynamo's adapter can read
         # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
         # default to rank 0; ADP stats carry the rank supplied by PyExecutor.

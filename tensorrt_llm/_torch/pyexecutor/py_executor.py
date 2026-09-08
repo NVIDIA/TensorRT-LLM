@@ -916,9 +916,9 @@ class PyExecutor:
         self.stats = deque()
         self._latest_kv_iter_stats = None
         self._last_kv_iter_stats_fetch_iter = None
-        self._kv_iter_stats_interval = getattr(
+        self._iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
-            'iteration_stats_interval', 1)
+            'iteration_stats_interval', 10)
         self._adp_iter_stats = ADPIterStatsBuffer()
         # Per-loop CPU wall and GPU forward time captured by the profile_step
         # closure (see _profiler). Populated whenever enable_iter_perf_stats or
@@ -2065,10 +2065,12 @@ class PyExecutor:
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
-        end, total_gpu_memory = torch.cuda.mem_get_info()
-        stats.gpu_mem_usage = total_gpu_memory - end
-        stats.cpu_mem_usage = 0
-        stats.pinned_mem_usage = 0
+        collect_rich_stats = stats.iter % self._iter_stats_interval == 0
+        if collect_rich_stats:
+            free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+            stats.gpu_mem_usage = total_gpu_memory - free_gpu_memory
+            stats.cpu_mem_usage = 0
+            stats.pinned_mem_usage = 0
 
         # NOTE: stats.iter was stamped at construction time in
         # _get_init_iter_stats. Do NOT re-stamp here from self.iter_counter
@@ -2078,7 +2080,7 @@ class PyExecutor:
 
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if kv_cache_manager is not None:
+        if kv_cache_manager is not None and collect_rich_stats:
             kv_stats = kv_cache_manager.get_kv_cache_stats()
             kv_stats_to_save = KvCacheStats()
             kv_stats_to_save.max_num_blocks = kv_stats.max_num_blocks
@@ -2095,13 +2097,14 @@ class PyExecutor:
             # Collect per-iteration stats (with deltas) at configured interval.
             # Between calls, C++ deltas accumulate so the reported values cover multiple iterations.
             # Guard: only fetch once per iter_counter to avoid draining deltas in PP multi-batch.
-            if (self.iter_counter % self._kv_iter_stats_interval == 0 and
-                    self._last_kv_iter_stats_fetch_iter != self.iter_counter):
+            if self._last_kv_iter_stats_fetch_iter != stats.iter:
                 self._latest_kv_iter_stats = kv_cache_manager.get_iteration_stats(
                 )
-                self._last_kv_iter_stats_fetch_iter = self.iter_counter
+                self._last_kv_iter_stats_fetch_iter = stats.iter
             else:
                 self._latest_kv_iter_stats = None
+        else:
+            self._latest_kv_iter_stats = None
 
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
@@ -2421,11 +2424,13 @@ class PyExecutor:
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
         #   [8] attention_dp_payload: Optional[RankIterStatsPayload]
+        #   [9] stats_sample_interval: int
         with self.stats_lock:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms, attention_dp_payload))
+                 gpu_forward_time_ms, attention_dp_payload,
+                 getattr(self, "_iter_stats_interval", 1)))
             if not _stats_buffer_is_unbounded(self.max_stats_len):
                 while len(self.stats) > self.max_stats_len:
                     self.stats.popleft()

@@ -206,6 +206,7 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    fake._iter_stats_interval = 1
     # Bind the real dummy-request predicate: a bare MagicMock auto-generates a
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
@@ -302,6 +303,36 @@ def test_empty_iteration():
     assert ifb.num_queued_gen_requests == 0
     assert ifb.num_queued_gen_kv_tokens == 0
     assert ifb.num_paused_kv_tokens == 0
+
+
+def test_unsampled_iteration_skips_gpu_and_kv_snapshots():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self([], None)
+    fake_self._iter_stats_interval = 10
+    kv_cache_manager = MagicMock()
+    fake_self.resource_manager.resource_managers.get.return_value = kv_cache_manager
+    stats = IterationStats()
+    stats.iter = 1
+    stats.inflight_batching_stats = InflightBatchingStats()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info"
+    ) as mem_get_info:
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+            scheduled_batch_stats=None,
+        )
+
+    mem_get_info.assert_not_called()
+    kv_cache_manager.get_kv_cache_stats.assert_not_called()
+    kv_cache_manager.get_iteration_stats.assert_not_called()
+    assert fake_self._latest_kv_iter_stats is None
 
 
 def test_prefill_only_no_prefix_cache():
