@@ -23,13 +23,14 @@ single derivation point meaningful:
 
     dp_num_tokens() == self.num_tokens after prepare()
 
-They run on a single GPU because the metadata constructors allocate CUDA
-buffers in ``__post_init__``.
+The invariant is pure integer arithmetic, so these run without a GPU: the
+``cpu_allocation`` fixture redirects the ``device='cuda'`` buffer allocations
+in ``__post_init__``/``prepare()`` to the CPU. Everything else -- the real
+constructors and the real ``prepare()`` -- is exercised unchanged.
 """
 
 import pytest
 import torch
-from utils.util import skip_num_gpus_less_than
 
 from tensorrt_llm._torch.speculative.draft_target import DraftTargetOneModelSpecMetadata
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
@@ -120,13 +121,36 @@ CASES = [
 ]
 
 
-@skip_num_gpus_less_than(1)
+@pytest.fixture
+def cpu_allocation(monkeypatch):
+    """Redirect the metadata's ``device='cuda'`` allocations to the CPU.
+
+    The spec metadata classes hardcode ``device='cuda'`` for their index
+    buffers, which would otherwise force this arithmetic-only test onto a GPU
+    runner. The spec modules all do a plain ``import torch``, so patching the
+    factories on the module object covers every allocation site. Copies into
+    the redirected buffers stay CPU->CPU and ``prefer_pinned()`` is already
+    False when no device is present.
+    """
+
+    def to_cpu(fn):
+        def wrapper(*args, **kwargs):
+            if kwargs.get("device") == "cuda":
+                kwargs["device"] = "cpu"
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    for name in ("empty", "arange", "zeros", "tensor"):
+        monkeypatch.setattr(torch, name, to_cpu(getattr(torch, name)))
+
+
 @pytest.mark.parametrize(
     "factory,expected",
     [(factory, expected) for _, factory, expected in CASES],
     ids=[case_id for case_id, _, _ in CASES],
 )
-def test_dp_num_tokens_matches_prepare(factory, expected) -> None:
+def test_dp_num_tokens_matches_prepare(cpu_allocation, factory, expected) -> None:
     """The pre-prepare allgather value must equal the post-prepare count."""
     metadata = factory()
     metadata.request_ids = list(range(NUM_SEQS))
