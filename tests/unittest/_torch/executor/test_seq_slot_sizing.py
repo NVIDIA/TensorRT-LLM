@@ -81,11 +81,14 @@ SIZING_CASES = [
         (True, 1, False, False, True),
         (False, 1, False, False, False),
         (True, 1, True, False, False),
-        # Pipeline parallelism is in scope. The extra seats are additive in
-        # pp_size and are only spendable because the ADP router now derives the
-        # retiring-request count identically on every stage.
-        (True, 2, False, False, True),
-        (True, 4, False, False, True),
+        # Pipeline parallelism is still out of scope, but no longer because the
+        # sizing cannot express it -- compute_max_num_sequences is additive, so
+        # (pp_size + 1) * max_batch_size is well defined. The missing piece is the
+        # consumer: only the last pipeline stage marks generation requests
+        # GENERATION_TO_COMPLETE, so the ADP router's retiring-request correction
+        # would not be rank-consistent.
+        (True, 2, False, False, False),
+        (True, 4, False, False, False),
         # Hybrid/SSM architectures are excluded: MambaHybridCacheManagerV2 sizes
         # its state-index pool from max_batch_size alone, so an extra seat would
         # have no state slot behind it.

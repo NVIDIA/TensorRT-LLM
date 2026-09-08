@@ -3188,17 +3188,7 @@ def resolve_max_num_sequences(model_engine,
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
-    """Enable transactional ADP dummy handling; still non-PP only.
-
-    Independent of ``should_enable_adp_overlap_seq_slot_headroom``, which *is* now
-    enabled under pipeline parallelism. The dummy path has its own PP obstacles,
-    unrelated to seat capacity: the ADP dummy is a singleton fixed request ID
-    while ``pp_size`` micro-batches are in flight, and
-    ``_finalize_adp_dummy_allocation`` is never called from ``_executor_loop_pp``,
-    so a skipped iteration leaks the dummy. Widening this gate is a separate
-    change with a separate failure mode, so the two are deliberately not moved
-    together.
-    """
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
     return not mapping.has_pp()
 
 
@@ -3240,11 +3230,13 @@ def should_enable_adp_overlap_seq_slot_headroom(
     is a property of overlap plus ADP admission, and was measured on an
     aggregated context-only run with no cache transceiver configured.
 
-    Pipeline parallelism is included. The extra seats are additive in pp_size
-    (see compute_max_num_sequences), and they are only *usable* because the
-    retiring-request count is now derived identically on every pipeline stage --
-    ADPRouter.exclude_retiring_requests documents that contract. Enabling this
-    gate without that fix would allocate headroom no rank ever spends.
+    Pipeline parallelism is still excluded here, but no longer because of the
+    sizing: compute_max_num_sequences now expresses the headroom additively, so
+    ``(pp_size + 1) * max_batch_size`` is a well-defined pool under PP. What is
+    missing is the *consumer*: ADPRouter's retiring-request correction requires
+    every pipeline stage to agree on which requests are retiring, and today only
+    the last stage marks generation requests GENERATION_TO_COMPLETE. Opening the
+    gate before that is fixed would allocate headroom no rank ever spends.
 
     Hybrid (Mamba/SSM) architectures are excluded. MambaHybridCacheManagerV2
     sizes its state-index pool from max_batch_size alone
@@ -3256,7 +3248,8 @@ def should_enable_adp_overlap_seq_slot_headroom(
     """
     if is_hybrid:
         return False
-    return (mapping.enable_attention_dp and not disable_overlap_scheduler)
+    return (mapping.enable_attention_dp and not mapping.has_pp()
+            and not disable_overlap_scheduler)
 
 
 def create_py_executor_instance(
