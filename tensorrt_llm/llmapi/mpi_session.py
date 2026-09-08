@@ -17,6 +17,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
 
+from tensorrt_llm._bootstrap import _UNIFIED_CACHE_ENV_VARS
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -553,8 +554,8 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
+            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            or key in _UNIFIED_CACHE_ENV_VARS or key == "FLASHINFER_CUBIN_DIR"
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)

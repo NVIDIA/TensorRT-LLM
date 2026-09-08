@@ -131,6 +131,35 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
+### Unified compiled-artifact cache
+
+Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
+artifact caches under a single root. TensorRT-LLM supplies the following
+defaults; an individually configured environment variable always takes
+precedence.
+
+| Environment variable | Default under `TRTLLM_CACHE_DIR` |
+|----------------------|------------------------------------|
+| `TLLM_AUTOTUNER_CACHE_PATH` | `autotuner/cache.json` |
+| `TORCHINDUCTOR_CACHE_DIR` | `inductor` |
+| `TRITON_CACHE_DIR` | `triton` |
+| `TORCH_EXTENSIONS_DIR` | `torch_extensions` |
+| `FLASHINFER_WORKSPACE_BASE` | `flashinfer` |
+| `CUTE_DSL_CACHE_DIR` | `cute_dsl` |
+| `DG_JIT_CACHE_DIR` | `deep_gemm` |
+| `TRTLLM_DG_CACHE_DIR` | `trtllm_deep_gemm` |
+| `CUDA_CACHE_PATH` | `cuda` |
+
+The directories are created by their respective consumers when needed.
+TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
+these unified defaults. The configured values are forwarded to dynamically
+spawned MPI workers.
+
+When unified caching configures `FLASHINFER_WORKSPACE_BASE`, that value takes
+precedence over the automatic FlashInfer workspace isolation described below.
+Use distinct `TRTLLM_CACHE_DIR` values when concurrent processes must not share
+their FlashInfer workspace.
+
 ### FlashInfer JIT workspaces for MPI workers
 
 `trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers

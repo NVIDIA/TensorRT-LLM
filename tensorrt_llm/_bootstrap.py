@@ -16,9 +16,10 @@
 
 Two phases, in this order, both driven from ``tensorrt_llm/__init__.py``:
 
-1. :func:`_prepare_environment` -- DLL search path, Python-library preload and
-   vendored ``triton_kernels`` precedence.  It must run *before* ``torch`` and
-   before any TensorRT-LLM shared object is loaded.
+1. :func:`_prepare_environment` -- compiled-artifact cache defaults, DLL search
+   path, Python-library preload and vendored ``triton_kernels`` precedence. It
+   must run *before* ``torch`` and before any TensorRT-LLM shared object is
+   loaded.
 2. :func:`_init` -- custom-op library loading and MPI initialization.  It runs
    after the package's own imports have completed.
 
@@ -43,6 +44,45 @@ from pathlib import Path
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 
 _inited = False
+
+_UNIFIED_CACHE_ROOT_ENV = "TRTLLM_CACHE_DIR"
+_UNIFIED_CACHE_ENV_VARS = (
+    "TLLM_AUTOTUNER_CACHE_PATH",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "TRITON_CACHE_DIR",
+    "TORCH_EXTENSIONS_DIR",
+    "FLASHINFER_WORKSPACE_BASE",
+    "CUTE_DSL_CACHE_DIR",
+    "DG_JIT_CACHE_DIR",
+    "TRTLLM_DG_CACHE_DIR",
+    "CUDA_CACHE_PATH",
+)
+
+
+def _unified_cache_defaults(cache_root: str) -> dict[str, str]:
+    """Return cache environment defaults rooted at ``cache_root``."""
+    cache_root = os.path.expanduser(cache_root)
+    return {
+        "TLLM_AUTOTUNER_CACHE_PATH": os.path.join(cache_root, "autotuner", "cache.json"),
+        "TORCHINDUCTOR_CACHE_DIR": os.path.join(cache_root, "inductor"),
+        "TRITON_CACHE_DIR": os.path.join(cache_root, "triton"),
+        "TORCH_EXTENSIONS_DIR": os.path.join(cache_root, "torch_extensions"),
+        "FLASHINFER_WORKSPACE_BASE": os.path.join(cache_root, "flashinfer"),
+        "CUTE_DSL_CACHE_DIR": os.path.join(cache_root, "cute_dsl"),
+        "DG_JIT_CACHE_DIR": os.path.join(cache_root, "deep_gemm"),
+        "TRTLLM_DG_CACHE_DIR": os.path.join(cache_root, "trtllm_deep_gemm"),
+        "CUDA_CACHE_PATH": os.path.join(cache_root, "cuda"),
+    }
+
+
+def _setup_unified_cache() -> None:
+    """Point compiled-artifact caches under ``TRTLLM_CACHE_DIR`` when set."""
+    cache_root = os.environ.get(_UNIFIED_CACHE_ROOT_ENV)
+    if not cache_root:
+        return
+
+    for name, path in _unified_cache_defaults(cache_root).items():
+        os.environ.setdefault(name, path)
 
 
 def _add_trt_llm_dll_directory():
@@ -112,6 +152,7 @@ def _setup_vendored_triton_kernels():
 
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
+    _setup_unified_cache()
     _add_trt_llm_dll_directory()
     _preload_python_lib()
     _setup_vendored_triton_kernels()
