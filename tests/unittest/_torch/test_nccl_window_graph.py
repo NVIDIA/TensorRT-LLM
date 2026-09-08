@@ -4,6 +4,7 @@
 import contextlib
 import inspect
 from dataclasses import dataclass, field
+from operator import getitem
 
 import pytest
 import torch
@@ -520,6 +521,63 @@ def test_each_decoder_layer_scope_survives_torch_compile():
     assert active_scopes == 0
 
 
+def test_decoder_layer_scope_survives_aot_with_input_used_before_layer():
+    from torch._functorch.aot_autograd import aot_module_simplified
+
+    from tensorrt_llm._torch.compilation.nccl_window import insert_nccl_window_tensor_scopes
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class TestLayer(DecoderLayer):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states + self.weight
+
+    class TestModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([TestLayer(), TestLayer()])
+
+        def forward(self, hidden_states):
+            hidden_states = self.layers[0](hidden_states)
+            # This weight is also an input to the next layer. Functionalizing a
+            # mutable input list used to move this earlier use after scope begin.
+            hidden_states = hidden_states * self.layers[1].weight
+            hidden_states = self.layers[1](hidden_states)
+            return (hidden_states,)
+
+    aot_graphs = []
+
+    def compile_graph(gm, example_inputs):
+        insert_nccl_window_tensor_scopes(gm)
+
+        def lint_graph(aot_gm, _example_inputs):
+            aot_gm.graph.lint()
+            aot_graphs.append(aot_gm)
+            return aot_gm.forward
+
+        return aot_module_simplified(gm, example_inputs, fw_compiler=lint_graph)
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(TestModel(), backend=compile_graph, fullgraph=True)
+        (result,) = compiled(torch.ones(1))
+    finally:
+        torch._dynamo.reset()
+
+    assert torch.equal(result, torch.full((1,), 3.0))
+    effect_ops = [
+        node.args[1]
+        for node in aot_graphs[0].graph.nodes
+        if node.target is torch.ops.higher_order.with_effects
+    ]
+    begin = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
+    end = torch.ops.trtllm.end_nccl_window_tensor_scope.default
+    assert effect_ops == [begin, end, begin, end]
+
+
 def test_decoder_layer_scope_preserves_concrete_forward_signature():
     from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
@@ -538,25 +596,47 @@ def test_decoder_layer_scope_preserves_concrete_forward_signature():
 
 def test_tensor_scope_compilation_metadata_pins_boundaries_to_primary_stream(monkeypatch):
     from tensorrt_llm._torch.compilation.multi_stream import auto_multi_stream
+    from tensorrt_llm._torch.compilation.nccl_window import lower_nccl_window_tensor_scope_effects
     from tensorrt_llm._torch.compilation.utils import inplace_info
 
     begin = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
     end = torch.ops.trtllm.end_nccl_window_tensor_scope.default
-    assert inplace_info()[begin] == {1: "inputs"}
-    assert inplace_info()[end] == {1: "inputs", 2: "outputs"}
+    assert begin not in inplace_info()
+    assert end not in inplace_info()
 
     graph = torch.fx.Graph()
+    effect_token = graph.placeholder("effect_token")
     hidden_states = graph.placeholder("hidden_states")
-    begin_node = graph.call_function(begin, kwargs={"inputs": [hidden_states]})
+    begin_node = graph.call_function(
+        torch.ops.higher_order.with_effects,
+        args=(effect_token, begin, [hidden_states]),
+    )
+    next_token = graph.call_function(getitem, args=(begin_node, 0))
     output = graph.call_function(torch.ops.aten.add.Tensor, args=(hidden_states, 1))
     end_node = graph.call_function(
-        end, kwargs={"inputs": [hidden_states], "outputs": [output], "failed": False}
+        torch.ops.higher_order.with_effects,
+        args=(next_token, end, [hidden_states], [output], False),
     )
-    graph.output(output)
+    final_token = graph.call_function(getitem, args=(end_node, 0))
+    graph.output((final_token, output))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    lower_nccl_window_tensor_scope_effects(gm)
+    scope_nodes = [
+        node for node in graph.nodes if node.op == "call_function" and node.target in (begin, end)
+    ]
+    assert [node.target for node in scope_nodes] == [begin, end]
+    assert all(node.target is not torch.ops.higher_order.with_effects for node in graph.nodes)
+    graph_output = next(node for node in graph.nodes if node.op == "output")
+    assert graph_output.args[0][0] is effect_token
 
     monkeypatch.setattr(auto_multi_stream, "estimate_time", lambda _node: 1)
-    dag = auto_multi_stream.MultiStreamDAG(torch.fx.GraphModule(torch.nn.Module(), graph))
+    dag = auto_multi_stream.MultiStreamDAG(gm)
     dag.assign_streams(2)
 
+    begin_node, end_node = scope_nodes
     assert dag.nodes[begin_node].stream.id == 0
     assert dag.nodes[end_node].stream.id == 0
+    assert dag.nodes[begin_node] in dag.nodes[output].in_edges.values()
+    assert dag.nodes[output] in dag.nodes[end_node].in_edges.values()
+    assert dag.nodes[end_node] in dag.exit_node.in_edges.values()

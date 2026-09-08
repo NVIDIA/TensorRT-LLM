@@ -32,7 +32,8 @@ from tensorrt_llm.mapping import Mapping
 
 from ..nccl_window_graph import release_nccl_window_graph_owner
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .nccl_window import insert_nccl_window_tensor_scopes
+from .nccl_window import (insert_nccl_window_tensor_scopes,
+                          lower_nccl_window_tensor_scope_effects)
 from .patterns import MATCHER_SUBSYSTEM
 from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import (register_add_norm,
@@ -164,6 +165,10 @@ class Backend:
                 f"unnamed_pass_{len(self.match_count_by_pass)}")
             self.match_count_by_pass[pass_name] = total_match_count
         graph.eliminate_dead_code()
+        if not self.enable_inductor:
+            # AOT has already used the effect token to preserve the boundaries.
+            # Lower it before execution to avoid per-layer Python HOP dispatch.
+            lower_nccl_window_tensor_scope_effects(gm)
         # After this pass, cannot run any dce!!!
         remove_copy_for_mutates_args(graph)
 
