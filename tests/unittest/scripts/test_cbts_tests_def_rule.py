@@ -63,6 +63,12 @@ def _make_perf_rule(tmp_path: Path) -> CbtsTestsDefRule:
         "l0_b200:\n- tests:\n  - perf/test_perf_sanity.py::test_e2e[case]\n",
         encoding="utf-8",
     )
+    (test_db_dir / "l0_gb200_multi_gpus_perf_sanity.yml").write_text(
+        "l0_gb200_multi_gpus_perf_sanity:\n"
+        "- tests:\n"
+        "  - perf/test_perf_sanity.py::test_e2e[case]\n",
+        encoding="utf-8",
+    )
     (test_db_dir / "l0_other.yml").write_text(
         "l0_other:\n- tests:\n  - other/test_other.py::test_other\n",
         encoding="utf-8",
@@ -70,6 +76,13 @@ def _make_perf_rule(tmp_path: Path) -> CbtsTestsDefRule:
     stages = {
         "H100_PCIe-PyTorch-Perf-1": Stage("H100_PCIe-PyTorch-Perf-1", "l0_perf", "x86_64", 1, 1),
         "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
+        "GB200-4_GPUs-PyTorch-PerfSanity-1": Stage(
+            "GB200-4_GPUs-PyTorch-PerfSanity-1",
+            "l0_gb200_multi_gpus_perf_sanity",
+            "x86_64",
+            1,
+            1,
+        ),
     }
     return CbtsTestsDefRule(YAMLIndex.load(test_db_dir), stages, tmp_path)
 
@@ -158,6 +171,23 @@ def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -
     assert result is not None
     assert result.affected_stages == {"H100_PCIe-PyTorch-Perf-1"}
     assert set(result.block_filters) == {("l0_perf", 0)}
+    assert result.perfsanity_relevant is False
+
+
+def test_perf_sanity_definition_keeps_perfsanity_required(tmp_path: Path) -> None:
+    result = _make_perf_rule(tmp_path).apply(
+        PRInputs(
+            changed_files=["tests/integration/defs/perf/test_perf_sanity.py"],
+            diffs={},
+        )
+    )
+
+    assert result is not None
+    assert result.affected_stages == {
+        "DGX_B200-PyTorch-1",
+        "GB200-4_GPUs-PyTorch-PerfSanity-1",
+    }
+    assert result.perfsanity_relevant is True
 
 
 def test_conftest_import_keeps_directory_fallback(tmp_path: Path) -> None:
@@ -174,9 +204,14 @@ def test_conftest_import_keeps_directory_fallback(tmp_path: Path) -> None:
     assert result is not None
     assert result.affected_stages == {
         "DGX_B200-PyTorch-1",
+        "GB200-4_GPUs-PyTorch-PerfSanity-1",
         "H100_PCIe-PyTorch-Perf-1",
     }
-    assert set(result.block_filters) == {("l0_b200", 0), ("l0_perf", 0)}
+    assert set(result.block_filters) == {
+        ("l0_b200", 0),
+        ("l0_gb200_multi_gpus_perf_sanity", 0),
+        ("l0_perf", 0),
+    }
 
 
 def test_uncovered_import_consumers_keep_directory_fallback(tmp_path: Path) -> None:
@@ -197,9 +232,14 @@ def test_uncovered_import_consumers_keep_directory_fallback(tmp_path: Path) -> N
     assert result is not None
     assert result.affected_stages == {
         "DGX_B200-PyTorch-1",
+        "GB200-4_GPUs-PyTorch-PerfSanity-1",
         "H100_PCIe-PyTorch-Perf-1",
     }
-    assert set(result.block_filters) == {("l0_b200", 0), ("l0_perf", 0)}
+    assert set(result.block_filters) == {
+        ("l0_b200", 0),
+        ("l0_gb200_multi_gpus_perf_sanity", 0),
+        ("l0_perf", 0),
+    }
 
 
 def test_scope_start_line_includes_decorators() -> None:

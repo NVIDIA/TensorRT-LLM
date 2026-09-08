@@ -38,7 +38,6 @@ from typing import Optional
 from blocks import Stage, YAMLIndex
 
 from ._helpers import (
-    is_perf_stem,
     iter_diff_added_post_line_numbers,
     iter_diff_post_line_numbers,
     iter_diff_pre_image,
@@ -636,7 +635,7 @@ class TestsDefRule(Rule):
             block_filters, self.yaml_index, self._stages_by_yaml
         )
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
-        perfsanity_relevant = any(is_perf_stem(stem) for stem, _ in block_filters)
+        perfsanity_relevant = any("perf_sanity" in stem for stem, _ in block_filters)
 
         nonarrow_note = ""
         if no_match:
