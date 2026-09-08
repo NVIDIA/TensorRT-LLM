@@ -47,6 +47,14 @@ _MINIMAX_M3_EVAL_CONFIG = {
     "max_seq_len": 4096,
 }
 
+# Similar reasons as above.
+_KIMI_K2_EVAL_CONFIG = {
+    "kv_cache_config": {
+        "enable_block_reuse": False,
+    },
+    "max_seq_len": 4096,
+}
+
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
@@ -1647,7 +1655,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  marks=skip_pre_blackwell,
                  id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
     pytest.param('Kimi-K2-Thinking-NVFP4',
-                 None,
+                 _KIMI_K2_EVAL_CONFIG,
                  marks=skip_pre_blackwell,
                  id='Kimi-K2-Thinking-NVFP4'),
     pytest.param('MiniMax-M3',
