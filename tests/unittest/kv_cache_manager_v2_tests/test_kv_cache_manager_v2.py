@@ -1007,7 +1007,7 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(
             self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
         )
-        with self.assertRaisesRegex(ValueError, "already been dropped"):
+        with self.assertRaisesRegex(RuntimeError, "already been dropped"):
             long_handle.drop()
 
     @requires_python_backend

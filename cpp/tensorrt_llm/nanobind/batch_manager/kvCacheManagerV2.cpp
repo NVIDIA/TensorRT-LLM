@@ -31,6 +31,7 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
 #include <cassert>
@@ -768,8 +769,33 @@ private:
 static_assert(std::is_move_constructible_v<BlockchainKeyIterator>,
     "BlockchainKeyIterator must be move-constructible (mGen captures mTokens.data())");
 
+namespace
+{
+//! Supplies kv_cache_manager_v2's GIL hooks. Py_IsInitialized() is safe without an interpreter, and
+//! PyGILState_Check() answers the question that matters: does *this* thread hold the GIL right now.
+void* releaseGilIfHeld() noexcept
+{
+    if (Py_IsInitialized() != 0 && PyGILState_Check() != 0)
+    {
+        return PyEval_SaveThread();
+    }
+    return nullptr;
+}
+
+void restoreGil(void* token) noexcept
+{
+    PyEval_RestoreThread(static_cast<PyThreadState*>(token));
+}
+
+// Static storage duration: the core holds this pointer for the lifetime of the process.
+constexpr kv::GilHooks kGilHooks{&releaseGilIfHeld, &restoreGil};
+} // namespace
+
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 {
+    // Let the core release the GIL from destructors without depending on the Python C API.
+    kv::setGilHooks(&kGilHooks);
+
     // Export the C++ debug mode as an immutable Python bool snapshot.
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
 

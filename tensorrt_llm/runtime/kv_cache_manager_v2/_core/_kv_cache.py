@@ -154,14 +154,14 @@ class PlannedDropHandle:
         """
         page_refs = self._page_refs
         if page_refs is None:
-            raise ValueError("Planned drop handle has already been dropped")
+            raise RuntimeError("Planned drop handle has already been dropped")
 
         pages = list[CommittedPage]()
         for page_ref in page_refs:
             page = page_ref()
             if page is not None:
                 if page.planned_drop_count <= 0:
-                    raise ValueError("Committed page has no planned drop")
+                    raise RuntimeError("Committed page has no planned drop")
                 pages.append(page)
 
         self._page_refs = None

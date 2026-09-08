@@ -665,7 +665,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         // 16-byte alignment: the cold-page codec's copy path uses 16-byte vector accesses and
         // requires its base pointer to be 16-aligned. Nothing here needs finer granularity, so
         // this is a floor rather than a computed requirement.
-        auto staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
+        auto const staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
         size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
         stagingPageIndices.resize(batchSize);
 

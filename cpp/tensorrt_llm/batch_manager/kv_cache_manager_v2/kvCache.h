@@ -128,9 +128,8 @@ public:
     // Deduplicates `pages` by identity, stores weak references, and increments
     // each page's plannedDropCount.
     //
-    // `manager` owns the API lock this handle takes, both here and in ~PlannedDropHandle,
-    // and must outlive it: drop the plans before shutting the manager down (see
-    // KVCacheManagerV2.shutdown(), which clears ConversationManager first).
+    // The handle takes the manager's API lock here, in drop() and in ~PlannedDropHandle, so it
+    // holds a strong reference: Python may collect it after the manager it was created from.
     PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages);
 
     // Mirrors Python's __del__: applies the plan if not already dropped.
@@ -143,11 +142,11 @@ public:
     //
     // A live page is removed from eviction tracking only when this is its final
     // plan and it is already droppable and queued for eviction. Calling this
-    // method twice throws (translated to Python ValueError).
+    // method twice throws (translated to Python RuntimeError).
     void drop();
 
 private:
-    KvCacheManager* mManager;
+    std::shared_ptr<KvCacheManager> mManager;
     // nullopt once dropped (mirrors Python's `_page_refs is None`).
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };

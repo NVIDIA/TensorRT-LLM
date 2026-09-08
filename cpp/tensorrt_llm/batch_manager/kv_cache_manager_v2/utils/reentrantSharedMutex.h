@@ -36,7 +36,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //!
 //! Deliberate non-features. None of these are checked -- a violation is a hang, so the rules
 //! below have to be respected by construction:
-//!   * The shared side is NOT re-entrant. Acquiring it twice on one thread is undefined behaviour:
+//!   * The shared side is NOT re-entrant *inside another shared acquisition*. (Asking for it
+//!     shared while already holding it exclusively is fine and is relied upon -- the owner-thread
+//!     check short-circuits before the mode is considered.) Taking it shared twice on one thread
+//!     is undefined behaviour:
 //!     [thread.sharedmutex.requirements.general] forbids a thread that already owns the mutex in
 //!     any mode from acquiring shared ownership. It happens not to hang on libstdc++ today, whose
 //!     default rwlock kind prefers readers, but on a writer-preferring implementation the inner

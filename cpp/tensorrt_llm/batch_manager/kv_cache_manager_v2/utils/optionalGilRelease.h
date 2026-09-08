@@ -17,39 +17,53 @@
 
 #pragma once
 
-#include <Python.h>
-
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-//! Releases the GIL for the enclosing scope if -- and only if -- this thread currently holds it.
+//! Lets the core release the GIL without depending on the Python C API.
 //!
 //! Motivation: destructors. A binding method can declare `nb::call_guard<nb::gil_scoped_release>`,
-//! but a *destructor* has no such hook: nanobind runs it from `tp_dealloc` with the GIL held,
-//! which is exactly the state that deadlocks against a thread holding the API lock and waiting on
-//! `gil_scoped_acquire` to run a Python callback. Objects here are also destroyed on pure-C++
-//! paths where there may be no interpreter at all, so an unconditional `nb::gil_scoped_release`
-//! is wrong; hence the runtime probe.
+//! but a *destructor* has no such hook: nanobind runs it from `tp_dealloc` with the GIL held, which
+//! is exactly the state that deadlocks against a thread holding the API lock and waiting on
+//! `gil_scoped_acquire` to run a Python callback. Objects here are also destroyed on pure-C++ paths
+//! where there may be no interpreter at all, so releasing unconditionally is wrong.
 //!
-//! `Py_IsInitialized()` is safe to call without an interpreter (libpython is linked into
-//! libtensorrt_llm), and `PyGILState_Check()` answers precisely the question that matters: does
-//! *this* thread hold the GIL right now.
+//! The core therefore only calls through these hooks; the nanobind layer supplies the Python C API
+//! implementation via setGilHooks(). They stay null in a build with no bindings, which makes
+//! OptionalGilRelease a no-op there. The GIL is process-wide, so a single global is enough.
+struct GilHooks
+{
+    //! Releases the GIL and returns an opaque token, or nullptr when this thread does not hold it.
+    void* (*release)() noexcept;
+    //! Re-acquires the GIL. Called only with a non-null token returned by release().
+    void (*restore)(void* token) noexcept;
+};
+
+//! Installs the hooks. `hooks` must have static storage duration: the core holds the pointer for
+//! the lifetime of the process. Called once from the nanobind module initializer.
+void setGilHooks(GilHooks const* hooks) noexcept;
+
+//! Returns the installed hooks, or nullptr when no bindings are loaded.
+[[nodiscard]] GilHooks const* gilHooks() noexcept;
+
+//! Releases the GIL for the enclosing scope if -- and only if -- this thread currently holds it.
 class OptionalGilRelease
 {
 public:
-    OptionalGilRelease()
+    OptionalGilRelease() noexcept
+        : mHooks(gilHooks())
     {
-        if (Py_IsInitialized() != 0 && PyGILState_Check() != 0)
+        if (mHooks != nullptr)
         {
-            mState = PyEval_SaveThread();
+            mToken = mHooks->release();
         }
     }
 
     ~OptionalGilRelease()
     {
-        if (mState != nullptr)
+        if (mToken != nullptr)
         {
-            PyEval_RestoreThread(mState);
+            mHooks->restore(mToken);
         }
     }
 
@@ -59,7 +73,8 @@ public:
     OptionalGilRelease& operator=(OptionalGilRelease&&) = delete;
 
 private:
-    PyThreadState* mState = nullptr;
+    GilHooks const* mHooks;
+    void* mToken = nullptr;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -1837,7 +1837,7 @@ void KvCache::stopCommitting()
 // ---------------------------------------------------------------------------
 
 PlannedDropHandle::PlannedDropHandle(KvCacheManager& manager, std::vector<CommittedPage*> const& pages)
-    : mManager(&manager)
+    : mManager(manager.shared_from_this())
 {
     // Exclusive: mutates pages reachable from the radix tree and copies non-atomic refcounts.
     auto const apiLock = mManager->lockExclusive();
@@ -1868,8 +1868,7 @@ void PlannedDropHandle::drop()
     // thread -- the binding releases the GIL, and the destructor fires wherever CPython collects.
     auto const apiLock = mManager->lockExclusive();
 
-    if (!mPageRefs.has_value())
-        throw std::invalid_argument("Planned drop handle has already been dropped");
+    TLLM_CHECK_WITH_INFO(mPageRefs.has_value(), "Planned drop handle has already been dropped");
 
     std::vector<SharedPtr<CommittedPage>> pages;
     for (auto const& ref : *mPageRefs)
@@ -1877,8 +1876,7 @@ void PlannedDropHandle::drop()
         auto page = ref.lock();
         if (page)
         {
-            if (page->plannedDropCount <= 0)
-                throw std::invalid_argument("Committed page has no planned drop");
+            TLLM_CHECK_WITH_INFO(page->plannedDropCount > 0, "Committed page has no planned drop");
             pages.push_back(std::move(page));
         }
     }
