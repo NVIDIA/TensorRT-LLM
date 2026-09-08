@@ -100,7 +100,7 @@ def read_legacy_files() -> list[str]:
     if not LEGACY_FILES_TXT.exists():
         raise FileNotFoundError(f"{LEGACY_FILES_TXT} not found")
     paths = []
-    for line in LEGACY_FILES_TXT.read_text().splitlines():
+    for line in LEGACY_FILES_TXT.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             paths.append(line)
@@ -383,21 +383,21 @@ def do_generate(paths: list[str]) -> None:
     """
     new_toml = generate_ruff_legacy_toml(paths)
 
-    old_pyproject = PYPROJECT_TOML.read_text()
+    old_pyproject = PYPROJECT_TOML.read_text(encoding="utf-8")
     new_pyproject_block = generate_pyproject_block(paths)
     new_pyproject = replace_managed_block(old_pyproject, new_pyproject_block)
 
-    old_precommit = PRECOMMIT_YAML.read_text()
+    old_precommit = PRECOMMIT_YAML.read_text(encoding="utf-8")
     new_precommit_block = generate_precommit_block(paths)
     new_precommit = replace_managed_block(old_precommit, new_precommit_block)
 
-    RUFF_LEGACY_TOML.write_text(new_toml)
+    RUFF_LEGACY_TOML.write_text(new_toml, encoding="utf-8")
     print(f"  Written: {RUFF_LEGACY_TOML.relative_to(REPO_ROOT)}")
 
-    PYPROJECT_TOML.write_text(new_pyproject)
+    PYPROJECT_TOML.write_text(new_pyproject, encoding="utf-8")
     print(f"  Updated: {PYPROJECT_TOML.relative_to(REPO_ROOT)}")
 
-    PRECOMMIT_YAML.write_text(new_precommit)
+    PRECOMMIT_YAML.write_text(new_precommit, encoding="utf-8")
     print(f"  Updated: {PRECOMMIT_YAML.relative_to(REPO_ROOT)}")
 
 
@@ -406,17 +406,17 @@ def do_check(paths: list[str]) -> None:
     any_stale = False
 
     expected = generate_ruff_legacy_toml(paths)
-    actual = RUFF_LEGACY_TOML.read_text() if RUFF_LEGACY_TOML.exists() else ""
+    actual = RUFF_LEGACY_TOML.read_text(encoding="utf-8") if RUFF_LEGACY_TOML.exists() else ""
     if show_diff("ruff-legacy.toml", actual, expected):
         any_stale = True
 
-    old_pyproject = PYPROJECT_TOML.read_text()
+    old_pyproject = PYPROJECT_TOML.read_text(encoding="utf-8")
     new_block = generate_pyproject_block(paths)
     expected_pyproject = replace_managed_block(old_pyproject, new_block)
     if show_diff("pyproject.toml", old_pyproject, expected_pyproject):
         any_stale = True
 
-    old_precommit = PRECOMMIT_YAML.read_text()
+    old_precommit = PRECOMMIT_YAML.read_text(encoding="utf-8")
     new_block = generate_precommit_block(paths)
     expected_precommit = replace_managed_block(old_precommit, new_block)
     if show_diff(".pre-commit-config.yaml", old_precommit, expected_precommit):
