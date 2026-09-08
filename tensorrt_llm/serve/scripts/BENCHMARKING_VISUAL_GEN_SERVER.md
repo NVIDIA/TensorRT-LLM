@@ -72,9 +72,6 @@ cannot carry is an error rather than a request the server ignores.
 | `image_reference` | ✓ | — | required |
 | `video_reference` · `audio_reference` | ✓ | — | — |
 
-Each reference conditions one generation, so it goes in a request and `common_params`
-rejects it.
-
 #### Resolution order
 
 Each request is `common_params`, then the request's own keys. `extra_params` merges per key
@@ -84,16 +81,21 @@ rather than being replaced whole.
   run.
 * `--num-requests` cycles or truncates the resulting list.
 
-#### References and prompt files
+#### File inputs
 
-A path is read and encoded when the document loads, so a missing file fails before the run
-starts. Relative paths resolve from the document, and `~` expands; there is no variable
-expansion. A reference may also be given in the wire form `MediaRef` declares — `{content,
-format}` — which is passed through untouched.
+Five keys take a file, and only these five. A bare string in any of them is a **local path**,
+read when the document loads, so a missing file fails before the run starts; relative paths
+resolve from the document and `~` expands, with no variable expansion.
 
-`extra_params.action_file` names a JSON `[T, D]` action trajectory, read into
-`extra_params.action` and dropped; setting both is an error. `_resolve_prompt_file` documents
-the shapes a prompt file is read in.
+| key | may sit in | what the file becomes |
+|---|---|---|
+| `image_reference` · `video_reference` · `audio_reference` | a request | base64 on the wire. Each conditions one generation, which is why `common_params` rejects them |
+| `prompt_file` | a request or `common_params` | that request's `prompt`; `_resolve_prompt_file` documents the shapes it is read in |
+| `extra_params.action_file` | a request or `common_params` | `extra_params.action`, a JSON `[T, D]` trajectory. Setting both is an error |
+
+The three reference slots also take the object form `MediaRef` declares — `{content, format}`
+with `format` one of `path`, `url` or `base64` — passed through untouched. That is how a URL or
+inline base64 is given. `prompt_file` and `action_file` take a path.
 
 ## Result
 
