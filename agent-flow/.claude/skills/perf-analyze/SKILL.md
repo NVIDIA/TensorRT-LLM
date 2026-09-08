@@ -1,6 +1,6 @@
 ---
 name: perf-analyze
-description: Launch and operate this repo's perf-analyze workflow, which DIAGNOSES a TensorRT-LLM serving deployment without applying changes — benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill), nsys + torch-profiler + ncu per-kernel deep dive (via the perf-nsight-compute-analysis skill), and a report naming the single dominant bottleneck. Use when the user wants to analyze / profile / diagnose trtllm-serve performance (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-analyze". To actually APPLY optimizations, use the perf-optimize workflow instead.
+description: Launch and operate this repo's perf-analyze workflow, which DIAGNOSES a TensorRT-LLM serving deployment without applying changes — benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill), nsys + ncu per-kernel deep dive (via the perf-nsight-compute-analysis skill), and a report naming the single dominant bottleneck. Use when the user wants to analyze / profile / diagnose trtllm-serve performance (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-analyze". To actually APPLY optimizations, use the perf-optimize workflow instead.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -13,8 +13,8 @@ metadata:
 serves the model, benchmarks one operating point, derives an analytical
 speed-of-light (SOL) ceiling (via the `internal-perf-sol-analysis`
 skill — the projector runs unless `sol.enabled: false` turns it off),
-profiles the same load under nsys + the torch profiler + a bounded ncu
-per-kernel deep dive on the top nsys kernels (the analyzer — the same
+profiles the same load under nsys + a bounded ncu per-kernel deep dive
+on the top nsys kernels (the analyzer — the same
 diagnosis stage perf-optimize runs; the ncu pass follows the
 `perf-nsight-compute-analysis` skill, and with the projector on the
 analyzer also correlates the measured per-op times against the ceiling
@@ -120,8 +120,8 @@ than inventing values:
   server knobs (parallelism, batch sizes, KV-cache fraction,
   CUDA-graph config, ...). Omit for server defaults. The server always
   runs the `pytorch` backend on `127.0.0.1:8000`.
-- `profile`: `methods` (subset of `[nsys, torch, ncu]`, default all
-  three) and `nsys_iter_range` (default `"100-150"`, the steady-state
+- `profile`: `methods` (subset of `[nsys, ncu]`, default both) and
+  `nsys_iter_range` (default `"100-150"`, the steady-state
   iteration window `TLLM_PROFILE_START_STOP` captures; the ncu deep
   dive arms on the same window via `--profile-from-start off`).
 - `slurm-environment`: include only when the server + benchmark must
@@ -176,7 +176,7 @@ a log file, then monitor.
   (`benchmark_results.md`, `sol_projection.md`,
   `profile_findings.md`, `performance_report.md/.html`,
   `progress.yaml`); run artifacts (`serve.log`, result JSON,
-  `*.nsys-rep`, `torch_trace/`) are left alone.
+  `*.nsys-rep`, `*.ncu-rep`) are left alone.
 - A workspace holding non-empty outputs but **no checkpoint** refuses
   to start (`FileExistsError`) — pass `--clean` or pick a new
   workspace directory.
@@ -190,7 +190,7 @@ Poll the workspace (and the launch log) rather than waiting silently:
   `sol_projection.md` (unless `sol.enabled: false`) →
   `profile_findings.md` → `performance_report.md` / `.html`.
 - Run artifacts: `serve.log` (server health), the raw benchmark result
-  JSON, `server_nsys.nsys-rep` + `nsys_stats.txt`, `torch_trace/`,
+  JSON, `server_nsys.nsys-rep` + `nsys_stats.txt`,
   `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`,
   `perf_metrics.json`.
 

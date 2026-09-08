@@ -496,10 +496,12 @@ def create_py_executor(
         if hasattr(spec_config, '_max_batch_size'):
             spec_config._max_batch_size = max_batch_size
 
-        # WAR for https://nvbugs/5807902
-        # Disable separate draft KV cache in disaggregated mode
-        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
-        if cache_transceiver_config is not None:
+        # WAR for https://nvbugs/5807902 (Eagle3 disagg RMSNorm crash, closed
+        # will-not-fix). Keep the blanket disable; carve out only the standalone
+        # drafters, which it stranded on their private max_seq_len-dense arena.
+        is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
+                                 or spec_config.spec_dec_mode.is_dspark())
+        if cache_transceiver_config is not None and not is_standalone_drafter:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla

@@ -400,7 +400,7 @@ def _build_transceiver_for_kv_slice(
         prompt_len=prompt_len,
         py_request_id=0,
         py_beam_width=beam_width,
-        is_generation_only_request=lambda: is_generation_only,
+        is_generation_only_request=is_generation_only,
         # num_extra_kv_tokens == max_draft_len - 1
         py_draft_tokens=[0 for _ in range(num_extra_kv_tokens + 1)],
     )

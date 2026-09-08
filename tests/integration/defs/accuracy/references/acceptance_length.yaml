@@ -86,3 +86,10 @@ TestGemma4_26B_A4B::test_nvfp4:
 TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
   ref_al: 3.143075
   min_al: 2.98592125
+# Measured on 8x GB300 with this harness's stock prompt. Higher K3 DSpark
+# figures elsewhere are --apply_chat_template runs, worth ~40% acceptance.
+# min_al is a collapse tripwire: a drafter whose slots collapse scores 1.09
+# with every accuracy gate still green.
+TestKimiK3DSpark::test_gsm8k_tep8:
+  ref_al: 4.323
+  min_al: 4.0

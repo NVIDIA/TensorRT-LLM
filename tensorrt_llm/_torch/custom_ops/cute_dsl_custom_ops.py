@@ -7990,9 +7990,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         arg is None at call time (re-verified on the pinned torch), and
         most calls pass no hints. Under torch.compile/functionalization
         the undeclared write is invisible, so the hint path is eager /
-        CUDA-graph only. ``TRTLLM_GVR_EMISSION=1`` gates the
-        emission-assisted wiring that feeds these tensors (opt-in,
-        experimental).
+        CUDA-graph only. The ``use_gvr_emission`` sparse-attention config
+        field gates the emission-assisted wiring that feeds these tensors
+        (opt-in; temporal-hint path only).
         """
         if not is_sm_100f():
             raise ValueError(
