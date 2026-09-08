@@ -214,7 +214,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
-| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) [^vg3] |
+| `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -234,7 +234,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **MiniMax-H3** [^vg3] | No | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
+| **MiniMax-H3** | No | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image-Layered** [^vg2] | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |
@@ -242,5 +242,3 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 [^vg2]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, and attention-parallel backends are not enabled yet.
-
-[^vg3]: `torch.compile` is supported. Dynamic FP8 and dynamic NVFP4 are available as experimental transformer paths. NVFP4 quantizes activations at runtime because the loader does not calibrate `input_scale`; `VisualGenArgs` enables that automatically for `{"quant_algo": "NVFP4", "dynamic": true}`. Both quantized paths visibly reduce output fidelity relative to BF16, so validate quality before using them for quality-sensitive work. All four attention backends (`VANILLA`, `FA4`, `TRTLLM`, `CUTEDSL`) are supported; outputs agree closely but are not bit-identical, since kernel reduction order differs. Padded packed sequences require `VANILLA`. Ref2VA is not yet enabled. The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE) restricts use by territory; obtain legal approval before downloading or running the weights.

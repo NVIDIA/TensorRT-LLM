@@ -103,9 +103,19 @@ MINIMAX_H3_QUALITY_NUM_FRAMES = 124
 MINIMAX_H3_NUM_INFERENCE_STEPS = 50
 MINIMAX_H3_SEED = 0
 # Calibrated against the exact golden digest below. The validated implementation
-# measured 0.01737 LPIPS and 0.006861 audio log-STFT distance; 0.05 leaves room
-# for supported GPU-kernel drift without weakening the regression signal.
-MINIMAX_H3_LPIPS_THRESHOLD = 0.05
+# measured 0.01737 LPIPS and 0.006861 audio log-STFT distance.
+#
+# LPIPS is 0.15, not the measured-plus-margin 0.05, to match the LTX-2 bound
+# raised in nvbug 6655986. A single-ULP bf16 change in an MLP epilogue shifts the
+# rounding trajectory of every denoising step, and over a video schedule that
+# compounds to LPIPS ~0.094 against a frozen golden with no quality change. H3
+# denoises 50 steps in the same bf16 regime, so a measured-plus-margin bound
+# would fail on benign whole-build numerics. 0.15 still leaves ~9x headroom over
+# the measured 0.01737.
+#
+# The audio bound stays at 0.05: log-STFT distance is not LPIPS and does not
+# accumulate the same way (measured 0.006861).
+MINIMAX_H3_LPIPS_THRESHOLD = 0.15
 MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD = 0.05
 MINIMAX_H3_LPIPS_BATCH_SIZE = 16
 MINIMAX_H3_MODEL_ID = "MiniMaxAI/MiniMax-H3"
