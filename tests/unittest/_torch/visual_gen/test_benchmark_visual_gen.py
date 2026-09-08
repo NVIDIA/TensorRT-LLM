@@ -155,11 +155,13 @@ def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
     assert from_cli == from_document
 
 
-def test_a_reference_in_common_params_is_rejected():
-    """It conditions one generation; the server's params.image is what it becomes."""
+@pytest.mark.parametrize("key, value", [("image_reference", "r.png"), ("prompt_file", "p.json")])
+def test_a_request_only_key_in_common_params_is_rejected(key, value):
+    """Each names what one generation is given, so spreading it over every request
+    would describe a run nobody asked for."""
     doc = {
         "backend": "openai-videos",
-        "common_params": {"image_reference": "r.png"},
+        "common_params": {key: value},
         "requests": [{"prompt": "p"}],
     }
     with pytest.raises(ValueError, match="belongs to a request"):

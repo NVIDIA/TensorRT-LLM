@@ -96,9 +96,10 @@ WIRE_ALIAS = {"num_images_per_prompt": "n", "image_reference": "image"}
 # and the read happens once, before the run. VisualGenParams rejects a bare path.
 # Read off the params rather than listed, so a slot the API gains is addressable.
 REFERENCE_KEYS = tuple(name for name in VisualGenParams.model_fields if name.endswith("_reference"))
-# Input keys a request and common_params both take. A reference takes neither: it
-# is the input to one generation, so it belongs to the request it conditions.
-COMMON_INPUT_KEYS = ("prompt", "prompt_file")
+# The input key common_params carries, so one prompt can stand for the whole run.
+COMMON_INPUT_KEYS = ("prompt",)
+# Input keys a request carries alone, each naming what one generation is given.
+REQUEST_INPUT_KEYS = ("prompt_file", *REFERENCE_KEYS)
 
 
 def _scalar_param_fields() -> dict[str, type]:
@@ -131,14 +132,14 @@ PATH_DISABLED_HINT = (
 )
 
 
-def _reject_misplaced_reference(cls, data: Any) -> Any:
+def _reject_request_only_key(cls, data: Any) -> Any:
     """``extra_forbidden`` would say it is not allowed, not where it belongs."""
     if isinstance(data, dict):
-        misplaced = sorted(key for key in data if key.endswith("_reference"))
+        misplaced = sorted(key for key in data if key in REQUEST_INPUT_KEYS)
         if misplaced:
             raise ValueError(
                 f"{', '.join(misplaced)} belongs to a request, not to every request. "
-                "Move it into the 'requests' entry it conditions."
+                "Move it into the 'requests' entry it applies to."
             )
     return data
 
@@ -197,7 +198,10 @@ def _document_model(
     return create_model(name, __base__=base, **kwargs, **fields)
 
 
-_PROMPT_FIELDS: dict[str, Any] = {key: (Optional[str], None) for key in COMMON_INPUT_KEYS}
+_COMMON_INPUT_FIELDS: dict[str, Any] = {key: (Optional[str], None) for key in COMMON_INPUT_KEYS}
+_REQUEST_INPUT_FIELDS: dict[str, Any] = {
+    key: (Optional[str], None) for key in REQUEST_INPUT_KEYS if key not in REFERENCE_KEYS
+}
 
 
 def _reference_fields(backend: str) -> dict[str, Any]:
@@ -219,17 +223,17 @@ def _workload_model(backend: str) -> type[VisualGenBenchWorkload]:
     common = _document_model(
         f"{prefix}Common",
         backend,
-        _PROMPT_FIELDS,
+        _COMMON_INPUT_FIELDS,
         __validators__={
-            "_reject_misplaced_reference": model_validator(mode="before")(
-                classmethod(_reject_misplaced_reference)
+            "_reject_request_only_key": model_validator(mode="before")(
+                classmethod(_reject_request_only_key)
             )
         },
     )
     request = _document_model(
         f"{prefix}Request",
         backend,
-        {**_PROMPT_FIELDS, **_reference_fields(backend)},
+        {**_COMMON_INPUT_FIELDS, **_REQUEST_INPUT_FIELDS, **_reference_fields(backend)},
         base=VisualGenBenchRequest,
     )
     return create_model(
@@ -1583,10 +1587,9 @@ def build_arg_parser() -> FlexibleArgumentParser:
             default=None,
             help=VisualGenParams.model_fields[name].description,
         )
-    for name, text in zip(COMMON_INPUT_KEYS, ("The prompt text.", "Path to a prompt file.")):
-        workload_group.add_argument(
-            f"--{name.replace('_', '-')}", type=str, default=None, help=text
-        )
+    workload_group.add_argument(
+        "--prompt", type=str, default=None, help="The prompt text every request carries."
+    )
     workload_group.add_argument(
         "--extra-params", type=str, default=None, help="Per-pipeline parameters, as a JSON object."
     )
