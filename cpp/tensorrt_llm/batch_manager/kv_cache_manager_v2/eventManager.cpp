@@ -537,7 +537,7 @@ std::optional<EventBlockHash> EventManager::parentHashFromBlock(Block const& blo
 std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
     Block const& block, std::optional<std::set<int>> const& lifeCycleIds)
 {
-    CacheLevel cacheLevel = kGpuLevel;
+    CacheLevel cacheLevel = kHotLevel;
     Priority priority = kPriorityDefault;
     bool foundPage = false;
     for (LifeCycleId lifeCycle{0}; lifeCycle < block.storage.size(); ++lifeCycle)

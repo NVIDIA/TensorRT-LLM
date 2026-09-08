@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from agent_flow.backends.base import Backend, BackendClient, ResultEvent
 from agent_flow.types import ToolCallEvent, UsageInfo
@@ -14,14 +15,19 @@ class FakeClient(BackendClient):
         tool_calls: list[ToolCallEvent] | None = None,
         error: Exception | None = None,
         usage: UsageInfo | None = None,
+        skills: list[str] | None = None,
     ) -> None:
         self.text = text
         self.tool_calls = tool_calls or []
         self.error = error
         self.usage = usage
+        self.skills = skills
         self.messages: list[str] = []
         self.send_count = 0
         self.closed = False
+
+    async def list_available_skills(self) -> list[str] | None:
+        return self.skills
 
     async def send_message(self, message: str):
         self.messages.append(message)
@@ -58,6 +64,7 @@ class FakeBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict | None = None,
+        cwd: Path | None = None,
     ):
         plan = self.plans[min(self.create_client_calls, len(self.plans) - 1)]
         self.create_client_calls += 1
@@ -66,6 +73,7 @@ class FakeBackend(Backend):
             tool_calls=plan.get("tool_calls"),
             error=plan.get("error"),
             usage=plan.get("usage"),
+            skills=plan.get("skills"),
         )
         client.system_prompt = system_prompt
         client.model = model
@@ -73,6 +81,7 @@ class FakeBackend(Backend):
         client.hooks = hooks
         client.disallowed_tools = disallowed_tools
         client.extra_mcp_servers = extra_mcp_servers
+        client.cwd = cwd
         self.clients.append(client)
         try:
             yield client

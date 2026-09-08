@@ -445,7 +445,7 @@ class TestAddMinLengthBans:
 
         def __init__(self, num_tokens, *, min_length=None, prompt_len=0, end_id=5):
             self._num_tokens = num_tokens  # total tokens (prompt + generated)
-            self.py_min_length = [min_length] if min_length is not None else None
+            self.py_min_length = min_length
             self.py_orig_prompt_len = prompt_len
             self.py_original_end_id = end_id
             self.py_end_id = end_id

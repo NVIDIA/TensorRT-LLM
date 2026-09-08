@@ -72,7 +72,6 @@ def _build_llm(
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type="TorchSampler",
         max_batch_size=fixed_params["max_beam_width"] * len(input_prompts),
         kv_cache_config=KvCacheConfig(max_tokens=10000),  # pyright: ignore
         max_seq_len=32,

@@ -35,6 +35,8 @@ struct PendingAllocationSegment
     int beamWidth;
     bool countAsMissed;
     bool countAsGeneration;
+    bool recordManagerStats;
+    bool recordRequestStats;
 };
 
 struct PendingStatsDelta
@@ -69,13 +71,15 @@ public:
     }
 
     bool recordAllocationRange(LifeCycleId lifeCycle, BlockOrdinal blockBegin, BlockOrdinal blockEnd, int beamWidth,
-        bool countAsMissed, bool countAsGeneration = false)
+        bool countAsMissed, bool countAsGeneration = false, bool recordManagerStats = true,
+        bool recordRequestStats = true)
     {
         if (blockBegin >= blockEnd)
         {
             return false;
         }
-        PendingAllocationSegment segment{lifeCycle, blockBegin, blockEnd, beamWidth, countAsMissed, countAsGeneration};
+        PendingAllocationSegment segment{lifeCycle, blockBegin, blockEnd, beamWidth, countAsMissed, countAsGeneration,
+            recordManagerStats, recordRequestStats};
         if (!add(allocationDelta(segment, blockBegin, blockEnd)))
         {
             return false;
@@ -84,21 +88,28 @@ public:
         return true;
     }
 
-    bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks)
+    bool recordReuse(LifeCycleId lifeCycle, int fullReusedBlocks, int partialReusedBlocks,
+        bool recordManagerStats = true, bool recordRequestStats = true)
     {
         int const reusedBlocks = fullReusedBlocks + partialReusedBlocks;
-        if (reusedBlocks == 0)
+        if (reusedBlocks == 0 || (!recordManagerStats && !recordRequestStats))
         {
             return false;
         }
 
         PendingStatsDelta delta;
-        delta.globalStats.reusedBlocks = reusedBlocks;
-        delta.requestStats.reusedBlocks = reusedBlocks;
-        delta.iterationStats.iterReusedBlocks = reusedBlocks;
-        delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
-        delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
-        delta.lifeCycle = lifeCycle;
+        if (recordManagerStats)
+        {
+            delta.globalStats.reusedBlocks = reusedBlocks;
+            delta.iterationStats.iterReusedBlocks = reusedBlocks;
+            delta.iterationStats.iterFullReusedBlocks = fullReusedBlocks;
+            delta.iterationStats.iterPartialReusedBlocks = partialReusedBlocks;
+            delta.lifeCycle = lifeCycle;
+        }
+        if (recordRequestStats)
+        {
+            delta.requestStats.reusedBlocks = reusedBlocks;
+        }
         return add(delta);
     }
 
@@ -193,15 +204,23 @@ private:
     {
         int64_t const numBlocks = static_cast<int64_t>(std::max(0, blockEnd - blockBegin)) * segment.beamWidth;
         PendingStatsDelta delta;
-        delta.globalStats.allocTotalBlocks = numBlocks;
-        delta.globalStats.allocNewBlocks = numBlocks;
-        delta.globalStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
-        delta.requestStats = delta.globalStats.copy();
-        delta.iterationStats.iterAllocTotalBlocks = numBlocks;
-        delta.iterationStats.iterAllocNewBlocks = numBlocks;
-        delta.iterationStats.iterMissedBlocks = segment.countAsMissed ? numBlocks : 0;
-        delta.iterationStats.iterGenAllocBlocks = segment.countAsGeneration ? numBlocks : 0;
-        delta.lifeCycle = segment.lifeCycle;
+        if (segment.recordManagerStats)
+        {
+            delta.globalStats.allocTotalBlocks = numBlocks;
+            delta.globalStats.allocNewBlocks = numBlocks;
+            delta.globalStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.iterationStats.iterAllocTotalBlocks = numBlocks;
+            delta.iterationStats.iterAllocNewBlocks = numBlocks;
+            delta.iterationStats.iterMissedBlocks = segment.countAsMissed ? numBlocks : 0;
+            delta.iterationStats.iterGenAllocBlocks = segment.countAsGeneration ? numBlocks : 0;
+            delta.lifeCycle = segment.lifeCycle;
+        }
+        if (segment.recordRequestStats)
+        {
+            delta.requestStats.allocTotalBlocks = numBlocks;
+            delta.requestStats.allocNewBlocks = numBlocks;
+            delta.requestStats.missedBlocks = segment.countAsMissed ? numBlocks : 0;
+        }
         return delta;
     }
 

@@ -247,7 +247,9 @@ def parse_chat_message_content_parts(
 
 def parse_chat_message_content(
         message: ChatCompletionMessageParam,
-        mm_data_tracker: MultimodalDataTracker) -> ConversationMessage:
+        mm_data_tracker: MultimodalDataTracker,
+        lenient_tool_call_arguments: bool = False,
+        keep_message_tools: bool = False) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -265,9 +267,17 @@ def parse_chat_message_content(
         mm_data_tracker,
     )
     if role == "assistant":
-        result.update(_parse_assistant_message_content(message))
+        result.update(
+            _parse_assistant_message_content(message,
+                                             lenient_tool_call_arguments))
     elif role == "tool":
         result.update(_parse_tool_message_content(message))
+    elif keep_message_tools and role == "system" and message.get("tools"):
+        # Message-level (dynamic) tool declarations: python-renderer chat
+        # templates (kimi_k3) render these as an in-conversation tool
+        # declare block at this message's position. Other models keep the
+        # pre-existing behavior of silently ignoring the key.
+        result["tools"] = message["tools"]
     return result
 
 
@@ -329,7 +339,10 @@ def _validate_fallback_tool_calls(
     return [tc.model_dump(exclude_unset=True) for tc in validated]
 
 
-def _normalize_tool_call_arguments(index: int, item: Any) -> dict[str, Any]:
+def _normalize_tool_call_arguments(index: int,
+                                   item: Any,
+                                   lenient_json: bool = False
+                                   ) -> dict[str, Any]:
     """Normalize `function.arguments` to the internal dict form."""
     item = dict(item)
     item["function"] = dict(item["function"])
@@ -341,6 +354,11 @@ def _normalize_tool_call_arguments(index: int, item: Any) -> dict[str, Any]:
         try:
             arguments = json.loads(arguments)
         except json.JSONDecodeError as e:
+            if lenient_json:
+                # Keep the raw string: python-renderer templates (kimi_k3)
+                # normalize unparsable arguments themselves and render them
+                # verbatim as a JSON block, matching the reference tokenizer.
+                return item
             raise ValueError(
                 f"tool_calls[{index}].function.arguments must be valid JSON."
             ) from e
@@ -357,7 +375,9 @@ def _normalize_tool_call_arguments(index: int, item: Any) -> dict[str, Any]:
     return item
 
 
-def _parse_fallback_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
+def _parse_fallback_tool_calls(
+        tool_calls: list[Any],
+        lenient_json: bool = False) -> list[dict[str, Any]]:
     """Parse raw tool-call lists accepted only by the tau2-bench fallback path.
 
     `openai_server.py` first attempts strict OpenAI request validation. Some tau2-bench requests
@@ -369,13 +389,15 @@ def _parse_fallback_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
     """
     tool_calls = _validate_fallback_tool_calls(tool_calls)
     return [
-        _normalize_tool_call_arguments(index, item)
+        _normalize_tool_call_arguments(index, item, lenient_json)
         for index, item in enumerate(tool_calls)
     ]
 
 
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
-def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_assistant_message_content(message: Dict[str, Any],
+                                     lenient_json: bool = False
+                                     ) -> Dict[str, Any]:
     result = {}
     # Include reasoning if present for interleaved thinking.
     reasoning_content = message.get("reasoning")
@@ -387,13 +409,14 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
         if isinstance(tool_calls, list):
-            result["tool_calls"] = _parse_fallback_tool_calls(tool_calls)
+            result["tool_calls"] = _parse_fallback_tool_calls(
+                tool_calls, lenient_json)
         else:
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
             tool_calls = list(tool_calls)
             result["tool_calls"] = [
-                _normalize_tool_call_arguments(index, item)
+                _normalize_tool_call_arguments(index, item, lenient_json)
                 for index, item in enumerate(tool_calls)
             ]
 
@@ -478,7 +501,13 @@ def parse_chat_messages_coroutines(
         content_format = ContentFormat.STRING
 
     for msg in messages:
-        parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
+        # kimi_k3's reference renderer keeps unparsable tool-call argument
+        # strings verbatim; other templates expect the strict dict contract.
+        parsed_msg = parse_chat_message_content(
+            msg,
+            mm_data_tracker,
+            lenient_tool_call_arguments=(model_type == "kimi_k3"),
+            keep_message_tools=(model_type == "kimi_k3"))
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

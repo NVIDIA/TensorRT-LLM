@@ -159,6 +159,7 @@ if __name__ == "__main__":
             package = re.sub(r'\s#.*$', '', package).rstrip()
             # WAR: ignore lines with "-f": No tool exists to parse complex requirements.txt
             if not package or \
+                package.startswith('#') or \
                 '-f' in package or \
                 package.startswith('--'):
                 continue

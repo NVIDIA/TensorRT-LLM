@@ -83,6 +83,23 @@ async def _fetch_context_usage(sdk_client: Any) -> dict[str, Any] | None:
         return None
 
 
+async def _fetch_server_info(sdk_client: Any) -> dict[str, Any] | None:
+    """The CLI's initialize response, or ``None`` when it cannot be read.
+
+    Like ``get_context_usage`` this is a local control request answered
+    from the session the SDK already connected — no model call, no
+    tokens. Returns commands, subagents, models and output styles.
+    """
+    getter = getattr(sdk_client, "get_server_info", None)
+    if getter is None:
+        return None
+    try:
+        info = await getter()
+    except Exception:
+        return None
+    return info if isinstance(info, dict) else None
+
+
 def _apply_context_usage(usage: UsageInfo, context: dict[str, Any] | None) -> UsageInfo:
     if not context:
         return usage
@@ -173,6 +190,34 @@ def _subagent_label_from_task_input(tool_input: dict[str, Any]) -> str:
     return "subagent"
 
 
+def _assistant_error_detail(message: AssistantMessage) -> str:
+    """Render whatever context the SDK attached to a failed assistant turn.
+
+    ``AssistantMessage.error`` is frequently the bare string ``"unknown"``,
+    which tells an operator nothing about why a campaign stage died. Surface
+    the adjacent fields (model, stop reason, usage, any partial content) so
+    the failure is diagnosable from the run log alone.
+    """
+    parts: list[str] = []
+    for attr in ("model", "stop_reason", "subtype", "uuid", "session_id"):
+        value = getattr(message, attr, None)
+        if value is not None:
+            parts.append(f"{attr}={value!r}")
+    usage = getattr(message, "usage", None)
+    if usage is not None:
+        parts.append(f"usage={usage!r}")
+    blocks = getattr(message, "content", None) or []
+    kinds = [type(block).__name__ for block in blocks]
+    if kinds:
+        parts.append(f"content_blocks={kinds}")
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(f"partial_text={text[:400]!r}")
+            break
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
 class ClaudeCodeClient(BackendClient):
     def __init__(self, sdk_client) -> None:
         self._client = sdk_client
@@ -202,7 +247,10 @@ class ClaudeCodeClient(BackendClient):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
-                        raise RuntimeError(f"Claude Code turn failed: {sdk_message.error}")
+                        raise RuntimeError(
+                            f"Claude Code turn failed: {sdk_message.error}"
+                            f"{_assistant_error_detail(sdk_message)}"
+                        )
                     parent_id = sdk_message.parent_tool_use_id
                     label = self._resolve_label(parent_id)
                     for block in sdk_message.content:
@@ -274,6 +322,34 @@ class ClaudeCodeClient(BackendClient):
         if usage.context_percentage is None and usage.context_tokens is None:
             return None
         return usage
+
+    async def list_available_skills(self) -> list[str] | None:
+        """Invocable skill names from the CLI's initialize response.
+
+        Read off ``get_server_info``'s ``commands`` — a local control
+        request, so this costs no model call. The names are the spelling
+        the harness loaded (plugin skills as ``<plugin>:<name>``), which
+        is what a caller quotes back to an agent.
+
+        ``commands`` is a **superset** of the skills the model itself can
+        invoke: it also carries the built-in slash commands and any skill
+        the CLI registered as a command but not as model-invocable (bad
+        frontmatter, or an opt-out). Membership therefore proves the name
+        is *installed*, not that ``Skill`` will load it. The exact
+        model-invocable list only ever arrives on the ``init`` event
+        mid-turn, which is precisely the model call this avoids.
+        """
+        info = await _fetch_server_info(self._client)
+        if info is None:
+            return None
+        commands = info.get("commands")
+        if not isinstance(commands, list):
+            return None
+        return [
+            entry["name"]
+            for entry in commands
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        ]
 
 
 _CLI_VERSION_TIMEOUT_S = 5.0
@@ -360,9 +436,10 @@ class ClaudeCodeBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
-        # External MCP server configs (e.g. ``{"Glean": {"type": "http",
-        # "url": ...}}``) are layered alongside the in-process
+        # External MCP server configs (e.g. ``{"knowledge-base": {"type":
+        # "http", "url": ...}}``) are layered alongside the in-process
         # ``agent-tools`` server built from ``tools``. The keys are the
         # server names the model sees and must therefore not collide with
         # ``agent-tools``.
@@ -392,7 +469,7 @@ class ClaudeCodeBackend(Backend):
             mcp_servers=mcp_servers,
             model=model,
             effort=_REASONING_EFFORT,
-            cwd=Path.cwd(),
+            cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
             can_use_tool=_approve_tool,

@@ -71,6 +71,23 @@ class TestLengthsByModality:
         with pytest.raises(ValueError):
             _lengths_by_modality([mp], ("image", "video"))
 
+    def test_cross_group_multi_modality_without_manifest_raises(self):
+        # Multi-group models register one single-modality group per encoder.
+        # A raw request (no ``mm_item_order``) with items from two of those
+        # groups must be rejected — the group-local ``modalities`` tuple is
+        # length 1 and can never trip the guard on its own, so the check
+        # widens to the request-level modality set.
+        mp = _mp(embedding_lengths=[4, 3], buckets={"image": {}, "audio": {}})
+        with pytest.raises(ValueError, match="mm_item_order"):
+            _lengths_by_modality([mp], ("image",))
+
+    def test_single_modality_outside_group_is_skipped(self):
+        # Request has only audio; called on the image group. Must silently
+        # return the group's empty bucket rather than KeyError on
+        # ``by_modality["audio"]``.
+        mp = _mp(embedding_lengths=[3], buckets={"audio": {}})
+        assert _lengths_by_modality([mp], ("image",)) == {"image": []}
+
 
 class TestSynthesizeSingleModalityManifest:
     def test_image_only(self):

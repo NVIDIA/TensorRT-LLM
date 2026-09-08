@@ -49,10 +49,10 @@ from transformers.activations import ACT2FN
 
 from tensorrt_llm._utils import maybe_pin_memory
 
-from ..attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
-from ..attention_backend.utils import get_attention_backend
+from ..attention.attention import Attention
+from ..attention.backends.interface import AttentionMetadata, PredefinedAttentionMask
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.linear import Linear
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl
@@ -735,8 +735,8 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
 
         # SigLip-style context-only metadata (kv_cache_manager=None, no decode);
         # built by the engine via ``MultimodalEncoderMixin.setup_attn_metadata``
-        # at the encoder ``(encoder_max_batch_size, encoder_max_num_tokens)``
-        # budget, then re-prepared each forward with the actual per-image seq
+        # at the ``encoder_max_num_tokens`` budget, then re-prepared each
+        # forward with the actual per-image seq
         # lens. The vision tower runs once per LLM step across all images, so
         # the batch axis is the cross-request image count.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata

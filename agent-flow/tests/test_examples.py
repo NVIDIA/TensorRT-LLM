@@ -96,7 +96,7 @@ def test_default_model_constants_respect_env_overrides():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
         env=env,
     )
 
@@ -126,7 +126,7 @@ def test_example_help_command_runs_from_repo_root():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
 
     combined_output = result.stdout + result.stderr
@@ -148,12 +148,37 @@ def test_quick_start_entrypoint_imports_without_module_error():
         cwd=root,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=60,
     )
 
     combined_output = result.stdout + result.stderr
     assert result.returncode == 0, combined_output
     assert "ModuleNotFoundError: No module named 'agent_flow'" not in combined_output
+
+
+def test_perf_entrypoints_import_without_module_error():
+    """The perf workflows' CLIs must resolve their cross-workflow imports.
+
+    ``perf_optimize`` imports ``perf_analyze``'s task schema, prompt
+    fragments and SOL methodology, so a broken vendoring of either package
+    shows up here as an import error rather than at the first real run.
+    """
+    root = Path(__file__).resolve().parents[1]
+    for module in (
+        "agent_flow.workflows.perf_analyze.cli",
+        "agent_flow.workflows.perf_optimize.cli",
+    ):
+        result = subprocess.run(
+            [sys.executable, "-m", module, "--help"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        combined_output = result.stdout + result.stderr
+        assert result.returncode == 0, combined_output
+        assert "ModuleNotFoundError: No module named 'agent_flow'" not in combined_output
 
 
 def test_workflow_entrypoint_modules_run_without_import_warnings():
@@ -162,12 +187,16 @@ def test_workflow_entrypoint_modules_run_without_import_warnings():
         "agent_flow.workflows.agent_team.cli",
         "agent_flow.workflows.agent_team.workflow",
         "agent_flow.workflows.modeling_bringup.cli",
+        "agent_flow.workflows.perf_analyze.cli",
+        "agent_flow.workflows.perf_analyze.workflow",
+        "agent_flow.workflows.perf_optimize.cli",
+        "agent_flow.workflows.perf_optimize.workflow",
     ):
         result = subprocess.run(
             [sys.executable, "-W", "error", "-m", module, "--help"],
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=60,
         )
         assert result.returncode == 0, result.stdout + result.stderr

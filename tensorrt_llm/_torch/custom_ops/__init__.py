@@ -22,9 +22,9 @@ from .torch_custom_ops import BufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
-# Attention custom ops are defined in modules.attention, and MLA custom ops are
-# defined in modules.mla. They are not re-exported here to avoid circular imports:
-# custom_ops must not depend on modules.attention or modules.mla.
+# Attention custom ops are defined in attention.attention, and MLA custom ops are
+# defined in attention.mla. They are not re-exported here to avoid circular imports:
+# custom_ops must not depend on attention.attention or attention.mla.
 
 
 def inplace_slice_copy(dest: torch.Tensor, src: torch.Tensor, dim1_start: int,
@@ -79,9 +79,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # importing the module is safe regardless of the result -- it just
     # logs and leaves ``IS_MEGAMOE_OP_AVAILABLE = False`` on partial
     # cutlass-dsl installs so callers can fall back via the factory.
-    from .cute_dsl_megamoe_custom_op import IS_MEGAMOE_OP_AVAILABLE
+    from ..moe.custom_ops.cute_dsl_megamoe_custom_op import \
+        IS_MEGAMOE_OP_AVAILABLE
     if IS_MEGAMOE_OP_AVAILABLE:
-        from .cute_dsl_megamoe_custom_op import cute_dsl_megamoe_nvfp4_blackwell
+        from ..moe.custom_ops.cute_dsl_megamoe_custom_op import \
+            cute_dsl_megamoe_nvfp4_blackwell
         __all__ += ['cute_dsl_megamoe_nvfp4_blackwell']
 
 if IS_CUTLASS_DSL_AVAILABLE and IS_FLASHINFER_AVAILABLE:

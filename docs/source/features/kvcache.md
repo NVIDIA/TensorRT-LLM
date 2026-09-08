@@ -88,6 +88,7 @@ Models that select the V2 manager by default:
 | Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
 | DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
 | GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
+| Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
@@ -101,6 +102,9 @@ Under `auto`, a model default of V2 falls back to V1 for that combination;
 setting `use_kv_cache_manager_v2: true` explicitly raises an error. This
 applies to every model that selects its manager through
 `use_kv_cache_manager_v2`, not just GPT-OSS.
+
+For the native V2 cold-storage representation and codec extension contract, see
+[KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
 
 ### Mamba Snapshot Boundaries
 
@@ -138,6 +142,8 @@ This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
+`pool_ratio` contains one positive, normalized cache-tier quota weight per
+layer group in layer-group ID order.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require
@@ -197,6 +203,12 @@ Before a block is evicted from GPU memory, it can optionally be offloaded to hos
 When offloading is enabled, the client can prevent specific blocks from being offloaded by toggling block priority. Blocks with lower priority than a certain threshold are not offloaded; they are evicted directly from GPU memory to reduce traffic between GPU and host. This priority is set with ```secondary_offload_min_priority```. Default value is 35, meaning any block with lower priority than 35 will not be offloaded.
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
+
+KV cache compression can reduce the storage and transfer cost of offloaded
+Pages, or reduce the amount of KV retained by an algorithm. Compression is
+configured separately from `KvCacheConfig`; see
+[KV Cache Compression](kv-cache-compression.md) for the available methods and
+their activation points.
 
 ### Partial Reuse
 

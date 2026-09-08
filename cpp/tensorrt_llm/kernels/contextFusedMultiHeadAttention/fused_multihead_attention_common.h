@@ -351,6 +351,8 @@ struct MHARunnerParams
 
     // Skip-softmax attention parameters
     float skipSoftmaxThresholdScaleFactor = 0;
+    // Skip correction when the row-max increase is within this base-2 threshold.
+    float skipCorrectionThreshold = 0;
 #ifdef SKIP_SOFTMAX_STAT
     // Statistics of skip-softmax, pointers of device memory for output
     uint32_t* skipSoftmaxTotalBlocks;

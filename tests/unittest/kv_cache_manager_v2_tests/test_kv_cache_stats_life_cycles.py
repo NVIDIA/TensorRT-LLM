@@ -40,7 +40,7 @@ PAGE_BYTES = 16
 HOST_LEVEL = CacheLevel(GPU_LEVEL + 1)
 
 
-def _make_recorder():
+def _make_recorder(*, manager_stats_enabled: bool = True, request_stats_enabled: bool = False):
     """Duck-typed _KVCache exposing only what the stats recorders touch.
 
     The recording methods are bound off the real class, so the life-cycle
@@ -57,7 +57,8 @@ def _make_recorder():
         commit_stats=lambda stats, by_life_cycle: committed.append((stats, by_life_cycle)),
     )
     recorder = SimpleNamespace(manager=manager)
-    recorder._should_record_stats = lambda: True
+    recorder._should_record_manager_stats = lambda: manager_stats_enabled
+    recorder._should_record_request_stats = lambda: request_stats_enabled
     for name in (
         "_is_attention_life_cycle",
         "_record_direct_iteration_stats",
@@ -66,6 +67,21 @@ def _make_recorder():
     ):
         setattr(recorder, name, getattr(_KVCache, name).__get__(recorder))
     return recorder, committed
+
+
+def test_request_only_stats_do_not_record_page_movement() -> None:
+    """Request-only accounting must not enable manager iteration statistics."""
+    recorder, committed = _make_recorder(manager_stats_enabled=False, request_stats_enabled=True)
+    page = SimpleNamespace(life_cycle=ATTN_LC)
+
+    recorder._record_migrated_slots([page], [object()], GPU_LEVEL, HOST_LEVEL)
+    recorder._record_dropped_pages([page], HOST_LEVEL)
+    recorder._record_direct_iteration_stats(
+        ATTN_LC,
+        KVCacheIterationStatsDelta(iter_intra_device_copy_blocks=1),
+    )
+
+    assert committed == []
 
 
 @pytest.mark.parametrize("life_cycle", [ATTN_LC, SSM_LC])

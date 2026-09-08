@@ -3,6 +3,7 @@
 
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -122,6 +123,38 @@ def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path
     assert extract_mamba_kv_cache_params(config.text_config).mamba_ssm_cache_dtype is torch.bfloat16
 
 
+def test_qwen_image_bench_config_normalizes_top_level_quantization(tmp_path):
+    model_dir = tmp_path / "Qwen-Image-Bench-FP8"
+    model_dir.mkdir()
+    _write_qwen_image_bench_config(model_dir)
+
+    config_path = model_dir / "config.json"
+    raw_config = json.loads(config_path.read_text())
+    raw_config["quantization_config"] = {
+        "activation_scheme": "dynamic",
+        "modules_to_not_convert": [
+            "model.language_model.layers.0.linear_attn.in_proj_a",
+            "model.visual.blocks.0.attn.qkv",
+            "mtp.layers.0.self_attn.q_proj",
+        ],
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    config_path.write_text(json.dumps(raw_config))
+
+    config = load_pretrained_config(str(model_dir))
+
+    excluded = config.quantization_config["modules_to_not_convert"]
+    assert "model.layers.0.linear_attn.in_proj_ba" in excluded
+    assert "model.layers.0.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.1.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.2.linear_attn.in_proj_qkvz" in excluded
+    assert "model.layers.3.linear_attn.in_proj_qkvz" not in excluded
+    assert not any(name.startswith("model.language_model.") for name in excluded)
+    assert not any(name.startswith("model.visual.") for name in excluded)
+    assert not any(name.startswith("mtp.") for name in excluded)
+
+
 def test_qwen3_5_conditional_text_config_does_not_use_image_bench_arch(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(_qwen3_5_text_config()))
 
@@ -204,3 +237,22 @@ def test_qwen_image_bench_forwards_speculative_interface():
     assert model.model is text_model
     assert model.lm_head is lm_head
     assert model.load_draft_weights("weights") is sentinel
+
+
+def test_qwen_image_bench_mapper_uses_normalized_inner_model_config():
+    inner_model_config = object()
+    llm = SimpleNamespace(model_config=inner_model_config, load_weights=Mock())
+    model = QwenImageBenchModel.__new__(QwenImageBenchModel)
+    object.__setattr__(model, "llm", llm)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.models.modeling_qwen_image_bench._is_mm_disagg",
+            return_value=True,
+        ),
+        patch.object(Qwen3_5MoeHfWeightMapper, "init_model_and_config") as init_mapper,
+    ):
+        model.load_weights({})
+
+    init_mapper.assert_called_once_with(llm, inner_model_config)
+    llm.load_weights.assert_called_once()

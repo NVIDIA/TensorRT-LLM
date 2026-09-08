@@ -18,6 +18,10 @@ from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
@@ -66,6 +70,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        # Token counting is stateless and cheap, so it is spread over the
+        # context workers round-robin rather than going through the router,
+        # which would charge the pick against KV-cache-aware load accounting.
+        self._count_tokens_rr_counter = 0
 
         match self._config.schedule_style:
             case "generation_first":
@@ -109,6 +117,29 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
+
+    async def anthropic_count_tokens(
+        self, request: AnthropicCountTokensRequest
+    ) -> AnthropicCountTokensResponse:
+        """Forward count-tokens to a context worker with the real tokenizer.
+
+        The disaggregated server holds no tokenizer of its own, so counting has
+        to happen on a worker. Context workers are the ones that tokenize
+        prompts, so the count they return is the one that will actually be used.
+        """
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return await self._ctx_client.post_json(
+            "v1/messages/count_tokens",
+            request,
+            AnthropicCountTokensResponse,
+            server,
+        )
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -192,25 +223,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             return False
         return True
 
-    @staticmethod
-    def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
-        if request.conversation_params is not None:
-            return request.conversation_params.conversation_id
-        if request.disaggregated_params is not None:
-            return request.disaggregated_params.conversation_id
-        return None
-
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        conversation_id = self._get_conversation_id(request)
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
                     request_type="context_only",
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
-                    conversation_id=conversation_id,
                     return_prompt_token_ids_b64=self._tokids_ctxbytes,
                 ),
                 "stream": False,
@@ -226,12 +247,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id: Optional[int],
         ctx_server_info: Optional[dict] = None,
     ) -> UCompletionRequest:
-        conversation_id = self._get_conversation_id(request)
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
-            request.disaggregated_params.conversation_id = conversation_id
             request.disaggregated_params.ctx_usage = ctx_response.usage
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
@@ -261,7 +280,6 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_request_id=disagg_request_id,
                 disagg_request_id=disagg_request_id,
                 schedule_style=self._schedule_style,
-                conversation_id=conversation_id,
             )
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})

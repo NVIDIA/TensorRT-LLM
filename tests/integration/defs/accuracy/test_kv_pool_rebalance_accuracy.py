@@ -43,10 +43,18 @@ def _inject_pool_ratio_mismatch(llm: LLM, *, skew: float = 2.0) -> None:
     past the auto-tuner's adjustment threshold. The hook requires a model with
     >=2 pool groups (e.g. Gemma-3-1B with VSWA) and raises otherwise, so a future
     model change can't silently turn this test into a no-op.
+
+    Also drops the executor's rebalance-check throttle to every iteration, so
+    the test does not depend on how ``KV_POOL_REBALANCE_CHECK_INTERVAL`` compares
+    to the number of iterations this short prompt set happens to run.  Raise that
+    interval above the iteration count and the hook would never fire, leaving the
+    token comparison below to pass vacuously; the ratio assertion in
+    ``_generate_tokens`` is the backstop that would catch it.
     """
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
     executor = llm._executor.engine
+    executor._rebalance_check_interval = 1
     kv_cache_manager = executor.kv_cache_manager
     _introspection.force_rebalance_precondition(kv_cache_manager.impl, skew=skew)
 
@@ -95,14 +103,38 @@ def _generate_tokens(*, model_path: str, disable_overlap: bool, enable_rebalance
     responsible for setting that env var (via monkeypatch or otherwise)
     before invoking this helper.
     """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
     with LLM(
         model_path,
         disable_overlap_scheduler=disable_overlap,
         kv_cache_config=_vswa_kv_cache_config(enable_rebalance=enable_rebalance),
     ) as llm:
+        impl = llm._executor.engine.kv_cache_manager.impl
         if enable_rebalance:
             _inject_pool_ratio_mismatch(llm)
+        ratio_before = list(_introspection.current_gpu_ratio(impl))
         outputs = llm.generate(_PROMPTS, _SAMPLING)
+        ratio_after = list(_introspection.current_gpu_ratio(impl))
+
+        # Guard against a vacuous pass.  Token equality between the rebalance
+        # and no-rebalance arms proves nothing if adjust() never ran, and
+        # nothing in the run logs at info level to tell us it did.  The pool
+        # ratio moving is the observable signature that it happened.
+        if enable_rebalance:
+            assert ratio_after != ratio_before, (
+                "rebalance never fired: GPU pool ratio unchanged at "
+                f"{ratio_before}. The token comparison would pass vacuously. "
+                "Check the executor's rebalance-check throttle and the V2 "
+                "auto-tuner's sample-count / cooldown gates."
+            )
+        else:
+            assert ratio_after == ratio_before, (
+                "pool ratio moved with enable_kv_pool_rebalance=False "
+                f"({ratio_before} -> {ratio_after}); the baseline arm is "
+                "supposed to hold pool ratios fixed."
+            )
+
         return [list(o.outputs[0].token_ids) for o in outputs]
 
 

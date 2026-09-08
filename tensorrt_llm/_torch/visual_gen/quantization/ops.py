@@ -99,6 +99,24 @@ def quantize_fp8_blockwise(
     return qweight, block_scales
 
 
+def quantize_fp8_rowwise(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize weight to FP8 E4M3 with per-channel (per-output-row) scale.
+
+    Uses torch.ops.tensorrt_llm.quantize_e4m3_activation CUDA kernel.
+
+    Args:
+        weight: Input weight tensor (BF16/FP16/FP32), shape (out_features, in_features)
+
+    Returns:
+        Tuple of:
+            - qweight: Quantized weight (FP8 E4M3), shape (out_features, in_features)
+            - weight_scale: Per-channel dequantization scales (FP32), shape (out_features,)
+    """
+    qweight, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(weight.contiguous())
+    return qweight, scale.squeeze(1).to(torch.float32)
+
+
 def quantize_nvfp4(
     weight: torch.Tensor, block_size: int = 16
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

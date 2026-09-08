@@ -306,7 +306,7 @@ class SinglePassMultiCTARadixTopKKernel:
             self.dtype,
             num_bits_per_copy=cutlass.const_expr(self.num_copy_bits),
         )
-        frag = cute.make_fragment((vec_size,), self.dtype)
+        frag = cute.make_rmem_tensor((vec_size,), self.dtype)
         stride = cutlass.const_expr(num_threads * vec_size)
 
         # Thread t covers [t*vs, t*vs+vs), [t*vs+stride, ...) in the aligned region.
@@ -326,7 +326,7 @@ class SinglePassMultiCTARadixTopKKernel:
             # Apply to_ordered into a correctly-typed uint32 fragment so
             # autovec_copy sees matching types (uint32 → uint32) and emits
             # STS.128 instead of 8 scalar STS instructions.
-            ordered_frag = cute.make_fragment((vec_size,), self.ordered_type)
+            ordered_frag = cute.make_rmem_tensor((vec_size,), self.ordered_type)
             for j in cutlass.range(vec_size, unroll_full=True):
                 ordered_frag[j] = self.to_ordered(frag[j])
 

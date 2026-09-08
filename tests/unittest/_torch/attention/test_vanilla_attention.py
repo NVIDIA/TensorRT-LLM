@@ -8,12 +8,13 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import (VanillaAttention,
-                                                   VanillaAttentionMetadata)
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends import (VanillaAttention,
+                                                    VanillaAttentionMetadata)
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
@@ -21,6 +22,29 @@ from tensorrt_llm.mapping import Mapping
 
 
 class TestVanillaAttention(unittest.TestCase):
+
+    def test_sparse_gqa_deduplicates_blocks(self):
+        result = VanillaAttention._single_token_sparse_attn_forward(
+            torch.zeros(1, 1),
+            torch.zeros(4, 1, 1),
+            torch.tensor([0.0, 0.0, 10.0, 10.0]).reshape(4, 1, 1),
+            torch.tensor([[0, 0, 1]], dtype=torch.int32),
+            indices_block_size=2,
+            qk_scale=1.0,
+        )
+
+        torch.testing.assert_close(result, torch.tensor([[5.0]]))
+
+    def test_selected_mla_attention_sink(self):
+        result = VanillaAttention._selected_mla_attention(
+            torch.zeros(1, 2),
+            torch.tensor([[2.0, 3.0]]),
+            value_dim=1,
+            scale=1.0,
+            attention_sink=torch.zeros(1),
+        )
+
+        torch.testing.assert_close(result, torch.tensor([[1.0]]))
 
     def test_kv_cache_manager_v2_sliding_window_eviction(self):
         device = torch.device("cuda")

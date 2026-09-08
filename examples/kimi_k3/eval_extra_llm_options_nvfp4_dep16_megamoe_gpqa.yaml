@@ -1,0 +1,52 @@
+# Kimi K3 NVFP4 on DEP16 for GPQA-Diamond, MegaMoE CuteDSL (4 nodes x 4 GPU).
+#
+# Identical to the CUTLASS GPQA config except for moe_config, so a difference
+# is attributable to the MoE backend alone. Fills the one empty cell in the
+# validation matrix: CUTLASS has both GSM8K (96.40) and GPQA-D (91.92);
+# MegaMoE had only GSM8K (96.32), and GSM8K is the cheap gate while GPQA is
+# the sensitive one -- parity on the former does not imply parity on the
+# latter, least of all across backends with different kernels and scale
+# handling.
+#
+# NOTE this run still carries the EXPERIMENTAL experts_per_token 13 -> 16
+# widening (see TODO-C). A good score here is evidence at one more shape, not
+# kernel-side coverage.
+#
+# Differs from the GSM8K DEP16 config in exactly one thing that matters:
+# max_seq_len. GSM8K answers are a few hundred tokens, so 8192 covered prompt
+# plus generation. GPQA-Diamond is a reasoning benchmark and the published
+# Kimi-K3 numbers were measured with a 65536-token generation budget, so the
+# sequence budget has to hold 4096 of prompt plus all of that.
+#
+# max_batch_size is 8, revised up from 4 after the 8-question smoke (job
+# 475469) measured what this model actually generates here: 3431 and 6000
+# tokens, not the 65536 the budget allows. The budget still has to cover the
+# worst case, but sizing CONCURRENCY for it was wrong -- at ~6k tokens and
+# ~63 KiB/token a sequence wants ~0.4 GiB, not ~4 GiB, so the pool funds
+# several. The V2 Mamba minimum also stays comfortable: ~0.42 GiB per resident
+# slot means ~4.2 GiB at batch 8, well under the ~15 GiB quota, and the GSM8K
+# DEP16 run already ran at 8. If several questions do run long the scheduler
+# simply admits fewer of them.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 69632
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: MEGAMOE_CUTEDSL
+  # max_num_tokens deliberately absent: for MEGAMOE_* it is the SymmBuffer
+  # capacity (divided again by ep_size under attention-DP), not the per-call
+  # chunking bound it is for CUTLASS. Carrying 131072 over would over-provision
+  # the generation buffer ~32x and eat the KV cache.
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.35
+  tokens_per_block: 64

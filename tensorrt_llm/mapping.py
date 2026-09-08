@@ -25,8 +25,6 @@ from tensorrt_llm._utils import mpi_disabled
 class CpType(StrEnum):
     # CP type for ulysses parallelism
     ULYSSES = "ULYSSES"
-    # CP type for star attention
-    STAR = "STAR"
     # CP type for ring attention
     RING = "RING"
     # CP type for helix parallelism

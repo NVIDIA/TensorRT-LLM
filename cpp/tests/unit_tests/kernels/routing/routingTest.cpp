@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -352,7 +352,7 @@ void RoutingKernelTest<T>::verifyResult(RoutingKernelTestParam const& param)
         assertEqual(bufferCast<int32_t>(*mPtrExpertCountsHost), expertCountsPtr, param.numExperts, "expert counts");
         // The second half of mPtrExpertCounts is only filled by the multi-kernel offsets pipeline
         // (routingIndicesOffsetsKernel). It is NOT filled by the coop kernel or cluster kernel.
-        // On SM90+, both the scores path (RoutingCustom.cu) and the post-topK path
+        // On SM90+, both the scores path (RoutingCustomKernels.cuh) and the post-topK path
         // (RoutingFromTopKIds.cu) may use the coop kernel instead of multi-kernel for medium
         // token counts. Skip this check whenever the coop path could have been taken.
         // The coop path requires SM90+ and numExperts <= 1024.

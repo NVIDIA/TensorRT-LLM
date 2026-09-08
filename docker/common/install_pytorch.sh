@@ -2,10 +2,18 @@
 
 set -ex
 
+# Authenticate the github.com clones in the source install paths below; no-op
+# when no token is available.
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
+if [ -n "${GITHUB_MIRROR}" ]; then
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
+
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
-TORCH_VERSION="2.11.0"
+TORCH_VERSION="2.12.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 
 prepare_environment() {

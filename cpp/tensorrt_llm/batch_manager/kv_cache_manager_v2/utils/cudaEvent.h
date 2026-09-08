@@ -19,11 +19,11 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include <algorithm>
 #include <cuda.h>
 #include <deque>
-#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -31,44 +31,6 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-// ---------------------------------------------------------------------------
-// FuncGuard<F> — generic RAII scope guard that calls a void() callable on destruction.
-// Movable (moved-from instance is disarmed). Not copyable.
-// ---------------------------------------------------------------------------
-template <typename F>
-class FuncGuard
-{
-public:
-    explicit FuncGuard(F&& func)
-        : mFunc(std::forward<F>(func))
-        , mActive(true)
-    {
-    }
-
-    ~FuncGuard()
-    {
-        if (mActive)
-        {
-            mFunc();
-        }
-    }
-
-    FuncGuard(FuncGuard&& other) noexcept
-        : mFunc(std::move(other.mFunc))
-        , mActive(other.mActive)
-    {
-        other.mActive = false;
-    }
-
-    FuncGuard(FuncGuard const&) = delete;
-    FuncGuard& operator=(FuncGuard const&) = delete;
-    FuncGuard& operator=(FuncGuard&&) = delete;
-
-private:
-    F mFunc;
-    bool mActive;
-};
 
 // ---------------------------------------------------------------------------
 // SimplePool<T, Derived> — generic resource pool for opaque handle types.
@@ -257,8 +219,8 @@ public:
     // NULL sentinel: always considered complete, no event in flight.
     static CachedCudaEvent makeNull() noexcept;
 
-    // Normal constructor: gets an event and records it on stream.
-    explicit CachedCudaEvent(CudaStream stream);
+    // Gets an event and records it on stream. Failure terminates because KVCM2 cannot safely operate without events.
+    explicit CachedCudaEvent(CudaStream stream) noexcept;
 
     // Copyable and movable (shared ownership of the underlying CUevent).
     CachedCudaEvent(CachedCudaEvent const&) = default;
@@ -283,7 +245,7 @@ public:
     }
 
     // Release the event back to pool. Visible to ALL copies sharing this event.
-    void close();
+    void close() noexcept;
 
     // Raw CUevent handle. Returns nullptr for NULL/closed events.
     // Also serves as identity key for deduplication.
@@ -351,11 +313,6 @@ class CachedCudaStream
 public:
     CachedCudaStream();
 
-    CachedCudaStream(CachedCudaStream&&) noexcept = default;
-    CachedCudaStream& operator=(CachedCudaStream&&) noexcept = default;
-    CachedCudaStream(CachedCudaStream const&) = delete;
-    CachedCudaStream& operator=(CachedCudaStream const&) = delete;
-
     [[nodiscard]] CUstream handle() const noexcept
     {
         return mPoolItem.get(); // CUstream = CUstream_st*
@@ -373,7 +330,7 @@ public:
         streamWaitEvents(reinterpret_cast<CudaStream>(handle()), events);
     }
 
-    CachedCudaEvent recordEvent();
+    CachedCudaEvent recordEvent() noexcept;
     void synchronize();
 
 private:
@@ -382,7 +339,8 @@ private:
 
 // ---------------------------------------------------------------------------
 // TemporaryCudaStream — pooled stream with finish-event tracking.
-// Mirrors Python's TemporaryCudaStream context manager.
+// Unlike the Python context manager, it records the finish event during exception unwinding so that work submitted
+// before the exception can still be fenced.
 //
 // Usage (matches Python's `with TemporaryCudaStream(events) as stream:`):
 //
@@ -390,7 +348,7 @@ private:
 //   {
 //       auto scope = tempStream.enter();   // __enter__
 //       launchKernel(tempStream.get());
-//   }                                      // ~Scope → __exit__ records finish event
+//   }                                      // scope exit records the event; failure terminates
 //   auto ev = tempStream.takeFinishEvent(); // after with block
 //
 // ---------------------------------------------------------------------------
@@ -400,17 +358,10 @@ public:
     // Acquire a stream from pool and issue cuStreamWaitEvent for each prior event.
     explicit TemporaryCudaStream(std::vector<CachedCudaEvent const*> const& priorEvents);
 
-    // Begin a scoped block. Destructor records the finish event (= Python __exit__).
-    // Skips recording during stack unwinding to match Python's `if not exc_type:` guard.
+    // Begin a scoped block. Destructor records the finish event, including during stack unwinding.
     [[nodiscard]] auto enter()
     {
-        int const exCount = std::uncaught_exceptions();
-        return FuncGuard(
-            [this, exCount]()
-            {
-                if (std::uncaught_exceptions() == exCount)
-                    mFinishEvent = mStream.recordEvent();
-            });
+        return FuncGuard([this]() noexcept { mFinishEvent = mStream.recordEvent(); });
     }
 
     [[nodiscard]] CUstream get() const noexcept
@@ -425,9 +376,6 @@ public:
         mFinishEvent = CachedCudaEvent::makeNull();
         return result;
     }
-
-    TemporaryCudaStream(TemporaryCudaStream const&) = delete;
-    TemporaryCudaStream& operator=(TemporaryCudaStream const&) = delete;
 
 private:
     CachedCudaStream mStream;

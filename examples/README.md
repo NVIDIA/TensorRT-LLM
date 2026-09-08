@@ -29,6 +29,7 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | Directory | Description |
 |---|---|
 | [`llm-api/`](llm-api/) | Python LLM API examples (offline inference, quantization, speculative decoding) |
+| [`kv_cache_compression/`](kv_cache_compression/) | KV cache compression examples, including NVFP4 cold-page quantization and TriAttention |
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
 | [`configs/`](configs/) | Pre-tuned serving configurations — [curated](configs/curated/) quick-starts and a [comprehensive database](configs/database/) |
 | [`auto_deploy/`](auto_deploy/) | AutoDeploy (beta) development examples, cookbooks, and model registry |
