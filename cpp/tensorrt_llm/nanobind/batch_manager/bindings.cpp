@@ -161,7 +161,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_prop_ro("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_prop_ro("lora_task_id", &GenLlmReq::getLoraTaskId)
-        .def_prop_ro("lookahead_config", &GenLlmReq::getLookaheadConfig)
         .def_prop_rw("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_prop_rw("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
         .def_rw("request_id", &GenLlmReq::mRequestId)
@@ -395,7 +394,6 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                 std::optional<at::Tensor> lora_config,
-                std::optional<executor::LookaheadDecodingConfig> lookahead_config,
                 std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
                 bool return_context_logits, bool return_generation_logits,
                 std::optional<tb::LlmRequest::VecTokens> draft_tokens, std::optional<at::Tensor> draft_logits,
@@ -442,9 +440,9 @@ void initBindings(nb::module_& m)
                         pad_id, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
                         multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_embedding_tensor_ptr,
                         mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
-                        lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
-                        return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
-                        exclude_input_from_output, encoder_input_tokens, return_encoder_output, client_id, priority,
+                        lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
+                        return_generation_logits, draft_tokens, draft_logits_tensor_ptr, exclude_input_from_output,
+                        encoder_input_tokens, return_encoder_output, client_id, priority,
                         encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                         llm_request_type, input_token_extra_ids, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
                         guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params,
@@ -459,14 +457,14 @@ void initBindings(nb::module_& m)
             nb::arg("multimodal_uuids") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
             nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
             nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
-            nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
-            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
-            nb::arg("draft_tokens") = std::nullopt, nb::arg("draft_logits") = std::nullopt,
-            nb::arg("exclude_input_from_output") = false, nb::arg("encoder_input_tokens") = std::nullopt,
-            nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
-            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_features") = std::nullopt,
-            nb::arg("encoder_output_len") = std::nullopt, nb::arg("cross_attention_mask") = std::nullopt,
+            nb::arg("lora_config") = std::nullopt, nb::arg("kv_cache_retention_config") = std::nullopt,
+            nb::arg("return_log_probs") = false, nb::arg("return_context_logits") = false,
+            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
+            nb::arg("draft_logits") = std::nullopt, nb::arg("exclude_input_from_output") = false,
+            nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
+            nb::arg("client_id") = std::nullopt, nb::arg("priority") = executor::Request::kDefaultPriority,
+            nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
+            nb::arg("cross_attention_mask") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
