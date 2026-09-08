@@ -1587,7 +1587,6 @@ def executor_request_to_llm_request(
         ] if executor_request.output_config.additional_model_outputs is not None
         else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
-        draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
         guided_decoding_params=executor_request.guided_decoding_params,
