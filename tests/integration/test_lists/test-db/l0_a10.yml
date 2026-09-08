@@ -14,6 +14,7 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/auto_deploy/models/custom/test_modeling_decilm.py::TestDeciLMForCausalLM
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_finish_reasons_fused.py
   - unittest/_torch/sampler/test_penalties.py
