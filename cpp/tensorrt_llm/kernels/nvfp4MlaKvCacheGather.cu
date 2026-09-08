@@ -635,6 +635,66 @@ __global__ __launch_bounds__(kThreadsPerBlock, kDirectBlocksPerSm) void nvFp4Mla
     }
 }
 
+__global__ void markContextGlobalTopKKernel(int32_t const* __restrict__ localTopKIndices,
+    int32_t const* __restrict__ queryReqIndices, int32_t const* __restrict__ cuKvLengths,
+    int32_t const* __restrict__ globalIndices, int32_t* __restrict__ selectedFlags,
+    int32_t* __restrict__ selectedGlobalIndices, int64_t numPairs, int32_t topK, int32_t numRequests,
+    int32_t maxKvTokens, int64_t numPoolTokens)
+{
+    for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; pair < numPairs;
+         pair += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        int32_t const row = static_cast<int32_t>(pair / topK);
+        int32_t const request = queryReqIndices[row];
+        int32_t const token = localTopKIndices[pair];
+        int32_t const globalIdx = globalIndices[pair];
+        if (request < 0 || request >= numRequests || token < 0 || globalIdx < 0
+            || static_cast<int64_t>(globalIdx) >= numPoolTokens)
+        {
+            continue;
+        }
+
+        int32_t const requestStart = cuKvLengths[request];
+        int32_t const requestLength = cuKvLengths[request + 1] - requestStart;
+        int64_t const packedToken = static_cast<int64_t>(requestStart) + token;
+        if (token < requestLength && packedToken >= 0 && packedToken < maxKvTokens
+            && atomicCAS(selectedFlags + packedToken, 0, 1) == 0)
+        {
+            selectedGlobalIndices[packedToken] = globalIdx;
+        }
+    }
+}
+
+__global__ void remapContextGlobalTopKKernel(int32_t const* __restrict__ localTopKIndices,
+    int32_t const* __restrict__ queryReqIndices, int32_t const* __restrict__ cuKvLengths,
+    int32_t const* __restrict__ selectedFlags, int32_t const* __restrict__ selectedOffsets,
+    int32_t* __restrict__ globalIndices, int64_t numPairs, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
+    int64_t numPoolTokens)
+{
+    for (int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; pair < numPairs;
+         pair += static_cast<int64_t>(gridDim.x) * blockDim.x)
+    {
+        int32_t const row = static_cast<int32_t>(pair / topK);
+        int32_t const request = queryReqIndices[row];
+        int32_t const token = localTopKIndices[pair];
+        int32_t const globalIdx = globalIndices[pair];
+        int32_t compact = -1;
+        if (request >= 0 && request < numRequests && token >= 0 && globalIdx >= 0
+            && static_cast<int64_t>(globalIdx) < numPoolTokens)
+        {
+            int32_t const requestStart = cuKvLengths[request];
+            int32_t const requestLength = cuKvLengths[request + 1] - requestStart;
+            int64_t const packedToken = static_cast<int64_t>(requestStart) + token;
+            if (token < requestLength && packedToken >= 0 && packedToken < maxKvTokens
+                && selectedFlags[packedToken] != 0)
+            {
+                compact = selectedOffsets[packedToken];
+            }
+        }
+        globalIndices[pair] = compact;
+    }
+}
+
 __global__ void markContextTopKKernel(int32_t const* __restrict__ localTopKIndices,
     int32_t const* __restrict__ queryReqIndices, int64_t const* __restrict__ cuKvLengths,
     int32_t const* __restrict__ blockTable, int32_t* __restrict__ selectedFlags,
@@ -832,6 +892,91 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
         nvFp4MlaKvCacheGatherGenericKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices,
             output, compactIndices, globalDequantScale, numPairs, headDim, residualDim, numPoolTokens);
     }
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+size_t getNvFp4MlaContextKvCacheGatherDirectWorkspaceSize(int32_t numRequests, int32_t maxKvTokens, cudaStream_t stream)
+{
+    if (numRequests <= 0 || maxKvTokens <= 0)
+    {
+        return 0;
+    }
+    size_t requestScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, requestScanWorkspaceSize,
+        static_cast<int32_t const*>(nullptr), static_cast<int32_t*>(nullptr), numRequests, stream));
+    size_t tokenScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, tokenScanWorkspaceSize, static_cast<int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr), maxKvTokens, stream));
+    size_t const tensorWorkspaceSize
+        = alignUp((static_cast<size_t>(numRequests) + 1 + static_cast<size_t>(maxKvTokens) * 3) * sizeof(int32_t),
+            kWorkspaceAlignment);
+    return tensorWorkspaceSize + std::max(requestScanWorkspaceSize, tokenScanWorkspaceSize);
+}
+
+void invokeNvFp4MlaContextKvCacheGatherDirect(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* localTopKIndices, int32_t const* queryReqIndices, int32_t const* compressedKvLengths,
+    int32_t* globalIndices, __nv_fp8_e4m3* output, float const* globalDequantScale, void* workspace,
+    size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests, int32_t maxKvTokens,
+    int32_t outputCapacity, int32_t headDim, int32_t residualDim, int64_t numPoolTokens, cudaStream_t stream)
+{
+    if (numQueryRows == 0 || topK == 0 || maxKvTokens == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(headDim > 0 && headDim % 16 == 0,
+        "NVFP4 MLA direct context gather requires head_dim to be a positive multiple of 16, got %d", headDim);
+    TLLM_CHECK_WITH_INFO(residualDim >= 0 && residualDim <= headDim && residualDim % 16 == 0,
+        "NVFP4 MLA direct context gather residual_dim must be a multiple of 16 in [0, head_dim], got %d", residualDim);
+    TLLM_CHECK_WITH_INFO(numRequests > 0, "num_requests must be positive");
+    int64_t const numPairs = static_cast<int64_t>(numQueryRows) * topK;
+    TLLM_CHECK_WITH_INFO(
+        numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA direct context gather exceeds int32 capacity");
+    TLLM_CHECK_WITH_INFO(outputCapacity >= std::min<int64_t>(maxKvTokens, numPairs),
+        "NVFP4 MLA direct context gather output capacity is too small");
+
+    size_t requestScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, requestScanWorkspaceSize,
+        static_cast<int32_t const*>(nullptr), static_cast<int32_t*>(nullptr), numRequests, stream));
+    size_t tokenScanWorkspaceSize = 0;
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(nullptr, tokenScanWorkspaceSize, static_cast<int32_t*>(nullptr),
+        static_cast<int32_t*>(nullptr), maxKvTokens, stream));
+    size_t const tensorWorkspaceSize
+        = alignUp((static_cast<size_t>(numRequests) + 1 + static_cast<size_t>(maxKvTokens) * 3) * sizeof(int32_t),
+            kWorkspaceAlignment);
+    size_t const scanWorkspaceSize = std::max(requestScanWorkspaceSize, tokenScanWorkspaceSize);
+    TLLM_CHECK_WITH_INFO(workspaceSize >= tensorWorkspaceSize + scanWorkspaceSize,
+        "NVFP4 MLA direct context gather workspace is too small");
+
+    auto* cuKvLengths = static_cast<int32_t*>(workspace);
+    auto* selectedFlags = cuKvLengths + numRequests + 1;
+    auto* selectedOffsets = selectedFlags + maxKvTokens;
+    auto* selectedGlobalIndices = selectedOffsets + maxKvTokens;
+    auto* scanWorkspace = reinterpret_cast<uint8_t*>(workspace) + tensorWorkspaceSize;
+
+    TLLM_CUDA_CHECK(cudaMemsetAsync(cuKvLengths, 0, sizeof(int32_t), stream));
+    TLLM_CUDA_CHECK(cub::DeviceScan::InclusiveSum(
+        scanWorkspace, requestScanWorkspaceSize, compressedKvLengths, cuKvLengths + 1, numRequests, stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(selectedFlags, 0, static_cast<size_t>(maxKvTokens) * sizeof(int32_t), stream));
+
+    int32_t const pairBlocks = std::max(1,
+        std::min(static_cast<int32_t>((numPairs + kThreadsPerBlock - 1) / kThreadsPerBlock),
+            tensorrt_llm::common::getMultiProcessorCount() * kBlocksPerSm));
+    markContextGlobalTopKKernel<<<pairBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices,
+        cuKvLengths, globalIndices, selectedFlags, selectedGlobalIndices, numPairs, topK, numRequests, maxKvTokens,
+        numPoolTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+    TLLM_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scanWorkspace, tokenScanWorkspaceSize, selectedFlags, selectedOffsets, maxKvTokens, stream));
+
+    int32_t const gatherBlocks = getPersistentBlockCount(maxKvTokens);
+    nvFp4MlaContextKvCacheGatherKernel<<<gatherBlocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool,
+        selectedFlags, selectedOffsets, selectedGlobalIndices, output, globalDequantScale, maxKvTokens, outputCapacity,
+        headDim, residualDim, numPoolTokens);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+
+    remapContextGlobalTopKKernel<<<pairBlocks, kThreadsPerBlock, 0, stream>>>(localTopKIndices, queryReqIndices,
+        cuKvLengths, selectedFlags, selectedOffsets, globalIndices, numPairs, topK, numRequests, maxKvTokens,
+        numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
