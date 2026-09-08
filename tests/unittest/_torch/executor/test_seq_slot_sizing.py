@@ -44,31 +44,27 @@ from tensorrt_llm._torch.pyexecutor._util import (
 )
 from tensorrt_llm.mapping import Mapping
 
-# (pp_size, disable_overlap, enable_overlap_headroom, is_disagg, expected_factor)
+# (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
 #
 # The terms are additive, not multiplicative: pipeline depth costs pp_size
 # micro-batches of seats, and the overlap deferral costs exactly one more
 # generation on top -- not one more per stage. At pp_size == 1 the two readings
 # coincide at 2x, which is why the headroom used to be expressible as a factor of
 # 2; the pp>1 rows are where they part company (5x, not 8x, at pp=4).
+#
+# Disaggregation is absent from this table on purpose -- see
+# test_seat_pool_has_no_disagg_term.
 SIZING_CASES = [
     # No PP. Every cell here is unchanged by this PR.
-    (1, False, False, False, 1),
-    (1, False, True, False, 2),
-    (1, True, True, False, 1),
-    (1, False, False, True, 2),
-    (1, False, True, True, 2),
+    (1, False, False, 1),
+    (1, False, True, 2),
+    (1, True, True, 1),
     # PP without the headroom: unchanged.
-    (4, False, False, False, 4),
-    (4, True, True, False, 4),
-    (2, False, False, True, 4),
-    (4, False, False, True, 8),
+    (4, False, False, 4),
+    (4, True, True, 4),
     # PP with the headroom: the one intended behaviour change (was pp_size).
-    (2, False, True, False, 3),
-    (4, False, True, False, 5),
-    # Disagg dominates the additive term rather than compounding with it: the two
-    # coefficients each cover one extra cohort of in-flight sequences.
-    (4, False, True, True, 8),
+    (2, False, True, 3),
+    (4, False, True, 5),
 ]
 
 
@@ -147,10 +143,10 @@ def test_non_overlap_adp_forward_intent_scope(pp_size, disable_overlap, expected
 
 
 @pytest.mark.parametrize(
-    "pp_size,disable_overlap,enable_overlap_headroom,is_disagg,expected_factor", SIZING_CASES
+    "pp_size,disable_overlap,enable_overlap_headroom,expected_factor", SIZING_CASES
 )
 def test_compute_max_num_sequences_scopes_overlap_headroom(
-    pp_size, disable_overlap, enable_overlap_headroom, is_disagg, expected_factor
+    pp_size, disable_overlap, enable_overlap_headroom, expected_factor
 ):
     max_batch_size = 8
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
@@ -160,10 +156,30 @@ def test_compute_max_num_sequences_scopes_overlap_headroom(
             max_batch_size,
             disable_overlap,
             enable_overlap_headroom=enable_overlap_headroom,
-            is_disagg=is_disagg,
         )
         == max_batch_size * expected_factor
     )
+
+
+def test_seat_pool_has_no_disagg_term():
+    """The disaggregation 2x is confined to KVCacheManagerV2's index pool.
+
+    A request awaiting its KV transfer holds an *index* lease and no seat at all:
+    ``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``
+    requests outright and only seats one once its transmission completes, while
+    admission stays at ``max_batch_size * pp_size``. So the index pool
+    legitimately runs ahead of the seat pool, and doubling the *seat* pool would
+    buy nothing while doubling everything keyed by seat -- sampler state,
+    ``[seats, draft_len, vocab]`` draft probabilities (~800 MB at 512 seats), the
+    penalty tensors and the pinned-host block-offset tables.
+
+    Asserting on the signature rather than on a return value is deliberate: a
+    value test cannot distinguish "the parameter is gone" from "the parameter
+    defaults to False", and it is the parameter's *existence* that invites a
+    caller to propagate the factor.
+    """
+    assert "is_disagg" not in inspect.signature(compute_max_num_sequences).parameters
+    assert "is_disagg" not in inspect.signature(resolve_max_num_sequences).parameters
 
 
 @pytest.mark.parametrize(
@@ -213,7 +229,6 @@ def test_resolve_max_num_sequences_prefers_the_published_pool(explicit, engine_s
             mapping,
             8,
             llm_args,
-            False,
             max_num_sequences=explicit,
         )
         == expected
@@ -245,13 +260,12 @@ def test_resolve_max_num_sequences_reads_llm_args_only_in_the_fallback():
             mapping,
             8,
             _Exploding(),
-            False,
             max_num_sequences=24,
         )
         == 24
     )
     # Branch 2: the engine's published pool.
-    assert resolve_max_num_sequences(engine_with_pool, mapping, 8, _Exploding(), False) == 16
+    assert resolve_max_num_sequences(engine_with_pool, mapping, 8, _Exploding()) == 16
 
 
 def test_sampler_args_require_the_resolved_pool():
@@ -292,22 +306,42 @@ class _FakeManager:
         self.max_admissible_sequences = max_admissible_sequences
 
 
-def test_validator_accepts_the_matching_pair():
-    validate_seq_slot_pool_covers_admission(16, _FakeManager(16))
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_validator_accepts_the_matching_pair(is_disagg):
+    validate_seq_slot_pool_covers_admission(16, _FakeManager(16), is_disagg=is_disagg)
 
 
-@pytest.mark.parametrize("admissible", [8, 32])
-def test_validator_is_two_sided(admissible):
-    """Both directions of the skew are bugs, and both have shipped.
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_validator_always_rejects_an_index_pool_below_the_seat_pool(is_disagg):
+    """The direction that shipped as nvbug 6627795, and it is never legitimate.
 
-    A one-sided ``seats >= admissible`` guard is what let nvbug 6627795 through:
-    the seat pool grew to 2B while the index pool stayed at B+1, which satisfies
-    the one-sided form and silently defers admitted requests one at a time. The
-    other direction -- index pool larger than the seat pool -- admits a request
-    that cannot be seated and raises inside the executor's event loop.
+    A one-sided ``seats >= admissible`` guard is what let it through: the seat
+    pool grew to 2B while the index pool stayed at B+1, which satisfies the
+    one-sided form and silently defers admitted requests one at a time.
+    Disaggregation is no excuse here -- its 2x makes the index pool *larger*, so
+    a shortfall under disagg means the two numbers were derived separately.
     """
-    with pytest.raises(ValueError, match="sequence-slot pool"):
-        validate_seq_slot_pool_covers_admission(16, _FakeManager(admissible))
+    with pytest.raises(ValueError, match="smaller than the seat"):
+        validate_seq_slot_pool_covers_admission(16, _FakeManager(8), is_disagg=is_disagg)
+
+
+def test_validator_rejects_a_larger_index_pool_only_when_aggregated():
+    """The other direction is a bug when aggregated and by design under disagg.
+
+    Aggregated, every indexed sequence is also a seated one, so a surplus can
+    only mean one of the two numbers was re-derived -- and a request would be
+    admitted that cannot be seated, with ``SlotManager.add_slot`` raising on the
+    executor's event-loop thread. Under disaggregation the surplus *is* the
+    mechanism: a request in KV transfer holds its index lease with no seat
+    (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``), so
+    the index pool carries a 2x that must not reach the seat pool. Admission is
+    bounded independently at ``max_batch_size * pp_size`` either way, so the
+    surplus is never extra concurrency.
+    """
+    with pytest.raises(ValueError, match="larger than the seat"):
+        validate_seq_slot_pool_covers_admission(16, _FakeManager(32), is_disagg=False)
+
+    validate_seq_slot_pool_covers_admission(16, _FakeManager(32), is_disagg=True)
 
 
 @pytest.mark.parametrize(
@@ -335,9 +369,9 @@ def test_validator_skips_managers_that_do_not_publish_capacity(manager):
     derives from KVCacheManagerV2 and therefore does publish
     max_admissible_sequences, so it *is* validated. That comparison holds
     because the headroom is withheld from hybrid on both sides -- seats are
-    B*pp (or 2*B*pp under disagg) and, with max_num_seq_slots withheld, its
-    index pool lands on exactly the same number. What hybrid does not receive
-    is the seat pool, not the check.
+    B*pp and, with max_num_seq_slots withheld, its index pool lands on exactly
+    the same number (2*B*pp under disagg, which the validator allows). What
+    hybrid does not receive is the seat pool, not the check.
     """
     validate_seq_slot_pool_covers_admission(16, manager)
 

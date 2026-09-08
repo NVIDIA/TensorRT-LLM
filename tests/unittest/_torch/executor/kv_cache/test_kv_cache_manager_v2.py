@@ -1643,6 +1643,12 @@ _INDEX_MAPPER_CAPACITY_CASES = [
     pytest.param(2, 1, True, 1, 4, 5, id="disagg_does_not_compound"),
     # Disagg without seat headroom keeps its own 2x.
     pytest.param(2, 1, True, 1, None, 5, id="disagg_only"),
+    # The same cell as it actually occurs once the seat pool is plumbed: disagg
+    # without ADP seats B*pp == 2, and the mapper still carries its own 2x. The
+    # surplus is deliberate and is the reason the 2x lives *here* and not in
+    # compute_max_num_sequences -- a request in KV transfer holds an index lease
+    # while SeqSlotManager.prepare_resources skips it, so it occupies no seat.
+    pytest.param(2, 1, True, 1, 2, 5, id="disagg_index_pool_exceeds_seat_pool"),
     # PP without the headroom: seats are B*pp, which the mapper already matched.
     pytest.param(2, 4, False, 1, 8, 9, id="pp4"),
     # PP with the headroom: seats are (pp+1)*B == 10, additive rather than
@@ -1685,34 +1691,44 @@ def test_index_mapper_capacity_covers_seq_slot_pool(
 # pipeline-parallel cell, and a caller that supplies no seat pool at all.
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "max_batch_size,pp_size,reserved,max_num_seq_slots,expected_admissible",
+    "max_batch_size,pp_size,is_disagg,reserved,max_num_seq_slots,expected_admissible",
     [
-        pytest.param(2, 1, 1, 4, 4, id="agg_adp_overlap"),
-        pytest.param(2, 4, 1, 10, 10, id="pp4_adp_overlap"),
-        pytest.param(2, 1, 5, None, 2, id="seats_unset_reserved_excluded"),
+        pytest.param(2, 1, False, 1, 4, 4, id="agg_adp_overlap"),
+        pytest.param(2, 4, False, 1, 10, 10, id="pp4_adp_overlap"),
+        pytest.param(2, 1, False, 5, None, 2, id="seats_unset_reserved_excluded"),
+        # Disagg is the one case where the published number legitimately exceeds
+        # the seat pool it is compared against.
+        pytest.param(2, 1, True, 1, 2, 4, id="disagg_exceeds_seat_pool"),
     ],
 )
 def test_index_mapper_publishes_max_admissible_sequences(
     max_batch_size: int,
     pp_size: int,
+    is_disagg: bool,
     reserved: int,
     max_num_seq_slots: int | None,
     expected_admissible: int,
 ) -> None:
-    """The manager publishes what it can seat, so nobody has to re-derive it.
+    """The manager publishes what it can index, so nobody has to re-derive it.
 
     ``_util.validate_seq_slot_pool_covers_admission`` compares this against the
     executor's sequence-slot pool at startup. It is the pool *net of* the reserved
-    padding/dummy slots, which no real sequence can take, and on every row where a
-    seat pool was plumbed through it equals that seat pool exactly -- that
-    equality is the invariant the validator enforces, in both directions.
+    padding/dummy slots, which no real sequence can take. Aggregated, it equals
+    the seat pool exactly on every row where one was plumbed through, and the
+    validator enforces that in both directions. Under disaggregation it may
+    exceed the seat pool, because an index lease outlives the seat while the KV
+    transfer drains -- so there the validator enforces only ``>=``.
     """
     _, _, admissible = _index_mapper_capacity_for(
         max_batch_size=max_batch_size,
         pp_size=pp_size,
+        is_disagg=is_disagg,
         num_reserved_index_slots=reserved,
         max_num_seq_slots=max_num_seq_slots,
     )
     assert admissible == expected_admissible
     if max_num_seq_slots is not None:
-        assert admissible == max_num_seq_slots
+        if is_disagg:
+            assert admissible >= max_num_seq_slots
+        else:
+            assert admissible == max_num_seq_slots

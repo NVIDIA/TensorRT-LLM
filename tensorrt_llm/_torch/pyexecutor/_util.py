@@ -3063,17 +3063,16 @@ def is_disagg_enabled(cache_transceiver_config) -> bool:
 def compute_max_num_sequences(mapping: Mapping,
                               max_batch_size: int,
                               disable_overlap_scheduler: bool,
-                              enable_overlap_headroom: bool = False,
-                              is_disagg: bool = False) -> int:
+                              enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    This is *the* definition of how many sequences can be simultaneously live.
-    Every pool keyed by live-request identity -- the sampler's per-slot state,
-    the guided decoder, the spec-decoding managers, KVCacheManagerV2's index
-    mapper -- must consume this number rather than re-deriving it from
-    ``max_batch_size``, because any two formulas that disagree are a bug: too
-    few index slots silently defers admitted requests (nvbug 6627795), too few
-    seats raises ``NoFreeSlotsError`` on the executor's event-loop thread.
+    This is *the* definition of how many sequences can be simultaneously
+    **seated**. Every pool keyed by seat identity -- the sampler's per-slot
+    state, the guided decoder, the spec-decoding managers -- must consume this
+    number rather than re-deriving it from ``max_batch_size``, because any two
+    formulas that disagree are a bug: too few seats raises ``NoFreeSlotsError``
+    on the executor's event-loop thread, and a KV index pool narrower than the
+    seat pool silently defers admitted requests (nvbug 6627795).
 
     The terms are **additive, not multiplicative**:
 
@@ -3090,38 +3089,50 @@ def compute_max_num_sequences(mapping: Mapping,
     the multiplicative reading costs ``+100%`` at ``pp_size == 4`` where the
     additive one costs ``+25%`` -- on pools that include eagerly-allocated
     ``[seats, draft_len, vocab]`` tensors.
+
+    Disaggregation deliberately does **not** appear here. Its ``2x`` is an
+    IndexMapper-local concern: a request awaiting its KV transfer holds an
+    *index* lease while holding no seat at all --
+    ``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``
+    requests outright and only seats them once the transmission completes -- so
+    the index pool legitimately runs ahead of the seat pool while admission
+    stays at ``max_batch_size * pp_size``. Propagating that factor into the seat
+    pool would double sampler state, ``[seats, draft_len, vocab]`` draft
+    probabilities and the pinned-host block-offset tables for leases that never
+    occupy a seat.
     """
     # Pipeline depth: pp_size micro-batches are structurally in flight.
     num_seats = max_batch_size * mapping.pp_size
     if enable_overlap_headroom and not disable_overlap_scheduler:
         num_seats += max_batch_size
-    if is_disagg:
-        # KVCacheManagerV2 sizes its own index pool max_batch_size * pp_size * 2
-        # under disagg (the lease outlives the request while the KV transfer
-        # drains), and the seat pool must cover the index pool. max() rather
-        # than a further multiplication because the disagg and overlap
-        # coefficients each cover one extra cohort of in-flight sequences --
-        # they overlap rather than compose.
-        num_seats = max(num_seats, max_batch_size * mapping.pp_size * 2)
     return num_seats
 
 
 def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
-                                            kv_cache_manager) -> None:
+                                            kv_cache_manager,
+                                            is_disagg: bool = False) -> None:
     """Fail at startup if the seat pool and the KV index pool disagree.
 
-    Both are leases held for a request's whole lifetime, so the two counts must
-    be *equal*: every sequence the executor can seat needs an index, and every
-    sequence the KV cache manager can index needs a seat. The check is
-    deliberately two-sided, because each direction has already shipped as a
-    separate bug and a one-sided ``>=`` guard is what let the first one through:
+    The invariant is ``index pool >= seat pool``, and the two bounds have
+    different characters -- which is why the check is asymmetric rather than a
+    plain equality:
 
-    * index pool < seat pool -- ``_create_kv_cache`` warns ``No free IndexMapper
-      slots``, returns ``None`` and the scheduler defers the request. Silent:
-      costs throughput, no error (nvbug 6627795).
-    * index pool > seat pool -- a request is admitted that cannot be seated and
-      ``SlotManager.add_slot`` raises on the executor's event-loop thread,
-      killing the rank mid-collective.
+    * index pool < seat pool -- **always a bug.** ``_create_kv_cache`` warns
+      ``No free IndexMapper slots``, returns ``None`` and the scheduler defers
+      the request. Silent: costs throughput, no error (nvbug 6627795). A
+      one-sided ``seats >= index pool`` guard is exactly what let this ship.
+    * index pool > seat pool -- a bug **when aggregated**, because there every
+      indexed sequence is also a seated one, so the surplus can only come from
+      one of the two numbers having been re-derived; a request would be admitted
+      that cannot be seated and ``SlotManager.add_slot`` would raise on the
+      executor's event-loop thread. Under disaggregation it is **by design**: a
+      request awaiting its KV transfer holds an index lease and no seat
+      (``SeqSlotManager.prepare_resources`` skips ``DISAGG_GENERATION_INIT``),
+      so the index pool carries a ``2x`` that the seat pool must not.
+
+    Admission is bounded independently at ``max_batch_size * pp_size`` by
+    ``ModelEngine.get_max_num_sequences()`` in both cases, so the surplus is
+    index headroom, never extra concurrency.
 
     Managers that do not publish ``max_admissible_sequences`` (V1, hybrid) are
     skipped rather than guessed at; publishing the attribute *as an int* is how a
@@ -3136,26 +3147,31 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         return
     if admissible == max_num_sequences:
         return
-    direction = ("smaller" if admissible < max_num_sequences else "larger")
-    consequence = (
-        "admitted requests would be silently deferred one at a time "
-        "(nvbug 6627795)" if admissible < max_num_sequences else
-        "a request could be admitted with no sequence slot to seat it, and "
-        "SlotManager.add_slot would raise on the executor's event loop")
+    if admissible > max_num_sequences:
+        if is_disagg:
+            # Expected: transfer-phase requests hold index leases, not seats.
+            return
+        direction, consequence = (
+            "larger",
+            "a request could be admitted with no sequence slot to seat it, and "
+            "SlotManager.add_slot would raise on the executor's event loop")
+    else:
+        direction, consequence = (
+            "smaller", "admitted requests would be silently deferred one at a "
+            "time (nvbug 6627795)")
     raise ValueError(
         f"{type(kv_cache_manager).__name__} can seat {admissible} concurrent "
         f"sequences but the executor's sequence-slot pool holds "
         f"{max_num_sequences}: the index pool is {direction} than the seat "
-        f"pool, so {consequence}. Both must come from "
-        "_util.compute_max_num_sequences; a mismatch means one of them was "
-        "re-derived from max_batch_size.")
+        f"pool, so {consequence}. The seat pool must come from "
+        "_util.compute_max_num_sequences and the index pool must be sized from "
+        "it; a mismatch means one of them was re-derived from max_batch_size.")
 
 
 def resolve_max_num_sequences(model_engine,
                               mapping: Mapping,
                               max_batch_size: int,
                               llm_args,
-                              is_disagg: bool,
                               max_num_sequences: Optional[int] = None) -> int:
     """Resolve the seat-pool size for a consumer, without re-deriving it.
 
@@ -3191,8 +3207,7 @@ def resolve_max_num_sequences(model_engine,
         max_batch_size,
         llm_args.disable_overlap_scheduler,
         enable_overlap_headroom=getattr(
-            model_engine, "_enable_adp_overlap_seq_slot_headroom", False),
-        is_disagg=is_disagg)
+            model_engine, "_enable_adp_overlap_seq_slot_headroom", False))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -3315,15 +3330,17 @@ def create_py_executor_instance(
         mapping,
         max_batch_size,
         llm_args,
-        is_disagg,
         max_num_sequences=max_num_sequences)
 
     # The seat pool and the KV index pool are sized independently and indexed by
-    # the same request identity, so any skew between them is a bug. Check it here
-    # rather than at first use: a startup ValueError names both numbers, while
-    # the runtime symptoms are a silent throughput loss in one direction and a
-    # raise inside the event loop in the other.
-    validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
+    # the same request identity, so an index pool narrower than the seat pool is
+    # always a bug and a wider one is a bug unless disaggregation explains it.
+    # Check it here rather than at first use: a startup ValueError names both
+    # numbers, while the runtime symptoms are a silent throughput loss in one
+    # direction and a raise inside the event loop in the other.
+    validate_seq_slot_pool_covers_admission(max_num_sequences,
+                                            kv_cache_manager,
+                                            is_disagg=is_disagg)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -3761,7 +3778,6 @@ def instantiate_sampler(
         mapping,
         max_batch_size,
         llm_args,
-        is_disagg_enabled(getattr(llm_args, "cache_transceiver_config", None)),
         max_num_sequences=max_num_sequences)
 
     sampler_args = create_torch_sampler_args(

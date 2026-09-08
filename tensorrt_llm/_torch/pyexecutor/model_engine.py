@@ -518,7 +518,7 @@ class PyTorchModelEngine(ModelEngine):
         # their state-slot pool from max_batch_size alone, so they cannot use
         # the headroom -- which is why this runs after the model is loaded
         # rather than next to `self.mapping`.
-        from ._util import (compute_max_num_sequences, is_disagg_enabled,
+        from ._util import (compute_max_num_sequences,
                             should_enable_adp_dummy_fixes,
                             should_enable_adp_overlap_seq_slot_headroom,
                             should_enable_non_overlap_adp_forward_intent,
@@ -534,7 +534,6 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_adp_overlap_seq_slot_headroom,
-            is_disagg=is_disagg_enabled(llm_args.cache_transceiver_config),
         )
         self._enable_scheduler_aware_adp_dummy = (
             should_enable_scheduler_aware_adp_dummy(

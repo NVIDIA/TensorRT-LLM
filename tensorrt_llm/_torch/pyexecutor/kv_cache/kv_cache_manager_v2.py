@@ -1456,15 +1456,24 @@ class KVCacheManagerV2(BaseResourceManager):
         #
         # `max_num_seq_slots` is the executor's sequence-slot pool size
         # (`PyTorchModelEngine.max_num_seq_slots`, sized by
-        # `_util.compute_max_num_sequences`). An index slot and a sequence slot are
-        # both leases held for the whole lifetime of a request, so whenever the
-        # executor can admit N concurrent sequences the index mapper must be able
-        # to hand out N indices. Under the overlap scheduler with attention DP the
-        # seat pool carries an extra factor of 2 because teardown of the retiring
-        # batch (`_process_previous_batch`) happens *after* the replacement batch
-        # has already been scheduled, so both cohorts hold their leases at once.
-        # Without this term the index mapper runs dry and `_create_kv_cache`
-        # silently defers requests one at a time (nvbug 6627795).
+        # `_util.compute_max_num_sequences`). Every sequence the executor can
+        # seat must be able to obtain an index, so the index pool has to cover
+        # the seat pool: `index pool >= seat pool`. Under the overlap scheduler
+        # with attention DP the seat pool carries an extra micro-batch because
+        # teardown of the retiring batch (`_process_previous_batch`) happens
+        # *after* the replacement batch has already been scheduled, so both
+        # cohorts hold their leases at once. Without consuming that number the
+        # index mapper runs dry and `_create_kv_cache` silently defers requests
+        # one at a time (nvbug 6627795).
+        #
+        # The disagg 2x is deliberately *local to this pool* and is not
+        # propagated back into the seat pool: a request in TRANS_IN_PROGRESS
+        # holds an index lease while holding no sequence slot at all
+        # (`SeqSlotManager.prepare_resources` skips DISAGG_GENERATION_INIT and
+        # only seats a request once its transmission completes). Doubling the
+        # seat pool instead would double sampler state, the
+        # `[seats, draft_len, vocab]` draft-probability tensors and the
+        # pinned-host block-offset tables for leases that never occupy a seat.
         #
         # Take the larger of the two bounds rather than multiplying them: the
         # disagg and overlap coefficients each cover one extra set of in-flight
@@ -1486,11 +1495,12 @@ class KVCacheManagerV2(BaseResourceManager):
         # slots reserved for padding/dummy requests, which are not available to
         # real sequences. Published so that
         # `_util.validate_seq_slot_pool_covers_admission` can compare it against
-        # the executor's sequence-slot pool without re-deriving either number --
-        # every skew between the two is a bug, in both directions (a smaller
-        # index pool defers requests one at a time, a larger one lets a request
-        # be admitted that cannot be seated and `SlotManager.add_slot` then
-        # raises on the executor's event loop).
+        # the executor's sequence-slot pool without re-deriving either number.
+        # An index pool *smaller* than the seat pool is always a bug (it defers
+        # requests one at a time); a *larger* one is a bug only when aggregated,
+        # where it would let a request be admitted that cannot be seated and
+        # `SlotManager.add_slot` would then raise on the executor's event loop.
+        # Under disagg the surplus is the 2x above, and is expected.
         self.max_admissible_sequences = index_mapper_capacity - num_reserved_index_slots
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
