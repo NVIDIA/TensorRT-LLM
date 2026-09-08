@@ -45,7 +45,7 @@ requests:
 A route accepts in the document what it accepts on the wire. The client derives each backend's
 schema from the request model that route validates against — `ImageGenerationRequest`,
 `ImageEditRequest` and `VideoGenerationRequest` in
-[`tensorrt_llm/serve/openai_protocol.py`](../../../tensorrt_llm/serve/openai_protocol.py) — so
+[`tensorrt_llm/serve/openai_protocol.py`](../openai_protocol.py) — so
 those models are the authority when this table falls behind.
 
 `backend` sits at the top level and selects the route, and so what the run measures. It is
