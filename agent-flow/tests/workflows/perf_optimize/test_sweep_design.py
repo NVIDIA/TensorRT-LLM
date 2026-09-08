@@ -60,18 +60,6 @@ def test_the_scored_command_is_the_anchor_free_one(tmp_path):
     assert "ctx_json" not in command
 
 
-def test_every_generated_command_names_the_skill_s_own_script(tmp_path):
-    scripts = _skill(tmp_path)
-    facts = sweep_design.facts_command(scripts, "/ckpt", tmp_path / "facts.json")
-    shapes = sweep_design.shapes_command(
-        scripts, tmp_path / "facts.json", tmp_path / "s.json", gpu="GB300", per_node=4
-    )
-    sol = sweep_design.sol_command(scripts, tmp_path / "plan.json", tmp_path / "sol.yaml")
-    assert sweep_design.FACTS_SCRIPT in facts
-    assert "--gpu-name GB300" in shapes and "--gpus-per-node 4" in shapes
-    assert sweep_design.DESIGN_SCRIPT in sol and "--plan" in sol
-
-
 # ------------------------------------------------------------- the widening
 
 
@@ -195,13 +183,9 @@ def test_a_real_round_trip_through_the_widening(tmp_path):
 
 def _instruction(tmp_path):
     return sweep_design.designer_instruction(
-        scripts=_skill(tmp_path),
+        model_dir="deepseek-V4-Pro",
         design_dir=tmp_path / "sweep_design",
-        shapes=["tep_4", "dep_8"],
-        facts=tmp_path / "facts.json",
-        ctx_config=tmp_path / "ctx.yaml",
-        sol_yaml=tmp_path / "sol.yaml",
-        plan=tmp_path / "plan.json",
+        tracks=["ctx", "gen"],
     )
 
 
@@ -238,10 +222,36 @@ def test_a_failed_shape_must_be_reported_not_omitted(tmp_path):
 def test_infrastructure_failure_and_a_memory_wall_are_kept_apart(tmp_path):
     """One is retried, the other is a finding -- conflating them loses a shape."""
     text = _instruction(tmp_path)
-    assert "corrupted dependency download" in text
+    assert "never started" in text
     assert "different findings" in text
 
 
-def test_the_widened_ctx_sweep_may_not_be_narrowed_by_the_agent(tmp_path):
+def test_the_skill_s_own_output_placement_rule_is_deferred_to(tmp_path):
+    """The rule an earlier generate-the-commands version had no place for.
+
+    `SKILL.md` writes generated YAMLs into `sweep_design/` for an existing
+    model dir, never on top of the curated ones. Wrapping its scripts took
+    the output path as a free parameter with no guard, trading a
+    recomputable mistake for an unrecoverable one.
+    """
     text = _instruction(tmp_path)
-    assert "do not narrow it" in text
+    assert "never on" in text and "curated" in text
+    assert "sweep_design/" in text
+
+
+def test_the_agent_is_told_to_invoke_the_skill_not_handed_its_commands(tmp_path):
+    """The agent invokes the skill rather than being handed its commands.
+
+    The phases are not four commands: they are also gates, a resume spine
+    and an output-placement rule.
+    """
+    text = _instruction(tmp_path)
+    assert "invoke the **create-sweep** skill and" in text
+    assert "design_sweep.py" not in text
+    assert "model_facts.py" not in text
+
+
+def test_the_irreversible_phases_are_excluded_with_the_reason(tmp_path):
+    text = _instruction(tmp_path)
+    assert "irreversible" in text
+    assert "accept rate" in text
