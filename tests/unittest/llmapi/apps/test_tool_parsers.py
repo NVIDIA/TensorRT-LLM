@@ -5492,3 +5492,142 @@ class TestForcedToolArgumentsEnd:
             "location": "Hello",
             "unit": "fahrenheit",
         }
+
+
+class TestUnparsedToolCallWarning:
+    """A detected-but-unparsed tool call must leave a diagnostic in the logs.
+
+    When ``has_tool_call`` is true but the parser extracts zero calls, the
+    request still returns 200 with an empty ``tool_calls`` list, which a client
+    cannot tell apart from the model choosing not to call a tool (GitHub issue
+    #17917). The serving layer therefore logs one warning naming the
+    configured parser on the non-streaming path.
+    """
+
+    class _MarkupOnlyParser(BaseToolParser):
+        """Recognises its marker but never extracts a call."""
+
+        def __init__(self):
+            super().__init__()
+            self.bot_token = "<tool_call>"
+            self.eot_token = "</tool_call>"
+
+        def has_tool_call(self, text: str) -> bool:
+            return self.bot_token in text
+
+        def detect_and_parse(self, text: str, tools):
+            return StreamingParseResult(normal_text="", calls=[])
+
+        def parse_streaming_increment(self, new_text: str, tools):
+            return StreamingParseResult(normal_text="", calls=[])
+
+        def structure_info(self):
+            return lambda name: StructureInfo(
+                begin="<tool_call>", end="</tool_call>", trigger="<tool_call>")
+
+    _PARSER_NAME = "markup_only_test_parser"
+    _TEXT_WITH_MARKUP = "<tool_call><function=get_weather></function></tool_call>"
+
+    @pytest.fixture(autouse=True)
+    def _register_parser(self):
+        from unittest.mock import patch
+
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+
+        with patch.dict(ToolParserFactory.parsers,
+                        {self._PARSER_NAME: self._MarkupOnlyParser}):
+            yield
+
+    @staticmethod
+    def _chat_args(tool_parser):
+        from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
+
+        args = ChatPostprocArgs(role="assistant", model="test-model")
+        args.tool_parser = tool_parser
+        args.tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        return args
+
+    @staticmethod
+    def _patched_logger():
+        from unittest.mock import patch
+
+        return patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger")
+
+    def test_chat_non_streaming_warns_and_names_parser(self):
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            _, calls = apply_tool_parser(args,
+                                         0,
+                                         self._TEXT_WITH_MARKUP,
+                                         streaming=False)
+
+        assert calls == []
+        assert mock_logger.warning.call_count == 1
+        message = mock_logger.warning.call_args.args[0]
+        assert self._PARSER_NAME in message
+        assert "--tool_parser" in message
+
+    def test_chat_non_streaming_silent_without_markup(self):
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            apply_tool_parser(args, 0, "The weather is sunny.", streaming=False)
+
+        mock_logger.warning.assert_not_called()
+
+    def test_chat_non_streaming_silent_when_calls_extracted(self):
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args("qwen3")
+        text = ('<tool_call>{"name": "get_weather", '
+                '"arguments": {"location": "Paris"}}</tool_call>')
+        with self._patched_logger() as mock_logger:
+            _, calls = apply_tool_parser(args, 0, text, streaming=False)
+
+        assert len(calls) == 1
+        mock_logger.warning.assert_not_called()
+
+    def test_chat_streaming_path_is_out_of_scope(self):
+        from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
+
+        args = self._chat_args(self._PARSER_NAME)
+        with self._patched_logger() as mock_logger:
+            apply_tool_parser(args,
+                              0,
+                              self._TEXT_WITH_MARKUP,
+                              streaming=True,
+                              finished=True)
+
+        mock_logger.warning.assert_not_called()
+
+    def test_responses_non_streaming_warns_and_names_parser(self):
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with self._patched_logger() as mock_logger:
+            _, calls = _apply_tool_parser(self._PARSER_NAME,
+                                          tools,
+                                          0,
+                                          self._TEXT_WITH_MARKUP,
+                                          streaming=False)
+
+        assert calls == []
+        assert mock_logger.warning.call_count == 1
+        assert self._PARSER_NAME in mock_logger.warning.call_args.args[0]
+
+    def test_responses_non_streaming_silent_without_markup(self):
+        from tensorrt_llm.serve.responses_utils import _apply_tool_parser
+
+        tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
+        with self._patched_logger() as mock_logger:
+            _apply_tool_parser(self._PARSER_NAME,
+                               tools,
+                               0,
+                               "The weather is sunny.",
+                               streaming=False)
+
+        mock_logger.warning.assert_not_called()

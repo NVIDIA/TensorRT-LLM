@@ -13,6 +13,32 @@ from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 from .utils import find_common_prefix, is_complete_json, partial_json_loads
 
 
+def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
+                               text: str, calls: List[ToolCallItem]) -> None:
+    """Warn when tool-call markup was detected but no tool call was extracted.
+
+    Without this, a tool call the parser could not extract is indistinguishable
+    from a model that chose not to call a tool: the request returns 200 with an
+    empty ``tool_calls`` list and the call is silently lost (GitHub issue
+    #17917). Intended for the non-streaming path, where the full text is
+    available.
+    """
+    if calls:
+        return
+    try:
+        detected = tool_parser.has_tool_call(text)
+    except NotImplementedError:
+        return
+    if not detected:
+        return
+    logger.warning(
+        f"Tool parser '{parser_name}' detected tool-call markup but extracted "
+        "no tool calls; the response will carry an empty tool_calls list. "
+        "Likely causes: the parser does not match the model's chat template "
+        "(check --tool_parser), the output is malformed or truncated, the tool "
+        "block is empty, or the parser rejected the arguments.")
+
+
 class BaseToolParser(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
