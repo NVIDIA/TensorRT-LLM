@@ -11,27 +11,21 @@ The legacy TensorRT backend has been removed and is no longer supported. This pa
 
 ## Overview
 
+Historically, the **legacy** TensorRT build workflow contained two major steps:
 
-The build workflow contains two major steps.
+1. Create TensorRT-LLM checkpoint models from existing checkpoints exported by the training framework.
+2. Build those TensorRT-LLM models into TensorRT engines (via `trtllm-build` / `tensorrt_llm.build`).
 
-1. Create TensorRT-LLM models from existing model checkpoints exported by the training framework.
-2. Build the TensorRT-LLM models to TensorRT-LLM engines.
+Both steps, the per-model `convert_checkpoint.py` scripts, the `tensorrt_llm/models/<name>/` convert packages, and the `trtllm-build` CLI were **removed with the TensorRT backend**. Do not run convert/build commands from this page. For serving today, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html) or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) with a Hugging Face checkpoint (see also [TensorRT Backend Removed](../tensorrt-backend-removal.md) and [](checkpoint.md)).
 
-To generalize the TensorRT-LLM optimization features to all models, and to share the same workflow between different models for TensorRT-LLM users, TensorRT-LLM has conventions about how the models shall be defined and how the models shall be imported.
-
-TensorRT-LLM checkpoint convention is documented in [](checkpoint.md) and all decoder-only models had been migrated to adopt the convention. Model-specific convert_checkpoint.py scripts are shipped as source code in example directories, and a trtllm-build CLI tool had been added. However, there are some disadvantages of providing convert checkpoint scripts outside the core TensorRT-LLM lib as example:
-
-1. TensorRT-LLM evolves so quickly that the model's definition code might have changed for better performance; which means the `convert_checkpoint.py` is out of date.
+The remainder of this page is retained only to document how that legacy convert→build flow used to work and why conversion code was moved toward the core lib before the backend was retired.
 
 
-2. TensorRT-LLM is creating a new set of high-level APIs which handle model conversion, engine building, and inference in one class for easier-of-use. Thus, the high-level APIs need to call the weights conversion code, which shall be part of TensorRT-LLM core lib, not the example. And the conversion code of different models shall have same interface such that the high-level APIs do not need to add many ad-hoc code for different models.
+## Conversion APIs (legacy)
 
-To mitigate these issues, the model specific `convert_checkpoint.py` scripts are being refactored. Most of the conversion code will be moved into core lib, sitting next to the model definition. Refer to `tensorrt_llm/models/llama/` as an example. There is a new set of APIs for importing models and converting weights. The 0.9 release refactored the LLaMA model class to adopt the new APIs, others models' refactor work is ongoing.
+The conversion APIs below (`TopModelMixin.from_hugging_face`, `LLaMAForCausalLM`, and the deleted `tensorrt_llm/models/llama/` package) were part of the removed TensorRT engine workflow. They are **not** present on current `main`.
 
-
-## Conversion APIs
-
-The API for weight conversion of the LLaMA model looks like this. A `TopModelMixin` class is introduced, `from_hugging_face()` interface is declared, the `LLaMAForCausalLM` class inherits `TopModelMixin` (not direct parent class, but in its base class hierarchy), and implements the interface.
+Historically, the weight-conversion API for the LLaMA model looked like this. A `TopModelMixin` class declared `from_hugging_face()`; `LLaMAForCausalLM` inherited `TopModelMixin` (not a direct parent, but in its base class hierarchy) and implemented the interface:
 
 ```python
 class TopModelMixin
@@ -56,9 +50,7 @@ class LLaMAForCausalLM (DecoderModelForCausalLM):
 ```
 
 
-Then, in the convert_checkpoint.py script in the
-[`examples/models/core/llama/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama/) directory of the GitHub repo,
-the logic can be greatly simplified. Even if the model definition code of TensorRT-LLM LLaMA class is changed due to some reason, the `from_hugging_face` API will keep the same, thus the existing workflow using this interface will not be affected.
+Historically, a thin `convert_checkpoint.py` wrapper lived under the deleted `examples/models/core/llama/` tree and called this API. That example directory and script are gone with the TensorRT backend; the `from_hugging_face` / `save_checkpoint` helpers are likewise absent.
 
 
 ```python
@@ -77,8 +69,7 @@ In the 0.9 release, only LLaMA is refactored. Since popular LLaMA (and its varia
 
 
 In future releases, there might be `from_jax`, `from_nemo`, `from_keras` or other factory methods for different training checkpoints added.
-For example, the Gemma 2B model and the convert_checkpoint.py file in the [`examples/models/core/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gemma/)
-directory support JAX and Keras formats in addition to Hugging Face. The model developers can choose to implement **any subset** of these factory methods for the models they contributed to TensorRT-LLM.
+Historically, Gemma also shipped a per-model `convert_checkpoint.py` under [`examples/models/core/gemma`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gemma/) (that script is gone; the directory now only documents the PyTorch path). Additional factory methods (`from_jax`, `from_nemo`, …) were planned for the TensorRT convert packages and were never completed before the backend was removed.
 
 
 For some formats which are not supported by TensorRT-LLM model developers, you still have the freedom to implement your own weights conversion outside the core lib; the flow will look like this:
@@ -109,11 +100,10 @@ TensorRT-LLM relies on NVIDIA Modelopt toolkit to support some of the quantizati
 
 In TensorRT-LLM 0.8 version:
 
-* For Modelopt-supported quantization algorithms, a standalone script,
-  [example/quantization/quantize.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/quantization/quantize.py)
-  can export TensorRT-LLM checkpoints, and the trtllm-build command needs to be executed to build the checkpoints to engines.
+* For Modelopt-supported quantization algorithms, a standalone script
+  `examples/quantization/quantize.py` historically exported TensorRT-LLM checkpoints, and `trtllm-build` built those checkpoints into engines. That `quantize.py` entry point is **no longer in the tree** (the `examples/quantization/` folder now documents loading pre-quantized HF checkpoints on the PyTorch backend).
 
-* For the non-Modelopt quantization algorithms, users need to use the per-model convert_checkpoint.py scripts to export TensorRT-LLM checkpoints.
+* For non-Modelopt quantization algorithms, users historically used the per-model `convert_checkpoint.py` scripts (also removed) to export TensorRT-LLM checkpoints.
 
 Use the `quantize()` interface to unify the different quantization flows. The default implementation is added in the `PretrainedModel` class.
 
@@ -175,14 +165,14 @@ engine.save(engine_dir)
 ```
 
 
-The `examples/quantization/quantize.py` is kept for backward compatibility.
+The `examples/quantization/quantize.py` helper was kept for a while for backward compatibility and has since been removed with the TensorRT backend.
 
 
-## Build APIs
+## Build APIs (legacy)
 
+The `tensorrt_llm.build` API (and the removed `tensorrt_llm/builder.py` / `BuildConfig` engine-build path) built a TensorRT-LLM model object into a TensorRT engine. It replaced an even older flow that created a builder, network object, traced the model, and built engines. That API is **not** shipped on current `main` (`setup.py` console scripts are only `trtllm-bench`, `trtllm-serve`, and `trtllm-eval`).
 
-The `tensorrt_llm.build` API builds the TensorRT-LLM model object to TensorRT-LLM engine. This new API replaced the older flow: creating a builder, creating a network object, tracing the model to the network, and building TensorRT engines.
-The usage of this API looks like this:
+Historically, usage looked like this:
 
 ```python
 llama = ... # create LLaMAForCausalLM object
@@ -192,13 +182,13 @@ engine.save(engine_dir)
 ```
 
 
-The Llama object can be created by any method mentioned in the [](#conversion-apis) or [](#quantization-apis) sections.
+The Llama object can be created by any method mentioned in the [](#conversion-apis-legacy) or [](#quantization-apis) sections.
 
 
-The `trtllm-build` CLI tool is a thin wrapper around this `tensorrt_llm.build` API. The flags of the CLI tool are kept close to the fields of the `BuildConfig` class.
+The removed `trtllm-build` CLI was a thin wrapper around that `tensorrt_llm.build` API; its flags mirrored the fields of the legacy `BuildConfig` class.
 
 
-If a model were to be saved into disk and then built to the engine later, TensorRT-LLM provides a `from_checkpoint` API to deserialize the checkpoint.
+If a model had been saved to disk and then built to an engine later, the legacy stack provided a `from_checkpoint` API to deserialize the checkpoint.
 
 ```python
 ## TensorRT-LLM code
@@ -212,7 +202,7 @@ class PretrainedModel:
 ```
 
 
-The `from_checkpoint` API is called to deserialize the checkpoint to a model object.  The `tensorrt_llm.build` API can be called to build the engine.
+Historically, `from_checkpoint` deserialized the checkpoint to a model object, and `tensorrt_llm.build` built the engine.
 
 
 ```python
@@ -221,25 +211,12 @@ engine = build(llama, build_config)
 engine.save(engine_dir)
 ```
 
-## CLI Tools
+## CLI Tools (removed)
 
-All the weights conversion, quantization, and build APIs mentioned above have corresponding CLI tools for convenience.
+The conversion / quantization / build CLIs documented historically on this page are **gone** with the TensorRT backend:
 
-* Model specific `convert_checkpoint.py` scripts are inside the `examples/<model xxx>/` folder.
-* A unified quantization script is inside the `examples/quantization/quantize.py` and can be shared by all **supported** models.
-* A `trtllm-build` CLI tool builds all models from TensorRT-LLM checkpoint.
+* Per-model `convert_checkpoint.py` scripts under `examples/<model>/` — deleted (many model example trees were removed or reduced to PyTorch READMEs).
+* Unified `examples/quantization/quantize.py` — deleted.
+* `trtllm-build` — no longer a console script (`setup.py` ships only `trtllm-bench`, `trtllm-serve`, `trtllm-eval`).
 
-Refer to the following considerations for the CLI tools:
-
-* These scripts and tools should be used for scripting. Do not import the Python functions/class defined in these tools. TensorRT-LLM does not promise the content of these scripts can be compatible with previous versions. The options of these tools may also be changed when it’s not avoidable.
-
-* These scripts in the example folder may use TensorRT-LLM internal/unstable APIs, which is not guaranteed to work if the examples’ version and the TensorRT-LLM install version are mismatched. There are some GitHub issues caused by version mismatch.
-    - https://github.com/NVIDIA/TensorRT-LLM/issues/1293
-    - https://github.com/NVIDIA/TensorRT-LLM/issues/1252
-    - https://github.com/NVIDIA/TensorRT-LLM/issues/1079
-
-    You should always install the same TensorRT-LLM version specified in `examples/<model xxx>/requirements.txt`.
-
-* In the future, the per-model conversion script may or may not be unified to one single script shared by models, given the nature of different models’ attributes may be different. However, the TensorRT-LLM team will try to make sure the flags for the same feature are consistent between different scripts.
-
-* The TensorRT-LLM team encourages use of the new low-level conversion/quantization/build API instead of these scripts. The conversion APIs will be added model-by-model gradually, which may span a few releases.
+Do not import or run those tools. For current workflows, load Hugging Face (or other supported) checkpoints directly with `trtllm-serve` / the LLM API, and evaluate with `trtllm-eval`. See [TensorRT Backend Removed](../tensorrt-backend-removal.md).
