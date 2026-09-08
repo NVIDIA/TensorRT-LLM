@@ -614,7 +614,7 @@ void initRequestBindings(nb::module_& m)
             nb::cast<tle::PriorityType>(state[23]), nb::cast<tle::RequestType>(state[24]),
             nb::cast<std::optional<tle::ContextPhaseParams>>(state[25]),
             nb::cast<std::optional<tle::Tensor>>(state[26]), nb::cast<std::optional<SizeType32>>(state[27]),
-            nb::cast<std::optional<tle::Tensor>>(state[28]), 1, nb::cast<std::optional<tle::Tensor>>(state[29]),
+            nb::cast<std::optional<tle::Tensor>>(state[28]), nb::cast<std::optional<tle::Tensor>>(state[29]),
             nb::cast<std::optional<tle::GuidedDecodingParams>>(state[30]), std::nullopt, std::nullopt,
             nb::cast<std::optional<tle::IdType>>(state[31]), nb::cast<std::optional<std::string>>(state[32]));
     };
@@ -661,8 +661,7 @@ void initRequestBindings(nb::module_& m)
                 bool return_all_generated_tokens, tle::PriorityType priority, tle::RequestType type,
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
-                std::optional<tle::Tensor> cross_attention_mask, SizeType32 num_return_sequences,
-                std::optional<tle::Tensor> skip_cross_attn_blocks,
+                std::optional<tle::Tensor> cross_attention_mask, std::optional<tle::Tensor> skip_cross_attn_blocks,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
@@ -676,7 +675,7 @@ void initRequestBindings(nb::module_& m)
                     std::move(logits_post_processor_name), std::move(logits_post_processor),
                     std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
-                    std::move(cross_attention_mask), num_return_sequences, std::move(skip_cross_attn_blocks),
+                    std::move(cross_attention_mask), std::move(skip_cross_attn_blocks),
                     std::move(guided_decoding_params), language_adapter_uid, allotted_time_ms, disagg_request_id,
                     std::move(cache_salt));
             },
@@ -711,7 +710,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("encoder_input_features") = nb::none(),
         nb::arg("encoder_output_length") = nb::none(),
         nb::arg("cross_attention_mask") = nb::none(),
-        nb::arg("num_return_sequences") = 1,
         nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
