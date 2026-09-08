@@ -120,13 +120,24 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
     constexpr int kNumThreads = 8;
     constexpr int kIterations = 2000;
     std::atomic<int> nonZeroMatches{0};
+    // Start barrier: without it the scheduler may run the workers one after another, and the test
+    // would pass having never had two probes in flight at once -- which is the whole point.
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
     std::vector<std::thread> threads;
     threads.reserve(kNumThreads);
     for (int threadIndex = 0; threadIndex < kNumThreads; ++threadIndex)
     {
         threads.emplace_back(
-            [&manager, &tokens, &nonZeroMatches, threadIndex]
+            [&manager, &tokens, &nonZeroMatches, &ready, &go, threadIndex]
             {
+                ready.fetch_add(1, std::memory_order_relaxed);
+                // Bounded, so a worker cannot hang if the release never comes.
+                auto const goDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+                while (!go.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < goDeadline)
+                {
+                    std::this_thread::yield();
+                }
                 for (int iteration = 0; iteration < kIterations; ++iteration)
                 {
                     ReuseScope scope;
@@ -138,6 +149,17 @@ TEST(KvCacheManagerV2ConcurrencyTest, ConcurrentProbeReuseIsSafe)
                 }
             });
     }
+
+    auto const readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (ready.load(std::memory_order_relaxed) < kNumThreads && std::chrono::steady_clock::now() < readyDeadline)
+    {
+        std::this_thread::yield();
+    }
+    // EXPECT, not ASSERT: the workers are joinable, and returning here would terminate. Release
+    // unconditionally either way, so nobody waits on a barrier that never opens.
+    EXPECT_EQ(ready.load(), kNumThreads) << "not every prober reached the start barrier";
+    go.store(true, std::memory_order_release);
+
     for (auto& thread : threads)
     {
         thread.join();
