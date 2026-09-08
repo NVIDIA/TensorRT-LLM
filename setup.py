@@ -404,6 +404,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     os.symlink(os.path.abspath(src_file), dst_file)
                 else:
                     print(f"Copying {rel_path} from local directory.")
+                    # Drop a stale symlink from a prior link-mode run so
+                    # copy2 writes a real file instead of following the link
+                    # into the shared build tree.
+                    if os.path.islink(dst_file):
+                        os.unlink(dst_file)
                     shutil.copy2(src_file, dst_file)
 
         source_fmha = os.path.join(precompiled_location, "3rdparty",
