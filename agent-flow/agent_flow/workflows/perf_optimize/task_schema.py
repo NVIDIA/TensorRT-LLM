@@ -37,13 +37,13 @@ block (the base validator preserves unknown ``profile`` keys):
 - ``profile.kernel_coverage`` — optional; when present (an empty mapping
   is valid — all defaults) it activates the **per-kernel coverage
   contract**: the analyzer's ncu deep dive must cover every kernel
-  at/above ``min_share_pct`` of GPU time (extending down the kern_sum
-  until ``coverage_target_pct`` is reached), and every covered kernel
-  gets both of its questions — faster? fusible? — answered in a
-  schema-validated ``kernel_ledger.yaml`` each round (a roadmap item or
-  an evidence-backed dismissal per question). Requires ``nsys`` (the
-  enumeration source) and ``ncu`` (the per-kernel metrics) in
-  ``profile.methods``.
+  at/above ``min_share_pct`` of in-window GPU time (extending down the
+  nsys timeline decomposition until ``coverage_target_pct`` is reached),
+  and every covered kernel gets both of its questions — faster?
+  fusible? — answered in a schema-validated ``kernel_ledger.yaml`` each
+  round (a roadmap item or an evidence-backed dismissal per question).
+  Requires ``nsys`` (the enumeration source) and ``ncu`` (the per-kernel
+  metrics) in ``profile.methods``.
 
 Base validation is delegated to
 :func:`agent_flow.workflows.perf_analyze.task_schema.load_and_validate_task_yaml`
@@ -68,6 +68,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     has_slurm_environment,
     is_curve_mode,
     num_prompts_per_point,
+    profile_ranks,
     remote_run_root,
     sol_enabled,
 )
@@ -150,12 +151,13 @@ KNOWN_KERNEL_COVERAGE_KEYS: frozenset[str] = frozenset({"min_share_pct", "covera
 # present (its presence is the opt-in; absent ⇒ the bounded top-kernel
 # ncu dive, the historical behavior).
 KERNEL_COVERAGE_DEFAULTS: dict[str, Any] = {
-    # Every kernel at/above this share of profiled GPU time gets its own
-    # ledger row (and ncu coverage).
+    # Every kernel at/above this share of in-window GPU time gets its
+    # own ledger row (and ncu coverage).
     "min_share_pct": 0.5,
-    # The enumerated rows must cover at least this much of GPU time —
-    # when the >= min_share_pct rows fall short, enumeration extends
-    # down the kern_sum (grouping related kernels is fine) until met.
+    # The enumerated rows must cover at least this much of in-window GPU
+    # time — when the >= min_share_pct rows fall short, enumeration
+    # extends down the timeline decomposition (grouping related kernels
+    # is fine) until met.
     "coverage_target_pct": 95.0,
 }
 
@@ -332,8 +334,8 @@ def _validate_kernel_coverage(data: Mapping[str, Any], errors: list[str]) -> dic
     if missing:
         errors.append(
             f"'profile.kernel_coverage' requires {missing} in 'profile.methods' — "
-            f"the kernel enumeration comes from the nsys kern_sum and the "
-            f"per-kernel metrics from ncu"
+            f"the kernel enumeration comes from the nsys timeline "
+            f"decomposition and the per-kernel metrics from ncu"
         )
         return None
     return merged
@@ -549,6 +551,7 @@ __all__ = [
     "load_and_validate_task_yaml",
     "max_regression_pct",
     "num_prompts_per_point",
+    "profile_ranks",
     "remote_run_root",
     "sol_enabled",
 ]

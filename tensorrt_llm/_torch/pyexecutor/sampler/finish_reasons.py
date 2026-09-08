@@ -30,6 +30,7 @@ from tensorrt_llm.bindings.executor import FinishReason
 
 from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest
+from .ops.triton import MAX_FUSED_ELEMENTS_PER_REQUEST, fused_write_finish_reasons
 from .sampler_common import int_tensor
 
 __all__ = ["FinishReasonsHandler"]
@@ -129,6 +130,9 @@ class FinishReasonsHandler:
             self._max_num_stop_words,
             self._max_stop_word_length,
             self._max_num_sequences,
+        )
+        self._fused_tile_fits: bool = (
+            self._max_tokens * self._max_beam_width <= MAX_FUSED_ELEMENTS_PER_REQUEST
         )
         self._past_tokens_shape: tuple[int, int, int] = (
             self._max_stop_word_length - 1 + self._max_tokens,
@@ -635,6 +639,35 @@ class FinishReasonsHandler:
             )
         return num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only
 
+    def _can_fuse_finish_reasons(
+        self,
+        *,
+        seq_slots: torch.Tensor,
+        seq_lens: torch.Tensor,
+        new_tokens: torch.Tensor,
+        stop_word_indices: torch.Tensor | None,
+        first_finish_reasons: torch.Tensor | None,
+    ) -> bool:
+        """Return whether only end-ID and maximum-length checks are active.
+
+        The tensor layouts below are invariants the caller already guarantees,
+        so they are asserted rather than tested: a layout regression should be
+        loud, not a silent fallback to the ten-kernel path.
+        """
+        if stop_word_indices is not None or first_finish_reasons is not None:
+            return False
+        assert seq_slots.dim() == 1 and seq_slots.is_contiguous()
+        assert seq_lens.dim() == 1 and seq_lens.is_contiguous()
+        assert seq_lens.numel() == seq_slots.numel()
+        assert seq_slots.dtype == torch.int64 and seq_lens.dtype in (torch.int32, torch.int64)
+        assert new_tokens.is_contiguous()
+        assert new_tokens.shape == (
+            self._max_tokens,
+            self._max_num_sequences,
+            self._max_beam_width,
+        )
+        return self._fused_tile_fits and seq_slots.numel() > 0
+
     @nvtx_range("_write_finish_reasons")
     def _write_finish_reasons(
         self,
@@ -675,9 +708,31 @@ class FinishReasonsHandler:
         # Seq Slots should be on the same device as new_tokens
         assert seq_slots.device == new_tokens.device
         assert seq_lens.device == new_tokens.device
-        tokens = new_tokens[:, seq_slots]
 
         store = self.store
+        if self._can_fuse_finish_reasons(
+            seq_slots=seq_slots,
+            seq_lens=seq_lens,
+            new_tokens=new_tokens,
+            stop_word_indices=stop_word_indices,
+            first_finish_reasons=first_finish_reasons,
+        ):
+            fused_write_finish_reasons(
+                finish_reasons=store.finish_reasons_cuda,
+                new_tokens=new_tokens,
+                seq_slots=seq_slots,
+                seq_lens=seq_lens,
+                max_lengths=store.max_lengths_cuda,
+                end_ids=store.end_ids_cuda,
+                max_tokens=self._max_tokens,
+                beam_width=self._max_beam_width,
+                not_finished_value=FinishReason.NOT_FINISHED.value,
+                length_value=FinishReason.LENGTH.value,
+                end_id_value=FinishReason.END_ID.value,
+            )
+            return
+
+        tokens = new_tokens[:, seq_slots]
         finish_reasons = store.finish_reasons_cuda
 
         # we need to fill with NOT_FINISHED so we can differentiate between

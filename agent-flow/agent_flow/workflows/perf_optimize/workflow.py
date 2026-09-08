@@ -23,6 +23,7 @@ from agent_flow import (
 )
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
+from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
     output_instruction,
@@ -30,7 +31,7 @@ from agent_flow.workflows.perf_analyze.sol_methodology import (
 )
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
-from . import gitops, kernel_ledger, reuse, roadmap_schema
+from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
 from .progress import (
     EVALUATOR_DECISIONS,
@@ -70,6 +71,7 @@ from .task_schema import (
     kernel_coverage,
     load_and_validate_task_yaml,
     max_regression_pct,
+    profile_ranks,
     sol_enabled,
 )
 
@@ -488,6 +490,7 @@ class PerfOptimizeWorkflow:
                     roadmap = self._validate_roadmap()
                     if enforce_ledger:
                         self._validate_kernel_ledger(roadmap, analysis_dir)
+                    self._validate_nsys_items(roadmap, analysis_dir)
                     self._record_nsys_capture(state, analysis_dir)
                     if not replan_only and not state.reuse_pending:
                         # This round's evidence now describes the current
@@ -1702,6 +1705,36 @@ class PerfOptimizeWorkflow:
                 f"--clean to start over."
             )
 
+    def _validate_nsys_items(self, roadmap: dict[str, Any], analysis_dir: Path) -> None:
+        """Hold the roadmap to the timeline analysis's own opportunity list.
+
+        Self-gating on the artifact: enforced exactly when this round's
+        ``nsys_analysis/items.json`` exists. A round that could not run
+        the pipeline (nsys not requested, skill absent, export or
+        pipeline error) writes none and owes nothing here — its
+        *Caveats* line carries that. Raising leaves the checkpoint
+        parked at the analyzer, so re-running retries the stage.
+        """
+        items_file = nsys_items.items_path(analysis_dir)
+        if not items_file.is_file():
+            return
+        try:
+            item_ids = nsys_items.load_item_ids(items_file)
+        except nsys_items.NsysItemsError as exc:
+            raise RuntimeError(
+                f"analyzer stage finished but {exc}\nRe-run the workflow to retry "
+                f"the analyzer stage, or pass --clean to start over."
+            ) from exc
+        problems = nsys_items.cross_validate(roadmap, item_ids)
+        if problems:
+            bullet = "\n  - "
+            raise RuntimeError(
+                f"analyzer stage finished but {self.roadmap_path} does not account "
+                f"for {items_file}:{bullet}{bullet.join(problems)}\n"
+                f"Re-run the workflow to retry the analyzer stage, or pass "
+                f"--clean to start over."
+            )
+
     # ------------------------------------------------------------ shared lookups
 
     def _task_data(self) -> dict[str, Any]:
@@ -1785,6 +1818,10 @@ class PerfOptimizeWorkflow:
     def _accuracy_block(self) -> dict[str, Any] | None:
         block = self._task_data().get("accuracy")
         return block if isinstance(block, dict) else None
+
+    def _profile_ranks(self) -> tuple[int, ...]:
+        """The rank ids nsys must capture, from the resolved spec."""
+        return profile_ranks(self._task_data())
 
     def _profile_methods(self) -> tuple[str, ...]:
         """``profile.methods`` from the resolved spec, defensively defaulted.
@@ -2213,7 +2250,7 @@ class PerfOptimizeWorkflow:
             f"`--reuse-analysis {state.reuse_analysis_dir}`: a previous run's "
             f"analysis has been imported into this workspace, so **round 1 "
             f"skips profiling entirely**. Do **not** launch `trtllm-serve`, "
-            f"do **not** run nsys / ncu / the torch profiler, and do **not** "
+            f"do **not** run nsys / ncu, and do **not** "
             f"run the benchmark — every trace this round would have captured "
             f"is already on disk, and re-deriving it is exactly the cost the "
             f"reuse exists to avoid.\n\n"
@@ -2307,7 +2344,7 @@ class PerfOptimizeWorkflow:
             ledger_path = analysis_dir / kernel_ledger.LEDGER_FILENAME
             ncu_scope = (
                 f"under the **per-kernel coverage contract** in your system "
-                f"prompt (it supersedes Run C's top-kernel targeting): "
+                f"prompt (it supersedes Run B's top-kernel targeting): "
                 f"enumerate every kernel at/above "
                 f"{coverage['min_share_pct']}% of GPU time from the fresh "
                 f"kern_sum (extend until "
@@ -2389,20 +2426,47 @@ class PerfOptimizeWorkflow:
             )
             + f", and drive "
             f"nsys from the **canonical `nsys profile` command in your system "
-            f"prompt** (don't improvise nsys flags). Then run the **ncu "
-            f"per-kernel deep dive** (Run C in your system prompt) — load "
+            f"prompt** (don't improvise nsys flags). "
+            f"{profile_ranks_note(self._profile_ranks())} Then **decompose that "
+            f"timeline with the `internal-perf-nsight-system-analysis` skill** (via "
+            f"the `Skill` tool; fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
+            f"name is not found), per your system prompt's Run A step 5: "
+            f"export the report with `nsys export --type sqlite`, run the "
+            f"skill's `run_all.py` single-variant into "
+            f"`{analysis_dir}/nsys_analysis`, and report the *nsys timeline* "
+            f"section from what it produces — per-iteration time, the "
+            f"busy/idle rungs, and the compute-absent split (launch-starved "
+            f"/ blocking / dependency-stalled) — not from the `nsys stats` "
+            f"table alone; an item aimed at host exposure and one aimed at a "
+            f"slow kernel are ranked from different numbers. Once that timing "
+            f"pass lands, take the two **Run A2** nsys passes from your system "
+            f"prompt as separate captures — `--gpu-metrics-devices` / "
+            f"`--gpu-metrics-frequency` for per-operator utilization, and the "
+            f"backtrace flags for call sites — never folded into the timing "
+            f"pass, and skipped gracefully (reason under *Caveats*) rather "
+            f"than fabricated; when A2a lands, re-run the skill's "
+            f"`run_all.py` with `--metrics-profile` pointed at its sqlite so "
+            f"the utilization bullet comes from the pipeline too (it re-reads "
+            f"files only — no server, no GPU). Verify the taxonomy and author "
+            f"`{analysis_dir}/nsys_analysis/items.json` as your system prompt's "
+            f"Run A step 5 requires, then account for every id it carries in "
+            f"`roadmap.yaml`'s `nsys_items` block — this stage does not pass "
+            f"until it does. Then run the **ncu "
+            f"per-kernel deep dive** (Run B in your system prompt) — load "
             f"the `perf-nsight-compute-analysis` skill "
             f"(via the `Skill` tool; fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if the bare "
             f"name is not found) as the capture + interpretation "
             f"methodology — {ncu_scope}. Save the traces, `nsys stats` "
-            f"output, and {ncu_artifacts} under "
+            f"output, the `nsys_analysis/` directory, and {ncu_artifacts} "
+            f"under "
             f"`{analysis_dir}`. Tear every server "
             f"down.\n\n"
             f"Do **all** of this within this single turn — poll readiness in "
             f"the foreground and do not yield to a background poll.\n\n"
             f"`Write` `{analysis_dir / 'profile_findings.md'}` (Profiling "
-            f"setup / nsys timeline / Torch profiler / ncu kernel analysis / "
+            f"setup / nsys timeline / ncu kernel analysis / "
             + ("SOL correlation / " if self._sol_enabled() else "")
             + f"Ranked bottleneck "
             f"hypotheses / Caveats), then `Write` the updated "
@@ -2467,7 +2531,7 @@ class PerfOptimizeWorkflow:
             f"still the state the analysis in `{profiled_dir}` describes. "
             f"Do **not** launch "
             f"`trtllm-serve`, "
-            f"do **not** run nsys / ncu / the torch profiler, and do **not** "
+            f"do **not** run nsys / ncu, and do **not** "
             f"run the benchmark: a fresh profile of an unchanged build "
             f"would reproduce those traces at full GPU cost. Plan from them "
             f"instead.\n\n"
@@ -2637,11 +2701,22 @@ class PerfOptimizeWorkflow:
             return ""
         profile_dir = self._attempt_dir(state) / "profile"
         if state.last_nsys_dir:
+            decompose = (
+                f"its `run_all.py` **comparative** — `--variant before` on the "
+                f"`.sqlite` under `{state.last_nsys_dir}` and `--variant after` "
+                f"on this capture's, reusing that directory's `taxonomy.json` "
+                f"so both sides classify identically — into "
+                f"`{profile_dir}/nsys_analysis`, whose `difference/rank-0/` "
+                f"holds the signed per-iteration and module-slice deltas "
+                f"(single-variant, compared by hand, only if that capture kept "
+                f"no `.sqlite`)"
+            )
             compare = (
-                f"compare it against the previous capture of the accepted "
-                f"state at `{state.last_nsys_dir}`"
+                f"report those deltas against the previous capture of the "
+                f"accepted state at `{state.last_nsys_dir}`"
             )
         else:
+            decompose = f"its `run_all.py` single-variant into `{profile_dir}/nsys_analysis`"
             compare = (
                 "there is no previous capture to compare against — report "
                 "this capture's kernel picture on its own"
@@ -2660,7 +2735,14 @@ class PerfOptimizeWorkflow:
             f"under the canonical `nsys profile` wrap, replay the canonical "
             f"load once{curve_note}, tear down, and save the `.nsys-rep`, "
             f"the `nsys stats` output as `nsys_stats.txt`, and the replay "
-            f"log into `{profile_dir}`. In `evaluation.md`'s *Kernel "
+            f"log into `{profile_dir}`. Then **decompose that capture with "
+            f"the `internal-perf-nsight-system-analysis` skill** (via the `Skill` "
+            f"tool; fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
+            f"name is not found) as your system prompt directs — `nsys "
+            f"export --type sqlite`, then {decompose} — so the mechanism check "
+            f"below rests on a measured per-iteration budget rather than an "
+            f"eyeballed one. In `evaluation.md`'s *Kernel "
             f"evidence* section, {compare}, and state whether the item's "
             f"claimed mechanism is visible in the trace. On REJECT or "
             f"PUSH_BACK, skip the capture entirely.\n\n"
