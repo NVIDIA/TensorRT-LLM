@@ -964,8 +964,18 @@ def _causal_conv1d_update_kernel(
             )
 
 
-_PACKED_CONV_ENABLED = os.environ.get("TRTLLM_GDN_CONV_PACKED", "0") == "1"
-_PACKED_CONV_REQUIRE_EVEN = os.environ.get("TRTLLM_GDN_CONV_PACKED_EVEN_ONLY", "1") == "1"
+# Minimum compute capability for the packed path. Its kernels emit 256-bit
+# wide loads/stores, which ptxas rejects outright below sm_100 ("Feature
+# '256 bit wide load/store' requires .target sm_100 or higher"). On sm_90 the
+# bands that do still compile lose to the kernel below from batch 63 up
+# (0.97x at 63/64, 0.92x at 96, 0.79x at 127), so there is nothing to fall
+# back to there either.
+_PACKED_CONV_MIN_SM = 100
+
+# Tri-state: unset selects the packed path wherever the guard admits it, which
+# on sm_100+ is everywhere it is also faster (1.10-1.77x, measured over
+# batch 1-1024 with no batch slower). "0" forces it off, "1" forces it on.
+_PACKED_CONV_ENABLED = os.environ.get("TRTLLM_GDN_CONV_PACKED", "1") == "1"
 
 
 def _packed_conv_applicable(
@@ -987,16 +997,12 @@ def _packed_conv_applicable(
     retrieve_next_token,
 ):
     """Host-side contract check for the packed conv path. No device sync."""
+    if get_sm_version() < _PACKED_CONV_MIN_SM:
+        return False
     # Shape/dtype contract the kernel bakes in (strides 12288 / 36864 hardcoded).
     if (dim, seqlen, state_len, width) != (4096, 3, 3, 4):
         return False
     if x.dtype != torch.bfloat16 or conv_state.dtype != torch.bfloat16:
-        return False
-    # Defense in depth: an earlier revision of this kernel used a batch//2 grid
-    # that silently dropped the last sequence at odd batch >= 128. Every
-    # CUDA-graph-captured decode batch is even (or 1), so refusing odd large
-    # batches costs nothing on the hot path.
-    if _PACKED_CONV_REQUIRE_EVEN and batch >= 128 and batch % 2 != 0:
         return False
     if activation not in ("silu", "swish"):
         return False

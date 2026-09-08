@@ -14,17 +14,19 @@
 # limitations under the License.
 """Tests for the packed GDN causal-conv1d-update fast path.
 
-The fast path is opt-in (``TRTLLM_GDN_CONV_PACKED=1``) and only engages on the exact
-contract it was written for. These tests pin both halves of that: the guard
-predicate must reject everything outside the contract, and inside the contract the
-fast path must agree with the shipped Triton kernel on all three results (``out``
-plus the two in-place mutated state tensors).
+The fast path engages automatically wherever its guard admits, which is the
+exact contract it was written for on sm_100 and above. These tests pin both
+halves of that: the guard predicate must reject everything outside the
+contract, and inside the contract the fast path must agree with the shipped
+Triton kernel on all three results (``out`` plus the two in-place mutated
+state tensors).
 """
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.mamba import causal_conv1d_triton as ccu
+from tensorrt_llm._utils import get_sm_version
 
 # Production GDN decode shape for Qwen3.6-35B-A3B at TP2.
 DIM = 4096
@@ -33,8 +35,8 @@ STATE_LEN = 3
 WIDTH = 4
 
 skip_unsupported = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="Requires CUDA",
+    not torch.cuda.is_available() or get_sm_version() < ccu._PACKED_CONV_MIN_SM,
+    reason=f"Packed GDN conv path requires CUDA and sm_{ccu._PACKED_CONV_MIN_SM}+",
 )
 
 
@@ -243,6 +245,29 @@ class TestGdnConvPackedGuard:
             t["weight"],
             t["bias"],
             None,
+            8,
+            DIM,
+            SEQLEN,
+            STATE_LEN,
+            WIDTH,
+            None,
+            t["conv_state_indices"],
+            None,
+            t["intermediate_conv_window"],
+            t["intermediate_state_indices"],
+            None,
+        )
+
+    def test_rejects_below_min_sm(self, monkeypatch):
+        """The kernels emit 256-bit accesses that ptxas rejects below sm_100."""
+        t = _make(8)
+        monkeypatch.setattr(ccu, "get_sm_version", lambda: ccu._PACKED_CONV_MIN_SM - 10)
+        assert not ccu._packed_conv_applicable(
+            t["x"],
+            t["conv_state"],
+            t["weight"],
+            t["bias"],
+            "silu",
             8,
             DIM,
             SEQLEN,
