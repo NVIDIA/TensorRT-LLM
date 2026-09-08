@@ -31,6 +31,7 @@ def test_minimal_task_gets_all_defaults(tmp_path):
         "max_rounds": 5,
         "max_attempts_per_item": 3,
         "max_items_per_round": 3,
+        "item_execution": "parallel",
         "approaches": ["config", "code"],
         "accept_fraction": 0.5,
         "noise_floor_pct": 1.0,
@@ -74,6 +75,19 @@ def test_user_approaches_value_wins_over_default(tmp_path):
         task = _write_task(tmp_path, {"optimize": {"approaches": value}})
         data = task_schema.load_and_validate_task_yaml(task)
         assert data["optimize"]["approaches"] == value
+
+
+def test_item_execution_accepts_serial_and_parallel(tmp_path):
+    for value in task_schema.ITEM_EXECUTIONS:
+        task = _write_task(tmp_path, {"optimize": {"item_execution": value}})
+        data = task_schema.load_and_validate_task_yaml(task)
+        assert data["optimize"]["item_execution"] == value
+
+
+def test_invalid_item_execution_rejected(tmp_path):
+    task = _write_task(tmp_path, {"optimize": {"item_execution": "threads"}})
+    with pytest.raises(task_schema.TaskSchemaError, match="optimize.item_execution"):
+        task_schema.load_and_validate_task_yaml(task)
 
 
 def test_invalid_approaches_rejected(tmp_path):
@@ -518,6 +532,7 @@ def test_the_census_matches_a_fully_populated_spec(tmp_path):
                 "max_rounds": 2,
                 "max_items_per_round": 1,
                 "max_attempts_per_item": 1,
+                "item_execution": "serial",
                 "approaches": ["config"],
                 "accept_fraction": 0.5,
                 "noise_floor_pct": 1.0,

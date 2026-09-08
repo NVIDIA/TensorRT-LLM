@@ -178,7 +178,7 @@ protected:
         tensorrt_llm::executor::PriorityType priority = tensorrt_llm::executor::Request::kDefaultPriority,
         LlmRequestState state = LlmRequestState::kCONTEXT_INIT)
     {
-        tensorrt_llm::runtime::SamplingConfig samplingConfig;
+        tensorrt_llm::executor::SamplingConfig samplingConfig;
         uint64_t reqId = optionalReqId.value_or((rand() % INT64_MAX) + 1);
         auto req = std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, false);
         req->setPriority(priority);
@@ -387,7 +387,7 @@ int runTest(CapacityScheduler& capacityScheduler,
             if (llmReq->isDisaggGenerationInitState())
             {
                 kvCacheManager->addSequenceBatch(
-                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth}}},
+                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.getBeamWidth()}}},
                     {std::ref(*llmReq)});
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 llmReq->setContextCurrentPosition(llmReq->mPromptLen);
@@ -412,11 +412,12 @@ int runTest(CapacityScheduler& capacityScheduler,
                 {
                     // We need to perform initialization work for the first context chunk.
                     kvCacheManager->addSequenceBatch(
-                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth}}}, {std::ref(*llmReq)});
+                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.getBeamWidth()}}},
+                        {std::ref(*llmReq)});
                     if (crossKvCacheManager)
                     {
-                        crossKvCacheManager->addSequenceBatch(
-                            {{{llmReq->mRequestId, llmReq->getEncoderOutputLen(), llmReq->mSamplingConfig.beamWidth}}},
+                        crossKvCacheManager->addSequenceBatch({{{llmReq->mRequestId, llmReq->getEncoderOutputLen(),
+                                                                  llmReq->mSamplingConfig.getBeamWidth()}}},
                             {std::ref(*llmReq)});
                     }
                 }
@@ -851,7 +852,7 @@ TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
         auto pendingReq = createRequest(promptLen, maxNewTokens, 1, std::nullopt,
             tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
         kvCacheManager->addSequenceBatch(
-            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.getBeamWidth()}}},
             {std::ref(*transferReq)});
 
         RequestList saturatedActiveRequests{transferReq, pendingReq};
@@ -1935,7 +1936,8 @@ TEST_F(CapacitySchedulerTest, MaxUtilizationPauseRetryDoesNotSelfSkip)
     std::iota(genTokens->begin(), genTokens->end(), 1000); // distinct prefix: not a duplicate of A/B
     auto requestG = createRequest(genTokens, /*maxNewTokens=*/5, /*optionalReqId=*/2);
     kvCacheManager->addSequenceBatch(
-        {{{requestG->mRequestId, requestG->mPromptLen, requestG->mSamplingConfig.beamWidth}}}, {std::ref(*requestG)});
+        {{{requestG->mRequestId, requestG->mPromptLen, requestG->mSamplingConfig.getBeamWidth()}}},
+        {std::ref(*requestG)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*requestG);
     requestG->addNewTokens({7});
     requestG->setState(LlmRequestState::kGENERATION_IN_PROGRESS);

@@ -156,6 +156,26 @@ _MX_CASES = (
         id="qwen3-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_MISTRAL_MODEL",
+            default_model_subdir="Mistral-7B-Instruct-v0.3",
+            repository_cache_prefix="models--trtllm-mx-e2e--mistral-tp1",
+            tp_size=1,
+        ),
+        id="mistral-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_MISTRAL_MODEL",
+            default_model_subdir="Mistral-7B-Instruct-v0.3",
+            repository_cache_prefix="models--trtllm-mx-e2e--mistral-tp2",
+            tp_size=2,
+        ),
+        id="mistral-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
 )
 
 

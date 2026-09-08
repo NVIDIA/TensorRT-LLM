@@ -259,7 +259,10 @@ class KVCacheManager:
         self,
         config: KVCacheManagerConfig,
         event_manager: "KVCacheEventManager | None" = None,
+        cold_page_codec: object | None = None,
     ) -> None:
+        if cold_page_codec is not None:
+            raise NotImplementedError("Cold-page codecs require the C++ KVCacheManagerV2 backend")
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
@@ -477,7 +480,12 @@ class KVCacheManager:
     def _match_reuse(
         self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
     ) -> ReuseMatch:
-        return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
+        return self._radix_tree.match(
+            reuse_scope,
+            input_tokens,
+            self.enable_partial_match,
+            self.init_config.reuse_match_backoff,
+        )
 
     def probe_reuse(
         self,

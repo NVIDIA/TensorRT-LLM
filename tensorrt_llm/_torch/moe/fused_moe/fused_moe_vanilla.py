@@ -13,6 +13,8 @@ from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp4_utils
 
+from .activation import (DEFAULT_MOE_ACTIVATION, MoEActivation,
+                         MoEActivationSupport, install_activation_params)
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
                             MoERejectReason, MoEStaticCapability)
 from .interface import MoEWeightLoadingMode, _reject
@@ -23,6 +25,11 @@ class VanillaMoE(nn.ModuleList):
 
     #: Declared explicitly because the resolver may return this ModuleList.
     capabilities = MoEStaticCapability()
+
+    # What ``forward_chunk`` executes: the gated arm via ``GatedMLP`` (SiLU),
+    # and the non-gated Relu2 arm.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2}))
 
     #: Quantization labels supported by the Linear dispatcher.
     _SUPPORTED_QUANT_LABELS = frozenset({
@@ -98,7 +105,7 @@ class VanillaMoE(nn.ModuleList):
         apply_router_weight_on_input: bool = False,
         pack_weights: bool = False,
         layer_idx: Optional[int] = None,
-        activation_type: ActivationType = ActivationType.Swiglu,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     ):
         from tensorrt_llm._torch.distributed import AllReduce
 
@@ -111,8 +118,9 @@ class VanillaMoE(nn.ModuleList):
         self.pack_weights = pack_weights
         self.layer_idx = layer_idx
 
-        self.activation_type = activation_type
-        self.is_gated_activation = is_gated_activation(activation_type)
+        self.activation = activation
+        self.activation_type = ActivationType(activation.kind)
+        self.is_gated_activation = is_gated_activation(activation.kind)
         # Activation eligibility (gated vs Relu2-only non-gated) is owned by
         # ``can_implement``. ``pack_weights`` is a construction option that is
         # not part of the problem/deployment question, so keep it here.
@@ -159,6 +167,8 @@ class VanillaMoE(nn.ModuleList):
             self.num_experts)
         self.expert_size_per_partition = self.expert_end - self.expert_start
 
+        install_activation_params(self)
+
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
@@ -167,7 +177,10 @@ class VanillaMoE(nn.ModuleList):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
-        # If True, the router weight will be multiplied on the input rather than at the end of FC2
+        # Stored but never read: no path here folds the router weight into the
+        # input, which is why ``capabilities`` leaves
+        # ``supports_apply_router_weight_on_input`` at False and the factory
+        # rejects a True before construction.
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
     def create_experts(self, module_list: nn.ModuleList = None):

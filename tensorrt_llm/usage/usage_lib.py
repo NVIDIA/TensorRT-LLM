@@ -930,6 +930,11 @@ class _TelemetrySession:
         with self.lock:
             return self._snapshot_unlocked()
 
+    def get_observed_signal(self) -> int:
+        """Return the observed signal without building a full snapshot."""
+        with self.lock:
+            return self.observed_signal
+
     def claim_terminal(
         self, outcome: TerminalOutcome
     ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
@@ -1292,10 +1297,7 @@ def record_termination_observation(
 
 def get_observed_signal() -> int:
     """Return the signal observed by the current process, if any."""
-    return _session_call(
-        lambda session: int(session.snapshot()["observedSignal"]),
-        0,
-    )
+    return _session_call(lambda session: session.get_observed_signal(), 0)
 
 
 def _send_if_session_active(

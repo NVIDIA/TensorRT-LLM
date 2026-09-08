@@ -92,14 +92,14 @@ def terminal_mocks():
             _telemetry.usage, "apply_usage_session_config", return_value=True
         ) as apply_config,
         patch.object(_telemetry.usage, "set_lifecycle_phase") as set_phase,
-        patch.object(_telemetry.usage, "get_observed_signal", return_value=0) as signal,
+        patch.object(_telemetry.usage, "get_observed_signal", return_value=0) as observed_signal,
         patch.object(_telemetry.usage, "record_observed_signal") as record_signal,
         patch.object(_telemetry.usage, "report_exit") as report_exit,
     ):
         yield SimpleNamespace(
             apply_config=apply_config,
             set_phase=set_phase,
-            signal=signal,
+            signal=observed_signal,
             record_signal=record_signal,
             report_exit=report_exit,
         )

@@ -618,8 +618,11 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
             # consume the checkpoint's packed FP4 weights and static input scales.
             dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
-            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
-                if convert_to_nvfp4:
+            if dense_mlp_match and cfg.quant_algo in (
+                QuantAlgo.W4A16_NVFP4,
+                QuantAlgo.NVFP4,
+            ):
+                if convert_to_nvfp4 and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 proj = dense_mlp_match.group(1)
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"

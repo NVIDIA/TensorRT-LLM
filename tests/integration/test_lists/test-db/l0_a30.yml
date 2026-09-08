@@ -14,7 +14,6 @@ l0_a30:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/modeling -k "modeling_nemotron_nas"
   - unittest/_torch/modeling -k "modeling_qwen3"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   - unittest/_torch/modeling -k "modeling_speculative"
@@ -40,6 +39,7 @@ l0_a30:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+  - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[80]
 - condition:
     ranges:
       system_gpu_count:
