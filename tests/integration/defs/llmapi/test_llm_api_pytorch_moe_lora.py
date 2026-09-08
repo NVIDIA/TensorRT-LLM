@@ -119,13 +119,15 @@ def _run_routed_expert_multi_lora(
 ) -> None:
     """Serve a MoE checkpoint with routed-expert LoRA and assert it applies.
 
-    The batch mixes a no-LoRA (rank-0) request with every adapter, asserting each
-    adapter moves the logits away from the no-LoRA row of that same batch and
-    that no two adapters land on the same value. Comparisons stay within one
+    The batch mixes two no-LoRA (rank-0) requests with every adapter, asserting
+    each adapter moves the logits away from the no-LoRA rows of that same batch
+    and that no two adapters land on the same value. Comparisons stay within one
     batch because batch width and first-call effects each shift the logits on
-    their own. With a CUDA graph the decode takes the slot-indexed input schema;
-    without one it takes the per-request schema. Both feed the same grouped-GEMM
-    LoRA core.
+    their own; the second no-LoRA row measures that batch's own noise floor, so
+    the thresholds are checked against the run rather than trusted from a past
+    calibration. With a CUDA graph the decode takes the slot-indexed input
+    schema; without one it takes the per-request schema. Both feed the same
+    grouped-GEMM LoRA core.
     """
     cache_config = {}
     if preallocate_all_adapters:
@@ -174,8 +176,15 @@ def _run_routed_expert_multi_lora(
         # reproducible rather than incidental.
         min_adapter_delta = 5e-3
 
-        # Row 0 is the no-LoRA baseline; rows 1.. are one per adapter.
-        requests = [None] + [
+        # Rows 0 and 1 are both no-LoRA; rows 2.. are one per adapter. Two
+        # baseline rows, not one, so the batch measures its own noise floor: every
+        # other assertion here is relative to the no-LoRA logprob, which makes that
+        # row the one thing nothing else can check. Two of them turn both failure
+        # modes into explicit, self-diagnosing errors -- a threshold that drifted
+        # after a kernel or sampler change, and an adapter leaking into a no-LoRA
+        # slot (which would move the baseline and quietly rescale every delta
+        # below).
+        requests = [None, None] + [
             LoRARequest(f"moe-lora-{i}", i, path) for i, path in enumerate(lora_paths)
         ]
         outputs = [
@@ -186,7 +195,16 @@ def _run_routed_expert_multi_lora(
             assert output.token_ids, f"Row {i} produced no tokens."
 
         base_first_logprob = outputs[0].logprobs[0]
-        adapter_logprobs = [o.logprobs[0] for o in outputs[1:]]
+        base_spread = abs(outputs[1].logprobs[0] - base_first_logprob)
+        assert base_spread < min_adapter_delta / 4, (
+            f"The two no-LoRA rows disagree by {base_spread:.3e}, which is not far "
+            f"enough below min_adapter_delta={min_adapter_delta:.0e} for the "
+            "adapter checks to mean anything. Either the batch noise floor has "
+            "risen (retune min_adapter_delta against it) or an adapter is leaking "
+            "into a no-LoRA slot."
+        )
+
+        adapter_logprobs = [o.logprobs[0] for o in outputs[2:]]
         for i, adapter_logprob in enumerate(adapter_logprobs):
             adapter_delta = abs(adapter_logprob - base_first_logprob)
             assert adapter_delta > min_adapter_delta, (
@@ -197,11 +215,18 @@ def _run_routed_expert_multi_lora(
 
         # Distinct adapters must not collapse onto one another: a slot-table bug
         # that pointed every token at one adapter's weights would still clear the
-        # per-adapter check above.
-        assert len(set(adapter_logprobs)) == len(adapter_logprobs), (
-            "Two routed-expert MoE LoRA adapters produced an identical first-token "
-            f"logprob {adapter_logprobs}; the slot tables likely collapsed onto one adapter."
-        )
+        # per-adapter check above. Compare against a threshold rather than for
+        # exact inequality -- a confident greedy first token drives the sampled
+        # logprob toward 0.0, where two genuinely-applied adapters can round to the
+        # same representable value and fail this for no reason.
+        for a in range(len(adapter_logprobs)):
+            for b in range(a + 1, len(adapter_logprobs)):
+                separation = abs(adapter_logprobs[a] - adapter_logprobs[b])
+                assert separation > min_adapter_delta / 4, (
+                    f"Adapters {a} and {b} produced first-token logprobs "
+                    f"{adapter_logprobs[a]} vs {adapter_logprobs[b]} (apart by "
+                    f"{separation:.3e}); the slot tables likely collapsed onto one adapter."
+                )
     finally:
         llm.shutdown()
 

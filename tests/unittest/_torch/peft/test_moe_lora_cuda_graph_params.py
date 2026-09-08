@@ -183,11 +183,17 @@ def test_update_weight_pointers_masks_ranks_for_uncovered_layers():
         max_lora_size=1, max_rank=rank, max_batch_size=1, layer_idxs=(bare_layer, covered_layer)
     )
 
-    # Create the caches first so update_weight_pointers takes its in-place
-    # refresh path, the one a captured graph replays against.
-    for layer_idx in (bare_layer, covered_layer):
-        for module_id in module_ids:
-            params.get_moe_slot_inputs(layer_idx, module_id)
+    # Hold the tables from *before* the update and assert on those objects. A
+    # captured graph replays against these exact buffers by address and never
+    # re-enters Python, so reading them back through get_moe_slot_inputs
+    # afterwards would test the getter instead: if that call refreshed, this test
+    # would pass even with the refresh removed from update_weight_pointers, while
+    # replay used stale tables.
+    cached = {
+        (layer_idx, module_id): params.get_moe_slot_inputs(layer_idx, module_id)
+        for layer_idx in (bare_layer, covered_layer)
+        for module_id in module_ids
+    }
 
     task_id = 7
     peft_configs = [
@@ -203,14 +209,15 @@ def test_update_weight_pointers_masks_ranks_for_uncovered_layers():
     params.update_weight_pointers({task_id: peft_configs}, (task_id,))
 
     for module_id in module_ids:
-        assert params.get_moe_slot_inputs(covered_layer, module_id)[0][0].item() == rank
-        assert params.get_moe_slot_inputs(bare_layer, module_id)[0][0].item() == 0
+        assert cached[(covered_layer, module_id)][0][0].item() == rank
+        assert cached[(bare_layer, module_id)][0][0].item() == 0
 
 
 @requires_cuda
 def test_get_moe_slot_inputs_packed_buffer_is_address_stable():
     """The packed (A, B, dora) buffer must be cached per (layer, module) so its
-    data_ptr() is stable across calls, which is required for CUDA-graph capture."""
+    data_ptr() is stable across calls *and* across an update, which is what
+    CUDA-graph capture records."""
     rank = 4
     params, key, module_ids = _make_params(max_lora_size=2, max_rank=rank)
     _populate_pointers(params, key, module_ids, rank)
@@ -220,14 +227,38 @@ def test_get_moe_slot_inputs_packed_buffer_is_address_stable():
     first_ptr = packed_first.data_ptr()
     first_ranks_ptr = ranks_first.data_ptr()
 
-    # Reassign a slot's pointers in place and re-extract; same backing buffer.
-    params.layer_params[key].h_b_ptrs[0, 0] = _fake_ptr(mid, 0, 0) + 777
+    # Re-point slot 0 through update_weight_pointers, the only thing that writes
+    # the host pointer tables in production. Poking layer_params directly and
+    # re-reading would instead assert that the getter refreshes -- which it
+    # deliberately no longer does, so that a missing refresh in the writer cannot
+    # hide behind a read.
+    task_id = 3
+    moved = _fake_ptr(mid, 0, 0) + 777
+    params.update_weight_pointers(
+        {
+            task_id: [
+                SimpleNamespace(
+                    layer_id=0,
+                    module_id=module_id,
+                    adapter_size=rank,
+                    weights_in_pointer=(moved if module_id == mid else _fake_ptr(module_id, 0, 0)),
+                    weights_out_pointer=_fake_ptr(module_id, 0, 1),
+                )
+                for module_id in module_ids
+            ]
+        },
+        (task_id, None),
+    )
+
     ranks_second, packed_second = params.get_moe_slot_inputs(layer_idx=0, module_id=mid)
+    # Same backing buffers -- a captured graph replays against these addresses.
     assert packed_second.data_ptr() == first_ptr
-    assert packed_second[0, 0].item() == _fake_ptr(mid, 0, 0) + 777
     # The masked rank table is likewise cached, since the captured H2D copy reads
     # it by address at replay.
     assert ranks_second.data_ptr() == first_ranks_ptr
+    # ...and the update reached them in place.
+    assert packed_second[0, 0].item() == moved
+    assert ranks_second[0].item() == rank
 
 
 @requires_cuda
