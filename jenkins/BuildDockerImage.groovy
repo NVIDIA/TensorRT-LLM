@@ -88,7 +88,7 @@ def globalVars = [
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
-    (MAINTENANCE_ENTRIES): [],
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
 ]
 
 @Field

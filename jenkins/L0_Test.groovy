@@ -2942,35 +2942,22 @@ String getTestReuseStagePattern(String stageName) {
     return "${stageNamePrefix}-[0-9]+(-cbts)?"
 }
 
-def findMaintenanceEntry(String stageName, List entries) {
-    def key = stageName.endsWith(CBTS_STAGE_SUFFIX) ?
-        stageName.substring(0, stageName.length() - CBTS_STAGE_SUFFIX.length()) : stageName
-    return (entries ?: []).find { entry ->
-        stageMatchesPattern(key, entry.pattern.toString())
-    }
-}
-
-def failMaintenanceStage(String stageName, Map entry) {
-    GlobalState.maintenanceSkips.add([
-        stage: stageName,
-        pattern: entry.pattern,
-        reason: entry.reason,
-    ])
+def failMaintenanceStage(String stageName, String reason) {
+    GlobalState.maintenanceSkips.add(stageName)
     echo "Skip - Resource maintenance is in progress. No test agent was launched."
-    echo "Skip stage name pattern: ${entry.pattern}"
-    echo "Skip reason: ${entry.reason}"
+    echo "Skip reason: ${reason}"
     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
         error "Stage '${stageName}' was not executed because of resource maintenance."
     }
 }
 
-def warnUnmatchedMaintenancePatterns(Collection stageNames, List entries) {
-    (entries ?: []).findAll { entry ->
+def warnUnmatchedMaintenancePatterns(Collection stageNames, List patterns) {
+    (patterns ?: []).findAll { pattern ->
         !stageNames.any { stageName ->
-            findMaintenanceEntry(stageName.toString(), [entry]) != null
+            stageMatchesPattern(stageName.toString(), pattern.toString())
         }
-    }.each { entry ->
-        echo "WARNING: Maintenance pattern '${entry.pattern}' matched no selected stage in this job."
+    }.each { pattern ->
+        echo "WARNING: Maintenance pattern '${pattern}' matched no selected stage in this job."
     }
 }
 
@@ -2998,12 +2985,13 @@ def appendMaintenanceSummary(Map globalVars) {
         def parentJob = parents[-2]
         def buildLabel = "${escapeMaintenanceHtml(env.JOB_NAME)} #${escapeMaintenanceHtml(env.BUILD_NUMBER)}"
         def buildUrl = escapeMaintenanceHtml(env.BUILD_URL)
-        def stages = GlobalState.maintenanceSkips.collect { entry ->
-            "<b>${escapeMaintenanceHtml(entry.stage)}</b>: ${escapeMaintenanceHtml(entry.reason)}"
+        def stages = GlobalState.maintenanceSkips.collect { stageName ->
+            "<b>${escapeMaintenanceHtml(stageName)}</b>"
         }.unique().join('<br/>')
+        def reason = escapeMaintenanceHtml(globalVars[MAINTENANCE_ENTRIES].reason)
         def summary = "<span data-maintenance-warning='true'>" +
-            "<b>Resource maintenance in <a href='${buildUrl}'>${buildLabel}</a>:</b><br/>" +
-            "${stages}</span><br/>"
+            "<b>Resource maintenance in <a href='${buildUrl}'>${buildLabel}</a>:</b> ${reason}<br/>" +
+            "<b>Affected stages:</b><br/>${stages}</span><br/>"
         trtllm_utils.appendBuildDescription(
             this, parentJob['name'], parentJob['build_number'], summary)
         echo "Appended maintenance summary to parent build ${parentJob['name']} #${parentJob['build_number']}."
@@ -3116,7 +3104,7 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
-    (MAINTENANCE_ENTRIES): [],
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
 ]
 
 class GlobalState {
@@ -7143,8 +7131,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
     warnUnmatchedMaintenancePatterns(
-        parallelJobsFiltered.keySet(), globalVars[MAINTENANCE_ENTRIES])
+        parallelJobsFiltered.keySet(), maintenancePatterns)
 
     // Per-stage execution scope for infra-scoped fail-fast (runBranchesWithInfraDefer).
     // A stage carrying opts.slurmDispatcher runs its work through a SLURM dispatcher
@@ -7154,7 +7144,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     stageInfraScope = [:]
     parallelJobsFiltered = parallelJobsFiltered.collectEntries { key, values ->
         def stageOpts = (values instanceof List && values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
-        def maintenanceEntry = findMaintenanceEntry(key, globalVars[MAINTENANCE_ENTRIES])
         stageInfraScope[key] = stageOpts.slurmDispatcher ? InfraFailure.SLURM : InfraFailure.K8S
         [key, {
         stage(key) {
@@ -7162,9 +7151,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
                 }
-            } else if (maintenanceEntry) {
+            } else if (stageMatchesAnyPattern(key, maintenancePatterns)) {
                 stage("Skip - Maintenance") {
-                    failMaintenanceStage(key, maintenanceEntry)
+                    failMaintenanceStage(key, maintenanceConfig.reason)
                 }
             } else if (values instanceof List) {
                 // parallelJobs entries are either [podSpec, runner] or
@@ -7245,19 +7234,19 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     testConfigs = testConfigs.findAll { key, config ->
         return config.image != null
     }
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
     warnUnmatchedMaintenancePatterns(
-        testConfigs.values()*.name, globalVars[MAINTENANCE_ENTRIES])
+        testConfigs.values()*.name, maintenancePatterns)
 
     echo "Filtered test configs with images:"
     println testConfigs
 
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
-        def maintenanceEntry = findMaintenanceEntry(
-            values.name, globalVars[MAINTENANCE_ENTRIES])
-        if (maintenanceEntry) {
+        if (stageMatchesAnyPattern(values.name, maintenancePatterns)) {
             stage(values.name) {
                 stage("Skip - Maintenance") {
-                    failMaintenanceStage(values.name, maintenanceEntry)
+                    failMaintenanceStage(values.name, maintenanceConfig.reason)
                 }
             }
         } else if (values.wheelInstalled) {

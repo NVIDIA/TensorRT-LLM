@@ -154,10 +154,6 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-@Field
-def MAINTENANCE_ENTRIES = "maintenance_entries"
-@Field
-def MAINTENANCE_CONFIG_PATH = "jenkins/config/maintenance_stages.txt"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
@@ -225,6 +221,8 @@ def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def RUN_MODE = "run_mode"
 @Field
 def BUILD_BRANCH = "build_branch"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
@@ -233,7 +231,7 @@ def globalVars = [
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): runMode,
-    (MAINTENANCE_ENTRIES): [],
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 if (runMode == "nightly_release") {
@@ -439,17 +437,21 @@ def checkoutTargetBranchFile(String targetBranch, String targetCommit, String so
         }
     }
 
-    try {
-        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, sourcePath, ".")
+    def gitlabRefs = targetCommit ? [targetCommit, targetBranch] : [targetBranch]
+    for (def gitlabRef : gitlabRefs) {
+        try {
+            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, gitlabRef, sourcePath, ".")
+            }
+            def sourceFileName = sourcePath.tokenize('/').last()
+            sh "mv ${sourceFileName} ${outputFile}"
+            return true
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to checkout ${sourcePath} from internal GitLab at ref " +
+                 "${gitlabRef}. Error: ${e.toString()}"
         }
-        def sourceFileName = sourcePath.tokenize('/').last()
-        sh "mv ${sourceFileName} ${outputFile}"
-        return true
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception e) {
-        echo "Failed to checkout ${sourcePath} from internal GitLab repository. Error: ${e.toString()}"
     }
     return false
 }
@@ -493,55 +495,7 @@ def mergeWaiveList(pipeline, globalVars)
             stageResult: 'UNSTABLE') {
             error "Failed to get TOT waive list. Fallback to use the default test waive list from the PR."
         }
-    }
-
-    def maintenanceTot = "maintenance_stages_TOT_${targetBranchTOTCommit}.txt"
-    def maintenanceSource = "${LLM_ROOT}/${MAINTENANCE_CONFIG_PATH}"
-    def isGetTOTMaintenanceConfig = checkoutTargetBranchFile(
-        targetBranch, targetBranchTOTCommit, MAINTENANCE_CONFIG_PATH, maintenanceTot)
-    if (!isGetTOTMaintenanceConfig) {
-        catchError(
-            buildResult: 'SUCCESS',
-            stageResult: 'UNSTABLE') {
-            error "Failed to get target maintenance config. No maintenance stages will be skipped."
-        }
-        globalVars[MAINTENANCE_ENTRIES] = []
-    } else {
-        if (!fileExists(maintenanceSource) &&
-            getMergeRequestChangedFileList(pipeline, globalVars).contains(MAINTENANCE_CONFIG_PATH)) {
-            error "Deleting or renaming ${MAINTENANCE_CONFIG_PATH} is not allowed."
-        }
-        def maintenanceDiff = ""
-        try {
-            def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
-                pipeline, globalVars, MAINTENANCE_CONFIG_PATH)
-            if (fetchedMaintenanceDiff == null) {
-                echo "WARNING: Maintenance config diff is unavailable. Using target TOT entries."
-            } else {
-                maintenanceDiff = fetchedMaintenanceDiff
-            }
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            echo "WARNING: Failed to get maintenance config diff. " +
-                 "Using target TOT entries. Error: ${e.toString()}"
-        }
-        writeFile file: 'diff_content.txt', text: maintenanceDiff
-        sh """
-            python3 mergeWaiveList.py \
-            --maintenance-config \
-            --cur-waive-list=${maintenanceSource} \
-            --latest-waive-list=${maintenanceTot} \
-            --diff-file=diff_content.txt \
-            --output-file=maintenance_entries.json
-        """
-        globalVars[MAINTENANCE_ENTRIES] = readJSON(
-            file: 'maintenance_entries.json', returnPojo: true)
-    }
-    echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
-
-    if (!isGetTOTWaiveList) {
-        return
+        return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
     }
 
     try {
@@ -570,6 +524,63 @@ def mergeWaiveList(pipeline, globalVars)
             error "Merge test waive list failed. Fallback to use the default test waive list from the PR. Error: ${e.toString()}"
         }
     }
+    return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
+}
+
+def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
+{
+    def maintenanceConfigPath = "jenkins/config/maintenance_stages.txt"
+    def targetBranch = targetBranchInfo.targetBranch
+    def targetBranchTOTCommit = targetBranchInfo.targetCommit
+    def maintenanceTot = "maintenance_stages_TOT_${targetBranchTOTCommit}.txt"
+    def maintenanceSource = "${LLM_ROOT}/${maintenanceConfigPath}"
+    def isGetTOTMaintenanceConfig = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, maintenanceConfigPath, maintenanceTot)
+    if (!isGetTOTMaintenanceConfig) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Failed to get target maintenance config. No maintenance stages will be skipped."
+        }
+        globalVars[MAINTENANCE_ENTRIES] = [reason: "", patterns: []]
+    } else {
+        if (!fileExists(maintenanceSource)) {
+            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+            def changedFileList = githubPrApiUrl != null
+                ? getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
+                : getGitlabMRChangedFile(pipeline, "getChangedFileList")
+            if (changedFileList.contains(maintenanceConfigPath)) {
+                error "Deleting or renaming ${maintenanceConfigPath} is not allowed."
+            }
+        }
+        def maintenanceDiff = ""
+        try {
+            def fetchedMaintenanceDiff = getMergeRequestOneFileChanges(
+                pipeline, globalVars, maintenanceConfigPath)
+            if (fetchedMaintenanceDiff == null) {
+                echo "WARNING: Maintenance config diff is unavailable. Using target TOT entries."
+            } else {
+                maintenanceDiff = fetchedMaintenanceDiff
+            }
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "WARNING: Failed to get maintenance config diff. " +
+                 "Using target TOT entries. Error: ${e.toString()}"
+        }
+        writeFile file: 'maintenance_diff_content.txt', text: maintenanceDiff
+        sh """
+            python3 mergeWaiveList.py \
+            --maintenance-config \
+            --cur-waive-list=${maintenanceSource} \
+            --latest-waive-list=${maintenanceTot} \
+            --diff-file=maintenance_diff_content.txt \
+            --output-file=maintenance_entries.json
+        """
+        globalVars[MAINTENANCE_ENTRIES] = readJSON(
+            file: 'maintenance_entries.json', returnPojo: true)
+    }
+    echo "Effective maintenance entries: ${globalVars[MAINTENANCE_ENTRIES]}"
 }
 
 def preparation(pipeline, testFilter, globalVars)
@@ -577,6 +588,7 @@ def preparation(pipeline, testFilter, globalVars)
     image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
+        def targetBranchInfo = [:]
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
@@ -600,7 +612,14 @@ def preparation(pipeline, testFilter, globalVars)
             if (testFilter[INFRA_DRY_RUN]) {
                 echo "Skipping Merge Test Waive List for the infrastructure dry run."
             } else {
-                mergeWaiveList(pipeline, globalVars)
+                targetBranchInfo = mergeWaiveList(pipeline, globalVars)
+            }
+        }
+        stage("Get Maintenance Stage List") {
+            if (testFilter[INFRA_DRY_RUN]) {
+                echo "Skipping Get Maintenance Stage List for the infrastructure dry run."
+            } else {
+                getMaintenanceStageList(pipeline, globalVars, targetBranchInfo)
             }
         }
     })
