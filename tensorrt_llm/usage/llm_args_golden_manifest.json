@@ -115,9 +115,7 @@
       "path": "batch_wait_timeout_ms"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
+      "capture_policy": "bool",
       "kind": "value",
       "path": "cache_transceiver_config.agent_bounce_buffer_enable"
     },
@@ -616,8 +614,11 @@
       "path": "kv_cache_config.enable_partial_reuse"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
+      "allowed_values": [
+        "auto"
+      ],
+      "capture_policy": "bool|literal",
+      "kind": "categorical",
       "path": "kv_cache_config.enable_swa_scratch_reuse"
     },
     {
