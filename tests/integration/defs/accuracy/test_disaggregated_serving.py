@@ -36,7 +36,8 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import LlmArgs, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig, LlmArgs,
+                                          MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
@@ -1995,6 +1996,107 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                       server_waiting_timeout=3600) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
+
+
+@pytest.mark.timeout(14400)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
+    # Same target model as TestDeepSeekV4Flash above (identical architecture,
+    # 43 layers), so the accuracy reference is looked up under the plain
+    # V4-Flash entry. This checkpoint additionally ships the DSpark drafter
+    # weights for target layers 40-42, and has the routed experts cast
+    # MXFP4 -> NVFP4 (its own cast_mxfp4_to_nvfp4.log reports the cast as
+    # bit-lossless, so the score must not move relative to the native export).
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-nvfp4-DSpark"
+
+    @pytest.mark.skip_less_device(8)
+    def test_gsm8k_1p1d_dep4(self):
+        """Full GSM8K over 1 ctx + 1 gen on a single 8-GPU node.
+
+        Weights are ~165 GiB, i.e. ~42 GiB/rank at TP=4, so both the DEP4
+        context worker and the DEP4 generation worker fit in one 8x B200
+        (178 GiB/GPU) node with ~130 GiB/rank left for KV cache and the
+        DSpark drafter's activations.
+
+        DSpark runs on the generation worker only: the drafter proposes
+        tokens during decode, and the context worker never decodes. This
+        mirrors the two-node TestDeepSeekV4ProDSparkMultinode recipe.
+        """
+        model_path = self.MODEL_PATH
+        # V4 uses the pure-Python KVCacheManagerV2, so the transceiver has to
+        # be the Python one; NIXL (not DEFAULT) skips the
+        # TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        # The drafter runs between target steps and its hidden-state capture
+        # needs a whole-sequence prefill, hence no overlap scheduler and no
+        # chunked prefill on either worker.
+        common_server_config = {
+            "attn_backend": "TRTLLM",
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "enable_attention_dp": True,
+            # MegaMoE CuTe DSL is the backend that serves the NVFP4 export.
+            "moe_config": {
+                "backend": "MEGAMOE_CUTEDSL"
+            },
+            "max_batch_size": 64,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "enable_chunked_prefill": False,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        ctx_server_config = {**common_server_config}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": 64
+            },
+            "speculative_config": {
+                "decoding_type": "DSpark",
+                "max_draft_len": 5,
+                "speculative_model": model_path,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
+        # makes generation startup substantially slower than context startup.
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      model_path,
+                                      server_waiting_timeout=3600,
+                                      max_workers=64) as llm:
+            # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
+            # so the specs behind the accuracy reference lookup have to be
+            # filled in to match the registered entry. MIXED_PRECISION is what
+            # the checkpoint's hf_quant_config declares: NVFP4 routed experts,
+            # attention / shared experts / head left alone.
+            llm.args.quant_config.quant_algo = "MIXED_PRECISION"
+            llm.args.speculative_config = DSparkDecodingConfig(
+                max_draft_len=5,
+                speculative_model=model_path,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"], timeout=7200)
 
 
 @pytest.mark.timeout(14400)
