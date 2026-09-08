@@ -5,3 +5,6 @@
 # See examples/disaggregated/README.md for backend details.
 cache_transceiver_config:
   backend: DEFAULT
+  transceiver_runtime: CPP
+kv_cache_config:
+  use_kv_cache_manager_v2: false
