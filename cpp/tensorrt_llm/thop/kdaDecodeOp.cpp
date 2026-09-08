@@ -213,30 +213,30 @@ void launch_selected_kernel(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-at::Tensor kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::Tensor w_q_t, at::Tensor w_k_t,
+// Inplace-only: the kernel writes the decode result into the caller-supplied
+// ``output`` and never allocates. Allocation lives in the Python wrapper, which
+// lets hot decode paths reuse one persistent, CUDA-graph-safe buffer.
+void kda_decode_fusion_forward(at::Tensor x_q, at::Tensor x_k, at::Tensor x_v, at::Tensor w_q_t, at::Tensor w_k_t,
     at::Tensor w_v_t, at::Tensor bias_q, at::Tensor bias_k, at::Tensor bias_v, at::Tensor cs_q, at::Tensor cs_k,
     at::Tensor cs_v, at::Tensor a_log, at::Tensor g, at::Tensor dt_bias, at::Tensor beta, at::Tensor onorm_g,
     at::Tensor onorm_weight, std::optional<at::Tensor> ssm_state_indices, at::Tensor cu_seqlens, at::Tensor state,
     bool apply_onorm, bool update_conv_cache, bool use_lower_bound, bool apply_beta_sigmoid, double lower_bound,
-    double scale, double onorm_eps, std::optional<at::Tensor> output)
+    double scale, double onorm_eps, at::Tensor output)
 {
     validate_kda_decode_fusion_inputs(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v,
         a_log, g, dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, apply_onorm,
         update_conv_cache);
     int const B = static_cast<int>(x_q.size(1));
     int const HV = static_cast<int>(x_v.size(2));
-    auto out = output.has_value() ? *output : at::empty({B, 1, HV, kDimV}, x_q.options());
-    if (output.has_value())
-    {
-        TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kBFloat16, "out must be a CUDA bfloat16 tensor");
-        TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
-        TORCH_CHECK(out.dim() == 4 && out.size(0) == B && out.size(1) == 1 && out.size(2) == HV && out.size(3) == kDimV,
-            "out must have shape [B, 1, HV, 128]");
-    }
+    TORCH_CHECK(output.is_cuda() && output.scalar_type() == at::kBFloat16, "output must be a CUDA bfloat16 tensor");
+    TORCH_CHECK(output.device() == x_q.device(), "output must be on the same device as x_q");
+    TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+    TORCH_CHECK(output.dim() == 4 && output.size(0) == B && output.size(1) == 1 && output.size(2) == HV
+            && output.size(3) == kDimV,
+        "output must have shape [B, 1, HV, 128]");
     launch_selected_kernel(x_q, x_k, x_v, w_q_t, w_k_t, w_v_t, bias_q, bias_k, bias_v, cs_q, cs_k, cs_v, a_log, g,
-        dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, out, apply_onorm, update_conv_cache,
-        use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps);
-    return out;
+        dt_bias, beta, onorm_g, onorm_weight, ssm_state_indices, cu_seqlens, state, output, apply_onorm,
+        update_conv_cache, use_lower_bound, apply_beta_sigmoid, lower_bound, scale, onorm_eps);
 }
 
 } // namespace
@@ -256,7 +256,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? ssm_state_indices, Tensor cu_seqlens, Tensor(d!) state, "
         "bool apply_onorm, bool update_conv_cache, bool use_lower_bound, "
         "bool apply_beta_sigmoid, float lower_bound, float scale, "
-        "float onorm_eps, Tensor(e!)? output=None) -> Tensor(e!)");
+        "float onorm_eps, Tensor(e!) output) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -7,6 +7,7 @@ IS_CUTLASS_DSL_AVAILABLE = False
 # Whether the public CuTe DSL package provides the SM107/Rubin helper module.
 # Rubin kernels stay disabled when it is absent and callers retain their
 # existing fallback paths.
+# TODO: flips to True once a Rubin-capable CuTe DSL package ships in the image.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":

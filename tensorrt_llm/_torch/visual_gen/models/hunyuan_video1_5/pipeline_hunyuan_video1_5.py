@@ -548,7 +548,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
 
     def infer(self, req):
         """Run inference from a DiffusionRequest (serve / high-level API path)."""
-        if req.params.image is not None:
+        if req.params.image_reference:
             raise ValueError(
                 "HunyuanVideo 1.5 currently supports text-to-video only; "
                 "image conditioning (I2V) is not supported."

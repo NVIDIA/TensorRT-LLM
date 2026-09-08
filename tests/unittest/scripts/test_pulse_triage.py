@@ -18,6 +18,7 @@ import json
 
 import pytest
 
+__extra_import_path__ = ["~"]
 from jenkins.scripts.pulse_in_pipeline_scanning.utils.triage import extract_ticket_refs
 
 pytestmark = pytest.mark.cpu_only

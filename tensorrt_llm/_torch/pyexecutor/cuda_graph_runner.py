@@ -13,7 +13,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
@@ -244,6 +244,18 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
+    def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
+                                     can_run_cuda_graph: bool):
+        """Return ``[(can_run_cuda_graph, batch_size)]`` per TP rank.
+
+        One fixed-size exchange, entered by every rank unconditionally.
+        """
+        gathered = self.config.dist.tp_allgather_int64(
+            [bool(can_run_cuda_graph), batch.batch_size])
+        flags = gathered[:, 0].astype(bool).tolist()
+        sizes = gathered[:, 1].tolist()
+        return list(zip(flags, sizes))
+
     def _get_seq_len_mode(
         self,
         batch: ScheduledRequests,
@@ -460,8 +472,8 @@ class CUDAGraphRunner:
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
@@ -737,8 +749,8 @@ class CUDAGraphRunner:
         new_batch_size = batch_size
 
         if self.enabled and self.config.enable_attention_dp and self.config.mapping.tp_size > 1:
-            graph_batch_info = self.config.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size], small_payload=True)
+            graph_batch_info = self._gather_adp_graph_batch_info(
+                batch, can_run_cuda_graph)
             all_can_run_cuda_graph = all(rank_info[0]
                                          for rank_info in graph_batch_info)
             if all_can_run_cuda_graph:

@@ -43,7 +43,7 @@
 
 # This file is copied and modified from cutlass example https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_blockscaled_gemm_persistent.py
 
-from typing import Optional, Tuple, Type, Union
+from typing import Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -53,7 +53,8 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import llvm
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
+from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import dsl_user_op
 
 from .custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
@@ -197,13 +198,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.indexer_extra_warp_id = tuple(
             range(self.tma_warp_id + 1, self.tma_warp_id + 1 +
                   indexer_transform_warps - 4)) if self.indexer_q_fusion else ()
-        self.threads_per_cta = 32 * len(
+        self.threads_per_warp = 32
+        self.threads_per_cta = self.threads_per_warp * len(
             (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id,
              *self.indexer_extra_warp_id))
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        self.epilog_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=self.epilog_sync_bar_id,
+            num_threads=self.threads_per_warp * len(self.epilog_warp_id),
+        )
+        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=self.tmem_ptr_sync_bar_id,
+            num_threads=self.threads_per_warp * len(
+                (self.mma_warp_id, *self.epilog_warp_id)),
+        )
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
@@ -1415,7 +1426,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             c_producer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
                 32 * len(self.epilog_warp_id),
-                32 * len(self.epilog_warp_id),
             )
             c_pipeline = pipeline.PipelineTmaStore.create(
                 num_stages=self.num_c_stage,
@@ -2088,14 +2098,27 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl,
-            cluster_shape_mnl,
-            swizzle_size=swizzle_size,
-            raster_along_m=raster_along_m)
+            num_ctas_mnl, cluster_shape_mnl, swizzle_size, raster_along_m)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters)
 
         return tile_sched_params, grid
+
+    @staticmethod
+    def needs_unpack_tma(
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+    ) -> bool:
+        """Decide whether TMA must use the UNPACK_U8 variant for operands.
+
+        Unpack is required when operand widths differ or either operand is
+        6-bit. Otherwise TMA can use the natural packed format.
+        """
+        if a_dtype.width != b_dtype.width:
+            return True
+        if a_dtype.width == 6 or b_dtype.width == 6:
+            return True
+        return False
 
     @staticmethod
     def is_valid_dtypes_and_scale_factor_vec_size(
@@ -2520,3 +2543,47 @@ def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
     for i in cutlass.range(cute.size(sf_ref_tensor)):
         mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
         sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
+
+
+def scaled_mm(
+    gemm_obj: Sm100BlockScaledPersistentDenseGemmKernel,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    a_major: Literal["m", "k"],
+    b_major: Literal["n", "k"],
+    c_major: Literal["m", "n"],
+    max_active_clusters: cutlass.Constexpr,
+    stream: cuda.CUstream,
+    epilogue_op: cutlass.Constexpr = lambda x: x,
+    options: str = "",
+):
+    """Compile the persistent dense blockscaled GEMM operation."""
+    a_ptr = make_ptr(a_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(b_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
+    sfa_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+    sfb_ptr = make_ptr(sf_dtype, 0, cute.AddressSpace.gmem, assumed_align=32)
+
+    a_major_mode = (OperandMajorMode.K
+                    if a_major == "k" else OperandMajorMode.MN)
+    b_major_mode = (OperandMajorMode.K
+                    if b_major == "k" else OperandMajorMode.MN)
+    c_layout = (utils.LayoutEnum.ROW_MAJOR
+                if c_major == "n" else utils.LayoutEnum.COL_MAJOR)
+    return cute.compile(
+        gemm_obj,
+        a_ptr,
+        b_ptr,
+        sfa_ptr,
+        sfb_ptr,
+        c_ptr,
+        (a_major_mode, b_major_mode, c_layout),
+        (cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0),
+         cutlass.Int32(0)),
+        max_active_clusters,
+        stream,
+        epilogue_op,
+        options=options,
+    )

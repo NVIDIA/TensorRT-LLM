@@ -27,6 +27,11 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
+from tensorrt_llm._torch.configs.qwen4_exp import (
+    Qwen4ExpConfig,
+    Qwen4ExpTextConfig,
+    Qwen4ExpVisionConfig,
+)
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -73,6 +78,9 @@ def _register_custom_configs_with_transformers() -> None:
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
         "gemma4_unified_vision": Gemma4UnifiedVisionConfig,
         "gemma4_unified_audio": Gemma4UnifiedAudioConfig,
+        "qwen4_exp_text": Qwen4ExpTextConfig,
+        "qwen4_exp": Qwen4ExpConfig,
+        "qwen4_exp_vision": Qwen4ExpVisionConfig,
     }
     # Cosmos3Config resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
@@ -102,4 +110,7 @@ __all__ = [
     "LagunaConfig",
     "MiniCPMV4_6Config",
     "MiniCPMV4_6VisionConfig",
+    "Qwen4ExpConfig",
+    "Qwen4ExpTextConfig",
+    "Qwen4ExpVisionConfig",
 ]

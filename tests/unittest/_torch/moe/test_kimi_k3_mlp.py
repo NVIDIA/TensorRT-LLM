@@ -207,6 +207,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
+    from tensorrt_llm._torch.utils import AuxStreamType
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -224,8 +225,13 @@ def test_kimi_k3_shared_expert_parallel_construction(
 
     fake_moe = _FakeMoE()
 
+    create_moe_kwargs = {}
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
-    monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "create_moe",
+        lambda **kwargs: create_moe_kwargs.update(kwargs) or fake_moe,
+    )
     monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
 
@@ -241,9 +247,16 @@ def test_kimi_k3_shared_expert_parallel_construction(
         moe_backend="TRTLLM",
     )
     config = _runtime_config()
-    runtime = modeling_kimi_linear.KimiK3MoERuntime(model_config, config, layer_idx=1)
+    moe_aux_stream_dict = {AuxStreamType.MoeChunkingOverlap: object()}
+    runtime = modeling_kimi_linear.KimiK3MoERuntime(
+        model_config,
+        config,
+        layer_idx=1,
+        moe_aux_stream_dict=moe_aux_stream_dict,
+    )
 
     shared = runtime.shared_experts
+    assert create_moe_kwargs["aux_stream_dict"] is moe_aux_stream_dict
     assert isinstance(shared, GatedMLP)
     assert shared.gate_up_proj.tp_size == expected_shared_tp
     assert shared.gate_up_proj.tp_rank == expected_shared_rank

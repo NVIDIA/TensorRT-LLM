@@ -44,7 +44,7 @@ host-overhead-dominant YAML configs in `tests/scripts/perf-sanity/aggregated/hos
 ```bash
 # Run a specific host perf config through perf_sanity
 pytest tests/integration/defs/perf/test_perf_sanity.py -v \
-    -k "host_perf_llama8b-llama8b_fp16_bs8_128_256" \
+    -k "host_perf_deepseek_v3_lite-v3lite_fp8_bs8_128_256" \
     --output-dir ./host_perf_results
 ```
 
