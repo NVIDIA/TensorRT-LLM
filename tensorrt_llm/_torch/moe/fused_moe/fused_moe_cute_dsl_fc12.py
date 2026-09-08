@@ -56,14 +56,17 @@ from .interface import _reject
 class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
     """Outer autotune runner for the fused FC12 backend.
 
-    Identical to the parent except the routing-tile candidate set: the v1
-    fused kernel only supports the 128-wide tile, so restrict the valid
-    tactics to ``[128]`` (the parent offers 128/256, which would make the
-    inner fused runner assert on 256 during autotuning).
+    Identical to the parent except the routing-tile candidate set: the fused
+    kernel supports the 128-wide tile (1-CTA) and the 256-wide tile (2-CTA,
+    cluster (2,1)), so restrict ``_tile_sizes`` to ``[128, 256]`` (the parent
+    also offers 512, which the fused v1 kernel does not support). The inner
+    fused runner derives mma_tiler_m == tile_size and cluster M == tile_size //
+    128 from the selected tile, mirroring the CuteDSL grouped-GEMM runners.
     """
 
-    def get_valid_tactics(self, inputs, profile, **kwargs):
-        return [128]
+    @staticmethod
+    def _tile_sizes():
+        return [128, 256]
 
 
 class CuteDslFc12FusedMoE(CuteDslFusedMoE):
