@@ -1,51 +1,46 @@
-"""The deterministic half of fixing an operating point.
+"""Asking the design skill for an operating point, on this workflow's terms.
 
-Establishing where to optimize is `create-sweep`'s job — a skill the
+Establishing *where* to optimize is `create-sweep`'s job — a skill the
 benchmark-config repo ships, carrying rules this workflow has no business
 restating: which parallelism tiers a mixture-of-experts model admits, where
 the tensor-parallel batch ceiling is, what a concurrency ladder looks like on
-each. Those rules live in someone else's repo and will move; copying them
-here would produce a second, quietly diverging answer.
+each, and where its generated configs may be written. Those rules live in
+someone else's repo and will move; a copy here would be a second, quietly
+diverging answer.
 
-**The skill runs normally, and this module checks what it produced.**
+So this module does not drive the skill. It hands an agent one instruction —
+invoke it, follow it, with two named departures — and reads back what the
+skill wrote.
 
-An earlier version of this file generated every command the design agent
-ran — four wrappers around the skill's own scripts — on the reasoning that a
-generated command cannot be drifted from. That was a bad trade, and the way
-it was bad is worth recording, because the same trade will look attractive
-again.
+**Two departures, and why only these.** The skill ends its sweep phase with
+``ibc-bench process frontier --ctx_json``: the end-to-end join, which this
+staged scope excludes. And its later phases prune irreversibly against a
+measured MTP accept rate this model does not have. Both are changes of
+*meaning*, which the skill cannot know about, so they are stated. The scored
+command is given verbatim rather than described because a described one is
+the kind an agent honours on the first turn and restates on the fourth — the
+session this module was written after did exactly that.
 
-The failure it prevented was one silent one: the skill ends its sweep phase
-with ``ibc-bench process frontier --ctx_json``, the end-to-end join, which
-this staged scope excludes. An agent told in prose to use the other
-post-processor may well forget on a later turn, and the result looks correct
-— a frontier appears, and nothing downstream can tell which anchor built it.
+**What this module is careful not to be.** Three earlier versions of it
+overreached, and the shape of each mistake is worth keeping because the same
+trade will look attractive again:
 
-The failure it *introduced* was worse. ``SKILL.md`` carries a rule those
-wrappers had no place for: for an **existing** model directory the generated
-YAMLs go into ``sweep_design/``, never on top of the curated configs. The
-wrappers took the output path as a free parameter with no guard, so one
-wrong argument would have overwritten a checked-in config that other people
-maintain — silently, irreversibly, and outside this run. Trading a
-recomputable mistake for an unrecoverable one is not a safety improvement.
+- Four wrappers generated the skill's own commands, on the reasoning that a
+  generated command cannot be drifted from. But ``SKILL.md`` also carries a
+  rule they had no place for — for an existing model directory the generated
+  YAMLs go into ``sweep_design/``, never on top of the curated configs — and
+  they took the output path as an unguarded parameter. Trading a recomputable
+  mistake (a frontier scored the wrong way) for an unrecoverable one
+  (overwriting a config other people maintain) is not a safety improvement.
+- One function rewrote the context sweep to widen its candidate list. Never
+  called, and it would have been this module editing a config it does not own.
+- Two checks read the skill's artefacts back and refused inconsistent ones.
+  Sound in principle and never wired to anything, so they asserted nothing
+  while looking like they did.
 
-More generally: the skill's phases are not four commands. They are also
-gates, a resume spine, an output-placement rule, and a probe protocol.
-Restating four argv strings dropped the rest of it while looking like
-faithful automation.
-
-So the skill is invoked as a skill and left to apply its own policies. What
-survives here is:
-
-- **one override** — :func:`postprocess_command`, because it is the one
-  place this workflow's scope genuinely differs from the skill's, and
-  because it changes semantics rather than paths;
-- **checks on the artefacts** — a probe plan that quietly dropped a shape, a
-  row whose ``max_num_tokens`` is inconsistent, a design sweep carrying a
-  build source. These read what the skill wrote and refuse it; none of them
-  can damage anything.
-
-Nothing here starts a process or writes a file the skill owns.
+What is left is an instruction, the command that instruction overrides, and a
+YAML reader. **Nothing here writes a file, edits a config, or starts a
+process.**
 """
 
 from __future__ import annotations
@@ -57,45 +52,9 @@ import yaml
 
 from agent_flow.workflows.perf_optimize.bench_cli import GEN_ONLY_MODULE
 
-#: Where the config repo keeps the skill. Both are checked because the two
-#: copies have been observed to disagree: on the checkout this was written
-#: against, ``.agents/skills`` held ``create-sweep`` and ``.claude/skills``
-#: did not, while ``.claude/skills`` held a skill the other lacked. Neither
-#: is a superset, so looking in one and reporting "not installed" would be
-#: wrong about half the time.
-SKILL_DIRS: tuple[str, ...] = (".agents/skills", ".claude/skills")
-SKILL_NAME = "create-sweep"
-
-#: The scripts the skill ships, and the only executable part of it this
-#: module names. Everything else in ``SKILL.md`` is instructions.
-FACTS_SCRIPT = "model_facts.py"
-DESIGN_SCRIPT = "design_sweep.py"
-
 
 class SweepDesignError(ValueError):
     """The design skill, or something it produced, is not usable."""
-
-
-def scripts_dir(repo_root: Path) -> Path:
-    """Where `create-sweep`'s scripts are in this checkout.
-
-    Reports both places it looked, because "the skill is not installed" and
-    "the skill is installed where the agent cannot see it" are different
-    problems with the same symptom — and the second one is the one that
-    actually happened.
-    """
-    root = Path(repo_root)
-    for parent in SKILL_DIRS:
-        found = root / parent / SKILL_NAME / "scripts"
-        if (found / DESIGN_SCRIPT).is_file():
-            return found
-    raise SweepDesignError(
-        f"no {SKILL_NAME}/scripts/{DESIGN_SCRIPT} under {root} in any of "
-        f"{list(SKILL_DIRS)}. Note that an agent only discovers skills under "
-        f"`.claude/skills`, so a copy that exists solely under `.agents/skills` "
-        f"is present on disk and uninvokable — check for that before concluding "
-        f"the skill is missing."
-    )
 
 
 # ------------------------------------------------------------ the one override
@@ -112,137 +71,6 @@ def postprocess_command(run_dir: Path) -> str:
     the part that is out of scope.
     """
     return f"python -m {GEN_ONLY_MODULE} -i {run_dir}"
-
-
-# ---------------------------------------------------------- the two deltas
-
-
-def widen_ctx_candidates(
-    config: Mapping[str, Any], *, batches: Sequence[int], tp_sizes: Sequence[int]
-) -> dict[str, Any]:
-    """Turn the sized context configuration into a candidate set.
-
-    The sweep format already expands ``max_batch`` x ``tp_size`` as a
-    product, so more candidates is a longer list rather than new machinery.
-    What it buys is that the context half is *selected from measurement*
-    like the generation half, instead of being computed and taken on trust —
-    and that costs nothing in rate matching, because requests per second per
-    context GPU is entirely inside the context measurement.
-
-    The sized values are kept in the lists whatever else is asked for: they
-    are the skill's own answer, and dropping them would make the sweep unable
-    to confirm or refute it.
-    """
-    if not batches or not tp_sizes:
-        raise SweepDesignError("a candidate set needs at least one batch and one tp_size")
-    widened = {key: value for key, value in config.items()}
-    entries = widened.get("benchmarks")
-    if not isinstance(entries, list) or not entries:
-        raise SweepDesignError(
-            "the generated ctx config has no 'benchmarks' entry to widen — the "
-            "design script's output shape changed, so this would silently sweep "
-            "nothing"
-        )
-    out: list[dict[str, Any]] = []
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            raise SweepDesignError(f"a 'benchmarks' entry is not a mapping: {entry!r}")
-        row = dict(entry)
-        row["max_batch"] = sorted({*_ints(entry.get("max_batch")), *batches})
-        row["tp_size"] = sorted({*_ints(entry.get("tp_size")), *tp_sizes})
-        out.append(row)
-    widened["benchmarks"] = out
-    # The override table is dropped rather than merged: it restates the same
-    # keys per GPU, and a sweep whose candidates come from two places is one
-    # whose planned expansion and measured expansion can disagree without
-    # anything raising.
-    widened.pop("gpu_overrides", None)
-    return widened
-
-
-def _ints(value: Any) -> list[int]:
-    if isinstance(value, (list, tuple)):
-        return [v for v in value if isinstance(v, int) and not isinstance(v, bool)]
-    return [value] if isinstance(value, int) and not isinstance(value, bool) else []
-
-
-# ------------------------------------------------------------ the checks
-
-
-def verify_plan(plan: Mapping[str, Any], *, expected_shapes: Sequence[str]) -> list[str]:
-    """Refuse a probe plan that silently measured fewer shapes than it planned.
-
-    A probe that fails leaves its shape out of ``entries`` rather than
-    failing the phase, so a plan can be well-formed, submit cleanly, and
-    characterise four of six shapes. The sweep that follows would then rank
-    a frontier the missing two were never on — and the report would describe
-    it as the frontier.
-    """
-    entries = plan.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise SweepDesignError(
-            "the probe plan carries no 'entries': no shape's max batch was "
-            "measured, so the sweep would have nothing to expand"
-        )
-    measured: dict[str, Any] = {}
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            raise SweepDesignError(f"a plan entry is not a mapping: {entry!r}")
-        shape = entry.get("shape")
-        name = _shape_name(shape) if isinstance(shape, Mapping) else str(shape)
-        batch = entry.get("max_batch")
-        if not isinstance(batch, int) or isinstance(batch, bool) or batch < 1:
-            raise SweepDesignError(
-                f"plan entry {name!r} has no usable max_batch ({batch!r}). The batch "
-                f"is measured, never defaulted: a guessed one either wastes the "
-                f"sweep on a configuration that will not fit, or leaves throughput "
-                f"unmeasured on one that would have."
-            )
-        measured[name] = batch
-    return [shape for shape in expected_shapes if shape not in measured]
-
-
-def _shape_name(shape: Mapping[str, Any]) -> str:
-    kind = "dep" if shape.get("adp") else "tep"
-    return f"{kind}_{shape.get('tp_size')}"
-
-
-#: The house rule, and `check-gen-config`'s Rule 1. Restated here only as an
-#: assertion over a generated file — the rule itself stays the skill's.
-def verify_sol_yaml(config: Mapping[str, Any]) -> None:
-    """Check the generated sweep before an allocation is spent on it.
-
-    Two things, both of which produce a run that succeeds and a number that
-    is about something else:
-
-    - ``max_num_tokens`` must be ``batch * (mtp + 1)``. Under it, the
-      generation step is token-starved and the measured iteration time
-      belongs to a smaller batch than the row claims.
-    - no build source. This sweep measures the image, so an inherited
-      ``trtllm_install`` would silently characterise somebody's checkout
-      instead — and the operating point every later campaign freezes on
-      would have been chosen on code that is not the baseline.
-    """
-    for key in ("trtllm_install", "trtllm_patch"):
-        if config.get(key) is not None:
-            raise SweepDesignError(
-                f"the generated sweep carries '{key}'. Fixing the operating point "
-                f"measures the image, so a build source here would choose the point "
-                f"on code that is not what any campaign starts from."
-            )
-    for index, row in enumerate(config.get("gen_configs") or []):
-        if not isinstance(row, (list, tuple)) or len(row) < 8:
-            raise SweepDesignError(f"gen_configs[{index}] is not a full row: {row!r}")
-        batch, mnt, mtp = row[3], row[4], row[7]
-        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (batch, mnt, mtp)):
-            raise SweepDesignError(f"gen_configs[{index}] has non-integer batch/mnt/mtp: {row!r}")
-        if mnt != batch * (mtp + 1):
-            raise SweepDesignError(
-                f"gen_configs[{index}]: max_num_tokens {mnt} != batch {batch} x "
-                f"(mtp {mtp} + 1) = {batch * (mtp + 1)}. Under it the generation "
-                f"step is token-starved and the measured iteration time belongs to "
-                f"a smaller batch than the row claims."
-            )
 
 
 def designer_instruction(*, model_dir: str, design_dir: Path, tracks: Sequence[str]) -> str:
