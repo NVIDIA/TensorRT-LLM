@@ -59,10 +59,10 @@ public:
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences,
-        std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
-        std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<Tensor> crossAttentionMask, std::optional<Tensor> skipCrossAttnBlocks,
+        std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
+        std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
+        std::optional<std::string> cacheSalt = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -92,7 +92,6 @@ public:
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
-        , mNumReturnSequences(numReturnSequences)
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
@@ -282,14 +281,6 @@ public:
         return mEncoderOutputLength;
     }
 
-    [[nodiscard]] std::optional<SizeType32> getNumReturnSequences() const
-    {
-        TLLM_LOG_WARNING(
-            "The 'getNumReturnSequences' method in the Request class is deprecated and will be removed in a future "
-            "release. Please use 'getNumReturnSequences' directly from the 'SamplingConfig' object.");
-        return mSamplingConfig.getNumReturnSequences();
-    }
-
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const
     {
         return mSkipCrossAttnBlocks;
@@ -450,15 +441,6 @@ public:
         mEncoderOutputLength = encoderOutputLength;
     }
 
-    void setNumReturnSequences(SizeType32 numReturnSequences)
-    {
-        TLLM_LOG_WARNING(
-            "The 'setNumReturnSequences' method in the Request class is deprecated and will be removed in a future "
-            "release. Please use 'setNumReturnSequences' directly on the 'SamplingConfig' object.");
-        mNumReturnSequences = numReturnSequences;
-        mSamplingConfig.setNumReturnSequences(numReturnSequences);
-    }
-
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
     {
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
@@ -494,15 +476,6 @@ private:
     {
         TLLM_CHECK(!mInputTokenIds.empty());
         TLLM_CHECK(mMaxNewTokens > 0);
-
-        // Show warning message unless mNumReturnSequences is the default value.
-        if (mNumReturnSequences > 1)
-        {
-            TLLM_LOG_WARNING(
-                "The 'numReturnSequences' in the Request class is deprecated and will be removed in a future release. "
-                "Please set the number of return sequences directly in 'SamplingConfig'.");
-            mSamplingConfig.setNumReturnSequences(mNumReturnSequences);
-        }
 
         if (mLogitsPostProcessorName.has_value() && mLogitsPostProcessor.has_value())
         {
@@ -555,7 +528,6 @@ private:
         lambda(mEncoderInputFeatures);
         lambda(mEncoderOutputLength);
         lambda(mCrossAttentionMask);
-        lambda(mNumReturnSequences);
         lambda(mSkipCrossAttnBlocks);
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
@@ -593,7 +565,6 @@ private:
     std::optional<Tensor> mEncoderInputFeatures;
     std::optional<SizeType32> mEncoderOutputLength;
     std::optional<Tensor> mCrossAttentionMask;
-    SizeType32 mNumReturnSequences;
     std::optional<Tensor> mSkipCrossAttnBlocks;
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;

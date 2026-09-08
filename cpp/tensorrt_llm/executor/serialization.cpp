@@ -854,7 +854,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto encoderInputFeatures = su::deserialize<std::optional<Tensor>>(is);
     auto encoderOutputLength = su::deserialize<std::optional<SizeType32>>(is);
     auto crossAttentionMask = su::deserialize<std::optional<Tensor>>(is);
-    auto numReturnSequences = su::deserialize<SizeType32>(is);
     auto skipCrossAttnBlocks = su::deserialize<std::optional<Tensor>>(is);
     auto guidedDecodingParams = su::deserialize<std::optional<GuidedDecodingParams>>(is);
     auto languageAdapterUid = su::deserialize<std::optional<SizeType32>>(is);
@@ -871,8 +870,8 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::nullopt, std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        std::move(crossAttentionMask), numReturnSequences, std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
+        std::move(crossAttentionMask), std::move(skipCrossAttnBlocks), std::move(guidedDecodingParams),
+        languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)

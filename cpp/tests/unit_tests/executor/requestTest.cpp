@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -157,7 +157,7 @@ TEST(RequestTest, serializeDeserialize)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), "Processor",
         std::nullopt, std::nullopt, 1234, false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
 
     auto serializedSize = Serialization::serializedSize(request);
