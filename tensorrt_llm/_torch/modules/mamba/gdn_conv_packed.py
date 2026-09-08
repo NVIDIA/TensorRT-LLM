@@ -2064,11 +2064,18 @@ def run(
         _gdn_conv_update_paired_bf16_kernel[(16, batch)](
             *args, INTERLEAVE=True, num_warps=4, num_stages=1
         )
+        return
     else:
         _gdn_conv_update_paired_bf16_kernel[(16, batch)](
             *args, INTERLEAVE=False, num_warps=4, num_stages=1
         )
         return
+    # The three branches above this point pair sequences and launch a
+    # batch // 2 grid, which leaves the last sequence unvisited when batch is
+    # odd. The two paired_bf16 branches launch one program per sequence and
+    # have already covered it, so they return rather than run the tail again --
+    # re-running it recomputes the output against a conv_state this call has
+    # already advanced.
     if batch & 1:
         _gdn_conv_update_paired_early_kernel[(16, 1)](
             *args, B_START=batch - 1, num_warps=4, num_stages=1

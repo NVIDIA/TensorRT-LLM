@@ -96,10 +96,31 @@ def _run(t, enabled):
 
 
 @skip_unsupported
-class TestGdnConvKfFastPath:
+class TestGdnConvPackedFastPath:
     """The fast path must be indistinguishable from the shipped kernel."""
 
-    @pytest.mark.parametrize("batch", [1, 2, 8, 64, 128, 129, 255, 256, 511, 512])
+    @pytest.mark.parametrize(
+        "batch",
+        [
+            1,
+            2,
+            8,
+            64,
+            128,
+            256,
+            512,
+            # Odd batches, one per dispatcher band. Those in [65, 127] take the
+            # paired_bf16 band, whose grid already visits every sequence; the
+            # odd-tail kernel must not run on top of it and recompute the last
+            # sequence against a conv_state this call has already advanced.
+            65,
+            97,
+            127,
+            129,
+            255,
+            511,
+        ],
+    )
     def test_matches_shipped_kernel(self, batch):
         t = _make(batch)
         ref_out, ref_state, ref_inter = _run(t, enabled=False)
@@ -123,7 +144,7 @@ class TestGdnConvKfFastPath:
 
 
 @skip_unsupported
-class TestGdnConvKfGuard:
+class TestGdnConvPackedGuard:
     """Anything outside the supported contract must fall through to the shipped kernel."""
 
     def test_accepts_production_contract(self):
