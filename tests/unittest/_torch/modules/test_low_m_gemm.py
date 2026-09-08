@@ -12,8 +12,12 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.modules.low_m_gemm as _mod
-from tensorrt_llm._torch.modules import linear as linear_module
-from tensorrt_llm._torch.modules.low_m_gemm import _BACKEND_ENV, LowMGemmDispatcher, _parse_enabled
+from tensorrt_llm._torch.modules.low_m_gemm import (
+    _BACKEND_ENV,
+    LOW_M_GEMM_OPT_IN_ATTR,
+    LowMGemmDispatcher,
+    _parse_enabled,
+)
 from tensorrt_llm._utils import is_sm_100f
 
 # ---------------------------------------------------------------------------
@@ -74,16 +78,31 @@ def test_prepare_labels_modules(monkeypatch) -> None:
     assert module._low_m_gemm_dispatcher is dispatcher
 
 
+def test_attach_reaches_the_router_gate(monkeypatch) -> None:
+    """The gate sets the attribute literally; attach() reads it by constant."""
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextGate
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.gate = Qwen3NextGate(hidden_size=8, num_experts=4, top_k=2, dtype=torch.bfloat16)
+    dispatcher = LowMGemmDispatcher()
+    dispatcher.attach(root)
+
+    assert getattr(Qwen3NextGate, LOW_M_GEMM_OPT_IN_ATTR, False)
+    assert root.gate._low_m_gemm_dispatcher is dispatcher
+    assert root.gate._low_m_gemm_name == "gate"
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
 
 
 def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
-    monkeypatch.setattr(linear_module, "LOW_M_GEMM_ACTIVE", True)
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
 
-    assert linear_module._should_apply_low_m_gemm(torch.empty((32, 128)))
-    assert not linear_module._should_apply_low_m_gemm(torch.empty((33, 128)))
+    assert _mod._should_apply_low_m_gemm(torch.empty((32, 128)))
+    assert not _mod._should_apply_low_m_gemm(torch.empty((33, 128)))
 
 
 # ---------------------------------------------------------------------------

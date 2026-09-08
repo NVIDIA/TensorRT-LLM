@@ -41,6 +41,11 @@ _MAX_M = 32
 
 _AUTOTUNER_OP_NAME = "trtllm::low_m_bf16_gemm"
 
+# A module that holds a plain [N, K] BF16 weight but is not a Linear -- a
+# hand-written MoE router gate, say -- opts into the race by setting this
+# attribute and calling apply_low_m_gemm() itself.
+LOW_M_GEMM_OPT_IN_ATTR = "_low_m_gemm_opt_in"
+
 # Env-var strings that activate the low-M GEMM path.
 # "cublas" / "cublaslt" were legacy aliases meaning "disabled"; anything
 # unrecognised raises ValueError.
@@ -309,6 +314,16 @@ class _SplitKGemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
+def _should_apply_low_m_gemm(input: torch.Tensor) -> bool:
+    """Fast pre-filter: check the global enable flag and M upper bound only."""
+    if not LOW_M_GEMM_ACTIVE:
+        return False
+    if input.ndim < 1:
+        return False
+    k = int(input.shape[-1])
+    return k > 0 and input.numel() <= _MAX_M * k
+
+
 class LowMGemmDispatcher:
     """Route eligible BF16 GEMMs to the best available kernel for each shape.
 
@@ -356,7 +371,7 @@ class LowMGemmDispatcher:
         model: torch.nn.Module,
         force: bool = False,
     ) -> None:
-        """Label every ``Linear`` submodule and bind this dispatcher to it.
+        """Label every ``Linear`` or opt-in submodule and bind this dispatcher to it.
 
         This is the **model-loading phase**: it iterates the module tree once,
         assigns ``_low_m_gemm_name`` and ``_low_m_gemm_dispatcher`` on each
@@ -364,7 +379,7 @@ class LowMGemmDispatcher:
         allocated; runners are created lazily on the first :meth:`apply` call.
 
         Args:
-            model: The model whose Linear submodules should be labelled.
+            model: The model whose eligible submodules should be labelled.
             force: Attach even when ``TRTLLM_LOW_M_GEMM_BACKEND`` is not set.
                 Reserved for callers that activate the dispatcher via a
                 mechanism other than the env var (e.g. a future LLM arg).
@@ -376,7 +391,9 @@ class LowMGemmDispatcher:
         if not LOW_M_GEMM_ACTIVE and not force:
             return
         for name, module in model.named_modules():
-            if module.__class__.__name__.endswith("Linear"):
+            if module.__class__.__name__.endswith("Linear") or getattr(
+                module, LOW_M_GEMM_OPT_IN_ATTR, False
+            ):
                 module._low_m_gemm_name = name
                 # Bind this dispatcher so apply_low_m_gemm can reach the
                 # per-engine instance without a global singleton.
@@ -436,7 +453,7 @@ class LowMGemmDispatcher:
         is required (e.g. in unit tests).
 
         Args:
-            model: The model whose Linear submodules should be labelled.
+            model: The model whose eligible submodules should be labelled.
             force: Initialise runners even when ``TRTLLM_LOW_M_GEMM_BACKEND``
                 is not set.  Reserved for callers that activate the low-M
                 GEMM path via a mechanism other than the env var (e.g. a future
@@ -590,20 +607,20 @@ def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
 ) -> LowMGemmDispatcher:
-    """Create a per-engine dispatcher and attach it to every Linear submodule.
+    """Create a per-engine dispatcher and attach it to every eligible submodule.
 
     Each call creates a fresh :class:`LowMGemmDispatcher` so that two model
     engines running in the same process (e.g. target + draft in speculative
     decoding) own independent dispatcher state and never share output buffers.
 
     This function performs only the lightweight **attach** phase: it labels every
-    ``Linear`` submodule with ``_low_m_gemm_name`` and ``_low_m_gemm_dispatcher``
+    ``Linear`` or opt-in submodule with ``_low_m_gemm_name`` and ``_low_m_gemm_dispatcher``
     so :func:`apply_low_m_gemm` can reach the per-engine instance without a
     global reference.  AutoTuner runners are initialised lazily on the first
     forward pass (warmup), not here.
 
     Args:
-        model: Model whose Linear submodules will be labelled.
+        model: Model whose eligible submodules will be labelled.
         force: Attach even when ``TRTLLM_LOW_M_GEMM_BACKEND`` is not set
             (reserved for callers that activate the dispatcher via a future
             LLM arg).
@@ -640,6 +657,7 @@ def apply_low_m_gemm(
 
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
+    "LOW_M_GEMM_OPT_IN_ATTR",
     "_MAX_M",
     "apply_low_m_gemm",
     "prepare_low_m_gemm",
