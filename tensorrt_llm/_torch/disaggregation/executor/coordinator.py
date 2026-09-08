@@ -8,7 +8,7 @@ hold a reference to it: everything it needs is injected as callables.
 """
 
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Callable, List, Tuple
+from typing import TYPE_CHECKING, Callable, List
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
@@ -28,7 +28,6 @@ class DisaggLoopDelegates:
     prepare_context_schedulable: Callable[[List[LlmRequest]], None]
     poll_gen_transfers: Callable[[], None]
     check_transfer_timeouts: Callable[[], None]
-    admit: Callable[[List[LlmRequest]], Tuple[List[LlmRequest], bool]]
     revert_deferred_gen_init: Callable[[List[LlmRequest], List[LlmRequest]], None]
     receive_gen_init: Callable[[List[LlmRequest]], None]
     poll_progress_when_idle: Callable[[], None]
@@ -70,13 +69,6 @@ class DisaggTransferCoordinator:
         self._d.check_transfer_timeouts()
 
     # -- scheduling ----------------------------------------------------------
-
-    def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
-        """Select the gen-init requests that may start receiving this iteration.
-
-        Returns ``(admitted, blocked_by_active_transfers)``.
-        """
-        return self._d.admit(fitting_gen_init)
 
     def revert_deferred_gen_init(
         self, candidates: List[LlmRequest], admitted: List[LlmRequest]
@@ -120,9 +112,6 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         super().__init__(
             DisaggLoopDelegates(**{f.name: _noop for f in fields(DisaggLoopDelegates)})
         )
-
-    def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
-        return fitting_gen_init, False
 
 
 def _noop(*_args, **_kwargs) -> None:
