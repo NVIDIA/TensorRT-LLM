@@ -400,7 +400,7 @@ def test_the_ctx_half_is_measured_and_selected_not_computed(tmp_path):
     # 9.09/4 = 2.27 beats 14.0/8 = 1.75 -- more total throughput, less per GPU.
     chosen = disagg_sol.select_ctx_point(points)
     assert chosen["ctx_gpus"] == 4
-    assert chosen["ranked_on"] == disagg_sol.CTX_RANK
+    assert disagg_sol.CTX_RANK in chosen["ranked_on"]
 
 
 def test_a_tie_on_efficiency_breaks_toward_the_smaller_worker(tmp_path):
@@ -439,3 +439,64 @@ def test_freezing_one_point_records_what_it_cannot_see():
     chosen = disagg_sol.select_point(FRONT, prefer="interactive")
     assert "Unobserved, not unchanged" in chosen["off_point_effects_unobserved"]
     assert "indistinguishable" in chosen["off_point_effects_unobserved"]
+
+
+def test_repeats_of_one_configuration_are_averaged_not_competed(tmp_path):
+    """Twelve directories, one configuration -- this is the real shape.
+
+    A ctx sweep repeats each case and expands over mtp_range, and mtp is not
+    part of a ctx operating point: the generation sweep's `ctx_config` block
+    has no mtp field. Ranking the repeats as candidates picks the luckiest
+    sample, and the measured spread across repeats (4.0 %) is wider than the
+    difference between configurations this selection has to resolve.
+    """
+    d = _design(tmp_path)
+    for mtp in (0, 3):
+        for test, req_s in ((1, 8.697), (2, 8.701), (3, 8.788)):
+            _ctx_case(d, f"ctx_8192_1_ratio08_2_16416_dep4_MTP{mtp}_test{test}", req_s)
+    chosen = disagg_sol.select_ctx_point(disagg_sol.ctx_points(d))
+    assert chosen["candidates"] == 1  # one configuration...
+    assert chosen["measurements"] == 6  # ...measured six times
+    assert chosen["repeats"] == 6
+    # the mean, not the 8.788 maximum
+    assert chosen[disagg_sol.CTX_METRIC] == pytest.approx(8.7286667, rel=1e-6)
+
+
+def test_a_different_repeat_of_the_incumbent_is_not_a_move(tmp_path):
+    """`moved` is the answer this whole staging exists to give.
+
+    Reporting True because a different directory won would say the operating
+    point should change when the selection in fact confirmed it.
+    """
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test3", 8.788)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP3_test1", 8.484)
+    chosen = disagg_sol.select_ctx_point(
+        disagg_sol.ctx_points(d),
+        incumbent={"case": "ctx_8192_1_ratio08_2_16416_dep4_MTP3_test1"},
+    )
+    assert chosen["moved"] is False
+
+
+def test_a_genuinely_different_configuration_is_a_move(tmp_path):
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP3_test1", 12.0)
+    _ctx_case(d, "ctx_8192_1_ratio08_4_16416_dep8_MTP3_test1", 8.0)
+    chosen = disagg_sol.select_ctx_point(
+        disagg_sol.ctx_points(d),
+        incumbent={"ctx_gpus": 8, "max_batch": 4, "adp": True},
+    )
+    assert chosen["ctx_gpus"] == 4
+    assert chosen["moved"] is True
+
+
+def test_the_configuration_with_the_better_mean_wins_a_lucky_repeat(tmp_path):
+    """The inversion the old rule produced, at the measured spread."""
+    d = _design(tmp_path)
+    for test, req_s in ((1, 10.0), (2, 10.0), (3, 10.4)):  # mean 10.13, max 10.4
+        _ctx_case(d, f"ctx_8192_1_ratio08_2_16416_dep4_MTP0_test{test}", req_s)
+    for test, req_s in ((1, 10.2), (2, 10.3), (3, 10.2)):  # mean 10.23, max 10.3
+        _ctx_case(d, f"ctx_8192_1_ratio08_4_16416_dep4_MTP0_test{test}", req_s)
+    chosen = disagg_sol.select_ctx_point(disagg_sol.ctx_points(d))
+    assert chosen["max_batch"] == 4  # the better mean, not the luckier max
+    assert chosen["spread_pct"] < 2.0

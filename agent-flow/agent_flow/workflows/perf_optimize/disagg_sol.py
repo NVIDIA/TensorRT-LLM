@@ -447,35 +447,96 @@ def _read_ctx_json(path: Path) -> float | None:
     return None
 
 
+#: What makes two ctx measurements the same candidate.
+#:
+#: Deliberately not the case name. A ctx sweep repeats each case (``rounds``)
+#: and expands over ``mtp_range``, so one configuration arrives as several
+#: differently-named directories — twelve of them, on the run this was
+#: checked against. MTP is not part of a ctx operating point at all: the
+#: generation sweep's ``ctx_config`` block has no mtp field, and the measured
+#: spread across mtp variants (2.4 %) sat inside the spread across repeats of
+#: one variant (4.0 %).
+#:
+#: Ranking those twelve as twelve candidates does two wrong things: it picks
+#: the luckiest repeat rather than the best configuration, and it reports
+#: having *moved* when it only moved between repeats of the incumbent.
+CTX_CONFIG_KEYS = ("ctx_gpus", "max_batch", "adp")
+
+
+def _config_key(point: Mapping[str, Any]) -> tuple:
+    facts = point
+    if not all(key in point for key in CTX_CONFIG_KEYS):
+        parsed = _ctx_case_facts(str(point.get("case") or ""))
+        if parsed is None:
+            return ("?", point.get("case"))
+        facts = parsed
+    return tuple(facts[key] for key in CTX_CONFIG_KEYS)
+
+
 def select_ctx_point(
     points: Iterable[Mapping[str, Any]], *, incumbent: Mapping[str, Any] | None = None
 ) -> dict[str, Any]:
-    """The most GPU-efficient measured prefill configuration.
+    """The most GPU-efficient measured prefill *configuration*.
 
     Scalar, so there is no ``prefer`` here and no Pareto front: unlike the
     decode curve, a ctx candidate that serves more requests per GPU is better
     in every way a deployment cares about. Ties break toward the smaller GPU
     count, because two configurations at one efficiency are not equal — the
     smaller one leaves the rest of the node to the generation side.
+
+    Repeats of one configuration are averaged rather than competed. Taking
+    the maximum over repeats would rank configurations by which one drew the
+    kindest sample, and the measured spread here — 4.0 % across twelve
+    repeats of a single configuration — is wider than the difference between
+    configurations that this selection is meant to resolve.
     """
     listed = [dict(p) for p in points]
     if not listed:
         raise DisaggSolError("no measured ctx candidate to choose between")
-    chosen = max(listed, key=lambda p: (p[CTX_RANK], -p["ctx_gpus"]))
+
+    grouped: dict[tuple, list[dict[str, Any]]] = {}
+    for point in listed:
+        grouped.setdefault(_config_key(point), []).append(point)
+
+    candidates = []
+    for key, repeats in grouped.items():
+        ranks = [r[CTX_RANK] for r in repeats]
+        values = [r[CTX_METRIC] for r in repeats]
+        first = repeats[0]
+        candidates.append(
+            {
+                "config": key,
+                "ctx_gpus": first["ctx_gpus"],
+                "max_batch": first["max_batch"],
+                "adp": first["adp"],
+                CTX_METRIC: sum(values) / len(values),
+                CTX_RANK: sum(ranks) / len(ranks),
+                "repeats": len(repeats),
+                "spread_pct": (max(ranks) - min(ranks)) / (sum(ranks) / len(ranks)) * 100.0,
+                "cases": [r.get("case") for r in repeats],
+            }
+        )
+
+    chosen = max(candidates, key=lambda c: (c[CTX_RANK], -c["ctx_gpus"]))
     result = {
-        "case": chosen.get("case"),
         "ctx_gpus": chosen["ctx_gpus"],
         "max_batch": chosen["max_batch"],
         "adp": chosen["adp"],
         CTX_METRIC: chosen[CTX_METRIC],
         CTX_RANK: chosen[CTX_RANK],
-        "ranked_on": CTX_RANK,
-        "candidates": len(listed),
-        "source_run_json": chosen.get("source_run_json"),
+        "ranked_on": f"mean {CTX_RANK} over {chosen['repeats']} repeat(s)",
+        "repeats": chosen["repeats"],
+        "spread_pct": chosen["spread_pct"],
+        "cases": chosen["cases"],
+        "candidates": len(candidates),
+        "measurements": len(listed),
     }
     if incumbent is not None:
         result["incumbent"] = dict(incumbent)
-        result["moved"] = chosen.get("case") != incumbent.get("case")
+        # By configuration, never by case name: a different repeat of the
+        # incumbent is not a move, and reporting it as one gives the wrong
+        # answer to the question this whole staging exists to ask.
+        result["moved"] = chosen["config"] != _config_key(incumbent)
     return result
 
 
