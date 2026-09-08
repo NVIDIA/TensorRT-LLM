@@ -251,9 +251,7 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
     stub_bin.mkdir()
     python_stub = stub_bin / "python3"
     python_stub.write_text("#!/bin/sh\n"
-                           "if [ \"$1\" = \"-S\" ]; then\n"
-                           "    echo \"$4/flashinfer\"\n"
-                           "elif [ \"$1\" = \"-c\" ]; then\n"
+                           "if [ \"$1\" = \"-c\" ]; then\n"
                            "    echo ipc:///tmp/trtllm-unified-cache-test\n"
                            "fi\n")
     python_stub.chmod(0o755)
@@ -261,7 +259,6 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
     openssl_stub.write_text("#!/bin/sh\nprintf '%064d\\n' 0\n")
     openssl_stub.chmod(0o755)
 
-    cache_root = tmp_path / "unified"
     env = os.environ.copy()
     for name in (
             "SLURM_NTASKS",
@@ -275,9 +272,10 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
             "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS",
     ):
         env.pop(name, None)
+    cache_root = tmp_path / "home" / "unified"
     env["PMI_RANK"] = "0"
-    env["TRTLLM_CACHE_DIR"] = str(cache_root)
     env["HOME"] = str(tmp_path / "home")
+    env["TRTLLM_CACHE_DIR"] = "~/unified"
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
 
     launcher = Path(__file__).parents[
