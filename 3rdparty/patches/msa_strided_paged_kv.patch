@@ -1,17 +1,5 @@
-diff --git a/python/fmha_sm100/__init__.py b/python/fmha_sm100/__init__.py
-index 8b13a0d27e9aacd8dde1f494a63204c9a32d72eb..ad91c432b9755fd35bc9f14fddbb860c5adb82e2 100644
---- a/python/fmha_sm100/__init__.py
-+++ b/python/fmha_sm100/__init__.py
-@@ -21,6 +21,7 @@ _SPARSE_LAZY_EXPORTS = frozenset(
-         "fp4_indexer_block_scores",
-         "build_k2q_csr",
-         "SparseK2qCsrBuilderSm100",
-+        "stage_selected_nvfp4_to_fp8",
-     }
- )
- 
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecbc9de679b 100644
+index b02f747..459f3be 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
 @@ -532,9 +532,8 @@ def _fmha_sm100_plan(
@@ -59,106 +47,16 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
          lse_total_size = 0
          workspace_lse = None
  
-@@ -754,6 +753,10 @@ def _fmha_sm100(
-     plan_info,
-     kv_indices: Optional[torch.Tensor] = None,
-     kv_block_indexes: Optional[torch.Tensor] = None,
-+    kv_physical_block_indexes: Optional[torch.Tensor] = None,
-+    sparse_custom_mask: Optional[torch.Tensor] = None,
-+    sparse_custom_mask_q_indices: Optional[torch.Tensor] = None,
-+    sparse_custom_mask_batch_indices: Optional[torch.Tensor] = None,
-     q_offset_override: Optional[Union[int, torch.Tensor]] = None,
-     out: Optional[torch.Tensor] = None,
-     max_score: Optional[torch.Tensor] = None,
-@@ -768,7 +771,12 @@ def _fmha_sm100(
+@@ -768,7 +767,7 @@ def _fmha_sm100(
  ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
  
      if plan_info["MM-SA-Nv"]:
 -        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
-+        if kv_physical_block_indexes is not None or sparse_custom_mask is not None:
-+            raise ValueError(
-+                "physical page indexes and sparse custom masks are only supported "
-+                "by the CUTLASS sparse FMHA path"
-+            )
 +        return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score,
                  sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
                  kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
                  kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
-@@ -808,6 +816,62 @@ def _fmha_sm100(
- 
-     batch_size = qo_segment_lens.shape[0]
- 
-+    if kv_physical_block_indexes is not None:
-+        if kv_block_indexes is None:
-+            raise ValueError(
-+                "kv_physical_block_indexes requires logical kv_block_indexes"
-+            )
-+        if (
-+            kv_physical_block_indexes.dtype != torch.int32
-+            or kv_physical_block_indexes.device != q.device
-+            or kv_physical_block_indexes.dim() != 3
-+            or tuple(kv_physical_block_indexes.shape)
-+            != tuple(kv_block_indexes.shape)
-+        ):
-+            raise ValueError(
-+                "kv_physical_block_indexes must be int32 on q.device with "
-+                "the same rank-3 shape as kv_block_indexes"
-+            )
-+
-+    custom_mask_args = (
-+        sparse_custom_mask,
-+        sparse_custom_mask_q_indices,
-+        sparse_custom_mask_batch_indices,
-+    )
-+    if any(arg is None for arg in custom_mask_args) and any(
-+        arg is not None for arg in custom_mask_args
-+    ):
-+        raise ValueError(
-+            "sparse_custom_mask and its query/batch indices must be provided together"
-+        )
-+    if sparse_custom_mask is not None:
-+        if kv_block_indexes is None:
-+            raise ValueError("sparse_custom_mask requires sparse kv_block_indexes")
-+        if (
-+            sparse_custom_mask.dtype != torch.int32
-+            or sparse_custom_mask.device != q.device
-+            or sparse_custom_mask.dim() != 3
-+            or sparse_custom_mask.shape[1] < 1
-+            or sparse_custom_mask.shape[2] < 1
-+        ):
-+            raise ValueError(
-+                "sparse_custom_mask must be int32 on q.device with shape "
-+                "[num_generation_requests, max_tree_tokens, num_mask_words]"
-+            )
-+        for name, indices in (
-+            ("sparse_custom_mask_q_indices", sparse_custom_mask_q_indices),
-+            ("sparse_custom_mask_batch_indices", sparse_custom_mask_batch_indices),
-+        ):
-+            if (
-+                indices.dtype != torch.int32
-+                or indices.device != q.device
-+                or indices.dim() != 1
-+                or indices.shape[0] != q.shape[0]
-+            ):
-+                raise ValueError(
-+                    f"{name} must be int32 on q.device with shape [total_qo_len]"
-+                )
-+
-     if isinstance(qo_offset, int):
-         qo_offset = torch.full_like(qo_segment_lens, qo_offset)
-     elif qo_offset is not None:
-@@ -911,6 +975,10 @@ def _fmha_sm100(
-         max_score,
-         max_k_tiles,
-         kv_block_indexes,
-+        kv_physical_block_indexes,
-+        sparse_custom_mask,
-+        sparse_custom_mask_q_indices,
-+        sparse_custom_mask_batch_indices,
-         pack_factor,
-         bool(qo_len_uniform),
-         torch.cuda.current_stream().cuda_stream,
-@@ -941,6 +1009,62 @@ def _fmha_sm100(
+@@ -941,6 +940,62 @@ def _fmha_sm100(
      return out, max_score
  
  
@@ -221,7 +119,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
  def fmha_sm100_plan(
      qo_segment_lens: torch.Tensor,
      kv_segment_lens: torch.Tensor,
-@@ -973,9 +1097,11 @@ def fmha_sm100_plan(
+@@ -973,9 +1028,11 @@ def fmha_sm100_plan(
          ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
          A tensor must have shape ``[batch_size]``.
      split_prefill_decode : bool, optional
@@ -236,7 +134,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
      **kwargs
          Planner options forwarded to ``_fmha_sm100_plan``.  Common options are
          ``num_kv_heads``, ``num_kv_splits``, ``page_size``,
-@@ -985,8 +1111,13 @@ def fmha_sm100_plan(
+@@ -985,8 +1042,13 @@ def fmha_sm100_plan(
      Returns
      -------
      tuple
@@ -252,7 +150,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
      """
  
      # assert qo_segment_lens.device.type == 'cpu' \
-@@ -997,31 +1128,23 @@ def fmha_sm100_plan(
+@@ -997,31 +1059,23 @@ def fmha_sm100_plan(
          qo_offset = kv_segment_lens - qo_segment_lens
      elif isinstance(qo_offset, int):
          qo_offset = torch.full_like(qo_segment_lens, qo_offset)
@@ -297,41 +195,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
                                      qo_offset=qo_offset, **kwargs)
          return (False, 0, batch_size, plan, None)
  
-@@ -1032,6 +1155,10 @@ def fmha_sm100(
-     plan_info,
-     kv_indices: Optional[torch.Tensor] = None,
-     kv_block_indexes: Optional[torch.Tensor] = None,
-+    kv_physical_block_indexes: Optional[torch.Tensor] = None,
-+    sparse_custom_mask: Optional[torch.Tensor] = None,
-+    sparse_custom_mask_q_indices: Optional[torch.Tensor] = None,
-+    sparse_custom_mask_batch_indices: Optional[torch.Tensor] = None,
-     q_offset_override: Optional[Union[int, torch.Tensor]] = None,
-     out: Optional[torch.Tensor] = None,
-     max_score: Optional[torch.Tensor] = None,
-@@ -1061,6 +1188,22 @@ def fmha_sm100(
-         Sparse KV block indices from ``sparse_topk_select``.  Shape
-         ``[total_qo_len, num_kv_heads or num_qo_heads, kv_block_num]``, dtype
-         int32, ascending per row with ``-1`` padding at the tail.
-+    kv_physical_block_indexes : torch.Tensor, optional
-+        Direct physical page IDs for sparse slots. Shape and strides match
-+        ``kv_block_indexes``. When present, K/V loads use these IDs while
-+        causal masking continues to use the logical ``kv_block_indexes``.
-+    sparse_custom_mask : torch.Tensor, optional
-+        Per-request/query packed visibility bits for a speculative tree. Shape
-+        ``[num_generation_requests, max_tree_tokens, num_mask_words]`` and
-+        dtype int32. History preceding the tree remains visible; bits apply
-+        only from the query's tree start.
-+    sparse_custom_mask_q_indices : torch.Tensor, optional
-+        Per-query zero-based position inside the speculative tree. Shape
-+        ``[total_qo_len]`` and dtype int32. Required with
-+        ``sparse_custom_mask``.
-+    sparse_custom_mask_batch_indices : torch.Tensor, optional
-+        Per-query row in ``sparse_custom_mask``. Shape ``[total_qo_len]`` and
-+        dtype int32. Required with ``sparse_custom_mask``.
-     q_offset_override : int or torch.Tensor, optional
-         Runtime causal-offset override.  Tensor form must have shape
-         ``[batch_size]`` on the same CUDA device as the plan metadata.  The
-@@ -1081,16 +1224,29 @@ def fmha_sm100(
+@@ -1081,16 +1135,23 @@ def fmha_sm100(
      -------
      tuple[torch.Tensor | None, torch.Tensor | None]
          ``(out, max_score)``.  Either item may be ``None`` if the corresponding
@@ -343,14 +207,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
      """
      has_mixed_prefill, split, batch_size, decode, prefill = plan_info
      if not has_mixed_prefill:
--        return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
-+        return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score,
-+            kv_indices=kv_indices, kv_block_indexes=kv_block_indexes,
-+            kv_physical_block_indexes=kv_physical_block_indexes,
-+            sparse_custom_mask=sparse_custom_mask,
-+            sparse_custom_mask_q_indices=sparse_custom_mask_q_indices,
-+            sparse_custom_mask_batch_indices=sparse_custom_mask_batch_indices,
-+            q_offset_override=q_offset_override, **kwargs)
+         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
      else:
 -
 -        decode_pack = decode.get("pack_factor", 1)
@@ -367,7 +224,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
          is_paged = kv_indices is not None
          nnz_qo = q.shape[0]
          num_qo_heads = q.shape[1]
-@@ -1101,10 +1257,12 @@ def fmha_sm100(
+@@ -1101,10 +1162,12 @@ def fmha_sm100(
          if is_paged:
              k_decode, v_decode = k, v
              k_prefill, v_prefill = k, v
@@ -384,40 +241,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
              decode_kv_indices = kv_indices[:kv_page_split]
              prefill_kv_indices = kv_indices[kv_page_split:]
          else:
-@@ -1119,6 +1277,32 @@ def fmha_sm100(
- 
-         decode_block_idx = kv_block_indexes[:decode_nnz] if kv_block_indexes is not None else None
-         prefill_block_idx = kv_block_indexes[decode_nnz:] if kv_block_indexes is not None else None
-+        decode_physical_block_idx = (
-+            kv_physical_block_indexes[:decode_nnz]
-+            if kv_physical_block_indexes is not None else None
-+        )
-+        prefill_physical_block_idx = (
-+            kv_physical_block_indexes[decode_nnz:]
-+            if kv_physical_block_indexes is not None else None
-+        )
-+        decode_sparse_custom_mask = sparse_custom_mask
-+        prefill_sparse_custom_mask = sparse_custom_mask
-+        decode_sparse_custom_q_indices = (
-+            sparse_custom_mask_q_indices[:decode_nnz]
-+            if sparse_custom_mask_q_indices is not None else None
-+        )
-+        prefill_sparse_custom_q_indices = (
-+            sparse_custom_mask_q_indices[decode_nnz:]
-+            if sparse_custom_mask_q_indices is not None else None
-+        )
-+        decode_sparse_custom_batch_indices = (
-+            sparse_custom_mask_batch_indices[:decode_nnz]
-+            if sparse_custom_mask_batch_indices is not None else None
-+        )
-+        prefill_sparse_custom_batch_indices = (
-+            sparse_custom_mask_batch_indices[decode_nnz:]
-+            if sparse_custom_mask_batch_indices is not None else None
-+        )
-         if isinstance(q_offset_override, int):
-             decode_qo_offset = torch.full((split,), q_offset_override, dtype=torch.int32, device=q.device)
-             prefill_qo_offset = torch.full((batch_size - split,), q_offset_override, dtype=torch.int32, device=q.device)
-@@ -1129,27 +1313,43 @@ def fmha_sm100(
+@@ -1129,27 +1192,35 @@ def fmha_sm100(
              decode_qo_offset = None
              prefill_qo_offset = None
  
@@ -433,10 +257,6 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 -            out=None, max_score=None,
 +            out=out[:decode_nnz] if write_in_place else None, max_score=None,
              kv_indices=decode_kv_indices, kv_block_indexes=decode_block_idx,
-+            kv_physical_block_indexes=decode_physical_block_idx,
-+            sparse_custom_mask=decode_sparse_custom_mask,
-+            sparse_custom_mask_q_indices=decode_sparse_custom_q_indices,
-+            sparse_custom_mask_batch_indices=decode_sparse_custom_batch_indices,
              q_offset_override=decode_qo_offset,
              **kwargs)
          prefill_out, prefill_ms = _fmha_sm100(
@@ -444,10 +264,6 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
 -            out=None, max_score=None,
 +            out=out[decode_nnz:] if write_in_place else None, max_score=None,
              kv_indices=prefill_kv_indices, kv_block_indexes=prefill_block_idx,
-+            kv_physical_block_indexes=prefill_physical_block_idx,
-+            sparse_custom_mask=prefill_sparse_custom_mask,
-+            sparse_custom_mask_q_indices=prefill_sparse_custom_q_indices,
-+            sparse_custom_mask_batch_indices=prefill_sparse_custom_batch_indices,
              q_offset_override=prefill_qo_offset,
              **kwargs)
  
@@ -466,7 +282,7 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
              out.copy_(combined_out)
  
          # ---- Merge max_score ----
-@@ -1261,7 +1461,7 @@ def sparse_topk_select(
+@@ -1261,7 +1332,7 @@ def sparse_topk_select(
      workspace_size = num_qo_heads * max_k_tiles * total_qo_len  # int32 elements
  
      workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
@@ -476,95 +292,37 @@ index b02f74736c63d58f6f29cc934027b34962e543cf..9160bbc3f39161e566bc6b6e8ced8ecb
          output_indices = output
      else:
 diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
-index 69490350d3c11146c7800b4218612d5fff27d7b6..daa40e1f78d8da49ba43cf2b07ac2172190da06f 100644
+index 6949035..e59ecfb 100644
 --- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
 +++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
-@@ -58,6 +58,21 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
+@@ -58,6 +58,8 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
        p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
        p.max_score_ptr, p.max_k_tiles,
        p.kv_block_indexes_ptr, p.kv_block_num,
 +      p.kv_block_indexes_stride_q, p.kv_block_indexes_stride_h,
 +      p.kv_block_indexes_stride_k,
-+      p.kv_physical_block_indexes_ptr,
-+      p.kv_physical_block_indexes_stride_q,
-+      p.kv_physical_block_indexes_stride_h,
-+      p.kv_physical_block_indexes_stride_k,
-+      p.sparse_custom_mask_ptr,
-+      p.sparse_custom_mask_stride_b,
-+      p.sparse_custom_mask_stride_q,
-+      p.sparse_custom_mask_stride_word,
-+      p.sparse_custom_mask_words,
-+      p.sparse_custom_mask_q_indices_ptr,
-+      p.sparse_custom_mask_q_indices_stride_q,
-+      p.sparse_custom_mask_batch_indices_ptr,
-+      p.sparse_custom_mask_batch_indices_stride_q,
        p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
        flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,
                                        p.o_direct_ptr, p.num_qo_heads_orig,
 diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
-index 878a90c774900e961724a563ab75c6e72b448081..240f7e32dc3d4533dd63f246b9d0fd2ba91f76be 100644
+index 878a90c..f621511 100644
 --- a/python/fmha_sm100/csrc/fmha_sm100_params.h
 +++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
-@@ -54,7 +54,23 @@ struct FMHACutlassSM100Params {
+@@ -54,6 +54,9 @@ struct FMHACutlassSM100Params {
    int max_k_tiles;
    int* kv_block_indexes_ptr;
    int kv_block_num;
--  int pack_factor = 1;
-+    int64_t kv_block_indexes_stride_q;
-+    int64_t kv_block_indexes_stride_h;
-+    int64_t kv_block_indexes_stride_k;
-+    int* kv_physical_block_indexes_ptr;
-+    int64_t kv_physical_block_indexes_stride_q;
-+    int64_t kv_physical_block_indexes_stride_h;
-+    int64_t kv_physical_block_indexes_stride_k;
-+    int* sparse_custom_mask_ptr;
-+    int64_t sparse_custom_mask_stride_b;
-+    int64_t sparse_custom_mask_stride_q;
-+    int64_t sparse_custom_mask_stride_word;
-+    int sparse_custom_mask_words;
-+    int* sparse_custom_mask_q_indices_ptr;
-+    int64_t sparse_custom_mask_q_indices_stride_q;
-+    int* sparse_custom_mask_batch_indices_ptr;
-+    int64_t sparse_custom_mask_batch_indices_stride_q;
-+    int pack_factor = 1;
++  int64_t kv_block_indexes_stride_q;
++  int64_t kv_block_indexes_stride_h;
++  int64_t kv_block_indexes_stride_k;
+   int pack_factor = 1;
    int h_r_original = 0;
    int q_stride_n_original = 0;
-   int q_stride_h_original = 0;
 diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
-index 7e21585130ae020ac88b04939126f0e2f5cbb827..60f08b4087ef9856d2e8d339ba66d52a78739280 100644
+index 7e21585..03e6c7a 100644
 --- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
 +++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
-@@ -36,6 +36,10 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
-                     Optional<ffi::TensorView> maybe_max_score,
-                     int64_t max_k_tiles,
-                     Optional<ffi::TensorView> maybe_kv_block_indexes,
-+                    Optional<ffi::TensorView> maybe_kv_physical_block_indexes,
-+                    Optional<ffi::TensorView> maybe_sparse_custom_mask,
-+                    Optional<ffi::TensorView> maybe_sparse_custom_mask_q_indices,
-+                    Optional<ffi::TensorView> maybe_sparse_custom_mask_batch_indices,
-                     int64_t pack_factor,
-                     bool qo_len_uniform,
-                     int64_t stream_ptr) {
-@@ -53,6 +57,18 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
-   int* kv_block_indexes_ptr = maybe_kv_block_indexes.has_value()
-                                   ? static_cast<int*>(maybe_kv_block_indexes.value().data_ptr())
-                                   : nullptr;
-+  int* kv_physical_block_indexes_ptr = maybe_kv_physical_block_indexes.has_value()
-+                                  ? static_cast<int*>(maybe_kv_physical_block_indexes.value().data_ptr())
-+                                  : nullptr;
-+  int* sparse_custom_mask_ptr = maybe_sparse_custom_mask.has_value()
-+                                  ? static_cast<int*>(maybe_sparse_custom_mask.value().data_ptr())
-+                                  : nullptr;
-+  int* sparse_custom_mask_q_indices_ptr = maybe_sparse_custom_mask_q_indices.has_value()
-+                                  ? static_cast<int*>(maybe_sparse_custom_mask_q_indices.value().data_ptr())
-+                                  : nullptr;
-+  int* sparse_custom_mask_batch_indices_ptr = maybe_sparse_custom_mask_batch_indices.has_value()
-+                                  ? static_cast<int*>(maybe_sparse_custom_mask_batch_indices.value().data_ptr())
-+                                  : nullptr;
- 
-   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
- 
-@@ -124,6 +140,34 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
+@@ -124,6 +124,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
    params.kv_block_num = maybe_kv_block_indexes.has_value()
                              ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
                              : 0;
@@ -574,32 +332,10 @@ index 7e21585130ae020ac88b04939126f0e2f5cbb827..60f08b4087ef9856d2e8d339ba66d52a
 +                                         ? maybe_kv_block_indexes.value().stride(1) : 0;
 +  params.kv_block_indexes_stride_k = maybe_kv_block_indexes.has_value()
 +                                         ? maybe_kv_block_indexes.value().stride(2) : 0;
-+  params.kv_physical_block_indexes_ptr = kv_physical_block_indexes_ptr;
-+  params.kv_physical_block_indexes_stride_q = maybe_kv_physical_block_indexes.has_value()
-+                                         ? maybe_kv_physical_block_indexes.value().stride(0) : 0;
-+  params.kv_physical_block_indexes_stride_h = maybe_kv_physical_block_indexes.has_value()
-+                                         ? maybe_kv_physical_block_indexes.value().stride(1) : 0;
-+  params.kv_physical_block_indexes_stride_k = maybe_kv_physical_block_indexes.has_value()
-+                                         ? maybe_kv_physical_block_indexes.value().stride(2) : 0;
-+  params.sparse_custom_mask_ptr = sparse_custom_mask_ptr;
-+  params.sparse_custom_mask_stride_b = maybe_sparse_custom_mask.has_value()
-+                                         ? maybe_sparse_custom_mask.value().stride(0) : 0;
-+  params.sparse_custom_mask_stride_q = maybe_sparse_custom_mask.has_value()
-+                                         ? maybe_sparse_custom_mask.value().stride(1) : 0;
-+  params.sparse_custom_mask_stride_word = maybe_sparse_custom_mask.has_value()
-+                                         ? maybe_sparse_custom_mask.value().stride(2) : 0;
-+  params.sparse_custom_mask_words = maybe_sparse_custom_mask.has_value()
-+                                         ? static_cast<int>(maybe_sparse_custom_mask.value().size(2)) : 0;
-+  params.sparse_custom_mask_q_indices_ptr = sparse_custom_mask_q_indices_ptr;
-+  params.sparse_custom_mask_q_indices_stride_q = maybe_sparse_custom_mask_q_indices.has_value()
-+                                         ? maybe_sparse_custom_mask_q_indices.value().stride(0) : 0;
-+  params.sparse_custom_mask_batch_indices_ptr = sparse_custom_mask_batch_indices_ptr;
-+  params.sparse_custom_mask_batch_indices_stride_q = maybe_sparse_custom_mask_batch_indices.has_value()
-+                                         ? maybe_sparse_custom_mask_batch_indices.value().stride(0) : 0;
  
    params.pack_factor = static_cast<int>(pack_factor);
    params.num_ctas = static_cast<int>(packed_work_range.size(0));
-@@ -188,9 +232,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
+@@ -188,9 +194,12 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                           * maybe_max_score.value().size(1)
                           * maybe_max_score.value().size(2)) : 0;
    params.gmem_bounds.kv_block_indexes_numel = maybe_kv_block_indexes.has_value()
@@ -616,143 +352,63 @@ index 7e21585130ae020ac88b04939126f0e2f5cbb827..60f08b4087ef9856d2e8d339ba66d52a
        ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
    params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
 diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
-index b11abe608c43c2ea02e989a0530193ad6de601a1..6940f2de554880e77f76498d41ce37a0e8e7cce6 100644
+index b11abe6..f6f95f7 100644
 --- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
 +++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
-@@ -126,6 +126,22 @@ struct FwdRunner {
+@@ -126,6 +126,9 @@ struct FwdRunner {
                           int max_k_tiles = 0,
                           int* kv_block_indexes = nullptr,
                           int kv_block_num = 0,
 +                         int64_t kv_block_indexes_stride_q = 0,
 +                         int64_t kv_block_indexes_stride_h = 0,
 +                         int64_t kv_block_indexes_stride_k = 0,
-+                         int* kv_physical_block_indexes = nullptr,
-+                         int64_t kv_physical_block_indexes_stride_q = 0,
-+                         int64_t kv_physical_block_indexes_stride_h = 0,
-+                         int64_t kv_physical_block_indexes_stride_k = 0,
-+                         int* sparse_custom_mask = nullptr,
-+                         int64_t sparse_custom_mask_stride_b = 0,
-+                         int64_t sparse_custom_mask_stride_q = 0,
-+                         int64_t sparse_custom_mask_stride_word = 0,
-+                         int sparse_custom_mask_words = 0,
-+                         int* sparse_custom_mask_q_indices = nullptr,
-+                         int64_t sparse_custom_mask_q_indices_stride_q = 0,
-+                         int* sparse_custom_mask_batch_indices = nullptr,
-+                         int64_t sparse_custom_mask_batch_indices_stride_q = 0,
                           int pack_factor = 1,
                           int q_stride_n_original = 0,
                           int q_stride_h_original = 0,
-@@ -224,6 +240,13 @@ struct FwdRunner {
+@@ -224,6 +227,7 @@ struct FwdRunner {
          arguments = {
            {problem_shape,
             {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
 +             kv_block_indexes_stride_q, kv_block_indexes_stride_h, kv_block_indexes_stride_k,
-+             kv_physical_block_indexes, kv_physical_block_indexes_stride_q,
-+             kv_physical_block_indexes_stride_h, kv_physical_block_indexes_stride_k,
-+             sparse_custom_mask, sparse_custom_mask_stride_b, sparse_custom_mask_stride_q,
-+             sparse_custom_mask_stride_word, sparse_custom_mask_words,
-+             sparse_custom_mask_q_indices, sparse_custom_mask_q_indices_stride_q,
-+             sparse_custom_mask_batch_indices, sparse_custom_mask_batch_indices_stride_q,
  #ifdef FMHA_GMEM_BOUNDS_CHECK
               pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
  #endif
-@@ -245,6 +268,13 @@ struct FwdRunner {
+@@ -245,6 +249,7 @@ struct FwdRunner {
          arguments = {
            problem_shape,
            {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
 +            kv_block_indexes_stride_q, kv_block_indexes_stride_h, kv_block_indexes_stride_k,
-+            kv_physical_block_indexes, kv_physical_block_indexes_stride_q,
-+            kv_physical_block_indexes_stride_h, kv_physical_block_indexes_stride_k,
-+            sparse_custom_mask, sparse_custom_mask_stride_b, sparse_custom_mask_stride_q,
-+            sparse_custom_mask_stride_word, sparse_custom_mask_words,
-+            sparse_custom_mask_q_indices, sparse_custom_mask_q_indices_stride_q,
-+            sparse_custom_mask_batch_indices, sparse_custom_mask_batch_indices_stride_q,
  #ifdef FMHA_GMEM_BOUNDS_CHECK
              pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
  #endif
-@@ -436,6 +466,22 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+@@ -436,6 +441,9 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                           int max_k_tiles = 0,
                           int* kv_block_indexes = nullptr,
                           int kv_block_num = 0,
 +                         int64_t kv_block_indexes_stride_q = 0,
 +                         int64_t kv_block_indexes_stride_h = 0,
 +                         int64_t kv_block_indexes_stride_k = 0,
-+                         int* kv_physical_block_indexes = nullptr,
-+                         int64_t kv_physical_block_indexes_stride_q = 0,
-+                         int64_t kv_physical_block_indexes_stride_h = 0,
-+                         int64_t kv_physical_block_indexes_stride_k = 0,
-+                         int* sparse_custom_mask = nullptr,
-+                         int64_t sparse_custom_mask_stride_b = 0,
-+                         int64_t sparse_custom_mask_stride_q = 0,
-+                         int64_t sparse_custom_mask_stride_word = 0,
-+                         int sparse_custom_mask_words = 0,
-+                         int* sparse_custom_mask_q_indices = nullptr,
-+                         int64_t sparse_custom_mask_q_indices_stride_q = 0,
-+                         int* sparse_custom_mask_batch_indices = nullptr,
-+                         int64_t sparse_custom_mask_batch_indices_stride_q = 0,
                           int pack_factor = 1,
                           int q_stride_n_original = 0,
                           int q_stride_h_original = 0,
-@@ -455,6 +501,13 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
+@@ -455,6 +463,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
        kv_indices, kv_page_indptr, total_page_num,
        maybe_max_score, max_k_tiles,
        kv_block_indexes, kv_block_num,
 +      kv_block_indexes_stride_q, kv_block_indexes_stride_h, kv_block_indexes_stride_k,
-+      kv_physical_block_indexes, kv_physical_block_indexes_stride_q,
-+      kv_physical_block_indexes_stride_h, kv_physical_block_indexes_stride_k,
-+      sparse_custom_mask, sparse_custom_mask_stride_b, sparse_custom_mask_stride_q,
-+      sparse_custom_mask_stride_word, sparse_custom_mask_words,
-+      sparse_custom_mask_q_indices, sparse_custom_mask_q_indices_stride_q,
-+      sparse_custom_mask_batch_indices, sparse_custom_mask_batch_indices_stride_q,
        pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
        pack_gqa, num_ctas);
  }
 diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f3250a60133 100644
+index 5a5d0f3..843aae8 100644
 --- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
 +++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
-@@ -902,6 +902,34 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
-         copy(tiled_tmem_load, l_tTMEM_LOADtS, tTMEM_LOADrS);
-         if constexpr (need_apply_mask) {
-           Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
-+          if (params.load.sparse_custom_mask != nullptr) {
-+            int batch_idx = get<2, 1>(blk_coord);
-+            int query_idx = __ldg(&params.load.sparse_custom_mask_q_indices[
-+                static_cast<int64_t>(batch_idx)
-+                * params.load.sparse_custom_mask_q_indices_stride_q]);
-+            int original_batch_idx = __ldg(&params.load.sparse_custom_mask_batch_indices[
-+                static_cast<int64_t>(batch_idx)
-+                * params.load.sparse_custom_mask_batch_indices_stride_q]);
-+            int64_t mask_row_offset
-+                = static_cast<int64_t>(original_batch_idx) * params.load.sparse_custom_mask_stride_b
-+                + static_cast<int64_t>(query_idx) * params.load.sparse_custom_mask_stride_q;
-+            CUTLASS_PRAGMA_UNROLL
-+            for (int i = 0; i < size(tTMEM_LOADrS); i++) {
-+              int q_coord = int(get<0>(tTMEM_LOADcS(i)));
-+              int kv_coord = int(get<1>(tTMEM_LOADcS(i)));
-+              int tree_start = Mask{}.sparse_causal_bound(q_coord, problem_shape) - query_idx;
-+              int tree_idx = kv_coord - tree_start;
-+              if (tree_idx >= 0 && tree_idx < params.load.sparse_custom_mask_words * 32) {
-+                auto mask_word = static_cast<uint32_t>(__ldg(&params.load.sparse_custom_mask[
-+                    mask_row_offset
-+                    + static_cast<int64_t>(tree_idx / 32)
-+                        * params.load.sparse_custom_mask_stride_word]));
-+                if ((mask_word & (uint32_t(1) << uint32_t(tree_idx % 32))) == 0) {
-+                  tTMEM_LOADrS(i) = -INFINITY;
-+                }
-+              }
-+            }
-+          }
-         }
-       }}
- 
-@@ -1131,14 +1159,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+@@ -1131,14 +1131,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
      int skip_count, real_masked_count, unmasked_count;
      int effective_end;
  
 -    int kbi_off_s = 0;
 +    int64_t kbi_off_s = 0;
-+    int sparse_custom_q_index = 0;
      if constexpr (kNeedSparse) {
        int h_r_s = get<3, 0, 0>(problem_shape);
 -      int num_kv_heads_s = get<3, 0, 1>(problem_shape);
@@ -762,15 +418,10 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
 -                + kv_head_idx_s * params.load.kv_block_num;
 +      kbi_off_s = static_cast<int64_t>(batch_idx_s) * params.load.kv_block_indexes_stride_q
 +                + static_cast<int64_t>(kv_head_idx_s) * params.load.kv_block_indexes_stride_h;
-+      if (params.load.sparse_custom_mask != nullptr) {
-+        sparse_custom_q_index = __ldg(&params.load.sparse_custom_mask_q_indices[
-+            static_cast<int64_t>(batch_idx_s)
-+            * params.load.sparse_custom_mask_q_indices_stride_q]);
-+      }
      }
  
      if constexpr (kNeedSparse) {
-@@ -1154,7 +1187,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+@@ -1154,7 +1153,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
  
        // Count padding blocks (backward scan for -1)
        int valid_blks = params.load.kv_block_num;
@@ -782,7 +433,7 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
          valid_blks--;
  
        int valid_tiles = (valid_blks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
-@@ -1223,7 +1259,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+@@ -1223,7 +1225,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
            cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
            return false;
          }
@@ -792,121 +443,55 @@ index 5a5d0f38887a6d7d5ebad00b9f6e7b599a1fedab..de9502d124b2d7a4c9d6940725ec3f32
          if (pos < 0) {
            cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
            return false;
-@@ -1232,7 +1269,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
-         cS = domain_offset(make_coord(q_s, kv_coord), cS_base);
-         int causal_bound = Mask{}.sparse_causal_bound(q_s, problem_shape);
-         constexpr int sub_tile_kv = get<1>(TileShapeQK{});
--        return kv_coord + sub_tile_kv <= causal_bound + 1;
-+        int unmasked_bound = causal_bound + 1;
-+        if (params.load.sparse_custom_mask != nullptr) {
-+          // History before the speculative tree remains fully visible.
-+          // Every tile intersecting the tree must retain the element-wise
-+          // mask even when it sits below the ordinary causal diagonal.
-+          unmasked_bound = min(unmasked_bound, causal_bound - sparse_custom_q_index);
-+        }
-+        return kv_coord + sub_tile_kv <= unmasked_bound;
-       }
-       return false;
-     };
-@@ -2076,7 +2120,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
-     pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
- 
-     Tensor tTMEM_LOADVrS = make_tensor<ElementQK>(shape(tTMEM_LOADVcS));
--   
-+
-     if constexpr (kNeedOutput)
-       copy(tiled_tmem_loadv, tTMEM_LOADVtS0, tTMEM_LOADVrS);
- 
 diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044de72ff09 100644
+index 0fdcbfa..c577f34 100644
 --- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
 +++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
-@@ -112,6 +112,22 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -112,6 +112,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
      int* kv_page_indptr = nullptr;
      int* kv_block_indexes = nullptr;
      int kv_block_num = 0;
 +    int64_t kv_block_indexes_stride_q = 0;
 +    int64_t kv_block_indexes_stride_h = 0;
 +    int64_t kv_block_indexes_stride_k = 0;
-+    int* kv_physical_block_indexes = nullptr;
-+    int64_t kv_physical_block_indexes_stride_q = 0;
-+    int64_t kv_physical_block_indexes_stride_h = 0;
-+    int64_t kv_physical_block_indexes_stride_k = 0;
-+    int* sparse_custom_mask = nullptr;
-+    int64_t sparse_custom_mask_stride_b = 0;
-+    int64_t sparse_custom_mask_stride_q = 0;
-+    int64_t sparse_custom_mask_stride_word = 0;
-+    int sparse_custom_mask_words = 0;
-+    int* sparse_custom_mask_q_indices = nullptr;
-+    int64_t sparse_custom_mask_q_indices_stride_q = 0;
-+    int* sparse_custom_mask_batch_indices = nullptr;
-+    int64_t sparse_custom_mask_batch_indices_stride_q = 0;
  #ifdef FMHA_GMEM_BOUNDS_CHECK
      int kv_page_indptr_size = 0;
      int kv_indices_size = 0;
-@@ -148,6 +164,22 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -148,6 +151,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
      int* kv_page_indptr = nullptr;
      int* kv_block_indexes = nullptr;
      int kv_block_num = 0;
 +    int64_t kv_block_indexes_stride_q = 0;
 +    int64_t kv_block_indexes_stride_h = 0;
 +    int64_t kv_block_indexes_stride_k = 0;
-+    int* kv_physical_block_indexes = nullptr;
-+    int64_t kv_physical_block_indexes_stride_q = 0;
-+    int64_t kv_physical_block_indexes_stride_h = 0;
-+    int64_t kv_physical_block_indexes_stride_k = 0;
-+    int* sparse_custom_mask = nullptr;
-+    int64_t sparse_custom_mask_stride_b = 0;
-+    int64_t sparse_custom_mask_stride_q = 0;
-+    int64_t sparse_custom_mask_stride_word = 0;
-+    int sparse_custom_mask_words = 0;
-+    int* sparse_custom_mask_q_indices = nullptr;
-+    int64_t sparse_custom_mask_q_indices_stride_q = 0;
-+    int* sparse_custom_mask_batch_indices = nullptr;
-+    int64_t sparse_custom_mask_batch_indices_stride_q = 0;
  #ifdef FMHA_GMEM_BOUNDS_CHECK
      int kv_page_indptr_size = 0;
      int kv_indices_size = 0;
-@@ -218,6 +250,19 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -218,6 +224,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
  
      Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
                    args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
 +                  args.kv_block_indexes_stride_q, args.kv_block_indexes_stride_h,
 +                  args.kv_block_indexes_stride_k,
-+                  args.kv_physical_block_indexes,
-+                  args.kv_physical_block_indexes_stride_q,
-+                  args.kv_physical_block_indexes_stride_h,
-+                  args.kv_physical_block_indexes_stride_k,
-+                  args.sparse_custom_mask, args.sparse_custom_mask_stride_b,
-+                  args.sparse_custom_mask_stride_q,
-+                  args.sparse_custom_mask_stride_word, args.sparse_custom_mask_words,
-+                  args.sparse_custom_mask_q_indices,
-+                  args.sparse_custom_mask_q_indices_stride_q,
-+                  args.sparse_custom_mask_batch_indices,
-+                  args.sparse_custom_mask_batch_indices_stride_q,
  #ifdef FMHA_GMEM_BOUNDS_CHECK
                    args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_numel,
  #endif
-@@ -525,11 +570,14 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -525,11 +533,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
        constexpr int effective_tile_kv = get<1>(TileShapeQK{});
        constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
  
 -      int kv_block_offset = 0;
 +      int64_t kv_block_offset = 0;
-+      int64_t kv_physical_block_offset = 0;
        if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
 -        int num_kv_heads_val = get<3, 0, 1>(params_problem_shape);
 -        kv_block_offset = batch_idx * num_kv_heads_val * params.kv_block_num
 -                        + kv_head_idx * params.kv_block_num;
 +        kv_block_offset = static_cast<int64_t>(batch_idx) * params.kv_block_indexes_stride_q
 +                        + static_cast<int64_t>(kv_head_idx) * params.kv_block_indexes_stride_h;
-+        kv_physical_block_offset
-+            = static_cast<int64_t>(batch_idx) * params.kv_physical_block_indexes_stride_q
-+            + static_cast<int64_t>(kv_head_idx) * params.kv_physical_block_indexes_stride_h;
        }
  
        // Keep full 4D tensor (page_size, D, H_kv, P) — select head at copy time
-@@ -549,14 +597,18 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -549,7 +556,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
          int page_for_lookup;
          if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
            int sparse_idx = (logical_page < params.kv_block_num)
@@ -916,18 +501,7 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044
                : -1;
            page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
          } else {
-           page_for_lookup = logical_page;
-           page_for_lookup = min(page_for_lookup, num_pages_batch - 1);
-         }
--        int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
-+        int physical_page = params.kv_physical_block_indexes != nullptr
-+            ? __ldg(&params.kv_physical_block_indexes[kv_physical_block_offset
-+                + static_cast<int64_t>(logical_page) * params.kv_physical_block_indexes_stride_k])
-+            : KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
-         { GPU_TRACE_SCOPE(LOAD_K); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
-         if (lane_predicate) {
-           auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
-@@ -573,14 +625,18 @@ struct Sm100FmhaLoadTmaWarpspecialized {
+@@ -573,7 +581,8 @@ struct Sm100FmhaLoadTmaWarpspecialized {
          int page_for_lookup;
          if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
            int sparse_idx = (logical_page < params.kv_block_num)
@@ -937,19 +511,8 @@ index 0fdcbfa097c4f4c1dbc53862b78b8afec3a6da82..35f07c3fc45ffd0973e562a80699d044
                : -1;
            page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
          } else {
-           page_for_lookup = logical_page;
-           page_for_lookup = min(page_for_lookup, num_pages_batch - 1);
-         }
--        int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
-+        int physical_page = params.kv_physical_block_indexes != nullptr
-+            ? __ldg(&params.kv_physical_block_indexes[kv_physical_block_offset
-+                + static_cast<int64_t>(logical_page) * params.kv_physical_block_indexes_stride_k])
-+            : KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
-         { GPU_TRACE_SCOPE(LOAD_V); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
-         if (lane_predicate) {
-           auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
-index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1b29bad35 100644
+index d72b17a..9c776a5 100644
 --- a/python/fmha_sm100/cute/interface.py
 +++ b/python/fmha_sm100/cute/interface.py
 @@ -136,6 +136,32 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
@@ -1502,7 +1065,7 @@ index d72b17a36e2ad31ea31e858e0f970f13742e6932..9c776a5d6a0298c33c53fa900be61cd1
          )
      return schedule
 diff --git a/python/fmha_sm100/cute/quantize.py b/python/fmha_sm100/cute/quantize.py
-index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9fe4836b83 100644
+index 4719a48..65e51be 100644
 --- a/python/fmha_sm100/cute/quantize.py
 +++ b/python/fmha_sm100/cute/quantize.py
 @@ -1,18 +1,68 @@
@@ -2288,7 +1851,7 @@ index 4719a4854bc9388b2a866598f9e21c1f14921181..65e51bedbec13f2b73fcd6b3569acd9f
  
  
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
-index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c698697ad22 100644
+index 99fd0b4..05b3254 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
 +++ b/python/fmha_sm100/cute/src/common/aot_cache.py
 @@ -6,6 +6,12 @@
@@ -2372,7 +1935,7 @@ index 99fd0b4da4ddb6fba21bcb18c924f5e9e8b583e6..05b325422c46c0452865a49074933c69
  
 diff --git a/python/fmha_sm100/cute/src/common/cuda_toolchain.py b/python/fmha_sm100/cute/src/common/cuda_toolchain.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..80cae6ebae837caf783283e5432679736c5ec2ae
+index 0000000..80cae6e
 --- /dev/null
 +++ b/python/fmha_sm100/cute/src/common/cuda_toolchain.py
 @@ -0,0 +1,169 @@
@@ -2546,7 +2109,7 @@ index 0000000000000000000000000000000000000000..80cae6ebae837caf783283e543267973
 +        return None
 +    return _assemble(body, isa_version, target)
 diff --git a/python/fmha_sm100/cute/src/common/tma_utils.py b/python/fmha_sm100/cute/src/common/tma_utils.py
-index 5bdc19a08eacf9a060f2c0a7a4d50a4adb735094..9df46999d95e8337de90afa6719bfa8d2d0de1e7 100644
+index 5bdc19a..9df4699 100644
 --- a/python/fmha_sm100/cute/src/common/tma_utils.py
 +++ b/python/fmha_sm100/cute/src/common/tma_utils.py
 @@ -118,9 +118,15 @@ def prefetch_tma_desc_raw(tma_desc_ptr, *, loc=None, ip=None):
@@ -2567,7 +2130,7 @@ index 5bdc19a08eacf9a060f2c0a7a4d50a4adb735094..9df46999d95e8337de90afa6719bfa8d
      )
      desc_ptr = cute_ir.inttoptr(ptr_ty, ptr_i64_align, loc=loc, ip=ip)
 diff --git a/python/fmha_sm100/cute/src/common/utils.py b/python/fmha_sm100/cute/src/common/utils.py
-index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577ff227cda 100644
+index 10b2b1f..cb7ea1c 100644
 --- a/python/fmha_sm100/cute/src/common/utils.py
 +++ b/python/fmha_sm100/cute/src/common/utils.py
 @@ -17,8 +17,42 @@ from cutlass.cute.runtime import from_dlpack
@@ -2824,7 +2387,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..cb7ea1c0359e3c3ea872944a87667577
  
  @dsl_user_op
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
-index f5950f3c5552107dcf8d4223383f39811dbed851..caad5947f140bda30e8ec64c87c7014b83916168 100644
+index f5950f3..caad594 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd.py
 @@ -1939,8 +1939,8 @@ class SparseAttentionForwardSm100:
@@ -2839,7 +2402,7 @@ index f5950f3c5552107dcf8d4223383f39811dbed851..caad5947f140bda30e8ec64c87c7014b
          tOrP: cute.Tensor,
          sK: cute.Tensor,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
-index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9425b093a 100644
+index ba930a6..2ba2ca4 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd/atten_fwd_nvfp4_kv.py
 @@ -9,7 +9,8 @@ forward contract:
@@ -3697,7 +3260,7 @@ index ba930a6db87fa6527b7216a522a7003bd809e8bb..2ba2ca4777ed4da5d85cd188f6a93fd9
          tOrP: cute.Tensor,
          sK: cute.Tensor,
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
-index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d73e87bb3 100644
+index 8ccc2cb..daf0e74 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py
 @@ -424,7 +424,13 @@ class SparseDecodeAttentionForwardSm100:
@@ -3819,338 +3382,8 @@ index 8ccc2cbfea1389e14be20ece1ef654cdaced95ea..daf0e74692096b827844e83838a2cf7d
          pipeline_s_p_o: pipeline.PipelineAsync,
          pipeline_p_lastsplit: pipeline.PipelineAsync,
          pipeline_sm_stats: pipeline.PipelineAsync,
-diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..0c480087750f977b5bbe663bd970a2eae1eeed98
---- /dev/null
-+++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/selected_nvfp4_to_fp8.py
-@@ -0,0 +1,324 @@
-+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+# SPDX-License-Identifier: Apache-2.0
-+
-+"""Stage selected M3 NVFP4 pages into a compact FP8 decode cache.
-+
-+The output page ``token * topk + slot`` contains one independently selected
-+physical source page for each KV head. It is intentionally not a conventional
-+paged cache: the planned selected-page decoder addresses it by token and slot,
-+while retaining the original logical page in ``q2k`` for causal/Eagle masks.
-+"""
-+
-+from __future__ import annotations
-+
-+import cuda.bindings.driver as cuda
-+import cutlass
-+import cutlass.cute as cute
-+import torch
-+from cutlass import Int32, Int64, const_expr
-+
-+from src.common.cute_dsl_utils import assume_tensor_aligned
-+from src.sm100.fwd.atten_fwd_nvfp4_kv import SparseAttentionForwardNvfp4KvSm100
-+
-+
-+class SelectedNvfp4ToFp8Sm100(SparseAttentionForwardNvfp4KvSm100):
-+    """Convert one selected ``(token, head, slot)`` page per CTA."""
-+
-+    def __init__(
-+        self,
-+        *,
-+        is_v: bool,
-+        head_dim: int,
-+        num_kv_heads: int,
-+        page_size: int,
-+        topk: int,
-+    ) -> None:
-+        if head_dim != 128 or page_size != 128:
-+            raise ValueError(
-+                "selected NVFP4 staging currently requires D128/P128, "
-+                f"got D{head_dim}/P{page_size}"
-+            )
-+        super().__init__(
-+            head_dim=head_dim,
-+            qheadperkv=16,
-+            paged_kv=True,
-+            page_size=page_size,
-+        )
-+        self.is_v = bool(is_v)
-+        self.num_kv_heads = int(num_kv_heads)
-+        self.threads = 256
-+
-+    @cute.jit
-+    def __call__(
-+        self,
-+        mData: cute.Tensor,
-+        mScale: cute.Tensor,
-+        mQ2k: cute.Tensor,
-+        mQBatchRow: cute.Tensor,
-+        mPageTable: cute.Tensor,
-+        mOut: cute.Tensor,
-+        data_page_stride: Int64,
-+        data_head_stride: Int64,
-+        data_row_stride: Int64,
-+        scale_page_stride: Int64,
-+        scale_head_stride: Int64,
-+        stream: cuda.CUstream,
-+    ) -> None:
-+        total_tasks = mQ2k.shape[0] * mQ2k.shape[1] * mQ2k.shape[2]
-+        self.kernel(
-+            assume_tensor_aligned(mData),
-+            mScale,
-+            mQ2k,
-+            mQBatchRow,
-+            mPageTable,
-+            assume_tensor_aligned(mOut),
-+            data_page_stride,
-+            data_head_stride,
-+            data_row_stride,
-+            scale_page_stride,
-+            scale_head_stride,
-+        ).launch(
-+            grid=(total_tasks, 1, 1),
-+            block=(self.threads, 1, 1),
-+            stream=stream,
-+        )
-+
-+    @cute.kernel
-+    def kernel(
-+        self,
-+        mData: cute.Tensor,
-+        mScale: cute.Tensor,
-+        mQ2k: cute.Tensor,
-+        mQBatchRow: cute.Tensor,
-+        mPageTable: cute.Tensor,
-+        mOut: cute.Tensor,
-+        data_page_stride: Int64,
-+        data_head_stride: Int64,
-+        data_row_stride: Int64,
-+        scale_page_stride: Int64,
-+        scale_head_stride: Int64,
-+    ) -> None:
-+        tidx = cute.arch.thread_idx()[0]
-+        linear_task = cute.arch.block_idx()[0]
-+        topk = Int32(mQ2k.shape[2])
-+        head_kv = Int32(mQ2k.shape[1])
-+        slot = linear_task % topk
-+        token_head = linear_task // topk
-+        head = token_head % head_kv
-+        token = token_head // head_kv
-+        logical_page = mQ2k[token, head, slot]
-+        safe_logical_page = logical_page if logical_page >= Int32(0) else Int32(0)
-+        request = mQBatchRow[token]
-+        physical_page = mPageTable[request, safe_logical_page]
-+        compact_page = token * topk + slot
-+
-+        # One conversion task covers 32 values (16 packed bytes and two scale
-+        # factors). A P128/D128 page has 512 such tasks, so 256 threads each
-+        # execute two. Invalid q2k entries are still staged from safe page 0;
-+        # the consumer masks them from their original negative logical ID.
-+        pair_task = tidx
-+        while pair_task < Int32(self.page_size * (self.head_dim // 32)):
-+            row = pair_task // Int32(self.head_dim // 32)
-+            pair_col = pair_task - row * Int32(self.head_dim // 32)
-+            packed_byte_col = pair_col * Int32(16)
-+            scale_col = pair_col * Int32(2)
-+
-+            data_offset = (
-+                Int64(physical_page) * data_page_stride
-+                + Int64(head) * data_head_stride
-+                + Int64(row) * data_row_stride
-+                + Int64(packed_byte_col)
-+            )
-+            src_ptr = cute.make_ptr(
-+                cutlass.Int32,
-+                mData.iterator.toint() + Int64(data_offset),
-+                cute.AddressSpace.gmem,
-+                assumed_align=16,
-+            )
-+            src = cute.make_tensor(src_ptr, cute.make_layout((4,)))
-+            words = cute.make_rmem_tensor((4,), cutlass.Int32)
-+            copy128 = cute.make_copy_atom(
-+                cute.nvgpu.CopyUniversalOp(),
-+                cutlass.Int32,
-+                num_bits_per_copy=128,
-+            )
-+            cute.copy(copy128, src, words)
-+
-+            scale_region = (
-+                Int64(physical_page) * scale_page_stride
-+                + Int64(head) * scale_head_stride
-+            )
-+            if const_expr(self.is_v):
-+                scale_lo = self._load_scale_e4m3_u8_swizzle4x4(
-+                    mScale, scale_region, row, scale_col
-+                )
-+                scale_hi = self._load_scale_e4m3_u8_swizzle4x4(
-+                    mScale, scale_region, row, scale_col + Int32(1)
-+                )
-+            else:
-+                scale_lo = self._load_scale_e4m3_u8_linear(
-+                    mScale, scale_region, row, scale_col
-+                )
-+                scale_hi = self._load_scale_e4m3_u8_linear(
-+                    mScale, scale_region, row, scale_col + Int32(1)
-+                )
-+
-+            values = cute.make_rmem_tensor((32,), cutlass.Float8E4M3FN)
-+            self._dequant_fp4x32_to_fp8(words, scale_lo, scale_hi, values)
-+            values_i32 = cute.recast_tensor(values, cutlass.Int32)
-+            out_offset = (
-+                ((compact_page * head_kv + head) * Int32(self.page_size) + row)
-+                * Int32(self.head_dim)
-+                + pair_col * Int32(32)
-+            )
-+            dst_ptr = cute.make_ptr(
-+                cutlass.Int32,
-+                mOut.iterator.toint() + Int64(out_offset),
-+                cute.AddressSpace.gmem,
-+                assumed_align=16,
-+            )
-+            dst = cute.make_tensor(dst_ptr, cute.make_layout((8,)))
-+            for word in cutlass.range_constexpr(8):
-+                dst[word] = values_i32[word]
-+            pair_task += Int32(self.threads)
-+
-+
-+_compile_cache: dict[tuple[object, ...], object] = {}
-+
-+
-+def stage_selected_nvfp4_to_fp8(
-+    data: torch.Tensor,
-+    scale: torch.Tensor,
-+    q2k: torch.Tensor,
-+    q_batch_row: torch.Tensor,
-+    page_table: torch.Tensor,
-+    out: torch.Tensor,
-+    *,
-+    is_v: bool,
-+) -> None:
-+    """Stage token-major selected packed NVFP4 pages into ``out`` FP8."""
-+
-+    if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
-+        raise TypeError("selected NVFP4 staging requires uint8 data and scale tensors")
-+    if q2k.dtype != torch.int32 or q2k.ndim != 3 or not q2k.is_contiguous():
-+        raise ValueError("q2k must be contiguous int32 [total_q, Hkv, topK]")
-+    if q_batch_row.dtype != torch.int32 or q_batch_row.shape != (q2k.shape[0],):
-+        raise ValueError("q_batch_row must be int32 [total_q]")
-+    if page_table.dtype != torch.int32 or page_table.ndim != 2:
-+        raise ValueError("page_table must be int32 [batch, max_pages]")
-+    total_q, head_kv, topk = (int(d) for d in q2k.shape)
-+    if data.ndim != 4 or scale.ndim != 4:
-+        raise ValueError("NVFP4 data and scale tensors must be paged HND rank-4 tensors")
-+    num_pages, data_heads, page_size, packed_dim = (int(d) for d in data.shape)
-+    if data_heads != head_kv or packed_dim * 2 != 128:
-+        raise ValueError(
-+            f"expected packed NVFP4 [pages, {head_kv}, P, 64], got {tuple(data.shape)}"
-+        )
-+    if tuple(scale.shape) != (num_pages, head_kv, page_size, 8):
-+        raise ValueError(
-+            f"expected NVFP4 scales {(num_pages, head_kv, page_size, 8)}, "
-+            f"got {tuple(scale.shape)}"
-+        )
-+    if data.stride(-1) != 1 or scale.stride(-1) != 1:
-+        raise ValueError("NVFP4 staging requires unit packed-data and scale inner strides")
-+    expected_out = (total_q * topk, head_kv, page_size, 128)
-+    if (
-+        out.dtype != torch.float8_e4m3fn
-+        or tuple(out.shape) != expected_out
-+        or not out.is_contiguous()
-+    ):
-+        raise ValueError(f"out must be contiguous FP8 with shape {expected_out}")
-+    device = data.device
-+    if any(t.device != device for t in (scale, q2k, q_batch_row, page_table, out)):
-+        raise ValueError("all selected NVFP4 staging tensors must share one CUDA device")
-+
-+    key = (
-+        "selected_nvfp4_to_fp8_v_sm100" if is_v else "selected_nvfp4_to_fp8_k_sm100",
-+        128,
-+        head_kv,
-+        page_size,
-+        topk,
-+    )
-+    if key not in _compile_cache:
-+        from src.common.aot_cache import try_load_aot
-+
-+        loaded = try_load_aot(key)
-+        if loaded is not None:
-+            _compile_cache[key] = loaded
-+
-+    if key not in _compile_cache:
-+        from quack.compile_utils import make_fake_tensor
-+        from src.common.aot_cache import save_aot
-+
-+        pages = cute.sym_int64()
-+        query_tokens = cute.sym_int64()
-+        batch = cute.sym_int64()
-+        max_pages = cute.sym_int64()
-+        compact_pages = cute.sym_int64()
-+        kernel = SelectedNvfp4ToFp8Sm100(
-+            is_v=bool(is_v),
-+            head_dim=128,
-+            num_kv_heads=head_kv,
-+            page_size=page_size,
-+            topk=topk,
-+        )
-+        _compile_cache[key] = cute.compile(
-+            kernel,
-+            make_fake_tensor(
-+                cutlass.Uint8,
-+                (pages, head_kv, page_size, 64),
-+                divisibility=16,
-+            ),
-+            make_fake_tensor(
-+                cutlass.Uint8,
-+                (pages, head_kv, page_size, 8),
-+                divisibility=1,
-+            ),
-+            make_fake_tensor(
-+                Int32,
-+                (query_tokens, head_kv, topk),
-+                divisibility=1,
-+                leading_dim=2,
-+            ),
-+            make_fake_tensor(
-+                Int32,
-+                (query_tokens,),
-+                divisibility=1,
-+                leading_dim=0,
-+            ),
-+            make_fake_tensor(
-+                Int32,
-+                (batch, max_pages),
-+                divisibility=1,
-+                leading_dim=1,
-+            ),
-+            make_fake_tensor(
-+                cutlass.Float8E4M3FN,
-+                (compact_pages, head_kv, page_size, 128),
-+                divisibility=16,
-+            ),
-+            Int64(0),
-+            Int64(0),
-+            Int64(0),
-+            Int64(0),
-+            Int64(0),
-+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-+            options="--enable-tvm-ffi",
-+        )
-+        save_aot(key, _compile_cache[key])
-+    _compile_cache[key](
-+        data,
-+        scale,
-+        q2k,
-+        q_batch_row,
-+        page_table,
-+        out,
-+        int(data.stride(0)),
-+        int(data.stride(1)),
-+        int(data.stride(2)),
-+        int(scale.stride(0)),
-+        int(scale.stride(1)),
-+    )
-+
-+
-+__all__ = ["SelectedNvfp4ToFp8Sm100", "stage_selected_nvfp4_to_fp8"]
 diff --git a/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py b/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
-index 599dacec76fe8780cafcd4003f41840747f23b50..f29b5b0f34a7beab6f5822305f7cfba37004cff0 100644
+index 599dace..f29b5b0 100644
 --- a/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
 +++ b/python/fmha_sm100/cute/src/sm100/fwd_decode/tile_scheduler.py
 @@ -179,8 +179,10 @@ class DecodeTileScheduler:
@@ -4176,7 +3409,7 @@ index 599dacec76fe8780cafcd4003f41840747f23b50..f29b5b0f34a7beab6f5822305f7cfba3
                  cute.arch.issue_clc_query(
                      mbarrier_addr, response_ptr, loc=loc, ip=ip)
 diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cute/test_sparse_atten.py
-index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad719620cd 100644
+index 21c777e..db3eee7 100644
 --- a/python/fmha_sm100/cute/test_sparse_atten.py
 +++ b/python/fmha_sm100/cute/test_sparse_atten.py
 @@ -19,9 +19,11 @@ from __future__ import annotations
@@ -4885,21 +4118,10 @@ index 21c777e1e7f9285fdbd1f9e23a53c90a0085e4f9..db3eee789544ff59eba40bf6677940ad
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
-index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..c4afc8ca5f15625c3c56e2029c2ce88541c00394 100644
+index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py
 +++ b/python/fmha_sm100/sparse.py
-@@ -70,6 +70,10 @@ from sparse_index_utils import build_k2q_csr  # noqa: E402
- # SM100 fused CSR builder (cute/src/sm100/prepare_k2q_csr.py).
- from src.sm100.prepare_k2q_csr import SparseK2qCsrBuilderSm100  # noqa: E402
- 
-+from src.sm100.fwd_decode.selected_nvfp4_to_fp8 import (  # noqa: E402
-+    stage_selected_nvfp4_to_fp8,
-+)
-+
- # FP4 block-score indexer (cute/fp4_indexer_interface.py).
- # Returns per-(Hq, kv_block, q) max scores; topK selection + q2k construction
- # remain caller-owned downstream steps.
-@@ -79,11 +83,13 @@ from fp4_indexer_interface import fp4_indexer_block_scores  # noqa: E402
+@@ -79,11 +79,13 @@ from fp4_indexer_interface import fp4_indexer_block_scores  # noqa: E402
  # (cute/quantize.py).
  from quantize import (  # noqa: E402
      Nvfp4QuantizedTensor,
@@ -4917,11 +4139,8 @@ index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..c4afc8ca5f15625c3c56e2029c2ce885
  )
  
  __all__ = [
-@@ -96,11 +102,14 @@ __all__ = [
-     "fp4_indexer_block_scores",
-     "build_k2q_csr",
+@@ -98,9 +100,11 @@ __all__ = [
      "SparseK2qCsrBuilderSm100",
-+    "stage_selected_nvfp4_to_fp8",
      # nvfp4 quantization helpers
      "Nvfp4QuantizedTensor",
 -    "quantize_bf16_to_nvfp4_128x4",
@@ -4937,15 +4156,10 @@ index 7006fcd90bfa7c3beb715dcf0465913f9e9d10ad..c4afc8ca5f15625c3c56e2029c2ce885
      "nvfp4_global_scale_from_amax",
  ]
 diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse_fmha_adapter.py
-index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed7853375287cd3248 100644
+index 306b416..a564d47 100644
 --- a/python/fmha_sm100/sparse_fmha_adapter.py
 +++ b/python/fmha_sm100/sparse_fmha_adapter.py
-@@ -125,15 +125,23 @@ def sparse_fmha_plan(
-     assert page_size >= 1, f"page_size={page_size}"
-     assert output_maxscore == False
-     assert causal == True
--    
-+
+@@ -129,11 +129,19 @@ def sparse_fmha_plan(
      batch = qo_segment_lens.shape[0]
      gpu_device = torch.device('cuda')
  
@@ -5099,24 +4313,6 @@ index 306b416b39e269cbcb86256958b53253534d1750..f181202daecfed580935c1ed78533752
      return page_table
  
  
-@@ -310,7 +382,7 @@ def sparse_fmha(
-     """
-     if kv_block_indexes is None:
-         raise ValueError("sparse_fmha requires kv_block_indexes")
--    
-+
- 
-     qo_segment_lens = plan_info["qo_segment_lens"]
-     cu_seqlens_q = plan_info["cu_seqlens_q"]
-@@ -335,7 +407,7 @@ def sparse_fmha(
-         q_offset_override = torch.full_like(qo_segment_lens, q_offset_override)
-     elif q_offset_override is not None:
-         assert q_offset_override.device == qo_segment_lens.device
--    
-+
-     if q_offset_override is not None:
-         seqused_k = (qo_segment_lens + q_offset_override).to(torch.int32).to(qo_segment_lens.device)
-     else:
 @@ -351,8 +423,8 @@ def sparse_fmha(
      if is_paged:
  
