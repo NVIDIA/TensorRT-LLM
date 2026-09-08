@@ -41,7 +41,6 @@ import time
 import traceback
 from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Optional, get_args
@@ -249,43 +248,99 @@ def _warn(message: str) -> None:
     print(f"WARNING: {message}", file=sys.stderr)
 
 
-@dataclass
-class VisualGenRequestRecord:
+class VisualGenRequestRecord(StrictBaseModel):
     """One request's timings, resolved params and outcome.
 
-    ``None`` means the timing is undefined for this backend (image has no poll
-    phase) or was not reported; such samples are dropped from the aggregates.
+    One of these per request is written to the result JSON under ``requests``
+    by ``--save-detailed``, and the run's aggregate series are these fields
+    over the run. ``None`` means the timing is undefined for this backend
+    (image has no poll phase) or was not reported; such samples are dropped
+    from the aggregates rather than counted as zero.
     """
 
-    index: int
-    prompt: str
-    params: dict[str, Any]
-    prompt_file: Optional[str] = None
-    action_file: Optional[str] = None
-    image_reference: Optional[str] = None
-    video_reference: Optional[str] = None
-    audio_reference: Optional[str] = None
-    success: bool = False
-    start: float = 0.0
-    end: float = 0.0
-    client_e2e: Optional[float] = None
-    client_gen: Optional[float] = None
-    server_e2e: Optional[float] = None
-    server_gen: Optional[float] = None
-    server_pre_denoise: Optional[float] = None
-    server_denoise: Optional[float] = None
-    server_post_denoise: Optional[float] = None
-    poll_count: Optional[int] = None
-    # Always a list: image backends can return n > 1, and a single shape lets a
-    # consumer read the result without branching on the backend.
-    output_paths: Optional[list[str]] = None
-    error: Optional[str] = None
+    index: int = Field(description="Position of this request in the workload.")
+    prompt: str = Field(description="The prompt text sent.")
+    params: dict[str, Any] = Field(
+        description="The merged parameters as sent, which is what this request measured."
+    )
+    prompt_file: Optional[str] = Field(
+        default=None,
+        description="The prompt file the document named, by locator. Resolution replaces "
+        "it with its text, so the locator is what is worth recording.",
+    )
+    action_file: Optional[str] = Field(
+        default=None, description="The action trajectory the document named, by locator."
+    )
+    image_reference: Optional[str] = Field(
+        default=None,
+        description="The image reference the document named, by locator -- a path, a URL, "
+        "or '<base64>'. The bytes themselves would be megabytes wide and useless here.",
+    )
+    video_reference: Optional[str] = Field(
+        default=None, description="The video reference the document named, by locator."
+    )
+    audio_reference: Optional[str] = Field(
+        default=None, description="The audio reference the document named, by locator."
+    )
+    success: bool = Field(
+        default=False,
+        description="Whether the request completed. A run with any failure is not a result.",
+    )
+    start: float = Field(default=0.0, description="Seconds from the run's start to this send.")
+    end: float = Field(default=0.0, description="Seconds from the run's start to this finish.")
+    client_e2e: Optional[float] = Field(
+        default=None,
+        description="Seconds from sending the request until its result has been fully read "
+        "from the server. Aggregated as e2e_latency.",
+    )
+    client_gen: Optional[float] = Field(
+        default=None,
+        description="Seconds from sending the request until the job first reports "
+        "'postprocessing' or 'completed'. Video only, and its granularity is "
+        "--poll-interval. Aggregated as gen_latency.",
+    )
+    server_e2e: Optional[float] = Field(
+        default=None,
+        description="Server-measured seconds from request arrival to the finished artifact: "
+        "the encoded file on the video route, the encoded image in the body on the image "
+        "routes.",
+    )
+    server_gen: Optional[float] = Field(
+        default=None,
+        description="Server-measured seconds in the engine's inference call, what "
+        "VisualGen.generate() costs, before any encoding or persistence. It excludes "
+        "network and poll granularity, which makes it the series to watch for regressions.",
+    )
+    server_pre_denoise: Optional[float] = Field(
+        default=None,
+        description="Server-measured seconds of text encoding, latent prep and conditioning, "
+        "on the GPU stream.",
+    )
+    server_denoise: Optional[float] = Field(
+        default=None, description="Server-measured seconds of this request's whole denoise loop."
+    )
+    server_post_denoise: Optional[float] = Field(
+        default=None,
+        description="Server-measured seconds of VAE decode, format conversion and audio "
+        "decode, on the GPU stream.",
+    )
+    poll_count: Optional[int] = Field(
+        default=None, description="Status polls this request took. Video only."
+    )
+    output_paths: Optional[list[str]] = Field(
+        default=None,
+        description="Where this request's media landed: server-side paths under "
+        "--response-format path, local files under --output-media-dir. Always a list, since "
+        "an image request with n > 1 has several and a single shape lets a consumer read "
+        "the result without branching on the backend.",
+    )
+    error: Optional[str] = Field(default=None, description="Why the request failed, if it did.")
 
 
 # Aggregated as their own series, so a timing added to the record above is
 # reported without a second list to keep in step with it.
 SERVER_TIMING_FIELDS = tuple(
-    field.name for field in fields(VisualGenRequestRecord) if field.name.startswith("server_")
+    name for name in VisualGenRequestRecord.model_fields if name.startswith("server_")
 )
 
 
@@ -1240,6 +1295,74 @@ def _record_json(record: VisualGenRequestRecord) -> dict[str, Any]:
     return data
 
 
+_STATS_SHAPE = (
+    "{mean, median, std, min, max, percentiles} over the run's requests, one sample per "
+    "request, with the percentiles --metric-percentiles asked for. Null when nothing "
+    "reported the series."
+)
+
+
+class VisualGenBenchResult(StrictBaseModel):
+    """The result JSON, and what ``--save-result`` writes.
+
+    Declared in the order it is emitted. A field left unset is absent from the
+    file rather than null, so a reader can tell "this run had no such thing"
+    from "nothing reported it": the rate key is whichever the backend produces,
+    ``per_gpu_throughput`` needs ``--num-gpus``, ``gen_latency`` is video only,
+    and ``timings`` and ``requests`` need ``--save-detailed``.
+    """
+
+    schema_version: int = Field(
+        description="Shape of this file. A file without the key predates it: its generation "
+        "config lived in flags and its latency keys carried other names."
+    )
+    date: str = Field(description="When the run finished, as YYYYmmdd-HHMMSS local time.")
+    backend: str = Field(description="The route measured.")
+    model: str = Field(description="The model id the requests carried.")
+    duration: float = Field(description="Seconds from the first send to the last finish.")
+    config: dict[str, Any] = Field(
+        description="The run settings this result was produced under, so a stored file says "
+        "how it was measured."
+    )
+    total_requests: int = Field(description="Requests sent.")
+    completed: int = Field(
+        description="Requests that succeeded. Below total_requests, the run is not a result."
+    )
+    request_throughput: float = Field(
+        description="Completed requests over the run's duration, in req/s."
+    )
+    frames_per_second: Optional[float] = Field(
+        default=None, description="Frames produced over the run's duration. Video routes."
+    )
+    images_per_second: Optional[float] = Field(
+        default=None, description="Images produced over the run's duration. Image routes."
+    )
+    e2e_latency: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Whole-request latency as the caller sees it, network and this client's "
+        f"own reads included. {_STATS_SHAPE}",
+    )
+    per_gpu_throughput: Optional[float] = Field(
+        default=None, description="request_throughput divided by --num-gpus."
+    )
+    gen_latency: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Latency to the job first reporting 'postprocessing' or 'completed', so "
+        "it stops before the media encode that e2e_latency includes. Video only, and its "
+        f"granularity is --poll-interval. {_STATS_SHAPE}",
+    )
+    timings: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="The server-measured series, one per server_* field of a request record, "
+        f"read from the Server-Timing response header. {_STATS_SHAPE}",
+    )
+    requests: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description="One record per request. A heterogeneous run cannot be attributed "
+        "without them.",
+    )
+
+
 def build_visual_gen_result(
     *,
     backend: str,
@@ -1253,38 +1376,50 @@ def build_visual_gen_result(
 ) -> dict[str, Any]:
     """Assemble the result JSON; stdout is printed from this same dict.
 
-    Per-request arrays and the server-side timings exist only under
-    ``save_detailed``.
+    Returned as a dict rather than the model so the conditional keys stay
+    absent: ``VisualGenBenchResult`` declares and documents every key, and the
+    unset ones are dropped here.
     """
     completed = sum(1 for record in records if record.success)
     rate_key, rate = _output_rate(records, backend, duration)
+    throughput = completed / duration if duration > 0 else 0.0
 
-    result: dict[str, Any] = {
-        # A file without this key is the pre-workload shape, whose generation config
-        # lived in flags and whose latency keys were named differently.
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
-        "backend": backend,
-        "model": model,
-        "duration": duration,
-        "config": config,
-        "total_requests": len(records),
-        "completed": completed,
-        "request_throughput": completed / duration if duration > 0 else 0.0,
-        rate_key: rate,
-        "e2e_latency": _stats(_samples(records, "client_e2e"), selected_percentiles),
-    }
-    if num_gpus:
-        result["per_gpu_throughput"] = result["request_throughput"] / num_gpus
-    if backend == VIDEO_BACKEND:
-        result["gen_latency"] = _stats(_samples(records, "client_gen"), selected_percentiles)
-    if save_detailed:
-        result["timings"] = {
-            name: _stats(_samples(records, name), selected_percentiles)
-            for name in SERVER_TIMING_FIELDS
-        }
-        result["requests"] = [_record_json(record) for record in records]
-    return result
+    result = VisualGenBenchResult(
+        schema_version=RESULT_SCHEMA_VERSION,
+        date=datetime.now().strftime("%Y%m%d-%H%M%S"),
+        backend=backend,
+        model=model,
+        duration=duration,
+        config=config,
+        total_requests=len(records),
+        completed=completed,
+        request_throughput=throughput,
+        **{rate_key: rate},
+        e2e_latency=_stats(_samples(records, "client_e2e"), selected_percentiles),
+        per_gpu_throughput=throughput / num_gpus if num_gpus else None,
+        gen_latency=(
+            _stats(_samples(records, "client_gen"), selected_percentiles)
+            if backend == VIDEO_BACKEND
+            else None
+        ),
+        timings=(
+            {
+                name: _stats(_samples(records, name), selected_percentiles)
+                for name in SERVER_TIMING_FIELDS
+            }
+            if save_detailed
+            else None
+        ),
+        requests=[_record_json(record) for record in records] if save_detailed else None,
+    )
+    absent = {name for name in ("frames_per_second", "images_per_second") if name != rate_key}
+    if not num_gpus:
+        absent.add("per_gpu_throughput")
+    if backend != VIDEO_BACKEND:
+        absent.add("gen_latency")
+    if not save_detailed:
+        absent |= {"timings", "requests"}
+    return result.model_dump(exclude=absent)
 
 
 def print_visual_gen_results(result: dict[str, Any], selected_percentiles: list[float]) -> None:

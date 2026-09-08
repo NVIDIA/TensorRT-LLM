@@ -25,6 +25,7 @@ from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     RESULT_SCHEMA_VERSION,
     SCALAR_PARAM_FIELDS,
     SERVER_TIMING_FIELDS,
+    VisualGenBenchResult,
     VisualGenRequestRecord,
     _make_record,
     _output_rate,
@@ -449,3 +450,42 @@ def test_a_phase_the_pipeline_does_not_time_is_null():
     assert unmeasured["server_pre_denoise"] is None
     assert unmeasured["server_post_denoise"] is None
     assert unmeasured["server_gen"] == pytest.approx(1.0)
+
+
+def _result(backend, *, save_detailed, num_gpus):
+    record = VisualGenRequestRecord(index=0, prompt="p", params={}, success=True)
+    record.end = 1.0
+    record.client_e2e = 1.0
+    return build_visual_gen_result(
+        backend=backend,
+        model="m",
+        duration=1.0,
+        records=[record],
+        selected_percentiles=[50.0],
+        config={},
+        save_detailed=save_detailed,
+        num_gpus=num_gpus,
+    )
+
+
+def test_a_key_the_run_has_no_value_for_is_absent_rather_than_null():
+    """A reader tells "this run had no such thing" from "nothing reported it" by
+    presence, so the optional keys are dropped rather than emitted as null."""
+    plain = _result("openai-images", save_detailed=False, num_gpus=None)
+
+    for absent in ("gen_latency", "per_gpu_throughput", "timings", "requests", "frames_per_second"):
+        assert absent not in plain, absent
+    assert "images_per_second" in plain
+    # A series nothing reported is null, which is not the same as an absent key.
+    assert "e2e_latency" in plain
+
+
+def test_every_result_key_is_declared_with_a_description():
+    """The models are where the result's fields are documented, so a key that
+    reaches the file without one has nowhere a reader can look it up."""
+    richest = _result("openai-videos", save_detailed=True, num_gpus=8)
+
+    assert set(richest) <= set(VisualGenBenchResult.model_fields)
+    for model in (VisualGenBenchResult, VisualGenRequestRecord):
+        undocumented = [name for name, spec in model.model_fields.items() if not spec.description]
+        assert not undocumented, f"{model.__name__}: {undocumented}"
