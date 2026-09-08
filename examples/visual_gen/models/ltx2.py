@@ -13,11 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LTX-2 Text-to-Video generation with audio.
+"""LTX-2 / LTX-2.3 Text-to-Video generation with audio.
+
+Both generations share the request construction and the Gemma3 text encoder, so
+--model_type only selects the default checkpoint and output name. The pipeline
+itself is chosen from the checkpoint config.
 
 Usage:
     python ltx2.py
     python ltx2.py --visual_gen_args ../configs/ltx2-1gpu.yaml
+    python ltx2.py --model_type ltx23 --visual_gen_args ../configs/ltx23-t2v-bf16-1gpu.yaml
     # Force two-stage on a checkpoint lacking the aux files:
     python ltx2.py --spatial_upsampler_path <upsampler.safetensors> \
         --distilled_lora_path <distilled-lora.safetensors>
@@ -27,14 +32,26 @@ import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 
+MODEL_DEFAULTS = {
+    "ltx2": {"model": "Lightricks/LTX-2", "output_path": "ltx2_t2v_output.mp4"},
+    "ltx23": {"model": "Lightricks/LTX-2.3", "output_path": "ltx23_t2v_output.mp4"},
+}
+
 
 def main():
-    parser = argparse.ArgumentParser(description="LTX-2 Text-to-Video example")
+    parser = argparse.ArgumentParser(description="LTX-2 / LTX-2.3 Text-to-Video example")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=sorted(MODEL_DEFAULTS),
+        default="ltx2",
+        help="LTX generation to run. Selects the default checkpoint and output name.",
+    )
     parser.add_argument(
         "--model",
         type=str,
-        default="Lightricks/LTX-2",
-        help="Model path or HuggingFace Hub ID",
+        default=None,
+        help="Model path or HuggingFace Hub ID (defaults per --model_type)",
     )
     parser.add_argument(
         "--visual_gen_args",
@@ -75,14 +92,15 @@ def main():
     parser.add_argument(
         "--output_path",
         type=str,
-        default="ltx2_t2v_output.mp4",
-        help="Path to save the output video",
+        default=None,
+        help="Path to save the output video (defaults per --model_type)",
     )
     args = parser.parse_args()
 
-    # LTX-2 requires pipeline_config.text_encoder_path for the Gemma3 text
-    # encoder. The YAML path is preferred for production configs; the default
-    # below keeps this script runnable as a minimal offline example.
+    defaults = MODEL_DEFAULTS[args.model_type]
+    model = args.model or defaults["model"]
+    output_path = args.output_path or defaults["output_path"]
+
     extra_args = (
         VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else VisualGenArgs()
     )
@@ -103,10 +121,8 @@ def main():
     ):
         if value is not None:
             extra_args.pipeline_config = {**extra_args.pipeline_config, key: value}
-    visual_gen = VisualGen(model=args.model, args=extra_args)
+    visual_gen = VisualGen(model=model, args=extra_args)
 
-    # --- Model-specific: T2V request construction ---
-    # Start from LTX-2 defaults and override the main request shape explicitly.
     params = visual_gen.default_params
     params.height = 512
     params.width = 768
@@ -120,8 +136,19 @@ def main():
         params=params,
     )
 
-    output.save(args.output_path)
-    print(f"Saved: {args.output_path}")
+    m = output.metrics
+    if m is not None:
+        print(
+            f"latency: generation={m.generation:.3f}s "
+            f"pre_denoise={m.pre_denoise:.3f}s "
+            f"denoise={m.denoise:.3f}s "
+            f"post_denoise={m.post_denoise:.3f}s"
+        )
+    else:
+        print("latency: metrics not populated")
+
+    output.save(output_path)
+    print(f"Saved: {output_path}")
 
 
 if __name__ == "__main__":
