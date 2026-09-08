@@ -27,7 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CBTS_ROOT = REPO_ROOT / "jenkins/scripts/cbts"
 sys.path.insert(0, str(CBTS_ROOT))
 
-from blocks import YAMLIndex  # noqa: E402
+from blocks import Stage, YAMLIndex  # noqa: E402
+from rules.base import PRInputs  # noqa: E402
 from rules.tests_def_rule import (  # noqa: E402
     ACCURACY_DIR,
     ACCURACY_REFS_PREFIX,
@@ -42,6 +43,36 @@ pytestmark = pytest.mark.cpu_only
 
 def _make_rule(repo_root: Path) -> CbtsTestsDefRule:
     return CbtsTestsDefRule(YAMLIndex(), {}, repo_root)
+
+
+def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -> None:
+    test_db_dir = tmp_path / "test-db"
+    test_db_dir.mkdir()
+    (test_db_dir / "l0_perf.yml").write_text(
+        "l0_perf:\n- tests:\n  - perf/test_perf.py::test_perf[case]\n",
+        encoding="utf-8",
+    )
+    (test_db_dir / "l0_b200.yml").write_text(
+        "l0_b200:\n- tests:\n  - perf/test_perf_sanity.py::test_e2e[case]\n",
+        encoding="utf-8",
+    )
+    yaml_index = YAMLIndex.load(test_db_dir)
+    stages = {
+        "H100_PCIe-PyTorch-Perf-1": Stage("H100_PCIe-PyTorch-Perf-1", "l0_perf", "x86_64", 1, 1),
+        "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
+    }
+    rule = CbtsTestsDefRule(yaml_index, stages, tmp_path)
+
+    result = rule.apply(
+        PRInputs(
+            changed_files=["tests/integration/defs/perf/pytorch_model_config.py"],
+            diffs={},
+        )
+    )
+
+    assert result is not None
+    assert result.affected_stages == {"H100_PCIe-PyTorch-Perf-1"}
+    assert set(result.block_filters) == {("l0_perf", 0)}
 
 
 def test_scope_start_line_includes_decorators() -> None:

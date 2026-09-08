@@ -60,6 +60,9 @@ _CLASS_RE = re.compile(r"class\s+(\w+)")
 # `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
 # by HF model name, unlike every other reference YAML.
 _TEST_ID_KEY_RE = re.compile(r"^(Test\w+)::(\w+)$")
+_DIRECT_TEST_CONSUMERS: dict[str, tuple[str, ...]] = {
+    "tests/integration/defs/perf/pytorch_model_config.py": ("perf/test_perf.py",),
+}
 
 
 def _scope_start_line(node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> int:
@@ -250,6 +253,9 @@ class TestsDefRule(Rule):
         class anchors via the model-name mapping in
         `_compute_accuracy_reference_anchors`.
         """
+        direct_consumers = _DIRECT_TEST_CONSUMERS.get(git_path)
+        if direct_consumers is not None:
+            return list(direct_consumers)
         if git_path.startswith(ACCURACY_REFS_PREFIX) and git_path.endswith((".yaml", ".yml")):
             return self._compute_accuracy_reference_anchors(git_path, yaml_path, diff)
         if not diff:
