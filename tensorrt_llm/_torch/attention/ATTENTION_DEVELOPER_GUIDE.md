@@ -248,11 +248,12 @@ estimator reserves it from the KV budget and the scheduler caps the driving sum.
 Keep the declared cost identical to the runtime allocation's when possible, or
 use a documented conservative upper bound. The current instances are the fp8
 context-MLA K/V dequant workspace and
-the NVFP4 DSA context gather workspace. Both are sized by summed attended KV
-length (`total_kv_len`), which cached prefixes can decouple from
-`max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`). NVFP4
-DSA reads the complete attended prefix even with chunked prefill, so it also
-returns `False` from `runtime_workspace_is_chunked_prefill_bounded`.
+the NVFP4 DSA and DeepSeek-V4 context gather workspaces. They are sized by
+summed attended KV length (`total_kv_len`), which cached prefixes can decouple
+from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
+NVFP4 sparse MLA reads the complete attended prefix even with chunked prefill,
+so it also returns `False` from
+`runtime_workspace_is_chunked_prefill_bounded`.
 
 ### 2.4 Capability reference
 

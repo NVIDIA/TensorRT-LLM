@@ -366,24 +366,67 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
             data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
+            num_pool_tokens = data_pool.numel() // (
+                (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2
+            )
             # The previous layer has already enqueued its attention on this stream.
             # Release its Python reference before allocating the next scratch so
             # the caching allocator can reuse the storage in stream order.
             metadata.nvfp4_compress_fp8_scratch = None
-            scratch = torch.empty(
-                (*compressed_indices.shape, self.head_dim),
-                dtype=torch.float8_e4m3fn,
-                device=global_indices.device,
-            )
-            torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
-                data_pool,
-                scale_pool,
-                compressed_indices,
-                scratch,
-                self._nvfp4_compress_scale_quant_orig,
-                NVFP4_COMPRESS_RESIDUAL_DIM,
-                data_pool.numel() // ((self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM) // 2),
-            )
+            if attention_input_type == AttentionInputType.generation_only:
+                scratch = torch.empty(
+                    (*compressed_indices.shape, self.head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=global_indices.device,
+                )
+                torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+                    data_pool,
+                    scale_pool,
+                    compressed_indices,
+                    scratch,
+                    self._nvfp4_compress_scale_quant_orig,
+                    NVFP4_COMPRESS_RESIDUAL_DIM,
+                    num_pool_tokens,
+                )
+            else:
+                request_count = (
+                    metadata.num_contexts
+                    if attention_input_type == AttentionInputType.context_only
+                    else metadata.num_seqs
+                )
+                compressed_kv_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                    :request_count
+                ].contiguous()
+                total_raw_kv_tokens = int(metadata.host_total_kv_lens[0].item())
+                if attention_input_type == AttentionInputType.mixed:
+                    total_raw_kv_tokens += int(metadata.host_total_kv_lens[1].item())
+                # Sum(floor(kv_len / ratio)) <= floor(sum(kv_len) / ratio).
+                # The latter is a host-known upper bound for the logical-token
+                # compaction workspace and avoids a device synchronization.
+                max_compressed_kv_tokens = total_raw_kv_tokens // self.compress_ratio
+                scratch_capacity = max(
+                    1,
+                    min(max_compressed_kv_tokens, compressed_indices.numel()),
+                )
+                scratch = torch.empty(
+                    (scratch_capacity, 1, self.head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=global_indices.device,
+                )
+                if max_compressed_kv_tokens > 0:
+                    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather_direct(
+                        data_pool,
+                        scale_pool,
+                        compressed_local_indices.contiguous(),
+                        req_id.contiguous(),
+                        compressed_kv_lengths,
+                        compressed_indices,
+                        scratch,
+                        self._nvfp4_compress_scale_quant_orig,
+                        NVFP4_COMPRESS_RESIDUAL_DIM,
+                        max_compressed_kv_tokens,
+                        num_pool_tokens,
+                    )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
