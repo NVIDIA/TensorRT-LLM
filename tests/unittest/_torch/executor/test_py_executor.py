@@ -3424,3 +3424,31 @@ def test_iter_stats_buffer_evicts_oldest_entry_in_constant_time():
     assert [entry[0] for entry in executor.stats] == [second, third]
     assert [entry[0] for entry in executor.get_latest_iteration_stats()] == [second, third]
     assert not executor.stats
+
+
+def test_iter_stats_profiler_does_not_create_or_sync_cuda_events():
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.iter_counter = 0
+    executor.profile_start_iters = set()
+    executor.profile_stop_iters = set()
+    executor.is_warmup = False
+    executor.print_log = False
+    executor.enable_iter_perf_stats = True
+    executor._iter_adp_dummy_ctx_tokens = 0
+    executor._iter_adp_dummy_gen_tokens = 0
+
+    with (
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.get_calibrator") as calibrator,
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.get_global_profiler",
+            return_value=None,
+        ),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.Event") as cuda_event,
+    ):
+        with executor._profiler() as profile_step:
+            profile_step()
+            profile_step()
+
+    cuda_event.assert_not_called()
+    calibrator.return_value.pre_step.assert_called()
+    assert executor._latest_host_step_time_ms is not None

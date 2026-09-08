@@ -335,6 +335,16 @@ def test_unsampled_iteration_skips_gpu_and_kv_snapshots():
     assert fake_self._latest_kv_iter_stats is None
 
 
+@pytest.mark.parametrize("iteration, expected", [(0, True), (9, False), (10, True)])
+def test_rich_iteration_stats_sampling_cadence(iteration, expected):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = types.SimpleNamespace(_iter_stats_interval=10)
+    stats = types.SimpleNamespace(iter=iteration)
+
+    assert PyExecutor._should_collect_rich_iter_stats(fake_self, stats) is expected
+
+
 def test_prefill_only_no_prefix_cache():
     # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
     # == full prompt (no chunked prefill). No prefix cache hits.

@@ -1722,13 +1722,13 @@ class PyExecutor:
         enabled = False
         start_time = None
 
-        # These events are used to record the time of the previous batch.
-        # We need two set of the start-end events to record the time through
-        # a ping-pong way so that it works with overlap scheduler.
+        # Iteration logging uses two event pairs in a ping-pong pattern. Iter
+        # stats use the batch-matched forward events instead, so keep these
+        # events lazy when only metrics collection is enabled.
         start_event_1 = None
-        end_event_1 = torch.cuda.Event(enable_timing=True)
+        end_event_1 = None
         start_event_2 = None
-        end_event_2 = torch.cuda.Event(enable_timing=True)
+        end_event_2 = None
         prev_device_step_time = None
 
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
@@ -1794,27 +1794,23 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
-            # Capture per-loop timing whenever stats or the iter log are
-            # enabled. The reading of the OTHER parity's event pair (the
-            # ping-pong) is what keeps synchronize() from blocking the GPU
-            # — the events being read have already passed by the time we
-            # read them. Stashing on self lets the /metrics serializer pick
-            # up the values without going through the log line.
-            should_capture_timing = self.print_log or self.enable_iter_perf_stats
-            if should_capture_timing and start_time is not None:
+            should_capture_host_timing = self.print_log or self.enable_iter_perf_stats
+            should_capture_device_timing = self.print_log
+            if should_capture_host_timing and start_time is not None:
                 end_time = time.time()
-                if it % 2 == 0:
-                    end_event_1.record()
-                    if start_event_2 is not None:
-                        end_event_2.synchronize()
-                        prev_device_step_time = start_event_2.elapsed_time(
-                            end_event_2)
-                else:
-                    end_event_2.record()
-                    if start_event_1 is not None:
-                        end_event_1.synchronize()
-                        prev_device_step_time = start_event_1.elapsed_time(
-                            end_event_1)
+                if should_capture_device_timing:
+                    if it % 2 == 0:
+                        end_event_1.record()
+                        if start_event_2 is not None:
+                            end_event_2.synchronize()
+                            prev_device_step_time = start_event_2.elapsed_time(
+                                end_event_2)
+                    else:
+                        end_event_2.record()
+                        if start_event_1 is not None:
+                            end_event_1.synchronize()
+                            prev_device_step_time = start_event_1.elapsed_time(
+                                end_event_1)
 
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 self._latest_host_step_time_ms = host_step_time
@@ -1873,14 +1869,16 @@ class PyExecutor:
 
             calibrator.pre_step(it)
             start_time = time.time()
-            if should_capture_timing:
+            if should_capture_device_timing:
                 if it % 2 == 0:
                     if start_event_1 is None:
                         start_event_1 = torch.cuda.Event(enable_timing=True)
+                        end_event_1 = torch.cuda.Event(enable_timing=True)
                     start_event_1.record()
                 else:
                     if start_event_2 is None:
                         start_event_2 = torch.cuda.Event(enable_timing=True)
+                        end_event_2 = torch.cuda.Event(enable_timing=True)
                     start_event_2.record()
 
         try:
@@ -2065,7 +2063,7 @@ class PyExecutor:
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
-        collect_rich_stats = stats.iter % self._iter_stats_interval == 0
+        collect_rich_stats = self._should_collect_rich_iter_stats(stats)
         if collect_rich_stats:
             free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
             stats.gpu_mem_usage = total_gpu_memory - free_gpu_memory
@@ -2288,6 +2286,11 @@ class PyExecutor:
         stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
 
         return stats
+
+    def _should_collect_rich_iter_stats(
+            self, stats: Optional[IterationStats]) -> bool:
+        return (stats is not None
+                and stats.iter % self._iter_stats_interval == 0)
 
     def _update_batch_acceptance_rate(
             self,
@@ -2774,7 +2777,8 @@ class PyExecutor:
                     gpu_forward_start = None
                     gpu_forward_end = None
                     gpu_forward_events_from_perf_pool = False
-                    if self.enable_iter_perf_stats:
+                    if (self.enable_iter_perf_stats and
+                            self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
@@ -4495,7 +4499,9 @@ class PyExecutor:
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if self.enable_iter_perf_stats and gpu_forward_start is None:
+                    if (self.enable_iter_perf_stats
+                            and gpu_forward_start is None and
+                            self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
@@ -5342,7 +5348,9 @@ class PyExecutor:
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if self.enable_iter_perf_stats and gpu_forward_start is None:
+                    if (self.enable_iter_perf_stats
+                            and gpu_forward_start is None and
+                            self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
                         gpu_forward_events_from_perf_pool = True
