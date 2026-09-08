@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import random
 import re
@@ -30,7 +31,8 @@ pytestmark = pytest.mark.cpu_only
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
-GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
+STAGE_CONFIG_JSON = os.path.join(REPO_ROOT, 'jenkins', 'scripts',
+                                 'test_stage_configs.json')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')
 
@@ -63,7 +65,7 @@ def test_stage_backed_tests_exclude_mixed_mappings() -> None:
 @pytest.fixture(scope="module")
 def stage_query():
     """Fixture that provides a StageQuery instance."""
-    return StageQuery(GROOVY, DB_DIR)
+    return StageQuery(STAGE_CONFIG_JSON, DB_DIR)
 
 
 @pytest.fixture(scope="module")
@@ -89,10 +91,10 @@ def sample_stages(stage_query: StageQuery) -> list[str]:
     if not all_stages:
         raise RuntimeError(
             "No stages found in stage mapping. This indicates a configuration "
-            "issue - either the Jenkins L0_Test.groovy file is not being "
-            "parsed correctly or the regex pattern for stage matching needs "
-            "to be updated. Please check that the groovy file exists and "
-            "contains stage definitions in the expected format.")
+            "issue - either jenkins/scripts/test_stage_configs.json is not "
+            "being parsed correctly, or it's missing/empty. Please check "
+            "that the file exists and contains stage definitions in the "
+            "expected format.")
 
     # Return up to MAX_SAMPLES stages randomly selected
     if len(all_stages) <= MAX_SAMPLES:
@@ -151,7 +153,7 @@ def test_documented_stage_examples_are_live(stage_query):
                 why = (f'{os.path.basename(path)} documents --stages {name}, '
                        'which ')
                 assert name in stage_query.stage_to_yaml, \
-                    why + f'is not a stage in {os.path.basename(GROOVY)}'
+                    why + f'is not a stage in {os.path.basename(STAGE_CONFIG_JSON)}'
                 assert stage_query.stages_to_tests([name]), \
                     why + 'maps to no tests'
                 checked += 1
@@ -179,10 +181,28 @@ def test_known_stage_without_tests_is_reported(tmp_path):
     """A known stage that runs no tests stays visible alongside other stages."""
     # No live stage is currently empty, so build a minimal repo whose
     # ``empty`` stage maps to a YAML holding only post_merge tests.
-    (tmp_path / 'jenkins').mkdir()
-    (tmp_path / 'jenkins' / 'L0_Test.groovy').write_text(
-        '"Filled-PyTorch-1": ["x", "l0_filled", 1, 1],\n'
-        '"Empty-PyTorch-1": ["x", "l0_empty", 1, 1],\n')
+    (tmp_path / 'jenkins' / 'scripts').mkdir(parents=True)
+    (tmp_path / 'jenkins' / 'scripts' / 'test_stage_configs.json').write_text(
+        json.dumps({
+            'configs': [
+                {
+                    'name': 'Filled-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_filled',
+                    'splits': 1
+                },
+                {
+                    'name': 'Empty-PyTorch',
+                    'arch': 'x86',
+                    'slurm': False,
+                    'platform': 'x',
+                    'testDB': 'l0_empty',
+                    'splits': 1
+                },
+            ]
+        }))
     db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
     db_dir.mkdir(parents=True)
     for name, stage in (('l0_filled', 'pre_merge'), ('l0_empty', 'post_merge')):
