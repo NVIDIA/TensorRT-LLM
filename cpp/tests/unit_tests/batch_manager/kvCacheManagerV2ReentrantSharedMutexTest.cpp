@@ -112,9 +112,15 @@ TEST(ReentrantSharedMutexTest, NestingDoesNotLeakToOtherThreads)
         // about to acquire. The remaining window between that store and the lock() call itself is
         // inherent, so still allow a brief grace period -- but the test now fails if the thread
         // never runs at all, which a fixed sleep alone would have passed.
-        ASSERT_TRUE(waitFor([&] { return otherAttempting.load(); })) << "contending thread never ran";
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        EXPECT_FALSE(otherEntered.load()) << "another thread entered while the lock was held";
+        // EXPECT, not ASSERT: `other` is joinable here, and returning early would run its
+        // destructor on a joinable thread, which terminates instead of reporting the failure.
+        bool const attempted = waitFor([&] { return otherAttempting.load(); });
+        EXPECT_TRUE(attempted) << "contending thread never ran";
+        if (attempted)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            EXPECT_FALSE(otherEntered.load()) << "another thread entered while the lock was held";
+        }
     } // both guards released here
     other.join();
     EXPECT_TRUE(otherEntered.load());
@@ -179,9 +185,14 @@ TEST(ReentrantSharedMutexTest, WriterWaitsForReaders)
             });
         // As above: confirm the writer actually reached its acquisition point before asserting
         // that it is still outside.
-        ASSERT_TRUE(waitFor([&] { return writerAttempting.load(); })) << "writer thread never ran";
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        EXPECT_FALSE(writerIn.load()) << "writer entered while a reader held the lock";
+        // EXPECT, not ASSERT: `writer` is joinable here (see above).
+        bool const attempted = waitFor([&] { return writerAttempting.load(); });
+        EXPECT_TRUE(attempted) << "writer thread never ran";
+        if (attempted)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            EXPECT_FALSE(writerIn.load()) << "writer entered while a reader held the lock";
+        }
     } // reader released here
     writer.join();
     EXPECT_TRUE(writerIn.load());

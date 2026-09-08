@@ -162,43 +162,59 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
 
     std::atomic<bool> stop{false};
     std::atomic<long long> probeCount{0};
+    // The prober also stops on its own deadline. glibc's rwlock prefers readers, so a continuous
+    // stream of shared acquisitions could in principle starve the writer; without the deadline the
+    // writer's next exclusive call would block forever and hang CI instead of failing.
+    auto const proberDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
     std::thread prober(
         [&]
         {
-            while (!stop.load(std::memory_order_relaxed))
+            while (!stop.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < proberDeadline)
             {
                 manager->probeReuse({}, toSpan(tokens), /*knownNoDigest=*/true);
                 probeCount.fetch_add(1, std::memory_order_relaxed);
+                std::this_thread::yield(); // leave the writer a window to acquire
             }
         });
 
     // Do not start the writer until the prober is demonstrably running, so "probes progressed
-    // alongside exclusive work" cannot be satisfied by the writer finishing first. Bounded, so a
-    // prober that never starts fails the test instead of hanging.
-    auto const proberDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-    while (probeCount.load(std::memory_order_relaxed) == 0 && std::chrono::steady_clock::now() < proberDeadline)
+    // alongside exclusive work" cannot be satisfied by the writer finishing first.
+    auto const startDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (probeCount.load(std::memory_order_relaxed) == 0 && std::chrono::steady_clock::now() < startDeadline)
     {
         std::this_thread::yield();
     }
-    ASSERT_GT(probeCount.load(), 0) << "prober never ran";
+    // EXPECT, not ASSERT: `prober` is joinable, and returning here would terminate on its destructor.
+    bool const proberRan = probeCount.load(std::memory_order_relaxed) > 0;
+    EXPECT_TRUE(proberRan) << "prober never ran";
 
-    // Now require further progress while the writer holds the exclusive lock repeatedly.
     long long const probesBeforeWriter = probeCount.load(std::memory_order_relaxed);
     constexpr long long kMinProbes = 1000;
-    for (int iteration = 0;
-         iteration < 100000 && probeCount.load(std::memory_order_relaxed) - probesBeforeWriter < kMinProbes;
-         ++iteration)
+    int writerIterations = 0;
+    if (proberRan)
     {
-        // Exclusive-locked, and re-entrant into other locked methods.
-        manager->getAndResetIterationStats();
-        manager->markStatsDirty(std::nullopt);
-        manager->clearStatsDirty(std::nullopt);
+        // do/while so at least one exclusive mutation always happens: if the prober had already
+        // cleared the threshold by the time the loop was entered, a while-loop would run zero
+        // iterations and the test would assert nothing about interleaving.
+        do
+        {
+            // Exclusive-locked, and re-entrant into other locked methods.
+            manager->getAndResetIterationStats();
+            manager->markStatsDirty(std::nullopt);
+            manager->clearStatsDirty(std::nullopt);
+            ++writerIterations;
+        } while (
+            writerIterations < 100000 && probeCount.load(std::memory_order_relaxed) - probesBeforeWriter < kMinProbes);
     }
 
     stop.store(true, std::memory_order_relaxed);
     prober.join();
-    EXPECT_GE(probeCount.load() - probesBeforeWriter, kMinProbes)
-        << "probes made no progress against concurrent exclusive work";
+
+    if (proberRan)
+    {
+        EXPECT_GE(probeCount.load() - probesBeforeWriter, kMinProbes)
+            << "probes made no progress against " << writerIterations << " exclusive mutations";
+    }
 }
 
 } // namespace
