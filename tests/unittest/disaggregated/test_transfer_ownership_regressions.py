@@ -20,7 +20,7 @@ import queue
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -1516,18 +1516,16 @@ def test_bridge_rejection_releases_only_without_physical_owner(
 
 
 @pytest.mark.cpu_only
-def test_terminal_sender_settles_late_unsubmitted_aux_peer_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     rid = 104
-    known_info = transfer_mod.RecvReqInfo(
+    active_info = transfer_mod.RecvReqInfo(
         sender_req_id=18,
         instance_name="gen",
         instance_rank=1,
         block_ids_per_layer_groups=[],
         unique_rid=rid,
     )
-    late_info = transfer_mod.RecvReqInfo(
+    unsubmitted_info = transfer_mod.RecvReqInfo(
         sender_req_id=18,
         instance_name="gen",
         instance_rank=2,
@@ -1536,11 +1534,13 @@ def test_terminal_sender_settles_late_unsubmitted_aux_peer_once(
     )
     sender = _make_owned_sender()
     sender._peer_requests_lock = threading.Lock()
-    sender._peer_requests = {rid: {known_info.instance_rank: known_info}}
-    sender._save_peer_req_info = Mock()
-    sender._send_failed_result_to_receiver = Mock()
+    sender._peer_requests = {
+        rid: {
+            active_info.instance_rank: active_info,
+            unsubmitted_info.instance_rank: unsubmitted_info,
+        }
+    }
     sender._send_aux_result_to_receiver = Mock()
-    monkeypatch.setattr(transfer_mod.RecvReqInfo, "from_bytes", Mock(return_value=late_info))
     params = DisaggregatedParams(
         disagg_request_id=rid,
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
@@ -1558,32 +1558,21 @@ def test_terminal_sender_settles_late_unsubmitted_aux_peer_once(
     session._terminal_status = None
     session._closed = False
     session.aux_task = transfer_mod.AuxSendTask(params, slot=0)
-    assert session.aux_task.begin_physical_operation(0)
-    sender._sessions = {rid: session}
+    assert session.aux_task.begin_physical_operation(active_info.instance_rank)
 
     session.set_exception("request failed before auxiliary submission")
     session.set_exception("duplicate terminal notification")
     sender._send_aux_result_to_receiver.assert_called_once_with(
-        known_info,
+        unsubmitted_info,
         AgentResult.FAILED,
     )
 
-    session._closed = True
-    message = [MessageType.REQUEST_DATA, b"request"]
-    sender._respond_with_kv(b"", message)
-    sender._respond_with_kv(b"", message)
-
-    assert sender._send_failed_result_to_receiver.call_args_list == [
-        call(late_info, include_aux=True),
-        call(late_info, include_aux=False),
-    ]
-    assert session.aux_task.has_started_physical_operation(0)
-    assert not session.aux_task.has_started_physical_operation(1)
-    assert not session.aux_task.has_started_physical_operation(2)
-    assert session._aux_result_reported == {1, 2}
-    sender._save_peer_req_info.assert_not_called()
-    session.aux_task.retire_unsubmitted_physical_operation(0)
-    sender._sessions.clear()
+    assert session.aux_task.has_started_physical_operation(active_info.instance_rank)
+    assert not session.aux_task.has_started_physical_operation(unsubmitted_info.instance_rank)
+    assert session._aux_result_reported == {unsubmitted_info.instance_rank}
+    assert not session.aux_task.resources_drained
+    session.aux_task.retire_unsubmitted_physical_operation(active_info.instance_rank)
+    assert session.aux_task.resources_drained
 
 
 @pytest.mark.cpu_only
@@ -1705,6 +1694,85 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
         True,
     )
     assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.FAILED
+
+
+@pytest.mark.cpu_only
+def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> None:
+    rid = 100
+    sender = _make_owned_sender()
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
+    )
+    task = transfer_mod.KVSendTask(
+        KVSlice(is_last_slice=True),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+    )
+    sender._sessions = {
+        rid: SimpleNamespace(
+            lock=threading.Lock(),
+            _closed=False,
+            has_failed=lambda: False,
+        )
+    }
+    peers = {
+        rank: transfer_mod.RecvReqInfo(
+            sender_req_id=18,
+            instance_name="gen",
+            instance_rank=rank,
+            block_ids_per_layer_groups=[],
+            unique_rid=rid,
+            slice_id=rank,
+        )
+        for rank in (1, 2)
+    }
+    build = Mock(side_effect=RuntimeError("descriptor build failed"))
+    monkeypatch.setattr(sender, "_build_kv_write_meta", build)
+
+    with pytest.raises(RuntimeError, match="descriptor build failed"):
+        sender.dispatch_task(task, peers)
+
+    build.assert_called_once_with(task, peers[1])
+    assert task.resources_drained
+    assert {rank: operation.state for rank, operation in task._physical_operations.items()} == {
+        1: transfer_mod._PhysicalOperationState.NOT_SUBMITTED,
+        2: transfer_mod._PhysicalOperationState.NOT_SUBMITTED,
+    }
+    results = [sender._send_task_queues[0].get_nowait() for _ in peers]
+    assert sender._send_task_queues[0].empty()
+    assert {endpoint for endpoint, _ in results} == {"receiver"}
+    assert {transfer_mod._KV_RESULT_PREFIX.unpack(message[1])[2] for _, message in results} == {
+        1,
+        2,
+    }
+
+
+@pytest.mark.cpu_only
+def test_legacy_aux_dispatch_remains_fail_fast() -> None:
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
+    sender._dispatch_task_to_peer = Mock(side_effect=RuntimeError("first peer failed"))
+    task = transfer_mod.AuxSendTask(
+        DisaggregatedParams(disagg_request_id=101),
+        slot=0,
+    )
+    peers = {
+        rank: transfer_mod.RecvReqInfo(
+            sender_req_id=18,
+            instance_name="gen",
+            instance_rank=rank,
+            block_ids_per_layer_groups=[],
+            unique_rid=101,
+        )
+        for rank in (1, 2)
+    }
+
+    with pytest.raises(RuntimeError, match="first peer failed"):
+        sender.dispatch_task(task, peers)
+
+    sender._dispatch_task_to_peer.assert_called_once_with(task, peers[1])
 
 
 @pytest.mark.cpu_only

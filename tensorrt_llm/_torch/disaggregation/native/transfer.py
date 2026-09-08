@@ -1554,7 +1554,7 @@ class Sender(SenderBase):
             try:
                 self._dispatch_task_to_peer(task, info)
             except Exception as error:
-                if not isinstance(task, AuxSendTask):
+                if not self._enforce_physical_ownership:
                     raise
                 if first_error is None:
                     first_error = error
@@ -1571,9 +1571,9 @@ class Sender(SenderBase):
                 self._send_failed_task_result_to_receiver(task, info)
                 return
             owned = True
-        if task._perf_timer is not None:
-            task._perf_timer.record_task_start(info.instance_rank)
         try:
+            if task._perf_timer is not None:
+                task._perf_timer.record_task_start(info.instance_rank)
             trans_meta = (
                 self._build_kv_write_meta(task, info)
                 if isinstance(task, KVSendTask)
@@ -1666,31 +1666,19 @@ class Sender(SenderBase):
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
                     tasks = None
-                    aux_task = None
                     terminal = True
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
-                    aux_task = session.aux_task
                     terminal = session.has_failed()
             if tasks is None:
-                include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
-                self._send_failed_result_to_receiver(
-                    info,
-                    include_aux=include_aux,
-                )
+                self._send_failed_result_to_receiver(info)
                 return
             if terminal:
-                include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
-                self._send_failed_result_to_receiver(
-                    info,
-                    include_aux=include_aux,
-                )
+                self._send_failed_result_to_receiver(info)
                 return
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
-        if aux_task is not None:
-            self._dispatch_task_to_peer(aux_task, info)
 
     def _send_failed_result_to_receiver(
         self,
@@ -1991,6 +1979,8 @@ class TxSession(TxSessionBase):
         terminal_error: Optional[Exception] = None
         task: Optional[AuxSendTask] = None
         with self.lock:
+            # In the ownership bridge's generation-first no-retry profile,
+            # prefill waits for every REQUEST_DATA, so this peer snapshot is sealed.
             req_info_snapshot = dict(self._sender._get_req_info(self.disagg_request_id) or {})
             if self._closed or self._terminal_status is not None:
                 terminal_error = self._exception or RuntimeError(
