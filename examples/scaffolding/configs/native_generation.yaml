@@ -1,0 +1,7 @@
+# JSON and YAML are both accepted; the loader uses yaml.safe_load for either.
+controller:
+  type: NativeGenerationController
+  args:
+    sampling_params:
+      max_tokens: 1024
+      temperature: 0.9

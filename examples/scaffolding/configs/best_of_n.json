@@ -1,0 +1,20 @@
+{
+  "controller": {
+    "type": "BestOfNController",
+    "args": {
+      "default_sample_num": 4,
+      "generation_controller": {
+        "type": "NativeGenerationController",
+        "args": {
+          "sampling_params": {
+            "max_tokens": 512,
+            "temperature": 0.9
+          }
+        }
+      },
+      "reward_controller": {
+        "type": "NativeRewardController"
+      }
+    }
+  }
+}
