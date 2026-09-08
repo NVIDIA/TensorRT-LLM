@@ -1784,12 +1784,11 @@ def test_mtp_checkpoint_type_config(uses_external_draft_model):
 
 
 @pytest.mark.parametrize("num_nextn_predict_layers", [2, 3])
-def test_mtp_moe_backend_rejected_after_checkpoint_resolves_one_engine(
-    num_nextn_predict_layers,
-):
+def test_mtp_moe_backend_allowed_after_checkpoint_resolves_vanilla(
+    num_nextn_predict_layers: int,
+) -> None:
     spec_config = MTPDecodingConfig(
         max_draft_len=1,
-        speculative_model="/tmp/assistant",
         moe_backend="CUTLASS",
     )
     model_config = SimpleNamespace(
@@ -1797,11 +1796,13 @@ def test_mtp_moe_backend_rejected_after_checkpoint_resolves_one_engine(
         num_nextn_predict_layers=num_nextn_predict_layers,
     )
 
-    with pytest.raises(ValueError, match="does not support one-engine MTP"):
-        update_spec_config_from_model_config(spec_config, model_config)
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_vanilla()
+    assert spec_config.moe_backend == "CUTLASS"
 
 
-def test_mtp_moe_backend_rejected_for_internal_mtp_eagle_one_model():
+def test_mtp_moe_backend_allowed_for_internal_mtp_eagle() -> None:
     spec_config = MTPDecodingConfig(
         max_draft_len=1,
         moe_backend="CUTLASS",
@@ -1812,8 +1813,10 @@ def test_mtp_moe_backend_rejected_for_internal_mtp_eagle_one_model():
         num_nextn_predict_layers=1,
     )
 
-    with pytest.raises(ValueError, match="does not support one-engine MTP"):
-        update_spec_config_from_model_config(spec_config, model_config)
+    update_spec_config_from_model_config(spec_config, model_config)
+
+    assert spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+    assert spec_config.moe_backend == "CUTLASS"
 
 
 @pytest.mark.parametrize(
@@ -1846,7 +1849,7 @@ def test_mtp_moe_backend_allowed_for_full_external_assistant(
     assert spec_config.moe_backend == "CUTLASS"
 
 
-def test_mtp_moe_backend_rejected_for_shared_kv_replacement_heads():
+def test_mtp_moe_backend_rejected_for_shared_kv_replacement_heads() -> None:
     class ReplacementHeadTarget:
         pass
 
@@ -1860,7 +1863,7 @@ def test_mtp_moe_backend_rejected_for_shared_kv_replacement_heads():
         num_nextn_predict_layers=1,
     )
 
-    with pytest.raises(ValueError, match="does not support one-engine MTP"):
+    with pytest.raises(ValueError, match="replacement-head MTP"):
         update_spec_config_from_model_config(spec_config, model_config, ReplacementHeadTarget)
 
     assert spec_config.uses_replacement_heads

@@ -1635,6 +1635,24 @@
       "path": "speculative_config.max_total_draft_tokens"
     },
     {
+      "allowed_values": [
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "speculative_config.moe_backend"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.num_eagle_layers"
