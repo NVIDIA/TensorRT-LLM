@@ -868,6 +868,60 @@ def test_slurm_bundle_preserves_canonical_templates():
         assert flag in slurm.analyzer, flag
 
 
+def test_remote_execution_prompt_is_short_and_task_specific():
+    task = {
+        "checkpoint_path": "/models/gemma",
+        "slurm-environment": {
+            "slurm_partition": "batch",
+            "docker_image": "/images/trtllm.sqsh",
+            "cluster_ssh": "user@login",
+            "remote_run_root": "/scratch/runs/gemma-serial",
+            "account": "acct",
+            "qos": "short",
+        },
+    }
+    bundle = build_perf_optimize_prompts(
+        include_slurm_environment=True,
+        remote_execution=task,
+        campaign_name="gemma-serial",
+    )
+    for role in (
+        "benchmarker",
+        "projector",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "qa",
+    ):
+        prompt = getattr(bundle, role)
+        compact = _norm(prompt)
+        assert "SSH target: user@login" in prompt
+        assert "Remote run root: /scratch/runs/gemma-serial" in prompt
+        assert "Container image: /images/trtllm.sqsh" in prompt
+        assert "Model checkpoint: /models/gemma" in prompt
+        assert "partition=batch, account=acct, qos=short" in prompt
+        assert "configured SSH target" in compact
+        assert "For each remote Slurm job" in compact
+        assert "isolated directory under the remote run root" in compact
+        assert "excluding `.git`, builds, and caches" in compact
+        assert "changed source" in compact
+        assert "wait for Slurm to finish" in compact
+        assert "role's required outputs and failure logs" in compact
+        assert "local inspection" in compact
+        assert "remove that remote job directory" in compact
+        assert "Prefer one allocation for related work" in compact
+        assert "retry only after a concrete correction" in compact
+        assert "or when another measurement is needed" in compact
+        for removed_detail in (
+            "Treat command output as noisy",
+            "probe, control, confirmation",
+            "harness failure",
+            "only Slurm submission",
+        ):
+            assert removed_detail not in compact
+    assert "SSH target:" not in bundle.reporter
+
+
 # --------------------------------------------------------- approach restriction
 
 
