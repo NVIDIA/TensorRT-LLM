@@ -346,8 +346,10 @@ std::tuple<torch::Tensor, torch::Tensor> minimaxM3Nvfp4QKVIndexerNormRopeKVInser
         "MiniMax-M3 NVFP4 horizontal producer requires Q, KV, and index heads");
     TORCH_CHECK(
         numHeadsKV == numHeadsIndex, "MiniMax-M3 NVFP4 horizontal producer requires index heads to equal KV heads");
-    TORCH_CHECK(numHeadsQ == 16 * numHeadsKV,
-        "MiniMax-M3 NVFP4 horizontal producer requires the model's 16:1 Q-to-KV head ratio");
+    // The model has a global 16:1 Q-to-KV head ratio, but that ratio is not
+    // preserved on a rank once TP exceeds the four KV heads.  For example,
+    // TP8 owns eight Q heads and one replicated KV head.  The kernel processes
+    // every packed head independently and does not require a local ratio.
     TORCH_CHECK(headDim == kHeadDim, "MiniMax-M3 NVFP4 horizontal producer requires head_dim=128");
     TORCH_CHECK(rotaryDim == kRotaryDim, "MiniMax-M3 NVFP4 horizontal producer requires rotary_dim=64");
     TORCH_CHECK(eps >= 0.0, "MiniMax-M3 NVFP4 horizontal producer requires eps >= 0");
