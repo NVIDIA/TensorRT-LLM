@@ -88,6 +88,20 @@ PY
 }
 
 function configure_flashinfer_workspace {
+    # Mirror the Python unified-cache default before importing TensorRT-LLM.
+    # An explicitly configured unified root is user-owned and must not be
+    # replaced by the launcher's automatic per-rank workspace isolation.
+    if [ -z "$FLASHINFER_WORKSPACE_BASE" ] && [ -n "$TRTLLM_CACHE_DIR" ]; then
+        local unified_flashinfer_workspace
+        if ! unified_flashinfer_workspace=$(python3 -S -c \
+            'import os, sys; print(os.path.join(os.path.expanduser(sys.argv[1]), "flashinfer"))' \
+            "$TRTLLM_CACHE_DIR"); then
+            log_stderr "Failed to derive the FlashInfer workspace from TRTLLM_CACHE_DIR"
+            exit 1
+        fi
+        export FLASHINFER_WORKSPACE_BASE="$unified_flashinfer_workspace"
+    fi
+
     # PMI_RANK or PMI_ID still proves that this process is launcher-managed
     # when PMI_SIZE is unavailable. Isolate even rank 0 in that case so rank-0
     # processes from concurrent jobs cannot share FlashInfer's default workspace.

@@ -117,3 +117,41 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     assert worker_env[_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV] == "1"
     assert all(worker_env[name] == os.environ[name] for name in _bootstrap._UNIFIED_CACHE_ENV_VARS)
     assert "UNRELATED_CACHE_DIR" not in worker_env
+
+
+@pytest.mark.parametrize("use_unified_cache", [False, True])
+def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_unified_cache: bool
+) -> None:
+    if not ENABLE_MULTI_DEVICE:
+        pytest.skip("multi-device required")
+
+    captured: dict[str, object] = {}
+
+    class FakeMpiPoolExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    cache_root = tmp_path / "unified"
+    if use_unified_cache:
+        monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, str(cache_root))
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
+    _bootstrap._setup_unified_cache()
+    session = SimpleNamespace(mpi_pool=None, n_workers=2, _env_overrides={})
+
+    mpi_session.MpiPoolSession._start_mpi_pool(session)
+
+    worker_env = captured["env"]
+    assert isinstance(worker_env, dict)
+    if use_unified_cache:
+        assert captured["python_args"] is None
+        assert worker_env["FLASHINFER_WORKSPACE_BASE"] == str(cache_root / "flashinfer")
+    else:
+        assert captured["python_args"] == [
+            "-c",
+            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+            mpi_session._FLASHINFER_WORKSPACE_ROOT,
+        ]
+        assert "FLASHINFER_WORKSPACE_BASE" not in worker_env
