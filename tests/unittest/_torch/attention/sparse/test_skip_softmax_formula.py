@@ -32,7 +32,7 @@ def test_skip_softmax_uses_function_local_numexpr_imports() -> None:
         """
         import sys
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxFormula,
         )
 
@@ -56,7 +56,7 @@ def test_skip_softmax_configures_numexpr_threads_at_import(
         import os
         import sys
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxFormula,
         )
 
