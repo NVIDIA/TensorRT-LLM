@@ -678,6 +678,59 @@ _TP_EXPERTS = 8
 _TP_TOPK = 2
 
 
+def test_tp16_mxfp4_logical_shard_is_padded_locally():
+    """TP16 owns 192 logical values but stores a 256-wide kernel tile."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod
+
+    method = object.__new__(W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod)
+    module = SimpleNamespace(
+        intermediate_size=_TP_INTERMEDIATE,
+        intermediate_size_per_partition=_TP_INTERMEDIATE // 16,
+        tp_size=16,
+        tp_rank=15,
+    )
+    assert method._uses_logical_tp_sharding(module)
+
+    # w1/w3 keep intermediate values on rows; each uint8 stores two hidden
+    # values, which does not change the intermediate slice width.
+    fc1 = (
+        torch.arange(_TP_INTERMEDIATE * 2, dtype=torch.int64)
+        .reshape(_TP_INTERMEDIATE, 2)
+        .to(torch.uint8)
+    )
+    fc1_shard = method._load_logical_tp_shard(
+        module, fc1, torch.Size((256, 2)), 0, 1, torch.device("cpu")
+    )
+    assert torch.equal(fc1_shard[:192], fc1[-192:])
+    assert torch.count_nonzero(fc1_shard[192:]) == 0
+
+    # w2 packs two intermediate values per byte; its 192-value logical shard
+    # is therefore 96 bytes and the 256-value destination is 128 bytes.
+    fc2 = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 2), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 2)
+        .to(torch.uint8)
+    )
+    fc2_shard = method._load_logical_tp_shard(
+        module, fc2, torch.Size((2, 128)), 1, 2, torch.device("cpu")
+    )
+    assert torch.equal(fc2_shard[:, :96], fc2[:, -96:])
+    assert torch.count_nonzero(fc2_shard[:, 96:]) == 0
+
+    # One uint8 scale covers 32 intermediate values: 6 logical scale bytes
+    # per rank, padded to 8 for the physical 256-value tile.
+    fc2_scale = (
+        torch.arange(2 * (_TP_INTERMEDIATE // 32), dtype=torch.int64)
+        .reshape(2, _TP_INTERMEDIATE // 32)
+        .to(torch.uint8)
+    )
+    fc2_scale_shard = method._load_logical_tp_shard(
+        module, fc2_scale, torch.Size((2, 8)), 1, 32, torch.device("cpu")
+    )
+    assert torch.equal(fc2_scale_shard[:, :6], fc2_scale[:, -6:])
+    assert torch.count_nonzero(fc2_scale_shard[:, 6:]) == 0
+
+
 def _make_packed_expert_bank(num_experts, intermediate, hidden, seed=101):
     """Random group-32 packed MXFP4 tensors in checkpoint layout (uint8)."""
     gen = torch.Generator().manual_seed(seed)
@@ -791,6 +844,8 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
                 expert_size_per_partition=backend.expert_size_per_partition,
                 initial_local_expert_ids=backend.initial_local_expert_ids,
                 scaling_vector_size=backend.scaling_vector_size,
+                intermediate_size=_TP_INTERMEDIATE,
+                intermediate_size_per_partition=_TP_INTERMEDIATE // tp_size,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 w3_w1_weight=backend.w3_w1_weight,
@@ -831,7 +886,7 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
 
 
 @situ_supported
-@pytest.mark.parametrize("tp_size", [2, 8], ids=lambda n: f"tp{n}")
+@pytest.mark.parametrize("tp_size", [2, 8, 16], ids=lambda n: f"tp{n}")
 def test_tp_shard_loader_matches_manual_slice(tp_size):
     """The stock shard loaders must equal a manual contiguous slice.
 
@@ -862,6 +917,9 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
             }
             for e in bank
         ]
+        # The TP16 destination is physically padded from 192 to 256. Loading
+        # the logical slice through a tp1 module exercises the same padding
+        # and transform while providing an ownership-independent reference.
         via_manual = _make_routed_moe(ipp, gate, num_experts=num_experts)
         _load_bank(via_manual, manual_bank)
 

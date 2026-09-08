@@ -6550,6 +6550,7 @@ _PACKED_MXFP4_SLOT_CLAIM_LOCK = threading.Lock()
 class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     weight_dtype = torch.uint8
     block_scales_dtype = torch.uint8
+    scaling_vector_size = 32
     # TRTLLM-Gen backend requires weight elements to be 128 aligned in intermediate dimension
     weight_alignment = 128
     # Due to kernel implementation, we enforce the input hidden dimension to be multiple of 512,
@@ -6578,8 +6579,64 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
 
+    def _uses_logical_tp_sharding(self, module: torch.nn.Module) -> bool:
+        """Whether this TP shape must be sliced before kernel padding.
+
+        The checkpoint's MXFP4 scale groups contain 32 logical values.  When
+        a per-rank shard contains whole groups but is not 128-aligned, padding
+        the full tensor before TP slicing changes rank ownership.  Slice the
+        original logical range first and pad that local range instead.
+        """
+        logical_size = module.intermediate_size_per_partition
+        return (module.tp_size > 1
+                and module.intermediate_size % module.tp_size == 0
+                and logical_size % self.scaling_vector_size == 0
+                and logical_size % self.weight_alignment != 0)
+
+    def _load_logical_tp_shard(self, module: torch.nn.Module,
+                               tensor: torch.Tensor, dst_shape: torch.Size,
+                               shard_dim: int, values_per_storage_element: int,
+                               device: torch.device) -> torch.Tensor:
+        """Slice one rank's logical range, then zero-pad to ``dst_shape``.
+
+        ``values_per_storage_element`` accounts for packed MXFP4 weights (two
+        values per uint8) and group-32 scales (32 values per uint8).
+        """
+        logical_size = module.intermediate_size_per_partition
+        if logical_size % values_per_storage_element != 0:
+            raise ValueError(
+                f"MXFP4 logical TP shard ({logical_size}) must be divisible "
+                f"by values_per_storage_element "
+                f"({values_per_storage_element}).")
+
+        storage_size = logical_size // values_per_storage_element
+        start = module.tp_rank * storage_size
+        stop = start + storage_size
+        if not 0 <= module.tp_rank < module.tp_size:
+            raise ValueError(
+                f"tp_rank ({module.tp_rank}) must be in [0, {module.tp_size}).")
+        if stop > tensor.shape[shard_dim]:
+            raise ValueError(
+                f"MXFP4 tensor shape {tuple(tensor.shape)} does not contain "
+                f"the logical TP shard [{start}:{stop}] on dim {shard_dim}.")
+
+        shard = tensor.narrow(shard_dim, start, storage_size).contiguous()
+        if len(shard.shape) != len(dst_shape) or any(
+                src > dst for src, dst in zip(shard.shape, dst_shape)):
+            raise ValueError(
+                f"MXFP4 logical TP shard shape {tuple(shard.shape)} cannot "
+                f"be padded to destination shape {tuple(dst_shape)}.")
+        return _pad_tensor_to_shape(shard, tuple(dst_shape)).to(device)
+
     def cache_derived_state(self, module: torch.nn.Module) -> None:
         super().cache_derived_state(module)
+        if self._uses_logical_tp_sharding(module):
+            # The physical buffer is padded to weight_alignment, but only the
+            # original logical values belong to this rank.
+            self.intermediate_size_per_partition_lean = (
+                module.intermediate_size_per_partition)
+            return
+
         # Create a proxy weight of unpadded size; dtype does not matter
         w1_weight = torch.empty([module.intermediate_size, module.hidden_size])
         # Calculate alignment
@@ -6623,52 +6680,64 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         non_blocking = dst_w3_w1_weight.device.type == "cuda"
 
-        # We pad before the sharding. This is done to avoid fractional scaling factors
-        # per shard.
-        #
-        # E.g. if we pad after the sharding, with intermediate_size = 2880,
-        # tp_size = 4, scaling_vector_size = 32, each shard gets 720 elements and
-        # 22.5 scaling factors. After padding, each shard gets 768 in
-        # intermediate_size, and 24 in scaling factors's intermediate_size.
-        # The 2nd rank will start loading the 23rd scaling factor,
-        # while it should've loaded 22nd for the first 16 elements only.
-        # We pad the weights before the sharding to avoid this issue.
-        alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, w1_weight.shape[0])
-        if len(w1_weight.shape) == 2:
-            # Pad weights
-            # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
-            assert w1_weight.dtype == torch.uint8
-            w1_weight = maybe_pad_for_mxfp4(w1_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
-            assert w3_weight.dtype == torch.uint8
-            w3_weight = maybe_pad_for_mxfp4(w3_weight,
-                                            self.input_hidden_alignment // 2,
-                                            alignment)
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+        if self._uses_logical_tp_sharding(module):
+            w1_weight_shard = self._load_logical_tp_shard(
+                module, w1_weight, dst_w1_weight.shape, 0, 1, device)
+            w3_weight_shard = self._load_logical_tp_shard(
+                module, w3_weight, dst_w3_weight.shape, 0, 1, device)
+            if len(w1_weight.shape) == 1:
+                w1_weight_shard = w1_weight_shard.float()
+                w3_weight_shard = w3_weight_shard.float()
+            else:
+                assert len(w1_weight.shape) == 2
+                assert w1_weight.dtype == torch.uint8
+                assert w3_weight.dtype == torch.uint8
         else:
-            # Pad bias, TRTLLM backend expects float32 bias.
-            assert len(w1_weight.shape) == 1
-            assert len(w3_weight.shape) == 1
-            w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
-            w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
+            # We pad before the sharding. This is done to avoid fractional scaling factors
+            # per shard.
+            #
+            # E.g. if we pad after the sharding, with intermediate_size = 2880,
+            # tp_size = 4, scaling_vector_size = 32, each shard gets 720 elements and
+            # 22.5 scaling factors. After padding, each shard gets 768 in
+            # intermediate_size, and 24 in scaling factors's intermediate_size.
+            # The 2nd rank will start loading the 23rd scaling factor,
+            # while it should've loaded 22nd for the first 16 elements only.
+            # We pad the weights before the sharding to avoid this issue.
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size,
+                                              w1_weight.shape[0])
+            if len(w1_weight.shape) == 2:
+                # Pad weights
+                # We already satisfy alignment factor of 2 for we pack two MXFP4 into Uint8.
+                assert w1_weight.dtype == torch.uint8
+                w1_weight = maybe_pad_for_mxfp4(
+                    w1_weight, self.input_hidden_alignment // 2, alignment)
+                assert w3_weight.dtype == torch.uint8
+                w3_weight = maybe_pad_for_mxfp4(
+                    w3_weight, self.input_hidden_alignment // 2, alignment)
+            else:
+                # Pad bias, TRTLLM backend expects float32 bias.
+                assert len(w1_weight.shape) == 1
+                assert len(w3_weight.shape) == 1
+                w1_weight = maybe_pad_for_mxfp4(w1_weight, alignment).float()
+                w3_weight = maybe_pad_for_mxfp4(w3_weight, alignment).float()
 
-        w1_weight_shard = load_weight_shard(w1_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-        w3_weight_shard = load_weight_shard(w3_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+            w1_weight_shard = load_weight_shard(w1_weight,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
+            w3_weight_shard = load_weight_shard(w3_weight,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
         # Keep weights in device buffer
-        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
         dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
         dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
 
@@ -6693,27 +6762,33 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         shard_w2_weight_dim = 2 * w2_weight.shape[1] if len(
             w2_weight.shape) == 2 else w2_weight.shape[0]
-        alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size, shard_w2_weight_dim)
-
-        if len(w2_weight.shape) == 2:
+        if (len(w2_weight.shape) == 2
+                and self._uses_logical_tp_sharding(module)):
             assert w2_weight.dtype == torch.uint8
-            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
-                                            self.weight_alignment)
+            w2_weight_shard = self._load_logical_tp_shard(
+                module, w2_weight, dst_w2_weight.shape, 1, 2, device)
         else:
-            # Pad bias, TRTLLM backend expects float32 bias.
-            # Divide bias by tp_size as we shard along the hidden dimension.
-            # The bias is applied at each TP rank before the final accumulation.
-            assert len(w2_weight.shape) == 1
-            w2_weight = maybe_pad_for_mxfp4(
-                w2_weight, self.weight_alignment).float() / module.tp_size
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size,
+                                              shard_w2_weight_dim)
+            if len(w2_weight.shape) == 2:
+                assert w2_weight.dtype == torch.uint8
+                w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
+                                                self.weight_alignment)
+            else:
+                # Pad bias, TRTLLM backend expects float32 bias.
+                # Divide bias by tp_size as we shard along the hidden dimension.
+                # The bias is applied at each TP rank before the final accumulation.
+                assert len(w2_weight.shape) == 1
+                w2_weight = maybe_pad_for_mxfp4(
+                    w2_weight, self.weight_alignment).float() / module.tp_size
 
-        w2_weight_shard = load_weight_shard(w2_weight,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
-                                            device=device)
+            w2_weight_shard = load_weight_shard(w2_weight,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.ROW,
+                                                device=device)
 
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
@@ -6742,34 +6817,42 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         dst_w3_w1_weight_scale_gpu = dst_w3_w1_weight_scale if dst_on_gpu else dst_w3_w1_weight_scale.cuda(
         )
 
-        alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
-                                          w3_weight_scale.shape[0])
-
-        w1_weight_scale = maybe_pad_for_mxfp4(
-            w1_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
-
-        w1_weight_scale = load_weight_shard(w1_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-        w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
-
         # Keep weights in device buffer
         dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.chunk(
             2, dim=0)
+        if self._uses_logical_tp_sharding(module):
+            w1_weight_scale = self._load_logical_tp_shard(
+                module, w1_weight_scale, dst_w1_weight_scale.shape, 0, 1,
+                device)
+            w3_weight_scale = self._load_logical_tp_shard(
+                module, w3_weight_scale, dst_w3_weight_scale.shape, 0, 1,
+                device)
+        else:
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size,
+                                              w3_weight_scale.shape[0])
+
+            w1_weight_scale = maybe_pad_for_mxfp4(
+                w1_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
+            w3_weight_scale = maybe_pad_for_mxfp4(
+                w3_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
+
+            w1_weight_scale = load_weight_shard(w1_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
+            w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
+
         dst_w3_weight_scale.copy_(
             w3_weight_scale.view(dst_w3_weight_scale.dtype))
         dst_w1_weight_scale.copy_(
@@ -6812,20 +6895,25 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
         dst_w2_weight_scale_gpu = dst_w2_weight_scale if dst_on_gpu else dst_w2_weight_scale.cuda(
         )
 
-        alignment = _get_weight_alignment(self.weight_alignment,
-                                          module.scaling_vector_size,
-                                          module.tp_size,
-                                          w2_weight_scale.shape[-1])
+        if self._uses_logical_tp_sharding(module):
+            w2_weight_scale = self._load_logical_tp_shard(
+                module, w2_weight_scale, dst_w2_weight_scale_gpu.shape, 1,
+                self.scaling_vector_size, device)
+        else:
+            alignment = _get_weight_alignment(self.weight_alignment,
+                                              module.scaling_vector_size,
+                                              module.tp_size,
+                                              w2_weight_scale.shape[-1])
 
-        w2_weight_scale = maybe_pad_for_mxfp4(
-            w2_weight_scale, alignment // module.scaling_vector_size,
-            self.weight_alignment)
+            w2_weight_scale = maybe_pad_for_mxfp4(
+                w2_weight_scale, alignment // module.scaling_vector_size,
+                self.weight_alignment)
 
-        w2_weight_scale = load_weight_shard(w2_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.ROW,
-                                            device=device)
+            w2_weight_scale = load_weight_shard(w2_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.ROW,
+                                                device=device)
 
         # Keep weights in device buffer
         dst_w2_weight_scale_gpu.copy_(
