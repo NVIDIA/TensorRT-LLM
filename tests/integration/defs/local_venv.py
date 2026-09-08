@@ -137,13 +137,18 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
                                         env=new_env,
                                         check=True,
                                         capture_output=True,
-                                        timeout=kwargs.pop("timeout", 600),
+                                        timeout=kwargs.pop("timeout", None),
                                         **kwargs)
                 return result.stdout.decode('utf-8')
-            except subprocess.CalledProcessError as e:
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired) as e:
+                stdout = (e.stdout.decode('utf-8') if isinstance(
+                    e.stdout, bytes) else e.stdout or '')
+                stderr = (e.stderr.decode('utf-8') if isinstance(
+                    e.stderr, bytes) else e.stderr or '')
                 raise RuntimeError(f"Failed to run `{shlex.join(e.cmd)}`:\n"
-                                   f"Stdout: {e.stdout.decode()}\n"
-                                   f"Stderr: {e.stderr.decode()}\n")
+                                   f"Stdout: {stdout}\n"
+                                   f"Stderr: {stderr}\n") from e
         else:
             print(f"Start subprocess with {caller}({redact_args(call_args)}, "
                   f"env={redact_env(new_env)})")

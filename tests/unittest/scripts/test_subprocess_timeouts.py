@@ -64,6 +64,15 @@ def _candidate_paths() -> list[Path]:
     return [_REPO_ROOT / path for path in result.stdout.splitlines()]
 
 
+def _has_effective_timeout(call: ast.Call) -> bool:
+    """Return whether a call has a timeout other than the literal None."""
+    return any(
+        keyword.arg == "timeout"
+        and (not isinstance(keyword.value, ast.Constant) or keyword.value.value is not None)
+        for keyword in call.keywords
+    )
+
+
 def _missing_timeout_lines(source: str, filename: str = "<unknown>") -> list[int]:
     tree = ast.parse(source, filename=filename)
     module_names, run_names = _subprocess_aliases(tree)
@@ -73,7 +82,7 @@ def _missing_timeout_lines(source: str, filename: str = "<unknown>") -> list[int
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and _is_subprocess_run(node, module_names, run_names)
-        and not any(keyword.arg == "timeout" for keyword in node.keywords)
+        and not _has_effective_timeout(node)
     ]
 
 
@@ -85,6 +94,7 @@ def _missing_timeout_lines(source: str, filename: str = "<unknown>") -> list[int
         "from subprocess import run\nrun(command)",
         "from subprocess import run as execute\nexecute(command)",
         "import subprocess\nsubprocess.run(command, **kwargs)",
+        "import subprocess\nsubprocess.run(command, timeout=None)",
     ),
 )
 def test_finds_subprocess_run_without_timeout(source: str) -> None:
