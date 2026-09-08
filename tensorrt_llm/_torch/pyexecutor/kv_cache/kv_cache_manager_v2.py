@@ -2905,6 +2905,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return {}
 
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """Return local-only buffer roles excluded from disaggregation.
+
+        Specialized managers may register storage-only buffers to satisfy
+        physical pool layout constraints. Such buffers remain part of local
+        slot copies, but contain no model state that needs to be transferred
+        between disaggregated workers.
+        """
+        return frozenset()
+
     @property
     def blocks_in_primary_pool(self) -> int:
         """
