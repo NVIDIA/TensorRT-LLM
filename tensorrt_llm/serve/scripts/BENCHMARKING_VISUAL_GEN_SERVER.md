@@ -83,19 +83,18 @@ rather than being replaced whole.
 
 #### File inputs
 
-Five keys take a file, and only these five. A bare string in any of them is a **local path**,
-read when the document loads, so a missing file fails before the run starts; relative paths
-resolve from the document and `~` expands, with no variable expansion.
+Five keys read a file, and no others. A bare string in any of them is a local path, resolved
+from the document, with `~` expanded and no variable expansion.
 
-| key | may sit in | what the file becomes |
-|---|---|---|
-| `image_reference` · `video_reference` · `audio_reference` | a request | base64 on the wire. Each conditions one generation, which is why `common_params` rejects them |
-| `prompt_file` | a request or `common_params` | that request's `prompt`; `_resolve_prompt_file` documents the shapes it is read in |
-| `extra_params.action_file` | a request or `common_params` | `extra_params.action`, a JSON `[T, D]` trajectory. Setting both is an error |
+| key | what the file becomes |
+|---|---|
+| `image_reference` · `video_reference` · `audio_reference` | base64 on the wire |
+| `prompt_file` | that request's `prompt`: a JSON object's `prompt` field, the whole object serialized when it has none, or the file's text when it is not JSON |
+| `extra_params.action_file` | `extra_params.action`, a JSON `[T, D]` trajectory |
 
-The three reference slots also take the object form `MediaRef` declares — `{content, format}`
-with `format` one of `path`, `url` or `base64` — passed through untouched. That is how a URL or
-inline base64 is given. `prompt_file` and `action_file` take a path.
+A URL or inline base64 goes in the object form `MediaRef` declares — `{content, format}` with
+`format` one of `path`, `url` or `base64` — which the three reference slots take and pass
+through untouched.
 
 ## Result
 
