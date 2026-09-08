@@ -24,13 +24,10 @@ reviews:
 
   auto_title_placeholder: "@coderabbitai title"
   auto_title_instructions: >-
-    Format: "[<ticket>][<category>] <title>", where "[<ticket>]" is optional
-    and included only when a ticket identifier (e.g. JIRA or NVBug ID) is
-    discoverable from the PR context. Category must be one of: fix, feat, doc,
+    Format: "[<category>] <title>". Category must be one of: fix, feat, doc,
     infra, style, refactor, perf, test, chore, revert. Enclose the category in
     square brackets. Keep the title concise (60 characters or fewer).
-    Example: "[feat] Add logit_bias support" or
-    "[TRTLLM-5516][perf] Optimize cuda graph padding".
+    Example: "[feat] Add logit_bias support".
 
   commit_status: false
   high_level_summary_instructions: |
@@ -78,9 +75,7 @@ reviews:
   auto_review:
     auto_incremental_review: true
     drafts: false
-    base_branches:
-      - main
-      - "release/.+"
+    base_branches: ["main", "release/.+"]
 
   path_instructions:
     # Production-code coverage review. This is required because tests/** rules
@@ -288,5 +283,4 @@ reviews:
 knowledge_base:
   code_guidelines:
     enabled: true
-    filePatterns:
-      - "**/CODING_GUIDELINES.md"
+    filePatterns: ["**/CODING_GUIDELINES.md"]
