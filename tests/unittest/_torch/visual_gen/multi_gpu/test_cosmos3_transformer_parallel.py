@@ -24,9 +24,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.visual_gen.config import (
         AttentionConfig,
         DiffusionModelConfig,
@@ -37,12 +34,6 @@ try:
         COSMOS3_EDGE_BACKBONE_TYPE,
         Cosmos3VFMTransformer,
     )
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     MODULES_AVAILABLE = True
@@ -226,6 +217,10 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,

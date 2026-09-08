@@ -15,11 +15,15 @@
 """
 TensorRT LLM perf tests
 """
+
+# Serve a lazy import of allowed_configs inside the function body of
+# import_allowed_perf_config() below.
+__extra_import_path__ = ["."]
+
 import json
 import os
 import re
 import shutil
-import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
@@ -29,8 +33,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import (get_device_count, get_llm_root, llm_models_root,
-                        trt_environment)
+from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -63,6 +66,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "glm_5_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
+    "qwen3.6_35b_a3b_fp4_mtp",
     "nemotron_3_nano_omni_nvfp4",
     "nemotron_3_nano_omni_nvfp4_image",
     "nemotron_nano_12b_v2",
@@ -96,6 +100,7 @@ SPEC_DEC_MODELS = {
     "qwen3_235b_a22b_fp4_eagle3",
     "gpt_oss_120b_eagle3",
     "gpt_oss_120b_eagle3_throughput",
+    "qwen3.6_35b_a3b_fp4_mtp",
     *SPEC_DEC_REAL_DATASET_MODELS,
 }
 
@@ -144,8 +149,6 @@ def import_allowed_perf_config():
     else:
         global ALLOWED_CONFIGS_CACHE
         if ALLOWED_CONFIGS_CACHE is None:
-            sys.path.append((os.path.join(get_llm_root(),
-                                          "tests/integration/defs/perf")))
             import allowed_configs
             ALLOWED_CONFIGS_CACHE = allowed_configs
         else:
@@ -838,12 +841,6 @@ class PerfTestConfig:
                 assert all(
                     [b >= 32 for b in self.batch_sizes]
                 ), f"BERT with small BS is very unstable! Please increase to at least 32."
-
-            # GPT-350m and Bloom-560m with small BS are very unstable. Only run these small models with larger BS.
-            if self.model_name in ["gpt_350m", "bloom_560m"]:
-                assert all(
-                    [b >= 32 for b in self.batch_sizes]
-                ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
         # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
         # auto-detection for multi-node setups.

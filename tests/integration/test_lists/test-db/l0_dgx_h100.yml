@@ -90,6 +90,9 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  # Exercise VisualGen worker-failure containment with live CUDA allocations
+  # spread across four local processes.
+  - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]
@@ -101,7 +104,6 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_hopper_w4a16
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
   - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
-  - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   # ------------- Disaggregated serving tests ---------------
   # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
   # A single wrapper case ran ~3581 s on B200 and brushed the outer pytest

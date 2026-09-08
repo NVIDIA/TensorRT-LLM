@@ -53,6 +53,18 @@ void launch_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, int32
 void launch_fp8_quantize_1x128_cutedsl_bf16_e4m3(__nv_fp8_e4m3* fp8_output, uint8_t* swizzled_scale_output,
     __nv_bfloat16 const* input, int m, int k, int padded_m, cudaStream_t stream);
 
+// Launches SwiGLU followed by fused 1x128 FP8 quantization and UE8M0 packing.
+//
+// Inputs:
+//   input  : BF16 [m, 2 * k] row-major contiguous, with gate followed by up
+// Outputs:
+//   fp8_output  : E4M3 [m, k] row-major contiguous
+//   scale_output: flat uint8 R128c4 when use_r128c4_layout is true; otherwise
+//                 uint32 [packed_sf_k, scale_leading_dim_uint32] for DeepGemm
+void launch_silu_and_mul_fp8_quantize_1x128_packed_bf16_e4m3(__nv_fp8_e4m3* fp8_output, void* scale_output,
+    __nv_bfloat16 const* input, int m, int k, int scale_leading_dim_uint32, bool use_r128c4_layout, float swiglu_limit,
+    bool has_swiglu_limit, cudaStream_t stream);
+
 } // namespace kernels::fp8_blockscale_gemm
 
 TRTLLM_NAMESPACE_END

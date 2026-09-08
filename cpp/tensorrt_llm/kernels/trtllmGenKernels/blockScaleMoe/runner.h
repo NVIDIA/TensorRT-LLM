@@ -204,7 +204,7 @@ class Runner
 {
 public:
     explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        bool useDeepSeekFp8, int tileTokensDim, ActType actType);
+        bool useDeepSeekFp8, int tileTokensDim, ActType actType, bool useFineGrained);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -243,7 +243,7 @@ class Runner
 {
 public:
     explicit Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights,
-        batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim);
+        batchedGemm::trtllm::gen::Dtype outputDtype, bool useDeepSeekFp8, int tileTokensDim, bool useFineGrained);
 
     size_t getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
         int32_t numTokens, int32_t configIndex) const;
@@ -412,8 +412,9 @@ class Runner
 public:
     // FIXME: tileTokensDim is hardcoded for now
     Runner(batchedGemm::trtllm::gen::Dtype dtypeAct, batchedGemm::trtllm::gen::Dtype dtypeWeights, bool useDeepSeekFp8,
-        int tileTokensDim = 8, ActType actType = ActType::SwiGlu);
-    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8);
+        int tileTokensDim = 8, ActType actType = ActType::SwiGlu, bool useFineGrained = false);
+    Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
+        bool useFineGrained = false);
 
     void run(
         MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex);

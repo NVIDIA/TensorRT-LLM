@@ -69,13 +69,13 @@ def test_matching_ignores_tuning_changes() -> None:
     assert benchmark_data_matches(previous_data, updated_data, get_test_case_match_keys())
 
 
-def _load_client_config() -> type:
-    """Return the real ClientConfig, without the integration-test packages.
+def _load_module() -> types.ModuleType:
+    """Import test_perf_sanity.py without the integration-test packages.
 
-    The derived-name rule is only worth testing against the class that owns it;
-    re-implementing the f-string here would assert nothing. test_perf_sanity.py
-    reaches torch and the OpenSearch client through its imports, so those are
-    stubbed -- ClientConfig.__init__ touches none of them.
+    Rules under test are only worth asserting against the code that owns them;
+    re-implementing them here would assert nothing. test_perf_sanity.py reaches
+    torch and the OpenSearch client through its imports, so those are stubbed --
+    ClientConfig.__init__ and wants_warmup touch none of them.
     """
     repo_root = pathlib.Path(__file__).resolve().parents[3]
     module_path = repo_root / "tests" / "integration" / "defs" / "perf" / "test_perf_sanity.py"
@@ -132,7 +132,12 @@ def _load_client_config() -> type:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
-    return module.ClientConfig
+    return module
+
+
+def _load_client_config() -> type:
+    """Return the real ClientConfig."""
+    return _load_module().ClientConfig
 
 
 def _disagg_client_data(multi_round: int) -> dict[str, object]:
@@ -279,3 +284,216 @@ def test_a_pre_merge_branch_does_not_match_post_merge_history() -> None:
     pre_merge_data = _benchmark_data(s_branch="github-pr-12345")
 
     assert not benchmark_data_matches(history, pre_merge_data, get_test_case_match_keys())
+
+
+def test_warmup_lets_the_initial_test_request_through() -> None:
+    """A warmup lane drops --no-test-input, which is what creates the warmup.
+
+    benchmark_serving's initial test request is excluded from the reported
+    metrics, so it is the cheapest available warmup. It reuses
+    input_requests[0], hence carries the lane's own ISL and OSL: on a disagg e2e
+    lane it absorbs the KV cache transceiver's one-time lazy connection setup
+    (ZMQ mesh + NIXL metadata registration) that otherwise slows the first
+    measured ctx->gen handover, and on a ctx_only lane it is a full-ISL prefill
+    that absorbs the first cold prefill out of the reported TTFT.
+    """
+    client_config = _load_client_config()
+
+    cold = client_config(_disagg_client_data(10), "example_model")
+    warm = client_config(_disagg_client_data(10), "example_model", warmup=True)
+
+    assert "--no-test-input" in cold._to_default_benchmark_cmd()
+    assert "--no-test-input" not in warm._to_default_benchmark_cmd()
+
+
+def test_warmup_cannot_be_enabled_from_lane_config() -> None:
+    """A "warmup" key in a lane yaml must not reach ClientConfig.warmup.
+
+    b_warmup is deliberately not a match key (see
+    test_match_keys_are_name_and_environment_only), so warmed results merge into
+    the same baseline history as their cold predecessors. That is only sound
+    while the value stays fully determined by benchmark_mode. Both config
+    parsers hand the raw yaml client dict straight to ClientConfig, so if warmup
+    were read from it, any lane -- including an aggregated one -- could enable
+    warmup for itself and silently fork its own baseline history with no visible
+    config difference. Hence the constructor argument.
+    """
+    client_config = _load_client_config()
+
+    from_yaml = client_config({**_disagg_client_data(10), "warmup": True}, "example_model")
+
+    assert from_yaml.warmup is False
+    assert from_yaml.to_db_data()["b_warmup"] is False
+    assert "--no-test-input" in from_yaml._to_default_benchmark_cmd()
+
+
+def test_warmup_is_suppressed_for_the_non_default_benchmark_clients() -> None:
+    """b_warmup records the EFFECTIVE value, not the requested one.
+
+    to_cmd dispatches to three builders, and only the built-in
+    benchmark_serving one has an initial test request to suppress. The agentx
+    and nv_sa builders emit no equivalent flag, so a requested warmup would not
+    happen there -- and a b_warmup=True row for a run that never warmed up is
+    worse than no row at all: it invites a later investigator to rule warmup out
+    as a cause it never had. Same convention as b_disable_overlap_scheduler,
+    which also reports what the run actually did.
+    """
+    client_config = _load_client_config()
+
+    nv_sa = client_config(
+        {**_disagg_client_data(10), "use_nv_sa_benchmark": True}, "example_model", warmup=True
+    )
+    agentx = client_config(
+        {**_disagg_client_data(10), "benchmark_client": "agentx"}, "example_model", warmup=True
+    )
+    default = client_config(_disagg_client_data(10), "example_model", warmup=True)
+
+    assert nv_sa.warmup is False
+    assert nv_sa.to_db_data()["b_warmup"] is False
+    assert agentx.warmup is False
+    assert agentx.to_db_data()["b_warmup"] is False
+    assert default.warmup is True
+    assert default.to_db_data()["b_warmup"] is True
+
+
+def test_warmup_is_suppressed_by_the_same_condition_to_cmd_dispatches_on() -> None:
+    """Only the agentx value suppresses warmup -- not any non-empty string.
+
+    Suppression exists because the agentx and nv_sa builders have no initial test
+    request to un-suppress. to_cmd selects them by `== AGENTX_BENCHMARK_CLIENT`
+    and `use_nv_sa_benchmark`, so warmup must be suppressed on exactly that
+    condition. Testing `not self.benchmark_client` (truthiness) instead looks
+    equivalent and is not: an unrecognised value is falsy-negative there, so
+    warmup gets suppressed while to_cmd still falls through to the default
+    builder -- a lane that asked to warm up, can warm up, and silently does not.
+    Unrecognised values do reach ClientConfig: only _parse_disagg_config_file
+    rejects them, and the aggregated parser passes its yaml dict through
+    unvalidated.
+
+    Asserted on the emitted command, not on self.warmup: b_warmup and
+    --no-test-input are both driven by self.warmup, so comparing them to each
+    other is circular and holds under either condition.
+    """
+    module = _load_module()
+    client_config = module.ClientConfig
+
+    unrecognised = client_config(
+        {**_disagg_client_data(10), "benchmark_client": "some-future-client"},
+        "example_model",
+        warmup=True,
+    )
+    cmd = unrecognised.to_cmd()
+
+    assert any("benchmark_serving" in arg for arg in cmd), (
+        "an unrecognised benchmark_client no longer falls through to the default "
+        "builder; this test's premise needs rechecking"
+    )
+    assert "--no-test-input" not in cmd, (
+        "warmup was suppressed for a lane that runs the default benchmark_serving "
+        "client anyway -- suppression must test == AGENTX_BENCHMARK_CLIENT, not the "
+        "truthiness of benchmark_client"
+    )
+
+
+def test_warmup_defaults_off_and_is_reported() -> None:
+    """Every other lane keeps today's behaviour, and the DB records which warmed."""
+    client_config = _load_client_config()
+
+    cold = client_config(_disagg_client_data(10), "example_model")
+    warm = client_config(_disagg_client_data(10), "example_model", warmup=True)
+
+    assert cold.warmup is False
+    assert cold.to_db_data()["b_warmup"] is False
+    assert warm.to_db_data()["b_warmup"] is True
+
+
+def test_warmup_is_derived_from_exactly_the_e2e_and_ctx_only_modes() -> None:
+    """Pin warmup to benchmark_mode, the reason b_warmup can skip the match key.
+
+    Asserted through wants_warmup rather than against the source text: the set
+    of warmed lanes is the contract, the expression that computes it is not, so
+    a behaviour-preserving refactor must not fail here. The tests above cover
+    what ClientConfig does with the value; only this one covers which lanes get
+    it.
+
+    Every mode the disagg parser can see is checked explicitly, so adding a mode
+    without deciding whether it warms up fails here rather than silently
+    inheriting a default. gen_only in particular must stay excluded: #18011
+    established that the extra handover leaves a stale mSenderFutures entry that
+    the CTX worker's blocking idle KV-transfer poll then waits on.
+    """
+    module = _load_module()
+
+    assert module.wants_warmup("e2e") is True
+    assert module.wants_warmup("ctx_only") is True
+    assert module.wants_warmup("gen_only") is False
+    assert module.wants_warmup("gen_only_no_context") is False
+    assert module.wants_warmup("") is False
+
+    # Pinned as an exact set, not by substring: a membership test against a
+    # tuple still "contains e2e" after gen_only has been added to it.
+    assert set(module.WARMUP_BENCHMARK_MODES) == {"e2e", "ctx_only"}, (
+        "the set of warmup lanes changed; e2e absorbs the KV transceiver's lazy "
+        "connection setup and ctx_only absorbs the first cold prefill, while "
+        "gen_only must stay excluded (#18011)"
+    )
+
+
+def test_warmup_reaches_client_config_only_from_the_disagg_parser() -> None:
+    """No second producer may hand ClientConfig a warmup value.
+
+    Locality, not expression shape: b_warmup is not a baseline match key, which
+    is only sound while one code path decides warmup for every lane. A second
+    ClientConfig(warmup=...) call site elsewhere -- notably in the aggregated
+    parser, which forwards lane yaml keys through verbatim -- would reintroduce
+    exactly the lane-settable warmup that test_warmup_cannot_be_enabled_from_
+    lane_config forbids by value.
+
+    _parse_disagg_config_file cannot be called directly here (PerfSanityTest-
+    Config's constructor shells out to nvidia-smi and raises without a GPU), so
+    this one property is checked against the source, scoped to that function.
+    """
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    module_path = repo_root / "tests" / "integration" / "defs" / "perf" / "test_perf_sanity.py"
+    tree = ast.parse(module_path.read_text())
+
+    def warmup_call_sites(node: ast.AST) -> list[ast.AST]:
+        return [
+            call
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "ClientConfig"
+            and any(keyword.arg == "warmup" for keyword in call.keywords)
+        ]
+
+    disagg_parsers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_parse_disagg_config_file"
+    ]
+    assert len(disagg_parsers) == 1, "expected exactly one _parse_disagg_config_file"
+
+    inside = warmup_call_sites(disagg_parsers[0])
+    total = warmup_call_sites(tree)
+    assert len(inside) == 1, (
+        f"expected exactly one ClientConfig(warmup=...) in _parse_disagg_config_file, "
+        f"found {len(inside)}"
+    )
+    assert len(total) == len(inside), (
+        f"ClientConfig(warmup=...) appears {len(total) - len(inside)} time(s) outside "
+        "_parse_disagg_config_file; warmup must be decided in exactly one place, or "
+        "b_warmup stops being fully determined by benchmark_mode"
+    )
+
+
+def test_warmup_is_not_a_match_key() -> None:
+    """Warmup is a measurement-quality knob, not part of case identity.
+
+    Making b_warmup a match key would fork all ~26 warmed lanes into a second
+    tracked series and make the improvement invisible in its own history -- a
+    permanent cost to paper over a one-time step. The four match keys are
+    identity, hardware, runtime and branch; none of them describes how well the
+    run was set up. Same rationale as s_benchmark_client.
+    """
+    assert "b_warmup" not in get_test_case_match_keys()

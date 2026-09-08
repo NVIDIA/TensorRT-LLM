@@ -92,6 +92,7 @@ add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(blockScaleMoeActivationTest blockScaleMoeActivationTest.cu)
+add_gtest(blockScaleMoeFinalizeTest blockScaleMoeFinalizeTest.cu)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
 
@@ -103,3 +104,20 @@ endif()
 
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
 add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+
+set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
+    nvfp4ColdPageKernelsTest.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
+add_gtest(nvfp4ColdPageKernelsTest "${NVFP4_COLD_PAGE_KERNEL_TEST_SRC}"
+          NO_TLLM_LINKAGE)
+target_include_directories(
+  nvfp4ColdPageKernelsTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+target_link_libraries(nvfp4ColdPageKernelsTest PRIVATE CUDA::cudart
+                                                       CUDA::cuda_driver)

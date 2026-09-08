@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 import functools
 import itertools
 import math
@@ -17,7 +18,12 @@ from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
-from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                              IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from ..locality_domain.autotune import tune_locality_domain_concurrent
+from ..locality_domain.runtime import LocalityDomainRuntime
+from ..locality_domain_utils import (get_current_locality_domain,
+                                     node_local_max_active_clusters)
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
@@ -36,8 +42,82 @@ except ImportError:
 SWIGLU_LIMIT_SCALAR_DISABLED = -1.0
 
 
+def _with_input_cuda_device(function):
+    """Run a custom-op implementation under its input tensor's CUDA device."""
+
+    @functools.wraps(function)
+    def wrapped(input, *args, **kwargs):
+        with torch.cuda.device(input.device):
+            return function(input, *args, **kwargs)
+
+    return wrapped
+
+
+def _validate_16_byte_aligned_dense_tensor(tensor: torch.Tensor,
+                                           tensor_name: str) -> None:
+    """Validate the pointer/strides required by dense CuTe TMA operands."""
+    if tensor.data_ptr() % 16 != 0:
+        raise ValueError(
+            f"{tensor_name} data pointer must be 16-byte aligned, got "
+            f"data_ptr={tensor.data_ptr()}.")
+    if tensor.shape[-1] > 1 and tensor.stride(-1) != 1:
+        raise ValueError(
+            f"{tensor_name} must have a contiguous innermost dimension, got "
+            f"shape={tuple(tensor.shape)} and stride={tuple(tensor.stride())}.")
+    for dim in range(tensor.dim() - 1):
+        if (tensor.shape[dim] > 1
+                and tensor.stride(dim) * tensor.element_size() % 16 != 0):
+            raise ValueError(
+                f"{tensor_name} stride in dimension {dim} must preserve "
+                "16-byte alignment, got "
+                f"shape={tuple(tensor.shape)} and stride={tuple(tensor.stride())}."
+            )
+
+
 def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
     return float("inf") if swiglu_limit_scalar < 0 else swiglu_limit_scalar
+
+
+def _get_cute_dsl_swap_ab_candidates(
+    m: int,
+    output_aligned: bool,
+    include_alternative: bool = False,
+) -> List[bool]:
+    """Return swap candidates in autotuning preference order.
+
+    Both orientations write the same physical row-major [M, N] output. When
+    swapping A and B, the kernel sees an [N, M] column-major view, so its
+    contiguous C dimension is still the original N dimension. Therefore the
+    16-byte output alignment requirement does not depend on logical M.
+
+    Base kernels retain the existing M-based performance preference to bound
+    autotuning cost. Mixed-cluster callers request the alternative orientation
+    because cluster-grid feasibility depends on which logical axis becomes the
+    kernel M dimension.
+    """
+    if not output_aligned:
+        return []
+    if m <= 128:
+        swap_ab_candidates = [True]
+    elif m >= 256:
+        swap_ab_candidates = [False]
+    else:
+        swap_ab_candidates = [False, True]
+    if include_alternative and len(swap_ab_candidates) == 1:
+        swap_ab_candidates.append(not swap_ab_candidates[0])
+    return swap_ab_candidates
+
+
+def _get_sm107_nvfp4_default_mma_config(
+    tile_size: int
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], Tuple[int, int]]:
+    """Return the valid fallback MMA and cluster shapes for one routing tile."""
+    mma_inst_m = min(tile_size, 256)
+    return (
+        (tile_size, 128, 256),
+        (mma_inst_m, 128, 128),
+        (mma_inst_m // 128, 1),
+    )
 
 
 class GroupedGemmInputsHelper:
@@ -257,10 +337,26 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
         7: permuted_idx_to_expanded_idx        - Token permutation mapping
         8: num_non_exiting_tiles   - Number of valid tiles
         9: global_sf               - Global scale factor
+        10+: optional output tensors for inplace variants
     """
     # Override: use permuted_idx_to_expanded_idx for shape inference
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
+
+    @staticmethod
+    def _resize_locality_domain_outputs(
+        m: int,
+        output_tensor: torch.Tensor,
+        output_sf_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        output_m = output_tensor.size(0)
+        assert output_m > 0
+        assert output_sf_tensor.numel() % output_m == 0
+        sf_size_per_m = output_sf_tensor.numel() // output_m
+        if output_m == m:
+            return output_tensor, output_sf_tensor
+        return (output_tensor.new_empty((m, output_tensor.size(1))),
+                output_sf_tensor.new_empty((m * sf_size_per_m, )))
 
     def inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Pre-hook for gather-based activation fusion kernel.
@@ -270,9 +366,22 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             - tile_idx_to_mn_limit
             - permuted_idx_to_expanded_idx (for gather operation)
             - num_non_exiting_tiles
+
+        Input layout:
+            0: a                       - Original input activation (not permuted)
+            1: b                       - Weight tensor
+            2: a_sf                    - Scale factor for a
+            3: b_sf                    - Scale factor for b
+            4: alpha                   - Per-expert scaling factor
+            5: tile_idx_to_group_idx   - Tile to expert mapping
+            6: tile_idx_to_mn_limit    - Tile M/N limits
+            7: permuted_idx_to_expanded_idx        - Token permutation mapping
+            8: num_non_exiting_tiles   - Number of valid tiles
+            9: global_sf               - Global scale factor
+            10+: optional output tensors for inplace variants
         """
         a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, \
-            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf = inputs
+            permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf, *others = inputs
         # Verify permuted_idx_to_expanded_idx index matches the class constant
         assert inputs[
             self.
@@ -304,9 +413,13 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             local_num_experts=self.num_local_experts,
             tile_tokens_dim=self.tile_size,
         )
+        if len(others) >= 2 and others[0] is not None and others[1] is not None:
+            others = list(others)
+            others[0], others[1] = self._resize_locality_domain_outputs(
+                permuted_idx_to_expanded_idx.size(0), others[0], others[1])
         return (a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx,
                 tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles, global_sf)
+                num_non_exiting_tiles, global_sf, *others)
 
 
 def get_dense_gemm_approximate_cta_nums(
@@ -356,6 +469,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
+    @functools.cache
+    def _get_full_device_max_active_clusters(device_id: int,
+                                             cluster_size: int) -> int:
+        """Return the cached full-device occupancy for a cluster shape."""
+        hardware_info = cutlass.utils.HardwareInfo(device_id=device_id)
+        return hardware_info.get_max_active_clusters(cluster_size)
+
+    def get_max_activate_clusters(cluster_size):
+        max_active = _get_full_device_max_active_clusters(
+            torch.cuda.current_device(), cluster_size)
+        if get_current_locality_domain() is not None:
+            node_local = node_local_max_active_clusters(max_active)
+            max_active = node_local if node_local is not None else max(
+                1, max_active // 2)
+        return max_active
+
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
         kernel_cache = dict()
@@ -391,6 +520,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tuple(self.group) if self.group is not None else None,
                 self.use_tvm_ffi,
             )
+
+        def __hash__(self):
+            return hash(self.unique_id())
+
+        def __eq__(self, other):
+            if not isinstance(other, self.__class__):
+                return False
+            return self.unique_id() == other.unique_id()
 
         def get_valid_tactics(
             self,
@@ -430,29 +567,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"(K%32={real_k%32}, expected 0). Skipping all tactics.")
                 return []
 
-            # Optimize swap_ab candidates based on M and N alignment
-            # swap_ab=False → C is N-major → requires N%8==0 (BF16: 128 bits / 16 bits = 8)
-            # swap_ab=True  → C is M-major → requires M%8==0
-            m_aligned = (m % 8 == 0)
-            n_aligned = (n % 8 == 0)
-
-            if not m_aligned and not n_aligned:
+            # Both swap orientations use the original N as C's physical
+            # contiguous dimension and require 16-byte BF16 alignment.
+            output_aligned = (n % 8 == 0)
+            if not output_aligned:
                 logger.debug(
-                    f"CuteDSL: Neither M={m} nor N={n} meets 16-byte alignment "
-                    f"(M%8={m%8}, N%8={n%8}). No valid C layout. Skipping all tactics."
-                )
+                    f"CuteDSL: Output N={n} does not meet the 16-byte "
+                    f"alignment requirement (N%8={n%8}). Skipping all tactics.")
                 return []
 
-            # Only test swap_ab values that satisfy alignment
-            swap_ab_candidates = []
-            if n_aligned:
-                swap_ab_candidates.append(False)  # N-major layout
-            if m_aligned:
-                swap_ab_candidates.append(True)  # M-major layout
+            swap_ab_candidates = _get_cute_dsl_swap_ab_candidates(
+                m, output_aligned)
+            if not swap_ab_candidates:
+                logger.debug(f"CuteDSL: No valid C layout for M={m}, N={n}. "
+                             "Skipping all tactics.")
+                return []
 
             logger.debug(
-                f"CuteDSL: M={m}(aligned={m_aligned}), N={n}(aligned={n_aligned}), K={real_k}(aligned=True). "
-                f"Testing swap_ab={swap_ab_candidates}")
+                f"CuteDSL: M={m}, N={n}(aligned={output_aligned}), K={real_k}(aligned=True). "
+                f"Using swap_ab={swap_ab_candidates}")
 
             # full shamoo
             mma_tiler_mn_candidates = [
@@ -476,7 +609,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            swap_ab_candidates = [True, False]
             # prune: prefetch is beneficial only when K is large enough
             use_prefetch_candidates = [True, False]
 
@@ -763,6 +895,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     key="nvmmh_nvfp4_filter_failure",
                 )
                 return tactics
+
+        def should_profile_tactic_in_subprocess(
+            self,
+            custom_op: str,
+            inputs: List[torch.Tensor],
+            tactic,
+            tuning_config: TuningConfig,
+            **kwargs,
+        ) -> bool:
+            # get_valid_tactics emits 4 fields:
+            # (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch).
+            return isinstance(tactic, tuple) and len(tactic) == 4
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                          assumed_align: int):
@@ -4278,11 +4422,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
 
+        # Keep the output M dimension aligned with input0's bucketed M so
+        # profiling uses consistent BMM shapes and runtime cache keys can be
+        # shared by inputs that map to the same bucket.
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(DynamicTensorSpec(
                 0, 1, get_last_power_of_2_num_tokens_buckets,
                 last_positive_power_of_2), ),
-            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape), ),
+            constraint_specs=(ConstraintSpec(2, 2, fp8_scale_infer_shape),
+                              ConstraintSpec(
+                                  4, 1,
+                                  lambda input_shapes: input_shapes[0][1])),
         )
 
         def __init__(self,
@@ -7346,12 +7496,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_output_values: bool,
             cluster_size: int,
             seqlen_sorted: bool,
+            enable_block_skip: bool = False,
+            use_ext_counts: bool = False,
+            emit_xstate: bool = False,
+            use_ext_cand: bool = False,
+            ext_rungs: bool = False,
+            cand_cap: int = 5120,
+            accept_cap: Optional[int] = None,
+            kc_override: Optional[int] = None,
         ) -> tuple:
             key = (dtype, top_k, next_n, enable_unroll_4, enable_phase3_unroll,
                    use_constant_hint, min_blocks_per_mp, use_256bit_load,
                    num_threads_per_block, enable_warp_parallel_reduce,
                    compress_ratio, return_output_values, cluster_size,
-                   seqlen_sorted)
+                   seqlen_sorted, enable_block_skip, use_ext_counts,
+                   emit_xstate, use_ext_cand, ext_rungs, cand_cap, accept_cap,
+                   kc_override)
             if key in cls.kernel_cache:
                 return key
             n_rows = cute.sym_int()
@@ -7384,6 +7544,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row_fake = (cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ), stride_order=(0, )) if seqlen_sorted else None)
+            # emission-assisted tier fake tensors (list/counts/rungs)
+            block_max_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, cute.sym_int()),
+                stride_order=(1, 0),
+                assumed_align=16) if enable_block_skip else None)
+            seed_thr_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, 8 if use_ext_counts else 3),
+                stride_order=(1, 0),
+                assumed_align=4) if (use_ext_counts or ext_rungs) else None)
+            xstate_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, 8),
+                stride_order=(1, 0),
+                assumed_align=4) if emit_xstate else None)
+            cand_vals_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (n_rows, cand_cap),
+                stride_order=(1, 0),
+                assumed_align=4) if use_ext_cand else None)
+            cand_idx_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, cand_cap),
+                stride_order=(1, 0),
+                assumed_align=4) if use_ext_cand else None)
+            cand_ctl_fake = (cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, 4),
+                stride_order=(1, 0),
+                assumed_align=8) if use_ext_cand else None)
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -7402,6 +7587,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
                 seqlen_sorted=seqlen_sorted,
+                enable_block_skip=enable_block_skip,
+                use_ext_counts=use_ext_counts,
+                emit_xstate=emit_xstate,
+                use_ext_cand=use_ext_cand,
+                ext_rungs=ext_rungs,
+                cand_cap=cand_cap,
+                accept_cap=accept_cap,
+                kc_override=kc_override,
+                # ext modes need 3 rung slots (M_thr == 3); only the
+                # slot count matters, not the qfrac values (P1b skipped)
+                r0_qfracs=((0.85, 0.35) if
+                           (use_ext_counts or ext_rungs) else None),
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -7412,6 +7609,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 out_indices_fake,
                 order_row_fake,
                 stream=fake_stream,
+                block_max=block_max_fake,
+                seed_thr=seed_thr_fake,
+                seed_counts=None,
+                xstate=xstate_fake,
+                cand_vals=cand_vals_fake,
+                cand_idx=cand_idx_fake,
+                cand_ctl=cand_ctl_fake,
                 options="--enable-tvm-ffi",
             )
             logger.debug(f"[compile cute_dsl gvr_topk_decode] {key}")
@@ -7521,6 +7725,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row: Optional[torch.Tensor] = None,
             counters: Optional[torch.Tensor] = None,
             max_batch_size: Optional[int] = None,
+            seed_thr: Optional[torch.Tensor] = None,
+            xstate: Optional[torch.Tensor] = None,
+            cand_vals: Optional[torch.Tensor] = None,
+            cand_idx: Optional[torch.Tensor] = None,
+            cand_ctl: Optional[torch.Tensor] = None,
+            block_max: Optional[torch.Tensor] = None,
+            num_threads: Optional[int] = None,
+            accept_cap: Optional[int] = None,
+            kc_override: Optional[int] = None,
         ) -> None:
             """Three paths, picked by ``(counters, order_row)``:
 
@@ -7543,9 +7756,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Host-only guard — no device sync. The op signature and output
             # contract are unchanged (unordered int32 indices, -1 pad only
             # for degenerate rows).
-            if _is_tiered_topk_supported(logits, pre_idx, seq_lens,
-                                         output_indices, top_k, next_n,
-                                         compress_ratio, order_row, counters):
+            if (seed_thr is None and cand_vals is None and xstate is None
+                    and block_max is None and _is_tiered_topk_supported(
+                        logits, pre_idx, seq_lens, output_indices, top_k,
+                        next_n, compress_ratio, order_row, counters)):
                 _tiered_topk(logits, pre_idx, seq_lens, output_indices, top_k,
                              next_n, compress_ratio)
                 return
@@ -7647,6 +7861,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ), ("order_row must be int32, CUDA, shape == seq_lens.shape "
                     f"(={tuple(seq_lens.shape)}); got dtype={order_row.dtype} "
                     f"shape={tuple(order_row.shape)}")
+            # emission-assisted tiers: mode from which ext tensors the
+            # caller handed in (see gvr_routing.plan_emission)
+            if seed_thr is not None:
+                assert seed_thr.shape[1] == 3 or seed_thr.shape[1] == 8, (
+                    "seed_thr must be [rows, 3] (rungs) or [rows, 8] "
+                    "(packed lines + counts row, the width the kernel "
+                    f"is compiled for); got width {seed_thr.shape[1]}")
+            use_ext_counts = seed_thr is not None and seed_thr.shape[1] == 8
+            ext_rungs = seed_thr is not None and seed_thr.shape[1] == 3
+            use_ext_cand = cand_vals is not None
+            enable_block_skip = block_max is not None
+            emit_xstate = xstate is not None
+            if use_ext_cand:
+                assert use_ext_counts, (
+                    "candidate list requires the packed seed row "
+                    "([rows, 8]: lines + counts)")
+                assert (cand_idx is not None and cand_ctl is not None
+                        and cand_vals.shape == cand_idx.shape
+                        and cand_ctl.shape == (num_rows, 4)), (
+                            "list tier needs cand_vals/cand_idx same shape "
+                            "+ cand_ctl [rows, 4]")
+            if (use_ext_counts or ext_rungs or use_ext_cand
+                    or enable_block_skip):
+                assert not lb_mode and order_row is None, (
+                    "ext tiers are single-CTA/sort-path only")
+                assert logits.dtype == torch.float32 and next_n == 1, (
+                    "ext tiers are compiled for fp32 logits and next_n==1; "
+                    f"got dtype={logits.dtype} next_n={next_n}")
+            if num_threads is not None:
+                tuning = dict(tuning, num_threads_per_block=num_threads)
+            elif use_ext_cand and top_k <= 512:
+                # small-K list rule: hit rows do O(list) work
+                tuning = dict(tuning, num_threads_per_block=512)
             key = cls._compile(
                 cute_dtype,
                 top_k,
@@ -7655,17 +7902,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_output_values=return_output_values,
                 cluster_size=cluster_size,
                 seqlen_sorted=seqlen_sorted,
+                enable_block_skip=enable_block_skip,
+                use_ext_counts=use_ext_counts,
+                emit_xstate=emit_xstate,
+                use_ext_cand=use_ext_cand,
+                ext_rungs=ext_rungs,
+                cand_cap=(cand_vals.shape[1] if use_ext_cand else 5120),
+                accept_cap=accept_cap,
+                kc_override=kc_override,
                 **tuning,
             )
             cls.kernel_cache[key](logits, pre_idx, seq_lens, None,
-                                  output_indices, order_row)
+                                  output_indices, order_row, block_max,
+                                  seed_thr, None, xstate, cand_vals, cand_idx,
+                                  cand_ctl)
 
     # TODO(dsa.py): wire ``order_row = argsort(seq_lens, descending=True)``
     # (device-side, graph-safe) into the LJF row-reorder branch when
     # ``num_rows >= 2 * num_sms``. Physical meaning: wave-2 must fit a
     # full SM-row's worth of CTAs so the sort has long-vs-short rows to
     # swap. Below that threshold the win is noise / can regress a few
-    # percent (measured, N in {8K,16K,32K}).
+    # percent (B200 N∈{8K,16K,32K} sweep 2026-06-23).
+    # xstate is written by the kernel but stays out of mutates_args
+    # (optional-mutate None-default IndexError; see the fp4 op note)
     @torch.library.custom_op("trtllm::cute_dsl_gvr_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
@@ -7682,6 +7941,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         order_row: Optional[torch.Tensor] = None,
         counters: Optional[torch.Tensor] = None,
         max_batch_size: Optional[int] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        xstate: Optional[torch.Tensor] = None,
+        cand_vals: Optional[torch.Tensor] = None,
+        cand_idx: Optional[torch.Tensor] = None,
+        cand_ctl: Optional[torch.Tensor] = None,
+        block_max: Optional[torch.Tensor] = None,
+        num_threads: Optional[int] = None,
+        accept_cap: Optional[int] = None,
+        kc_override: Optional[int] = None,
     ) -> None:
         """CuTe DSL GVR (Guess-Verify-Refine) Top-K decode for Blackwell.
 
@@ -7715,6 +7983,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size: Required with ``counters``; ignored
                 otherwise. Power of 2 in ``[64, 1024]``, must match
                 the value passed to LB prepare.
+
+        Of the optional hint tensors the kernel WRITES ``xstate`` (the
+        closed-loop publish); it cannot be declared in ``mutates_args``:
+        torch.library raises IndexError when a declared-mutable Optional
+        arg is None at call time (re-verified on the pinned torch), and
+        most calls pass no hints. Under torch.compile/functionalization
+        the undeclared write is invisible, so the hint path is eager /
+        CUDA-graph only. The ``use_gvr_emission`` sparse-attention config
+        field gates the emission-assisted wiring that feeds these tensors
+        (opt-in; temporal-hint path only).
         """
         if not is_sm_100f():
             raise ValueError(
@@ -7752,6 +8030,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             order_row=order_row,
             counters=counters,
             max_batch_size=max_batch_size,
+            seed_thr=seed_thr,
+            xstate=xstate,
+            cand_vals=cand_vals,
+            cand_idx=cand_idx,
+            cand_ctl=cand_ctl,
+            block_max=block_max,
+            num_threads=num_threads,
+            accept_cap=accept_cap,
+            kc_override=kc_override,
         )
 
     @torch.library.register_fake("trtllm::cute_dsl_gvr_topk_decode")
@@ -7768,6 +8055,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
         order_row: Optional[torch.Tensor] = None,
         counters: Optional[torch.Tensor] = None,
         max_batch_size: Optional[int] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        xstate: Optional[torch.Tensor] = None,
+        cand_vals: Optional[torch.Tensor] = None,
+        cand_idx: Optional[torch.Tensor] = None,
+        cand_ctl: Optional[torch.Tensor] = None,
+        block_max: Optional[torch.Tensor] = None,
+        num_threads: Optional[int] = None,
+        accept_cap: Optional[int] = None,
+        kc_override: Optional[int] = None,
     ) -> None:
         return None
 
@@ -8371,6 +8667,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # BF16 Dense Persistent BMM (CuTe DSL) for Blackwell
     # ======================================================================
 
+    def _bf16_preferred_cluster_has_launchable_grid(
+        m: int,
+        n: int,
+        batch_size: int,
+        use_2cta_instrs: bool,
+        mma_tiler_mn: Tuple[int, int],
+        preferred_cluster_shape_mn: Tuple[int, int],
+        fallback_cluster_shape_mn: Tuple[int, int],
+    ) -> bool:
+        """Return whether mixed preferred/fallback launch has any preferred cluster.
+
+        The preferred-cluster kernel derives preferred_grid.z from the fallback
+        grid CTA count divided by the preferred cluster size.  If the autotuner
+        profiles a small M bucket and that quotient is zero, CUDA rejects the
+        launch with cudaErrorInvalidValue.
+
+        The per-CTA M-tile is mma_tiler_mn[0] for 1-CTA MMA but mma_tiler_mn[0]//2
+        for 2-CTA MMA (the grid is built from the per-CTA tile), so the CTA-tile
+        count uses the halved tile when use_2cta_instrs -- otherwise the fallback
+        CTA count is undercounted and valid preferred-cluster tactics are pruned.
+        """
+        cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+        ctas_m = ceil_div(m, cta_tile_m)
+        ctas_n = ceil_div(n, mma_tiler_mn[1])
+        fallback_ctas_m = pad_up(ctas_m, fallback_cluster_shape_mn[0])
+        fallback_ctas_n = pad_up(ctas_n, fallback_cluster_shape_mn[1])
+        fallback_ctas = fallback_ctas_m * fallback_ctas_n * batch_size
+        preferred_cluster_ctas = (preferred_cluster_shape_mn[0] *
+                                  preferred_cluster_shape_mn[1])
+        return fallback_ctas >= preferred_cluster_ctas
+
+    def _bf16_cluster_m_fits(
+        m: int,
+        use_2cta_instrs: bool,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+    ) -> bool:
+        """Whether the M dimension provides enough CTA-tiles for the M-cluster.
+
+        An M-cluster wider than the available M CTA-tiles leaves phantom CTAs
+        whose cluster-multicast peers are never launched, which probabilistically
+        triggers an illegal memory access / hang during autotuner profiling
+        (observed on SM107 with the M=1 decode MLA absorb BMM, cluster_m=4). The
+        per-CTA M-tile is mma_tiler_mn[0] for 1-CTA MMA but mma_tiler_mn[0]//2 for
+        2-CTA MMA (the kernel builds the grid from the per-CTA tile), so the
+        CTA-tile count must use the halved tile when use_2cta_instrs -- otherwise
+        valid 2-CTA / preferred-cluster tactics (e.g. m=128, tile_m=128, 2cta,
+        cluster_m=2 -> 2 real M-CTAs) get pruned. N over-padding is handled by the
+        kernel, so only the M axis is gated; cluster_m=4 / preferred (4,2) stay
+        available for large-M shapes.
+        """
+        cta_tile_m = mma_tiler_mn[0] // (2 if use_2cta_instrs else 1)
+        return ceil_div(m, cta_tile_m) >= cluster_shape_mn[0]
+
     class CuteDSLBf16BlackwellBmmRunner(TunableRunner):
         kernel_class = PersistentDenseGemmKernel
         kernel_cache = dict()
@@ -8490,6 +8840,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             #   B stride  = a_tensor.stride(0)
             a_stride_m = a_tensor.stride(1)
             a_stride_batch = a_tensor.stride(0)
+            b_stride_n = b_tensor.stride(1)
+            b_stride_batch = b_tensor.stride(0)
 
             if not self.use_tvm_ffi:
                 a_ptr = make_ptr(
@@ -8555,6 +8907,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
                     options="--opt-level 2 --enable-tvm-ffi"
@@ -8576,6 +8930,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_tmp,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                 )
             else:
                 compiled_gemm(
@@ -8588,6 +8944,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     a_stride_m,
                     a_stride_batch,
+                    b_stride_n,
+                    b_stride_batch,
                     stream=stream,
                 )
 
@@ -8947,11 +9305,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      num_epi_subtiles,
                      epi_dtype,
                      output_dtype,
-                     remove_online_sf_transpose=False):
+                     remove_online_sf_transpose=False,
+                     emit_block_meta=False,
+                     emit_hit_stats=True,
+                     emit_seed_counts=False,
+                     seed_packed=False,
+                     emit_cand=False,
+                     cand_cap=5120,
+                     emit_cand_bucketed=False,
+                     accept_cap=8192):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap,
+                   emit_cand_bucketed, accept_cap)
             if key in cls.kernel_cache:
                 return
 
@@ -9014,6 +9382,81 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                             (num_ctas, 2),
                                                             stride_order=(1, 0))
 
+            # Block-meta tensors (fused-GVR support): nb_pad*4 records.
+            block_max_fake = None
+            hit_stats_fake = None
+            hit_bitmap_fake = None
+            if emit_block_meta:
+                nb_sym = cute.sym_int()
+                block_max_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(), nb_sym),
+                    stride_order=(1, 0),
+                    assumed_align=16)
+                if emit_hit_stats:
+                    hit_stats_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 4),
+                        stride_order=(1, 0),
+                        assumed_align=16)
+                    hit_bitmap_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Int32, (sym_B, cute.sym_int()),
+                        stride_order=(1, 0),
+                        assumed_align=16)
+            cand_fake = None
+            cand_ctl_fake = None
+            if emit_cand:
+                cand_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), cand_cap * 2),
+                    stride_order=(1, 0),
+                    assumed_align=8)
+                cand_ctl_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 2),
+                    stride_order=(1, 0),
+                    assumed_align=8)
+            cand_idx_fake = None
+            cand_cur_fake = None
+            if emit_cand_bucketed:
+                # bucketed SoA: cand slot reused as the fp32 VALUES tensor
+                wtot = 2 * accept_cap + cand_cap
+                cand_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(), wtot),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_idx_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), wtot),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_ctl_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 4),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                cand_cur_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 4),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+            seed_thr_fake = None
+            seed_counts_fake = None
+            if emit_seed_counts:
+                if seed_packed:
+                    # [rows, 8] fp32 packed seed row: lines at cols 0..2,
+                    # counts at cols 3..5; same tensor bound to both params.
+                    seed_thr_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 8),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                    seed_counts_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 8),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                else:
+                    seed_thr_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 3),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+                    seed_counts_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Int32, (cute.sym_int(), 3),
+                        stride_order=(1, 0),
+                        assumed_align=4)
+
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -9028,6 +9471,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype=to_cutlass[epi_dtype],
                 output_dtype=to_cutlass[output_dtype],
                 remove_online_sf_transpose=remove_online_sf_transpose,
+                emit_block_meta=emit_block_meta,
+                emit_hit_stats=emit_hit_stats,
+                emit_seed_counts=emit_seed_counts,
+                seed_packed=seed_packed,
+                emit_cand=emit_cand,
+                cand_cap=cand_cap,
+                emit_cand_bucketed=emit_cand_bucketed,
+                accept_cap=accept_cap,
             )
 
             compiled = cute.compile(
@@ -9042,7 +9493,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sm_fake,
                 cutlass.Int32(1),
                 cutlass.Int32(1),
+                # keep __call__'s argument order: stream, then emission
+                # slots (the runtime call drops the stream, same sequence)
                 fake_stream,
+                block_max_fake,
+                hit_stats_fake,
+                hit_bitmap_fake,
+                seed_thr=seed_thr_fake,
+                seed_counts=seed_counts_fake,
+                cand=cand_fake,
+                cand_ctl=cand_ctl_fake,
+                cand_idx_t=cand_idx_fake,
+                cand_cur=cand_cur_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -9063,6 +9525,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             epi_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
             remove_online_sf_transpose: bool = False,
+            emit_block_meta: bool = False,
+            emit_hit_stats: bool = True,
+            hit_bitmap: Optional[torch.Tensor] = None,
+            block_max_out: Optional[torch.Tensor] = None,
+            hit_stats_out: Optional[torch.Tensor] = None,
+            emit_seed_counts: bool = False,
+            seed_thr: Optional[torch.Tensor] = None,
+            seed_counts_out: Optional[torch.Tensor] = None,
+            emit_cand: bool = False,
+            cand_out: Optional[torch.Tensor] = None,
+            cand_ctl_out: Optional[torch.Tensor] = None,
+            emit_cand_bucketed: bool = False,
+            accept_cap: int = 8192,
+            cand_idx_out: Optional[torch.Tensor] = None,
+            cand_cur_out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -9078,8 +9555,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
                 epi_dtype: epilogue compute dtype
                 output_dtype: output logits dtype
+                emit_block_meta: also emit per-128-block metadata for the
+                    fused GVR top-k. Requires ``hit_bitmap``
+                    [B, >= nb_pad*4] int32 (1 bit per compressed kv
+                    position, request-level). ``block_max_out``
+                    [B*next_n, nb_pad*4] fp32 (4 warp-partial records per
+                    block) is allocated when not supplied;
+                    ``hit_stats_out`` [B*next_n, 4] fp32 must be supplied
+                    when ``emit_hit_stats`` is set.
             Returns:
-                logits: [B*next_n, max_context_len] output_dtype
+                logits [B*next_n, max_context_len]; with emit_block_meta,
+                the tuple (logits, block_max, hit_stats).
+
+            The optional emission tensors (``block_max_out`` /
+            ``seed_thr`` / ``cand_*``) are written by the kernel but
+            cannot be declared in ``mutates_args``: torch.library raises
+            IndexError when a declared-mutable Optional arg is None at
+            call time (re-verified on the pinned torch), and plain
+            logits-only calls pass none of them. Emission is therefore
+            eager / CUDA-graph only.
             """
             B, next_n, H, half_D = q.shape
             N = next_n * H
@@ -9132,10 +9626,154 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             logits = logits[:, :max_context_len]
 
+            # Block-meta buffers (fused-GVR support). nb_pad mirrors the
+            # logits padding so WG1's odd-num_kv OOB tile lands in padding.
+            if emit_block_meta:
+                nb_pad = aligned_max_ctx // compute_block_kv
+                # 4 warp-partial records per block (see FP4MQALogitsKernel).
+                nrec = nb_pad * 4
+                if emit_hit_stats:
+                    assert (
+                        hit_bitmap is not None
+                        and hit_bitmap.dtype == torch.int32
+                        and hit_bitmap.is_cuda and hit_bitmap.is_contiguous()
+                        and hit_bitmap.dim() == 2 and hit_bitmap.shape[0] == B
+                        and hit_bitmap.shape[1] >= nb_pad * 4
+                    ), (f"emit_hit_stats requires hit_bitmap int32 "
+                        f"[{B}, >= {nb_pad * 4}]; got "
+                        f"{None if hit_bitmap is None else (hit_bitmap.dtype, tuple(hit_bitmap.shape))}"
+                        )
+                    # Per-row aggregate {enc_min, enc_max, sum, cnt}. The
+                    # kernel only ATOMICALLY MERGES into this buffer — the
+                    # caller must pre-initialize it to the identities
+                    # {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} each step.
+                    assert hit_stats_out is not None, (
+                        "emit_hit_stats requires a caller-initialized "
+                        "hit_stats_out [B*next_n, 4] fp32 (identity-filled)")
+                    assert (hit_stats_out.shape == (B * next_n, 4)
+                            and hit_stats_out.is_contiguous())
+                else:
+                    hit_bitmap = None
+                    hit_stats_out = None
+                if block_max_out is None:
+                    block_max_out = torch.empty((B * next_n, nrec),
+                                                device=q.device,
+                                                dtype=torch.float32)
+                assert (block_max_out.shape == (B * next_n, nrec)
+                        and block_max_out.is_contiguous())
+
+            seed_packed = False
+            if emit_seed_counts:
+                assert emit_block_meta, (
+                    "emit_seed_counts requires emit_block_meta")
+                if seed_counts_out is None:
+                    # Packed contract: seed_thr IS the [rows, 8] fp32 seed
+                    # row; lines at cols 0..2, counts accumulate as fp32 at
+                    # cols 3..5. Caller zeroes cols 3..7 and writes lines
+                    # each step.
+                    seed_packed = True
+                    assert (
+                        seed_thr is not None and seed_thr.dtype == torch.float32
+                        and seed_thr.is_cuda and seed_thr.is_contiguous()
+                        and seed_thr.shape == (B * next_n, 8)
+                    ), (f"packed emit_seed_counts requires seed_thr fp32 "
+                        f"[{B * next_n}, 8]; got "
+                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                        )
+                    seed_counts_out = seed_thr
+                else:
+                    # Legacy split contract: 3 thresholds per row (fp32),
+                    # counts accumulated with red.global.add.s32 into a
+                    # caller-zeroed int32 [rows, 3].
+                    assert (
+                        seed_thr is not None and seed_thr.dtype == torch.float32
+                        and seed_thr.is_cuda and seed_thr.is_contiguous()
+                        and seed_thr.shape == (B * next_n, 3)
+                    ), (f"emit_seed_counts requires seed_thr fp32 "
+                        f"[{B * next_n}, 3]; got "
+                        f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                        )
+                    assert (seed_counts_out.dtype == torch.int32
+                            and seed_counts_out.is_cuda
+                            and seed_counts_out.is_contiguous()
+                            and seed_counts_out.shape == (B * next_n, 3)), (
+                                "emit_seed_counts requires a caller-zeroed "
+                                "seed_counts_out int32 [B*next_n, 3]")
+            else:
+                seed_thr = None
+                seed_counts_out = None
+
+            cand_cap = 0
+            if emit_cand:
+                assert emit_seed_counts, (
+                    "emit_cand requires emit_seed_counts (t_0 threshold)")
+                # Unordered (value, index) pair scatter; the caller zeroes
+                # cand_ctl_out {claimed, void} each step. cand_out is
+                # [B*next_n, CAP*2] int32 (fp32 bits in even words).
+                assert (
+                    cand_out is not None and cand_out.dtype == torch.int32
+                    and cand_out.is_cuda and cand_out.is_contiguous()
+                    and cand_out.dim() == 2 and cand_out.shape[0] == B * next_n
+                    and cand_out.shape[1] % 2 == 0 and cand_out.shape[1] > 0), (
+                        "emit_cand requires cand_out int32 [B*next_n, CAP*2]")
+                assert (cand_ctl_out is not None
+                        and cand_ctl_out.dtype == torch.int32
+                        and cand_ctl_out.is_cuda
+                        and cand_ctl_out.is_contiguous()
+                        and cand_ctl_out.shape == (B * next_n, 2)), (
+                            "emit_cand requires a caller-zeroed cand_ctl_out "
+                            "int32 [B*next_n, 2]")
+                cand_cap = cand_out.shape[1] // 2
+            elif emit_cand_bucketed:
+                assert emit_seed_counts, (
+                    "emit_cand_bucketed requires emit_seed_counts")
+                # SoA contract: cand_out = fp32 VALUES [rows, 2*segA+capC],
+                # cand_idx_out = int32 positions (same width), cand_cur_out =
+                # int32 [rows, 4] cursors (caller-zeroed), cand_ctl_out =
+                # int32 [rows, 4] {n0, void, n1, n2} (caller-zeroed)
+                assert cand_out is not None, (
+                    "emit_cand_bucketed requires cand_out")
+                W = cand_out.shape[1]
+                assert (
+                    cand_out.dtype == torch.float32 and cand_out.is_cuda
+                    and cand_out.is_contiguous() and cand_out.dim() == 2
+                    and cand_out.shape[0] == B * next_n
+                    and W > 2 * accept_cap), (
+                        "bucketed requires cand_out fp32 [rows, 2*segA+capC]")
+                assert (cand_idx_out is not None
+                        and cand_idx_out.dtype == torch.int32
+                        and cand_idx_out.is_cuda
+                        and cand_idx_out.is_contiguous()
+                        and cand_idx_out.shape == cand_out.shape), (
+                            "bucketed requires cand_idx_out int32, same shape")
+                assert (cand_ctl_out is not None
+                        and cand_ctl_out.dtype == torch.int32
+                        and cand_ctl_out.is_cuda
+                        and cand_ctl_out.is_contiguous()
+                        and cand_ctl_out.shape == (B * next_n, 4)), (
+                            "bucketed requires caller-zeroed cand_ctl_out "
+                            "int32 [rows, 4]")
+                assert (cand_cur_out is not None
+                        and cand_cur_out.dtype == torch.int32
+                        and cand_cur_out.is_cuda
+                        and cand_cur_out.is_contiguous()
+                        and cand_cur_out.shape == (B * next_n, 4)), (
+                            "bucketed requires caller-zeroed cand_cur_out "
+                            "int32 [rows, 4]")
+                cand_cap = W - 2 * accept_cap
+            else:
+                cand_out = None
+                cand_ctl_out = None
+            if not emit_cand_bucketed:
+                cand_idx_out = None
+                cand_cur_out = None
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
+                   emit_seed_counts, seed_packed, emit_cand, cand_cap,
+                   emit_cand_bucketed, accept_cap)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -9147,14 +9785,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_epi_subtiles,
                     epi_dtype,
                     output_dtype,
-                    remove_online_sf_transpose=remove_online_sf_transpose)
+                    remove_online_sf_transpose=remove_online_sf_transpose,
+                    emit_block_meta=emit_block_meta,
+                    emit_hit_stats=emit_hit_stats,
+                    emit_seed_counts=emit_seed_counts,
+                    seed_packed=seed_packed,
+                    emit_cand=emit_cand,
+                    cand_cap=cand_cap,
+                    emit_cand_bucketed=emit_cand_bucketed,
+                    accept_cap=accept_cap)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
+            if emit_block_meta:
+                compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
+                         context_lens, schedule_meta, num_phys_blocks, B,
+                         block_max_out, hit_stats_out, hit_bitmap, seed_thr,
+                         seed_counts_out, cand_out, cand_ctl_out, cand_idx_out,
+                         cand_cur_out)
+                return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
-                     context_lens, schedule_meta, num_phys_blocks, B)
+                     context_lens, schedule_meta, num_phys_blocks, B, None,
+                     None, None, None, None, None, None, None, None)
             return logits
 
+    # NOTE: the optional emission tensors ARE written by the kernel but must
+    # stay out of mutates_args (torch.library IndexErrors on None defaults).
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",
                              mutates_args=(),
                              device_types="cuda")
@@ -9171,6 +9827,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
         remove_online_sf_transpose: bool = False,
+        block_max_out: Optional[torch.Tensor] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        cand_out: Optional[torch.Tensor] = None,
+        cand_idx_out: Optional[torch.Tensor] = None,
+        cand_ctl_out: Optional[torch.Tensor] = None,
+        cand_cur_out: Optional[torch.Tensor] = None,
+        accept_cap: int = 8192,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -9196,7 +9859,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"epi_dtype={epi_dtype} output_dtype={output_dtype}",
             key="cute_dsl_fp4_paged_mqa_logits_inputs",
         )
-        return CuteDSLFP4PagedMQALogitsRunner.forward(
+        ret = CuteDSLFP4PagedMQALogitsRunner.forward(
             q,
             sf_q,
             kv_fused,
@@ -9208,7 +9871,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
             output_dtype=output_dtype,
-            remove_online_sf_transpose=remove_online_sf_transpose)
+            remove_online_sf_transpose=remove_online_sf_transpose,
+            emit_block_meta=block_max_out is not None,
+            emit_hit_stats=False,
+            block_max_out=block_max_out,
+            emit_seed_counts=seed_thr is not None,
+            seed_thr=seed_thr,
+            emit_cand_bucketed=cand_out is not None,
+            accept_cap=accept_cap,
+            cand_out=cand_out,
+            cand_idx_out=cand_idx_out,
+            cand_ctl_out=cand_ctl_out,
+            cand_cur_out=cand_cur_out)
+        # with emission on the runner returns a tuple; the op returns
+        # logits only (emission buffers are caller-owned)
+        return ret[0] if isinstance(ret, tuple) else ret
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")
     def _(
@@ -9224,6 +9901,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
         remove_online_sf_transpose: bool = False,
+        block_max_out: Optional[torch.Tensor] = None,
+        seed_thr: Optional[torch.Tensor] = None,
+        cand_out: Optional[torch.Tensor] = None,
+        cand_idx_out: Optional[torch.Tensor] = None,
+        cand_ctl_out: Optional[torch.Tensor] = None,
+        cand_cur_out: Optional[torch.Tensor] = None,
+        accept_cap: int = 8192,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]
@@ -9235,7 +9919,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # =========================================================================
     # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
     # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
-    # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl_mla.py).
+    # Used by the cute_dsl_mla FMHA library (see attention/backends/fmha/cute_dsl_mla.py).
     # =========================================================================
 
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
@@ -10082,3 +10766,2699 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
     ) -> None:
         return None
+
+    # ============================================================================
+    # Rubin (SM107) Support
+    # ============================================================================
+    # The following code provides CuTe DSL GEMM support for Rubin GPUs.
+    # Requires Rubin support in the public nvidia-cutlass-dsl package.
+
+    if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        # Rubin (SM107) MOE Grouped GEMM Support
+        # ====================================================================
+        # The following code provides CuteDSL NVFP4 grouped GEMM kernels for
+        # Mixture-of-Experts (MoE) on Rubin GPUs (SM107).
+        # Two fused kernels are provided:
+        #   1. Gather + Grouped GEMM + activation fusion (FC1 layer)
+        #   2. Grouped GEMM + Finalize (scatter-add) fusion (FC2 layer)
+
+        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion import \
+            Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
+
+        class Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                TunableRunner):
+            """Rubin runner for gather + grouped GEMM + activation fusion.
+
+            SM107 counterpart to Blackwell's
+            ``Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner``.
+            Supports SwiGLU and Relu2.
+            Key differences from Blackwell:
+            - Uses LDGSTS (cp.async) for A/SFA loading instead of TMA
+            - Supports B-reuse pattern (mma_tiler_m = 2 * mma_inst_shape_m)
+            - Takes mma_inst_shape and mma_tiler as 3-tuples (not 2-tuples)
+            """
+            kernel_class = Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel
+            kernel_cache = dict()
+            tuning_config_cache = dict()
+
+            def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    activation_type: ActivationType = ActivationType.Swiglu):
+                super().__init__()
+                self.num_experts = num_experts
+                self.top_k = top_k
+                self.num_local_experts = num_local_experts
+                self.local_expert_offset = local_expert_offset
+                self.tile_size = tile_size
+                self.scaling_vector_size = scaling_vector_size
+                self.activation_type = ActivationType(int(activation_type))
+                if self.activation_type not in (ActivationType.Swiglu,
+                                                ActivationType.Relu2):
+                    raise ValueError(
+                        f"Rubin NVFP4 CuteDSL FC1 does not support "
+                        f"{self.activation_type.name}")
+                self.is_gated = is_gated_activation(self.activation_type)
+
+                if (sm_version := get_sm_version()) != 107:
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports SM 107 (Rubin) only, but got SM {sm_version}"
+                    )
+
+                if self.tile_size not in (128, 256, 512):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports tile_size 128, 256 and 512 only, but got {self.tile_size}"
+                    )
+
+            def unique_id(self):
+                return (
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    self.scaling_vector_size,
+                    int(self.activation_type),
+                )
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple[int, int]]:
+                a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, *_ = inputs
+                # m is the permuted size from permuted_idx_to_expanded_idx, not from a
+                m = permuted_idx_to_expanded_idx.size(0)
+                k = a.size(1) * 2
+                l, n = b.size(0), b.size(1)  # noqa: E741
+
+                # Rubin 4xFP4 tile sizes:
+                # Without B-reuse: mma_tiler_m == mma_inst_shape_m
+                #   - (128, 128): 1CTA
+                #   - (256, 256): 2CTA
+                # With B-reuse: mma_tiler_m == 2 * mma_inst_shape_m
+                #   - (256, 128): 1CTA, B-reuse
+                #   - (512, 256): 2CTA, B-reuse
+                # Fixed K dimensions for FP4: mma_tiler_k=256, mma_inst_k=128
+                mma_tiler_k = 256
+                mma_inst_k = 128
+
+                # (mma_tiler_m, mma_inst_m) candidates
+                mma_m_candidates = [
+                    (128, 128),  # no B-reuse, 1CTA
+                    (256, 256),  # no B-reuse, 2CTA
+                    (256, 128),  # B-reuse, 1CTA
+                    (512, 256),  # B-reuse, 2CTA
+                ]
+                # N dimension candidates (must match between tiler and inst)
+                mma_n_candidates = [128, 256]
+                # cluster_M is pinned to the MMA CTA-group size by the
+                # cta_group_m filter below (1 for 1-CTA, 2 for 2-CTA).
+                # cluster_N>1 multicasts A across N-CTAs (one GMEM read
+                # broadcast to the cluster); validated for cluster_M==atom_m.
+                cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1),
+                                               (2, 2), (2, 4)]
+                raster_along_m_candidates = [False]
+                # A-load path: "cpasync" (per-thread LDGSTS gather) vs "tma"
+                # (TMA tile::gather4). Autotuned per shape.
+                a_path_candidates = ["cpasync", "tma"]
+
+                valid_tactics = []
+                for (mma_tiler_m, mma_inst_m), mma_n, cluster_shape_mn, \
+                        raster_along_m, a_path in (
+                         itertools.product(mma_m_candidates, mma_n_candidates,
+                                           cluster_shape_mn_candidates,
+                                           raster_along_m_candidates,
+                                           a_path_candidates)):
+
+                    # The kernel requires each cluster to cover exactly
+                    # one routing tile along M:
+                    #   - 1-CTA (mma_inst_m=128): cluster_m must be 1
+                    #   - 2-CTA (mma_inst_m=256): cluster_m must be 2
+                    # and the CTA-pair's M extent (mma_tiler_m) must equal
+                    # the routing tile_size.  Any other combination
+                    # (mma_tiler_m != tile_size, or cluster_m spanning
+                    # multiple independent M-tiles) produces ~40% element
+                    # mismatches empirically.
+                    cta_group_m = 2 if mma_inst_m == 256 else 1
+                    if cluster_shape_mn[0] != cta_group_m:
+                        continue
+                    if mma_tiler_m != self.tile_size:
+                        continue
+                    # The Rubin epilogue stores full output and SFC subtiles
+                    # only, so partial GEMM N tiles are not valid.
+                    if n % mma_n != 0:
+                        continue
+
+                    # cluster_N>1 multicasts A across cluster-N CTAs, each
+                    # computing a DISTINCT N-tile. This is only correct when the
+                    # N-tiles (n // mma_n) divide evenly across the cluster;
+                    # otherwise the multicast misaligns and the output is wrong.
+                    # (The autotuner picks by latency with no correctness check,
+                    # so an un-pruned bad multicast tactic could be selected in
+                    # production — must gate it here.)
+                    if cluster_shape_mn[1] > 1 and (
+                            n % (mma_n * cluster_shape_mn[1]) != 0):
+                        continue
+
+                    # TMA gather4 is stable for per-CTA/2CTA A loads, but the
+                    # multicast variant is not reliable on Rubin: cluster_N>1
+                    # requires A multicast across N-CTAs. Keep cluster_N
+                    # tactics available through the cpasync A path only.
+                    if a_path == "tma" and cluster_shape_mn[1] > 1:
+                        continue
+
+                    mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+
+                    if self.__class__.kernel_class.can_implement(
+                            a_dtype=cutlass.Float4E2M1FN,
+                            b_dtype=cutlass.Float4E2M1FN,
+                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_vec_size=self.scaling_vector_size,
+                            c_dtype=cutlass.Float4E2M1FN,
+                            mma_inst_shape=mma_inst_shape,
+                            mma_tiler=mma_tiler,
+                            cluster_shape_mn=cluster_shape_mn,
+                            m=m,
+                            n=n,
+                            k=k,
+                            l=l,
+                            a_major="k",
+                            b_major="k",
+                            c_major="n",
+                    ):
+                        valid_tactics.append(
+                            (mma_tiler, mma_inst_shape, cluster_shape_mn,
+                             raster_along_m, a_path))
+
+                logger.debug(
+                    f"CuteDSL Rubin GatherGroupedGemmSwiglu: Found {len(valid_tactics)} valid tactics "
+                    f"for M={m}, N={n}, K={k}, L={l}")
+                return valid_tactics
+
+            def get_tuning_config(self) -> TuningConfig:
+                key = self.unique_id()
+                if key not in self.__class__.tuning_config_cache:
+                    helper = GatherGroupedGemmInputsHelper(
+                        self.num_experts, self.top_k, self.num_local_experts,
+                        self.local_expert_offset, self.tile_size)
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        # Use permuted_idx_to_expanded_idx (IDX_SHAPE_INFER) for tuning
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            GatherGroupedGemmInputsHelper.IDX_SHAPE_INFER, 0,
+                            helper.gen_tuning_buckets,
+                            helper.map_to_tuning_buckets), ),
+                        constraint_specs=(
+                            ConstraintSpec(0, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(5, 0,
+                                           helper.infer_shape_max_num_tiles),
+                            ConstraintSpec(6, 0,
+                                           helper.infer_shape_max_num_tiles),
+                        ),
+                        inputs_pre_hook=helper.inputs_pre_hook,
+                    )
+                return self.__class__.tuning_config_cache[key]
+
+            def forward(self, inputs: List[torch.Tensor],
+                        tactic: Optional[tuple], **kwargs) -> torch.Tensor:
+                a, b, a_sf, b_sf, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf, output_tensor, output_sf_tensor = inputs
+                # Verify permuted_idx_to_expanded_idx index matches the class constant
+                assert inputs[
+                    GatherGroupedGemmInputsHelper.
+                    IDX_PERMUTED_IDX_TO_EXPANDED_IDX] is permuted_idx_to_expanded_idx
+                assert a.dtype == torch.float4_e2m1fn_x2
+                assert a.dim() == 2
+                assert b.dtype == torch.float4_e2m1fn_x2
+                assert b.dim() == 3
+                assert a_sf.dtype == torch.uint8
+                assert a_sf.dim() == 2
+                assert b_sf.dtype == torch.uint8
+                assert b_sf.dim() == 3
+                assert alpha.dtype == torch.float32
+                assert alpha.dim() == 1
+
+                # a.size(0) is orig_m (original input size before gather)
+                # permuted_idx_to_expanded_idx.size(0) is m (permuted size after gather)
+                orig_m, k = a.size(0), a.size(1) * 2
+                m = permuted_idx_to_expanded_idx.size(0)
+                l, n = b.size(0), b.size(1)  # noqa: E741
+                scale_k = k // self.scaling_vector_size
+                interm_size = n // 2 if self.is_gated else n
+                assert m % self.tile_size == 0
+                assert k % (self.scaling_vector_size * 4) == 0
+                n_alignment = self.scaling_vector_size * 4 * (2 if self.is_gated
+                                                              else 1)
+                assert n % n_alignment == 0
+                assert b.size(2) * 2 == k
+                assert a_sf.size(0) == orig_m
+                assert a_sf.size(1) == scale_k
+                assert b_sf.size(0) == l
+                assert b_sf.size(1) == n
+                assert b_sf.size(2) == scale_k
+                assert alpha.size(0) == l
+
+                num_tiles = m // self.tile_size
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
+                assert global_sf.dtype == torch.float32
+                assert global_sf.numel() == 1
+
+                partition_id = kwargs.get("partition_id", -1)
+                locality_domain_half_gemm = output_tensor is not None or output_sf_tensor is not None
+                if locality_domain_half_gemm:
+                    if not self.is_gated:
+                        raise ValueError(
+                            "Rubin locality domain half-GEMM currently supports SwiGLU only"
+                        )
+                    if partition_id < 0 or partition_id >= 2:
+                        raise ValueError(
+                            "partition_id must be 0 or 1 when output tensors are provided."
+                        )
+                    assert output_tensor is not None and output_sf_tensor is not None
+                    assert output_tensor.dim() == 2
+                    assert output_tensor.dtype == a.dtype
+                    assert output_tensor.shape[0] == m and output_tensor.shape[
+                        1] == interm_size // 2 * 2, f"[locality domain] output_tensor.shape={output_tensor.shape}, m={m}, n={n}"
+                    assert output_sf_tensor.dim() == 1
+                    sf_locality_domain_total_size = m * interm_size // self.scaling_vector_size
+                    assert output_sf_tensor.shape[
+                        0] == sf_locality_domain_total_size * 2
+                    # c: point into shared buffer at column offset
+                    # (kernel uses full stride via locality_domain_half_gemm + full_c_shape)
+                    c_byte_offset = partition_id * interm_size // 2  # fp4x2 cols
+                    c = output_tensor.view(torch.uint8)[:, c_byte_offset:].view(
+                        torch.float4_e2m1fn_x2)
+                    # Keep the SFC pointer at the start of the full shared
+                    # buffer. The kernel applies the partition's N-tile offset
+                    # in full-layout coordinates.
+                    assert interm_size % 64 == 0
+                    c_sf = output_sf_tensor
+                    c_sf_n_tile_offset_val = cutlass.Int64(partition_id *
+                                                           interm_size // 64)
+                else:
+                    c = torch.empty(m,
+                                    interm_size // 2,
+                                    dtype=a.dtype,
+                                    device=a.device)
+                    c_sf = torch.empty(m * interm_size //
+                                       self.scaling_vector_size,
+                                       dtype=a_sf.dtype,
+                                       device=a_sf.device)
+                    c_sf_n_tile_offset_val = cutlass.Int64(0)
+
+                a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                 a.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=32)
+                b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                 b.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=32)
+                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                    a_sf.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                    b_sf.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                     cute.AddressSpace.gmem)
+                tile_idx_to_group_idx_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                tile_idx_to_mn_limit_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_mn_limit.data_ptr(),
+                    cute.AddressSpace.gmem)
+                permuted_idx_to_expanded_idx_ptr = make_ptr(
+                    cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                num_non_exiting_tiles_ptr = make_ptr(
+                    cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                    cute.AddressSpace.gmem)
+                global_sf_ptr = make_ptr(cutlass.Float32, global_sf.data_ptr(),
+                                         cute.AddressSpace.gmem)
+                c_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                 c.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=32)
+                c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                    c_sf.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                if isinstance(tactic, tuple):
+                    mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m, a_path = tactic
+                else:
+                    # Default tactic for Rubin
+                    mma_tiler, mma_inst_shape, cluster_shape_mn = \
+                        _get_sm107_nvfp4_default_mma_config(self.tile_size)
+                    raster_along_m = False
+                    a_path = "cpasync"
+                assert mma_tiler[
+                    0] >= self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
+
+                # c_stride_m for locality domain strided output (0 = default contiguous)
+                c_stride_m_val = cutlass.Int64(
+                    interm_size *
+                    2) if locality_domain_half_gemm else cutlass.Int64(0)
+
+                max_active_clusters = get_max_activate_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cache_key = (self.scaling_vector_size, self.tile_size,
+                             self.top_k, mma_tiler, mma_inst_shape,
+                             cluster_shape_mn, raster_along_m,
+                             locality_domain_half_gemm, a_path,
+                             int(self.activation_type), max_active_clusters)
+                if cache_key not in self.__class__.kernel_cache:
+                    gemm = self.__class__.kernel_class(
+                        sf_vec_size=self.scaling_vector_size,
+                        mma_inst_shape=mma_inst_shape,
+                        mma_tiler=mma_tiler,
+                        cluster_shape_mn=cluster_shape_mn,
+                        vectorized_f32=True,
+                        topk=self.top_k,
+                        raster_along_m=raster_along_m,
+                        locality_domain_half_gemm=locality_domain_half_gemm,
+                        a_path=a_path,
+                        activation_type=self.activation_type,
+                    )
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_ptr,
+                        c_sf_ptr,
+                        alpha_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        permuted_idx_to_expanded_idx_ptr,
+                        num_non_exiting_tiles_ptr,
+                        global_sf_ptr,
+                        orig_m,
+                        m,
+                        n,
+                        k,
+                        l,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        c_stride_m=c_stride_m_val,
+                        c_sf_n_tile_offset=c_sf_n_tile_offset_val,
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    c_sf_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    global_sf_ptr,
+                    orig_m,
+                    m,
+                    n,
+                    k,
+                    l,
+                    stream=stream,
+                    c_stride_m=c_stride_m_val,
+                    c_sf_n_tile_offset=c_sf_n_tile_offset_val,
+                )
+                return c, c_sf
+
+        def _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            output_sf_tensor: Optional[torch.Tensor],
+            scaling_vector_size: int,
+            partition_id: int,
+            activation_type: ActivationType,
+            precomputed_tactic: Optional[str],
+            tuner_key: str,
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            tuner = AutoTuner.get()
+            if output_tensor is not None or output_sf_tensor is not None:
+                if output_tensor is None or output_sf_tensor is None:
+                    raise ValueError(
+                        "output_tensor and output_sf_tensor must be provided together."
+                    )
+                if partition_id < 0 or partition_id >= 2:
+                    raise ValueError(
+                        "partition_id must be 0 or 1 when output tensors are provided."
+                    )
+            elif partition_id != -1:
+                raise ValueError(
+                    "partition_id must be -1 when output tensors are not provided."
+                )
+
+            runner = Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                scaling_vector_size,
+                activation_type=activation_type,
+            )
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
+                output_tensor, output_sf_tensor
+            ]
+            choose_one_kwargs = {}
+            if output_tensor is not None:
+                choose_one_kwargs["partition_id"] = partition_id
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    tuner_key,
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                    **choose_one_kwargs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+            output, output_sf = runner(inputs,
+                                       tactic=best_tactic,
+                                       partition_id=partition_id)
+            if output_tensor is not None:
+                return None, None
+            return output, output_sf
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin",
+            mutates_args=("output_tensor", "output_sf_tensor"),
+            schema=
+            "(Tensor input, Tensor weight, Tensor input_scale, Tensor weight_scale, Tensor alpha, "
+            "Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+            "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, Tensor global_sf, "
+            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+            "SymInt local_expert_offset, SymInt tile_size, "
+            "Tensor(a16!)? output_tensor, Tensor(a17!)? output_sf_tensor, "
+            "SymInt scaling_vector_size=16, SymInt partition_id=-1, "
+            f"SymInt activation_type={int(ActivationType.Swiglu)}, "
+            "str? precomputed_tactic=None) -> (Tensor?, Tensor?)",
+            device_types="cuda")
+        def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            output_sf_tensor: Optional[torch.Tensor],
+            scaling_vector_size: int = 16,
+            partition_id: int = -1,
+            activation_type: int = int(ActivationType.Swiglu),
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                input, weight, input_scale, weight_scale, alpha,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles, global_sf,
+                num_experts, top_k, num_local_experts, local_expert_offset,
+                tile_size, output_tensor, output_sf_tensor,
+                scaling_vector_size, partition_id,
+                ActivationType(activation_type), precomputed_tactic,
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            output_sf_tensor: Optional[torch.Tensor],
+            scaling_vector_size: int = 16,
+            partition_id: int = -1,
+            activation_type: int = int(ActivationType.Swiglu),
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            m = permuted_idx_to_expanded_idx.size(0)
+            n = weight.size(1)
+            is_gated = is_gated_activation(ActivationType(activation_type))
+            interm_size = n // 2 if is_gated else n
+            if output_tensor is not None or output_sf_tensor is not None:
+                assert output_tensor is not None
+                assert output_sf_tensor is not None
+                return None, None
+            output = torch.empty(m,
+                                 interm_size // 2,
+                                 dtype=input.dtype,
+                                 device=input.device)
+            output_scale = torch.empty(m * interm_size // scaling_vector_size,
+                                       dtype=input_scale.dtype,
+                                       device=input_scale.device)
+            return output, output_scale
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin",
+            mutates_args=("output_tensor", "output_sf_tensor"),
+            schema=
+            "(Tensor input, Tensor weight_0, Tensor weight_1, Tensor input_scale, "
+            "Tensor weight_scale_0, Tensor weight_scale_1, Tensor alpha, "
+            "Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+            "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+            "Tensor global_sf, SymInt num_experts, SymInt top_k, "
+            "SymInt num_local_experts, SymInt local_expert_offset, "
+            "SymInt tile_size, Tensor(a!) output_tensor, "
+            "Tensor(b!) output_sf_tensor, SymInt scaling_vector_size=16, "
+            f"SymInt activation_type={int(ActivationType.Swiglu)}) -> ()",
+            device_types="cuda")
+        def cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin(
+                input: torch.Tensor,
+                weight_0: torch.Tensor,
+                weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                weight_scale_0: torch.Tensor,
+                weight_scale_1: torch.Tensor,
+                alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                global_sf: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                output_tensor: torch.Tensor,
+                output_sf_tensor: torch.Tensor,
+                scaling_vector_size: int = 16,
+                activation_type: int = int(ActivationType.Swiglu),
+        ) -> None:
+            """Tune and launch both Rubin locality domain NVFP4 MoE FC1 partitions.
+
+            The MoE outer runner invokes this op during preparation so locality domain
+            resources, tactics, and kernels are ready before CUDA graph capture.
+            Direct callers must likewise invoke it once before capture.
+            """
+            if weight_0.shape != weight_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC1 weight shards must have identical "
+                    f"shapes, got {tuple(weight_0.shape)} and "
+                    f"{tuple(weight_1.shape)}.")
+            if weight_0.dtype != weight_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC1 weight shards must have identical "
+                    f"dtypes, got {weight_0.dtype} and {weight_1.dtype}.")
+            if weight_scale_0.shape != weight_scale_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC1 weight-scale shards must have "
+                    f"identical shapes, got {tuple(weight_scale_0.shape)} and "
+                    f"{tuple(weight_scale_1.shape)}.")
+            if weight_scale_0.dtype != weight_scale_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC1 weight-scale shards must have "
+                    f"identical dtypes, got {weight_scale_0.dtype} and "
+                    f"{weight_scale_1.dtype}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            # Preserve the pre-refactor leaf namespace so persisted tactic
+            # caches remain reusable after moving ownership into this op.
+            tuner_key = (
+                "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin")
+            op_runner = (
+                Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+                    num_experts,
+                    top_k,
+                    num_local_experts,
+                    local_expert_offset,
+                    tile_size,
+                    scaling_vector_size,
+                    activation_type=ActivationType(activation_type),
+                ))
+            inputs = [
+                input,
+                weight_0,
+                input_scale,
+                weight_scale_0,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                global_sf,
+                output_tensor,
+                output_sf_tensor,
+            ]
+
+            def launch_partition(
+                partition_id: int,
+                partition_inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                weight = weight_0 if partition_id == 0 else weight_1
+                weight_scale = (weight_scale_0
+                                if partition_id == 0 else weight_scale_1)
+                torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                    input=partition_inputs[0],
+                    weight=weight,
+                    input_scale=partition_inputs[2],
+                    weight_scale=weight_scale,
+                    alpha=partition_inputs[4],
+                    tile_idx_to_group_idx=partition_inputs[5],
+                    tile_idx_to_mn_limit=partition_inputs[6],
+                    permuted_idx_to_expanded_idx=partition_inputs[7],
+                    num_non_exiting_tiles=partition_inputs[8],
+                    global_sf=partition_inputs[9],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    tile_size=tile_size,
+                    output_tensor=partition_inputs[10],
+                    output_sf_tensor=partition_inputs[11],
+                    scaling_vector_size=scaling_vector_size,
+                    partition_id=partition_id,
+                    activation_type=activation_type,
+                    precomputed_tactic=repr(tactic),
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                tuner_key,
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.get_tuning_config(),
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_locality_domain_inplace_rubin"
+        )
+        def _(
+                input: torch.Tensor,
+                weight_0: torch.Tensor,
+                weight_1: torch.Tensor,
+                input_scale: torch.Tensor,
+                weight_scale_0: torch.Tensor,
+                weight_scale_1: torch.Tensor,
+                alpha: torch.Tensor,
+                tile_idx_to_group_idx: torch.Tensor,
+                tile_idx_to_mn_limit: torch.Tensor,
+                permuted_idx_to_expanded_idx: torch.Tensor,
+                num_non_exiting_tiles: torch.Tensor,
+                global_sf: torch.Tensor,
+                num_experts: int,
+                top_k: int,
+                num_local_experts: int,
+                local_expert_offset: int,
+                tile_size: int,
+                output_tensor: torch.Tensor,
+                output_sf_tensor: torch.Tensor,
+                scaling_vector_size: int = 16,
+                activation_type: int = int(ActivationType.Swiglu),
+        ) -> None:
+            return None
+
+        # ----------------------------------------------------------------
+        # Rubin BF16/FP16 Gather + SwiGLU Fusion (FC1 layer)
+        # ----------------------------------------------------------------
+        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_gather_grouped_gemm_swiglu_fusion import \
+            Sm107ContiguousGatherGroupedGemmSwigluFusionKernel
+
+        class Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(TunableRunner):
+            """Rubin (SM107) runner for BF16/FP16 gather + grouped GEMM + SwiGLU fusion (FC1).
+
+            Similar to the blockscaled runner but without scale factors.
+            Uses MmaF16BF16Op (K=16) for BFloat16/Float16 inputs.
+            """
+            kernel_class = Sm107ContiguousGatherGroupedGemmSwigluFusionKernel
+            kernel_cache = dict()
+            tuning_config_cache = dict()
+
+            def __init__(self,
+                         num_experts: int,
+                         top_k: int,
+                         num_local_experts: int,
+                         local_expert_offset: int,
+                         tile_size: int,
+                         input_dtype: Optional[torch.dtype] = None):
+                super().__init__()
+                self.num_experts = num_experts
+                self.top_k = top_k
+                self.num_local_experts = num_local_experts
+                self.local_expert_offset = local_expert_offset
+                self.tile_size = tile_size
+                self.input_dtype = input_dtype
+
+                if input_dtype is not None and input_dtype not in (
+                        torch.bfloat16, torch.float16):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} requires BF16 or FP16 input, "
+                        f"but got {input_dtype}")
+
+                if (sm_version := get_sm_version()) != 107:
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports SM 107 (Rubin) only, but got SM {sm_version}"
+                    )
+
+                if self.tile_size not in (64, 128, 256):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports tile_size 64, 128 and 256 only, but got {self.tile_size}"
+                    )
+
+            def unique_id(self):
+                return (
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    self.input_dtype,
+                )
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple[int, int]]:
+                a, b, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, *_ = inputs
+                m = permuted_idx_to_expanded_idx.size(0)
+                k = a.size(1)
+                l, n = b.size(0), b.size(1)  # noqa: E741
+
+                ab_dtype = cutlass.BFloat16 if a.dtype == torch.bfloat16 else cutlass.Float16
+                c_dtype = ab_dtype
+
+                # BF16/FP16 tile sizes (no B-reuse):
+                #   - (64, N): 1CTA
+                #   - (128, N): 1CTA
+                #   - (256, N): 2CTA
+                # Fixed K dimensions: mma_tiler_k=64, mma_inst_k=16
+                mma_tiler_k = 64
+                mma_inst_k = 16
+
+                mma_n_candidates = [128, 256]
+                raster_along_m_candidates = [False]
+
+                # BF16 (no B-reuse): CTA tile M must equal tile_size.
+                # 2CTA (CtaGroup.TWO) is only valid for tile_size=256
+                # (mma_m=256 triggers CtaGroup.TWO internally).
+                # cluster_shape_mn is always (max(1, tile_size//128), 1).
+                mma_m = self.tile_size
+                cluster_shape_mn = (max(1, self.tile_size // 128), 1)
+
+                valid_tactics = []
+                for mma_n, raster_along_m in (itertools.product(
+                        mma_n_candidates, raster_along_m_candidates)):
+
+                    mma_tiler = (mma_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_m, mma_n, mma_inst_k)
+
+                    if self.__class__.kernel_class.can_implement(
+                            a_dtype=ab_dtype,
+                            b_dtype=ab_dtype,
+                            c_dtype=c_dtype,
+                            mma_inst_shape=mma_inst_shape,
+                            mma_tiler=mma_tiler,
+                            cluster_shape_mn=cluster_shape_mn,
+                            m=m,
+                            n=n,
+                            k=k,
+                            l=l,
+                            a_major="k",
+                            b_major="k",
+                            c_major="n",
+                    ):
+                        valid_tactics.append((mma_tiler, mma_inst_shape,
+                                              cluster_shape_mn, raster_along_m))
+
+                logger.debug(
+                    f"CuteDSL Rubin BF16 GatherGroupedGemmSwiglu: Found {len(valid_tactics)} valid tactics "
+                    f"for M={m}, N={n}, K={k}, L={l}")
+                return valid_tactics
+
+            # BF16 input layout (no scale factors):
+            #   0: a, 1: b, 2: alpha,
+            #   3: tile_idx_to_group_idx, 4: tile_idx_to_mn_limit,
+            #   5: permuted_idx_to_expanded_idx, 6: num_non_exiting_tiles
+            _BF16_IDX_PERMUTED = 5
+
+            def get_tuning_config(self,
+                                  has_output_tensor: bool = False
+                                  ) -> TuningConfig:
+                key = (*self.unique_id(), has_output_tensor)
+                if key not in self.__class__.tuning_config_cache:
+                    helper = GatherGroupedGemmInputsHelper(
+                        self.num_experts, self.top_k, self.num_local_experts,
+                        self.local_expert_offset, self.tile_size)
+                    # BF16 has permuted_idx at index 5, not 7 (no scale
+                    # factor inputs). Override IDX_SHAPE_INFER so that
+                    # infer_shape_num_tokens / infer_shape_max_num_tiles
+                    # read the correct tensor.
+                    helper.IDX_SHAPE_INFER = self._BF16_IDX_PERMUTED
+                    constraint_specs = [
+                        ConstraintSpec(0, 0, helper.infer_shape_num_tokens),
+                        ConstraintSpec(3, 0, helper.infer_shape_max_num_tiles),
+                        ConstraintSpec(4, 0, helper.infer_shape_max_num_tiles),
+                    ]
+                    if has_output_tensor:
+                        constraint_specs.append(
+                            ConstraintSpec(
+                                7, 0,
+                                helper.infer_shape_max_num_permuted_tokens))
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            self._BF16_IDX_PERMUTED, 0,
+                            helper.gen_tuning_buckets,
+                            helper.map_to_tuning_buckets), ),
+                        constraint_specs=tuple(constraint_specs),
+                        inputs_pre_hook=self._bf16_inputs_pre_hook,
+                    )
+                return self.__class__.tuning_config_cache[key]
+
+            def _bf16_inputs_pre_hook(
+                    self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+                """Pre-hook adapted for BF16 input layout (no scale factors)."""
+                a, b, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit, \
+                    permuted_idx_to_expanded_idx, num_non_exiting_tiles, *maybe_output = inputs
+
+                helper = GatherGroupedGemmInputsHelper(self.num_experts,
+                                                       self.top_k,
+                                                       self.num_local_experts,
+                                                       self.local_expert_offset,
+                                                       self.tile_size)
+
+                max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+                num_tokens = helper.infer_num_tokens(max_num_permuted_tokens)
+                num_tokens_per_expert = helper.generate_num_tokens_per_expert(
+                    num_tokens, approx_max_load=True)
+                token_selected_experts = helper.generate_token_selected_experts(
+                    num_tokens, num_tokens_per_expert)
+
+                token_selected_experts = token_selected_experts.cuda()
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+
+                (
+                    new_tile_idx_to_group_idx,
+                    new_tile_idx_to_mn_limit,
+                    _,
+                    new_permuted_idx_to_expanded_idx,
+                    _,
+                    new_num_non_exiting_tiles,
+                ) = torch.ops.trtllm.moe_sort(
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_experts,
+                    top_k=self.top_k,
+                    local_expert_offset=self.local_expert_offset,
+                    local_num_experts=self.num_local_experts,
+                    tile_tokens_dim=self.tile_size,
+                )
+
+                updated_inputs = [
+                    a,
+                    b,
+                    alpha,
+                    new_tile_idx_to_group_idx,
+                    new_tile_idx_to_mn_limit,
+                    new_permuted_idx_to_expanded_idx,
+                    new_num_non_exiting_tiles,
+                ]
+                if maybe_output:
+                    updated_inputs.append(maybe_output[0])
+                return updated_inputs
+
+            def forward(self, inputs: List[torch.Tensor],
+                        tactic: Optional[tuple], **kwargs) -> torch.Tensor:
+                (a, b, alpha, tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                 permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                 *maybe_output) = inputs
+                assert inputs[
+                    self._BF16_IDX_PERMUTED] is permuted_idx_to_expanded_idx
+                assert a.dtype in (torch.bfloat16, torch.float16)
+                assert a.dim() == 2
+                assert b.dtype == a.dtype
+                assert b.dim() == 3
+                assert alpha.dtype == torch.float32
+                assert alpha.dim() == 1
+
+                ab_dtype = cutlass.BFloat16 if a.dtype == torch.bfloat16 else cutlass.Float16
+
+                orig_m, k = a.size(0), a.size(1)
+                m = permuted_idx_to_expanded_idx.size(0)
+                l, n = b.size(0), b.size(1)  # noqa: E741
+                interm_size = n // 2
+                assert m % self.tile_size == 0
+                assert b.size(2) == k
+                assert alpha.size(0) == l
+
+                num_tiles = m // self.tile_size
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
+
+                if maybe_output:
+                    partition_id = kwargs.get("partition_id", -1)
+                    if partition_id < 0 or partition_id >= 2:
+                        raise ValueError(
+                            "partition_id must be 0 or 1 when output_tensor is provided."
+                        )
+                    output_tensor = maybe_output[0]
+                    assert output_tensor.dim() == 2
+                    assert output_tensor.dtype == a.dtype
+                    assert output_tensor.shape[0] == m
+                    assert output_tensor.shape[1] == interm_size * 2
+                    c = output_tensor[:, partition_id *
+                                      interm_size:(partition_id + 1) *
+                                      interm_size]
+                    c_stride_m_val = cutlass.Int64(output_tensor.shape[1])
+                    locality_domain_half_gemm = True
+                else:
+                    c = torch.empty(m,
+                                    interm_size,
+                                    dtype=a.dtype,
+                                    device=a.device)
+                    c_stride_m_val = cutlass.Int64(0)
+                    locality_domain_half_gemm = False
+
+                a_ptr = make_ptr(ab_dtype,
+                                 a.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(ab_dtype,
+                                 b.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                c_ptr = make_ptr(ab_dtype,
+                                 c.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                     cute.AddressSpace.gmem)
+                tile_idx_to_group_idx_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                tile_idx_to_mn_limit_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_mn_limit.data_ptr(),
+                    cute.AddressSpace.gmem)
+                permuted_idx_to_expanded_idx_ptr = make_ptr(
+                    cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                num_non_exiting_tiles_ptr = make_ptr(
+                    cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                    cute.AddressSpace.gmem)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                if isinstance(tactic, tuple):
+                    mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m = tactic
+                else:
+                    mma_tiler = (self.tile_size, 128, 64)
+                    mma_inst_shape = (self.tile_size, 128, 16)
+                    cluster_shape_mn = (max(1, self.tile_size // 128), 1)
+                    raster_along_m = False
+
+                max_active_clusters = get_max_activate_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cache_key = (a.dtype, self.tile_size, self.top_k, mma_tiler,
+                             mma_inst_shape, cluster_shape_mn, raster_along_m,
+                             locality_domain_half_gemm, max_active_clusters)
+                if cache_key not in self.__class__.kernel_cache:
+                    gemm = self.__class__.kernel_class(
+                        mma_inst_shape=mma_inst_shape,
+                        mma_tiler=mma_tiler,
+                        cluster_shape_mn=cluster_shape_mn,
+                        vectorized_f32=True,
+                        topk=self.top_k,
+                        raster_along_m=raster_along_m,
+                    )
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        a_ptr,
+                        b_ptr,
+                        c_ptr,
+                        alpha_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        permuted_idx_to_expanded_idx_ptr,
+                        num_non_exiting_tiles_ptr,
+                        orig_m,
+                        m,
+                        n,
+                        k,
+                        l,
+                        tile_size=self.tile_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        c_stride_m=c_stride_m_val,
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    orig_m,
+                    m,
+                    n,
+                    k,
+                    l,
+                    stream=stream,
+                    c_stride_m=c_stride_m_val,
+                )
+                return c
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin",
+            mutates_args=("output_tensor", ),
+            schema="(Tensor input, Tensor weight, Tensor alpha, "
+            "Tensor tile_idx_to_group_idx, Tensor tile_idx_to_mn_limit, "
+            "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, "
+            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+            "SymInt local_expert_offset, SymInt tile_size, "
+            "Tensor(a!)? output_tensor, SymInt partition_id, "
+            "str? precomputed_tactic=None) -> Tensor?",
+            device_types="cuda")
+        def cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            partition_id: int,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Optional[torch.Tensor]:
+            tuner = AutoTuner.get()
+            if output_tensor is not None:
+                if partition_id < 0 or partition_id >= 2:
+                    raise ValueError(
+                        "partition_id must be 0 or 1 when output_tensor is provided."
+                    )
+            elif partition_id != -1:
+                raise ValueError(
+                    "partition_id must be -1 when output_tensor is not provided."
+                )
+
+            runner = Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                input_dtype=input.dtype)
+            inputs = [
+                input,
+                weight,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+            ]
+            if output_tensor is not None:
+                inputs.append(output_tensor)
+
+            choose_one_kwargs = {}
+            if output_tensor is not None:
+                choose_one_kwargs["partition_id"] = partition_id
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin",
+                    [runner],
+                    runner.get_tuning_config(output_tensor is not None),
+                    inputs,
+                    **choose_one_kwargs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+
+            output = runner(inputs,
+                            tactic=best_tactic,
+                            partition_id=partition_id)
+            if output_tensor is not None:
+                return None
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: Optional[torch.Tensor],
+            partition_id: int,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Optional[torch.Tensor]:
+            m = permuted_idx_to_expanded_idx.size(0)
+            n = weight.size(1)
+            interm_size = n // 2
+            if output_tensor is not None:
+                return None
+            return torch.empty(m,
+                               interm_size,
+                               dtype=input.dtype,
+                               device=input.device)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_locality_domain_inplace_rubin",
+            mutates_args=("output_tensor", ),
+            schema="(Tensor input, Tensor weight_0, Tensor weight_1, "
+            "Tensor alpha, Tensor tile_idx_to_group_idx, "
+            "Tensor tile_idx_to_mn_limit, "
+            "Tensor permuted_idx_to_expanded_idx, "
+            "Tensor num_non_exiting_tiles, SymInt num_experts, SymInt top_k, "
+            "SymInt num_local_experts, SymInt local_expert_offset, "
+            "SymInt tile_size, Tensor(a!) output_tensor) -> ()",
+            device_types="cuda")
+        def cute_dsl_bf16_gather_grouped_gemm_swiglu_locality_domain_inplace_rubin(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: torch.Tensor,
+        ) -> None:
+            """Tune and launch both Rubin locality domain BF16 MoE FC1 partitions.
+
+            The MoE outer runner primes this op before CUDA graph capture.
+            Direct callers must likewise invoke it once before capture.
+            """
+            if weight_0.shape != weight_1.shape:
+                raise ValueError(
+                    "locality domain BF16 MoE FC1 weight shards must have identical "
+                    f"shapes, got {tuple(weight_0.shape)} and "
+                    f"{tuple(weight_1.shape)}.")
+            if weight_0.dtype != weight_1.dtype:
+                raise ValueError(
+                    "locality domain BF16 MoE FC1 weight shards must have identical "
+                    f"dtypes, got {weight_0.dtype} and {weight_1.dtype}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            # Preserve the pre-refactor leaf namespace for cache compatibility.
+            tuner_key = (
+                "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin")
+            op_runner = Sm107ContiguousGatherGroupedGemmSwigluFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                input_dtype=input.dtype,
+            )
+            inputs = [
+                input,
+                weight_0,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                output_tensor,
+            ]
+
+            def launch_partition(
+                partition_id: int,
+                partition_inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                weight = weight_0 if partition_id == 0 else weight_1
+                torch.ops.trtllm.cute_dsl_bf16_gather_grouped_gemm_swiglu_rubin(
+                    input=partition_inputs[0],
+                    weight=weight,
+                    alpha=partition_inputs[2],
+                    tile_idx_to_group_idx=partition_inputs[3],
+                    tile_idx_to_mn_limit=partition_inputs[4],
+                    permuted_idx_to_expanded_idx=partition_inputs[5],
+                    num_non_exiting_tiles=partition_inputs[6],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    tile_size=tile_size,
+                    output_tensor=partition_inputs[7],
+                    partition_id=partition_id,
+                    precomputed_tactic=repr(tactic),
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                tuner_key,
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.get_tuning_config(has_output_tensor=True),
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_bf16_gather_grouped_gemm_swiglu_locality_domain_inplace_rubin"
+        )
+        def _(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_tensor: torch.Tensor,
+        ) -> None:
+            return None
+
+        # ----------------------------------------------------------------
+        # Rubin Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)
+        # ----------------------------------------------------------------
+        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion import \
+            Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+
+        class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                TunableRunner):
+            """Rubin (SM107) runner for grouped GEMM + finalize fusion (FC2).
+
+            This is the Rubin counterpart to
+            Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner.
+            Key differences from Blackwell:
+            - Takes mma_inst_shape and mma_tiler as 3-tuples (not 2-tuples)
+            - Kernel __init__ takes topK parameter
+            - Supports B-reuse pattern
+            """
+            kernel_class = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel
+            kernel_cache = dict()
+            tuning_config_cache = dict()
+
+            def __init__(self,
+                         num_experts: int,
+                         top_k: int,
+                         num_local_experts: int,
+                         local_expert_offset: int,
+                         tile_size: int,
+                         output_dtype: torch.dtype,
+                         scaling_vector_size: int = 16):
+                super().__init__()
+                self.num_experts = num_experts
+                self.top_k = top_k
+                self.num_local_experts = num_local_experts
+                self.local_expert_offset = local_expert_offset
+                self.tile_size = tile_size
+
+                assert output_dtype == torch.bfloat16
+                self.output_dtype = output_dtype
+                self.scaling_vector_size = scaling_vector_size
+
+                if (sm_version := get_sm_version()) != 107:
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports SM 107 (Rubin) only, but got SM {sm_version}"
+                    )
+
+                if self.tile_size not in (128, 256, 512):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports tile_size 128, 256 and 512 only, but got {self.tile_size}"
+                    )
+
+            def unique_id(self):
+                return (
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    self.output_dtype,
+                    self.scaling_vector_size,
+                )
+
+            @staticmethod
+            def _is_n_tiling_compatible(n: int, mma_n: int,
+                                        cluster_n: int) -> bool:
+                """Return whether the kernel can cover N without a tail tile."""
+                return n % (mma_n * cluster_n) == 0
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple[int, int]]:
+                a, b, *_ = inputs
+                m, k = a.size(0), a.size(1) * 2
+                l, n = b.size(0), b.size(1)  # noqa: E741
+
+                # Rubin FP4 K-dimension: mma_tiler_k=256, mma_inst_k=128
+                mma_tiler_k = 256
+                mma_inst_k = 128
+
+                # (mma_tiler_m, mma_inst_m) candidates
+                mma_m_candidates = [
+                    (128, 128),  # no B-reuse, 1CTA
+                    (256, 256),  # no B-reuse, 2CTA
+                    (256, 128),  # B-reuse, 1CTA
+                    (512, 256),  # B-reuse, 2CTA
+                ]
+                # Restrict N candidates to 128 and 256 (matching Blackwell).
+                # mma_n=192 and mma_n=64 trigger the kernel's special SFB
+                # slicing paths (cta_tile_shape_n=192 / cta_tile_shape_n=64)
+                # which cause CUDA_ERROR_ILLEGAL_ADDRESS for certain N
+                # dimensions (e.g., Qwen3-30B-A3B with N=2048, mma_n=192).
+                mma_n_candidates = [128, 256]
+                cluster_shape_mn_candidates = [(1, 1), (2, 1), (1, 2), (2, 2)]
+                raster_along_m_candidates = [False]
+
+                valid_tactics = []
+                for (mma_tiler_m,
+                     mma_inst_m), mma_n, cluster_shape_mn, raster_along_m in (
+                         itertools.product(mma_m_candidates, mma_n_candidates,
+                                           cluster_shape_mn_candidates,
+                                           raster_along_m_candidates)):
+
+                    # The kernel requires each cluster to cover exactly
+                    # one routing tile along M:
+                    #   - 1-CTA (mma_inst_m=128): cluster_m must be 1
+                    #   - 2-CTA (mma_inst_m=256): cluster_m must be 2
+                    # and the CTA-pair's M extent (mma_tiler_m) must equal
+                    # the routing tile_size.  Any other combination
+                    # (mma_tiler_m != tile_size, or cluster_m spanning
+                    # multiple independent M-tiles) produces ~40% element
+                    # mismatches empirically.
+                    cta_group_m = 2 if mma_inst_m == 256 else 1
+                    if cluster_shape_mn[0] != cta_group_m:
+                        continue
+                    if mma_tiler_m != self.tile_size:
+                        continue
+                    if not self._is_n_tiling_compatible(n, mma_n,
+                                                        cluster_shape_mn[1]):
+                        continue
+
+                    mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_inst_m, mma_n, mma_inst_k)
+
+                    if self.__class__.kernel_class.can_implement(
+                            a_dtype=cutlass.Float4E2M1FN,
+                            b_dtype=cutlass.Float4E2M1FN,
+                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_vec_size=self.scaling_vector_size,
+                            c_dtype=cutlass.BFloat16,
+                            mma_inst_shape=mma_inst_shape,
+                            mma_tiler=mma_tiler,
+                            cluster_shape_mn=cluster_shape_mn,
+                            m=m,
+                            n=n,
+                            k=k,
+                            l=l,
+                            a_major="k",
+                            b_major="k",
+                            c_major="n",
+                    ):
+                        valid_tactics.append((mma_tiler, mma_inst_shape,
+                                              cluster_shape_mn, raster_along_m))
+
+                logger.debug(
+                    f"CuteDSL Rubin GroupedGemmFinalize: Found {len(valid_tactics)} valid tactics "
+                    f"for M={m}, N={n}, K={k}, L={l}")
+                return valid_tactics
+
+            def get_tuning_config(self) -> TuningConfig:
+                key = self.unique_id()
+                if key not in self.__class__.tuning_config_cache:
+                    helper = GroupedGemmInputsHelper(self.num_experts,
+                                                     self.top_k,
+                                                     self.num_local_experts,
+                                                     self.local_expert_offset,
+                                                     self.tile_size)
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            0, 0, helper.gen_tuning_buckets,
+                            helper.map_to_tuning_buckets), ),
+                        constraint_specs=(
+                            ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                            ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(6, 0,
+                                           helper.infer_shape_max_num_tiles),
+                            ConstraintSpec(7, 0,
+                                           helper.infer_shape_max_num_tiles),
+                            ConstraintSpec(
+                                8, 0,
+                                helper.infer_shape_max_num_permuted_tokens),
+                            ConstraintSpec(10, 0,
+                                           helper.infer_shape_num_tokens),
+                        ),
+                        inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
+                    )
+                return self.__class__.tuning_config_cache[key]
+
+            def forward(self, inputs: List[torch.Tensor],
+                        tactic: Optional[tuple]) -> torch.Tensor:
+                a, b, a_sf, b_sf, alpha, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+                assert a.dtype == torch.float4_e2m1fn_x2
+                assert a.dim() == 2
+                assert b.dtype == torch.float4_e2m1fn_x2
+                assert b.dim() == 3
+                assert a_sf.dtype == torch.uint8
+                assert a_sf.dim() == 1
+                assert b_sf.dtype == torch.uint8
+                assert b_sf.dim() == 3
+                assert alpha.dtype == torch.float32
+                assert alpha.dim() == 1
+
+                m, k = a.size(0), a.size(1) * 2
+                l, n = b.size(0), b.size(1)  # noqa: E741
+                scale_k = k // self.scaling_vector_size
+                assert m % self.tile_size == 0
+                assert k % (self.scaling_vector_size * 4) == 0
+                assert b.size(2) * 2 == k
+                assert a_sf.size(0) == m * scale_k
+                assert b_sf.size(0) == l
+                assert b_sf.size(1) == n
+                assert b_sf.size(2) == scale_k
+                assert alpha.size(0) == l
+
+                assert c.dtype == self.output_dtype
+                assert c.dim() == 2
+                num_tokens = c.size(0)
+                assert c.size(1) == n or c.size(1) == n * 2
+
+                num_tiles = m // self.tile_size
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
+                assert token_final_scales.dtype == torch.float32
+                assert token_final_scales.dim() == 2
+                assert token_final_scales.size() == (num_tokens, self.top_k)
+
+                locality_domain_id = get_current_locality_domain()
+                locality_domain_half_gemm = locality_domain_id is not None
+                if locality_domain_half_gemm:
+                    assert locality_domain_id in (
+                        0,
+                        1), f"Invalid locality domain id: {locality_domain_id}"
+                    assert c.size(1) == n * 2, \
+                        f"[locality domain] FC2 output must be 2x width: c.size(1)={c.size(1)}, n={n}"
+                    # c: stride directly into shared buffer (kernel uses c_stride_row)
+                    c = c[:,
+                          locality_domain_id * n:(locality_domain_id + 1) * n]
+
+                if isinstance(tactic, tuple):
+                    mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m = tactic
+                else:
+                    # Default tactic for Rubin
+                    mma_tiler, mma_inst_shape, cluster_shape_mn = \
+                        _get_sm107_nvfp4_default_mma_config(self.tile_size)
+                    raster_along_m = False
+                assert mma_tiler[
+                    0] >= self.tile_size, f"Tactic ({tactic}) is incompatible with tile size ({self.tile_size})"
+                if not self._is_n_tiling_compatible(n, mma_tiler[1],
+                                                    cluster_shape_mn[1]):
+                    raise ValueError(
+                        f"Tactic ({tactic}) is incompatible with N={n}: "
+                        f"mma_n={mma_tiler[1]} and cluster_n={cluster_shape_mn[1]} "
+                        "require N to be divisible by their product.")
+
+                a_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                 a.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=32)
+                b_ptr = make_ptr(cutlass.Float4E2M1FN,
+                                 b.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=32)
+                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                    a_sf.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                    b_sf.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(),
+                                     cute.AddressSpace.gmem)
+                tile_idx_to_group_idx_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                tile_idx_to_mn_limit_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_mn_limit.data_ptr(),
+                    cute.AddressSpace.gmem)
+                permuted_idx_to_expanded_idx_ptr = make_ptr(
+                    cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                num_non_exiting_tiles_ptr = make_ptr(
+                    cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                    cute.AddressSpace.gmem)
+                token_final_scales_ptr = make_ptr(cutlass.Float32,
+                                                  token_final_scales.data_ptr(),
+                                                  cute.AddressSpace.gmem)
+                c_ptr = make_ptr(cutlass.BFloat16,
+                                 c.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                # c_stride_row for locality domain strided output (0 = default contiguous)
+                c_stride_row_val = cutlass.Int64(
+                    n * 2) if locality_domain_half_gemm else cutlass.Int64(0)
+
+                max_active_clusters = get_max_activate_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cache_key = (self.scaling_vector_size, self.tile_size,
+                             self.top_k, mma_tiler, mma_inst_shape,
+                             cluster_shape_mn, raster_along_m,
+                             locality_domain_half_gemm, max_active_clusters)
+                if cache_key not in self.__class__.kernel_cache:
+                    gemm = self.__class__.kernel_class(
+                        sf_vec_size=self.scaling_vector_size,
+                        mma_inst_shape=mma_inst_shape,
+                        mma_tiler=mma_tiler,
+                        cluster_shape_mn=cluster_shape_mn,
+                        raster_along_m=raster_along_m,
+                        topK=self.top_k,
+                    )
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        a_ptr,
+                        b_ptr,
+                        a_sf_ptr,
+                        b_sf_ptr,
+                        c_ptr,
+                        alpha_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        permuted_idx_to_expanded_idx_ptr,
+                        num_non_exiting_tiles_ptr,
+                        token_final_scales_ptr,
+                        m,
+                        n,
+                        k,
+                        l,
+                        num_tokens,
+                        self.top_k,
+                        tile_size=self.tile_size,
+                        scaling_vector_size=self.scaling_vector_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        c_stride_row=c_stride_row_val,
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_ptr,
+                    alpha_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    token_final_scales_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    num_tokens,
+                    self.top_k,
+                    stream=stream,
+                    c_stride_row=c_stride_row_val,
+                )
+                # c written via stride — no copy-back needed
+                return c
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin",
+            mutates_args=("output", ),
+            device_types="cuda")
+        def cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            tuner = AutoTuner.get()
+
+            runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts, top_k, num_local_experts, local_expert_offset,
+                tile_size, output_dtype, scaling_vector_size)
+
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                token_final_scales
+            ]
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        def cute_dsl_nvfp4_grouped_gemm_finalize_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+        ) -> torch.Tensor:
+            num_tokens = token_final_scales.size(0)
+            n = weight.size(1)
+            output = torch.zeros(num_tokens,
+                                 n,
+                                 dtype=output_dtype,
+                                 device=input.device)
+            torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin(
+                input=input,
+                weight=weight,
+                input_scale=input_scale,
+                weight_scale=weight_scale,
+                alpha=alpha,
+                output=output,
+                tile_idx_to_group_idx=tile_idx_to_group_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+                scaling_vector_size=scaling_vector_size,
+            )
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            return
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_locality_domain_inplace_rubin",
+            mutates_args=("output", ),
+            schema=
+            "(Tensor input, Tensor weight_0, Tensor weight_1, Tensor input_scale, "
+            "Tensor weight_scale_0, Tensor weight_scale_1, Tensor alpha, "
+            "Tensor(a!) output, Tensor tile_idx_to_group_idx, "
+            "Tensor tile_idx_to_mn_limit, "
+            "Tensor expanded_idx_to_permuted_idx, "
+            "Tensor permuted_idx_to_expanded_idx, "
+            "Tensor num_non_exiting_tiles, Tensor token_final_scales, "
+            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+            "SymInt local_expert_offset, SymInt tile_size, "
+            "ScalarType output_dtype, SymInt ep_size, "
+            "bool enable_alltoall=False, SymInt scaling_vector_size=16) -> ()",
+            device_types="cuda")
+        def cute_dsl_nvfp4_grouped_gemm_finalize_locality_domain_inplace_rubin(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            ep_size: int,
+            enable_alltoall: bool = False,
+            scaling_vector_size: int = 16,
+        ) -> None:
+            """Tune and launch both Rubin locality domain NVFP4 MoE FC2 partitions.
+
+            The MoE outer runner primes this op before CUDA graph capture.
+            Direct callers must likewise invoke it once before capture.
+            """
+            if weight_0.shape != weight_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC2 weight shards must have identical "
+                    f"shapes, got {tuple(weight_0.shape)} and "
+                    f"{tuple(weight_1.shape)}.")
+            if weight_0.dtype != weight_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC2 weight shards must have identical "
+                    f"dtypes, got {weight_0.dtype} and {weight_1.dtype}.")
+            if weight_scale_0.shape != weight_scale_1.shape:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC2 weight-scale shards must have "
+                    f"identical shapes, got {tuple(weight_scale_0.shape)} and "
+                    f"{tuple(weight_scale_1.shape)}.")
+            if weight_scale_0.dtype != weight_scale_1.dtype:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC2 weight-scale shards must have "
+                    f"identical dtypes, got {weight_scale_0.dtype} and "
+                    f"{weight_scale_1.dtype}.")
+            if output.dtype != output_dtype:
+                raise ValueError(
+                    "locality domain NVFP4 MoE FC2 output tensor dtype must match "
+                    f"output_dtype, got {output.dtype} and {output_dtype}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            # Preserve the pre-refactor leaf namespace for cache compatibility.
+            tuner_key = (
+                "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin")
+            op_runner = (
+                Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                    num_experts,
+                    top_k,
+                    num_local_experts,
+                    local_expert_offset,
+                    tile_size,
+                    output_dtype,
+                    scaling_vector_size,
+                ))
+            inputs = [
+                input,
+                weight_0,
+                input_scale,
+                weight_scale_0,
+                alpha,
+                output,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                token_final_scales,
+            ]
+
+            def launch_partition(
+                partition_id: int,
+                partition_inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                weight = weight_0 if partition_id == 0 else weight_1
+                weight_scale = (weight_scale_0
+                                if partition_id == 0 else weight_scale_1)
+                torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_rubin(
+                    input=partition_inputs[0],
+                    weight=weight,
+                    input_scale=partition_inputs[2],
+                    weight_scale=weight_scale,
+                    alpha=partition_inputs[4],
+                    output=partition_inputs[5],
+                    tile_idx_to_group_idx=partition_inputs[6],
+                    tile_idx_to_mn_limit=partition_inputs[7],
+                    permuted_idx_to_expanded_idx=partition_inputs[8],
+                    num_non_exiting_tiles=partition_inputs[9],
+                    token_final_scales=partition_inputs[10],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                    scaling_vector_size=scaling_vector_size,
+                    precomputed_tactic=repr(tactic),
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                tuner_key,
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.get_tuning_config(),
+            )
+            # Profiling finalize accumulates into the shared output. Preserve
+            # the selective all-to-all memset semantics when restoring the
+            # baseline before the actual dual-partition launch.
+            if AutoTuner.get().is_tuning_mode:
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=top_k,
+                    ep_size=ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_locality_domain_inplace_rubin"
+        )
+        def _(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale_0: torch.Tensor,
+            weight_scale_1: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            ep_size: int,
+            enable_alltoall: bool = False,
+            scaling_vector_size: int = 16,
+        ) -> None:
+            return None
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_grouped_gemm_finalize_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            scaling_vector_size: int = 16,
+        ) -> torch.Tensor:
+            num_tokens = token_final_scales.size(0)
+            n = weight.size(1)
+            return torch.empty(num_tokens,
+                               n,
+                               dtype=output_dtype,
+                               device=input.device)
+
+        # ----------------------------------------------------------------
+        # Rubin BF16/FP16 Finalize Fusion (FC2 layer: grouped GEMM + scatter-add)
+        # ----------------------------------------------------------------
+        from ..cute_dsl_kernels.rubin.moe.rubin_contiguous_grouped_gemm_finalize_fusion import \
+            Sm107ContiguousGroupedGemmFinalizeFusionKernel
+
+        class Sm107ContiguousGroupedGemmFinalizeFusionRunner(TunableRunner):
+            """Rubin (SM107) runner for BF16/FP16 grouped GEMM + finalize fusion (FC2).
+
+            Similar to the blockscaled finalize runner but without scale factors.
+            Uses MmaF16BF16Op (K=16) for BFloat16/Float16 inputs.
+            """
+            kernel_class = Sm107ContiguousGroupedGemmFinalizeFusionKernel
+            kernel_cache = dict()
+            tuning_config_cache = dict()
+
+            def __init__(self,
+                         num_experts: int,
+                         top_k: int,
+                         num_local_experts: int,
+                         local_expert_offset: int,
+                         tile_size: int,
+                         output_dtype: torch.dtype,
+                         input_dtype: Optional[torch.dtype] = None):
+                super().__init__()
+                self.num_experts = num_experts
+                self.top_k = top_k
+                self.num_local_experts = num_local_experts
+                self.local_expert_offset = local_expert_offset
+                self.tile_size = tile_size
+
+                assert output_dtype in (torch.bfloat16, torch.float16)
+                self.output_dtype = output_dtype
+                self.input_dtype = input_dtype
+                if input_dtype is not None and input_dtype not in (
+                        torch.bfloat16, torch.float16):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} requires BF16 or FP16 input, "
+                        f"but got {input_dtype}")
+
+                if (sm_version := get_sm_version()) != 107:
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports SM 107 (Rubin) only, but got SM {sm_version}"
+                    )
+
+                if self.tile_size not in (64, 128, 256):
+                    raise ValueError(
+                        f"{self.__class__.kernel_class.__name__} supports tile_size 64, 128 and 256 only, but got {self.tile_size}"
+                    )
+
+            def unique_id(self):
+                return (
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    self.tile_size,
+                    self.output_dtype,
+                    self.input_dtype,
+                )
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple[int, int]]:
+                a, b, *_ = inputs
+                m, k = a.size(0), a.size(1)
+                l, n = b.size(0), b.size(1)  # noqa: E741
+
+                ab_dtype = cutlass.BFloat16 if a.dtype == torch.bfloat16 else cutlass.Float16
+                c_dtype = cutlass.BFloat16 if self.output_dtype == torch.bfloat16 else cutlass.Float16
+
+                # BF16/FP16 K-dimension: mma_tiler_k=64, mma_inst_k=16
+                mma_tiler_k = 64
+                mma_inst_k = 16
+
+                # BF16 (no B-reuse): CTA tile M must equal tile_size.
+                # cluster_shape_mn is always (max(1, tile_size//128), 1).
+                mma_n_candidates = [128, 256]
+                raster_along_m_candidates = [False]
+
+                mma_m = self.tile_size
+                cluster_shape_mn = (max(1, self.tile_size // 128), 1)
+
+                valid_tactics = []
+                for mma_n, raster_along_m in (itertools.product(
+                        mma_n_candidates, raster_along_m_candidates)):
+
+                    mma_tiler = (mma_m, mma_n, mma_tiler_k)
+                    mma_inst_shape = (mma_m, mma_n, mma_inst_k)
+
+                    if self.__class__.kernel_class.can_implement(
+                            a_dtype=ab_dtype,
+                            b_dtype=ab_dtype,
+                            c_dtype=c_dtype,
+                            mma_inst_shape=mma_inst_shape,
+                            mma_tiler=mma_tiler,
+                            cluster_shape_mn=cluster_shape_mn,
+                            m=m,
+                            n=n,
+                            k=k,
+                            l=l,
+                            a_major="k",
+                            b_major="k",
+                            c_major="n",
+                    ):
+                        valid_tactics.append((mma_tiler, mma_inst_shape,
+                                              cluster_shape_mn, raster_along_m))
+
+                logger.debug(
+                    f"CuteDSL Rubin BF16 GroupedGemmFinalize: Found {len(valid_tactics)} valid tactics "
+                    f"for M={m}, N={n}, K={k}, L={l}")
+                return valid_tactics
+
+            def _bf16_inputs_pre_hook_finalize(
+                    self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+                """Pre-hook for BF16 finalize (no scale factors)."""
+                a, b, output, tile_idx_to_group_idx, \
+                    tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, \
+                    num_non_exiting_tiles, token_final_scales = inputs
+
+                helper = GroupedGemmInputsHelper(self.num_experts, self.top_k,
+                                                 self.num_local_experts,
+                                                 self.local_expert_offset,
+                                                 self.tile_size)
+                num_tokens = helper.infer_num_tokens(a.size(0))
+                num_tokens_per_expert = helper.generate_num_tokens_per_expert(
+                    num_tokens, approx_max_load=True)
+                token_selected_experts = \
+                    helper.generate_token_selected_experts(
+                        num_tokens, num_tokens_per_expert)
+
+                token_selected_experts = token_selected_experts.cuda()
+                token_final_scales = torch.ones_like(token_selected_experts,
+                                                     dtype=torch.float32)
+                (
+                    tile_idx_to_group_idx,
+                    tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx,
+                    total_num_padded_tokens,
+                    num_non_exiting_tiles,
+                ) = torch.ops.trtllm.moe_sort(
+                    token_selected_experts=token_selected_experts,
+                    token_final_scales=token_final_scales,
+                    num_experts=self.num_experts,
+                    top_k=self.top_k,
+                    local_expert_offset=self.local_expert_offset,
+                    local_num_experts=self.num_local_experts,
+                    tile_tokens_dim=self.tile_size,
+                )
+                return (a, b, output, tile_idx_to_group_idx,
+                        tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles, token_final_scales)
+
+            def get_tuning_config(self) -> TuningConfig:
+                key = self.unique_id()
+                if key not in self.__class__.tuning_config_cache:
+                    helper = GroupedGemmInputsHelper(self.num_experts,
+                                                     self.top_k,
+                                                     self.num_local_experts,
+                                                     self.local_expert_offset,
+                                                     self.tile_size)
+                    # BF16 finalize input layout (8 tensors):
+                    #   0: a, 1: b, 2: c (output),
+                    #   3: tile_idx_to_group_idx, 4: tile_idx_to_mn_limit,
+                    #   5: permuted_idx_to_expanded_idx, 6: num_non_exiting_tiles,
+                    #   7: token_final_scales
+                    self.__class__.tuning_config_cache[key] = TuningConfig(
+                        dynamic_tensor_specs=(DynamicTensorSpec(
+                            0, 0, helper.gen_tuning_buckets,
+                            helper.map_to_tuning_buckets), ),
+                        constraint_specs=(
+                            ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(3, 0,
+                                           helper.infer_shape_max_num_tiles),
+                            ConstraintSpec(4, 0,
+                                           helper.infer_shape_max_num_tiles),
+                            ConstraintSpec(
+                                5, 0,
+                                helper.infer_shape_max_num_permuted_tokens),
+                            ConstraintSpec(7, 0, helper.infer_shape_num_tokens),
+                        ),
+                        inputs_pre_hook=self._bf16_inputs_pre_hook_finalize,
+                    )
+                return self.__class__.tuning_config_cache[key]
+
+            def forward(self, inputs: List[torch.Tensor],
+                        tactic: Optional[tuple]) -> torch.Tensor:
+                a, b, c, tile_idx_to_group_idx, tile_idx_to_mn_limit, permuted_idx_to_expanded_idx, num_non_exiting_tiles, token_final_scales = inputs
+                assert a.dtype in (torch.bfloat16, torch.float16)
+                assert a.dim() == 2
+                assert b.dtype == a.dtype
+                assert b.dim() == 3
+
+                ab_dtype = cutlass.BFloat16 if a.dtype == torch.bfloat16 else cutlass.Float16
+                c_cutlass_dtype = cutlass.BFloat16 if c.dtype == torch.bfloat16 else cutlass.Float16
+
+                m, k = a.size(0), a.size(1)
+                l, n = b.size(0), b.size(1)  # noqa: E741
+                assert m % self.tile_size == 0
+                assert b.size(2) == k
+
+                assert c.dtype == self.output_dtype
+                assert c.dim() == 2
+                num_tokens = c.size(0)
+                assert c.size(1) == n or c.size(1) == n * 2
+
+                locality_domain_id = get_current_locality_domain()
+                locality_domain_half_gemm = locality_domain_id is not None
+                if locality_domain_half_gemm:
+                    assert locality_domain_id in (
+                        0,
+                        1), f"Invalid locality domain id: {locality_domain_id}"
+                    assert c.size(1) == n * 2, \
+                        f"[locality domain] BF16 FC2 output must be 2x width: c.size(1)={c.size(1)}, n={n}"
+                    c_stride_row_val = cutlass.Int64(c.size(1))
+                    c = c[:,
+                          locality_domain_id * n:(locality_domain_id + 1) * n]
+                else:
+                    c_stride_row_val = cutlass.Int64(0)
+
+                num_tiles = m // self.tile_size
+                assert tile_idx_to_group_idx.dtype == torch.int32
+                assert tile_idx_to_group_idx.size() == (num_tiles, )
+                assert tile_idx_to_mn_limit.dtype == torch.int32
+                assert tile_idx_to_mn_limit.size() == (num_tiles, )
+                assert permuted_idx_to_expanded_idx.dtype == torch.int32
+                assert permuted_idx_to_expanded_idx.size() == (m, )
+                assert num_non_exiting_tiles.dtype == torch.int32
+                assert num_non_exiting_tiles.numel() == 1
+                assert token_final_scales.dtype == torch.float32
+                assert token_final_scales.dim() == 2
+                assert token_final_scales.size() == (num_tokens, self.top_k)
+
+                a_ptr = make_ptr(ab_dtype,
+                                 a.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(ab_dtype,
+                                 b.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                tile_idx_to_group_idx_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_group_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                tile_idx_to_mn_limit_ptr = make_ptr(
+                    cutlass.Int32, tile_idx_to_mn_limit.data_ptr(),
+                    cute.AddressSpace.gmem)
+                permuted_idx_to_expanded_idx_ptr = make_ptr(
+                    cutlass.Int32, permuted_idx_to_expanded_idx.data_ptr(),
+                    cute.AddressSpace.gmem)
+                num_non_exiting_tiles_ptr = make_ptr(
+                    cutlass.Int32, num_non_exiting_tiles.data_ptr(),
+                    cute.AddressSpace.gmem)
+                token_final_scales_ptr = make_ptr(cutlass.Float32,
+                                                  token_final_scales.data_ptr(),
+                                                  cute.AddressSpace.gmem)
+                c_ptr = make_ptr(c_cutlass_dtype,
+                                 c.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+
+                torch_stream = torch.cuda.current_stream()
+                stream = cuda.CUstream(torch_stream.cuda_stream)
+
+                if isinstance(tactic, tuple):
+                    mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m = tactic
+                else:
+                    # Default tactic for Rubin BF16/FP16
+                    mma_tiler = (self.tile_size, 128, 64)
+                    mma_inst_shape = (self.tile_size, 128, 16)
+                    cluster_shape_mn = (max(1, self.tile_size // 128), 1)
+                    raster_along_m = False
+
+                max_active_clusters = get_max_activate_clusters(
+                    cluster_shape_mn[0] * cluster_shape_mn[1])
+                cache_key = (a.dtype, c.dtype, self.tile_size, self.top_k,
+                             mma_tiler, mma_inst_shape, cluster_shape_mn,
+                             raster_along_m, locality_domain_half_gemm,
+                             max_active_clusters)
+                if cache_key not in self.__class__.kernel_cache:
+                    gemm = self.__class__.kernel_class(
+                        mma_inst_shape=mma_inst_shape,
+                        mma_tiler=mma_tiler,
+                        cluster_shape_mn=cluster_shape_mn,
+                        raster_along_m=raster_along_m,
+                        topK=self.top_k,
+                    )
+                    compiled_gemm = cute.compile(
+                        gemm.wrapper,
+                        a_ptr,
+                        b_ptr,
+                        c_ptr,
+                        tile_idx_to_group_idx_ptr,
+                        tile_idx_to_mn_limit_ptr,
+                        permuted_idx_to_expanded_idx_ptr,
+                        num_non_exiting_tiles_ptr,
+                        token_final_scales_ptr,
+                        m,
+                        n,
+                        k,
+                        l,
+                        num_tokens,
+                        self.top_k,
+                        tile_size=self.tile_size,
+                        max_active_clusters=max_active_clusters,
+                        stream=stream,
+                        c_stride_row=c_stride_row_val,
+                    )
+                    self.__class__.kernel_cache[cache_key] = compiled_gemm
+                else:
+                    compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
+                    tile_idx_to_group_idx_ptr,
+                    tile_idx_to_mn_limit_ptr,
+                    permuted_idx_to_expanded_idx_ptr,
+                    num_non_exiting_tiles_ptr,
+                    token_final_scales_ptr,
+                    m,
+                    n,
+                    k,
+                    l,
+                    num_tokens,
+                    self.top_k,
+                    stream=stream,
+                    c_stride_row=c_stride_row_val,
+                )
+                return c
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin",
+            mutates_args=("output", ),
+            device_types="cuda")
+        def cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            tuner = AutoTuner.get()
+
+            runner = Sm107ContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                input_dtype=input.dtype)
+
+            inputs = [
+                input, weight, output, tile_idx_to_group_idx,
+                tile_idx_to_mn_limit, permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles, token_final_scales
+            ]
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        def cute_dsl_bf16_grouped_gemm_finalize_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            num_tokens = token_final_scales.size(0)
+            n = weight.size(1)
+            output = torch.zeros(num_tokens,
+                                 n,
+                                 dtype=output_dtype,
+                                 device=input.device)
+            torch.ops.trtllm.cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin(
+                input=input,
+                weight=weight,
+                output=output,
+                tile_idx_to_group_idx=tile_idx_to_group_idx,
+                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles=num_non_exiting_tiles,
+                token_final_scales=token_final_scales,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_local_experts,
+                local_expert_offset=local_expert_offset,
+                tile_size=tile_size,
+                output_dtype=output_dtype,
+            )
+            return output
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            return
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_locality_domain_inplace_rubin",
+            mutates_args=("output", ),
+            schema="(Tensor input, Tensor weight_0, Tensor weight_1, "
+            "Tensor(a!) output, Tensor tile_idx_to_group_idx, "
+            "Tensor tile_idx_to_mn_limit, "
+            "Tensor expanded_idx_to_permuted_idx, "
+            "Tensor permuted_idx_to_expanded_idx, "
+            "Tensor num_non_exiting_tiles, Tensor token_final_scales, "
+            "SymInt num_experts, SymInt top_k, SymInt num_local_experts, "
+            "SymInt local_expert_offset, SymInt tile_size, "
+            "ScalarType output_dtype, SymInt ep_size, "
+            "bool enable_alltoall=False) -> ()",
+            device_types="cuda")
+        def cute_dsl_bf16_grouped_gemm_finalize_locality_domain_inplace_rubin(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            ep_size: int,
+            enable_alltoall: bool = False,
+        ) -> None:
+            """Tune and launch both Rubin locality domain BF16 MoE FC2 partitions.
+
+            The MoE outer runner primes this op before CUDA graph capture.
+            Direct callers must likewise invoke it once before capture.
+            """
+            if weight_0.shape != weight_1.shape:
+                raise ValueError(
+                    "locality domain BF16 MoE FC2 weight shards must have identical "
+                    f"shapes, got {tuple(weight_0.shape)} and "
+                    f"{tuple(weight_1.shape)}.")
+            if weight_0.dtype != weight_1.dtype:
+                raise ValueError(
+                    "locality domain BF16 MoE FC2 weight shards must have identical "
+                    f"dtypes, got {weight_0.dtype} and {weight_1.dtype}.")
+            if output.dtype != output_dtype:
+                raise ValueError(
+                    "locality domain BF16 MoE FC2 output tensor dtype must match "
+                    f"output_dtype, got {output.dtype} and {output_dtype}.")
+
+            runtime = LocalityDomainRuntime(num_partitions=2)
+            # Preserve the pre-refactor leaf namespace for cache compatibility.
+            tuner_key = (
+                "trtllm::cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin")
+            op_runner = Sm107ContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                input_dtype=input.dtype,
+            )
+            inputs = [
+                input,
+                weight_0,
+                output,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                token_final_scales,
+            ]
+
+            def launch_partition(
+                partition_id: int,
+                partition_inputs: List[torch.Tensor],
+                tactic,
+            ) -> None:
+                weight = weight_0 if partition_id == 0 else weight_1
+                torch.ops.trtllm.cute_dsl_bf16_grouped_gemm_finalize_inplace_rubin(
+                    input=partition_inputs[0],
+                    weight=weight,
+                    output=partition_inputs[2],
+                    tile_idx_to_group_idx=partition_inputs[3],
+                    tile_idx_to_mn_limit=partition_inputs[4],
+                    permuted_idx_to_expanded_idx=partition_inputs[5],
+                    num_non_exiting_tiles=partition_inputs[6],
+                    token_final_scales=partition_inputs[7],
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_local_experts=num_local_experts,
+                    local_expert_offset=local_expert_offset,
+                    tile_size=tile_size,
+                    output_dtype=output_dtype,
+                    precomputed_tactic=repr(tactic),
+                )
+
+            runner, best_tactic = tune_locality_domain_concurrent(
+                tuner_key,
+                op_runner,
+                runtime,
+                2,
+                launch_partition,
+                inputs,
+                op_runner.get_tuning_config(),
+            )
+            # Restore the same selective zero baseline used by the backend
+            # before the real dual-partition finalize launch.
+            if AutoTuner.get().is_tuning_mode:
+                torch.ops.trtllm.moe_output_memset_inplace(
+                    input=output,
+                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+                    num_non_exiting_tiles=num_non_exiting_tiles,
+                    tile_tokens_dim=tile_size,
+                    top_k=top_k,
+                    ep_size=ep_size,
+                    enable_alltoall=enable_alltoall,
+                )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_locality_domain_inplace_rubin"
+        )
+        def _(
+            input: torch.Tensor,
+            weight_0: torch.Tensor,
+            weight_1: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            expanded_idx_to_permuted_idx: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            ep_size: int,
+            enable_alltoall: bool = False,
+        ) -> None:
+            return None
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_bf16_grouped_gemm_finalize_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            num_tokens = token_final_scales.size(0)
+            n = weight.size(1)
+            return torch.empty(num_tokens,
+                               n,
+                               dtype=output_dtype,
+                               device=input.device)

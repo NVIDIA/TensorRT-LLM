@@ -29,12 +29,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from utils.util import skip_pre_ada
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora, reference_swiglu_moe_lora
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
-from tests.unittest.utils.util import skip_pre_ada
 
 _TRTLLM_AVAILABLE = hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_moe")
 

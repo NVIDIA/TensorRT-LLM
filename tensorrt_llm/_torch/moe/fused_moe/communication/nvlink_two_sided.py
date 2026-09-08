@@ -23,10 +23,12 @@ NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 
 import os
 from typing import List, Optional, Tuple
+from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._mnnvl_utils import MnnvlCheckpointCommunicator, MnnvlMemory, MnnvlMoe
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import _collect_active_ranks
 from tensorrt_llm.mapping import Mapping
 
 from .base import Communication
@@ -42,6 +44,8 @@ class NVLinkTwoSided(Communication):
     The required symmetric memory size is proportional to the communication channels opened.
     """
 
+    _INSTANCES: WeakSet = WeakSet()
+
     def __init__(
         self,
         mapping: Mapping,
@@ -52,6 +56,11 @@ class NVLinkTwoSided(Communication):
         alltoall_result_do_sum: bool = False,
     ):
         super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkTwoSided does not support Helix context parallelism because "
+                "its MNNVL communicator covers only the tensor-parallel group"
+            )
 
         # Store needed parameters
         self.num_experts = num_experts
@@ -76,6 +85,7 @@ class NVLinkTwoSided(Communication):
 
         # Initialize dispatch state
         self._dispatch_state = {}
+        self._INSTANCES.add(self)
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -99,6 +109,67 @@ class NVLinkTwoSided(Communication):
         """
         return True
 
+    def checkpoint_resource_key(self) -> int:
+        """Identify the process-global TRT-native two-sided workspaces."""
+        return id(MnnvlMoe)
+
+    def checkpoint_prepare(self) -> None:
+        """Detach TRT-native two-sided workspaces after global quiescence."""
+        workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        if all(workspace is None or not workspace.mapped for workspace in workspaces):
+            MnnvlMoe.checkpoint_prepare()
+            return
+        local_clients_idle = not any(instance._dispatch_state for instance in self._INSTANCES)
+        workspace = MnnvlMoe.moe_workspace
+        assert workspace is not None
+        comm = workspace.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
+        try:
+            active_ranks = _collect_active_ranks(
+                comm,
+                local_clients_idle=local_clients_idle,
+                expected_size=self.ep_size,
+            )
+        except TimeoutError:
+            for candidate in workspaces:
+                if candidate is not None:
+                    candidate.checkpoint_fail_closed()
+            raise
+        if active_ranks:
+            raise RuntimeError(
+                f"Cannot checkpoint during an active MoE All-to-All phase on ranks {active_ranks}"
+            )
+        MnnvlMoe.checkpoint_prepare()
+
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
+        """Restore TRT-native two-sided workspaces and protocol state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocations. Every rank must call this method
+                symmetrically.
+        """
+        workspace = MnnvlMoe.moe_workspace or MnnvlMoe.moe_prepare_workspace
+        if comm is None and workspace is not None:
+            comm = workspace.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
+        restore_required = any(
+            workspace is not None and not workspace.mapped
+            for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
+        )
+        MnnvlMoe.checkpoint_restore(comm)
+        if not restore_required:
+            return
+        for instance in self._INSTANCES:
+            instance._dispatch_state = {}
+
     def prepare_dispatch(
         self,
         token_selected_slots: torch.Tensor,
@@ -108,6 +179,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm prepare dispatch: gather EPLB statistics and prepare alltoall_info.
         """
+        MnnvlMoe.require_mapped()
         all_rank_max_num_tokens = max(all_rank_num_tokens)
         top_k = token_selected_slots.shape[1]
 
@@ -144,6 +216,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm dispatch (post-quant, uses alltoall_info from prepare_dispatch).
         """
+        MnnvlMoe.require_mapped()
         # Read alltoall_info from dispatch_state (set by prepare_dispatch)
         alltoall_info = self._dispatch_state.get("alltoall_info")
         if alltoall_info is None:
@@ -189,6 +262,7 @@ class NVLinkTwoSided(Communication):
         """
         NVLINK two-sided comm combine - reads from self._dispatch_state.
         """
+        MnnvlMoe.require_mapped()
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
 
@@ -204,4 +278,5 @@ class NVLinkTwoSided(Communication):
             do_reduce=self.alltoall_result_do_sum,
         )
 
+        self._dispatch_state = {}
         return final_hidden_states

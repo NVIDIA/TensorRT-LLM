@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 from unittest.mock import patch
 
@@ -11,8 +9,6 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.speculative.speculation_gate import SpeculationGate
 from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
 from tensorrt_llm.logger import logger
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 @pytest.fixture(scope="function")

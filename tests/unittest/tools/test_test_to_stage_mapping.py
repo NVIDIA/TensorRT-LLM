@@ -8,15 +8,13 @@ from types import SimpleNamespace
 
 import pytest
 
-pytestmark = pytest.mark.cpu_only
-
-# Add scripts directory to path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
-SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
-sys.path.insert(0, SCRIPTS_DIR)
-
+__extra_import_path__ = ["~/scripts"]
 from test_to_stage_mapping import StageQuery
 
+pytestmark = pytest.mark.cpu_only
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
 GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')

@@ -51,7 +51,7 @@ def _get_trtllm_gen_unavailability_reason() -> Optional[str]:
     if not IS_FLASHINFER_AVAILABLE:
         return "flashinfer is not installed"
 
-    from ..attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 
     missing_ops = FlashInferTrtllmGenFmha._missing_fused_nanobind_ops()
     if missing_ops:
@@ -73,7 +73,7 @@ def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
 
     import flashinfer
 
-    from ..attention_backend.fmha.flashinfer_trtllm_gen import (
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import (
         _get_multi_ctas_kv_counter_size,
         _get_workspace_size,
     )
@@ -97,7 +97,7 @@ def validate_dflash_trtllm_gen_runtime(
     has_context_attention: bool,
 ) -> None:
     """Fail before cache allocation when DFlash's kernel shape is unsupported."""
-    from ..attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 
     get_dflash_trtllm_gen_ops()
     if dtype not in FlashInferTrtllmGenFmha.SUPPORTED_INPUT_DTYPES:

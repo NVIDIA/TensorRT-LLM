@@ -153,6 +153,10 @@ void initRequestBindings(nb::module_& m)
             nb::arg("num_return_sequences") = nb::none(),
             nb::arg("min_p") = nb::none(),
             nb::arg("beam_width_array") = nb::none())               // clang-format on
+        // Copy constructor. LlmRequest used to take a distinct runtime::SamplingConfig built from
+        // an executor one, so callers spell `SamplingConfig(params._get_sampling_config())`; keep
+        // that form working now that both sides are the same type.
+        .def(nb::init<tle::SamplingConfig const&>(), nb::arg("sampling_config"))
         .def_prop_rw("beam_width", &tle::SamplingConfig::getBeamWidth, &tle::SamplingConfig::setBeamWidth)
         .def_prop_rw("top_k", &tle::SamplingConfig::getTopK, &tle::SamplingConfig::setTopK)
         .def_prop_rw("top_p", &tle::SamplingConfig::getTopP, &tle::SamplingConfig::setTopP)
@@ -243,29 +247,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
         .def("__getstate__", outputConfigGetstate)
         .def("__setstate__", outputConfigSetstate);
-
-    auto externalDraftTokensConfigGetstate = [](tle::ExternalDraftTokensConfig const& self)
-    { return nb::make_tuple(self.getTokens(), self.getLogits(), self.getAcceptanceThreshold()); };
-    auto externalDraftTokensConfigSetstate
-        = [](tle::ExternalDraftTokensConfig& externalDraftTokensConfig, nb::tuple const& state)
-    {
-        if (state.size() != 3)
-        {
-            throw std::runtime_error("Invalid ExternalDraftTokensConfig state!");
-        }
-        new (&externalDraftTokensConfig) tle::ExternalDraftTokensConfig(nb::cast<VecTokens>(state[0]),
-            nb::cast<std::optional<Tensor>>(state[1]), nb::cast<std::optional<FloatType>>(state[2]));
-    };
-    nb::class_<tle::ExternalDraftTokensConfig>(m, "ExternalDraftTokensConfig")
-        .def(nb::init<VecTokens, std::optional<Tensor>, std::optional<FloatType> const&, std::optional<bool>>(),
-            nb::arg("tokens"), nb::arg("logits") = nb::none(), nb::arg("acceptance_threshold") = nb::none(),
-            nb::arg("fast_logits") = nb::none())
-        .def_prop_ro("tokens", &tle::ExternalDraftTokensConfig::getTokens)
-        .def_prop_ro("logits", &tle::ExternalDraftTokensConfig::getLogits)
-        .def_prop_ro("acceptance_threshold", &tle::ExternalDraftTokensConfig::getAcceptanceThreshold)
-        .def("__getstate__", externalDraftTokensConfigGetstate)
-        .def("__setstate__", externalDraftTokensConfigSetstate)
-        .def_prop_ro("fast_logits", &tle::ExternalDraftTokensConfig::getFastLogits);
 
     auto promptTuningConfigGetstate = [](tle::PromptTuningConfig const& self)
     { return nb::make_tuple(self.getEmbeddingTable(), self.getInputTokenExtraIds()); };
@@ -545,34 +526,6 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", ContextPhaseParamsGetState)
         .def("__setstate__", ContextPhaseParamsSetState);
 
-    auto EagleDecodingConfigGetstate = [](tle::EagleConfig const& self)
-    {
-        return nb::make_tuple(self.getEagleChoices(), self.isGreedySampling(), self.getPosteriorThreshold(),
-            self.useDynamicTree(), self.getDynamicTreeMaxTopK());
-    };
-    auto EagleDecodingConfigSetstate = [](tle::EagleConfig& self, nb::tuple const& state)
-    {
-        if (state.size() != 5)
-        {
-            throw std::runtime_error("Invalid EagleConfig state!");
-        }
-        new (&self) tle::EagleConfig(nb::cast<std::optional<tle::EagleChoices>>(state[0]), nb::cast<bool>(state[1]),
-            nb::cast<std::optional<float>>(state[2]), nb::cast<bool>(state[3]),
-            nb::cast<std::optional<SizeType32>>(state[4]));
-    };
-    nb::class_<tle::EagleConfig>(m, "EagleConfig")
-        .def(nb::init<std::optional<tle::EagleChoices>, bool, std::optional<float>, bool, std::optional<SizeType32>>(),
-            nb::arg("eagle_choices") = nb::none(), nb::arg("greedy_sampling") = true,
-            nb::arg("posterior_threshold") = nb::none(), nb::arg("use_dynamic_tree") = false,
-            nb::arg("dynamic_tree_max_topK") = nb::none())
-        .def_prop_ro("eagle_choices", &tle::EagleConfig::getEagleChoices)
-        .def_prop_ro("greedy_sampling", &tle::EagleConfig::isGreedySampling)
-        .def_prop_ro("posterior_threshold", &tle::EagleConfig::getPosteriorThreshold)
-        .def_prop_ro("use_dynamic_tree", &tle::EagleConfig::useDynamicTree)
-        .def_prop_ro("dynamic_tree_max_topK", &tle::EagleConfig::getDynamicTreeMaxTopK)
-        .def("__getstate__", EagleDecodingConfigGetstate)
-        .def("__setstate__", EagleDecodingConfigSetstate);
-
     // Guided decoding params
     auto pyGuidedDecodingParams = nb::class_<tle::GuidedDecodingParams>(m, "GuidedDecodingParams");
 
@@ -616,18 +569,18 @@ void initRequestBindings(nb::module_& m)
             reinterpret_cast<char const*>(inputTokenIds.data()), inputTokenIds.size() * sizeof(VecTokens::value_type));
         return nb::make_tuple(std::move(inputTokenIdsBytes), self.getMaxTokens(), self.getStreaming(),
             self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
-            self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getExternalDraftTokensConfig(),
-            self.getPromptTuningConfig(), self.getMultimodalInput(), self.getMultimodalEmbedding(),
-            self.getMropeConfig(), self.getLoraConfig(), self.getLookaheadConfig(), self.getKvCacheRetentionConfig(),
-            self.getLogitsPostProcessorName(), self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(),
-            self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(),
-            self.getContextPhaseParams(), self.getEncoderInputFeatures(), self.getEncoderOutputLength(),
-            self.getCrossAttentionMask(), self.getEagleConfig(), self.getSkipCrossAttnBlocks(),
-            self.getGuidedDecodingParams(), self.getDisaggRequestId(), self.getCacheSalt());
+            self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getPromptTuningConfig(),
+            self.getMultimodalInput(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
+            self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
+            self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
+            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
+            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
+            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
+            self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 35)
+        if (state.size() != 33)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -650,22 +603,20 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
             nb::cast<std::optional<std::list<VecTokens>>>(state[8]),
             nb::cast<std::optional<std::list<VecTokens>>>(state[9]), nb::cast<std::optional<Tensor>>(state[10]),
-            nb::cast<std::optional<tle::ExternalDraftTokensConfig>>(state[11]),
-            nb::cast<std::optional<tle::PromptTuningConfig>>(state[12]),
-            nb::cast<std::optional<tle::MultimodalInput>>(state[13]), nb::cast<std::optional<Tensor>>(state[14]),
-            nb::cast<std::optional<tle::MropeConfig>>(state[15]), nb::cast<std::optional<tle::LoraConfig>>(state[16]),
-            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[17]),
-            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[18]),
-            nb::cast<std::optional<std::string>>(state[19]),
-            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[20]), nb::cast<std::optional<VecTokens>>(state[21]),
-            nb::cast<std::optional<IdType>>(state[22]), nb::cast<bool>(state[23]),
-            nb::cast<tle::PriorityType>(state[24]), nb::cast<tle::RequestType>(state[25]),
-            nb::cast<std::optional<tle::ContextPhaseParams>>(state[26]),
-            nb::cast<std::optional<tle::Tensor>>(state[27]), nb::cast<std::optional<SizeType32>>(state[28]),
-            nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
-            nb::cast<std::optional<tle::Tensor>>(state[31]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
+            nb::cast<std::optional<tle::PromptTuningConfig>>(state[11]),
+            nb::cast<std::optional<tle::MultimodalInput>>(state[12]), nb::cast<std::optional<Tensor>>(state[13]),
+            nb::cast<std::optional<tle::MropeConfig>>(state[14]), nb::cast<std::optional<tle::LoraConfig>>(state[15]),
+            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[16]),
+            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[17]),
+            nb::cast<std::optional<std::string>>(state[18]),
+            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[19]), nb::cast<std::optional<VecTokens>>(state[20]),
+            nb::cast<std::optional<IdType>>(state[21]), nb::cast<bool>(state[22]),
+            nb::cast<tle::PriorityType>(state[23]), nb::cast<tle::RequestType>(state[24]),
+            nb::cast<std::optional<tle::ContextPhaseParams>>(state[25]),
+            nb::cast<std::optional<tle::Tensor>>(state[26]), nb::cast<std::optional<SizeType32>>(state[27]),
+            nb::cast<std::optional<tle::Tensor>>(state[28]), 1, nb::cast<std::optional<tle::Tensor>>(state[29]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[30]), std::nullopt, std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[31]), nb::cast<std::optional<std::string>>(state[32]));
     };
 
     // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
@@ -699,9 +650,7 @@ void initRequestBindings(nb::module_& m)
                 tle::OutputConfig const& output_config, std::optional<tle::SizeType32> const& end_id,
                 std::optional<tle::SizeType32> const& pad_id, std::optional<std::vector<SizeType32>> position_ids,
                 std::optional<std::list<tle::VecTokens>> bad_words, std::optional<std::list<tle::VecTokens>> stop_words,
-                std::optional<tle::Tensor> embedding_bias,
-                std::optional<tle::ExternalDraftTokensConfig> external_draft_tokens_config,
-                std::optional<tle::PromptTuningConfig> prompt_tuning_config,
+                std::optional<tle::Tensor> embedding_bias, std::optional<tle::PromptTuningConfig> prompt_tuning_config,
                 std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::Tensor> multimodal_embedding,
                 std::optional<tle::MropeConfig> mrope_config, std::optional<tle::LoraConfig> lora_config,
                 std::optional<tle::LookaheadDecodingConfig> lookahead_config,
@@ -713,7 +662,7 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
                 std::optional<tle::Tensor> cross_attention_mask, SizeType32 num_return_sequences,
-                std::optional<tle::EagleConfig> eagle_config, std::optional<tle::Tensor> skip_cross_attn_blocks,
+                std::optional<tle::Tensor> skip_cross_attn_blocks,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
@@ -721,15 +670,15 @@ void initRequestBindings(nb::module_& m)
             {
                 new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
                     output_config, end_id, pad_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
-                    std::move(embedding_bias), std::move(external_draft_tokens_config), std::move(prompt_tuning_config),
-                    std::move(multimodal_input), std::move(multimodal_embedding), std::move(mrope_config),
-                    std::move(lora_config), std::move(lookahead_config), std::move(kv_cache_retention_config),
+                    std::move(embedding_bias), std::move(prompt_tuning_config), std::move(multimodal_input),
+                    std::move(multimodal_embedding), std::move(mrope_config), std::move(lora_config),
+                    std::move(lookahead_config), std::move(kv_cache_retention_config),
                     std::move(logits_post_processor_name), std::move(logits_post_processor),
                     std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
-                    std::move(cross_attention_mask), num_return_sequences, std::move(eagle_config),
-                    std::move(skip_cross_attn_blocks), std::move(guided_decoding_params), language_adapter_uid,
-                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
+                    std::move(cross_attention_mask), num_return_sequences, std::move(skip_cross_attn_blocks),
+                    std::move(guided_decoding_params), language_adapter_uid, allotted_time_ms, disagg_request_id,
+                    std::move(cache_salt));
             },
             // clang-format off
         nb::arg("input_token_ids"),
@@ -744,7 +693,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("bad_words") = nb::none(),
         nb::arg("stop_words") = nb::none(),
         nb::arg("embedding_bias") = nb::none(),
-        nb::arg("external_draft_tokens_config") = nb::none(),
         nb::arg("prompt_tuning_config") = nb::none(),
         nb::arg("multimodal_input") = nb::none(),
         nb::arg("multimodal_embedding") = nb::none(),
@@ -764,7 +712,6 @@ void initRequestBindings(nb::module_& m)
         nb::arg("encoder_output_length") = nb::none(),
         nb::arg("cross_attention_mask") = nb::none(),
         nb::arg("num_return_sequences") = 1,
-        nb::arg("eagle_config") = nb::none(),
         nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
@@ -784,8 +731,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("bad_words", &tle::Request::getBadWords, &tle::Request::setBadWords)
         .def_prop_rw("stop_words", &tle::Request::getStopWords, &tle::Request::setStopWords)
         .def_prop_rw("embedding_bias", &tle::Request::getEmbeddingBias, &tle::Request::setEmbeddingBias)
-        .def_prop_rw("external_draft_tokens_config", &tle::Request::getExternalDraftTokensConfig,
-            &tle::Request::setExternalDraftTokensConfig)
         .def_prop_rw("prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
         .def_prop_rw("multimodal_input", &tle::Request::getMultimodalInput, &tle::Request::setMultimodalInput)
         .def_prop_rw(
@@ -808,7 +753,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
         .def_prop_rw("cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
-        .def_prop_rw("eagle_config", &tle::Request::getEagleConfig, &tle::Request::setEagleConfig)
         .def_prop_rw(
             "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks)
         .def_prop_rw(

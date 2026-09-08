@@ -21,12 +21,15 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, EncoderCUDAGraphRunner, EncoderCUDAGraphRunnerConfig,
-    KeyType, _restore_spec_decode_capture_state,
+    KeyType, SampleType, _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state)
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
+    setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
-    _filter_cuda_graph_batch_sizes, _make_single_token_context_graph_batch)
+    _filter_cuda_graph_batch_sizes, _get_context_prompt_lookahead_token,
+    _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
@@ -41,8 +44,10 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
 # isort: on
 from utils.util import skip_ray
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.interface import \
+    INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -171,6 +176,30 @@ def _create_request_with_tokens(tokens: list[int], req_id: int) -> LlmRequest:
     return request
 
 
+def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
+    """An internal chunk hands back the next prompt token; the last one does not.
+
+    The boundary is read off the request's live chunking state rather than a
+    Python-side prompt length, which a preemption leaves stale.
+    """
+    request = _create_request_with_tokens([10, 11, 12, 13, 14], 1)
+
+    request.context_chunk_size = 2
+    assert _get_context_prompt_lookahead_token(request, 2) == 12
+
+    # A reused prefix advances the live cursor while py_prompt_len remains the
+    # original prompt length. Internal chunk [2, 4) still looks up token 4.
+    request.context_current_position = 2
+    request.context_chunk_size = 2
+    assert _get_context_prompt_lookahead_token(request, 4) == 14
+
+    # Final chunk [2, 5): nothing follows in the prompt, so the drafter falls
+    # back to the token the target just sampled.
+    request.context_chunk_size = 3
+    assert (_get_context_prompt_lookahead_token(
+        request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
+
+
 def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=req_id,
@@ -182,7 +211,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_draft_tokens=[],
         py_is_first_draft=False,
         is_context_only_request=False,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         py_disaggregated_params=None,
         py_multimodal_data=None,
         py_mm_encoder_event=None,
@@ -227,6 +256,7 @@ def _make_forward_only_engine(
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
+    engine._stage_in_graph_sampling = None
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
@@ -445,7 +475,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)
-        context.is_generation_only_request = lambda: True
+        context.is_generation_only_request = True
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [context]
         graph_batch, promoted_ids = _make_single_token_context_graph_batch(
@@ -622,6 +652,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = True
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -648,6 +679,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_aggregates_encoder_tokens(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner.max_beam_width = 1
         runner._get_seq_len_mode.return_value = False
         context = _make_request_stub(1)
@@ -672,6 +704,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         first_context = _make_request_stub(1)
         first_context.encoder_output_len = 7
@@ -718,6 +751,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_includes_peft_cache_dtype(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -775,6 +809,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_includes_lora_variant(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -856,7 +891,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids, None, False)
+                                                     promoted_ids, None, False,
+                                                     None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -1154,6 +1190,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "encoder_decoder",
             "encode_only",
             "mm_encoder_only",
+            "ple_recurrent_state",
+            "nested_ple_recurrent_state",
             "context_parallel",
         )
         for case in cases:
@@ -1177,6 +1215,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine._is_encode_only = True
                 elif case == "mm_encoder_only":
                     engine.llm_args.mm_encoder_only = True
+                elif case == "ple_recurrent_state":
+                    engine.model.has_ple = True
+                elif case == "nested_ple_recurrent_state":
+                    engine.model.model = SimpleNamespace(llm=SimpleNamespace(
+                        model=SimpleNamespace(has_ple=True)))
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
 
@@ -1648,7 +1691,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           max_num_tokens=32,
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
-        spec_metadata = Mock()
+        # A bare Mock auto-vivifies every attribute, so optional metadata
+        # fields read by _prepare_tp_inputs must be pinned off explicitly.
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
 
         context = _create_request_with_tokens([11, 22, 33, 44], 1)
         context.context_current_position = 3
@@ -1736,18 +1784,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         for max_tokens_per_item, expected_max_seq_len in cases:
             with self.subTest(max_tokens_per_item=max_tokens_per_item):
                 encoder = CapturingEncoder()
-                model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-                model_engine.model = torch.nn.Sequential(encoder)
-                model_engine.encoder_max_num_tokens = encoder_max_num_tokens
-                model_engine.mm_encoder_attention_metadata_capacity = None
                 if max_tokens_per_item is None:
-                    model_engine.input_processor = Mock()
+                    input_processor = Mock()
                 else:
-                    model_engine.input_processor = Mock(
+                    input_processor = Mock(
                         spec=BaseMultimodalDummyInputsBuilder)
-                    model_engine.input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+                    input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
 
-                model_engine._set_up_multimodal_encoder_attn_metadata()
+                setup_mm_encoder_attn_metadata(torch.nn.Sequential(encoder),
+                                               input_processor,
+                                               encoder_max_num_tokens, None)
 
                 self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)

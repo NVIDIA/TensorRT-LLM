@@ -3,27 +3,25 @@
 Iteratively **applies** TensorRT-LLM serving optimizations — the acting
 counterpart to `perf-analyze` (which only diagnoses). Measures a
 `trtllm-serve` baseline, plans evidence-grounded optimizations into a
-machine-readable `roadmap.yaml`, applies them one at a time, gates every
-change on code quality / functionality / measured gain (with an nsys
-capture of every accepted state), runs the configured number of rounds,
+machine-readable `roadmap.yaml`, evaluates a round's selected items in
+serial or parallel worktrees, integrates parallel candidate-ready results, gates every
+change on code quality / functionality / measured gain, runs the configured number of rounds,
 independently verifies the final state, and reports expected-vs-measured
 results.
 
-```
-benchmarker ──▶  projector  ──▶ ┌── round loop (max_rounds; deterministic breaks) ──┐ ──▶ qa ──▶ reporter
- (baseline)     (SOL ceiling,   │ analyzer ──▶ ┌─ item loop (≤ max_items_per_round)─┐│   (final     (report)
-                 on unless      │ (roadmap     │ optimizer ◀──▶ evaluator           ││    verification)
-                 sol.enabled:   │  ranked by   │ (apply next    (gate → APPROVE |   ││
-                 false)         │  benefit;    │  pending item)  REJECT | PUSH_BACK;││
-                                │  profiles    │                 ≤ max_attempts     ││
-                                │  after an    │                 _per_item retries) ││
-                                │  accept,     └────────────────────────────────────┘│
-                                │  else re-plans, no GPU)                             │
-                                └─────────────────────────────────────────────────────┘
-
---reuse-analysis <dir> imports a previous perf-analyze / perf-optimize
+`--reuse-analysis <dir>` imports a previous perf-analyze / perf-optimize
 run's baseline, SOL projection and profile, starting the campaign at the
 optimize stage (round 1's analyzer then plans without profiling).
+```
+benchmarker ──▶ (projector) ──▶ ┌──── round loop (max_rounds) ─────────────────────────┐ ──▶ qa ──▶ reporter
+ (baseline)     (SOL ceiling)   │ analyzer ──▶ optimizer ⇄ evaluator item pairs         │   (final     (report)
+                                │               (serial or parallel worktrees;          │ verification)
+                                │                ≤ max_attempts_per_item)               │
+                                │                         │                             │
+                                │                         ▼ (parallel only)              │
+                                │                    integrator                         │
+                                │            (combine, benchmark, verdict)              │
+                                └───────────────────────────────────────────────────────┘
 ```
 
 - **benchmarker** — serves the checkpoint, runs the canonical
@@ -51,16 +49,27 @@ optimize stage (round 1's analyzer then plans without profiling).
   round that neither accepted anything nor made a potentially
   build-changing code attempt it runs **replan-only**, planning from the
   standing profile and that round's verdicts — see *What a round costs*):
-  profiles the *current* build (nsys +
-  torch profiler + an ncu per-kernel deep dive on the top nsys kernels,
-  captured over the same iteration window and interpreted with the
+  profiles the *current* build (nsys — decomposed with the
+  `internal-perf-nsight-system-analysis` skill into per-iteration time, busy/idle
+  rungs and the compute-absent split (launch-starved / blocking /
+  dependency-stalled) — plus an ncu per-kernel deep dive on the top
+  kernels of that decomposition (ranked by in-window union time, not by
+  the capture-wide `kern_sum`), captured over the same iteration window
+  and interpreted
+  with the
   `perf-nsight-compute-analysis` skill — per-kernel SOL%, occupancy,
   warp stalls → bound class; perf-analyze methodology), then
   writes/updates
   `roadmap.yaml` — items ordered by `expected_gain_pct` (bottleneck share
   removed, casebook-grounded), never by fix ease, each item's evidence
   drawn across the analyses (nsys timeline, ncu kernel analysis, SOL
-  correlation when the projector ran) rather than the timeline alone.
+  correlation when the projector ran) rather than the timeline alone,
+  and each kernel-speedup item bounded by the operator's measured
+  headroom rather than its cost. The timeline analysis's own
+  `items.json` is accounted for row by row in `roadmap.yaml`'s
+  `nsys_items` block — every opportunity it found becomes an item or a
+  dismissal with evidence, and the orchestrator validates that the
+  moment the turn ends (see *The nsys opportunity-coverage gate*).
   Later rounds re-profile
   (bottlenecks shift after each accepted item) and update statuses /
   ordering without rewriting history — a round following one that left
@@ -81,9 +90,13 @@ optimize stage (round 1's analyzer then plans without profiling).
   part of the gap gets a new item or an evidence-backed reason it
   cannot be closed in this campaign (unexplained parts stay labeled
   unexplained).
-- **optimizer** — applies pending roadmap items **one at a time**
-  (top-1 first; up to `max_items_per_round` per round, so several items
-  share one analyzer profile while each keeps its own evaluation):
+- **optimizer** — one independent persistent optimizer is created for each
+  dispatched item. With `item_execution: parallel`, up to
+  `max_items_per_round` pairs run concurrently from the same frozen round
+  base. With `serial`, each worktree starts from the latest accepted
+  campaign state. In both modes, approved and rejected terminal items
+  consume the shared `max_items_per_round` budget. Retries for one item
+  are always sequential:
   `approach: config` edits `tuning/extra_llm_api_options.yaml`;
   `approach: code` edits the TRT-LLM source (installed-package check
   first). Smoke-checks the server, never benchmarks, never commits.
@@ -94,8 +107,8 @@ optimize stage (round 1's analyzer then plans without profiling).
 - **evaluator** — reviews the diff, verifies functionality (sanity
   completions; targeted tests for code items), re-measures with the
   canonical benchmark, and applies the acceptance gate (below). Emits a
-  structured three-way verdict with a reason category: **APPROVE**
-  accepts the attempt, **PUSH_BACK** loops back to the optimizer with
+  structured three-way verdict with a reason category: **APPROVE** marks the
+  isolated result `candidate_ready`, **PUSH_BACK** loops back to the optimizer with
   actionable feedback (up to `max_attempts_per_item` attempts total),
   and **REJECT** fails the item terminally — the judge's call that no
   retry would help, saving the benchmarks a doomed retry would burn.
@@ -105,16 +118,25 @@ optimize stage (round 1's analyzer then plans without profiling).
   applied-but-no-gain / blocked-by-constraint) — the projection-free
   evidence the analyzer's re-planning and the report's remaining-gap
   accountability are built from.
-- **accept-evidence capture** — inside the evaluator's APPROVE turns,
+- **integrator** *(parallel only)* — after every item worker reaches `candidate_ready` or
+  `failed`, combines candidate commits/configs in roadmap order in a separate
+  integration worktree, resolves only conflicts and minimal combination
+  defects, benchmarks the combined state, and emits the authoritative
+  `APPROVE | FALLBACK_BEST | REJECT` verdict. It may diagnose/remediate twice;
+  after that it validates only the best standalone candidate, or rejects all.
+  Before applying the structured verdict, the Python orchestrator verifies
+  that included ids are non-empty candidate-ready items and cross-checks the
+  reported threshold, measured gain, and Pareto-curve regression budget.
+- **candidate evidence capture** — inside the evaluator's APPROVE turns,
   not a separate stage: after the clean measurement, the evaluator
   relaunches the server under the canonical nsys wrap, replays the load
   once, and saves `attempt_<k>/profile/` (trace, `nsys_stats.txt`,
-  replay log), then writes a *Kernel evidence* section comparing the
-  capture against the previous capture of the accepted state (the
-  round's analyzer profile, or the prior accept) — verifying the item's
-  claimed mechanism is actually visible in the trace. Because rejected
-  attempts are hard-reverted, the **last accept's capture is always a
-  profile of the final accepted state** — the reporter's "after" side.
+  `nsys_analysis/`, replay log), then writes a *Kernel evidence* section
+  comparing the capture against the frozen accepted state — verifying
+  the item's claimed mechanism is actually visible in the trace. Because
+  rejected attempts are hard-reverted. A final-state integration
+  capture, when produced, becomes the reporter's newest accepted-state
+  profile.
   The capture is diagnostic, never a measurement (fresh relaunch; the
   verdict comes from the un-profiled run); no capture is made when
   `nsys` is not in `profile.methods`, and a failed capture never flips
@@ -147,6 +169,41 @@ optimize stage (round 1's analyzer then plans without profiling).
 The orchestrator — not the agents — owns the roadmap lifecycle fields and
 the git state of the TRT-LLM checkout, driven by the evaluator's
 structured decisions in `progress.yaml`.
+
+## The nsys opportunity-coverage gate
+
+The `internal-perf-nsight-system-analysis` skill closes every run by writing
+`nsys_analysis/items.json` — the performance opportunities the timeline
+found, each with a stable `id`, the step table behind it and a
+`magnitudeMs`. Without a consumer that list is prose: the analyzer reads
+the numbers, writes findings, and whether an opportunity ever reached
+the plan is invisible.
+
+So `roadmap.yaml` carries a top-level `nsys_items` block accounting for
+every id in that file — the same `disposition` / `ref` vocabulary as
+`kernel_ledger.yaml`, for the same reason:
+
+```yaml
+nsys_items:
+  - {id: nsys-01, disposition: item, ref: opt-003}
+  - {id: nsys-02, disposition: dismissed, ref: "0.2 ms/iter is below the noise floor"}
+```
+
+An `item` ref must name a real roadmap id (any status — an opportunity
+whose fix was already tried *was* considered); a `dismissed` ref is the
+evidence for dismissing it. The orchestrator validates the block the
+moment the analyzer's turn ends, so an opportunity that was neither
+planned nor dismissed parks the campaign at the analyzer instead of
+quietly evaporating. Dismissing is a first-class answer — below the
+noise floor, mechanism already present, no allowed approach reaches it —
+and is always cheaper than an unfounded item a full benchmark has to
+disprove.
+
+**Self-gating on the artifact**, so it needs no task knob: enforced
+exactly when the round produced an `items.json`. A replan-only round
+runs no profiler and writes none; a round whose skill was unavailable or
+whose pipeline errored writes none either and records the reason under
+*Caveats*. Neither owes the block anything.
 
 ## The acceptance gate
 
@@ -189,6 +246,8 @@ No agent decides when to stop. The loop runs exactly
 `optimize.max_rounds` rounds unless one of two deterministic,
 orchestrator-enforced breaks fires first:
 
+- **Round budget spent** — `optimize.max_rounds` rounds have closed, each
+  selecting up to `max_items_per_round` candidates.
 - **Roadmap exhausted on an unchanged build** — no pending item
   promises at least `noise_floor_pct` through an allowed approach
   (checked after every analyzer turn and after every item's terminal
@@ -216,9 +275,15 @@ deliberately omitted, so a rebuilt gitignored `.so` or JIT/AOT cache may
 survive the source revert. The orchestrator records that uncertainty and
 profiles rather than pretending the old traces are current.
 
+A round selects up to `optimize.max_items_per_round` pending roadmap
+items. Their optimizer/evaluator loops run serially or concurrently
+according to `optimize.item_execution`; parallel candidates are combined
+and measured by the Integrator, while serial candidates are accepted
+directly.
+
 - **Profiling round** — round 1; any round opening after an accept; and
   any round whose reverted code attempt may have changed ignored build
-  output. Re-profiles the current runtime (nsys + torch + ncu per
+  output. Re-profiles the current runtime (nsys + ncu per
   `profile.methods`) and re-ranks the roadmap against fresh traces. An
   older checkpoint with no profile-currency marker also buys one
   conservative profile on resume.
@@ -327,7 +392,8 @@ exactly as in perf-analyze):
 | field | required | default | meaning |
 | --- | --- | --- | --- |
 | `optimize.max_rounds` | no | `5` | The number of rounds the loop **runs** (not just a cap — only the two deterministic breaks above end it earlier); each round is one analyzer turn + up to `max_items_per_round` items, so `max_rounds × max_items_per_round` bounds total items attempted. Only rounds with a stale or unproven runtime profile pay to refresh it (see *What a round costs*), so this bounds items far more tightly than GPU hours. |
-| `optimize.max_items_per_round` | no | `3` | Items applied per round, **one at a time** — each still gets its own optimizer ⇄ evaluator gate, measured gain, and revert; the budget only sets how many share one analyzer turn. `1` reproduces the original one-item-per-round loop. |
+| `optimize.max_items_per_round` | no | `3` | Maximum optimizer/evaluator pairs selected per round. Every pair owns an isolated worktree, tuning copy, progress file, and bounded attempt loop. |
+| `optimize.item_execution` | no | `parallel` | `parallel` fans out all selected pairs from one frozen round base and runs the Integrator. `serial` runs them one at a time from the latest accepted campaign state, accepts each approved candidate directly, and emits no batch lifecycle or Integrator progress events. |
 | `optimize.max_attempts_per_item` | no | `3` | Total optimizer attempts per item: PUSH_BACK verdicts retry until this bound, then the item is marked `failed` and reverted (an explicit REJECT fails it immediately). |
 | `optimize.approaches` | no | `[config, code]` | Which optimization approaches the run may plan/apply: `config` edits the live tuning YAML, `code` edits the TRT-LLM source. Restrict to `[code]` for a code-only campaign (no knob tuning) or `[config]` to leave the checkout untouched. Enforced in three layers: the analyzer only plans allowed items, the orchestrator never dispatches a disallowed pending item, and any attempt that edits through a disallowed approach (tuning file differs from the accepted snapshot / dirty worktree) is auto-rejected before the evaluator benchmarks it. |
 | `optimize.accept_fraction` | no | `0.5` | Fraction of an item's `expected_gain_pct` the measured gain must reach. |
@@ -344,6 +410,23 @@ exactly as in perf-analyze):
 / `p99_ttft_ms` (likewise `*_tpot_ms`, `*_itl_ms`, `*_e2el_ms`). Gains
 are always normalized so positive = improvement (throughput up, latency
 down).
+
+When `slurm-environment.cluster_ssh` is set, paths belong to these machines:
+
+| Field | Location |
+| --- | --- |
+| `trtllm_repo_path` | Local checkout edited and managed by perf-optimize. |
+| `extra_llm_api_options` | Local input copied into the workflow's live tuning YAML. |
+| `checkpoint_path` | Remote path visible to the Slurm job/container. |
+| `slurm-environment.cluster_ssh` | SSH target; setting it enables remote execution. |
+| `slurm-environment.docker_image` | Remote SQSH path visible to Slurm/Pyxis. |
+| `slurm-environment.remote_run_root` | Remote absolute temporary root; defaults to `~/agent_flow_workspace/<workspace-name>`. |
+| `slurm-environment.slurm_partition`, `account`, `qos` | Settings of the selected remote Slurm cluster. |
+
+The workflow workspace and Git stay local. Agents copy required inputs and
+changed source to isolated directories below the remote run root, then pull
+required outputs back. Without `cluster_ssh`, all paths refer to the machine
+running the CLI.
 
 ## Git requirements (read before running)
 
@@ -388,7 +471,7 @@ down).
 │   ├── manifest.md                  #   what was imported, and from where
 │   └── prior_roadmap.yaml           #   source campaign's roadmap — read-only prior art
 ├── rounds/round_<n>/
-│   ├── analysis/                    # analyzer: profile_findings.md, nsys/torch/ncu traces (+ regions.json / sol.json when the projector ran;
+│   ├── analysis/                    # analyzer: profile_findings.md, nsys/ncu traces, nsys_analysis/ (+ regions.json / sol.json when the projector ran;
 │   │                                #   + kernel_ledger.yaml with a profile.kernel_coverage block)
 │   └── item_<j>_<id>/attempt_<k>/   # per item: optimization_summary.md, evaluation.md, result *.json
 │       └── profile/                 # accept-evidence nsys capture (APPROVEd attempts only)
@@ -429,10 +512,35 @@ down).
   canonical `benchmark_serving.py` / `nsys profile` / `ncu` templates at
   the configured operating point(s) — one run per `benchmark.concurrency`
   point in Pareto-curve mode — so numbers stay comparable across the
-  whole campaign. The analyzer's ncu deep dive is bounded
-  (`--launch-count`, kernel filter from the top nsys kernels) and
-  interpreted with the `perf-nsight-compute-analysis` skill; it degrades
-  gracefully when `ncu` or the skill is unavailable.
+  whole campaign. Every nsys capture — the analyzer's round profile and
+  the evaluator's accept-evidence capture alike — is exported to
+  `.sqlite` and decomposed with the `internal-perf-nsight-system-analysis` skill
+  into `nsys_analysis/`, so "the launch gaps shrunk" is a measured
+  per-iteration budget on both sides rather than an eyeballed kernel
+  table. The accept-evidence capture runs that pipeline **comparative**
+  against the previous capture of the accepted state, so the mechanism
+  check reads signed deltas out of `difference/rank-0/` instead of
+  comparing two trees by eye. Kernels are classified with the
+  checked-in TRT-LLM taxonomy
+  (`perf_analyze/assets/taxonomy_trtllm.json`), which the analyzer
+  extends per workload before quoting any category number. The
+  analyzer's ncu deep dive is bounded
+  (`--launch-count`, kernel filter from the top decomposition kernels)
+  and
+  interpreted with the `perf-nsight-compute-analysis` skill; both
+  degrade gracefully when the tool or the skill is unavailable.
+- **Multi-rank capture (`profile.profile_ranks`, default `[0]`).**
+  Listing several ranks wraps each of them separately inside the
+  launcher step and unlocks the skill's rank-jitter step, whose
+  `pinned`-vs-`rotating` straggler verdict is the only evidence that
+  separates "waiting on a slow rank" from "waiting on the network".
+  Above world size 1 a bare `trtllm-serve` cannot deliver it — its
+  workers are `MPI.COMM_SELF.Spawn`ed and nsys does not follow them — so
+  per-rank traces need the Slurm `trtllm-llmapi-launch` shape. An
+  imbalance item is filed under the category of the imbalanced *work*
+  (`compute` for uneven expert load, and so on), never `communication`:
+  the jitter wait shows up inside a collective but bucketing, overlap
+  and interconnect levers cannot recover another rank's lateness.
 - **Per-kernel coverage contract (optional).** A
   `profile.kernel_coverage` block in `task.yaml` (empty mapping =
   defaults: `min_share_pct: 0.5`, `coverage_target_pct: 95`) upgrades
@@ -501,7 +609,7 @@ down).
   as read-only reference, used only if it is installed in the
   session.
 - **Cost.** The analyzer re-profiles every round that follows an accept
-  or a potentially build-changing reverted code attempt (nsys + torch +
+  or a potentially build-changing reverted code attempt (nsys plus
   the bounded ncu deep dive by default); set `profile.methods: [nsys]`
   to trim it. When the standing runtime profile is still current, the
   next round opens replan-only and pays no GPU time at all — see *What a
@@ -510,12 +618,10 @@ down).
   profiled replay (the accept-evidence capture), and the final
   verification runs one more benchmark at campaign end. The per-item
   evaluator benchmark is the irreducible price of per-item attribution;
-  raising `max_items_per_round` amortizes the analyzer profile across
-  more items, at the cost of applying later items in the round against
-  a ranking profiled before the earlier ones landed. Under fixed-round
-  semantics `max_rounds` is the primary cost knob — the loop will spend
-  the whole budget unless the roadmap runs dry on an unchanged build or
-  the target is met.
+  raising `max_items_per_round` amortizes an analyzer profile across
+  more serial items or widens a parallel batch. Parallel execution trades extra
+  isolation/integration work for concurrency. Across the campaign,
+  `max_rounds` remains the primary round budget.
 - **Local vs Slurm.** With a `slurm-environment` block, every
   server-launching role (all but the projector and the reporter) is
   augmented with the Slurm container-bootstrap guidance, exactly like

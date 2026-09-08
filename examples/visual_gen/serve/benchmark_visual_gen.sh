@@ -47,6 +47,10 @@ NUM_PROMPTS=${NUM_PROMPTS:-3}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
 PROMPT=${PROMPT:-"A cat walks through a field of flowers, with the wind blowing gently"}
 
+# Server lifecycle defaults
+SERVER_TIMEOUT=${SERVER_TIMEOUT:-3600}
+SERVER_SHUTDOWN_TIMEOUT=${SERVER_SHUTDOWN_TIMEOUT:-60}
+
 # Output
 RESULT_DIR=${RESULT_DIR:-"./benchmark_results"}
 
@@ -56,7 +60,7 @@ RESULT_DIR=${RESULT_DIR:-"./benchmark_results"}
 
 wait_for_server() {
     local url="http://${HOST}:${PORT}/health"
-    local max_wait=${SERVER_TIMEOUT:-3600}  # 60 minutes for model loading + warmup on NFS
+    local max_wait=$SERVER_TIMEOUT  # 60 minutes for model loading + warmup on NFS
     local elapsed=0
     local interval=5
 
@@ -77,11 +81,27 @@ wait_for_server() {
 }
 
 cleanup() {
+    local exit_code=$?
+    local elapsed=0
+
+    trap - EXIT
+    trap '' INT TERM
+
     if [ -n "${SERVER_PID:-}" ]; then
         echo "Stopping server (PID: $SERVER_PID)..."
         kill "$SERVER_PID" 2>/dev/null || true
+        while kill -0 "$SERVER_PID" 2>/dev/null && [ "$elapsed" -lt "$SERVER_SHUTDOWN_TIMEOUT" ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "Server did not stop within ${SERVER_SHUTDOWN_TIMEOUT}s; sending SIGKILL..."
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+        fi
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+
+    return "$exit_code"
 }
 
 # ---------------------------------------------------------------------------
@@ -119,9 +139,16 @@ echo "  Command: ${SERVER_CMD}"
 SERVER_LOG="${RESULT_DIR}/server.log"
 mkdir -p "${RESULT_DIR}"
 
+# Route SIGINT and SIGTERM through exit instead of Bash's signal-dependent
+# default handling. This guarantees the EXIT cleanup and preserves the
+# conventional caller-visible statuses, 130 and 143.
+SERVER_PID=
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 $SERVER_CMD > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-trap cleanup EXIT
 
 echo "  Server PID: $SERVER_PID"
 echo "  Server log: $SERVER_LOG"

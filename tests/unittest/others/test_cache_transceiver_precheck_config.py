@@ -27,20 +27,11 @@ import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import precheck_config as pcfg
+import run_precheck as rp
 
-import precheck_config as pcfg  # noqa: E402
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+_PRECHECK_DIR = os.path.dirname(os.path.abspath(pcfg.__file__))
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -922,7 +913,6 @@ class TestMultiPeerOrchestration:
         fail_ctx=False,
         wave_delay_s=0,
     ):
-        import sys
         import types
 
         # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
@@ -1240,7 +1230,6 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
     delivered via bcast the rank must raise; with a clean (None) broadcast it
     must return normally.
     """
-    import sys
     import types
 
     monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))

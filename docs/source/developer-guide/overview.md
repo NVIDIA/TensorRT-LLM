@@ -151,3 +151,39 @@ export TLLM_RANK_CRASH_HARD_KILL_GRACE=-1
 Use the escape hatch when you would rather have peer ranks reach their own
 timeouts — for example when attaching a debugger to a surviving rank, or when a
 harness collects per-rank state that a job-wide abort would destroy.
+
+## DeepGEMM Barrier Timeout
+
+The DeepGEMM MegaMoE kernels synchronize expert-parallel ranks with in-kernel
+barriers that self-abort after a fixed wall-clock budget, defaulting to 60
+seconds. When the budget is exceeded the kernel prints a diagnostic and trips a
+device-side assert, which poisons the CUDA context — so the first Python-level
+traceback usually points at whatever unrelated kernel ran next, not at the
+barrier:
+
+```text
+DeepGEMM grid sync timeout (60s): sm=114, thread=0, grid_sync_idx=0, ...
+DeepGEMM NVLink barrier timeout (60s): rank=5, counter=1381, signal=8, target=16, ...
+```
+
+Read `signal` against `target`: `signal=8, target=16` means only 8 of the 16
+ranks ever arrived at the barrier.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DG_JIT_BARRIER_TIMEOUT_SECONDS` | `60` | Wall-clock budget, in seconds, for DeepGEMM's in-kernel grid-sync and NVLink barriers. Values `<= 0` are ignored and the built-in default applies. |
+
+```bash
+# Give a large expert-parallel group more headroom before the barrier self-aborts.
+export DG_JIT_BARRIER_TIMEOUT_SECONDS=300
+```
+
+The value is baked into the kernels at JIT compile time and participates in the
+JIT cache key, so changing it recompiles the affected kernels rather than
+silently reusing a cached binary.
+
+This is primarily a diagnostic knob: raising it distinguishes a slow-but-healthy
+rendezvous (all ranks eventually arrive and the run proceeds) from a genuine
+hang or a rank-count mismatch (the same `signal`/`target` split reappears at the
+larger budget). Prefer fixing the underlying imbalance over permanently raising
+the budget, since a longer timeout also delays detection of real hangs.

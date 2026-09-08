@@ -183,7 +183,10 @@ def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
 
 
 def setup(app):
-    from helper import generate_examples, generate_llmapi, update_version
+    from helper import (check_llmapi_reference_size,
+                        compact_llmapi_search_signature, generate_examples,
+                        generate_llmapi, strip_llmapi_search_docstrings,
+                        update_version)
 
     # `import tensorrt_llm` pulls in the compiled bindings, which link against
     # libcuda.so.1. On a driverless (CPU) doc-build node that resolves only if
@@ -206,6 +209,9 @@ def setup(app):
         print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
+    app.connect('autodoc-process-docstring', strip_llmapi_search_docstrings)
+    app.connect('autodoc-process-signature', compact_llmapi_search_signature)
+    app.connect('build-finished', check_llmapi_reference_size)
 
     generate_examples()
     generate_llmapi()

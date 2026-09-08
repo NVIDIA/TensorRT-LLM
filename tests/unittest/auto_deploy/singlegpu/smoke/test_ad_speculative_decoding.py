@@ -16,8 +16,6 @@
 
 import torch
 from _model_test_utils import get_small_model_config
-from build_and_run_ad import ExperimentConfig, main
-from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleOneModelFactory
@@ -27,6 +25,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.hidden_states import (
 )
 from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
+from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 
 def get_extra_seq_len_for_kv_cache(llm_args) -> int:

@@ -697,6 +697,20 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
+    for policy in ("auto", "rank_striped_read_ahead"):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            checkpoint_io_policy=policy,
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["checkpoint_io_policy"] == policy
+        assert meta["capture_succeeded"] is True
+
+
 def _walk_captured_keys(model) -> set[str]:
     """Capture a single nested config model and return its captured keys."""
     config, _ = _loads_payloads(model)
@@ -713,16 +727,12 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     """
     from tensorrt_llm.llmapi.llm_args import (
         AutoDecodingConfig,
-        MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
     )
 
     mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
     assert _walk_captured_keys(mtp) >= {"decoding_type"}
-
-    medusa = MedusaDecodingConfig(max_draft_len=1, medusa_choices=[[0]])
-    assert _walk_captured_keys(medusa) >= {"decoding_type"}
 
     ngram = NGramDecodingConfig(max_draft_len=1, max_matching_ngram_size=2)
     assert _walk_captured_keys(ngram) >= {"decoding_type"}

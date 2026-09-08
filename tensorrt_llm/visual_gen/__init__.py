@@ -52,11 +52,12 @@ if TYPE_CHECKING:
         SparseAttentionConfig,
         TeaCacheConfig,
         TorchCompileConfig,
+        VAEConfig,
         VideoSparseAttentionConfig,
         VisualGenArgs,
     )
     from .output import VisualGenMetrics, VisualGenOutput
-    from .params import VisualGenParams
+    from .params import MediaRef, VisualGenParams
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 # Public name -> providing module.
@@ -79,9 +80,11 @@ _LAZY_ATTRS = {
     "TeaCacheConfig": "tensorrt_llm.visual_gen.args",
     "TorchCompileConfig": "tensorrt_llm.visual_gen.args",
     "VideoSparseAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "VAEConfig": "tensorrt_llm.visual_gen.args",
     "VisualGenMetrics": "tensorrt_llm.visual_gen.output",
     "VisualGenOutput": "tensorrt_llm.visual_gen.output",
     "VisualGenParams": "tensorrt_llm.visual_gen.params",
+    "MediaRef": "tensorrt_llm.visual_gen.params",
     "QuantConfig": "tensorrt_llm.models.modeling_utils",
 }
 
@@ -114,6 +117,7 @@ __all__ = [
     "VisualGen",
     "VisualGenArgs",
     "VisualGenParams",
+    "MediaRef",
     "VisualGenResult",
     "VisualGenOutput",
     "VisualGenMetrics",
@@ -130,6 +134,7 @@ __all__ = [
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
     "VideoSparseAttentionConfig",
+    "VAEConfig",
     "CacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",

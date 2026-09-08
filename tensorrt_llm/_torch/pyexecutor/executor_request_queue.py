@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import enum
 import queue
 import threading
 import time
@@ -13,6 +14,16 @@ from .request_utils import get_num_child_requests
 
 SHUTDOWN_REQUEST_ID = -1
 CONTROL_REQUEST_ID = -2
+
+
+class RequestAdmissionState(enum.Enum):
+    """Persistent request-admission state across engine sleep and wakeup."""
+
+    RUNNING = "running"
+    PARKING = "parking"
+    PARKED = "parked"
+    WAKING = "waking"
+    FAILED = "failed"
 
 
 @dataclasses.dataclass
@@ -61,7 +72,96 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        self.admission_state = RequestAdmissionState.RUNNING
+        self._pending_sleep_tags: frozenset[str] = frozenset()
+        self._parked_tags: frozenset[str] = frozenset()
+        self._pending_wakeup_tags: frozenset[str] = frozenset()
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+
+    def _transition_admission_state(
+        self,
+        expected: RequestAdmissionState,
+        target: RequestAdmissionState,
+    ) -> None:
+        if self.admission_state is not expected:
+            raise RuntimeError(
+                "Invalid executor admission transition: "
+                f"{self.admission_state.value} -> {target.value}; "
+                f"expected {expected.value}")
+        self.admission_state = target
+
+    def begin_sleep_transition(self, tags: Iterable[str]) -> None:
+        """Close admission before the executor starts draining for sleep."""
+        with self.enqueue_lock:
+            sleep_tags = frozenset(tags)
+            self._transition_admission_state(
+                RequestAdmissionState.RUNNING,
+                RequestAdmissionState.PARKING,
+            )
+            self._pending_sleep_tags = sleep_tags
+
+    def complete_sleep_transition(self) -> None:
+        """Publish PARKED only after every rank has completed sleep."""
+        with self.enqueue_lock:
+            self._transition_admission_state(
+                RequestAdmissionState.PARKING,
+                RequestAdmissionState.PARKED,
+            )
+            self._parked_tags = self._pending_sleep_tags
+            self._pending_sleep_tags = frozenset()
+
+    def abort_sleep_transition(self) -> None:
+        """Reopen admission after a recoverable pre-mutation sleep failure."""
+        with self.enqueue_lock:
+            if self.admission_state is RequestAdmissionState.FAILED:
+                return
+            self._transition_admission_state(
+                RequestAdmissionState.PARKING,
+                RequestAdmissionState.RUNNING,
+            )
+            self._pending_sleep_tags = frozenset()
+
+    def begin_wakeup_transition(self, tags: Iterable[str]) -> None:
+        """Keep admission closed while parked resources are restored."""
+        with self.enqueue_lock:
+            wakeup_tags = frozenset(tags)
+            self._transition_admission_state(
+                RequestAdmissionState.PARKED,
+                RequestAdmissionState.WAKING,
+            )
+            self._pending_wakeup_tags = wakeup_tags
+
+    def complete_wakeup_transition(self) -> None:
+        """Reopen admission only after all originally parked tags are restored."""
+        with self.enqueue_lock:
+            remaining_tags = self._parked_tags - self._pending_wakeup_tags
+            target = RequestAdmissionState.PARKED
+            if not remaining_tags:
+                target = RequestAdmissionState.RUNNING
+            self._transition_admission_state(RequestAdmissionState.WAKING,
+                                             target)
+            self._parked_tags = remaining_tags
+            self._pending_wakeup_tags = frozenset()
+
+    def abort_wakeup_transition(self) -> None:
+        """Return to PARKED after a recoverable pre-mutation wakeup failure."""
+        with self.enqueue_lock:
+            if self.admission_state is RequestAdmissionState.FAILED:
+                return
+            self._transition_admission_state(
+                RequestAdmissionState.WAKING,
+                RequestAdmissionState.PARKED,
+            )
+            self._pending_wakeup_tags = frozenset()
+
+    def fail_sleep_wakeup_transition(self) -> None:
+        """Permanently close admission after sleep/wakeup may have mutated state."""
+        with self.enqueue_lock:
+            self.admission_state = RequestAdmissionState.FAILED
+
+    def get_admission_state(self) -> RequestAdmissionState:
+        with self.enqueue_lock:
+            return self.admission_state
 
     def _get_request_id(self, request: Optional[ExecutorRequest] = None):
         # if request has a disagg_request_id, use it as request id so that
@@ -93,6 +193,10 @@ class ExecutorRequestQueue:
         req_ids = []
         with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
+            if self.admission_state is not RequestAdmissionState.RUNNING:
+                raise RuntimeError(
+                    "Cannot enqueue requests while executor admission is "
+                    f"{self.admission_state.value}")
             start_time = time.time()
             for request in requests:
                 req_id = self._get_request_id(request)
@@ -140,6 +244,12 @@ class ExecutorRequestQueue:
             self.active = False
 
     def can_enqueue_request(self) -> bool:
+        with self.enqueue_lock:
+            return (self.active and self.dist.rank == 0
+                    and self.admission_state is RequestAdmissionState.RUNNING)
+
+    def can_enqueue_control_request(self) -> bool:
+        """Return whether rank zero can enqueue shutdown/control sentinels."""
         with self.enqueue_lock:
             return self.active and self.dist.rank == 0
 

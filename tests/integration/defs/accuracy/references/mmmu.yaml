@@ -51,7 +51,7 @@ nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:
 nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 39.0
+    accuracy: 38.5
 nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
@@ -74,6 +74,10 @@ Qwen/Qwen3.5-35B-A3B:
     accuracy: 60.444
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 58.889
+Qwen/Qwen3.8-Flash-Next:
+  - quant_algo: NVFP4
+    spec_dec_algo: MTP
+    accuracy: 58.44
 # Kimi K2.5 multimodal (MoonViT + DeepSeek-V3 MoE backbone, ~1T params).
 # Values below are measured with NVFP4 checkpoint (thinking mode enabled).
 moonshotai/Kimi-K2.5:

@@ -318,8 +318,15 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         # may resolve an older site-packages triton_kernels package.
         triton_kernels_src = os.path.join(llm_root, "triton_kernels")
         if os.path.isdir(triton_kernels_src):
+            # case_fn embeds a pytest node id, which contains "::". This
+            # directory goes into PYTHONPATH, and os.pathsep is ":" on Linux,
+            # so leaving it in splits this single entry into three: the
+            # directory truncated at ".py", an empty entry, and a bare relative
+            # path named after the test function. The override below would then
+            # never be found, and the relative fragment would resolve against
+            # whatever the working directory happens to be.
             pythonpath_overrides_dir = os.path.join(
-                output_dir, f"pythonpath-overrides-{case_fn}")
+                output_dir, f"pythonpath-overrides-{case_fn}".replace(":", "-"))
             os.makedirs(pythonpath_overrides_dir, exist_ok=True)
             triton_kernels_link = os.path.join(pythonpath_overrides_dir,
                                                "triton_kernels")

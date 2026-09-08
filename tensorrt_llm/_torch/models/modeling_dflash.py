@@ -12,7 +12,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm.logger import logger
 
 from ...functional import RotaryScalingType
-from ..modules.rotary_embedding import RotaryEmbedding
+from ..attention.rotary_embedding import RotaryEmbedding
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope

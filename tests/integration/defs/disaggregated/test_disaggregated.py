@@ -602,9 +602,15 @@ def run_client_tests(example_dir,
                         "Using `asyncio` in Python"
                     ]
                 elif "qwen3_32b_fp8" in test_desc:
+                    # https://nvbugs/6566734: the greedy completion of the raw
+                    # asyncio prompt is near-tied between answering the question
+                    # and continuing it; both are valid non-garbage outputs.
                     expected_strings = [
                         "The capital of Germany is Berlin",
-                        "Asyncio in Python is a library"
+                        [
+                            "Asyncio in Python is a library",
+                            "I have read that it is used for asynchronous programming"
+                        ]
                     ]
                 else:
                     expected_strings = [
@@ -1070,7 +1076,7 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            300,  # timeout
+            server_start_timeout,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
@@ -2089,9 +2095,18 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     # documented off switch.
     gen_env = None
     assert_gen_log_contains = None
+    # Default readiness budget. On Blackwell (SM100/103) the CuTe DSL MLA decode
+    # JIT and autotuner warmup deterministically push cold-start readiness to
+    # ~370s: every observed B200/B300 run overran the 300s default, so raise it
+    # to the 1200s budget other disagg tests already use (a real hang still
+    # fails at 1200s). H100 registers in ~138s and its 300s-mark failures are
+    # dominated by a separate UCX/NIXL issue, not slow warmup, so keep 300s
+    # there rather than delaying those failures.
+    server_start_timeout = 300
     if get_sm_version() in (100, 103):
         gen_env = {"TLLM_LOG_LEVEL": "INFO"}
         assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+        server_start_timeout = 1200
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -2099,7 +2114,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                            gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory(),
-                           assert_gen_log_contains=assert_gen_log_contains)
+                           assert_gen_log_contains=assert_gen_log_contains,
+                           server_start_timeout=server_start_timeout)
 
 
 @skip_no_hopper
@@ -2343,8 +2359,6 @@ def benchmark_model_root(request):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "fp8")
     elif (request.param == "DeepSeek-V3-Lite-bf16"):
         model_path = os.path.join(models_root, "DeepSeek-V3-Lite", "bf16")
-    elif request.param == "llama-v3-8b-hf":
-        model_path = os.path.join(models_root, "llama-models-v3", "8B")
     elif request.param == "llama-3.1-8b-instruct-hf-fp8":
         model_path = os.path.join(models_root, "llama-3.1-model",
                                   "Llama-3.1-8B-Instruct-FP8")
@@ -3040,7 +3054,8 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
 
 
 @skip_pre_hopper
@@ -4141,6 +4156,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                   os.path.dirname(__file__))
 
     env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,

@@ -34,7 +34,8 @@ def _import_triton_prefill():
         "..",
         "tensorrt_llm",
         "_torch",
-        "attention_backend",
+        "attention",
+        "backends",
         "triton_prefill.py",
     )
     spec = importlib.util.spec_from_file_location("triton_prefill", os.path.abspath(path))

@@ -53,7 +53,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
 from tensorrt_llm.media.decoding import VideoStreamInfo
-from tensorrt_llm.visual_gen.params import VisualGenParams
+from tensorrt_llm.visual_gen.params import MediaRef, VisualGenParams
 
 pytestmark = pytest.mark.cosmos3
 
@@ -428,7 +428,7 @@ class TestSourceDerivedDefaults:
 
     REFERENCE = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
-    def _infer_req(self, _params=None, **extra):
+    def _infer_req(self, _params=None, *, video=None, **extra):
         # Executor-merged shape: num_frames/frame_rate carry pipeline defaults,
         # height/width are declared None, and nothing reads as caller intent.
         params = (
@@ -442,6 +442,10 @@ class TestSourceDerivedDefaults:
             )
         )
         params.extra_params = dict(extra)
+        # The V2V reference reaches a worker resolved, so ``format="bytes"`` is
+        # the only spelling ``infer()`` can see.
+        if video is not None:
+            params.video_reference = [MediaRef(content=video, format="bytes")]
         return SimpleNamespace(params=params, prompt="a prompt")
 
     def _captured(self, req):

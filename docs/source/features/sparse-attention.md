@@ -223,6 +223,8 @@ sparse_attention_config:
 
 ## Further Reading
 
+- [KV Cache Compression](kv-cache-compression.md) — methods that reduce the
+  stored KV representation or retained KV set outside the Attention kernel.
 - [Blog 17: Sparse Attention in TensorRT-LLM](../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.md) — framework design, per-algorithm implementation details, evaluation results.
 - [Blog 16: Accelerating Long Context Inference with Skip Softmax Attention](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md) — algorithm details, kernel internals, end-to-end benchmarks.
 - [Sparse Attention Development Guide](../developer-guide/sparse-attention-development-guide.md) — how to add a new sparse attention algorithm, including config classes, prediction modules, auxiliary memory, and registration.

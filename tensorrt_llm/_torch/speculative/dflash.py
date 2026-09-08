@@ -24,8 +24,8 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ..attention.backends import AttentionMetadata
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime

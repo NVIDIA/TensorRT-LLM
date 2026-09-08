@@ -217,7 +217,7 @@ def get_model_yaml_config(model_label: str,
         },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
-        # backend (see accuracy/test_llm_api_pytorch.py::TestGLM52).
+        # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).
         # Spec decoding is intentionally left off so the sweep measures kernel
         # time rather than MTP acceptance rate.
         {
@@ -314,6 +314,28 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'config': {
+                'trust_remote_code': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'dtype': 'fp8',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
+                },
+            }
+        },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
         {
             'patterns': ['minimax_m3_mxfp8'],
@@ -362,20 +384,6 @@ def get_model_yaml_config(model_label: str,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                 },
-            }
-        },
-        # Llama-v4 Scout FP4 with cuda graph padding
-        {
-            'patterns': ['llama_v4_scout_17b_16e_instruct_fp4'],
-            'config': {
-                'cuda_graph_config': {
-                    'enable_padding':
-                    True,
-                    'batch_sizes': [
-                        1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
-                        4096, 8192
-                    ]
-                }
             }
         },
         # GPT-OSS 120B max throughput test

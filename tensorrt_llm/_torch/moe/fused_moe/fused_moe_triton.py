@@ -41,14 +41,30 @@ from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+from .activation import (DEFAULT_MOE_ACTIVATION, ActivationParamShape,
+                         MoEActivation, MoEActivationSupport,
+                         install_activation_params)
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
-                            MoERejectReason)
+                            MoERejectReason, MoEStaticCapability)
 from .interface import MoE, _reject
 from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
                            load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
 from .routing import (ROUTING_METHOD_TYPE_TO_CLASS, BaseMoeRoutingMethod,
                       RenormalizeMoeRoutingMethod)
+
+
+def _swiglu_scalars(module: nn.Module) -> tuple[float, float]:
+    """SwiGLU ``alpha`` / ``beta``, with the kernel-neutral value for an absent one.
+
+    ``is None`` rather than ``or``: 0.0 is a legal value for both registers, and
+    ``or`` cannot tell "the caller passed zero" from "the caller passed nothing".
+    ``beta`` in particular selects the fused-activation path at every call site,
+    so conflating the two silently reroutes the layer.
+    """
+    alpha = 1.0 if module.act_alpha is None else float(module.act_alpha)
+    beta = 0.0 if module.act_beta is None else float(module.act_beta)
+    return alpha, beta
 
 
 # Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
@@ -469,13 +485,12 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                               out_dtype=module.dtype)
 
         # Call the Triton gemm kernel, which also does permutation and activation
-        alpha = module.swiglu_alpha or 1.0
-        beta = module.swiglu_beta or 0.0
+        alpha, beta = _swiglu_scalars(module)
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu",
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
-                        reduction_n=2), (alpha, module.swiglu_limit))
+                        reduction_n=2), (alpha, module.act_clamp))
             act_out = matmul(
                 hidden_states,
                 gemm1_weights,
@@ -492,7 +507,7 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
                 a_ragged_metadata=rdata.ragged_metadata if rdata else None,
                 gather_indx=gather_indx,
                 precision_config=pc1)
-            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
+            act_out = swiglu_torch(act_out, alpha, beta, module.act_clamp)
 
         # Step 3: Gemm2
         # Setup quantization context
@@ -714,13 +729,12 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton gemm kernel, which also does permutation and activation
-        alpha = module.swiglu_alpha or 1.0
-        beta = module.swiglu_beta or 0.0
+        alpha, beta = _swiglu_scalars(module)
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu",
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
-                        reduction_n=2), (alpha, module.swiglu_limit))
+                        reduction_n=2), (alpha, module.act_clamp))
             act_out = matmul(
                 hidden_states,
                 gemm1_weights,
@@ -737,7 +751,7 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 a_ragged_metadata=rdata.ragged_metadata if rdata else None,
                 gather_indx=gather_indx,
                 precision_config=pc1)
-            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
+            act_out = swiglu_torch(act_out, alpha, beta, module.act_clamp)
 
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
         act_out, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -1454,14 +1468,13 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                               out_dtype=module.dtype)
 
         # Call the Triton gemm kernel, which also does permutation and activation
-        alpha = module.swiglu_alpha or 1.0
-        beta = module.swiglu_beta or 0.0
+        alpha, beta = _swiglu_scalars(module)
         hidden_states = _maybe_pad_activation(hidden_states)
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu",
                         triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
-                        reduction_n=2), (alpha, module.swiglu_limit))
+                        reduction_n=2), (alpha, module.act_clamp))
 
             act_out = matmul(
                 hidden_states,
@@ -1479,7 +1492,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 a_ragged_metadata=rdata.ragged_metadata if rdata else None,
                 gather_indx=gather_indx,
                 precision_config=pc1)
-            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
+            act_out = swiglu_torch(act_out, alpha, beta, module.act_clamp)
 
         if self.activation_dtype == torch.float8_e4m3fn:
             # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
@@ -1549,6 +1562,17 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
 
 class TritonFusedMoE(MoE):
+
+    capabilities = MoEStaticCapability(supports_expert_bias=True)
+
+    # The Triton epilogue always runs the OAI gated SwiGLU functor, with the
+    # constants baked into the kernel launch and defaulting to
+    # alpha=1.0 / beta=0.0 (plain SwiGLU) when the activation carries none.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias}),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
+    )
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -1645,9 +1669,7 @@ class TritonFusedMoE(MoE):
         VANILLA,
         bias: bool = False,
         layer_idx: Optional[int] = None,
-        swiglu_alpha: Optional[torch.Tensor] = None,
-        swiglu_beta: Optional[torch.Tensor] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -1659,6 +1681,7 @@ class TritonFusedMoE(MoE):
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            activation=activation,
         )
         # Eligibility (SM / routing / smart_router / quant) is owned by
         # ``can_implement``; do not re-assert it here.
@@ -1679,21 +1702,9 @@ class TritonFusedMoE(MoE):
 
         self.bias = bias
 
-        def _maybe_squeeze_act_param(p):
-            if p is None or isinstance(p, (int, float)):
-                return p
-            assert isinstance(p, torch.Tensor)
-            assert p.dtype == torch.float32
-            assert p.shape == (self.expert_size_per_partition, ), p.shape
-            assert torch.all(
-                p == p[0]
-            ), "All experts must have the same swiglu alpha/beta for Triton kernel"
-            p = p[0].item()
-            return p
-
-        self.swiglu_alpha = _maybe_squeeze_act_param(swiglu_alpha)
-        self.swiglu_beta = _maybe_squeeze_act_param(swiglu_beta)
-        self.swiglu_limit = _maybe_squeeze_act_param(swiglu_limit)
+        # Reduces the constants to the per-launch scalars this kernel bakes, and
+        # rejects a per-expert one instead of silently using expert 0's value.
+        install_activation_params(self)
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
