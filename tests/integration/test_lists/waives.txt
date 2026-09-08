@@ -75,7 +75,6 @@ disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-C
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6162322)
 examples/test_deepseek_v4_pro.py::test_short_token_boundary_smoke SKIP (https://nvbugs/6670227)
-examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_lpips_against_golden SKIP (https://nvbugs/6721560)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example SKIP (https://nvbugs/6731945)
 examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_lpips_against_golden SKIP (https://nvbugs/6731945)
