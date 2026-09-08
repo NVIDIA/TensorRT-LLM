@@ -1115,7 +1115,9 @@ class PyTorchModelEngine(ModelEngine):
             cache_indirection=self.cache_indirection_attention
             if self.attn_backend.Metadata is TrtllmAttentionMetadata else None,
             lora=self._lora,
-            model_forward=self.model_forward,
+            # Do not retain the engine through a bound method.
+            model_forward=functools.partial(
+                type(self).model_forward, weakref.proxy(self)),
         )
         runner_config = NoKVCacheRunnerConfig(
             max_batch_size=self.batch_size,
