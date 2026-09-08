@@ -662,10 +662,12 @@ accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-c
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM2_5::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_auto_dtype[tp_size=8-ep_size=8] TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] TIMEOUT (180)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False-eval_mode=inferencemax] TIMEOUT (180)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-eval_mode=inferencemax] TIMEOUT (60)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=False] TIMEOUT (180)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=True] TIMEOUT (180)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False-eval_mode=inferencemax-kv_dtype=default] TIMEOUT (180)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-eval_mode=inferencemax-kv_dtype=default] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-eval_mode=inferencemax-kv_dtype=nvfp4] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=False-kv_dtype=default] TIMEOUT (180)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=False-kv_dtype=nvfp4] TIMEOUT (180)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-use_msa=True-cuda_graph=True-eval_mode=inferencemax-disagg=True-kv_dtype=default] TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_kv_eagle3_smoke TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
