@@ -308,6 +308,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             f"VisualGenMapping.build_mesh: dims={self._dim_names}, "
             f"shape={shape}, mesh={cls.device_mesh}"
         )
+        cls._populate_group_cache()
 
         if self.seq_size > 1:
             if self._use_attn2d_plane:
@@ -515,7 +516,14 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             if self.world_size == 1:
                 return SingleProcessGroup.get_group()
             return None
-        return cls.device_mesh[dim].get_group()
+        # Cached dict read (torch.compile folds it to a constant).  Only names
+        # that are not mesh dims reach the fallback, where indexing the mesh
+        # raises the same KeyError as before.
+        pg = cls._cached_group(dim)
+        if pg is None:
+            pg = cls.device_mesh[dim].get_group()
+            cls._group_cache[dim] = pg
+        return pg
 
     def _logical_cp_group(self) -> Optional[ProcessGroup]:
         """Full logical CP tile (all ``cp_row`` × ``cp_col`` ranks in one group)."""
