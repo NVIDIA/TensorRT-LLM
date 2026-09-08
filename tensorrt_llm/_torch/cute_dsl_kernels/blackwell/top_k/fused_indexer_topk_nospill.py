@@ -121,6 +121,8 @@ def WS_ROWW_OF(nrep):
 
 
 CAPL = 4096  # K-th-bin candidates a row lists for the last arriver (bigger bins: old path)
+CAPC = 1024  # K-th-bin (token, fp32 score) pairs the row's finisher takes in SMEM (bigger bins: old path)
+assert 2 * CAPC <= NBINS  # the pairs live in the dead coarse histogram
 
 
 C_CAND = 6
@@ -425,6 +427,98 @@ def _st_dsmem_u32(addr, val):
     )
 
 
+@cute.jit
+def _key_of(v):
+    """fp32 score -> the epilogue's signed-monotone 16-bit key of its fp16 rounding."""
+    ui = I32(v.to(F16).bitcast(U16)) & 0xFFFF
+    return ui ^ (0x8000 + ((ui >> 15) & 1) * 0x7FFF)
+
+
+@cute.jit
+def _f32_of_i32(i):
+    return F32(_llvm.bitcast(F32.mlir_type, I32(i).ir_value()))
+
+
+@cute.jit
+def _entry_of(t, vbits):
+    """(token, fp32 score bits) -> packed list entry: hi = signed-monotone score key, lo = 0x7FFFFFFF - token,
+    so one signed 64-bit compare orders by score, then by lower token."""
+    return I32(0x7FFFFFFF) - t, vbits ^ ((vbits >> 31) & 0x7FFFFFFF)
+
+
+@cute.jit
+def _val_of_entry(e):
+    """packed list entry -> (token, fp32 score)"""
+    hi = I32(e >> 32)
+    return I32(0x7FFFFFFF) - I32(e & cutlass.Int64(0xFFFFFFFF)), _f32_of_i32(
+        hi ^ ((hi >> 31) & 0x7FFFFFFF)
+    )
+
+
+@cute.jit
+def _finish_prep(sFine, sCtl, tidx):
+    """Zero the finisher's histogram and counters (before the round that delivers the list)."""
+    if tidx < NFINE:
+        sFine[tidx] = I32(0)
+    if tidx == 0:
+        sCtl[19] = I32(0)
+        sCtl[20] = I32(0)
+        sCtl[23] = I32(-2147483647 - 1)
+        sCtl[24] = I32(2147483647)
+
+
+@cute.jit
+def _finish_list(sP, n, r1, cabove, gI, gV, sFine, sCtl, sTie, sTS, tidx, warp_idx):
+    """Select the r1 highest of n packed entries (see _entry_of) -- every member of the row's K-th
+    coarse bin -- into output slots cabove..: fine histogram of the fp16 keys, descent, write-out;
+    the fp16 class at the K-th value is ranked in fp32 (ties by token) unless all its members are
+    equal (the zero class of a row with fewer than K positive scores: any r2 of them are exact and
+    the provisional fill stands). _finish_prep must precede. No trailing barrier."""
+    for i in cutlass.range(tidx, n, NTHREADS, unroll=2):
+        th, vh = _val_of_entry(sP[i])
+        kc = _key_of(vh)
+        cute.arch.atomic_add(sFine.iterator + (kc & (NFINE - 1)), I32(1), scope="cta")
+    cute.arch.barrier()
+    _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
+    cute.arch.barrier()
+    b2 = sCtl[2]
+    r2 = r1 - sCtl[3]
+    base2 = cabove + sCtl[3]
+    for i in cutlass.range(tidx, n, NTHREADS, unroll=2):
+        e = sP[i]
+        tc, vc = _val_of_entry(e)
+        k2 = _key_of(vc) & (NFINE - 1)
+        if k2 > b2:
+            p = cute.arch.atomic_add(sCtl.iterator + 19, I32(1), scope="cta")
+            gI[cabove + p] = tc
+            gV[cabove + p] = vc
+        elif k2 == b2:
+            p = cute.arch.atomic_add(sCtl.iterator + 20, I32(1), scope="cta")
+            if p < r2:
+                gI[base2 + p] = tc
+                gV[base2 + p] = vc
+            sTie[p] = tc
+            sTS[p] = vc
+            # class spread on the signed-monotone score key: equal max/min = all-equal class
+            hk = I32(e >> 32)
+            cute.arch.atomic_max(sCtl.iterator + 23, hk, scope="cta")
+            cute.arch.atomic_min(sCtl.iterator + 24, hk, scope="cta")
+    cute.arch.barrier()
+    ntie = sCtl[20]
+    if (ntie > r2) and (sCtl[23] != sCtl[24]):
+        for ti in cutlass.range(tidx, ntie, NTHREADS, unroll=1):
+            si = sTS[ti]
+            pi = sTie[ti]
+            rk = I32(0)
+            for tj in cutlass.range(ntie, unroll=1):
+                sj = sTS[tj]
+                if (sj > si) or ((sj == si) and (sTie[tj] < pi)):
+                    rk = rk + 1
+            if rk < r2:
+                gI[base2 + rk] = pi
+                gV[base2 + rk] = si
+
+
 @cute.kernel
 def _dsv4_kernel(
     tiled_mma: cute.TiledMma,
@@ -455,6 +549,7 @@ def _dsv4_kernel(
     RBT: cutlass.Constexpr,
     GM: cutlass.Constexpr,
     NREP: cutlass.Constexpr,
+    FPV: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -479,6 +574,7 @@ def _dsv4_kernel(
     sSFA_raw = smem.allocate_array(U32, STAGES * 128, byte_alignment=128)
     sSFB_raw = smem.allocate_array(U32, 128, byte_alignment=128)
     sKey_raw = smem.allocate_array(U16, NDENSE * TOK, byte_alignment=128)
+    sVal32_raw = smem.allocate_array(F32, NDENSE * TOK if FPV else 4, byte_alignment=128)
     sHist = smem.allocate_tensor(I32, cute.make_layout(NBINS), byte_alignment=128)
     sTot = smem.allocate_tensor(I32, cute.make_layout(NBINS), byte_alignment=128)
     sFTot = smem.allocate_tensor(I32, cute.make_layout(NFINE), byte_alignment=128)
@@ -500,6 +596,10 @@ def _dsv4_kernel(
     sVal = cute.make_tensor(cute.recast_ptr(sKey_raw, dtype=F16), cute.make_layout(NDENSE * TOK))
     sKey32 = cute.make_tensor(
         cute.recast_ptr(sKey_raw, dtype=U32), cute.make_layout(NDENSE * TOK // 2)
+    )
+    sVal32 = cute.make_tensor(sVal32_raw, cute.make_layout(NDENSE * TOK if FPV else 4))
+    sVal32i = cute.make_tensor(
+        cute.recast_ptr(sVal32_raw, dtype=I32), cute.make_layout(NDENSE * TOK if FPV else 4)
     )
 
     ab_full = mbar
@@ -1013,6 +1113,8 @@ def _dsv4_kernel(
                             wslot = wslot - 2 * CHUNK
                 else:
                     sVal[pos] = hv
+                    if cutlass.const_expr(FPV == 1):
+                        sVal32[pos] = sc
                     if (i > 0) or (lane < lim0):
                         cute.arch.atomic_add(sHist.iterator + (ki >> 5), I32(1), scope="cta")
                 if cutlass.const_expr(NLOC > NDENSE):
@@ -1155,14 +1257,22 @@ def _dsv4_kernel(
     # the K-th bin's population decides the row's merge path; read it before the streaming
     # pass stages winner keys in the same buffer (sWK aliases sTot)
     nb1 = I32(0)
-    if cutlass.const_expr(GM == 1):
+    if cutlass.const_expr(GM == 1 or (FPV == 1 and CS > 1)):
         nb1 = sTot[b1]
+    elif cutlass.const_expr(FPV == 1):
+        nb1 = sHist[b1]
 
     # ---------------- single streaming pass: claim + fine histogram ----------
     # Single-CTA rows stage winners in SMEM (sHist / sTot are dead after the
     # coarse descent; local slot == output slot) and write them out with full
     # lines after the pass, instead of per-warp partial-line stores.
     sWK = cute.make_tensor(cute.recast_ptr(sTot.iterator, dtype=U16), cute.make_layout(2 * NBINS))
+    sWV = cute.make_tensor(cute.recast_ptr(sTot.iterator, dtype=F32), cute.make_layout(NBINS))
+    # list finisher: packed (score key, token) entries in sHist, tie class in sTot / sCand
+    sP = cute.make_tensor(
+        cute.recast_ptr(sHist.iterator, dtype=cutlass.Int64), cute.make_layout(CAPC)
+    )
+    sTS2 = cute.make_tensor(cute.recast_ptr(sCand.iterator, dtype=F32), cute.make_layout(CAP))
     ndn = ntl
     nsurv = I32(0)
     if cutlass.const_expr(NLOC > NDENSE):
@@ -1212,20 +1322,32 @@ def _dsv4_kernel(
             p = base + n0lo
             if cutlass.const_expr(CS == 1 or GM == 1):
                 sHist[p] = t0
-                sWK[p] = kv0
+                if cutlass.const_expr(FPV == 1):
+                    sWV[p] = sVal32[p0]
+                else:
+                    sWK[p] = kv0
             else:
                 gI[p] = t0
-                u0 = I32(kv0) ^ (0x8000 + ((((I32(kv0) >> 15) & 1) ^ 1) * 0x7FFF))
-                gV[p] = U16(u0 & 0xFFFF).bitcast(F16).to(F32)
+                if cutlass.const_expr(FPV == 1):
+                    gV[p] = sVal32[p0]
+                else:
+                    u0 = I32(kv0) ^ (0x8000 + ((((I32(kv0) >> 15) & 1) ^ 1) * 0x7FFF))
+                    gV[p] = U16(u0 & 0xFFFF).bitcast(F16).to(F32)
         if hi1:
             p = base + cute.arch.popc(m0) + cute.arch.popc(m1 & lmask)
             if cutlass.const_expr(CS == 1 or GM == 1):
                 sHist[p] = t1
-                sWK[p] = kv1
+                if cutlass.const_expr(FPV == 1):
+                    sWV[p] = sVal32[p0 + 1]
+                else:
+                    sWK[p] = kv1
             else:
                 gI[p] = t1
-                u1 = I32(kv1) ^ (0x8000 + ((((I32(kv1) >> 15) & 1) ^ 1) * 0x7FFF))
-                gV[p] = U16(u1 & 0xFFFF).bitcast(F16).to(F32)
+                if cutlass.const_expr(FPV == 1):
+                    gV[p] = sVal32[p0 + 1]
+                else:
+                    u1 = I32(kv1) ^ (0x8000 + ((((I32(kv1) >> 15) & 1) ^ 1) * 0x7FFF))
+                    gV[p] = U16(u1 & 0xFFFF).bitcast(F16).to(F32)
         if live and (t0 < L) and (n0 == b1):
             q = cute.arch.atomic_add(sCtl.iterator + 11, I32(1), scope="cta")
             if q < CAP:
@@ -1242,13 +1364,20 @@ def _dsv4_kernel(
         nwin = sCtl[8]
         for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
             gI[j] = sHist[j]
-            kw = I32(sWK[j])
-            uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
-            gV[j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+            if cutlass.const_expr(FPV == 1):
+                gV[j] = sWV[j]
+            else:
+                kw = I32(sWK[j])
+                uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+                gV[j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
     use_list = I32(0)
-    if cutlass.const_expr(GM == 1):
+    if cutlass.const_expr(FPV == 1):
+        if nb1 <= CAPC:
+            use_list = I32(1)
+    elif cutlass.const_expr(GM == 1):
         if nb1 <= CAPL:
             use_list = I32(1)
+    if cutlass.const_expr(GM == 1):
         gb = I32(0)
         nwin = I32(0)
         cb = I32(0)
@@ -1271,9 +1400,12 @@ def _dsv4_kernel(
             nwin = sCtl[8]
             for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
                 gI[gb + j] = sHist[j]
-                kw = I32(sWK[j])
-                uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
-                gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+                if cutlass.const_expr(FPV == 1):
+                    gV[gb + j] = sWV[j]
+                else:
+                    kw = I32(sWK[j])
+                    uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+                    gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
             cb = sCtl[18]
             ncl = sCtl[11]
             nsl = ncl
@@ -1319,7 +1451,12 @@ def _dsv4_kernel(
                     idx = cb + bl + cute.arch.popc(ml & lml)
                 if take:
                     gRow[WS_CAND_OF(NREP) + 2 * idx] = t
-                    gRow[WS_CAND_OF(NREP) + 2 * idx + 1] = kk
+                    if cutlass.const_expr(FPV == 1):
+                        elo, ehi = _entry_of(t, sVal32i[es])
+                        gRow[WS_CAND_OF(NREP) + 2 * idx] = elo
+                        gRow[WS_CAND_OF(NREP) + 2 * idx + 1] = ehi
+                    else:
+                        gRow[WS_CAND_OF(NREP) + 2 * idx + 1] = kk
         else:
             # fine merge through GMEM; the winner range is reserved with one atomic per CTA and
             # written out while the second spin barrier completes
@@ -1339,9 +1476,12 @@ def _dsv4_kernel(
             nwin = sCtl[8]
             for j in cutlass.range(tidx, nwin, NTHREADS, unroll=1):
                 gI[gb + j] = sHist[j]
-                kw = I32(sWK[j])
-                uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
-                gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
+                if cutlass.const_expr(FPV == 1):
+                    gV[gb + j] = sWV[j]
+                else:
+                    kw = I32(sWK[j])
+                    uw = kw ^ (0x8000 + ((((kw >> 15) & 1) ^ 1) * 0x7FFF))
+                    gV[gb + j] = U16(uw & 0xFFFF).bitcast(F16).to(F32)
             if tidx == 0:
                 ctr2 = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ARR2) * 4)
                 v2 = _ld_acquire_gpu(ctr2)
@@ -1354,238 +1494,318 @@ def _dsv4_kernel(
                     wrow_i + cutlass.Int64((WS_FINE_OF(NREP) + 32 * tidx) * 4)
                 )
             cute.arch.barrier()
-    # No rendezvous before the fine push: peer sFTot buffers were zeroed before
-    # the scan-end arrive and nobody reads them until the wait below.
-    if cutlass.const_expr(CS > 1 and GM == 0):
-        ptf = [cute.arch.map_dsmem_ptr(sFTot.iterator, c) for c in range(CS)]
-        if tidx < NFINE:
-            v = sFine[tidx]
-            if v != 0:
-                for c in cutlass.range_constexpr(CS):
-                    cute.arch.atomic_add(ptf[c] + tidx, v, scope="cluster")
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-
-    # ---------------- level 2: fine descent (32 bins) ------------------------
-    if cutlass.const_expr(CS > 1):
-        _pick32(sFTot, sCtl, tidx, warp_idx, r1, 2)
-    else:
-        _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
-    cute.arch.barrier()
-    b2 = sCtl[2]
-    c2above = sCtl[3]
-    r2 = r1 - c2above
-    base2 = cabove + c2above
-
-    # ---------------- boundary claim + tie fill ------------------------------
-    cnt9 = sCtl.iterator + 9
-    cnt10 = sCtl.iterator + 10
-    if cutlass.const_expr(CS > 1 and GM == 0):
-        cnt9 = cute.arch.map_dsmem_ptr(sCtl.iterator + 9, 0)
-        cnt10 = cute.arch.map_dsmem_ptr(sCtl.iterator + 10, 0)
-    sTie = sHist
-    tie_base = I32(0)
-    if cutlass.const_expr(CS > 1 and GM == 0):
-        tie_base = I32(cute.arch.map_dsmem_ptr(sHist.iterator, 0).toint())
-    cnt9_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ABV) * 4)
-    cnt10_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_TIE) * 4)
-    ncand = sCtl[11]
-    nscan = ncand
-    if ncand > CAP:
-        nscan = ndn * TOK + nsurv
-    if cutlass.const_expr(GM == 1):
-        if use_list == 0:
-            nitb = (nscan + NTHREADS - 1) // NTHREADS
-            lanew = tidx % 32
-            lmw = (I32(1) << lanew) - I32(1)
-            for it in cutlass.range(nitb, unroll=1):
-                ci = it * NTHREADS + tidx
-                live = ci < nscan
-                es = I32(0)
-                if live:
-                    es = ci
-                    if ncand <= CAP:
-                        es = sCand[ci]
-                pl = es
-                kk = I32(0)
-                if live:
-                    if cutlass.const_expr(NLOC > NDENSE):
-                        if es < NDENSE * TOK:
-                            kk = I32(sKey[es])
-                        else:
-                            kk = I32(sSKey[es - NDENSE * TOK])
-                            pl = sSPos[es - NDENSE * TOK]
-                    else:
-                        kk = I32(sKey[es])
-                t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
-                take = live and (t < L) and ((kk >> 5) == b1)
-                if ncand <= CAP:
-                    take = live
-                k2 = kk & (NFINE - 1)
-                ab = take and (k2 > b2)
-                tie = take and (k2 == b2)
-                ma = cute.arch.vote_ballot_sync(ab)
-                mt = cute.arch.vote_ballot_sync(tie)
-                basea = I32(0)
-                baset = I32(0)
-                if lanew == 0:
-                    if ma != 0:
-                        basea = _atom_add_gpu(cnt9_i, cute.arch.popc(ma))
-                    if mt != 0:
-                        baset = _atom_add_gpu(cnt10_i, cute.arch.popc(mt))
-                basea = cute.arch.shuffle_sync(basea, 0)
-                baset = cute.arch.shuffle_sync(baset, 0)
-                ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
-                if ab:
-                    p = basea + cute.arch.popc(ma & lmw)
-                    gI[cabove + p] = t
-                    gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
-                if tie:
-                    p = baset + cute.arch.popc(mt & lmw)
-                    if p < r2:
-                        gI[base2 + p] = t
-                        gV[base2 + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
-                    if cutlass.const_expr(REFINE == 1):
-                        if p < TIECAP:
-                            gRow[WS_TIE_OF(NREP) + p] = t
-    else:
-        for ci in cutlass.range(tidx, nscan, NTHREADS, unroll=2):
-            es = ci
-            if ncand <= CAP:
-                es = sCand[ci]
-            pl = es
-            kk = I32(0)
-            if cutlass.const_expr(NLOC > NDENSE):
-                if es < NDENSE * TOK:
-                    kk = I32(sKey[es])
-                else:
-                    kk = I32(sSKey[es - NDENSE * TOK])
-                    pl = sSPos[es - NDENSE * TOK]
-            else:
-                kk = I32(sKey[es])
-            t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
-            take = t < L
-            if ncand <= CAP:
-                take = True
-            else:
-                take = take and ((kk >> 5) == b1)
-            if take:
-                k2 = kk & (NFINE - 1)
-                if k2 > b2:
-                    p = I32(0)
-                    if cutlass.const_expr(GM == 1):
-                        p = _atom_add_gpu(cnt9_i, I32(1))
-                    else:
-                        p = cute.arch.atomic_add(cnt9, I32(1), scope="cluster")
-                    ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
-                    gI[cabove + p] = t
-                    gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
-                elif k2 == b2:
-                    p = I32(0)
-                    if cutlass.const_expr(GM == 1):
-                        p = _atom_add_gpu(cnt10_i, I32(1))
-                    else:
-                        p = cute.arch.atomic_add(cnt10, I32(1), scope="cluster")
-                    if p < r2:
-                        gI[base2 + p] = t
-                        ub2 = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
-                        gV[base2 + p] = U16(ub2 & 0xFFFF).bitcast(F16).to(F32)
-                    if cutlass.const_expr(REFINE == 1):
-                        if p < TIECAP:
-                            # tie member list for the fp32 refinement (sPart is dead here)
-                            if cutlass.const_expr(GM == 1):
-                                gRow[WS_TIE_OF(NREP) + p] = t
-                            elif cutlass.const_expr(CS > 1):
-                                _st_dsmem_u32(tie_base + p * 4, t)
-                            else:
-                                sTie[p] = t
+    # ---------------- list finisher: the K-th bin's (token, fp32) pairs go to one CTA ----------
+    skip_old = I32(0)
+    b2 = I32(0)
+    c2above = I32(0)
+    r2 = I32(0)
+    base2 = I32(0)
     last = crk == 0
-    if cutlass.const_expr(GM == 1):
-        # the last CTA to finish the boundary pass owns the tail: it takes the tie list and
-        # the tie count, and re-zeroes the row's workspace once nobody else touches it
-        cute.arch.fence_acq_rel_gpu()
-        cute.arch.barrier()
-        if tidx == 0:
-            sCtl[17] = _atom_add_gpu(
-                wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_DONE) * 4), I32(1)
-            )
-            cute.arch.fence_acq_rel_gpu()
-        cute.arch.barrier()
-        last = sCtl[17] == CSd - 1
-        ntg = I32(0)
-        nall = I32(0)
-        if cutlass.const_expr(REFINE == 1):
-            if (use_list == 1) and (sCtl[17] != CSd - 1):
-                # warm L2 with this CTA's K-th-bin candidate pages for the tail CTA's fp32 pass
-                nmine = ncl
-                if ncl > CAP:
-                    nmine = sCtl[19]
-                if nmine > 512:
-                    nmine = I32(512)
-                for i in cutlass.range(tidx, nmine, NTHREADS, unroll=1):
-                    tc = gRow[WS_CAND_OF(NREP) + 2 * (cb + i)]
-                    pgc = kv_ptr.toint() + cutlass.Int64(gBT[tc >> 5]) * PGB
-                    for pfl in cutlass.range_constexpr(PGB // 128):
-                        _pfl2(pgc + pfl * 128)
-        if last:
-            if use_list == 1:
-                # the whole K-th bin of the row: fine histogram, descent, write-out, tie list
-                nall = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_CAND) * 4))
-                if tidx < 32:
-                    sFine[tidx] = I32(0)
+    sTie = sHist
+    if cutlass.const_expr(FPV == 1 and GM == 0):
+        if use_list == 1:
+            skip_old = I32(1)
+            ncll = sCtl[11]
+            if cutlass.const_expr(CS > 1):
+                # every CTA appends its members to rank 0's list; one cluster barrier; rank 0 finishes
                 if tidx == 0:
-                    sCtl[19] = I32(0)
-                    sCtl[20] = I32(0)
+                    sCtl[21] = cute.arch.atomic_add(
+                        cute.arch.map_dsmem_ptr(sCtl.iterator + 22, 0), ncll, scope="cluster"
+                    )
+                _finish_prep(sFine, sCtl, tidx)
                 cute.arch.barrier()
-                for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
-                    kc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4))
-                    cute.arch.atomic_add(sFine.iterator + (kc & (NFINE - 1)), I32(1), scope="cta")
+                cbl = sCtl[21]
+                ltb = I32(cute.arch.map_dsmem_ptr(sHist.iterator, 0).toint())
+                for il in cutlass.range(tidx, ncll, NTHREADS, unroll=1):
+                    esl = sCand[il]
+                    elo, ehi = _entry_of(
+                        (crk + (ntl - 1 - (esl >> 7)) * CSd) * TOK + (esl & (TOK - 1)), sVal32i[esl]
+                    )
+                    _st_dsmem_u32(ltb + (cbl + il) * 8, elo)
+                    _st_dsmem_u32(ltb + (cbl + il) * 8 + 4, ehi)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                if crk == 0:
+                    _finish_list(
+                        sP, sCtl[22], r1, cabove, gI, gV, sFine, sCtl, sTot, sTS2, tidx, warp_idx
+                    )
+            else:
+                # the winners left sHist above; the entries take its place
+                _finish_prep(sFine, sCtl, tidx)
                 cute.arch.barrier()
-                _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
+                for il in cutlass.range(tidx, ncll, NTHREADS, unroll=1):
+                    esl = sCand[il]
+                    elo, ehi = _entry_of(
+                        (crk + (ntl - 1 - (esl >> 7)) * CSd) * TOK + (esl & (TOK - 1)), sVal32i[esl]
+                    )
+                    sHist[2 * il] = elo
+                    sHist[2 * il + 1] = ehi
                 cute.arch.barrier()
-                b2 = sCtl[2]
-                c2above = sCtl[3]
-                r2 = r1 - c2above
-                base2 = cabove + c2above
-                for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
-                    tc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i) * 4))
-                    kc = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4))
-                    k2 = kc & (NFINE - 1)
-                    uc = kc ^ (0x8000 + ((((kc >> 15) & 1) ^ 1) * 0x7FFF))
-                    p = I32(0)
-                    if k2 > b2:
-                        p = cute.arch.atomic_add(sCtl.iterator + 19, I32(1), scope="cta")
-                        gI[cabove + p] = tc
-                        gV[cabove + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
-                    elif k2 == b2:
-                        p = cute.arch.atomic_add(sCtl.iterator + 20, I32(1), scope="cta")
+                _finish_list(sP, ncll, r1, cabove, gI, gV, sFine, sCtl, sTot, sTS2, tidx, warp_idx)
+            cute.arch.barrier()
+    if skip_old == 0:
+        # No rendezvous before the fine push: peer sFTot buffers were zeroed before
+        # the scan-end arrive and nobody reads them until the wait below.
+        if cutlass.const_expr(CS > 1 and GM == 0):
+            ptf = [cute.arch.map_dsmem_ptr(sFTot.iterator, c) for c in range(CS)]
+            if tidx < NFINE:
+                v = sFine[tidx]
+                if v != 0:
+                    for c in cutlass.range_constexpr(CS):
+                        cute.arch.atomic_add(ptf[c] + tidx, v, scope="cluster")
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
+        # ---------------- level 2: fine descent (32 bins) ------------------------
+        if cutlass.const_expr(CS > 1):
+            _pick32(sFTot, sCtl, tidx, warp_idx, r1, 2)
+        else:
+            _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
+        cute.arch.barrier()
+        b2 = sCtl[2]
+        c2above = sCtl[3]
+        r2 = r1 - c2above
+        base2 = cabove + c2above
+
+        # ---------------- boundary claim + tie fill ------------------------------
+        cnt9 = sCtl.iterator + 9
+        cnt10 = sCtl.iterator + 10
+        if cutlass.const_expr(CS > 1 and GM == 0):
+            cnt9 = cute.arch.map_dsmem_ptr(sCtl.iterator + 9, 0)
+            cnt10 = cute.arch.map_dsmem_ptr(sCtl.iterator + 10, 0)
+        tie_base = I32(0)
+        if cutlass.const_expr(CS > 1 and GM == 0):
+            tie_base = I32(cute.arch.map_dsmem_ptr(sHist.iterator, 0).toint())
+        cnt9_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_ABV) * 4)
+        cnt10_i = wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_TIE) * 4)
+        ncand = sCtl[11]
+        nscan = ncand
+        if ncand > CAP:
+            nscan = ndn * TOK + nsurv
+        if cutlass.const_expr(GM == 1):
+            if use_list == 0:
+                nitb = (nscan + NTHREADS - 1) // NTHREADS
+                lanew = tidx % 32
+                lmw = (I32(1) << lanew) - I32(1)
+                for it in cutlass.range(nitb, unroll=1):
+                    ci = it * NTHREADS + tidx
+                    live = ci < nscan
+                    es = I32(0)
+                    if live:
+                        es = ci
+                        if ncand <= CAP:
+                            es = sCand[ci]
+                    pl = es
+                    kk = I32(0)
+                    if live:
+                        if cutlass.const_expr(NLOC > NDENSE):
+                            if es < NDENSE * TOK:
+                                kk = I32(sKey[es])
+                            else:
+                                kk = I32(sSKey[es - NDENSE * TOK])
+                                pl = sSPos[es - NDENSE * TOK]
+                        else:
+                            kk = I32(sKey[es])
+                    t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
+                    take = live and (t < L) and ((kk >> 5) == b1)
+                    if ncand <= CAP:
+                        take = live
+                    k2 = kk & (NFINE - 1)
+                    ab = take and (k2 > b2)
+                    tie = take and (k2 == b2)
+                    ma = cute.arch.vote_ballot_sync(ab)
+                    mt = cute.arch.vote_ballot_sync(tie)
+                    basea = I32(0)
+                    baset = I32(0)
+                    if lanew == 0:
+                        if ma != 0:
+                            basea = _atom_add_gpu(cnt9_i, cute.arch.popc(ma))
+                        if mt != 0:
+                            baset = _atom_add_gpu(cnt10_i, cute.arch.popc(mt))
+                    basea = cute.arch.shuffle_sync(basea, 0)
+                    baset = cute.arch.shuffle_sync(baset, 0)
+                    ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
+                    if ab:
+                        p = basea + cute.arch.popc(ma & lmw)
+                        gI[cabove + p] = t
+                        gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
+                    if tie:
+                        p = baset + cute.arch.popc(mt & lmw)
                         if p < r2:
-                            gI[base2 + p] = tc
-                            gV[base2 + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
+                            gI[base2 + p] = t
+                            gV[base2 + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
                         if cutlass.const_expr(REFINE == 1):
                             if p < TIECAP:
-                                sTie[p] = tc
-                cute.arch.barrier()
-                if tidx == 0:
-                    sCtl[10] = sCtl[20]
-            else:
-                ntg = _ld_relaxed_gpu(cnt10_i)
-                if ntg > TIECAP:
-                    ntg = I32(TIECAP)
-                if tidx == 0:
-                    sCtl[10] = _ld_relaxed_gpu(cnt10_i)
-                if cutlass.const_expr(REFINE == 1):
-                    for i in cutlass.range(tidx, ntg, NTHREADS, unroll=1):
-                        sTie[i] = _ld_relaxed_gpu(wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + i) * 4))
-        cute.arch.barrier()
-        if last:
-            for i in cutlass.range(tidx, WS_TIE_OF(NREP) + ntg, NTHREADS, unroll=1):
-                gRow[i] = I32(0)
-    elif cutlass.const_expr(CS > 1):
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-    elif cutlass.const_expr(REFINE == 1):
-        cute.arch.barrier()
+                                gRow[WS_TIE_OF(NREP) + p] = t
+        else:
+            for ci in cutlass.range(tidx, nscan, NTHREADS, unroll=2):
+                es = ci
+                if ncand <= CAP:
+                    es = sCand[ci]
+                pl = es
+                kk = I32(0)
+                if cutlass.const_expr(NLOC > NDENSE):
+                    if es < NDENSE * TOK:
+                        kk = I32(sKey[es])
+                    else:
+                        kk = I32(sSKey[es - NDENSE * TOK])
+                        pl = sSPos[es - NDENSE * TOK]
+                else:
+                    kk = I32(sKey[es])
+                t = (crk + (ntl - 1 - (pl >> 7)) * CSd) * TOK + (pl & (TOK - 1))
+                take = t < L
+                if ncand <= CAP:
+                    take = True
+                else:
+                    take = take and ((kk >> 5) == b1)
+                if take:
+                    k2 = kk & (NFINE - 1)
+                    if k2 > b2:
+                        p = I32(0)
+                        if cutlass.const_expr(GM == 1):
+                            p = _atom_add_gpu(cnt9_i, I32(1))
+                        else:
+                            p = cute.arch.atomic_add(cnt9, I32(1), scope="cluster")
+                        ub = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
+                        gI[cabove + p] = t
+                        gV[cabove + p] = U16(ub & 0xFFFF).bitcast(F16).to(F32)
+                    elif k2 == b2:
+                        p = I32(0)
+                        if cutlass.const_expr(GM == 1):
+                            p = _atom_add_gpu(cnt10_i, I32(1))
+                        else:
+                            p = cute.arch.atomic_add(cnt10, I32(1), scope="cluster")
+                        if p < r2:
+                            gI[base2 + p] = t
+                            ub2 = kk ^ (0x8000 + ((((kk >> 15) & 1) ^ 1) * 0x7FFF))
+                            gV[base2 + p] = U16(ub2 & 0xFFFF).bitcast(F16).to(F32)
+                        if cutlass.const_expr(REFINE == 1):
+                            if p < TIECAP:
+                                # tie member list for the fp32 refinement (sPart is dead here)
+                                if cutlass.const_expr(GM == 1):
+                                    gRow[WS_TIE_OF(NREP) + p] = t
+                                elif cutlass.const_expr(CS > 1):
+                                    _st_dsmem_u32(tie_base + p * 4, t)
+                                else:
+                                    sTie[p] = t
+        last = crk == 0
+        if cutlass.const_expr(GM == 1):
+            # the last CTA to finish the boundary pass owns the tail: it takes the tie list and
+            # the tie count, and re-zeroes the row's workspace once nobody else touches it
+            cute.arch.fence_acq_rel_gpu()
+            cute.arch.barrier()
+            if tidx == 0:
+                sCtl[17] = _atom_add_gpu(
+                    wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_DONE) * 4), I32(1)
+                )
+                cute.arch.fence_acq_rel_gpu()
+            cute.arch.barrier()
+            last = sCtl[17] == CSd - 1
+            ntg = I32(0)
+            nall = I32(0)
+            if cutlass.const_expr(REFINE == 1 and FPV == 0):
+                if (use_list == 1) and (sCtl[17] != CSd - 1):
+                    # warm L2 with this CTA's K-th-bin candidate pages for the tail CTA's fp32 pass
+                    nmine = ncl
+                    if ncl > CAP:
+                        nmine = sCtl[19]
+                    if nmine > 512:
+                        nmine = I32(512)
+                    for i in cutlass.range(tidx, nmine, NTHREADS, unroll=1):
+                        tc = gRow[WS_CAND_OF(NREP) + 2 * (cb + i)]
+                        pgc = kv_ptr.toint() + cutlass.Int64(gBT[tc >> 5]) * PGB
+                        for pfl in cutlass.range_constexpr(PGB // 128):
+                            _pfl2(pgc + pfl * 128)
+            if last:
+                if use_list == 1:
+                    # the whole K-th bin of the row: fine histogram, descent, write-out, tie list
+                    nall = _ld_relaxed_gpu(
+                        wrow_i + cutlass.Int64((WS_CTR_OF(NREP) + 32 * C_CAND) * 4)
+                    )
+                    if cutlass.const_expr(FPV == 1):
+                        # plain loads after the DONE acquire: independent, kept in flight
+                        gRow64 = cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Int64,
+                                wrow_i + cutlass.Int64(WS_CAND_OF(NREP) * 4),
+                                GMEM,
+                                assumed_align=8,
+                            ),
+                            cute.make_layout(CAPL),
+                        )
+                        for il in cutlass.range(tidx, nall, NTHREADS, unroll=4):
+                            sP[il] = gRow64[il]
+                        _finish_prep(sFine, sCtl, tidx)
+                        cute.arch.barrier()
+                        _finish_list(
+                            sP, nall, r1, cabove, gI, gV, sFine, sCtl, sTot, sTS2, tidx, warp_idx
+                        )
+                    else:
+                        if tidx < 32:
+                            sFine[tidx] = I32(0)
+                        if tidx == 0:
+                            sCtl[19] = I32(0)
+                            sCtl[20] = I32(0)
+                        cute.arch.barrier()
+                        for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
+                            kc = _ld_relaxed_gpu(
+                                wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4)
+                            )
+                            cute.arch.atomic_add(
+                                sFine.iterator + (kc & (NFINE - 1)), I32(1), scope="cta"
+                            )
+                        cute.arch.barrier()
+                        _pick32(sFine, sCtl, tidx, warp_idx, r1, 2)
+                        cute.arch.barrier()
+                        b2 = sCtl[2]
+                        c2above = sCtl[3]
+                        r2 = r1 - c2above
+                        base2 = cabove + c2above
+                        for i in cutlass.range(tidx, nall, NTHREADS, unroll=2):
+                            tc = _ld_relaxed_gpu(
+                                wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i) * 4)
+                            )
+                            kc = _ld_relaxed_gpu(
+                                wrow_i + cutlass.Int64((WS_CAND_OF(NREP) + 2 * i + 1) * 4)
+                            )
+                            k2 = kc & (NFINE - 1)
+                            uc = kc ^ (0x8000 + ((((kc >> 15) & 1) ^ 1) * 0x7FFF))
+                            p = I32(0)
+                            if k2 > b2:
+                                p = cute.arch.atomic_add(sCtl.iterator + 19, I32(1), scope="cta")
+                                gI[cabove + p] = tc
+                                gV[cabove + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
+                            elif k2 == b2:
+                                p = cute.arch.atomic_add(sCtl.iterator + 20, I32(1), scope="cta")
+                                if p < r2:
+                                    gI[base2 + p] = tc
+                                    gV[base2 + p] = U16(uc & 0xFFFF).bitcast(F16).to(F32)
+                                if cutlass.const_expr(REFINE == 1):
+                                    if p < TIECAP:
+                                        sTie[p] = tc
+                        cute.arch.barrier()
+                        if tidx == 0:
+                            sCtl[10] = sCtl[20]
+                else:
+                    ntg = _ld_relaxed_gpu(cnt10_i)
+                    if ntg > TIECAP:
+                        ntg = I32(TIECAP)
+                    if tidx == 0:
+                        sCtl[10] = _ld_relaxed_gpu(cnt10_i)
+                    if cutlass.const_expr(REFINE == 1):
+                        for i in cutlass.range(tidx, ntg, NTHREADS, unroll=1):
+                            sTie[i] = _ld_relaxed_gpu(
+                                wrow_i + cutlass.Int64((WS_TIE_OF(NREP) + i) * 4)
+                            )
+            cute.arch.barrier()
+            if last:
+                for i in cutlass.range(tidx, WS_TIE_OF(NREP) + ntg, NTHREADS, unroll=1):
+                    gRow[i] = I32(0)
+        elif cutlass.const_expr(CS > 1):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        elif cutlass.const_expr(REFINE == 1):
+            cute.arch.barrier()
 
     # ---------------- fp32 boundary refinement ------------------------------
     # The fp16 key is exact above the boundary; only the tie class at the K-th
@@ -1878,6 +2098,7 @@ def _launch(
     RBT: cutlass.Constexpr,
     GM: cutlass.Constexpr,
     NREP: cutlass.Constexpr,
+    FPV: cutlass.Constexpr,
 ):
     tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
         FP4, FP4, OperandMajorMode.K, OperandMajorMode.K, SF, 32, tcgen05.CtaGroup.ONE, (TOK, HD)
@@ -1935,6 +2156,7 @@ def _launch(
         + HD * DIMB
         + 512
         + NDENSE * TOK * 2
+        + (NDENSE * TOK * 4 if FPV else 16)
         + 2 * NBINS * 4
         + 64 * 4
         + (NBINS // 8) * 4
@@ -1978,6 +2200,7 @@ def _launch(
         RBT,
         GM,
         NREP,
+        FPV,
     ).launch(
         grid=[B * CS, 1, 1],
         block=[NTHREADS, 1, 1],
@@ -2023,11 +2246,12 @@ def _workspace(device, nrep, nsm, key):
 SMEM_CAP = 231424
 
 
-def _stages(NDENSE, NLOC, SCAP, RBT):
+def _stages(NDENSE, NLOC, SCAP, RBT, FPV=0):
     fixed = (
         HD * DIMB
         + 512
         + NDENSE * TOK * 2
+        + (NDENSE * TOK * 4 if FPV else 16)
         + SCAP * 6
         + (2 * CHUNK * TOK * 2 if SCAP > 0 else 16)
         + 2 * NBINS * 4
@@ -2126,14 +2350,22 @@ def _config(B, MAXB, NPAGES, KTOP):
     SCAP = 0
     if NLOC > NDENSE:
         SCAP = ((KTOP + TIECAP + CHUNK * TOK + 511) // 512) * 512
-    STAGES = _stages(NDENSE, NLOC, SCAP, RBT)
+    # fp32 scores kept per dense position (list finisher, no K-page re-read) when the stage
+    # budget survives; filtered (long) rows keep the fp16 keys and the virtual-tile refinement
+    FPV = 0
+    if SCAP == 0 and os.environ.get("TRTLLM_FUSED_TOPK_FPV", "1") == "1":
+        if _stages(NDENSE, NLOC, SCAP, RBT, 1) >= int(
+            os.environ.get("TRTLLM_FUSED_TOPK_FPV_MINSTAGES", "12")
+        ):
+            FPV = 1
+    STAGES = _stages(NDENSE, NLOC, SCAP, RBT, FPV)
     # fp32-exact boundary: the K-th fp16 tie class is rescored through the MMA
     # path (on by default); TRTLLM_FUSED_TOPK_FP32_EXACT=0 keeps the fp16 fill
     REFINE = 0 if os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "1") == "0" else 1
     assert KTOP <= NBINS and TIECAP <= NBINS and TIECAP <= CAP, (
         "tie lists reuse the histogram and candidate buffers"
     )
-    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP)
+    key = (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP, FPV)
     return key, NREP, nsm
 
 
@@ -2150,6 +2382,8 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
         os.environ.get("TRTLLM_FUSED_TOPK_GMEM_SPLIT", "auto"),
         os.environ.get("TRTLLM_FUSED_TOPK_NDENSE", ""),
         os.environ.get("TRTLLM_FUSED_TOPK_FP32_EXACT", "1"),
+        os.environ.get("TRTLLM_FUSED_TOPK_FPV", "1"),
+        os.environ.get("TRTLLM_FUSED_TOPK_FPV_MINSTAGES", "12"),
     )
     cfg = _cfg.get(ck)
     if cfg is None:
@@ -2169,7 +2403,23 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
     stream = cuda.CUstream(_raw_stream(indices.device))
     fn = _cache.get(key)
     if fn is None:
-        (B, NCOMP, KTOP, MAXB, NPAGES, STAGES, CS, NLOC, NDENSE, SCAP, REFINE, RBT, GM, NREP) = key
+        (
+            B,
+            NCOMP,
+            KTOP,
+            MAXB,
+            NPAGES,
+            STAGES,
+            CS,
+            NLOC,
+            NDENSE,
+            SCAP,
+            REFINE,
+            RBT,
+            GM,
+            NREP,
+            FPV,
+        ) = key
         fn = cute.compile(
             _launch,
             kv_ptr,
@@ -2196,6 +2446,7 @@ def run(q_fp4, sf_q, kv_cache, weights, context_lens, block_table, top_k_t, indi
             RBT,
             GM,
             NREP,
+            FPV,
         )
         _cache[key] = fn
     fn(kv_ptr, q_ptr, sfq_ptr, w_ptr, clen_ptr, bt_ptr, oi_ptr, ov_ptr, ws_ptr, stream)

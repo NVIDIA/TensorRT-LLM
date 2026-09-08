@@ -92,6 +92,13 @@ def _build_inputs(batch, n_comp, k_top, weight_mode, seed, device, pattern="rand
             pos = t % (n_comp * 1.0)
             tile = torch.div(pos, 128.0, rounding_mode="floor")
             c = torch.where(tile % 2 == 0, 1.0 + pos / n_comp, torch.full_like(t, 25.0))
+        elif (
+            pattern == "plateau"
+        ):  # 200 distinct winners, then a 900-member equal class at the K-th
+            pos = t % (n_comp * 1.0)
+            c = 0.1 + 1.8 * torch.rand(t.shape, generator=g, device=device)
+            c = torch.where(pos < 200, 3.5 + 0.5 * pos / 200, c)
+            c = torch.where((pos >= 1000) & (pos < 1900), torch.full_like(t, 3.0), c)
         else:  # "giantbin": 70% of the row shares one high value
             c = torch.where(
                 torch.rand(t.shape, generator=g, device=device) < 0.7,
@@ -592,6 +599,34 @@ def test_fused_indexer_topk_nospill_mixed_lengths(batch, split, monkeypatch):
         device=device,
     )
     inp["context_lens"] = lens
+    indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
+    values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
+    fused_indexer_topk_nospill.run(
+        inp["q_fp4"],
+        inp["sf_q"],
+        inp["kv_cache"],
+        inp["weights"],
+        inp["context_lens"],
+        inp["block_table"],
+        None,
+        indices,
+        values,
+    )
+    torch.cuda.synchronize()
+    _check_rows(inp, indices, values, k_top)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch", [2, 16, 80])
+@pytest.mark.parametrize("split", ["auto", "1"])
+def test_fused_indexer_topk_nospill_equal_class(batch, split, monkeypatch):
+    # The K-th value sits inside a 900-member class of one exact score: the candidate list holds
+    # the whole class and more members than slots remain, so the finisher must recognise the
+    # all-equal class and fill the slots without ranking (cluster, single-CTA and GMEM layouts)
+    monkeypatch.setenv("TRTLLM_FUSED_TOPK_GMEM_SPLIT", split)
+    device = torch.device("cuda")
+    k_top = 1024
+    inp = _build_inputs(batch, 8192, k_top, "nonneg", seed=2718, device=device, pattern="plateau")
     indices = torch.full((batch, k_top), -3, dtype=torch.int32, device=device)
     values = torch.full((batch, k_top), float("nan"), dtype=torch.float32, device=device)
     fused_indexer_topk_nospill.run(
