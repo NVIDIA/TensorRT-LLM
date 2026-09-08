@@ -144,9 +144,15 @@ Rules that keep the loop deterministic:
   `disposition: item` `ref` must name a real roadmap item id, any
   status: an opportunity whose fix was already tried *was* considered.
   A `dismissed` `ref` is the evidence for dismissing it, never a bare
-  restatement. Carry still-valid rows forward each round — the analyzer
-  rewrites the block, so a dropped row reads as an unaccounted
-  opportunity and fails validation.
+  restatement. **Round N > 1**: author the block fresh from *this*
+  round's `items.json`. An `nsys-NN` id is local to the analysis that
+  wrote it — a re-profile renumbers from `nsys-01` — so unlike a roadmap
+  item id it is never carried forward, and a previous round's row never
+  covers this round's same-numbered opportunity. Re-state a judgement
+  that still holds against the id this round's file gives it, citing the
+  earlier round in `ref` when that saves re-deriving the evidence. A row
+  naming an id absent from the current file fails validation exactly as
+  an unaccounted id does.
 - **Ownership.** Only the **analyzer** writes item content (ids, titles,
   categories, evidence, gains, ordering) and may mark still-pending items
   `obsolete` when fresh evidence — a re-profile, or the verdicts a

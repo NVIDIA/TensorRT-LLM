@@ -1309,8 +1309,11 @@ def test_roadmap_spec_documents_the_nsys_items_block():
     assert "must name a real roadmap item id, any status" in spec
     # Absent when the pipeline could not run; required when it did.
     assert "omitted entirely when it does not" in spec
-    # The block is rewritten each round, so a dropped row is a violation.
-    assert "a dropped row reads as an unaccounted opportunity" in spec
+    # Ids are local to the analysis that wrote them, so the block is
+    # authored fresh each round rather than carried forward — a stale row
+    # names an id this round's file does not have.
+    assert "author the block fresh from *this* round's `items.json`" in spec
+    assert "never carried forward" in spec
 
 
 def test_analyzer_categorizes_imbalance_by_the_work_not_the_collective():
