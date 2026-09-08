@@ -16,7 +16,7 @@
 """Unit tests for speculative modeling classes."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import pytest
 import torch
@@ -29,11 +29,14 @@ from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
     SpecDecOneEngineForCausalLM,
+    _build_mtp_one_model_draft,
     _copy_model_config_with_moe_backend,
     external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 class _FakeDraftModel(nn.Module):
@@ -483,3 +486,100 @@ def test_loaded_draft_moe_backend_uses_isolated_model_config() -> None:
     resolve_backend.assert_called_once_with(
         "AUTO", "DraftBackendTestForCausalLM", quant_config=target_config.quant_config
     )
+
+
+def test_internal_mtp_without_override_reuses_target_model_config() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=None)
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+        return_value=sentinel.draft_model,
+    ) as mtp_cls:
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    assert draft_model is sentinel.draft_model
+    assert mtp_cls.call_args.args[0] is target_config
+    assert target_model.preload_weight_modules == []
+
+
+@pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])
+@pytest.mark.parametrize(
+    "quant_config_key",
+    ["model.layers.2.mlp.experts", "mtp.layers.0.mlp.experts"],
+)
+def test_internal_mtp_moe_backend_uses_isolated_layer_config(
+    requested_backend: str,
+    quant_config_key: str,
+) -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend=requested_backend)
+    mtp_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    target_config.quant_config_dict = {
+        quant_config_key: mtp_quant_config,
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch.object(ModelConfig, "resolve_moe_backend", return_value="TRTLLM") as resolve_backend,
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        draft_model = _build_mtp_one_model_draft(
+            target_config, None, sentinel.lm_head, target_model
+        )
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert draft_model is sentinel.draft_model
+    assert mtp_model_config is not target_config
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert mtp_model_config.quant_config_dict is target_config.quant_config_dict
+    assert mtp_model_config.extra_attrs is target_config.extra_attrs
+    assert target_config.moe_backend == "CUTEDSL"
+    assert target_config._frozen
+    assert target_model.preload_weight_modules == ["experts", "routing_method", "all_reduce"]
+    resolve_backend.assert_called_once_with(
+        requested_backend,
+        "DraftBackendTestForCausalLM",
+        quant_config=mtp_quant_config,
+    )
+
+
+def test_internal_mtp_auto_resolves_from_layer_quantization() -> None:
+    target_config = _draft_backend_test_model_config("CUTEDSL")
+    target_config.spec_config = SimpleNamespace(moe_backend="AUTO")
+    target_config.quant_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    target_config.quant_config_dict = {
+        "model.layers.2.mlp.experts": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+    }
+    target_config._frozen = True
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with (
+        patch("tensorrt_llm._torch.model_config.is_sm_100f", return_value=True),
+        patch(
+            "tensorrt_llm._torch.models.modeling_speculative.MTPForCausalLM",
+            return_value=sentinel.draft_model,
+        ) as mtp_cls,
+    ):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)
+
+    mtp_model_config = mtp_cls.call_args.args[0]
+    assert mtp_model_config.moe_backend == "TRTLLM"
+    assert target_config.moe_backend == "CUTEDSL"
+
+
+def test_internal_mtp_rejects_nemotron_backend_mismatch() -> None:
+    target_config = _draft_backend_test_model_config("CUTLASS")
+    target_config.pretrained_config.model_type = "nemotron_h"
+    target_config.spec_config = SimpleNamespace(moe_backend="VANILLA")
+    target_model = SimpleNamespace(aux_stream_dict={}, preload_weight_modules=[])
+
+    with pytest.raises(ValueError, match="Nemotron-H embedded MTP layers"):
+        _build_mtp_one_model_draft(target_config, None, sentinel.lm_head, target_model)

@@ -2089,6 +2089,25 @@
       "path": "speculative_config.max_total_draft_tokens"
     },
     {
+      "allowed_values": [
+        "AUTO",
+        "CUTLASS",
+        "CUTEDSL",
+        "TRTLLM",
+        "DEEPGEMM",
+        "DENSEGEMM",
+        "VANILLA",
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM",
+        "MEGAMOE_CUTEDSL"
+      ],
+      "annotation": "Optional[Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.moe_backend"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
