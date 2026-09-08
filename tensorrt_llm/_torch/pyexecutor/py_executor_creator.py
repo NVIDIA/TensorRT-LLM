@@ -6,6 +6,7 @@ import functools
 import gc
 import importlib
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1093,7 +1094,7 @@ def create_py_executor(
             try:
                 current_dwdp_manager.__exit__(None, None, None)
             except BaseException:
-                logger.exception(
-                    "Failed to roll back DWDP after PyExecutor construction error"
-                )
+                logger.error(
+                    "Failed to roll back DWDP after PyExecutor construction error\n"
+                    f"{traceback.format_exc()}")
         raise

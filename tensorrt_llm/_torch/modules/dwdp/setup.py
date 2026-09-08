@@ -41,6 +41,7 @@ no-op (returns the existing manager stored on the model).
 
 from __future__ import annotations
 
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -78,7 +79,10 @@ def _release_during_rollback(resource, what: str) -> None:
     try:
         resource.release()
     except BaseException:  # noqa: BLE001 - cleanup must never mask the original
-        logger.exception(f"[DWDP Setup] {what} release failed during rollback")
+        logger.error(
+            f"[DWDP Setup] {what} release failed during rollback\n"
+            f"{traceback.format_exc()}"
+        )
 
 
 def setup_dwdp(
@@ -336,7 +340,9 @@ def teardown_dwdp(
         try:
             manager.release()
         except BaseException as exc:  # noqa: BLE001 - every manager must be tried
-            logger.exception("[DWDP Teardown] Manager release failed")
+            logger.error(
+                f"[DWDP Teardown] Manager release failed\n{traceback.format_exc()}"
+            )
             if first_error is None:
                 first_error = exc
     if first_error is not None:

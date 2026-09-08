@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import bisect
 import logging
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -534,7 +535,9 @@ class DWDPWeightManager:
                 try:
                     self._transport.release()
                 except Exception:  # noqa: BLE001 - must not mask the buffer error
-                    logger.exception("[DWDPWeightManager] Transport release failed")
+                    logger.error(
+                        f"[DWDPWeightManager] Transport release failed\n{traceback.format_exc()}"
+                    )
                 self._transport = None
             self._batched_copy_plans.clear()
             self._released = True
