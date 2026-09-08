@@ -45,7 +45,7 @@ from helpers import (convert_request_input_to_dict,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
 # Use PYTHONPATH=../llmapi/tensorrt_llm/1/
-from model import TritonPythonModel
+from model import TritonPythonModel, validate_media_urls
 
 
 @dataclass
@@ -515,3 +515,54 @@ def test_execute_single_request_skips_response_when_cancelled():
             asyncio.run(model._execute_single_request(request))
 
     assert sender.sent == [], "must not double-send after cancellation"
+
+
+@pytest.mark.parametrize("url", [
+    "/etc/passwd",
+    "/lustre/private/secret.png",
+    "file:///etc/passwd",
+    "relative/path.jpg",
+    "ftp://example.com/a.jpg",
+])
+def test_validate_media_urls_rejects_local_and_unknown_schemes(url):
+    # image_url is client-controlled; a local path would make the server read
+    # its own filesystem with the Triton process's permissions.
+    with pytest.raises(MockTritonModelException) as excinfo:
+        validate_media_urls([url])
+    assert "image_url" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("url", [
+    "http://images.example.com/a.jpg",
+    "https://images.example.com/a.jpg",
+    "data:image/png;base64,iVBORw0KGgo=",
+])
+def test_validate_media_urls_accepts_remote_and_inline(url):
+    validate_media_urls([url])
+
+
+def test_convert_request_rejects_local_path_before_loading():
+    # The rejection must happen before the media loader is reached.
+    model = _make_multimodal_model(enabled=True)
+    called = False
+
+    async def fake_helper(**kwargs):
+        nonlocal called
+        called = True
+        return {"prompt": "rendered"}
+
+    inputs_mod = MagicMock()
+    inputs_mod.async_build_multimodal_prompt = fake_helper
+    request = make_mock_triton_request({
+        **inputs(),
+        "image_url": [b"/etc/passwd"],
+    })
+
+    with patch.dict(sys.modules, {
+            "tensorrt_llm": MagicMock(),
+            "tensorrt_llm.inputs": inputs_mod,
+    }):
+        with pytest.raises(MockTritonModelException):
+            asyncio.run(model._convert_request(request))
+
+    assert not called, "loader must not be reached for a rejected URL"

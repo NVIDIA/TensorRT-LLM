@@ -35,6 +35,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from random import randint
 from typing import Any
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -83,6 +84,24 @@ def get_model_config(filename, include_keys=None, exclude_keys=None):
             for k, v in engine_config.items() if k not in exclude_keys
         }
     return engine_config
+
+
+# `image_url` is client-controlled, and the media loaders happily open local
+# paths and `file://` with the server process's permissions. Until the allowed
+# scope is agreed with the deployment owner, accept only remote fetches and
+# inline data, so a request cannot make the server read its filesystem.
+ALLOWED_MEDIA_SCHEMES = ("http", "https", "data")
+
+
+def validate_media_urls(urls):
+    """Reject media references that would read the server's filesystem."""
+    for url in urls:
+        if urlparse(url).scheme not in ALLOWED_MEDIA_SCHEMES:
+            raise pb_utils.TritonModelException(
+                f"Unsupported image_url {url!r}: only "
+                f"{', '.join(ALLOWED_MEDIA_SCHEMES)} are accepted. Local paths "
+                "and file:// URLs are rejected because the input is "
+                "client-controlled.")
 
 
 def get_input_scalar_by_name(request,
@@ -665,16 +684,17 @@ class TritonPythonModel:
             if image_url is not None and image_url.size > 0:
                 from tensorrt_llm.inputs import async_build_multimodal_prompt
 
+                media = [
+                    url.decode("utf-8") if isinstance(url, bytes) else str(url)
+                    for url in image_url.reshape(-1)
+                ]
+                validate_media_urls(media)
                 prompt = await async_build_multimodal_prompt(
                     model_type=self._mm_model_type,
                     tokenizer=self._mm_tokenizer,
                     processor=self._mm_processor,
                     prompt=prompt,
-                    media=[
-                        url.decode("utf-8")
-                        if isinstance(url, bytes) else str(url)
-                        for url in image_url.reshape(-1)
-                    ],
+                    media=media,
                     modality="image",
                 )
 
