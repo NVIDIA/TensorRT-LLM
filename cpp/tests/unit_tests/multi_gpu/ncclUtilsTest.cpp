@@ -1335,6 +1335,53 @@ TEST_F(CreateNCCLWindowTensorTest, NestedTensorLeaseScopesTransferEscapedOutputs
         nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, innerOutputBuffer.ptr, stream));
 }
 
+TEST_F(CreateNCCLWindowTensorTest, FailedCompiledScopesUnwindToEagerEntryDepth)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    std::vector<int64_t> shape = {16, 16};
+
+    auto const parentDepth = allocator.beginTensorLeaseScope({}, device);
+    auto [input, inputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(inputBuffer.isValid());
+    auto* inputStorage = input.storage().unsafeGetStorageImpl();
+    auto const eagerDepth = allocator.beginTensorLeaseScope({inputStorage}, device);
+
+    // Model two compiled boundaries whose end operations never execute after an exception.
+    allocator.beginTensorLeaseScope({inputStorage}, device);
+    auto [temporary, temporaryBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(temporaryBuffer.isValid());
+    allocator.beginTensorLeaseScope({inputStorage}, device);
+    auto [detached, detachedBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(detachedBuffer.isValid());
+    detached = torch::Tensor();
+
+    allocator.endTensorLeaseScope({inputStorage}, device, stream, true, eagerDepth);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::isQuarantined(allocator, *mComm, temporaryBuffer.ptr));
+    EXPECT_TRUE(nccl_util::NCCLWindowAllocatorTestAccess::isQuarantined(allocator, *mComm, detachedBuffer.ptr));
+
+    // The legitimate parent and escaped input survive; a subsequent invocation starts cleanly.
+    auto const retryDepth = allocator.beginTensorLeaseScope({inputStorage}, device);
+    EXPECT_EQ(retryDepth, eagerDepth);
+    auto [output, outputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(outputBuffer.isValid());
+    EXPECT_NE(outputBuffer.ptr, temporaryBuffer.ptr);
+    EXPECT_NE(outputBuffer.ptr, detachedBuffer.ptr);
+    allocator.endTensorLeaseScope({inputStorage}, device, stream, false, retryDepth);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, outputBuffer.ptr, stream));
+    allocator.endTensorLeaseScope({}, device, stream, false, parentDepth);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
+
+    auto const freshDepth = allocator.beginTensorLeaseScope({}, device);
+    EXPECT_EQ(freshDepth, parentDepth);
+    allocator.endTensorLeaseScope({}, device, stream, false, freshDepth);
+}
+
 TEST_F(CreateNCCLWindowTensorTest, FailedTensorLeaseScopeQuarantinesBuffers)
 {
     using nccl_util::createNCCLWindowTensor;

@@ -164,6 +164,12 @@ class MultiStreamDAG:
 
         latest_inplace_stat = {}
         inplace_map = inplace_info()
+        begin_scope = torch.ops.trtllm.begin_nccl_window_tensor_scope.default
+        end_scope = torch.ops.trtllm.end_nccl_window_tensor_scope.default
+        ordering_barriers = {
+            begin_scope: ("inputs", ),
+            end_scope: ("inputs", "outputs"),
+        }
 
         def flatten_args(args):
             """Recursively flatten nested arguments into a flat list."""
@@ -216,6 +222,11 @@ class MultiStreamDAG:
                         args = flatten_args([node.kwargs[inplace_arg]])
                         for arg in args:
                             latest_inplace_stat[arg] = vertex
+                if func in ordering_barriers:
+                    for arg_name in ordering_barriers[func]:
+                        args = flatten_args([node.kwargs[arg_name]])
+                        for arg in args:
+                            latest_inplace_stat[arg] = vertex
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)
@@ -266,7 +277,8 @@ class MultiStreamDAG:
         }
 
         def pick_stream(start_time, node) -> Stream:
-            if node.node.op == "call_function" and node.node.target in primary_stream_ops:
+            if (node.node.op == "call_function"
+                    and node.node.target in primary_stream_ops):
                 return streams[0]
             if node.weight == 0:
                 # This is a symint node or a getitem node.

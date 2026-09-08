@@ -801,10 +801,11 @@ void NCCLWindowAllocator::registerTensorLease(
     }
 }
 
-void NCCLWindowAllocator::beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device)
+size_t NCCLWindowAllocator::beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device)
 {
     std::lock_guard<std::mutex> lock(mMutex);
     auto& scopeStack = mTensorLeaseScopeStacks[getTensorLeaseScopeKey(device)];
+    auto const entryDepth = scopeStack.size();
     scopeStack.emplace_back();
     auto* scope = &scopeStack.back();
 
@@ -822,10 +823,11 @@ void NCCLWindowAllocator::beginTensorLeaseScope(std::vector<c10::StorageImpl con
         leaseIt->second.scope = scope;
         scope->storages.insert(storage);
     }
+    return entryDepth;
 }
 
-void NCCLWindowAllocator::endTensorLeaseScope(
-    std::vector<c10::StorageImpl const*> const& outputStorages, int device, cudaStream_t stream, bool failed)
+void NCCLWindowAllocator::endTensorLeaseScope(std::vector<c10::StorageImpl const*> const& outputStorages, int device,
+    cudaStream_t stream, bool failed, std::optional<size_t> entryDepth)
 {
     std::unordered_set<c10::StorageImpl const*> const escapedStorages(outputStorages.begin(), outputStorages.end());
 
@@ -834,8 +836,10 @@ void NCCLWindowAllocator::endTensorLeaseScope(
     TLLM_CHECK_WITH_INFO(stackIt != mTensorLeaseScopeStacks.end() && !stackIt->second.empty(),
         "NCCL window tensor lease scope stack is empty for device %d on the current thread", device);
     auto& scopeStack = stackIt->second;
-    auto& scope = scopeStack.back();
-    auto* parentScope = scopeStack.size() > 1 ? &scopeStack[scopeStack.size() - 2] : nullptr;
+    auto const targetDepth = entryDepth.value_or(scopeStack.size() - 1);
+    TLLM_CHECK_WITH_INFO(targetDepth < scopeStack.size(), "Invalid NCCL window tensor scope entry depth");
+    TLLM_CHECK_WITH_INFO(
+        failed || scopeStack.size() == targetDepth + 1, "Unbalanced NCCL window tensor scopes on successful exit");
     auto finishLease = [&](TensorLease const& lease)
     {
         if (failed)
@@ -848,31 +852,37 @@ void NCCLWindowAllocator::endTensorLeaseScope(
         }
     };
 
-    for (auto const* storage : scope.storages)
+    while (scopeStack.size() > targetDepth)
     {
-        auto leaseIt = mTensorLeases.find(storage);
-        TLLM_CHECK_WITH_INFO(leaseIt != mTensorLeases.end(), "NCCL window tensor scope contains an unknown storage");
-        if (escapedStorages.find(storage) != escapedStorages.end())
+        // Carry explicitly escaped storages through interrupted child scopes to the surviving parent.
+        auto& scope = scopeStack.back();
+        auto* parentScope = scopeStack.size() > 1 ? &scopeStack[scopeStack.size() - 2] : nullptr;
+        for (auto const* storage : scope.storages)
         {
-            leaseIt->second.scope = parentScope;
-            if (parentScope)
+            auto leaseIt = mTensorLeases.find(storage);
+            TLLM_CHECK_WITH_INFO(
+                leaseIt != mTensorLeases.end(), "NCCL window tensor scope contains an unknown storage");
+            if (escapedStorages.find(storage) != escapedStorages.end())
             {
-                parentScope->storages.insert(storage);
+                leaseIt->second.scope = parentScope;
+                if (parentScope)
+                {
+                    parentScope->storages.insert(storage);
+                }
+                continue;
             }
-            continue;
+
+            auto const releasedLease = leaseIt->second;
+            mTensorLeases.erase(leaseIt);
+            finishLease(releasedLease);
         }
 
-        auto const releasedLease = leaseIt->second;
-        mTensorLeases.erase(leaseIt);
-        finishLease(releasedLease);
+        for (auto const& detachedLease : scope.detachedLeases)
+        {
+            finishLease(detachedLease);
+        }
+        scopeStack.pop_back();
     }
-
-    for (auto const& detachedLease : scope.detachedLeases)
-    {
-        finishLease(detachedLease);
-    }
-
-    scopeStack.pop_back();
     if (scopeStack.empty())
     {
         mTensorLeaseScopeStacks.erase(stackIt);
