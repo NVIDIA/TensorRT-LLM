@@ -1013,12 +1013,9 @@ def test_validate_run_ws_requires_16_byte_alignment() -> None:
 # ===========================================================================
 # ==== prefill: per-row [ks, ke) windows (run_prefill) ======================
 # ===========================================================================
-# Contract: row r selects the Top-K of logits[r, ks:ke] (ks=row_starts[r],
-# ke=row_ends[r], compressed column units), output in the LOCAL frame
-# (column - ks) with a trailing -1 pad; nv=ke-ks <= k gives identity 0..nv-1.
-# The base is rounded down to a 16B boundary and the <=3 lead lanes are masked,
-# so ks % 4 in {1,2,3} (2nd+ request of a multi-request chunk) is exercised
-# with poison (+inf/NaN/3e38/-inf) written at [ks-3, ks) and [ke, npad).
+# Contract: Top-K of logits[r, ks:ke] in the local frame (column - ks), -1 pad,
+# identity for nv <= k. ks % 4 in {1,2,3} is exercised with poison written at
+# [ks-3, ks) and [ke, npad).
 
 
 def _prefill_reference(logits, row_starts, row_ends, top_k):
@@ -1037,10 +1034,9 @@ def _prefill_reference(logits, row_starts, row_ends, top_k):
 
 
 def _check_prefill_exact(logits, got, row_starts, row_ends, top_k):
-    """Tie-aware radix-parity check: trailing -1 pad from lengths; head unique
-    and in [0, nv); identity for nv <= k; exact index set when the k-th value
-    is unique, else strictly-above set + tie-class count (signed zeros and
-    genuine +/-inf compare like radix). NaN-in-window rows are structure-only."""
+    """Tie-aware radix-parity check: -1 pad from lengths, unique head in [0, nv),
+    identity for nv <= k; exact set when the k-th value is unique, else the
+    strictly-above set plus a tie-class count. NaN-in-window rows: structure only."""
     assert got.shape == (logits.shape[0], top_k) and got.dtype == torch.int32
     ks, ke = row_starts.tolist(), row_ends.tolist()
     got64 = got.to(torch.int64)
@@ -1113,10 +1109,9 @@ def _make_prefill_case(rows, ncols, ks_list, ke_list, *, top_k, seed, dist="rand
 
 @pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
 def test_prefill_causal_ramp(top_k):
-    """Single-request causal ramp (ks=0), 148 rows with nv = 1..148 < k: one
-    tier-0 launch where every row takes the short-row identity path. The k
-    boundary is test_prefill_short_rows; mixed short/long rows in one launch is
-    test_prefill_packed_misaligned_ks."""
+    """Causal ramp (ks=0), 148 rows with nv = 1..148 < k: one tier-0 launch, all
+    short-row identity. k boundary: test_prefill_short_rows; mixed short/long
+    rows in one launch: test_prefill_packed_misaligned_ks."""
     rows = 148
     ks = [0] * rows
     ke = list(range(1, rows + 1))

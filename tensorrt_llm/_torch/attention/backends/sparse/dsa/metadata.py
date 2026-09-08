@@ -437,12 +437,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         for bs in batch_sizes or ():
             rows.add(int(bs) * nn)
         msl_c = int(self.get_indexer_max_seq_len())
-        # Prefill leg: the self-sampling engine also serves prefill (per-row
-        # [ks, ke) windows). It is placed BEFORE the DeepGEMM decode-stride
-        # guard below (which would return early for an odd msl_c) because the
-        # DeepGEMM prefill stride is always a 256-multiple. Bounded to the six
-        # tier x U engines per k; best-effort under the same OOM guard as the
-        # decode leg.
+        # Prefill leg first: the decode-stride guard below may return early for
+        # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
         try:
             _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
         except torch.cuda.OutOfMemoryError:

@@ -220,11 +220,8 @@ class TopK(nn.Module):
         return output_indices
 
     def _selfsampling_prefill_ok(self, scores: torch.Tensor) -> bool:
-        """Engine hardware-format gate for the self-sampling prefill Top-K.
-
-        fp32 row-major scores with a float4-aligned row stride and a 16B base
-        (the DeepGEMM prefill logits arena, whose rows are 1024B-aligned). The
-        all-short tile case is handled by the caller before this check."""
+        """Engine format gate: fp32 row-major scores with a float4-aligned row
+        stride and a 16B base (the DeepGEMM prefill logits arena)."""
         return (
             scores.dtype == torch.float32
             and scores.stride(1) == 1

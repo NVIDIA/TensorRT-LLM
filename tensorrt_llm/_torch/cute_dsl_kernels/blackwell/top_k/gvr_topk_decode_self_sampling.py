@@ -1351,12 +1351,9 @@ class GvrMainKernel:
         self.r_const = int(r_const)
         # hint-free: gather_hint sites compiled out (sentinel pass-through)
         self.hint_free = bool(hint_free)
-        # prefill: per-row window [ks, ke) from row_starts/row_ends (rides the
-        # kv_lens / pre_idx ABI slots); base rounds down to a 16B boundary and
-        # the <=3 lead lanes are positionally masked. Single-CTA-per-row only
-        # (no SPLIT/workspace/TSH); next_n==1, cr_shift==0 (ks/ke are already
-        # in compressed column units). All prefill edits are const_expr-gated
-        # so legacy/varlen codegen stays byte-identical.
+        # prefill: per-row [ks, ke) window riding the kv_lens/pre_idx ABI slots,
+        # base rounded down to 16B with the <=3 lead lanes masked, one CTA per
+        # row (no SPLIT); every edit is const_expr-gated so other codegen is unchanged.
         self.prefill = bool(prefill)
         if self.prefill:
             assert (
@@ -1529,10 +1526,8 @@ class GvrMainKernel:
         col0 = cutlass.Int32(0)
         if cutlass.const_expr(self.varlen):
             if cutlass.const_expr(self.prefill):
-                # per-row window [ks, ke) already in compressed column units
-                # (kv_lens slot = row_starts, pre_idx slot = row_ends); no
-                # next_n / cr_shift math. Clamp only for memory safety — the
-                # indexer guarantees 0 <= ks <= ke <= logits.shape[1].
+                # ks/ke are already compressed column units (kv_lens = row_starts,
+                # pre_idx = row_ends); the clamps are for memory safety only.
                 ks = kv_lens[row]
                 ke = pre_idx[row]
                 if ks < cutlass.Int32(0):
@@ -1860,10 +1855,8 @@ class GvrMainKernel:
             # P3 slice (clamped in-row): the data P3 touches first starts
             # flowing while warp0 walks the chain. Short rows clamp every
             # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so the clamp must stay in
-            # the row's own window [col0, ke) — an npad-based clamp would
-            # over-read col0 columns past the last row's allocation. n4-1 is
-            # the last full in-window float4 (>=0 even for the n=0 short pass).
+            # prefill: the base is shifted to col0, so clamp within the row's own
+            # window [col0, ke) — n4-1 is the last full in-window float4.
             if cutlass.const_expr(self.prefill):
                 plim4 = n4 - cutlass.Int32(1)
                 if plim4 < cutlass.Int32(0):
@@ -1897,11 +1890,9 @@ class GvrMainKernel:
             C.ld_g_f32x4(atom128, x_addr, p4, fsa)
             C.ld_g_f32x4(atom128, x_addr, p4 + cutlass.Int32(1), fsb)
             if cutlass.const_expr(self.prefill):
-                # only thread 0's fsa (float4 index 0) can hold the <=3 masked
-                # lead lanes; substitute the always-valid lane 3 so the sample
-                # min/max fold and histogram stay finite and count-invariant
-                # (a materialized -inf would drive f2s_rz to INT_MIN and write
-                # out of bounds in the sample histogram at :1930).
+                # only thread 0's float4 0 holds the <=3 lead lanes; substitute
+                # lane 3 (a -inf would drive f2s_rz to INT_MIN and index the
+                # sample histogram out of bounds).
                 if tidx == cutlass.Int32(0):
                     ld_ = s_lead[0]
                     for q in cutlass.range_constexpr(3):

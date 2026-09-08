@@ -1678,13 +1678,9 @@ class PyTorchModelEngine(ModelEngine):
 
     def _ensure_dsa_attn_metadata_for_warmup(
             self, resource_manager: ResourceManager) -> None:
-        """Build the DSA attention metadata if no warmup forward created it.
-
-        A draft engine, a guided decoder, or a context-only server without
-        general warmup can skip every warmup forward; the DSA pre-compile
-        hooks would then find no metadata and the indexer top-K engines
-        would JIT on the first live request. No-op unless the backend is DSA.
-        """
+        """Build the DSA attention metadata if no warmup forward created it, so
+        the top-K pre-compile hooks still run (draft engine, guided decoder or
+        context-only server without general warmup). No-op unless DSA."""
         if getattr(self, "attn_metadata", None) is not None:
             return
         try:

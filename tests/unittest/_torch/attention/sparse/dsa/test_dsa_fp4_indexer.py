@@ -84,10 +84,8 @@ def _dense_context_bounds(seq_len: int, seq_len_kv: int, device):
 @skip_pre_blackwell
 @pytest.mark.parametrize("seq_len_kv", [1027, 4099])
 def test_fp4_mqa_logits_pass_selfsampling_prefill_format_gate(seq_len_kv):
-    """DeepSeek-V4 prefill (cr=4) hands these logits to the self-sampling GVR
-    prefill engine, whose format gate needs a float4-aligned row stride on
-    odd compressed widths; an exact-width producer would silently fall back
-    to radix."""
+    """The self-sampling prefill gate needs DeepGEMM's float4-aligned row stride
+    on odd compressed widths; an exact-width producer would fall back to radix."""
     torch.manual_seed(0)
     num_heads, head_dim, seq_len = 64, 128, 64
     q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)

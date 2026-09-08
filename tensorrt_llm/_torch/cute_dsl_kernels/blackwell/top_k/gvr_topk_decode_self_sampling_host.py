@@ -679,13 +679,9 @@ def route_streaming(
 _VARLEN_CACHE = {}
 
 # ---- prefill launcher cache ------------------------------------------------
-# Prefill routes always force R==1 (single CTA per row): route_streaming gives
-# R>1 only for b<=74, so the representative row counts below (first row of each
-# route band) pin R=1 and reduce the engine set to <=6 per k. The launcher
-# compiled function depends only on the row TIER, k and the envelope bucket
-# (which selects U on the tier-0 1024-thread arm; tiers 1/2 fix U), never on
-# the exact row count (arbitrary q-tile / q-split remainders) or npad (a
-# runtime scalar), so the cache stays bounded over a long-running server.
+# Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
+# launcher depends only on the row tier, k and the envelope bucket — never on the
+# exact row count or npad — so the cache stays bounded on a long-running server.
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
@@ -708,10 +704,8 @@ def _prefill_cache_key(tier: int, k: int, n_bucket: int):
 
 
 def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
-    """Capture-time prefill plan + compiled launcher (main family, R=1).
-
-    Mirrors ``_varlen_launcher``'s main branch but with r_const=1, split=False
-    (so tsh_en=0) and the prefill compile flag. SCAP_/CMP_/aim are envelope
+    """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
+    r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
     upper bounds; npad is filled per call in ``run_prefill``."""
     key = _prefill_cache_key(tier, k, n_bucket)
     hit = _PREFILL_CACHE.get(key)
@@ -1506,31 +1500,10 @@ def run_prefill(
     max_row_len: int | None = None,
     workspace: torch.Tensor | None = None,
 ) -> None:
-    """Hint-free self-sampling Top-K for the prefill phase, per-row windows.
-
-    Row semantics (mirror of ``topKPerRowPrefill`` / ``indexer_topk_prefill``):
-    row ``r`` selects the Top-K of ``logits[r, ks:ke]`` where
-    ``ks = row_starts[r]``, ``ke = row_ends[r]`` (both int32, in the SAME
-    compressed column units the DeepGEMM prefill producer emits — no
-    ``next_n`` / ``compress_ratio`` math). ``k`` comes from
-    ``indices.shape[1]``. The output is written in the LOCAL frame (column
-    minus ``ks``) with a trailing ``-1`` pad; rows with ``nv = ke - ks <= k``
-    get the identity ``0..nv-1`` (matching the radix short-row contract). The
-    engine reads exactly ``[r*npad + (ks & ~3), r*npad + ke)`` — no dependence
-    on any producer slack.
-
-    Envelope: ``max_row_len`` (a capture-stable engine constant) or, when
-    omitted, ``logits.shape[1]`` — a host int, so the call performs NO device
-    reads and is CUDA-graph-replay safe (it refuses to compile a new plan
-    under capture). Launches in ``<=65535``-row slabs so ``gridDim.y`` never
-    overflows.
-
-    KNOWN LIMITATION: rows containing NaN inside the window are out of
-    contract (as for the radix reference — both order NaN implementation-
-    specifically). DeepGEMM prefill logits are finite in-window. Trusted
-    invariant: ``0 <= ks <= ke <= logits.shape[1]`` (the indexer guarantees
-    it); the kernel clamps ``ke <= npad`` for memory safety only.
-    """
+    """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
+    ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
+    with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
+    No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1]."""
     if logits.dtype is not _F32:
         raise RuntimeError(
             f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
@@ -1570,10 +1543,8 @@ def run_prefill(
         raise RuntimeError("indices base must be 16-byte aligned")
     if logits.stride(1) != 1:
         raise RuntimeError("logits inner stride must be 1")
-    # DeepGEMM prefill rows are 1024B-aligned with >=256 float slack, so the
-    # row stride is valid for EVERY row count (the varlen 1-row shape[1] rule
-    # is a paged-MQA-arena quirk that would reject odd-width single-token
-    # prefill tiles — the common fully-cached follow-up turn).
+    # key on stride(0) for every row count: DeepGEMM prefill rows are 1024B-aligned
+    # with slack, and the varlen 1-row shape[1] rule would reject odd-width tiles.
     npad = logits.stride(0)
     if npad & 3:
         raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
@@ -1610,10 +1581,8 @@ def run_prefill(
                 )
             lc = _prefill_launcher(tier, k, n_bucket)
         _, fn, (scap, cmp_), tail = lc
-        # ABI parity with the varlen main call: pre_idx slot = row_ends,
-        # kv_lens slot = row_starts. The n / SMP / TGT / Q / SS2 / TGT2 launch
-        # scalars are dead (re-derived per row); only npad / k / SCAP_ / CMP_
-        # matter, R=1.
+        # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
+        # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
         pre = (0, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
         fn(lg[r0:r1], row_ends[r0:r1], indices[r0:r1], ws, *pre, row_starts[r0:r1], *tail)
     return
@@ -1796,16 +1765,9 @@ def warmup_prefill(
     num_rows_list: Sequence[int] = (1, 149, 297),
     row_stride: int | None = None,
 ) -> None:
-    """TESTING/INIT ONLY — compile the prefill engine set before serving.
-
-    Six engines per k at most: the tier-0 (1024-thread) arm walks the pow2
-    envelope buckets (U = 1/2/4/8), tiers 1/2 fix U so one launch each. One
-    tiny real launch per distinct ``(tier, k, bucket)`` cache key; ``ks=0``,
-    ``ke=n_env`` (all long rows). ``max_cols`` is the compressed max column
-    count (``get_indexer_max_seq_len``); the bucket caps at 32768 (U=8 above),
-    so envelopes past it share one key. The done-key gates only the GPU
-    launches — the ``_PREFILL_CACHE`` population is idempotent.
-    """
+    """Compile the prefill engine set before serving (<=6 per k): the tier-0 arm
+    walks the pow2 envelope buckets up to 32768, tiers 1/2 need one launch each.
+    ``max_cols`` is the compressed max column count; idempotent per done-key."""
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
