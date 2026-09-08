@@ -278,9 +278,10 @@ public:
     // host execution thread, so allocations made while the caller temporarily selects an auxiliary
     // stream still join the active compiled scope. Before ending a scope, callers must order
     // auxiliary-stream consumers before the supplied completion stream.
-    void beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device);
-    void endTensorLeaseScope(
-        std::vector<c10::StorageImpl const*> const& outputStorages, int device, cudaStream_t stream, bool failed);
+    // Return the entry depth so an eager caller can unwind interrupted compiled scopes on failure.
+    size_t beginTensorLeaseScope(std::vector<c10::StorageImpl const*> const& inputStorages, int device);
+    void endTensorLeaseScope(std::vector<c10::StorageImpl const*> const& outputStorages, int device,
+        cudaStream_t stream, bool failed, std::optional<size_t> entryDepth = std::nullopt);
 
     // Destructor fallback. The lease ID prevents a late tensor destructor from releasing a newer
     // checkout of the same allocation. Fallback-released buffers are quarantined until communicator

@@ -67,16 +67,22 @@ class _NCCLWindowTensorScope:
     allocated inside the scope are tracked by the allocator. Values passed to
     :meth:`escape` transfer to the surrounding scope; all other leases are
     released on the current stream when the scope exits.
+
+    Exceptional exit also unwinds unfinished compiled scopes back to this
+    scope's entry depth, quarantining their unescaped leases.
     """
 
     def __init__(self, inputs: Any):
         self._inputs: list[torch.Tensor] = []
         _cuda_tensors(inputs, self._inputs)
         self._outputs: list[torch.Tensor] = []
+        self._entry_depth = 0
 
     def __enter__(self) -> "_NCCLWindowTensorScope":
         if self._inputs:
-            torch.ops.trtllm.begin_nccl_window_tensor_scope(self._inputs)
+            self._entry_depth = torch.ops.trtllm.begin_nccl_window_tensor_scope.tracked(
+                self._inputs
+            )
         return self
 
     def escape(self, outputs: Any) -> Any:
@@ -93,7 +99,9 @@ class _NCCLWindowTensorScope:
             return
 
         failed = exc_type is not None
-        torch.ops.trtllm.end_nccl_window_tensor_scope(self._inputs, self._outputs, failed)
+        torch.ops.trtllm.end_nccl_window_tensor_scope.tracked(
+            self._inputs, self._outputs, failed, self._entry_depth
+        )
 
 
 def nccl_window_tensor_scope(inputs: Any) -> _NCCLWindowTensorScope:

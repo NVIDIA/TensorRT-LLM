@@ -1632,29 +1632,44 @@ std::vector<c10::StorageImpl const*> getTensorStorages(torch::List<torch::Tensor
 } // namespace
 #endif // ENABLE_MULTI_DEVICE
 
-void beginNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+int64_t beginTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
 {
 #if ENABLE_MULTI_DEVICE
     auto [storages, device] = getTensorScopeInputs(inputs);
-    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().beginTensorLeaseScope(storages, device);
+    return static_cast<int64_t>(
+        tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().beginTensorLeaseScope(storages, device));
 #else
     (void) inputs;
+    return 0;
+#endif
+}
+
+void beginNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs)
+{
+    static_cast<void>(beginTrackedNCCLWindowTensorScope(inputs));
+}
+
+void endTrackedNCCLWindowTensorScope(torch::List<torch::Tensor> const& inputs,
+    torch::List<torch::Tensor> const& outputs, bool failed, int64_t entryDepth)
+{
+#if ENABLE_MULTI_DEVICE
+    auto const device = getTensorScopeInputs(inputs).second;
+    auto outputStorages = getTensorStorages(outputs);
+    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().endTensorLeaseScope(outputStorages, device,
+        at::cuda::getCurrentCUDAStream(device), failed,
+        entryDepth < 0 ? std::nullopt : std::optional<size_t>{static_cast<size_t>(entryDepth)});
+#else
+    (void) inputs;
+    (void) outputs;
+    (void) failed;
+    (void) entryDepth;
 #endif
 }
 
 void endNCCLWindowTensorScope(
     torch::List<torch::Tensor> const& inputs, torch::List<torch::Tensor> const& outputs, bool failed)
 {
-#if ENABLE_MULTI_DEVICE
-    auto const device = getTensorScopeInputs(inputs).second;
-    auto outputStorages = getTensorStorages(outputs);
-    tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().endTensorLeaseScope(
-        outputStorages, device, at::cuda::getCurrentCUDAStream(device), failed);
-#else
-    (void) inputs;
-    (void) outputs;
-    (void) failed;
-#endif
+    endTrackedNCCLWindowTensorScope(inputs, outputs, failed, -1);
 }
 
 namespace
@@ -2455,10 +2470,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float eps) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
-    // Scope boundaries change allocator ownership associated with tensor storage. Mutable aliases
-    // make that side effect visible to the dispatcher.
-    m.def("begin_nccl_window_tensor_scope(Tensor(a!)[] inputs) -> ()");
-    m.def("end_nccl_window_tensor_scope(Tensor(a!)[] inputs, Tensor(b!)[] outputs, bool failed) -> ()");
+    // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.
+    // Python registers them as ordered effects so AOT preserves their runtime order.
+    m.def("begin_nccl_window_tensor_scope(Tensor[] inputs) -> ()");
+    m.def("end_nccl_window_tensor_scope(Tensor[] inputs, Tensor[] outputs, bool failed) -> ()");
+    // Eager boundaries track depth to unwind compiled scopes interrupted by an exception.
+    m.def("begin_nccl_window_tensor_scope.tracked(Tensor[] inputs) -> int");
+    m.def(
+        "end_nccl_window_tensor_scope.tracked(Tensor[] inputs, Tensor[] outputs, bool failed, int entry_depth) -> ()");
     m.def("set_nccl_window_graph_owner(int owner) -> ()");
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
@@ -2497,6 +2516,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);
     m.impl("begin_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::beginNCCLWindowTensorScope);
     m.impl("end_nccl_window_tensor_scope", &tensorrt_llm::torch_ext::endNCCLWindowTensorScope);
+    m.impl("begin_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::beginTrackedNCCLWindowTensorScope);
+    m.impl("end_nccl_window_tensor_scope.tracked", &tensorrt_llm::torch_ext::endTrackedNCCLWindowTensorScope);
     m.impl("is_nccl_window_buffer", &tensorrt_llm::torch_ext::isNCCLWindowBuffer);
     m.impl("minimax_allreduce_rms", &tensorrt_llm::torch_ext::minimax_allreduce_rms);
     m.impl("minimax_allreduce_rms_qk", &tensorrt_llm::torch_ext::minimax_allreduce_rms_qk);
@@ -2552,6 +2573,9 @@ TORCH_LIBRARY_IMPL(trtllm, CPU, m)
     m.impl("preallocate_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&, int64_t) { return; });
     m.impl("is_nccl_window_buffer", [](at::Tensor const&, torch::List<int64_t> const&) { return false; });
     m.impl("begin_nccl_window_tensor_scope", [](torch::List<torch::Tensor> const&) { return; });
+    m.impl("begin_nccl_window_tensor_scope.tracked", [](torch::List<torch::Tensor> const&) { return int64_t{0}; });
+    m.impl("end_nccl_window_tensor_scope.tracked",
+        [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool, int64_t) { return; });
     m.impl("end_nccl_window_tensor_scope",
         [](torch::List<torch::Tensor> const&, torch::List<torch::Tensor> const&, bool) { return; });
 }

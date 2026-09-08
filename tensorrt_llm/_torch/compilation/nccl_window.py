@@ -2,11 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Hashable
+from operator import getitem
 
 import torch
 from torch.fx import GraphModule, Node
 
 from ..modules.decoder_layer import DecoderLayer
+
+_SCOPE_OPS = {
+    torch.ops.trtllm.begin_nccl_window_tensor_scope.default,
+    torch.ops.trtllm.end_nccl_window_tensor_scope.default,
+}
 
 
 def _decoder_layer(node: Node) -> Hashable | None:
@@ -90,4 +96,38 @@ def insert_nccl_window_tensor_scopes(gm: GraphModule) -> GraphModule:
     if regions:
         gm.graph.lint()
         gm.recompile()
+    return gm
+
+
+def lower_nccl_window_tensor_scope_effects(gm: GraphModule) -> GraphModule:
+    """Lower AOT effect wrappers after they have enforced scope ordering."""
+    graph = gm.graph
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.higher_order.with_effects
+            or len(node.args) < 2
+            or node.args[1] not in _SCOPE_OPS
+        ):
+            continue
+
+        token, op, *args = node.args
+        if op is torch.ops.trtllm.begin_nccl_window_tensor_scope.default:
+            kwargs = {"inputs": args[0]}
+        else:
+            kwargs = {"inputs": args[0], "outputs": args[1], "failed": args[2]}
+
+        with graph.inserting_before(node):
+            direct = graph.call_function(op, kwargs=kwargs)
+        direct.meta = {key: value for key, value in node.meta.items() if key != "val"}
+        direct.meta["val"] = None
+
+        for user in list(node.users):
+            if user.op != "call_function" or user.target is not getitem or user.args[1] != 0:
+                raise RuntimeError("Unexpected NCCL window effect output")
+            user.replace_all_uses_with(token)
+            graph.erase_node(user)
+        graph.erase_node(node)
+
+    graph.lint()
     return gm
