@@ -651,7 +651,7 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
+    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4
 
