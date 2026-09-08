@@ -2370,6 +2370,19 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 "True.")
         return value
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # `validate_assignment` cannot be enabled on this model: the model
+        # validators below assign to `self`, and re-running validation on every
+        # assignment recurses without bound. Guard just the retired field so a
+        # post-construction `config.eagle3_one_model = False` fails loud instead
+        # of leaving a value telemetry reports but the runtime ignores.
+        if name == "eagle3_one_model" and value is False:
+            raise ValueError(
+                "eagle3_one_model=False is no longer supported: the two-model "
+                "Eagle3 path has been removed. Omit the field or set it to "
+                "True.")
+        super().__setattr__(name, value)
+
     @model_validator(mode='after')
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
@@ -2791,6 +2804,16 @@ class MTPDecodingConfig(DecodingBaseConfig):
                 "two-model MTP path has been removed. Omit the field or set "
                 "it to True.")
         return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # See EagleDecodingConfig.__setattr__ for why this is a guard rather
+        # than `validate_assignment`.
+        if name == "mtp_eagle_one_model" and value is False:
+            raise ValueError(
+                "mtp_eagle_one_model=False is no longer supported: the "
+                "two-model MTP path has been removed. Omit the field or set "
+                "it to True.")
+        super().__setattr__(name, value)
 
     use_dynamic_tree: bool = Field(
         default=False,
