@@ -612,7 +612,7 @@ class SuffixAutomatonManager(BaseResourceManager):
             # one-shot -- and (b) pin an SA slot for the whole KV-transfer
             # duration. Defer to the generation-request loop below, which
             # runs once the request is scheduled with its full history.
-            if req.is_generation_only_request():
+            if req.is_generation_only_request:
                 continue
             if req.is_first_context_chunk:
                 if req.request_id not in self._initialized_requests:
@@ -631,7 +631,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         # one-shot init; free_resources clears it on completion.
         for req in scheduled_batch.generation_requests:
             if (
-                req.is_generation_only_request()
+                req.is_generation_only_request
                 and not req.is_dummy
                 and req.request_id not in self._initialized_requests
             ):

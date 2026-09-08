@@ -60,6 +60,7 @@ from typing import Any, Mapping
 
 from agent_flow.workflows.perf_analyze.task_schema import (
     EXTRA_LLM_API_OPTIONS_FIELD,
+    REMOTE_RUN_ROOT_FIELD,
     TaskSchemaError,
     cluster_ssh,
     concurrency_points,
@@ -67,6 +68,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     has_slurm_environment,
     is_curve_mode,
     num_prompts_per_point,
+    remote_run_root,
     sol_enabled,
 )
 from agent_flow.workflows.perf_analyze.task_schema import (
@@ -533,6 +535,7 @@ __all__ = [
     "KNOWN_OPTIMIZE_KEYS",
     "ITEM_EXECUTIONS",
     "OPTIMIZE_DEFAULTS",
+    "REMOTE_RUN_ROOT_FIELD",
     "VALID_METRICS",
     "TaskSchemaError",
     "concurrency_points",
@@ -546,5 +549,6 @@ __all__ = [
     "load_and_validate_task_yaml",
     "max_regression_pct",
     "num_prompts_per_point",
+    "remote_run_root",
     "sol_enabled",
 ]

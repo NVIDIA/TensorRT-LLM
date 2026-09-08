@@ -473,6 +473,19 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
+        # Opt-in in-graph sampling: let the engine sample inside its forward CUDA
+        # graph. The sampler resolves each batch to a tier and stages the
+        # buffers the in-graph step reads; the engine keys its graph cache on
+        # the tier and calls back at the tail of the forward. Both hooks stay
+        # unregistered (and the engine unchanged) unless the sampler implements
+        # the protocol and the feature is enabled.
+        if (getattr(model_engine, "enable_in_graph_sampling", False)
+                and hasattr(sampler, "resolve_in_graph_sample_type")):
+            model_engine.register_sample_type_resolver(
+                sampler.resolve_in_graph_sample_type,
+                sampler.stage_in_graph_sampling)
+            model_engine.register_sample_in_graph_callable(
+                self._sample_in_graph)
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
@@ -7010,7 +7023,7 @@ class PyExecutor:
         """Flush generation transfer errors through a TP-uniform path."""
         error_requests = [
             req for req in self._get_disagg_reqs_in_error_state()
-            if req.is_generation_only_request()
+            if req.is_generation_only_request
         ]
         local_needs_flush = bool(error_requests)
 
@@ -8122,6 +8135,18 @@ class PyExecutor:
                     f'Unsupported cp type {cp_type.name}.')
         self._update_request_states_tp(scheduled_requests)
 
+    def _sample_in_graph(self, model_outputs) -> None:
+        """Sample at the tail of the model's forward graph.
+
+        Invoked by the engine right after the LM head, inside the graph capture
+        region, so the sampling kernels of a graph-capturable tier belong to the
+        forward graph. The tier and its buffers were staged before the forward
+        by stage_in_graph_sampling; a batch that resolved to FULL makes this a
+        no-op and is sampled eagerly by _sample_async instead.
+        """
+        self.sampler.sample_in_graph(model_outputs,
+                                     self.sampler.current_sample_type)
+
     @nvtx_range("_sample_async")
     def _sample_async(self, scheduled_batch,
                       batch_outputs) -> SampleState | None:
@@ -8713,7 +8738,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            if request.is_generation_only_request and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously

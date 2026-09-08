@@ -63,7 +63,6 @@ from .state import (
 )
 from .task_schema import (
     OPTIMIZE_DEFAULTS,
-    cluster_ssh,
     concurrency_points,
     dump_task_yaml,
     focus_concurrencies,
@@ -402,22 +401,6 @@ class PerfOptimizeWorkflow:
         state = self._init_state(task, log)
         if state is None:
             return
-
-        # Where git commands run, decided once and before the first one is issued.
-        #
-        # HERE rather than in `_init_state`, because a resumed run returns from that
-        # method early — setting it on the fresh-run path only would leave every
-        # resume issuing git against the local filesystem, where the checkout does
-        # not exist. This is the one point both paths pass through with the task
-        # resolved.
-        ssh_alias = cluster_ssh(self._task_data())
-        gitops.use_cluster(ssh_alias)
-        if ssh_alias:
-            print_message(
-                f"[bold cyan]git via ssh {ssh_alias} — the checkout lives on the "
-                f"cluster, not on this host[/bold cyan]",
-                log,
-            )
 
         try:
             self._ensure_optimization_branch(state, log)

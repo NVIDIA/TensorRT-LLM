@@ -364,6 +364,23 @@ exactly as in perf-analyze):
 are always normalized so positive = improvement (throughput up, latency
 down).
 
+When `slurm-environment.cluster_ssh` is set, paths belong to these machines:
+
+| Field | Location |
+| --- | --- |
+| `trtllm_repo_path` | Local checkout edited and managed by perf-optimize. |
+| `extra_llm_api_options` | Local input copied into the workflow's live tuning YAML. |
+| `checkpoint_path` | Remote path visible to the Slurm job/container. |
+| `slurm-environment.cluster_ssh` | SSH target; setting it enables remote execution. |
+| `slurm-environment.docker_image` | Remote SQSH path visible to Slurm/Pyxis. |
+| `slurm-environment.remote_run_root` | Remote absolute temporary root; defaults to `~/agent_flow_workspace/<workspace-name>`. |
+| `slurm-environment.slurm_partition`, `account`, `qos` | Settings of the selected remote Slurm cluster. |
+
+The workflow workspace and Git stay local. Agents copy required inputs and
+changed source to isolated directories below the remote run root, then pull
+required outputs back. Without `cluster_ssh`, all paths refer to the machine
+running the CLI.
+
 ## Git requirements (read before running)
 
 `perf-optimize` **mutates the TRT-LLM checkout** at `trtllm_repo_path`:

@@ -442,6 +442,59 @@ def test_kernel_coverage_accessor_defends_against_malformed_specs():
     assert merged == {"min_share_pct": 2.0, "coverage_target_pct": 95.0}
 
 
+def test_remote_run_root_is_optional_and_can_be_explicit(tmp_path):
+    task = _write_task(
+        tmp_path,
+        {
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+            }
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert task_schema.remote_run_root(data, "campaign") == "~/agent_flow_workspace/campaign"
+
+    explicit = _write_task(
+        tmp_path,
+        {
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+                "remote_run_root": "/scratch/runs/campaign",
+            }
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(explicit)
+    assert task_schema.remote_run_root(data, "ignored") == "/scratch/runs/campaign"
+
+    data["slurm-environment"]["remote_run_root"] = "relative/run"
+    explicit.write_text(yaml.safe_dump(data), encoding="utf-8")
+    with pytest.raises(task_schema.TaskSchemaError, match="remote_run_root"):
+        task_schema.load_and_validate_task_yaml(explicit)
+
+
+def test_remote_source_and_tuning_paths_resolve_next_to_task(tmp_path):
+    (tmp_path / "options.yaml").write_text("{}\n", encoding="utf-8")
+    task = _write_task(
+        tmp_path,
+        {
+            "trtllm_repo_path": "repo",
+            "extra_llm_api_options": "options.yaml",
+            "slurm-environment": {
+                "slurm_partition": "batch",
+                "docker_image": "/image.sqsh",
+                "cluster_ssh": "user@login",
+            },
+        },
+    )
+    data = task_schema.load_and_validate_task_yaml(task)
+    assert data["trtllm_repo_path"] == str((tmp_path / "repo").resolve())
+    assert data["extra_llm_api_options"] == str((tmp_path / "options.yaml").resolve())
+
+
 @pytest.mark.parametrize("field", ["max_rounds", "max_attempts_per_item", "max_items_per_round"])
 def test_a_valueless_budget_key_degrades_to_the_documented_default(tmp_path, field):
     """`max_items_per_round:` with nothing after it is YAML for ``None``.
