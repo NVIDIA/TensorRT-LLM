@@ -29,8 +29,6 @@ This page repeats no field description. Each lives with its definition:
 * **Execution** — how the client drives the run, and how the media comes back.
 * **Results** — what the run writes down.
 
-Four of them are their flags and nothing more. Workload is the one with a shape of its own.
-
 ### Workload
 
 A YAML or JSON file, the same document inline (starting with `{` or `[`), or a bare list of
