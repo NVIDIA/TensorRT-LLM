@@ -5,7 +5,8 @@ import tempfile
 import pytest
 import requests
 import yaml
-from test_common.perf_metrics_utils import wait_for_perf_metrics_jsonl
+from test_common.perf_metrics_utils import (read_perf_metrics_jsonl,
+                                            wait_for_perf_metrics_jsonl)
 
 from tensorrt_llm.serve import perf_metrics
 
@@ -133,4 +134,72 @@ def test_streaming_metrics_require_request_opt_in(server: RemoteOpenAIServer):
     )
     assert response.status_code == 200
     assert "data: [DONE]" in response.text
+    assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text
+
+
+def test_responses_return_perf_metrics_and_jsonl_dump(
+        server: RemoteOpenAIServer, perf_metrics_output_dir):
+    # /v1/responses has to feed the same per-request perf metrics pipeline as
+    # /v1/completions and /v1/chat/completions (GitHub issue #13949).
+    num_existing_records = len(read_perf_metrics_jsonl(perf_metrics_output_dir))
+
+    response = requests.post(
+        f"{server.url_root}/v1/responses",
+        headers={perf_metrics.RETURN_METRICS_HEADER: "1"},
+        json={
+            "model": "Server",
+            "input": "Hello, my name is",
+            "max_output_tokens": 2,
+        },
+        timeout=120,
+    )
+    assert response.status_code == 200
+
+    for header in (
+            perf_metrics.SERVER_TIMING_HEADER,
+            perf_metrics.START_END_TIME_HEADER,
+            perf_metrics.STEP_METRICS_HEADER,
+            perf_metrics.CTX_CHUNK_METRICS_HEADER,
+    ):
+        assert response.headers.get(header)
+
+    expected_count = num_existing_records + 1
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                          expected_count=expected_count)
+    data = records[-1]
+    assert data["status"] == "complete"
+
+    request_metrics = data["perf_metrics"]
+    assert request_metrics["first_iter"] <= request_metrics["last_iter"]
+
+    timing_metrics = request_metrics["timing_metrics"]
+    assert timing_metrics["arrival_time"] < timing_metrics[
+        "first_scheduled_time"]
+    assert timing_metrics["first_token_time"] <= timing_metrics[
+        "last_token_time"]
+
+
+def test_responses_streaming_metrics_require_request_opt_in(
+        server: RemoteOpenAIServer):
+    payload = {
+        "model": "Server",
+        "input": "Hello, my name is",
+        "max_output_tokens": 2,
+        "stream": True,
+    }
+    response = requests.post(f"{server.url_root}/v1/responses",
+                             json=payload,
+                             timeout=120)
+    assert response.status_code == 200
+    assert "event: response.completed" in response.text
+    assert f"event: {perf_metrics.SSE_METRICS_EVENT}" not in response.text
+
+    response = requests.post(
+        f"{server.url_root}/v1/responses",
+        headers={perf_metrics.RETURN_METRICS_HEADER: "1"},
+        json=payload,
+        timeout=120,
+    )
+    assert response.status_code == 200
+    assert "event: response.completed" in response.text
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text
