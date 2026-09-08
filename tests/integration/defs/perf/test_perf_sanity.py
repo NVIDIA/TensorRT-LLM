@@ -656,7 +656,7 @@ CHECKPOINT_IO_POLICY_PATTERN = re.compile(
     r"selected=(?P<selected>[^,]+), activated=(?P<activated>True|False), "
     r"effective=(?P<effective>[^,]+), fallback_reason=(?P<fallback_reason>.*)\."
 )
-CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v2-pr-clustered-75-auto-25-native"
+CHECKPOINT_IO_EXPERIMENT_VERSION = "checkpoint-io-v3-postmerge-75-auto-25-native"
 CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV = "TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY"
 CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT = 4
 CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET = 0
@@ -678,6 +678,7 @@ class CheckpointIoExperimentAssignment(NamedTuple):
     assigned_arm: str
     assignment_source: str
     pr_number: Optional[int]
+    root_build_number: Optional[int]
 
 
 def _unassigned_checkpoint_io_experiment(
@@ -689,6 +690,7 @@ def _unassigned_checkpoint_io_experiment(
         assigned_arm="unassigned",
         assignment_source=assignment_source,
         pr_number=None,
+        root_build_number=None,
     )
 
 
@@ -713,10 +715,10 @@ def assign_checkpoint_io_experiment(
 ) -> CheckpointIoExperimentAssignment:
     """Assign one deterministic policy and write it into generated configs.
 
-    The GitHub PR number selects one native bucket and three auto buckets, so
-    reruns of one PR retain the same policy. Explicit config policy remains
-    authoritative and excludes the launch from assignment. A valid override is
-    intended for reproduction.
+    Pre-merge runs always exercise auto. Post-merge runs use the root Jenkins
+    build number to select one native bucket and three auto buckets. Explicit
+    config policy remains authoritative and excludes the launch from
+    assignment. A valid override is intended for reproduction.
     """
     environment = os.environ if environment is None else environment
     override = environment.get(CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV, "")
@@ -739,26 +741,42 @@ def assign_checkpoint_io_experiment(
             assigned_arm=override,
             assignment_source="override",
             pr_number=None,
+            root_build_number=None,
         )
     elif not telemetry_eligible:
         return _unassigned_checkpoint_io_experiment("non_telemetry")
     else:
         job_info = get_job_info() if job_info is None else job_info
-        if not job_info.get("b_is_pr_job", False):
-            return _unassigned_checkpoint_io_experiment("non_pr_pipeline")
-        raw_pr_number = str(job_info.get("s_trigger_mr_id", ""))
-        if not raw_pr_number.isdecimal() or int(raw_pr_number) <= 0:
-            return _unassigned_checkpoint_io_experiment("missing_pr_number")
-        pr_number = int(raw_pr_number)
-        bucket = pr_number % CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT
-        assigned_arm = "native" if bucket == CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET else "auto"
-        assignment = CheckpointIoExperimentAssignment(
-            version=CHECKPOINT_IO_EXPERIMENT_VERSION,
-            bucket=bucket,
-            assigned_arm=assigned_arm,
-            assignment_source="pr_number",
-            pr_number=pr_number,
-        )
+        if job_info.get("b_is_pr_job", False):
+            raw_pr_number = str(job_info.get("s_trigger_mr_id", ""))
+            pr_number = (
+                int(raw_pr_number) if raw_pr_number.isdecimal() and int(raw_pr_number) > 0 else None
+            )
+            assignment = CheckpointIoExperimentAssignment(
+                version=CHECKPOINT_IO_EXPERIMENT_VERSION,
+                bucket=-1,
+                assigned_arm="auto",
+                assignment_source="premerge_default",
+                pr_number=pr_number,
+                root_build_number=None,
+            )
+        elif job_info.get("b_is_post_merge", False):
+            raw_build_number = str(job_info.get("s_job_id", ""))
+            if not raw_build_number.isdecimal() or int(raw_build_number) <= 0:
+                return _unassigned_checkpoint_io_experiment("missing_root_build")
+            root_build_number = int(raw_build_number)
+            bucket = root_build_number % CHECKPOINT_IO_EXPERIMENT_BUCKET_COUNT
+            assigned_arm = "native" if bucket == CHECKPOINT_IO_EXPERIMENT_NATIVE_BUCKET else "auto"
+            assignment = CheckpointIoExperimentAssignment(
+                version=CHECKPOINT_IO_EXPERIMENT_VERSION,
+                bucket=bucket,
+                assigned_arm=assigned_arm,
+                assignment_source="postmerge_build_number",
+                pr_number=None,
+                root_build_number=root_build_number,
+            )
+        else:
+            return _unassigned_checkpoint_io_experiment("unknown_pipeline")
 
     for config in config_data:
         config["checkpoint_io_policy"] = assignment.assigned_arm
@@ -985,7 +1003,12 @@ def add_checkpoint_io_experiment_values(
     new_data["l_checkpoint_io_experiment_bucket"] = assignment.bucket
     new_data["s_checkpoint_io_experiment_assigned_arm"] = assignment.assigned_arm
     new_data["s_checkpoint_io_experiment_assignment_source"] = assignment.assignment_source
-    new_data["l_checkpoint_io_experiment_pr_number"] = assignment.pr_number or -1
+    new_data["l_checkpoint_io_experiment_pr_number"] = (
+        assignment.pr_number if assignment.pr_number is not None else -1
+    )
+    new_data["l_checkpoint_io_experiment_root_build_number"] = (
+        assignment.root_build_number if assignment.root_build_number is not None else -1
+    )
     new_data["s_startup_observation_id"] = observation_id
     new_data["b_startup_observation_primary_row"] = primary_row
 
