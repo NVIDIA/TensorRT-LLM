@@ -227,6 +227,15 @@ Each accepts the same fill value: `1`, `on`, `true` or `zero` for zeros, `nan`
 for NaN (any uncovered read then fails immediately and visibly rather than
 producing a plausible number), or any number for that constant.
 
+> **Packed NVFP4 (e2m1) limitation.** A packed sub-byte pool cannot store an
+> arbitrary sentinel: every non-zero fill value collapses to the byte pattern
+> `0x7f`. For most packed formats `0x7f` is non-finite, so a `nan`/`inf`
+> sentinel still poisons the page. Packed NVFP4 (e2m1) has no NaN/Inf encoding,
+> so `0x7f` decodes to `+6.0` (the largest finite magnitude) instead. On such a
+> pool the sentinel lands as `6.0` -- still a recognisable out-of-band pattern,
+> but not one that an `isnan`/`isinf` check will flag. Only zero fills carry
+> over exactly for packed e2m1.
+
 - `TRTLLM_KV_GUARD_PAGE` reserves one page that no request can be given, fills
   it with the chosen pattern, and publishes its per-layer index. Attention
   backends that have to keep masked-out page-table entries in range park them

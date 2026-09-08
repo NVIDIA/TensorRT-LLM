@@ -1187,8 +1187,26 @@ def test_fill_kv_pages_packed_buffer():
 
 def test_fill_kv_pages_empty_is_a_noop():
     buffer = torch.ones(2, 2)
-    kv_cache_v2_module._fill_kv_pages(buffer, [], 0.0)
+    assert kv_cache_v2_module._fill_kv_pages(buffer, [], 0.0) is True
     assert torch.equal(buffer, torch.ones(2, 2))
+
+
+def test_fill_kv_pages_reports_applied():
+    buffer = torch.ones(4, 2)
+    assert kv_cache_v2_module._fill_kv_pages(buffer, [1], 0.0) is True
+
+
+def test_fill_kv_pages_skips_dtype_without_index_fill():
+    """FP8 has no ``index_fill_`` kernel; the fill is skipped, not fatal."""
+    try:
+        torch.zeros(2, dtype=torch.float8_e4m3fn).index_fill_(0, torch.tensor([0]), float("nan"))
+    except NotImplementedError:
+        pass
+    else:
+        pytest.skip("index_fill_ is supported for float8 on this platform")
+
+    buffer = torch.zeros(4, 2, dtype=torch.float8_e4m3fn)
+    assert kv_cache_v2_module._fill_kv_pages(buffer, [1], float("nan")) is False
 
 
 def test_guard_page_accessors_report_no_guard_by_default():
@@ -1325,6 +1343,70 @@ def test_fresh_fill_refills_page_reassigned_after_release(
 
     assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
     assert torch.equal(buffer[2], torch.full((2,), 1.5))
+
+
+def test_fresh_fill_preserves_generated_kv_across_slot_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """suspend -> physical-slot change -> resume must not overwrite generated KV.
+
+    ``resume`` can onboard an already-generated block into a different physical
+    page, copying the block's KV into the new slot. The block keeps its ordinal,
+    so freshness has to be keyed off the ordinal, not the page id: keying off the
+    page id sees the new slot as a fresh allocation and clobbers the restored KV
+    (the reviewer's page 5 -> page 6 example). A genuinely new page grown after
+    the resume must still be filled.
+    """
+    buffer = torch.zeros(8, 2)
+    kv_cache = _FreshFillKVCache([2, 5])
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+
+    manager._fill_fresh_kv_pages(1)
+    # The owner generates into ordinal 1 (physical page 5).
+    buffer[5] = 9.0
+
+    # suspend + resume relocates ordinal 1 from page 5 to page 6, copying its KV.
+    buffer[6] = 9.0
+    kv_cache.pages = [2, 6]
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[6], torch.full((2,), 9.0))  # restored KV survives
+    assert torch.equal(buffer[5], torch.full((2,), 9.0))  # old slot untouched
+
+    # A page grown after the resume is a real new allocation -> still filled.
+    kv_cache.pages = [2, 6, 7]
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[7], torch.full((2,), _FRESH_FILL))
+    assert torch.equal(buffer[6], torch.full((2,), 9.0))
+
+
+def test_fresh_fill_preserves_kv_across_block_onboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offload / onboard migration of several blocks must not be treated as fresh.
+
+    A committed prefix plus two generated blocks all move to new physical pages
+    when the cache is onboarded from a secondary tier. Every ordinal keeps its
+    logical block, so none of the new pages is fresh and the copied KV stays.
+    """
+    buffer = torch.zeros(24, 2)
+    kv_cache = _FreshFillKVCache([10, 11, 12], num_committed_tokens=TOKENS_PER_BLOCK)
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[10], torch.zeros(2))  # committed prefix, never filled
+    assert torch.equal(buffer[11], torch.full((2,), _FRESH_FILL))
+    # The owner generates into ordinals 1 and 2.
+    buffer[11] = 4.0
+    buffer[12] = 5.0
+
+    # Onboard relocates every block; the KV is copied to the new slots.
+    buffer[20] = 4.0
+    buffer[21] = 4.0
+    buffer[22] = 5.0
+    kv_cache.pages = [20, 21, 22]
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[21], torch.full((2,), 4.0))
+    assert torch.equal(buffer[22], torch.full((2,), 5.0))
 
 
 class _GuardKVCache:

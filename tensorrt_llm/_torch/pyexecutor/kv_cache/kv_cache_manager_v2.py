@@ -155,24 +155,43 @@ def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
         return None
 
 
-def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> None:
+def _fill_kv_pages(buffer: torch.Tensor, pages: Sequence[int], value: float) -> bool:
     """Write ``value`` into the named pages of one layer's KV buffer.
 
-    A packed sub-byte (e.g. NVFP4) pool is viewed as int8, where 0 stays zero
-    in every sub-byte float format it packs and 0x7f sets every exponent bit,
-    which is the non-finite pattern in all of them.
+    Returns ``True`` if the fill was applied, ``False`` if the buffer's dtype has
+    no ``index_fill_`` kernel and the fill was skipped (see below).
+
+    A packed sub-byte pool is viewed as int8: 0 stays zero in every sub-byte
+    float format it packs, and any non-zero request collapses to 0x7f (every
+    exponent bit set). For most packed formats 0x7f is the non-finite pattern,
+    so a ``nan``/``inf`` sentinel survives. Packed NVFP4 (e2m1) is the exception:
+    e2m1 has no NaN/Inf encoding, so 0x7f decodes to +6.0 (the largest finite
+    magnitude), not a non-finite value. A guard/fresh sentinel on a packed e2m1
+    pool therefore lands as 6.0 rather than a true poison value -- still a
+    recognisable, out-of-band pattern, but not one an ``isnan``/``isinf`` check
+    catches. (No packed e2m1 pool reaches this today: the guard's only consumer
+    is the FlashInfer SWA path, which does not see an NVFP4 pool.)
+
+    Unpacked FP8 (``float8_e4m3fn``/``float8_e5m2``) has no ``index_fill_`` CUDA
+    kernel and raises ``NotImplementedError`` -- the same gap
+    ``check_invalid_values_in_kv_cache`` already guards its ``isnan``/``isinf``
+    against. Rather than crash a run, the fill is skipped and the caller told so.
 
     One ``index_fill_`` per layer rather than one per page: a 4k-token prompt
     is 128 pages on each of ~60 layers, and a fill per page there costs more in
     launch overhead than the writes themselves.
     """
     if not pages:
-        return
+        return True
     index = torch.as_tensor(list(pages), dtype=torch.long, device=buffer.device)
-    if buffer.dtype.is_floating_point:
-        buffer.index_fill_(0, index, value)
-    else:
-        buffer.index_fill_(0, index, 0 if value == 0.0 else 0x7F)
+    try:
+        if buffer.dtype.is_floating_point:
+            buffer.index_fill_(0, index, value)
+        else:
+            buffer.index_fill_(0, index, 0 if value == 0.0 else 0x7F)
+    except NotImplementedError:
+        return False
+    return True
 
 
 class Role:
@@ -1459,11 +1478,13 @@ class KVCacheManagerV2(BaseResourceManager):
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
             "TRTLLM_KV_FRESH_PAGE_FILL",
         )
-        # request id -> pool id -> (currently assigned page indices already
-        # filled, last seen page list). The second half is the early-out: an
-        # unchanged list means nothing was handed out since the previous step.
-        self._fresh_pages_filled: Dict[int, Dict[int, tuple]] = {}
+        # request id -> pool id -> the pool's last-seen base page-index array
+        # (indexed by block ordinal). Comparing it against the current array is
+        # both the early-out (unchanged -> nothing handed out since the previous
+        # step) and the per-ordinal freshness key (see ``_fill_fresh_kv_pages``).
+        self._fresh_pages_filled: Dict[int, Dict[int, np.ndarray]] = {}
         self._fresh_fill_announced = False
+        self._fresh_fill_unavailable_announced = False
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no
@@ -1587,29 +1608,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _fill_fresh_kv_pages(self, request_id: int) -> None:
         """Diagnostic: write a known pattern into pages as they are handed out.
 
-        A page freed by one request and handed to another still carries the
-        previous owner's keys and values, so a decode that reads past what its
-        own request wrote reads live data from a stranger. Filling on
-        assignment makes such a read produce the pattern instead, for the whole
-        run rather than only for the requests served before the first page was
-        recycled.
+        A page recycled from one request to another still holds the previous
+        owner's keys and values, so a decode that reads past what its own
+        request wrote sees a stranger's data. Filling on assignment turns such a
+        read into the pattern instead. Only pages not yet given to the request
+        are written, and only beyond ``num_committed_tokens`` (rounded up, so a
+        partially reused block stays protected) -- overwriting the matched or
+        committed prefix would corrupt a correct answer.
 
-        Only pages the request has not yet been given are written, and only
-        beyond ``num_committed_tokens`` -- the leading pages hold the prefix
-        this request matched in the reuse tree (or committed itself), and
-        writing over those would corrupt a correct answer rather than diagnose
-        anything. The boundary rounds up, so a partially reused block stays
-        protected.
-
-        ``TRTLLM_KV_FRESH_PAGE_FILL=zero`` gives a fresh page zeros; ``nan``
-        poisons it, which turns any read of a slot the owner has not written
-        yet into an immediate failure instead of a plausible number. Unset --
-        the default -- returns immediately and touches nothing.
-
-        This runs on every generation step of every request, so the common case
-        -- no new page since the last call -- has to be cheap: the page list is
-        compared per pool against the host copy the cache already maintains,
-        and the per-layer work only happens when that comparison differs.
+        ``TRTLLM_KV_FRESH_PAGE_FILL=zero`` fills zeros; ``nan`` poisons (any read
+        of an unwritten slot fails visibly). Unset -- the default -- touches
+        nothing. This runs every generation step, so the no-new-page common case
+        stays cheap: the per-pool page list is compared against the host copy
+        the cache already maintains, and per-layer work happens only on a change.
         """
         if self._fresh_page_fill is None:
             return
@@ -1621,31 +1632,46 @@ class KVCacheManagerV2(BaseResourceManager):
         num_blocks = int(kv_cache.num_blocks)
         state = self._fresh_pages_filled.setdefault(request_id, {})
         filled = 0
+        unfillable_dtype = False
         for pool_id in range(self.num_pools):
             base = np.frombuffer(
                 kv_cache.get_base_page_indices(pool_id), dtype=np.int32, count=num_blocks
             )
-            seen, previous = state.setdefault(pool_id, (set(), None))
+            previous = state.get(pool_id)
             if (
                 previous is not None
                 and previous.size == base.size
                 and np.array_equal(previous, base)
             ):
                 continue
-            state[pool_id] = (seen, base.copy())
-            # ``seen`` tracks the request's current pages, not its lifetime
-            # history: a page released by a shrink can be recycled by another
-            # request and handed back later, and by then it carries that
-            # request's data, so it has to count as fresh again.
-            seen.intersection_update(int(page) for page in base if page != BAD_PAGE_INDEX)
-            fresh = [
-                int(page)
-                for ordinal, page in enumerate(base)
-                if ordinal >= protected and page != BAD_PAGE_INDEX and int(page) not in seen
-            ]
+            # Freshness is keyed off the block ORDINAL, not the physical page
+            # id. ``get_base_page_indices`` is indexed by block ordinal, and an
+            # ordinal names the same logical block across a request's life even
+            # when its physical page moves: ``resume`` after an offload can
+            # onboard an existing generated block into a different GPU slot,
+            # copying the block's KV with it. Keying off the raw page id would
+            # see that new slot as a brand-new allocation and overwrite the
+            # restored KV. A page is fresh only when its ordinal had no page
+            # last time -- a block newly appended past the previous length, or
+            # an ordinal whose slot was empty (``BAD_PAGE_INDEX``). A block that
+            # was already present and only changed page is a relocation of an
+            # existing logical block, so it is left alone. A page released by a
+            # shrink and later handed back regrows past the (then shorter)
+            # previous length, so it is refilled -- the recycled-page leak the
+            # fill exists to catch stays covered. (This assumes every shrink is
+            # observed by a fill call before the ordinal is regrown, which holds
+            # because a fill follows every resize, and release clears the state.)
+            prev_size = 0 if previous is None else int(previous.size)
+            fresh = []
+            for ordinal, page in enumerate(base):
+                page = int(page)
+                if ordinal < protected or page == BAD_PAGE_INDEX:
+                    continue
+                if ordinal >= prev_size or int(previous[ordinal]) == BAD_PAGE_INDEX:
+                    fresh.append(page)
+            state[pool_id] = base.copy()
             if not fresh:
                 continue
-            seen.update(fresh)
             for layer_idx in self.pp_layers:
                 if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
                     continue
@@ -1658,8 +1684,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 pages = [page * scale // self.kv_factor for page in fresh]
                 pages = [page for page in pages if 0 <= page < buffer.shape[0]]
                 if pages:
-                    _fill_kv_pages(buffer, pages, self._fresh_page_fill)
-                    filled += len(pages)
+                    if _fill_kv_pages(buffer, pages, self._fresh_page_fill):
+                        filled += len(pages)
+                    else:
+                        unfillable_dtype = True
+        if unfillable_dtype and not self._fresh_fill_unavailable_announced:
+            # FP8 and other dtypes without an index_fill_ kernel can't carry the
+            # pattern; say so once rather than silently doing nothing.
+            self._fresh_fill_unavailable_announced = True
+            logger.warning(
+                "KVCacheManagerV2: TRTLLM_KV_FRESH_PAGE_FILL set but the KV dtype "
+                "has no index_fill_ kernel (e.g. FP8); fresh-page fill skipped"
+            )
         if filled:
             # The forward pass reads these pages in the same iteration, so the
             # fill has to be complete before it starts. A stream-ordered write
