@@ -147,15 +147,6 @@ commands:
         flags:
         - "--config"
         - "--extra_llm_api_options"
-      fail_fast_on_attention_window_too_large:
-        type: bool
-        default: true
-        status: deprecated
-        required: false
-        multiple: false
-        is_flag: true
-        flags:
-        - "--fail_fast_on_attention_window_too_large"
       free_gpu_memory_fraction:
         type: float
         default: 0.9
