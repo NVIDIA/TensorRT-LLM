@@ -3100,6 +3100,11 @@ def detect_sharding_from_config(
     for lin_node in linear_nodes:
         # use node's weight name to get the module name
         weight_name = extract_weight_name(lin_node)
+        if not weight_name:
+            ad_logger.debug(
+                f"Could not find a weight name for linear node {lin_node.name}. Skipping."
+            )
+            continue
         # get the parent layer_subgraph
         layer_subgraph = [
             layer
