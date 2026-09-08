@@ -152,6 +152,7 @@ class UncommittedPage(Page):
             self,
             None,
             CachedCudaEvent.NULL,
+            None,
             rawref.ref(manager._storage),
             life_cycle,
             cache_level,
@@ -261,6 +262,7 @@ class CommittedPage(Page):
             self,
             None,
             CachedCudaEvent.NULL,
+            None,
             rawref.ref(storage),
             life_cycle,
             cache_level,
@@ -444,7 +446,7 @@ class _SharedPageLock:
             self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
         self._user = LockOwner(rawref.ref(kv_cache), beam_index, ordinal, life_cycle)
         old_base_index = kv_cache._update_base_page_index(
-            beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
+            beam_index, ordinal, life_cycle, self._get_base_page_index()
         )
         assert old_base_index == BAD_PAGE_INDEX
 
@@ -471,7 +473,8 @@ class _SharedPageLock:
         return page
 
     def _get_base_page_index(self) -> PageIndex:
-        return PageIndex(self.page.slot_id)
+        storage = unwrap_rawref(self._user.kv_cache).manager._storage
+        return storage._base_page_index_for_slot(self._user.life_cycle, self.page.slot_id)
 
 
 BlockPage = _SharedPageLock | _PageHolder | None
@@ -505,7 +508,13 @@ def batched_lock_to_gpu(
         requirements[lc2pg[t.life_cycle]] += 1
 
     try:
-        storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder, drop_recorder)
+        storage.prepare_free_slots(
+            GPU_LEVEL,
+            requirements,
+            locality_domain_id=kv_cache.locality_domain_id,
+            migration_recorder=migration_recorder,
+            drop_recorder=drop_recorder,
+        )
         partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
