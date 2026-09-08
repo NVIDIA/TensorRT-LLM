@@ -500,3 +500,71 @@ def test_the_configuration_with_the_better_mean_wins_a_lucky_repeat(tmp_path):
     chosen = disagg_sol.select_ctx_point(disagg_sol.ctx_points(d))
     assert chosen["max_batch"] == 4  # the better mean, not the luckier max
     assert chosen["spread_pct"] < 2.0
+
+
+# ---------------------------------------------------------------- the run
+
+
+def _supervisable(tmp_path):
+    d = _design(tmp_path)
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])
+    spec = {
+        "checkpoint_path": "/ckpt",
+        "optimize": {"approaches": ["code"]},
+        FIELD: {
+            "tracks": ["ctx", "gen"],
+            "design": {"design_dir": str(d), "prefer": "interactive"},
+        },
+    }
+    return d, spec
+
+
+def test_a_design_that_was_never_scored_is_refused_not_fallen_back_from(tmp_path):
+    """Falling back is exactly the behaviour this layer exists to remove."""
+    d = _design(tmp_path)
+    spec = {FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}}}
+    with pytest.raises(disagg_sol.DisaggSolError, match="no measured space to choose|no scored"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"gen": tmp_path / "g.yaml"},
+            repos={"gen": tmp_path / "r"},
+            workspace_root=tmp_path / "ws",
+            label="t",
+            dry_run=True,
+        )
+
+
+def test_a_dry_run_selects_and_writes_every_spec_without_starting_anything(tmp_path):
+    """The same code path minus the processes."""
+    d, spec = _supervisable(tmp_path)
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"ctx": tmp_path / "c.yaml", "gen": tmp_path / "g.yaml"},
+        repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "ws",
+        label="t",
+        dry_run=True,
+    )
+    assert record["started"] is False
+    assert record["ctx_point"]["ctx_gpus"] == 4
+    assert record["gen_point"]["concurrency"] == 1
+    assert [c["track"] for c in record["campaigns"]] == ["ctx", "gen"]
+    assert (tmp_path / "ws" / disagg_sol.RUN_RECORD).is_file()
+
+
+def test_the_record_says_what_was_selected_and_against_what(tmp_path):
+    """Answerable afterwards from a file, not from a shrug."""
+    d, spec = _supervisable(tmp_path)
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"ctx": tmp_path / "c.yaml", "gen": tmp_path / "g.yaml"},
+        repos={"ctx": tmp_path / "rc", "gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "ws",
+        label="t",
+        dry_run=True,
+        incumbent={"shape": "tep_4_eplb0_mtp0", "concurrency": 1},
+    )
+    assert record["gen_point"]["moved"] is False
+    assert record["design_dir"] == str(d)
+    assert "e2e_view_absent" in record["gen_point"]
