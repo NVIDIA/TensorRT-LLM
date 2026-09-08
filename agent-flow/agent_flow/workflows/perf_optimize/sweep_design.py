@@ -7,32 +7,45 @@ the tensor-parallel batch ceiling is, what a concurrency ladder looks like on
 each. Those rules live in someone else's repo and will move; copying them
 here would produce a second, quietly diverging answer.
 
-But the skill is executed by an agent, and two things about that are not
-safe to leave to one:
+**The skill runs normally, and this module checks what it produced.**
 
-**Scope.** The skill's own Phase 3 finishes by rate-matching the generation
-curve against a context anchor. That is the end-to-end join, and this
-workflow's staged scope does not include it — so the last command has to
-change. An instruction to "use the other post-processor" is exactly the kind
-a busy agent honours on the first run and forgets on the second, and the
-failure is silent: a frontier appears, it looks like a frontier, and nothing
-downstream can tell it was built against an anchor nobody asked for. The
-session this module was written after did precisely that, from a prompt that
-said otherwise.
+An earlier version of this file generated every command the design agent
+ran — four wrappers around the skill's own scripts — on the reasoning that a
+generated command cannot be drifted from. That was a bad trade, and the way
+it was bad is worth recording, because the same trade will look attractive
+again.
 
-**The candidate set.** A context point can be *selected* rather than
-computed — its objective, requests per second per context GPU, is scalar and
-needs no rate match — but only if more than one candidate was measured. The
-skill emits a single sized configuration, so widening it into a candidate
-list is a change this workflow wants and the skill has no reason to make.
+The failure it prevented was one silent one: the skill ends its sweep phase
+with ``ibc-bench process frontier --ctx_json``, the end-to-end join, which
+this staged scope excludes. An agent told in prose to use the other
+post-processor may well forget on a later turn, and the result looks correct
+— a frontier appears, and nothing downstream can tell which anchor built it.
 
-So the split: **this module decides and checks; the agent executes.** Every
-command an agent runs is generated here, so the scope is not something it
-can drift from, and every artefact it produces is validated here, so a
-missing probe or an inconsistent row stops the run instead of quietly
-narrowing what gets measured. Nothing here starts a process — the agent is
-already on the cluster where the checkpoint is, and adding a second way to
-reach it would defeat :mod:`.gitops`' single-door rule for no gain.
+The failure it *introduced* was worse. ``SKILL.md`` carries a rule those
+wrappers had no place for: for an **existing** model directory the generated
+YAMLs go into ``sweep_design/``, never on top of the curated configs. The
+wrappers took the output path as a free parameter with no guard, so one
+wrong argument would have overwritten a checked-in config that other people
+maintain — silently, irreversibly, and outside this run. Trading a
+recomputable mistake for an unrecoverable one is not a safety improvement.
+
+More generally: the skill's phases are not four commands. They are also
+gates, a resume spine, an output-placement rule, and a probe protocol.
+Restating four argv strings dropped the rest of it while looking like
+faithful automation.
+
+So the skill is invoked as a skill and left to apply its own policies. What
+survives here is:
+
+- **one override** — :func:`postprocess_command`, because it is the one
+  place this workflow's scope genuinely differs from the skill's, and
+  because it changes semantics rather than paths;
+- **checks on the artefacts** — a probe plan that quietly dropped a shape, a
+  row whose ``max_num_tokens`` is inconsistent, a design sweep carrying a
+  build source. These read what the skill wrote and refuse it; none of them
+  can damage anything.
+
+Nothing here starts a process or writes a file the skill owns.
 """
 
 from __future__ import annotations
@@ -85,53 +98,7 @@ def scripts_dir(repo_root: Path) -> Path:
     )
 
 
-# ------------------------------------------------------------- the commands
-
-
-def facts_command(scripts: Path, model_path: str, out: Path) -> str:
-    """Phase 0. Reads the checkpoint's index; touches no GPU."""
-    return f"python3 - {model_path} < {Path(scripts) / FACTS_SCRIPT} > {out}"
-
-
-def shapes_command(scripts: Path, facts: Path, out: Path, *, gpu: str, per_node: int) -> str:
-    """The planning half of Phase 2: which shapes are legal at all."""
-    return (
-        f"python3 {Path(scripts) / DESIGN_SCRIPT} shapes --facts {facts} "
-        f"--gpu-name {gpu} --gpus-per-node {per_node} > {out}"
-    )
-
-
-def ctx_command(
-    scripts: Path,
-    facts: Path,
-    out: Path,
-    *,
-    gpu: str,
-    per_node: int,
-    isl: int,
-    ratio: str,
-    model_card: str,
-    model_path: str,
-    model_prefix: str,
-    dataset_prefix: str,
-) -> str:
-    """The design half of Phase 1: a sized context configuration.
-
-    One configuration, which :func:`widen_ctx_candidates` then turns into a
-    candidate set. Generated first rather than hand-written so the sizing —
-    weight bytes against GPU memory — stays the skill's arithmetic.
-    """
-    return (
-        f"python3 {Path(scripts) / DESIGN_SCRIPT} ctx --facts {facts} "
-        f"--gpu-name {gpu} --gpus-per-node {per_node} --isl {isl} --ratio {ratio} "
-        f"--model-card {model_card} --model-path '{model_path}' "
-        f"--model-prefix {model_prefix} --dataset-prefix {dataset_prefix} --out {out}"
-    )
-
-
-def sol_command(scripts: Path, plan: Path, out: Path) -> str:
-    """The design half of Phase 3: the sweep, from the *measured* plan."""
-    return f"python3 {Path(scripts) / DESIGN_SCRIPT} sol --plan {plan} --out {out}"
+# ------------------------------------------------------------ the one override
 
 
 def postprocess_command(run_dir: Path) -> str:
@@ -278,68 +245,52 @@ def verify_sol_yaml(config: Mapping[str, Any]) -> None:
             )
 
 
-def designer_instruction(
-    *,
-    scripts: Path,
-    design_dir: Path,
-    shapes: Sequence[str],
-    facts: Path,
-    ctx_config: Path,
-    sol_yaml: Path,
-    plan: Path,
-) -> str:
-    """What the design agent is asked to do, and only that.
+def designer_instruction(*, model_dir: str, design_dir: Path, tracks: Sequence[str]) -> str:
+    """What the design agent is asked to do: run the skill, with one override.
 
-    Everything deterministic is already generated by the time this is built,
-    so the agent's job is the part that genuinely needs judgement: driving
-    the probe loop, deciding whether a failed job was a memory wall or an
-    infrastructure fault, and waiting on the cluster. The scored command is
-    handed over verbatim rather than described, so the staged scope is not
-    something the agent can restate differently on a later turn.
+    Deliberately short. The skill's own ``SKILL.md`` carries the phases, the
+    probe protocol, the submission gates, the resume spine and — the reason
+    an earlier version of this function was wrong — the rule about where
+    generated YAMLs may be written. Restating any of that here would produce
+    a second copy to drift from; the agent reads the skill.
+
+    What this adds is the one thing the skill cannot know: that this
+    workflow's scope excludes the end-to-end join, so the sweep is scored
+    anchor-free. That is a change of meaning rather than of path, and it is
+    given as the exact command because a described one is the kind an agent
+    honours on the first turn and restates differently on the fourth.
     """
     return (
-        f"Fix this model's operating point by driving the **create-sweep** skill's "
-        f"probe and sweep phases. Everything that can be generated already has "
-        f"been; what is left needs judgement, which is why you are running it.\n\n"
-        f"**Design directory:** `{design_dir}` — read `{DESIGN_STATE_HINT}` there "
-        f"first and resume from whatever phase it records.\n\n"
-        f"**Already on disk (do not regenerate):**\n"
-        f"- `{facts}` — the model facts\n"
-        f"- `{ctx_config}` — the ctx candidate sweep, already widened so the "
-        f"context point can be *selected from measurement* rather than computed. "
-        f"Submit it as-is; do not narrow it.\n\n"
-        f"**Your work, in order:**\n\n"
-        f"1. **Probe each shape's max batch.** Shapes: {list(shapes)}. Follow the "
-        f"**test-max-batch** skill: start from a comparable model's batch, halve "
-        f"on OOM, stop when one passes and twice that fails. TEP never above 256. "
-        f"A shape whose probe fails for an infrastructure reason — a job that "
-        f"never started, a corrupted dependency download — is retried; a shape "
-        f"that genuinely OOMs at its smallest batch is recorded as not fitting. "
-        f"Those are different findings and the plan must not conflate them.\n"
-        f"   Record every result in `{plan}`.\n\n"
-        f"2. **Submit the ctx candidate sweep** (`{ctx_config}`). It has no "
-        f"dependency on the probes, so submit it first and let it run alongside "
-        f"them.\n\n"
-        f"3. **Generate and submit the concurrency sweep.** Build it from the "
-        f"measured plan:\n"
-        f"   ```bash\n   {sol_command(scripts, plan, sol_yaml)}\n   ```\n"
-        f"   then validate it with the **check-gen-config** skill before "
-        f"submitting.\n\n"
-        f"4. **Score it — with this command and no other:**\n"
-        f"   ```bash\n   {postprocess_command(Path('<each run dir>'))}\n   ```\n"
-        f"   Do **not** run `ibc-bench process frontier`, and do not pass a "
-        f"`--ctx_json` to anything. This campaign builds no end-to-end view: the "
-        f"frontier that command produces rate-matches the generation curve "
-        f"against a context anchor, which is a measurement this scope does not "
-        f"take. It would still emit a curve, and the curve would still look "
-        f"correct — that is precisely why the command is given here rather than "
-        f"described.\n\n"
+        f"Fix this model's operating point: invoke the **create-sweep** skill and "
+        f"follow it. It carries the phases, the probe protocol, the submission "
+        f"gates and the rules about where its generated YAMLs may be written -- "
+        f"follow those as written, including its rule that for an EXISTING model "
+        f"directory the generated configs go into `sweep_design/` and never on "
+        f"top of the curated ones.\n\n"
+        f"- model_dir: `{model_dir}` (existing)\n"
+        f"- design directory: `{design_dir}` -- read its `{DESIGN_STATE_HINT}` "
+        f"first and resume from whatever phase it records\n"
+        f"- halves this campaign will optimize afterwards: {list(tracks)}\n\n"
+        f"**Two departures from the skill, and only these two.**\n\n"
+        f"**1. Stop after the concurrency sweep.** Do not run the predict/prune "
+        f"phase or the final frontier. Both require a measured MTP accept rate "
+        f"this model does not have, and the pruning is irreversible -- it would "
+        f"throw away points on the strength of a multiplier nobody measured.\n\n"
+        f"**2. Score the generation runs with this command and no other:**\n"
+        f"```bash\n{postprocess_command(Path('<each run dir>'))}\n```\n"
+        f"Do **not** run `ibc-bench process frontier`, and do not pass "
+        f"`--ctx_json` to anything. This campaign builds no end-to-end view: that "
+        f"command rate-matches the generation curve against a context anchor, a "
+        f"measurement this scope does not take. It would still emit a curve, and "
+        f"the curve would still look correct -- which is why the replacement is "
+        f"given as a command rather than described.\n\n"
         f"**Do not select the operating point.** Your output is the measured "
-        f"space; choosing a point from it happens after you, against a stated "
-        f"preference you have not been given.\n\n"
-        f"**Every number must be traceable to a file you can name.** A shape "
-        f"whose probe or sweep failed is reported as failed — never omitted, "
-        f"because a silently missing shape becomes a frontier it was never on."
+        f"space; choosing from it happens after you, against a stated preference "
+        f"you have not been given.\n\n"
+        f"**A shape whose probe or sweep failed is reported as failed** -- never "
+        f"omitted, because a silently missing shape becomes a frontier it was "
+        f"never on. Say which failed and why: a job that never started and a "
+        f"genuine memory wall are different findings."
     )
 
 
