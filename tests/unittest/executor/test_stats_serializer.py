@@ -152,6 +152,20 @@ class _FakePeakStorage:
 
 
 class TestStatsSerializer:
+    def test_batch_converter_parses_shared_attention_dp_snapshot_once(self):
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_batch_to_dict(
+            [
+                (iter_stats, None, None, 0),
+                (iter_stats, None, None, 1),
+            ]
+        )
+
+        assert [row["attentionDpRank"] for row in result] == [0, 1]
+        assert result[0] is not result[1]
+        iter_stats.to_json_str.assert_called_once_with()
+
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
         iter_stats = _make_mock_iteration_stats()

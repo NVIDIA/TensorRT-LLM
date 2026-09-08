@@ -1092,7 +1092,7 @@ class BaseWorker(GenerationExecutor):
         return startup_metrics
 
     @staticmethod
-    def _stats_to_dict(stats) -> dict:
+    def _stats_to_dict(stats, base_stats_dict: Optional[dict] = None) -> dict:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
         # Already converted on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
@@ -1111,7 +1111,13 @@ class BaseWorker(GenerationExecutor):
         attention_dp_payload = stats[8] if len(stats) > 8 else None
         stats_sample_interval = stats[9] if len(stats) > 9 else 1
 
-        stats_dict = json.loads(iteration_stats.to_json_str())
+        if base_stats_dict is None:
+            stats_dict = json.loads(iteration_stats.to_json_str())
+        else:
+            stats_dict = dict(base_stats_dict)
+            if "inflightBatchingStats" in stats_dict:
+                stats_dict["inflightBatchingStats"] = dict(
+                    stats_dict["inflightBatchingStats"])
         rich_stats_sampled = stats_dict.get("iter",
                                             0) % stats_sample_interval == 0
         stats_dict["statsCollectionInterval"] = stats_sample_interval
@@ -1165,6 +1171,25 @@ class BaseWorker(GenerationExecutor):
             stats_dict["schedulerMode"] = scheduler_mode
 
         return stats_dict
+
+    @staticmethod
+    def _stats_batch_to_dict(stats_batch: list) -> list[dict]:
+        """Convert a batch while parsing each shared IterationStats snapshot once."""
+        base_stats_by_id = {}
+        result = []
+        for stats in stats_batch:
+            if (isinstance(stats, tuple) and len(stats) == 2
+                    and stats[0] == "per_rank_dict"):
+                result.append(stats[1])
+                continue
+            iteration_stats = stats[0]
+            stats_id = id(iteration_stats)
+            if stats_id not in base_stats_by_id:
+                base_stats_by_id[stats_id] = json.loads(
+                    iteration_stats.to_json_str())
+            result.append(
+                BaseWorker._stats_to_dict(stats, base_stats_by_id[stats_id]))
+        return result
 
     @staticmethod
     def _stats_serializer(stats) -> str:

@@ -55,8 +55,8 @@ class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
     def fetch_stats(self):
         return ["first", "second"]
 
-    def _stats_to_dict(self, stats):
-        return {"value": stats}
+    def _stats_batch_to_dict(self, stats):
+        return [{"value": stat} for stat in stats]
 
 
 def test_fetch_responses_processes_and_filters_engine_responses():

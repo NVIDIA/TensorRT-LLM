@@ -134,7 +134,7 @@ class RpcWorkerMixin:
             if (time.time() - start) >= timeout:
                 break
             await asyncio.sleep(0.1)
-        return [self._stats_to_dict(s) for s in stats]
+        return self._stats_batch_to_dict(stats)
 
     async def fetch_kv_cache_events_wait_async(self, timeout: Optional[float] = None) -> list:
         """Poll for KV cache events until available or timeout.
@@ -160,7 +160,7 @@ class RpcWorkerMixin:
         """
         stats = await asyncio.to_thread(self.fetch_stats)
         # Convert before RPC because native IterationStats objects are not picklable.
-        return [self._stats_to_dict(s) for s in stats]
+        return self._stats_batch_to_dict(stats)
 
     async def fetch_kv_cache_capacity_async(self) -> str:
         """Async version of fetch_kv_cache_capacity using asyncio.to_thread."""
