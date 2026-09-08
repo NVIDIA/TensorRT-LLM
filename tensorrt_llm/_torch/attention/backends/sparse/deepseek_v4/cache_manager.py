@@ -15,6 +15,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
+from math import gcd
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -57,6 +58,7 @@ from .params import (
 )
 
 COMPRESS_BLOCK_SCALE_ROLE = DataRole("deepseek_v4_compress_block_scale")
+KV_CACHE_COPY_ALIGNMENT = 16
 NVFP4_VECTOR_SIZE = 16
 
 
@@ -1021,6 +1023,25 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         manager_layer_id_to_layer_attn: Dict[
             Tuple[LayerId, DataRole], Tuple[int, DeepseekV4AttentionType]
         ] = {}
+        nvfp4_padding_pages: Dict[int, int] = {}
+        if self._use_nvfp4_compress:
+            compress_layers_by_scale_page_size: Dict[int, List[int]] = defaultdict(list)
+            scale_bytes_per_token = (
+                self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM
+            ) // NVFP4_VECTOR_SIZE
+            for layer_idx in self.pp_layers:
+                compress_ratio = self._compress_ratios[layer_idx]
+                if compress_ratio_has_attention(compress_ratio, DeepseekV4AttentionType.COMPRESS):
+                    scale_page_size = self.compressed_block_sizes[layer_idx] * scale_bytes_per_token
+                    compress_layers_by_scale_page_size[scale_page_size].append(layer_idx)
+
+            for scale_page_size, grouped_layers in compress_layers_by_scale_page_size.items():
+                page_count_alignment = KV_CACHE_COPY_ALIGNMENT // gcd(
+                    scale_page_size, KV_CACHE_COPY_ALIGNMENT
+                )
+                padding_pages = (-len(grouped_layers)) % page_count_alignment
+                if padding_pages:
+                    nvfp4_padding_pages[grouped_layers[-1]] = padding_pages
 
         def _add_layer(
             layer_idx: int,
@@ -1042,16 +1063,38 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 for attn_type in attention_types
             ]
             if self._use_nvfp4_compress and DeepseekV4AttentionType.COMPRESS in attention_types:
+                scale_page_size = (
+                    self.compressed_block_sizes[layer_idx]
+                    * (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM)
+                    // NVFP4_VECTOR_SIZE
+                )
                 buffers.append(
                     BufferConfig(
                         role=COMPRESS_BLOCK_SCALE_ROLE,
-                        size=(
-                            self.compressed_block_sizes[layer_idx]
-                            * (self.head_dim + NVFP4_COMPRESS_RESIDUAL_DIM)
-                            // NVFP4_VECTOR_SIZE
-                        ),
+                        size=scale_page_size,
                     )
                 )
+                # Reuse snapshots copy complete coalesced slots in 16-byte
+                # grains. Pad with complete data/scale pages so the shared-page
+                # stride and the data/scale page-index converters stay equal.
+                data_page_size = self._get_attn_bytes_per_block(
+                    DeepseekV4AttentionType.COMPRESS, layer_idx
+                )
+                for padding_idx in range(nvfp4_padding_pages.get(layer_idx, 0)):
+                    buffers.extend(
+                        [
+                            BufferConfig(
+                                role=DataRole(f"deepseek_v4_compress_padding_{padding_idx}"),
+                                size=data_page_size,
+                            ),
+                            BufferConfig(
+                                role=DataRole(
+                                    f"deepseek_v4_compress_block_scale_padding_{padding_idx}"
+                                ),
+                                size=scale_page_size,
+                            ),
+                        ]
+                    )
             layer_config = AttentionLayerConfig(
                 layer_id=layer_id,
                 buffers=buffers,
