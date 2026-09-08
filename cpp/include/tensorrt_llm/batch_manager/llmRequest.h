@@ -148,8 +148,7 @@ public:
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        SizeType32 numReturnSequences = 1, std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt,
-        bool returnPerfMetrics = false,
+        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
@@ -211,7 +210,6 @@ public:
         , mLlmRequestType(llmRequestType)
         , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
-        , mNumReturnSequences(numReturnSequences)
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
@@ -243,7 +241,7 @@ public:
         bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
         bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
-        executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
@@ -282,7 +280,6 @@ public:
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mContextPhaseParams(contextPhaseParams)
-        , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSalt(std::move(cacheSalt))
     {
@@ -2170,8 +2167,6 @@ protected:
     // TODO: add real extra id for encoder tokens.
     std::optional<std::shared_ptr<VecUniqueTokens>> mEncoderUniqueTokens{std::nullopt};
 
-    SizeType32 mNumReturnSequences{1};
-
     SizeType32 mSequenceIndex{0};
 
     std::vector<RequestPtr> mChildRequests;
@@ -2297,34 +2292,6 @@ private:
 
         setReturnLogProbs(outputLogProbs);
 
-        // Handling the backward compatibility of numReturnSequences.
-        if (mNumReturnSequences > 1)
-        {
-            if (!mSamplingConfig.getNumReturnSequences())
-            {
-                TLLM_LOG_WARNING(
-                    "In the Executor class, mNumReturnSequences is deprecated. Please set numReturnSequences in "
-                    "SamplingConfig directly.");
-            }
-            else if (mSamplingConfig.getNumReturnSequences()
-                && mSamplingConfig.getNumReturnSequences().value() != mNumReturnSequences)
-            {
-                TLLM_THROW(
-                    "In the Executor class, both mSamplingConfig.numReturnSequences (%d) and mNumReturnSequences (%d) "
-                    "are provided but unmatched. Please use numReturnSequences in SamplingConfig directly.",
-                    mSamplingConfig.getNumReturnSequences().value(), mNumReturnSequences);
-            }
-            // setNumReturnSequences validates against the beam width, which the previous raw
-            // field assignment did not. Report that here so the deprecated spelling fails with
-            // an actionable message instead of a bare check failure.
-            TLLM_CHECK_WITH_INFO(
-                mSamplingConfig.getBeamWidth() == 1 || mNumReturnSequences <= mSamplingConfig.getBeamWidth(),
-                "In the Executor class, mNumReturnSequences (%d) must not exceed the beam width (%d). Please set "
-                "numReturnSequences in SamplingConfig directly.",
-                mNumReturnSequences, mSamplingConfig.getBeamWidth());
-            mSamplingConfig.setNumReturnSequences(mNumReturnSequences);
-        }
-
         if (!isChild())
         {
             // Initialize result states unless it is a child and a child request should share parent's one.
@@ -2397,7 +2364,7 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, SizeType32 numReturnSequences = 1,
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt,
         std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
@@ -2439,8 +2406,8 @@ public:
             std::move(crossAttentionMask), llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            numReturnSequences, skipCrossAttnBlocks, returnPerfMetrics, std::move(guidedDecodingParams),
-            languageAdapterUid, allottedTimeMs, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
+            skipCrossAttnBlocks, returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs,
+            contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
