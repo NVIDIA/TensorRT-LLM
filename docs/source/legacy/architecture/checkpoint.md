@@ -11,7 +11,7 @@ The legacy TensorRT backend has been removed and is no longer supported. This pa
 
 ## Overview
 
-The earlier versions (pre-0.8 version) of TensorRT LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT LLM. This file documents the workflow around TensorRT LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.
+The earlier versions (pre-0.8 version) of TensorRT LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT LLM. This file documents the **legacy** workflow around the TensorRT LLM checkpoint format and the (now removed) CLI tools that used to generate checkpoints, build engines, and evaluate engines.
 
 There are three steps in the workflow:
 
@@ -178,21 +178,14 @@ Here is the AWQ scaling factors of `mlp.fc` linear layer:
 - `transformer.layers.0.mlp.fc.prequant_scaling_factor`
 
     ```{note}
-    The linear weights in TensorRT LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT LLM implemented by plugin may use (`in_feature`, `out_feature`) shape. The `trtllm-build` command adds a transpose operation to post-process it.
+    The linear weights in TensorRT LLM checkpoint always follows (`out_feature`, `in_feature`) shape, whereas some quantized linear in TensorRT LLM implemented by plugin may use (`in_feature`, `out_feature`) shape. Historically, the removed `trtllm-build` CLI added a transpose operation to post-process that layout difference.
+    ```
 
 ### Example
 
-Let's take OPT as an example and deploy the model with tensor parallelism 2:
+The per-model `convert_checkpoint.py` scripts (for example under the deleted `examples/opt/` tree) and the `trtllm-build` CLI were removed with the TensorRT backend. The layout below is retained only to illustrate the **legacy checkpoint directory shape**; do not run convert/build commands from this page. For serving today, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html) or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) with a Hugging Face checkpoint (see also [TensorRT Backend Removed](../tensorrt-backend-removal.md)).
 
-```bash
-cd examples/opt
-python3 convert_checkpoint.py --model_dir ./opt-125m \
-                --dtype float16 \
-                --tp_size 2 \
-                --output_dir ./opt/125M/trt_ckpt/fp16/2-gpu/
-```
-
-Here is the checkpoint directory:
+Here is an illustrative checkpoint directory for a tensor-parallelism-2 OPT checkpoint:
 
 ```
 ./opt/125M/trt_ckpt/fp16/1-gpu/
@@ -227,29 +220,10 @@ Here is the `config.json`:
 
 ## Build Checkpoint into TensorRT Engine
 
-TensorRT LLM provides a unified build command: `trtllm-build`. Before using it,
-you may need to add it to the `PATH`.
+The unified `trtllm-build` CLI that turned a TensorRT LLM checkpoint into a TensorRT engine was removed with the TensorRT backend and is no longer shipped (`setup.py` console scripts are only `trtllm-bench`, `trtllm-serve`, and `trtllm-eval`).
 
-```bash
-export PATH=/usr/local/bin:$PATH
-
-trtllm-build --checkpoint_dir ./opt/125M/trt_ckpt/fp16/2-gpu/ \
-                --gemm_plugin float16 \
-                --max_batch_size 8 \
-                --max_input_len 924 \
-                --max_seq_len 1024 \
-                --output_dir ./opt/125M/trt_engines/fp16/2-gpu/
-```
+Do not attempt to rebuild engines from legacy checkpoints. Load Hugging Face weights directly with `trtllm-serve` or the LLM API instead.
 
 ## Make Evaluation
 
-```bash
-mpirun -n 2 --allow-run-as-root \
-    python3 ../summarize.py --engine_dir ./opt/125M/trt_engines/fp16/2-gpu/ \
-                        --batch_size 1 \
-                        --test_trt_llm \
-                        --hf_model_dir opt-125m \
-                        --data_type fp16 \
-                        --check_accuracy \
-                        --tensorrt_llm_rouge1_threshold=14
-```
+Engine evaluation via `examples/summarize.py --engine_dir ...` was part of the removed TensorRT workflow (`examples/summarize.py` no longer exists). For accuracy evaluation on the PyTorch backend, use [`trtllm-eval`](../../commands/trtllm-eval.rst).
