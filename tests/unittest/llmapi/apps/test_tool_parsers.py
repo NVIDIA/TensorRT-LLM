@@ -5513,15 +5513,19 @@ class TestUnparsedToolCallWarning:
             self.eot_token = "</tool_call>"
 
         def has_tool_call(self, text: str) -> bool:
+            """Report the marker as present whenever ``bot_token`` occurs."""
             return self.bot_token in text
 
         def detect_and_parse(self, text: str, tools):
+            """Always fail to extract a call from the complete text."""
             return StreamingParseResult(normal_text="", calls=[])
 
         def parse_streaming_increment(self, new_text: str, tools):
+            """Always fail to extract a call from a streamed increment."""
             return StreamingParseResult(normal_text="", calls=[])
 
         def structure_info(self):
+            """Return a trivial structure for the test marker."""
             return lambda name: StructureInfo(
                 begin="<tool_call>", end="</tool_call>", trigger="<tool_call>")
 
@@ -5530,6 +5534,7 @@ class TestUnparsedToolCallWarning:
 
     @pytest.fixture(autouse=True)
     def _register_parser(self):
+        """Register the markup-only parser with the factory for each test."""
         from unittest.mock import patch
 
         from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
@@ -5541,6 +5546,7 @@ class TestUnparsedToolCallWarning:
 
     @staticmethod
     def _chat_args(tool_parser):
+        """Build Chat Completions postproc args with one tool and ``tool_parser``."""
         from tensorrt_llm.serve.postprocess_handlers import ChatPostprocArgs
 
         args = ChatPostprocArgs(role="assistant", model="test-model")
@@ -5550,11 +5556,13 @@ class TestUnparsedToolCallWarning:
 
     @staticmethod
     def _patched_logger():
+        """Patch the logger the warning helper writes to."""
         from unittest.mock import patch
 
         return patch("tensorrt_llm.serve.tool_parser.base_tool_parser.logger")
 
     def test_chat_non_streaming_warns_and_names_parser(self):
+        """Chat, non-streaming: one warning that names the parser and the flag."""
         from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
 
         args = self._chat_args(self._PARSER_NAME)
@@ -5571,6 +5579,7 @@ class TestUnparsedToolCallWarning:
         assert "--tool_parser" in message
 
     def test_chat_non_streaming_silent_without_markup(self):
+        """Chat, non-streaming: plain text without markup stays silent."""
         from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
 
         args = self._chat_args(self._PARSER_NAME)
@@ -5580,6 +5589,7 @@ class TestUnparsedToolCallWarning:
         mock_logger.warning.assert_not_called()
 
     def test_chat_non_streaming_silent_when_calls_extracted(self):
+        """Chat, non-streaming: a successfully parsed call stays silent."""
         from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
 
         args = self._chat_args("qwen3")
@@ -5592,6 +5602,7 @@ class TestUnparsedToolCallWarning:
         mock_logger.warning.assert_not_called()
 
     def test_chat_streaming_path_is_out_of_scope(self):
+        """Chat, streaming: the warning is not emitted on the streaming path."""
         from tensorrt_llm.serve.postprocess_handlers import apply_tool_parser
 
         args = self._chat_args(self._PARSER_NAME)
@@ -5605,6 +5616,7 @@ class TestUnparsedToolCallWarning:
         mock_logger.warning.assert_not_called()
 
     def test_responses_non_streaming_warns_and_names_parser(self):
+        """Responses, non-streaming: one warning that names the parser."""
         from tensorrt_llm.serve.responses_utils import _apply_tool_parser
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))
@@ -5620,6 +5632,7 @@ class TestUnparsedToolCallWarning:
         assert self._PARSER_NAME in mock_logger.warning.call_args.args[0]
 
     def test_responses_non_streaming_silent_without_markup(self):
+        """Responses, non-streaming: plain text without markup stays silent."""
         from tensorrt_llm.serve.responses_utils import _apply_tool_parser
 
         tools = _make_tools(("get_weather", _SCHEMA_LOCATION))

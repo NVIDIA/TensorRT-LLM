@@ -33,7 +33,8 @@ def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
         return
     logger.warning(
         f"Tool parser '{parser_name}' detected tool-call markup but extracted "
-        "no tool calls; the response will carry an empty tool_calls list. "
+        "no tool calls from the model output; the response will not carry "
+        "any tool call. "
         "Likely causes: the parser does not match the model's chat template "
         "(check --tool_parser), the output is malformed or truncated, the tool "
         "block is empty, or the parser rejected the arguments.")
