@@ -4260,7 +4260,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return get_size_in_bytes(cache_size // quant_vector_size, scaling_factor_dtype)
 
-    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
+    def _iter_cache_buffers_for_invalid_check(self) -> Iterable[Tuple[int, torch.Tensor]]:
         pool_handled = set()
         for layer_id, layer_offset in self.layer_offsets.items():
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]
@@ -4269,7 +4269,7 @@ class KVCacheManagerV2(BaseResourceManager):
             buffer = self.get_buffers(layer_id)
             if buffer is None:
                 continue
-            yield buffer
+            yield layer_id, buffer
             pool_handled.add(pool_id)
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
@@ -4278,7 +4278,7 @@ class KVCacheManagerV2(BaseResourceManager):
             [False], dtype=torch.bool, device=torch.cuda.current_device()
         )
 
-        for buffer in self._iter_cache_buffers_for_invalid_check():
+        for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
             # process in chunks of 256 pages to avoid OoM
             for i in range(0, buffer.shape[0], 256):
                 buffer_slice = buffer[i : i + 256]
@@ -4289,6 +4289,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
+                # warmup runs this with fill_with_zero=True to scrub the cache
+                # before inference, but that must not wipe the guard-page
+                # sentinel -- doing so would leave the startup warning claiming
+                # a guard that no longer exists. Rewrite the guard page after
+                # the zero. Each pool is zeroed on one representative layer, so
+                # only that layer's guard page needs restoring here.
+                guard_page = self._guard_page_by_layer.get(layer_id)
+                if guard_page is not None and self._guard_page_value is not None:
+                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:

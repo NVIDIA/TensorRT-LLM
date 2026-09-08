@@ -1539,3 +1539,25 @@ def test_guard_page_request_id_clears_cuda_graph_draft_window() -> None:
     assert guard in kv_cache_v2_module._RESERVED_REQUEST_IDS
 
 
+def test_warmup_zeroing_preserves_guard_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``check_invalid_values_in_kv_cache(fill_with_zero=True)`` runs during
+    warmup and scrubs the cache; it must leave the guard-page sentinel intact,
+    otherwise the startup warning claims a guard that no longer exists."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    guard_page = 3
+    buffer = torch.ones(6, 2)
+    buffer[guard_page] = float("nan")  # the guard sentinel
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_offsets = {0: 0}
+    manager.layer_to_pool_mapping_dict = {0: 0}
+    manager.get_buffers = lambda layer_idx, kv_layout="NHD": buffer
+    manager._guard_page_by_layer = {0: guard_page}
+    manager._guard_page_value = float("nan")
+
+    manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+
+    assert torch.isnan(buffer[guard_page]).all()  # sentinel survives the scrub
+    assert torch.equal(buffer[0], torch.zeros(2))  # everything else is zeroed
+    assert torch.equal(buffer[5], torch.zeros(2))
