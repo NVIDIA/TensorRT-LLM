@@ -68,7 +68,7 @@ def _load_sol_attn() -> Callable:
 # Architectures with a Sol-Attn CuTe kernel. Kept in sync with
 # ``sol_attn/interface.py::_CUTE_BACKENDS``; duplicated here so the eligibility
 # check does not have to import the CuTe DSL.
-SUPPORTED_ARCHS = frozenset({(10, 0)})
+SUPPORTED_ARCHS = frozenset({(10, 0), (10, 3)})
 
 
 def sol_attn_ineligible_reason(q) -> Optional[str]:

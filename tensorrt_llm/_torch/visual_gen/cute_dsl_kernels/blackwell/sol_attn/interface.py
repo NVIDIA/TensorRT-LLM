@@ -12,8 +12,13 @@ import functools
 import torch
 
 BLOCK_SIZE = 64
+# The vendored kernel lives in ``sm100/`` and serves both datacenter Blackwell
+# steppings: the CuTe DSL JIT targets whatever device it compiles on, and the
+# kernel body uses no sm100-exclusive construct. Measured identical on both --
+# see THIRD_PARTY_NOTICES.md.
 _CUTE_BACKENDS = {
     (10, 0): "cute_sm100",  # B200 / GB200
+    (10, 3): "cute_sm100",  # B300 / GB300 (Blackwell Ultra)
 }
 _compiled = {}
 
@@ -105,8 +110,8 @@ def get_sol_attn_backend(device: torch.device | str | int | None = None) -> str:
 def _validate_cute(arch, tokens, kv_splits):
     if kv_splits != 1:
         raise ValueError(
-            "kv_splits=2/4 was an SM90-only path; this build ships SM100 "
-            "kernels only, so kv_splits must be 1."
+            "kv_splits=2/4 was an SM90-only path; this build ships the SM100 "
+            "kernel only, so kv_splits must be 1."
         )
     route_groups = ((tokens + 63) // 64 + 63) // 64
     if kv_splits > route_groups:
@@ -197,10 +202,12 @@ def _sol_attn_cute(
         stream = _stream(q.device)
         key = (q.device.index, arch, batch, tokens, heads, kv_splits)
 
-        if arch != (10, 0):
+        if arch not in _CUTE_BACKENDS:
             # Unreachable via sol_attn(): _backend_for_arch raises first. Kept
             # explicit because the alternative on a missed guard is returning
             # the uninitialised `output` buffer, i.e. silently wrong results.
+            # Keyed off _CUTE_BACKENDS rather than a literal so widening the
+            # dispatch map cannot leave this guard behind.
             raise ValueError(f"no Sol-Attn CuTe kernel for SM{arch[0]}{arch[1]}")
         sink_start_block, sink_end_block = _sink_block_range(
             tokens,

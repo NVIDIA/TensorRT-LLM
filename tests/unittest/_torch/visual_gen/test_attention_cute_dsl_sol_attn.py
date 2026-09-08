@@ -416,6 +416,42 @@ def test_supported_archs_matches_kernel_dispatch_map():
     assert _backend_mod().SUPPORTED_ARCHS == frozenset(interface._CUTE_BACKENDS)
 
 
+def test_datacenter_blackwell_archs_are_supported():
+    """Both datacenter Blackwell steppings dispatch to the vendored kernel.
+
+    sm103 (B300/GB300) runs the same `sm100/` kernel as sm100: the CuTe DSL JIT
+    targets the device it compiles on and the kernel body uses no sm100-only
+    construct. Verified on hardware against a B200 control; see the kernel's
+    THIRD_PARTY_NOTICES.md.
+    """
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
+
+    assert (10, 0) in interface._CUTE_BACKENDS
+    assert (10, 3) in interface._CUTE_BACKENDS
+
+
+def test_no_arch_literal_outside_the_dispatch_map():
+    """`_sol_attn_cute`'s guard must key off _CUTE_BACKENDS, not a literal.
+
+    That guard is a second, deeper check than `_backend_for_arch`, and it is
+    the one no other test reaches: `test_supported_archs_matches_kernel_dispatch_map`
+    keeps SUPPORTED_ARCHS and _CUTE_BACKENDS in step, so widening both leaves a
+    hardcoded literal here as the only thing still rejecting the new arch --
+    with every test green. Assert on the source so the coupling cannot regress.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
+
+    src = inspect.getsource(interface._sol_attn_cute)
+    assert "arch not in _CUTE_BACKENDS" in src, (
+        "the guard in _sol_attn_cute must be keyed off _CUTE_BACKENDS"
+    )
+    assert "arch != (10, 0)" not in src, (
+        "hardcoded architecture literal in _sol_attn_cute; key it off _CUTE_BACKENDS"
+    )
+
+
 def test_quant_attention_config_rejected_with_sol_attn():
     """Sol-Attn replaces the dense CuTeDSL path, so quantized attention cannot
     compose with it; accepting the pair would silently ignore the quant request."""
