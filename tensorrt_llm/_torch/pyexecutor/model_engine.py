@@ -3708,7 +3708,7 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. The model module reference, runner, and MM item scheduler, which
+        2. The runner, MM item scheduler, and model module reference, which
            hold references to the model.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
