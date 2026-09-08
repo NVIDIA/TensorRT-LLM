@@ -12,6 +12,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     is_disagg_inflight_cancel_enabled,
@@ -294,6 +295,25 @@ class DisaggTransferCoordinator:
                 f"kv_transfer_timeout_ms={timeout_ms}ms; "
                 f"{self._describe_transfer_timeout(request)}"
             )
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                disagg_diagnostics.emit_event(
+                    "transfer_timeout_observed",
+                    side="ctx" if kind == "context" else "gen",
+                    request_id=get_unique_rid(request),
+                    local_request_id=request.py_request_id,
+                    rank=self._dist.rank,
+                    elapsed_ms=elapsed_ms,
+                    timeout_ms=timeout_ms,
+                    timeout_owner="pyexecutor",
+                    timer_start_monotonic_ns=int(
+                        request.py_kv_transfer_start_time * 1_000_000_000
+                    ),
+                    state=request.state.name,
+                    cancellation_requested=self.inflight_cancel_active(),
+                    tp_rank=self._dist.tp_rank,
+                    pp_rank=self._dist.pp_rank,
+                    cp_rank=self._dist.cp_rank,
+                )
             request.py_kv_transfer_timed_out = True
 
     @nvtx_range("check_transfer_timeouts")
@@ -329,12 +349,53 @@ class DisaggTransferCoordinator:
         # Real synchronous gen_only transfers still honor the budget to bound
         # the number of blocking transfers started in one executor iteration.
         if is_gen_only_no_context_benchmark():
-            return fitting_gen_init, False
-
-        if not (self._transfer_window_is_active() and fitting_gen_init):
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and fitting_gen_init:
+                self._emit_disagg_transfer_window_results(
+                    fitting_gen_init, fitting_gen_init, policy="not_applicable"
+                )
             return fitting_gen_init, False
 
         controller = self._admission_controller
+        if not (self._transfer_window_is_active() and fitting_gen_init):
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and fitting_gen_init:
+                if controller is None or not controller.enabled():
+                    policy = "disabled"
+                elif transfer_window_bypass_eligible(
+                    self._transceiver, self._dist, self._is_kv_manager_v2
+                ):
+                    policy = "bypassed"
+                else:
+                    policy = "inactive"
+                legacy_result = None
+                if policy == "bypassed":
+                    try:
+                        legacy_result = controller.select(
+                            self._registry.active_requests(), fitting_gen_init
+                        )
+                    except Exception:
+                        # Counterfactual diagnostics must never affect the
+                        # actual bypass decision.
+                        pass
+                self._emit_disagg_transfer_window_results(
+                    fitting_gen_init,
+                    fitting_gen_init,
+                    policy=policy,
+                    controller=controller,
+                    legacy_admitted_requests=(
+                        legacy_result.admitted_requests if legacy_result is not None else None
+                    ),
+                    legacy_active_transfer_blocks=(
+                        legacy_result.active_transfer_blocks if legacy_result is not None else None
+                    ),
+                    legacy_admitted_transfer_blocks=(
+                        legacy_result.admitted_transfer_blocks if legacy_result is not None else None
+                    ),
+                    legacy_limited_by_budget=(
+                        legacy_result.limited_by_budget if legacy_result is not None else None
+                    ),
+                )
+            return fitting_gen_init, False
+
         admission_result = controller.select(self._registry.active_requests(), fitting_gen_init)
         if admission_result.deferred_request_count > 0:
             logger.debug(
@@ -345,15 +406,89 @@ class DisaggTransferCoordinator:
                 f"budget={controller.max_transfer_blocks}"
             )
 
-        self.revert_deferred_gen_init(fitting_gen_init, admission_result.admitted_requests)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            self._emit_disagg_transfer_window_results(
+                fitting_gen_init,
+                admission_result.admitted_requests,
+                policy="enforced",
+                controller=controller,
+                active_transfer_blocks=admission_result.active_transfer_blocks,
+                admitted_transfer_blocks=admission_result.admitted_transfer_blocks,
+            )
+
+        self.revert_deferred_gen_init(
+            fitting_gen_init, admission_result.admitted_requests, reason="transfer_window"
+        )
 
         return (
             admission_result.admitted_requests,
             admission_result.is_blocked_by_active_transfers(),
         )
 
+    def _emit_disagg_transfer_window_results(
+        self,
+        candidates: List[LlmRequest],
+        admitted_requests: List[LlmRequest],
+        *,
+        policy: str,
+        controller: Optional[DisaggTransferAdmissionController] = None,
+        active_transfer_blocks: Optional[int] = None,
+        admitted_transfer_blocks: Optional[int] = None,
+        legacy_admitted_requests: Optional[List[LlmRequest]] = None,
+        legacy_active_transfer_blocks: Optional[int] = None,
+        legacy_admitted_transfer_blocks: Optional[int] = None,
+        legacy_limited_by_budget: Optional[bool] = None,
+    ) -> None:
+        """Emit per-request transfer-window decisions for offline analysis."""
+        if not disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            return
+        admitted_ids = {request.py_request_id for request in admitted_requests}
+        legacy_admitted_ids = (
+            {request.py_request_id for request in legacy_admitted_requests}
+            if legacy_admitted_requests is not None
+            else None
+        )
+        tokens_per_block = getattr(controller, "tokens_per_block", 0)
+        for request in candidates:
+            prompt_tokens = getattr(request, "total_input_len_cp", None)
+            if prompt_tokens is None:
+                prompt_tokens = request.prompt_len
+            request_blocks = (
+                (prompt_tokens + tokens_per_block - 1) // tokens_per_block
+                if tokens_per_block > 0
+                else None
+            )
+            disagg_diagnostics.emit_event(
+                "gen_transfer_window_result",
+                side="gen",
+                request_id=get_unique_rid(request),
+                local_request_id=request.py_request_id,
+                rank=self._dist.rank,
+                outcome="admitted" if request.py_request_id in admitted_ids else "deferred",
+                policy=policy,
+                prompt_tokens=prompt_tokens,
+                request_blocks=request_blocks,
+                active_transfer_blocks=active_transfer_blocks,
+                admitted_transfer_blocks=admitted_transfer_blocks,
+                transfer_block_budget=getattr(controller, "max_transfer_blocks", None),
+                legacy_budget_outcome=(
+                    "admitted" if request.py_request_id in legacy_admitted_ids else "deferred"
+                )
+                if legacy_admitted_ids is not None
+                else None,
+                legacy_active_transfer_blocks=legacy_active_transfer_blocks,
+                legacy_admitted_transfer_blocks=legacy_admitted_transfer_blocks,
+                legacy_limited_by_budget=legacy_limited_by_budget,
+                tp_rank=self._dist.tp_rank,
+                pp_rank=self._dist.pp_rank,
+                cp_rank=self._dist.cp_rank,
+            )
+
     def revert_deferred_gen_init(
-        self, candidates: List[LlmRequest], admitted: List[LlmRequest]
+        self,
+        candidates: List[LlmRequest],
+        admitted: List[LlmRequest],
+        reason: str = "pp_reconciliation",
     ) -> None:
         """Release KV allocated for candidates that were not admitted.
 
@@ -371,6 +506,19 @@ class DisaggTransferCoordinator:
         ]
         if deferred_requests:
             self._effects.revert_ctx_alloc(deferred_requests)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                for request in deferred_requests:
+                    disagg_diagnostics.emit_event(
+                        "gen_kv_rollback",
+                        side="gen",
+                        request_id=get_unique_rid(request),
+                        local_request_id=request.py_request_id,
+                        rank=self._dist.rank,
+                        reason=reason,
+                        tp_rank=self._dist.tp_rank,
+                        pp_rank=self._dist.pp_rank,
+                        cp_rank=self._dist.cp_rank,
+                    )
 
     @nvtx_range("align_gen_admission_across_cp")
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
@@ -568,7 +716,23 @@ class DisaggTransferCoordinator:
             return
         for req in requests:
             if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                req.py_kv_transfer_start_time = time.monotonic()
+                timeout_start = time.monotonic()
+                req.py_kv_transfer_start_time = timeout_start
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    disagg_diagnostics.emit_event(
+                        "transfer_timeout_started",
+                        side="gen",
+                        request_id=get_unique_rid(req),
+                        local_request_id=req.py_request_id,
+                        rank=self._dist.rank,
+                        timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                        timeout_owner="pyexecutor",
+                        timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
+                        state=req.state.name,
+                        tp_rank=self._dist.tp_rank,
+                        pp_rank=self._dist.pp_rank,
+                        cp_rank=self._dist.cp_rank,
+                    )
 
     def poll_progress_when_idle(self) -> None:
         """Reap completed context KV transfers so their blocks can be freed.
@@ -649,6 +813,21 @@ class DisaggTransferCoordinator:
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
                 self._transfers.start_transfer(req)
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    disagg_diagnostics.emit_event(
+                        "ctx_send_ready",
+                        side="ctx",
+                        request_id=get_unique_rid(req),
+                        local_request_id=req.py_request_id,
+                        rank=self._dist.rank,
+                        prompt_tokens=req.prompt_len,
+                        state=req.state.name,
+                        source_kv_request_owned=True,
+                        source_kv_reuse_pinned=self._transfers.should_store_blocks,
+                        tp_rank=self._dist.tp_rank,
+                        pp_rank=self._dist.pp_rank,
+                        cp_rank=self._dist.cp_rank,
+                    )
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
@@ -661,7 +840,23 @@ class DisaggTransferCoordinator:
                     self.release_transfer(req)
                     continue
                 if self._transceiver.kv_transfer_timeout_ms is not None:
-                    req.py_kv_transfer_start_time = time.monotonic()
+                    timeout_start = time.monotonic()
+                    req.py_kv_transfer_start_time = timeout_start
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        disagg_diagnostics.emit_event(
+                            "transfer_timeout_started",
+                            side="ctx",
+                            request_id=get_unique_rid(req),
+                            local_request_id=req.py_request_id,
+                            rank=self._dist.rank,
+                            timeout_ms=self._transceiver.kv_transfer_timeout_ms,
+                            timeout_owner="pyexecutor",
+                            timer_start_monotonic_ns=int(timeout_start * 1_000_000_000),
+                            state=req.state.name,
+                            tp_rank=self._dist.tp_rank,
+                            pp_rank=self._dist.pp_rank,
+                            cp_rank=self._dist.cp_rank,
+                        )
             elif (
                 self._transceiver.pipeline_transfer_enabled
                 and req.state != LlmRequestState.GENERATION_COMPLETE

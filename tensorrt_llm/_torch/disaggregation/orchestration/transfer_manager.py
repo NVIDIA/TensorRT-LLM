@@ -3,6 +3,8 @@
 
 from typing import Dict, Optional
 
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
+from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm.logger import logger
@@ -115,6 +117,23 @@ class AsyncTransferManager:
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
+            if (
+                disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+                and self.should_store_blocks
+                and request.is_context_only_request
+            ):
+                mapping = getattr(self.kv_cache_manager, "mapping", None)
+                disagg_diagnostics.emit_event(
+                    "ctx_source_unpinned",
+                    side="ctx",
+                    request_id=get_unique_rid(request),
+                    local_request_id=request.py_request_id,
+                    rank=getattr(mapping, "rank", None),
+                    source_kv_reuse_pinned=False,
+                    state=request.state.name,
+                    block_reuse_id=transfer_metadata.block_id,
+                )
 
             return True
 

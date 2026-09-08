@@ -585,6 +585,13 @@ def test_partial_publication_waits_for_queued_writer_success(
             )
 
     receiver._request_sender_data = request_sender_data
+    emit_event = Mock()
+    monkeypatch.setattr(
+        transfer_mod.disagg_diagnostics,
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        True,
+    )
+    monkeypatch.setattr(transfer_mod.disagg_diagnostics, "emit_event", emit_event)
     monkeypatch.setattr(
         transfer_mod.tensorrt_llm.bindings,
         "global_steady_clock_now",
@@ -604,6 +611,13 @@ def test_partial_publication_waits_for_queued_writer_success(
         session.receive(_sole_piece())
 
     assert queued_endpoints == ["tcp://sender-0"]
+    request_data_events = [
+        call for call in emit_event.call_args_list if call.args == ("gen_request_data_sent",)
+    ]
+    assert len(request_data_events) == 1
+    assert request_data_events[0].kwargs["request_id"] == rid
+    assert request_data_events[0].kwargs["peer_rank"] == 0
+    assert request_data_events[0].kwargs["ownership_enabled"] is True
     if not writer_settles_before_failure:
         assert not session.resources_drained()
 
