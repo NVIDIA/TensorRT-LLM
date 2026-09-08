@@ -24,10 +24,13 @@ reviews:
 
   auto_title_placeholder: "@coderabbitai title"
   auto_title_instructions: >-
-    Format: "[<category>] <title>". Category must be one of: fix, feat, doc,
+    Format: "[<ticket>][<category>] <title>", where "[<ticket>]" is optional
+    and included only when a ticket identifier (e.g. JIRA or NVBug ID) is
+    discoverable from the PR context. Category must be one of: fix, feat, doc,
     infra, style, refactor, perf, test, chore, revert. Enclose the category in
     square brackets. Keep the title concise (60 characters or fewer).
-    Example: "[feat] Add logit_bias support".
+    Example: "[feat] Add logit_bias support" or
+    "[TRTLLM-5516][perf] Optimize cuda graph padding".
 
   commit_status: false
   high_level_summary_instructions: |
@@ -52,7 +55,8 @@ reviews:
 
     For test-list-only changes, summarize the affected list files and entries
     directly. Do not require test-function changes or CBTS touchmap evidence.
-  walkthrough_instructions: |
+
+    ## Per-File QA Perspective
     For each changed file, include a concise QA perspective:
     - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
       the test covers and whether it is listed in tests/integration/test_lists/test-db/ (CI)
