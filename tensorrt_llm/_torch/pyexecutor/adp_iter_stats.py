@@ -95,6 +95,19 @@ class ADPIterStatsBuffer:
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
+        self.queue_payload(payload)
+        iter_id = payload.iter_stats_iter
+
+        if is_rank0:
+            self._rank0_iter_stats[iter_id] = stats
+            self._rank0_req_stats[iter_id] = req_stats
+            self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
+            self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
+            self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
+            self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
+
+    def queue_payload(self, payload: RankIterStatsPayload) -> None:
+        """Queue a compact payload without constructing full iteration stats."""
         iter_id = payload.iter_stats_iter
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
@@ -105,14 +118,6 @@ class ADPIterStatsBuffer:
         self._payloads[iter_id] = payload
         self._synthetic_iters.discard(iter_id)
         self._note_payload_insert(iter_id)
-
-        if is_rank0:
-            self._rank0_iter_stats[iter_id] = stats
-            self._rank0_req_stats[iter_id] = req_stats
-            self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
-            self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
-            self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
-            self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""

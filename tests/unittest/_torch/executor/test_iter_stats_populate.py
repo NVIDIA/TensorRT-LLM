@@ -817,6 +817,57 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
     return buffer
 
 
+def test_nonzero_attention_dp_rank_queues_compact_stats_without_full_update():
+    """Nonzero ADP ranks should only construct the allgather payload."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
+
+    scheduled_stats = ScheduledBatchStats(
+        num_ctx_requests=1,
+        num_ctx_tokens=100,
+        num_ctx_kv_tokens=10,
+        num_gen_requests=2,
+        num_gen_kv_tokens=20,
+        num_paused_requests=3,
+        num_paused_kv_tokens=30,
+    )
+    iter_stats = IterationStats()
+    iter_stats.iter = 9
+    batch_state = types.SimpleNamespace(
+        iter_start_time=0.0,
+        iter_stats=iter_stats,
+        gpu_forward_events_from_perf_pool=True,
+        gpu_forward_start_event="start",
+        gpu_forward_end_event="end",
+        scheduled_batch_stats=scheduled_stats,
+        scheduled_requests=_StubScheduledBatch(),
+    )
+    fake_self = types.SimpleNamespace(
+        enable_attention_dp=True,
+        dist=types.SimpleNamespace(rank=1),
+        perf_manager=MagicMock(),
+        _adp_iter_stats=MagicMock(),
+        _collect_scheduled_batch_stats=MagicMock(),
+        _update_iter_stats=MagicMock(),
+        _populate_req_stats=MagicMock(),
+    )
+
+    PyExecutor._process_iter_stats(fake_self, [], [], batch_state)
+
+    fake_self.perf_manager.release_forward_timing_events.assert_called_once_with("start", "end")
+    fake_self._collect_scheduled_batch_stats.assert_not_called()
+    fake_self._update_iter_stats.assert_not_called()
+    fake_self._populate_req_stats.assert_not_called()
+    payload = fake_self._adp_iter_stats.queue_payload.call_args.args[0]
+    assert payload.iter_stats_iter == 9
+    assert payload.num_context_requests == 1
+    assert payload.num_ctx_tokens == 100
+    assert payload.num_ctx_kv_tokens == 10
+    assert payload.num_gen_requests == 2
+    assert payload.num_gen_kv_tokens == 20
+    assert payload.num_paused_requests == 3
+    assert payload.num_paused_kv_tokens == 30
+
+
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     """Verify ADP fanout emits one rank-local row per rank with queue on rank 0."""
     # Rank 0 emits one stats row per ADP rank. Scheduled fields stay

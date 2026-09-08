@@ -358,6 +358,7 @@ class ScheduledBatchStats:
     num_gen_requests: Optional[int] = None
     num_gen_kv_tokens: Optional[int] = None
     num_paused_requests: Optional[int] = None
+    num_paused_kv_tokens: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -1971,12 +1972,17 @@ class PyExecutor:
                 pass
 
         num_paused_requests = 0
+        num_paused_kv_tokens = 0
         paused_requests = (scheduled_batch.paused_requests +
                            scheduled_batch.recompute_paused_requests)
         for req in paused_requests:
             if filter_dummies and self._is_stats_dummy_request(req):
                 continue
             num_paused_requests += 1
+            try:
+                num_paused_kv_tokens += req.get_num_tokens(0)
+            except RuntimeError:
+                pass
 
         return ScheduledBatchStats(
             num_ctx_requests=num_context_requests,
@@ -1985,6 +1991,7 @@ class PyExecutor:
             num_gen_requests=num_gen_requests,
             num_gen_kv_tokens=num_gen_kv_tokens,
             num_paused_requests=num_paused_requests,
+            num_paused_kv_tokens=num_paused_kv_tokens,
         )
 
     def _populate_req_stats(
@@ -2271,13 +2278,17 @@ class PyExecutor:
         # requests — were decoding but got evicted back to the waiting
         # pool for this iteration.
         num_paused_kv_tokens = 0
-        for req in paused_requests:
-            if self._is_stats_dummy_request(req):
-                continue
-            try:
-                num_paused_kv_tokens += req.get_num_tokens(0)
-            except RuntimeError:
-                pass
+        if scheduled_batch_stats.num_paused_kv_tokens is not None:
+            num_paused_kv_tokens = int(
+                scheduled_batch_stats.num_paused_kv_tokens)
+        else:
+            for req in paused_requests:
+                if self._is_stats_dummy_request(req):
+                    continue
+                try:
+                    num_paused_kv_tokens += req.get_num_tokens(0)
+                except RuntimeError:
+                    pass
 
         stats.inflight_batching_stats.num_ctx_kv_tokens = num_ctx_kv_tokens
         stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
@@ -2469,6 +2480,34 @@ class PyExecutor:
                 self.perf_manager.release_forward_timing_events(
                     batch_state.gpu_forward_start_event,
                     batch_state.gpu_forward_end_event)
+            return
+
+        if self.enable_attention_dp and self.dist.rank != 0:
+            if batch_state.gpu_forward_events_from_perf_pool:
+                self.perf_manager.release_forward_timing_events(
+                    batch_state.gpu_forward_start_event,
+                    batch_state.gpu_forward_end_event)
+            scheduled_stats = batch_state.scheduled_batch_stats
+            if scheduled_stats is None:
+                scheduled_stats = self._collect_scheduled_batch_stats(
+                    batch_state.scheduled_requests)
+            self._adp_iter_stats.queue_payload(
+                RankIterStatsPayload(
+                    has_iter_stats=1,
+                    iter_stats_iter=batch_state.iter_stats.iter,
+                    num_context_requests=int(scheduled_stats.num_ctx_requests
+                                             or 0),
+                    num_ctx_tokens=int(scheduled_stats.num_ctx_tokens or 0),
+                    num_ctx_kv_tokens=int(scheduled_stats.num_ctx_kv_tokens
+                                          or 0),
+                    num_gen_requests=int(scheduled_stats.num_gen_requests or 0),
+                    num_gen_kv_tokens=int(scheduled_stats.num_gen_kv_tokens
+                                          or 0),
+                    num_paused_requests=int(scheduled_stats.num_paused_requests
+                                            or 0),
+                    num_paused_kv_tokens=int(
+                        scheduled_stats.num_paused_kv_tokens or 0),
+                ))
             return
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
@@ -2784,6 +2823,8 @@ class PyExecutor:
                     gpu_forward_end = None
                     gpu_forward_events_from_perf_pool = False
                     if (self.enable_iter_perf_stats and
+                        (not self.enable_attention_dp or self.dist.rank == 0)
+                            and
                             self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
                         )
@@ -4505,7 +4546,8 @@ class PyExecutor:
                     # GPU and CPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if (self.enable_iter_perf_stats
+                    if (self.enable_iter_perf_stats and
+                        (not self.enable_attention_dp or self.dist.rank == 0)
                             and gpu_forward_start is None and
                             self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
@@ -5354,7 +5396,8 @@ class PyExecutor:
                     # GPU timing for perf metrics
                     gpu_forward_start, gpu_forward_end, gpu_sample_end = self.perf_manager.create_timing_events(
                     )
-                    if (self.enable_iter_perf_stats
+                    if (self.enable_iter_perf_stats and
+                        (not self.enable_attention_dp or self.dist.rank == 0)
                             and gpu_forward_start is None and
                             self._should_collect_rich_iter_stats(iter_stats)):
                         gpu_forward_start, gpu_forward_end = self.perf_manager.borrow_forward_timing_events(
