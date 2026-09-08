@@ -1302,6 +1302,10 @@ def test_prefill_warmup_idempotent_and_no_rejit():
     finally:
         dev.get_compiled = orig
     assert calls["n"] == 0, f"warmup missed keys: {calls['n']} live compiles"
+    # the capture-time readiness query agrees with the cache: warmed shape
+    # ready, an unwarmed k (4 is valid but never compiled) not ready
+    assert ss_host.prefill_ready(lg, out)
+    assert not ss_host.prefill_ready(lg[:1], torch.empty((1, 4), dtype=torch.int32, device=_DEV))
 
 
 def test_prefill_capture_no_host_sync():

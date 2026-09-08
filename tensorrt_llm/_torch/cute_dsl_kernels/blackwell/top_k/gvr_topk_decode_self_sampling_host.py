@@ -1619,6 +1619,23 @@ def run_prefill(
     return
 
 
+def prefill_ready(logits: torch.Tensor, indices: torch.Tensor) -> bool:
+    """True iff ``run_prefill(logits, ..., indices)`` would launch without
+    compiling — the same (tier, k, envelope bucket) keys it looks up, so a
+    caller can route around the engine under CUDA graph capture. Host-only."""
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return True
+    k = indices.shape[1]
+    npad = logits.stride(0)
+    n_bucket = _prefill_bucket(min(max(logits.shape[1], 1), max(npad, 1)))
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0)
+        if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
+            return False
+    return True
+
+
 __all__ = [
     "route",
     "route_static",
@@ -1629,6 +1646,7 @@ __all__ = [
     "run_ws",
     "run_varlen",
     "run_prefill",
+    "prefill_ready",
     "warmup_varlen",
     "warmup_prefill",
     "workspace_bytes",

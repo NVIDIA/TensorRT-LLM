@@ -158,18 +158,33 @@ class TopK(nn.Module):
                 # zero-work self-sampling launch. Deliberate, no warning.
                 pass
             elif self._selfsampling_prefill_ok(scores):
-                from ..cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_prefill
-
-                logger.info_once(
-                    "self-sampling GVR prefill top-K engaged "
-                    f"(K={self.top_k}, cr={self.compress_ratio}, hint-free).",
-                    key="selfsampling_topk_prefill_engaged",
+                from ..cute_dsl_kernels.blackwell.top_k import (
+                    selfsampling_topk_prefill_ready,
+                    selfsampling_topk_run_prefill,
                 )
-                # ks/ke are already in compressed column units; run_prefill
-                # writes the local (column - ks) frame with -1 pad and no host
-                # reads (envelope from scores.shape[1]).
-                selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
-                return output_indices
+
+                if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
+                    scores, output_indices
+                ):
+                    # the engine never JIT-compiles under capture; an engine
+                    # missed by warmup takes the exact radix path in the graph
+                    logger.warning_once(
+                        "self-sampling GVR prefill engine is not compiled for this "
+                        "shape and cannot JIT under CUDA graph capture; using the "
+                        "CUDA radix prefill Top-K.",
+                        key="selfsampling_topk_prefill_capture_radix",
+                    )
+                else:
+                    logger.info_once(
+                        "self-sampling GVR prefill top-K engaged "
+                        f"(K={self.top_k}, cr={self.compress_ratio}, hint-free).",
+                        key="selfsampling_topk_prefill_engaged",
+                    )
+                    # ks/ke are already in compressed column units; run_prefill
+                    # writes the local (column - ks) frame with -1 pad and no
+                    # host reads (envelope from scores.shape[1]).
+                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
                 # an odd DeepGEMM width, or a bf16 producer): exact radix.
@@ -216,6 +231,10 @@ class TopK(nn.Module):
             and scores.stride(0) % 4 == 0
             and scores.data_ptr() % 16 == 0
         )
+
+    @staticmethod
+    def _prefill_capturing(scores: torch.Tensor) -> bool:
+        return scores.is_cuda and torch.cuda.is_current_stream_capturing()
 
     def _forward_decode(
         self,

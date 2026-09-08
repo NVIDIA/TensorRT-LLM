@@ -38,6 +38,8 @@ else:
 
 from utils.util import skip_pre_blackwell  # noqa: E402
 
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation  # noqa: E402
+
 FP4_MQA_NUM_HEADS = [
     pytest.param(
         32,
@@ -76,6 +78,40 @@ def _dense_context_bounds(seq_len: int, seq_len_kv: int, device):
     cu_ks = torch.zeros(seq_len, dtype=torch.int32, device=device)
     cu_ke = torch.arange(1, seq_len + 1, dtype=torch.int32, device=device) + (seq_len_kv - seq_len)
     return cu_ks, cu_ke.to(torch.int32)
+
+
+@pytest.mark.skipif(not HAS_DEEP_GEMM, reason="fp8_fp4_mqa_logits not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len_kv", [1027, 4099])
+def test_fp4_mqa_logits_pass_selfsampling_prefill_format_gate(seq_len_kv):
+    """DeepSeek-V4 prefill (cr=4) hands these logits to the self-sampling GVR
+    prefill engine, whose format gate needs a float4-aligned row stride on
+    odd compressed widths; an exact-width producer would silently fall back
+    to radix."""
+    torch.manual_seed(0)
+    num_heads, head_dim, seq_len = 64, 128, 64
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    cu_ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    cu_ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
+    q_fp4, q_scale_full = _fp4_quantize_sf_transpose(q)
+    k_fp4, k_scale_full = _fp4_quantize_sf_transpose(k)
+
+    logits = deep_gemm.fp8_fp4_mqa_logits(
+        (q_fp4, q_scale_full.view(seq_len, num_heads)),
+        (k_fp4, k_scale_full.reshape(-1)),
+        weights,
+        cu_ks,
+        cu_ke,
+        False,  # clean_logits
+        0,  # max_seqlen_k
+        torch.float32,  # logits_dtype
+    )
+
+    assert logits.shape == (seq_len, seq_len_kv)
+    top_k = TopK(512, prefill_implementation=TopKImplementation.CUTE_DSL_GVR, compress_ratio=4)
+    assert top_k._selfsampling_prefill_ok(logits), (logits.dtype, tuple(logits.stride()))
 
 
 @pytest.mark.skipif(not HAS_DEEP_GEMM, reason="fp8_fp4_mqa_logits not available")

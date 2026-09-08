@@ -465,6 +465,7 @@ def _install_fake_prefill_runner(monkeypatch) -> Mock:
         SimpleNamespace(
             selfsampling_topk_run_varlen=Mock(),
             selfsampling_topk_run_prefill=prefill,
+            selfsampling_topk_prefill_ready=Mock(return_value=True),
         ),
     )
     return prefill
@@ -571,3 +572,32 @@ def test_gvr_v2_prefill_rejects_output_width_mismatch(monkeypatch) -> None:
     with pytest.raises(AssertionError):
         _prefill_call(top_k, scores, out_width=3)
     runner.assert_not_called()
+
+
+def test_gvr_v2_prefill_capture_uncompiled_uses_radix(monkeypatch) -> None:
+    """Under CUDA graph capture an engine missed by warmup must not JIT; the
+    exact radix path is captured instead."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k"]
+    fake.selfsampling_topk_prefill_ready = Mock(return_value=False)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    scores = torch.randn(3, 8)
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores)
+
+    runner.assert_not_called()
+    fake.selfsampling_topk_prefill_ready.assert_called_once_with(scores, output)
+    radix.assert_called_once_with(scores, row_starts, row_ends, output, 2)
+
+
+def test_gvr_v2_prefill_capture_compiled_uses_engine(monkeypatch) -> None:
+    runner = _install_fake_prefill_runner(monkeypatch)
+    monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+
+    _prefill_call(top_k, torch.randn(3, 8))
+
+    runner.assert_called_once()

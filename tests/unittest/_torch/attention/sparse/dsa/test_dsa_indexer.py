@@ -1534,6 +1534,31 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     )  # double check for per-element similarity
 
 
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+@pytest.mark.parametrize("seq_len_kv", [1027, 4099])
+def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
+    """The self-sampling GVR prefill engine engages only while DeepGEMM keeps
+    a float4-aligned row stride on odd-width logits; an exact-width producer
+    would silently route every such tile back to radix."""
+    torch.manual_seed(0)
+    num_heads, head_dim, seq_len = 64, 128, 64
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
+    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+
+    logits = deep_gemm.fp8_mqa_logits(
+        q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
+    )
+
+    assert logits.shape == (seq_len, seq_len_kv)
+    top_k = TopK(512, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    assert top_k._selfsampling_prefill_ok(logits), (logits.dtype, tuple(logits.stride()))
+
+
 def _create_mock_metadata(
     request_ids,
     batch_size,

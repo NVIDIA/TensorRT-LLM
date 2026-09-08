@@ -20,6 +20,7 @@ from .gvr_topk_decode import GvrParams, GvrTopKKernel
 from .gvr_topk_decode_direct import DirectTopKKernel
 from .gvr_topk_decode_dispatch import is_tiered_topk_supported, tiered_topk
 from .gvr_topk_decode_reg import GvrRegKernel
+from .gvr_topk_decode_self_sampling_host import prefill_ready as selfsampling_topk_prefill_ready
 from .gvr_topk_decode_self_sampling_host import run_prefill as selfsampling_topk_run_prefill
 from .gvr_topk_decode_self_sampling_host import run_varlen as selfsampling_topk_run_varlen
 from .gvr_topk_decode_tp import GvrTpKernel
@@ -38,4 +39,5 @@ __all__ = [
     "is_tiered_topk_supported",
     "selfsampling_topk_run_varlen",
     "selfsampling_topk_run_prefill",
+    "selfsampling_topk_prefill_ready",
 ]
