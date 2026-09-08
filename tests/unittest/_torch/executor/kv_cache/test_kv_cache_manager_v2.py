@@ -1449,6 +1449,7 @@ def _make_guard_manager(
     manager._stream = SimpleNamespace(cuda_stream=None)
     manager.kv_cache_map = {}
     manager.index_mapper = Mock()
+    manager.impl = Mock()
 
     def create_kv_cache(request_id: int, *args: object, **kwargs: object) -> object | None:
         del args, kwargs
@@ -1510,3 +1511,10 @@ def test_reserve_guard_page_failure_releases_the_reservation(
         manager.index_mapper.remove_sequence.assert_called_once_with(
             kv_cache_v2_module._GUARD_PAGE_REQUEST_ID
         )
+        # The dummy create marked the id stats-excluded; the bail-out must undo
+        # it, matching what free_resources does on the normal teardown.
+        manager.impl.clear_stats_excluded.assert_called_once_with(
+            kv_cache_v2_module._GUARD_PAGE_REQUEST_ID
+        )
+
+

@@ -1510,27 +1510,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _reserve_guard_page(self) -> None:
         """Diagnostic: park masked-out page-table entries on a page nobody owns.
 
-        The attention backends have to keep every entry of a row's page list in
-        range, including the entries a sliding window has already evicted --
-        FlashInfer dereferences a page id before it applies ``window_left``.
-        Those entries are rewritten to page 0, which is a live page owned by
-        whichever request happens to hold it, so the kernel reads another
-        sequence's keys and values and relies entirely on the mask to throw the
-        result away.
+        Attention backends keep every entry of a row's page list in range, even
+        entries a sliding window has evicted (FlashInfer dereferences a page id
+        before applying ``window_left``). Those entries default to page 0, a
+        live page some request owns, so the kernel reads a stranger's keys and
+        values and trusts the mask to discard them. This reserves one page no
+        request can be given, fills it with a recognisable pattern, and
+        publishes its per-layer index so the backends park there instead: a
+        masking bug then reads a detectable signature rather than silent garbage.
 
-        When hunting reads of KV pages a request does not own, that is exactly
-        the signal one wants to remove: this reserves one page that no request
-        can ever be given, fills it with a recognisable pattern, and publishes
-        its per-layer index so the backends park there instead. The mask still
-        decides the result; what changes is that a masking bug turns silent
-        garbage from a stranger's page into a detectable signature.
-
-        ``TRTLLM_KV_GUARD_PAGE=1`` (or ``zero``) fills the page with zeros;
-        ``nan`` fills it with NaN, which turns any read the mask does not cover
-        into an immediate, visible failure instead of a plausible number; a
-        number fills it with that number. Unset -- the default -- reserves
-        nothing and leaves every code path as it was. When on it costs one page
-        and one index slot.
+        ``TRTLLM_KV_GUARD_PAGE=1``/``zero`` fills zeros, ``nan`` fills NaN (any
+        uncovered read fails visibly), a number fills that number. Unset -- the
+        default -- reserves nothing. When on it costs one page and one index
+        slot.
         """
         setting = self._guard_page_fill
         value = self._guard_page_value
@@ -1547,6 +1539,9 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
             kv_cache.close()
             self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Never committed, so the reuse tree can never hand this page to a
@@ -1557,8 +1552,12 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
             kv_cache.close()
             self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
+        unfillable_dtype = False
         for layer_idx in self.pp_layers:
             buffer = self.get_buffers(layer_idx)
             if buffer is None:
@@ -1567,14 +1566,28 @@ class KVCacheManagerV2(BaseResourceManager):
             page = next((int(p) for p in pages if p != BAD_PAGE_INDEX), None)
             if page is None or not 0 <= page < buffer.shape[0]:
                 continue
-            self._guard_page_by_layer[layer_idx] = page
-            _fill_kv_pages(buffer, [page], value)
+            # Record the page only when the sentinel actually landed: a dtype
+            # with no index_fill_ kernel (e.g. FP8) would leave the page holding
+            # whatever it held before, so publishing it as a guard would be a
+            # false claim.
+            if _fill_kv_pages(buffer, [page], value):
+                self._guard_page_by_layer[layer_idx] = page
+            else:
+                unfillable_dtype = True
         torch.cuda.synchronize()
         if not self._guard_page_by_layer:
-            logger.warning("KVCacheManagerV2: guard page reserved but no layer resolved it")
+            reason = (
+                "no index_fill_ kernel for the KV dtype (e.g. FP8)"
+                if unfillable_dtype
+                else "no layer resolved it"
+            )
+            logger.warning(f"KVCacheManagerV2: guard page reserved but {reason}")
             self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
             kv_cache.close()
             self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            # The dummy create marked this id stats-excluded; free_resources
+            # clears that on the normal teardown, so the bail-outs must too.
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Warning, not info: this is the only proof a run has that the switch
@@ -2708,7 +2721,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 for layer_id in typed_range(LayerId(self.num_local_layers))
             ]
         )
-        return max_num_pages // self.kv_factor - len(reserved)
+        # Subtract the pages the reserved sequences hold, not the count of
+        # sequences: the two only coincide while every reservation is a single
+        # page (the guard is today). Summing ``num_blocks`` keeps this a page
+        # count if a reservation ever spans more than one.
+        reserved_pages = sum(int(self.kv_cache_map[req_id].num_blocks) for req_id in reserved)
+        return max_num_pages // self.kv_factor - reserved_pages
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):
@@ -4278,6 +4296,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._request_stats_enabled_ids.clear()
+        self._fresh_pages_filled.clear()
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
