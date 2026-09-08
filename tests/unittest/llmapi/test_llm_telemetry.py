@@ -19,22 +19,19 @@ hook fires, and that telemetry_disabled flows through correctly.
 """
 
 import os
-import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm.llmapi import KvCacheConfig, llm_args
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.usage import usage_lib
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from utils.llm_data import llm_models_root  # noqa: E402
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 

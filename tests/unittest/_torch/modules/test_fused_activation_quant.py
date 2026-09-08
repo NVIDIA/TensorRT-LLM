@@ -17,8 +17,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
-from tests.unittest.utils.util import getSMVersion
+from utils.util import getSMVersion
 
 
 def fused_relu2_quantize_available():

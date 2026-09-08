@@ -20,11 +20,11 @@ from ....functional import PositionEmbeddingType
 from ....logger import logger
 from ....mapping import Mapping
 from ....models.modeling_utils import QuantConfig
-from ...attention_backend import TrtllmAttention, TrtllmAttentionMetadata
-from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ...attention.backends import TrtllmAttention, TrtllmAttentionMetadata
+from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ...attention.mla import MLA
 from ...model_config import ModelConfig
 from ..linear import Linear, TensorParallelMode
-from ..mla import MLA
 
 _KIMI_K3_MLA_GEN_BACKEND_ENV = "TLLM_K3_MLA_GEN_BACKEND"
 _KIMI_K3_MLA_GEN_BACKENDS = ("cute-dsl", "trtllm-gen")
@@ -291,10 +291,9 @@ class KimiK3MLAAttention(MLA):
             rms_norm_eps=rms_norm_eps,
             flashinfer_mla_backend=_select_mla_generation_backend(model_config.get_quant_config()),
         )
-        # Run MLA eagerly instead of through the registered custom op: K3's
-        # accuracy is validated against the eager path. The output gate is a
-        # base hook (_apply_output_gate) and works on either branch.
-        self.register_to_config = False
+        # Keep the base MLA registration enabled so breakable CUDA graphs use
+        # the shared custom op. The output gate is a base hook and runs on both
+        # the registered and eager paths before the row-parallel o_proj.
 
         self.use_output_gate = use_output_gate
 

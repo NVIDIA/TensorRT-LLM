@@ -1029,6 +1029,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
+    # When True, use tunable_fp8_per_token_quant (AutoTuner selects TRT-LLM vs
+    # vectorized kernel). Visual gen pipelines set this to True before model
+    # construction; LLM paths leave it False.
+    use_tunable_quantize: bool = False
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -1053,6 +1058,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
+        # fp8_rowwise_gemm requires a 2D mat1; flatten here and unflatten the output below.
+        orig_shape = input.shape
+        if input.dim() > 2:
+            input = input.reshape(-1, input.shape[-1])
+
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -1061,8 +1072,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                                          dtype=torch.float32)
         else:
             # Use dynamic per-token quantization for activation
-            qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
-                input)
+            if FP8RowwiseLinearMethod.use_tunable_quantize:
+                qinput, cur_input_scale = torch.ops.trtllm.tunable_fp8_per_token_quant(
+                    input)
+            else:
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                    input)
 
         # This op does not support bias now.
         output_buffer_kind = (
@@ -1086,6 +1101,8 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         )
         if bias is not None:
             output = output + bias
+        if len(orig_shape) > 2:
+            output = output.reshape(*orig_shape[:-1], output.shape[-1])
         return output
 
     def _get_scale_name(self, weights: List[Dict]):
@@ -1211,13 +1228,29 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
+        sm_version = get_sm_version()
         if is_sm_100f():
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
+                if sm_version in (100, 103):
+                    output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
+                else:
+                    # cute_dsl_fp8_gemm_blackwell runs only on sm100/103. On
+                    # other sm_100f GPUs (e.g. sm107) keep honoring the DeepGEMM
+                    # opt-out with the trtllm-gen kernel, which consumes the
+                    # same raw fp32 scales.
+                    if module.use_cute_dsl_blockscaling_mm:
+                        logger.warning_once(
+                            "use_cute_dsl_blockscaling_mm: no CuTe DSL FP8 "
+                            f"block-scale GEMM on SM{sm_version}; using the "
+                            "trtllm-gen kernel instead.",
+                            key="cute_dsl_fp8_blockscale_unsupported_sm")
+                    output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                        act_input_fp8, module.weight, act_input_sf,
+                        module.weight_scale)
             else:
                 output = torch.ops.trtllm.fp8_swap_ab_gemm(
                     input,
@@ -1225,7 +1258,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     module.weight_scale,
                     disable_ue8m0_cast=True,
                 )
-        elif get_sm_version() == 120:
+        elif sm_version == 120:
             act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)

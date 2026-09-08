@@ -9,7 +9,6 @@ from tensorrt_llm._utils import mpi_comm
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
-from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
@@ -48,7 +47,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -60,7 +58,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
     ) -> None:
         super().__init__(
             engine=engine,
-            executor_config=executor_config,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -113,7 +110,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         engine: Path,
         rpc_addr: str,
         *,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -130,7 +126,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         # Step 1: Create the worker instance
         worker = RpcWorker(
             engine=engine,
-            executor_config=executor_config,
             is_llm_executor=is_llm_executor,
             llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,

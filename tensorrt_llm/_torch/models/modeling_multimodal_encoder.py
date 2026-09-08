@@ -21,7 +21,7 @@ from typing import Optional, Type
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
-from ..attention_backend.interface import AttentionMetadata
+from ..attention.backends.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
 
 # Legacy fallback for encoders that do not yet opt into atomic-item scheduling

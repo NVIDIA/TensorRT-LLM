@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import dataclasses
 import math
 import re
 from functools import lru_cache
@@ -37,14 +38,14 @@ from ...inputs import (
 )
 from ...inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from ...logger import logger
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.utils import get_attention_backend
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends.utils import get_attention_backend
+from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
-from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -527,8 +528,12 @@ class Qwen3VLVisionAttention(Qwen2_5_VLVisionAttention):
         model_config.pretrained_config.vision_config.torch_dtype = (
             model_config.pretrained_config.text_config.dtype
         )
+        # Sparse-attention configurations describe the language decoder. A
+        # composite VLM shares ModelConfig with its vision tower, so clear the
+        # language-only setting before generic Attention selects its hooks.
+        vision_model_config = dataclasses.replace(model_config, sparse_attention_config=None)
         super().__init__(
-            model_config,
+            vision_model_config,
             layer_idx=layer_idx,
             reduce_output=(
                 not model_config.mapping.enable_attention_dp and model_config.mapping.tp_size > 1
@@ -1328,6 +1333,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
+            "Qwen4ExpForConditionalGeneration": "Qwen4ExpForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
@@ -1511,7 +1517,15 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
                 "Raw multimodal inputs require a local multimodal encoder on this "
                 "worker, or multimodal_embedding handles from an encoder handoff."
             )
-        if not has_raw_image_or_video_data and not getattr(self, "support_mm_disagg", False):
+        # Aggregate encoder prefetch and caching can replace the raw payload
+        # with a local embedding before the language-model forward. A missing
+        # local encoder, rather than an embedding-only payload, identifies an
+        # encoder-handoff request.
+        if (
+            not has_raw_image_or_video_data
+            and self.mm_encoder is None
+            and not getattr(self, "support_mm_disagg", False)
+        ):
             raise NotImplementedError(
                 f"{type(self)} does not support disaggregated inference yet. Please unset "
                 "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."

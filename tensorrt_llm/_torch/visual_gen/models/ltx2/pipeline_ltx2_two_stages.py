@@ -17,7 +17,11 @@ from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
+from tensorrt_llm._torch.visual_gen.quantization.ops import (
+    quantize_fp8_blockwise,
+    quantize_fp8_rowwise,
+    quantize_nvfp4,
+)
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
@@ -414,13 +418,18 @@ def _dequantize_fp8_weight(
 ) -> torch.Tensor:
     """Dequantize FP8 E4M3 weight back to BF16.
 
-    Handles per-tensor scales (scalar), standard float32 block-scale grids,
-    and the packed int32 layout.
+    Handles per-tensor scales (scalar), per-output-row (rowwise) float32
+    scales, standard float32 block-scale grids, and the packed int32
+    layout.
     """
     bf16 = fp8_weight.to(torch.bfloat16)
 
     if weight_scale.numel() == 1:
         return bf16 * weight_scale.float().item()
+
+    if weight_scale.dim() == 1:
+        # Rowwise (per-output-channel) scale: one value per output row.
+        return bf16 * weight_scale.float().to(bf16.device).unsqueeze(1)
 
     out_features, in_features = fp8_weight.shape
 
@@ -444,11 +453,14 @@ def _requantize_fp8_weight(
     repack: bool = False,
     block_size: int = 128,
     per_tensor: bool = False,
+    rowwise: bool = False,
 ) -> tuple:
     """Quantize BF16 weight to FP8 E4M3.
 
     When *per_tensor* is True, a single scalar scale is computed from the
-    tensor-wide absmax.  Otherwise 128x128 block scales are used.
+    tensor-wide absmax. When *rowwise* is True, one scale per output row
+    (per-output-channel) is computed. Otherwise 128x128 block scales are
+    used.
 
     When *repack* is True (block-scale only) the returned weight/scale pair
     is post-processed through ``resmooth_to_fp8_e8m0`` +
@@ -463,6 +475,9 @@ def _requantize_fp8_weight(
         scale = amax / fp8_max
         qw = (bf16_weight.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
         return qw, scale.to(bf16_weight.device)
+
+    if rowwise:
+        return quantize_fp8_rowwise(bf16_weight)
 
     qw, scale = quantize_fp8_blockwise(bf16_weight, block_size)
 
@@ -560,6 +575,7 @@ def _apply_lora_deltas(
                     is_packed = not is_per_tensor and _is_fp8_scale_packed(
                         ws_param.data, out_f, in_f
                     )
+                    is_rowwise = not is_per_tensor and not is_packed and ws_param.data.dim() == 1
 
                     saved_state[param_name] = param.data.clone()
                     saved_state[scale_key] = ws_param.data.clone()
@@ -575,6 +591,7 @@ def _apply_lora_deltas(
                         bf16,
                         repack=is_packed,
                         per_tensor=is_per_tensor,
+                        rowwise=is_rowwise,
                     )
                     new_scale = _scale_like(new_scale, ws_param.data)
                     param.data.copy_(qw)
@@ -825,6 +842,7 @@ class _PersistentLoRAWeightCache:
                     is_packed = not is_per_tensor and _is_fp8_scale_packed(
                         ws_param.data, out_f, in_f
                     )
+                    is_rowwise = not is_per_tensor and not is_packed and ws_param.data.dim() == 1
 
                     bf16 = _dequantize_fp8_weight(
                         param.data,
@@ -836,6 +854,7 @@ class _PersistentLoRAWeightCache:
                         bf16,
                         repack=is_packed,
                         per_tensor=is_per_tensor,
+                        rowwise=is_rowwise,
                     )
                     new_scale = _scale_like(new_scale, ws_param.data)
 

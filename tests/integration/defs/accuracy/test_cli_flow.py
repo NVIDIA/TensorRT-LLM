@@ -14,7 +14,7 @@
 # limitations under the License.
 import pytest
 
-from tensorrt_llm.llmapi import EagleDecodingConfig, MedusaDecodingConfig
+from tensorrt_llm.llmapi import EagleDecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
@@ -146,32 +146,8 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "lmsys/vicuna-7b-v1.3"
     MODEL_PATH = f"{llm_models_root()}/vicuna-7b-v1.3"
     EXAMPLE_FOLDER = "models/core/llama"
-    MEDUSA_MODEL_NAME = "FasterDecoding/medusa-vicuna-7b-v1.3"
-    MEDUSA_MODEL_PATH = f"{llm_models_root()}/medusa-vicuna-7b-v1.3"
     EAGLE_MODEL_NAME = "yuhuili/EAGLE-Vicuna-7B-v1.3"
     EAGLE_MODEL_PATH = f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3"
-
-    @skip_post_blackwell
-    @parametrize_with_ids("cuda_graph", [False, True])
-    def test_medusa(self, cuda_graph, mocker):
-        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
-
-        extra_summarize_args = [
-            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 0, 0, 0], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [0, 0, 0, 1], [1, 6], [0, 7, 0]]"
-        ]
-        if cuda_graph:
-            extra_summarize_args.append("--cuda_graph_mode")
-
-        self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.
-                 model_fields["decoding_type"].default,
-                 extra_convert_args=[
-                     f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
-                     "--num_medusa_heads=4"
-                 ],
-                 extra_build_args=["--speculative_decoding_mode=medusa"],
-                 extra_summarize_args=extra_summarize_args)
 
     @skip_post_blackwell
     @parametrize_with_ids("cuda_graph,chunked_context,typical_acceptance",
@@ -302,24 +278,6 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
-
-    @skip_pre_hopper
-    @skip_post_blackwell
-    def test_medusa_fp8_prequantized(self, mocker):
-        # nvidia/Llama-3.1-8B-Medusa-FP8
-        mocker.patch.object(self.__class__, "MODEL_PATH",
-                            f"{llm_models_root()}/llama3.1-medusa-8b-hf_v0.1")
-        mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
-        mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
-
-        extra_summarize_args = [
-            "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
-        ]
-        self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.
-                 model_fields["decoding_type"].default,
-                 extra_build_args=["--speculative_decoding_mode=medusa"],
-                 extra_summarize_args=extra_summarize_args)
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):
