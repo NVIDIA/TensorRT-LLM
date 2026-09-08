@@ -60,6 +60,12 @@ using TileScheduler = tk::TileScheduler;
 
 using trtllm::gen::ceilDiv;
 
+// Keep the trtllm-gen helper name available when AttentionMaskType is aliased to TRT-LLM's enum.
+inline bool isAnySlidingWindowMask(AttentionMaskType maskType)
+{
+    return tk::usesSlidingWindowMask(maskType);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Check macros: streaming-style (matching trtllm-gen calling convention).
 ////////////////////////////////////////////////////////////////////////////////////////////////////

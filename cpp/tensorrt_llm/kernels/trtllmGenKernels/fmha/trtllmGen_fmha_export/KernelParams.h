@@ -327,6 +327,10 @@ template <class FmhaOptions> static auto makeStrideKv(FmhaOptions const& options
   int32_t const headSizeBytesK = headDimQk * tg::dtypeGetNumBits(options.mDtypeK) / 8;
   int32_t const headSizeBytesV = headDimV * tg::dtypeGetNumBits(options.mDtypeV) / 8;
   int32_t const maxHeadSizeBytesKv = std::max(headSizeBytesK, headSizeBytesV);
+  // The standalone runner stores K and V in one synthetic pool with equal byte-width slots. Thus
+  // an H128 E2m1 V row is padded to 256 logical FP4 elements when paired with H128 E4m3 K. Runtime
+  // integrations with separate K/V tensors build descriptors from each tensor's actual strides, so
+  // their V cache remains compact while K and V share only the logical page indices.
   // The padded head size expressed as element count in dtypeK and dtypeV.
   int32_t const paddedHeadDimK = maxHeadSizeBytesKv * 8 / tg::dtypeGetNumBits(options.mDtypeK);
   int32_t const paddedHeadDimV = maxHeadSizeBytesKv * 8 / tg::dtypeGetNumBits(options.mDtypeV);
@@ -436,7 +440,8 @@ static auto makeTmaShapeStrideKv(FmhaOptions const& options,
   auto headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
   // The column index and strides needs to divide by 2.
-  auto const colIdxDivisor = options.mDtypeKv == tg::Dtype::E2m1 ? 2 : 1;
+  auto const dtypeKv = isK ? options.mDtypeK : options.mDtypeV;
+  auto const colIdxDivisor = dtypeKv == tg::Dtype::E2m1 ? 2 : 1;
   // When mStoreTransformedKvInTmem is true, the dimensions reflect FP4 element dimensions, thus
   // no need to divide.
   auto shape = std::vector<uint64_t>{
@@ -463,7 +468,8 @@ template <class FmhaOptions> static bool canUseTmaKvReshape(FmhaOptions const& o
   // For K the headDim may include extra RoPE coefficients.
   int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
-  int32_t const colIdxDivisor = options.mDtypeKv == tg::Dtype::E2m1 ? 2 : 1;
+  auto const dtypeKv = isK ? options.mDtypeK : options.mDtypeV;
+  int32_t const colIdxDivisor = dtypeKv == tg::Dtype::E2m1 ? 2 : 1;
   int32_t const physicalHeadDim = headDim / colIdxDivisor;
   return strideKeys / colIdxDivisor == physicalHeadDim;
 }
@@ -506,6 +512,31 @@ static auto makeTmaShapeStrideKvSf(FmhaOptions const& options,
   return std::make_tuple(shape, stride);
 }
 
+// Build the TMA descriptor for K or V block scaling factors.
+template <class FmhaOptions, class KernelTraits_>
+static CUtensorMap buildTmaDescriptorKvSf(FmhaOptions const& options,
+                                          KernelTraits_ const& kernelTraits,
+                                          KernelParams const& params,
+                                          bool isK,
+                                          void const* sfBasePtr) {
+  auto [shapeSf, strideSf] =
+    makeTmaShapeStrideKvSf(options, kernelTraits, params, isK, kernelTraits.mReshapeFactorKvSf);
+
+  // The tile shape has one SF per NumEltsPerSf K/V elements in the head dimension.
+  std::vector<uint32_t> tileShapeSf(shapeSf.size(), 1);
+  int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+  tileShapeSf[0] = headDim / kernelTraits.mNumEltsPerSf * kernelTraits.mReshapeFactorKvSf;
+  // The token dimension is reduced by the same reshape factor used by the descriptor shape.
+  tileShapeSf[1] = kernelTraits.mNumKeysPerTile / kernelTraits.mReshapeFactorKvSf;
+
+  return buildNdTmaDescriptor(tg::Dtype::E4m3,
+                              shapeSf,
+                              strideSf,
+                              tileShapeSf,
+                              const_cast<void*>(sfBasePtr),
+                              /*swizzled=*/false);
+}
+
 // Update the kernel parameters.
 template <class FmhaOptions_>
 static KernelParams updateKernelParams(FmhaOptions_ const& options,
@@ -541,6 +572,8 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrCustomMaskOffsets,
                          params.ptrFirstSparseMaskOffsetsKv,
                          params.ptrSparseMlaTopKLens,
+                         params.ptrVariableWindowTokenStarts,
+                         params.ptrVariableWindowTokenEnds,
                          params.ptrSageAttnSfsQ,
                          params.ptrSageAttnSfsK,
                          params.ptrSageAttnSfsP,
@@ -595,6 +628,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int64_t const* customMaskOffsetsPtrD,
                                     int32_t const* firstSparseMaskOffsetsKvPtrD,
                                     int32_t const* sparseMlaTopKLensPtrD,
+                                    int32_t const* variableWindowTokenStartsD,
+                                    int32_t const* variableWindowTokenEndsD,
                                     float const* ptrSageAttnSfsQ,
                                     float const* ptrSageAttnSfsK,
                                     float const* ptrSageAttnSfsP,
@@ -623,7 +658,7 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     bool usesSharedPagedKvIdx) {
 
   // Create the return struct.
-  KernelParams params;
+  KernelParams params{};
 
   params.logicalGridDimX = logicalGridDimX;
   params.logicalGridDimY = logicalGridDimY;
@@ -649,8 +684,6 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
   // Whether store transformed K/V in TMEM.
   bool const storeTransformedKvInTmem{kernelTraits.mStoreTransformedKvInTmem};
   // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
-  auto const numEltsDivisor =
-    options.mDtypeKv == tg::Dtype::E2m1 && !storeTransformedKvInTmem ? 2 : 1;
   // Use the compile-time factor as an upper bound. Descriptor setup lowers the launch-time factor
   // when the input strides do not make consecutive token rows contiguous for a widened TMA box.
   int32_t reshapeFactorKv{kernelTraits.mReshapeFactorKv};
@@ -668,19 +701,22 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                                 reshapeFactorKv);
 
   // The tileShapes for K/V.
-  std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
-  tileShapeKv[0] = kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisor * reshapeFactorKv;
-  tileShapeKv[1] = kernelTraits.mNumKeysPerTile / reshapeFactorKv;
-  // K and V might use different tileShapes.
-  std::vector<uint32_t> tileShapeK(tileShapeKv);
-  std::vector<uint32_t> tileShapeV(tileShapeKv);
-  if (!storeTransformedKvInTmem && !kernelTraits.mSeparateLoadKvTask &&
+  std::vector<uint32_t> tileShapeK(shapeK.size(), 1);
+  std::vector<uint32_t> tileShapeV(shapeK.size(), 1);
+  int32_t const numEltsDivisorK =
+    options.mDtypeK == tg::Dtype::E2m1 && !storeTransformedKvInTmem ? 2 : 1;
+  int32_t const numEltsDivisorV =
+    options.mDtypeV == tg::Dtype::E2m1 && !storeTransformedKvInTmem ? 2 : 1;
+  tileShapeK[0] = kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisorK * reshapeFactorKv;
+  tileShapeV[0] = kernelTraits.mNumEltsInClampedHeadDimKv / numEltsDivisorV * reshapeFactorKv;
+  tileShapeK[1] = tileShapeV[1] = kernelTraits.mNumKeysPerTile / reshapeFactorKv;
+  if (!storeTransformedKvInTmem && !kernelTraits.mSeparateSmemKv &&
       options.mDtypeK != options.mDtypeV) {
     // tileShapeKv is in dtypeK elements. When dtypeV != dtypeK, we need to express tileShapeV in
     // terms of dtypeV elements so the V TMA descriptor transfers the same number of bytes as K to
     // match barrier expectations.
     tileShapeV[0] =
-      tileShapeV[0] * tg::dtypeGetNumBits(options.mDtypeK) / tg::dtypeGetNumBits(options.mDtypeV);
+      tileShapeK[0] * tg::dtypeGetNumBits(options.mDtypeK) / tg::dtypeGetNumBits(options.mDtypeV);
   }
   // If there is only one page per tile, each CTA will only load half of NumKeysPerTile for K.
   if (options.mClusterDimX == 2 && kernelTraits.mNumKeysPerTile == kernelTraits.mTileSizeKv) {
@@ -742,42 +778,16 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                       /*swizzled=*/kernelTraits.mSwizzleV,
                                       /*unpack4b=*/storeTransformedKvInTmem);
 
-  // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
-  if (options.mDtypeKv == tg::Dtype::E2m1) {
-    // The maximum headDim for K and V.
-    int maxHeadDimKv{std::max(options.mHeadDimQk, options.mHeadDimV)};
-    // The number of elements per SF.
-    int32_t NumEltsPerSf = kernelTraits.mNumEltsPerSf;
-    // Compute the shape and stride for SF tensor.
-    // FIXME: assume K and V uses the same shape.
-    auto [shapeKvSf, strideKvSf] = makeTmaShapeStrideKvSf(options,
-                                                          kernelTraits,
-                                                          params,
-                                                          /*isK*/ true,
-                                                          kernelTraits.mReshapeFactorKvSf);
-    // The tileShapes for K/V.
-    std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
-    tileShapeKvSf[0] = maxHeadDimKv / NumEltsPerSf * kernelTraits.mReshapeFactorKvSf;
-    tileShapeKvSf[1] = kernelTraits.mNumKeysPerTile / kernelTraits.mReshapeFactorKvSf;
-
-    // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into
-    // (headDim / NumEltsPerSf * reshapeFactorKvSf, tileSizeKv / reshapeFactorKvSf).
-    // Build tma descriptor for K SF.
-    // If multiple headDimStages are used, we will load the full headDim's SFs to avoid reshaping
-    // SFs layout.
-    params.tmaKSf_ = buildNdTmaDescriptor(tg::Dtype::E4m3,
-                                          shapeKvSf,
-                                          strideKvSf,
-                                          tileShapeKvSf,
-                                          const_cast<void*>(kSfBasePtr),
-                                          /*swizzled = */ false);
-    // Build tma descriptor for V SF.
-    params.tmaVSf_ = buildNdTmaDescriptor(tg::Dtype::E4m3,
-                                          shapeKvSf,
-                                          strideKvSf,
-                                          tileShapeKvSf,
-                                          const_cast<void*>(vSfBasePtr),
-                                          /*swizzled = */ false);
+  // E2m1 inputs need additional scaling factors for dequantization.
+  if (options.mDtypeK == tg::Dtype::E2m1 || options.mDtypeV == tg::Dtype::E2m1) {
+    if (options.mDtypeK == tg::Dtype::E2m1) {
+      params.tmaKSf_ =
+        buildTmaDescriptorKvSf(options, kernelTraits, params, /*isK=*/true, kSfBasePtr);
+    }
+    if (options.mDtypeV == tg::Dtype::E2m1) {
+      params.tmaVSf_ =
+        buildTmaDescriptorKvSf(options, kernelTraits, params, /*isK=*/false, vSfBasePtr);
+    }
   }
 
   // Shape/stride for gmem tensor O.
@@ -851,7 +861,14 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
 #endif // TLLM_TEST
 #endif // TLLM_RUBIN_FEATURES
 
-  params.mAttentionWindowSize = options.mAttentionWindowSize;
+  // The sliding-window reaches forwarded to the kernel: query q attends to K in
+  // [q - leftSlidingWindow, q + rightSlidingWindow].
+  params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+  params.mRightSlidingWindow = options.mRightSlidingWindow;
+  // VariableWindow bounds are launch metadata: int32[sumSeqLensQ], indexed by
+  // cumSeqLensQ[b] + localQ. They are not part of the cubin cache key.
+  params.ptrVariableWindowTokenStarts = variableWindowTokenStartsD;
+  params.ptrVariableWindowTokenEnds = variableWindowTokenEndsD;
   if (options.mChunkedAttentionSize > 0) {
     // The chunked attention size is a power of 2 (verified in FmhaOptions.h).
     params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -971,6 +988,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     float const*,
                                     uint32_t const*,
                                     int64_t const*,
+                                    int32_t const*,
+                                    int32_t const*,
                                     int32_t const*,
                                     int32_t const*,
                                     float const*,

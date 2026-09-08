@@ -138,6 +138,11 @@ def get_attention_feature_unsupported_reason(
         return "attention sinks are not supported."
     if forward_args.attention_mask_data is not None:
         return "custom attention masks are not supported."
+    if (
+        forward_args.variable_window_token_starts is not None
+        or forward_args.variable_window_token_ends is not None
+    ):
+        return "variable-window attention is not supported by this adapter."
     if forward_args.enable_dsv4_epilogue_fusion:
         return "DSv4 epilogue fusion is not supported."
     if (
