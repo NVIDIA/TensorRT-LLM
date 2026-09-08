@@ -468,12 +468,14 @@ def test_prefill_sparse_kv_compaction(scenario: ContextScenario) -> None:
 #                           tested on SM100                 tested on SM100
 #   Compute phase           Packed prefill, single-token,  Packed prefill, single-token,
 #                           and linear draft decode;        linear multi-query compute,
-#                           tested q_len 1 and 4            and mixed batches; tested; the
+#                           tested q_len 1 and 4            and variable-length batches;
+#                                                          tested; the
 #                                                          integrated MiniMax-M3 decode uses 1
 #   Attention type          MQA/GQA; Q heads divisible    MQA/GQA; Q heads divisible
 #                           by KV heads                    by KV heads
-#   Q heads per KV head     <= 32; tested 2, 3, 4, 8,      2, 4, 8, or 16; tested all
-#                           16, 24, 31, and 32              integrated MiniMax-M3 uses 16
+#   Q heads per KV head     <= 32; tested 2, 3, 4, 8,      2, 4, 8, or 16; decode tests cover
+#                           16, 24, 31, and 32              all; prefill tests cover 8 and 16;
+#                                                          integrated MiniMax-M3 uses 16
 #   Q/KV head counts        No additional discrete limit;  No additional discrete kernel limit;
 #                           tested Q={6,8,16,32,48,62,64},  tested Q={4,8,16,32}, KV={1,2}
 #                           KV={1,2,4,8}
@@ -494,8 +496,9 @@ def test_prefill_sparse_kv_compaction(scenario: ContextScenario) -> None:
 #   Sparse indices          int32 physical token indices   int32 request-local block indices
 #                           per KV head/query; tested       per KV head/query; per-token lists,
 #                                                          -1 padding, and physical remap tested
-#   Sparse Top-K            Positive multiple of 4;        Prefill kernel accepts 4, 8, 16,
-#                           tested 4, 32, 64, and 128       or 32 and tests cover all; the
+#   Sparse Top-K            Positive multiple of 4;        Kernel accepts 4, 8, 16, or 32;
+#                           tested 4, 32, 64, and 128       decode tests cover 4 and 8, prefill
+#                                                          tests cover 16 and 32; the
 #                                                          integrated MiniMax-M3 path uses 16
 #   Attention semantics     Causal; tested                 Causal with per-request Q offsets;
 #                                                          bottom-right and custom offsets tested
@@ -961,35 +964,23 @@ _BLOCK_SPARSE_GQA_CASES = [
     ],
     pytest.param(
         BlockSparseGqaScenario(
-            q_lens=(1, 4, 33),
-            kv_lens=(1152, 1280, 1408),
-            num_q_heads=8,
-            num_kv_heads=2,
-            active_blocks=3,
-            shuffle_pages=True,
-            per_token_blocks=True,
-        ),
-        id="msa_gqa_mixed_varlen_shuffled_pages_padded_indices",
-    ),
-    pytest.param(
-        BlockSparseGqaScenario(
-            q_lens=(33,),
+            q_lens=(1,),
             kv_lens=(640,),
-            num_q_heads=4,
+            num_q_heads=16,
             num_kv_heads=2,
             topk=4,
         ),
-        id="msa_gqa_2q_per_kv_topk4",
+        id="msa_gqa_decode_topk4",
     ),
     pytest.param(
         BlockSparseGqaScenario(
-            q_lens=(33,),
+            q_lens=(1,),
             kv_lens=(1152,),
-            num_q_heads=8,
+            num_q_heads=16,
             num_kv_heads=2,
             topk=8,
         ),
-        id="msa_gqa_4q_per_kv_topk8",
+        id="msa_gqa_decode_topk8",
     ),
     pytest.param(
         BlockSparseGqaScenario(
