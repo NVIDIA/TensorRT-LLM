@@ -3708,8 +3708,8 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. The model module reference, and the MM item scheduler, which
-           holds one of its own.
+        2. The model module reference, runner, and MM item scheduler, which
+           hold references to the model.
         3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
 
@@ -3738,9 +3738,10 @@ class PyTorchModelEngine(ModelEngine):
             model_loader.cleanup()
             self.model_loader = None
 
-        # The scheduler keeps its own references to the model and the input
-        # processor, so clearing the engine's attributes alone would leave the
-        # weights reachable past `release_gc()` below.
+        # The runner and scheduler keep their own references to the model, so
+        # clearing the engine's attribute alone would leave the weights
+        # reachable past `release_gc()` below.
+        self._runner = None
         self._mm_item_scheduler = None
         self.model = None
 

@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -346,6 +347,33 @@ def create_model_engine_and_kvcache(
     )
 
     return model_engine, kv_cache_manager
+
+
+def test_cleanup_releases_runner_model_before_release_gc() -> None:
+
+    class Model:
+        pass
+
+    engine = object.__new__(PyTorchModelEngine)
+    model = Model()
+    model_ref = weakref.ref(model)
+    engine._cleanup_done = False
+    engine.model_loader = None
+    engine._runner = SimpleNamespace(_model=model)
+    engine._mm_item_scheduler = None
+    engine.model = model
+    engine._release_cuda_graphs = Mock()
+    engine.input_processor = None
+    del model
+
+    def assert_model_released() -> None:
+        assert model_ref() is None
+
+    with patch("tensorrt_llm._torch.pyexecutor.model_engine.release_gc",
+               side_effect=assert_model_released) as release_gc:
+        engine.cleanup()
+
+    release_gc.assert_called_once_with()
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
