@@ -29,7 +29,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
-                            LlmapiAccuracyTestHarness)
+                            LlmapiAccuracyTestHarness,
+                            assert_guided_decoding_regex)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -850,14 +851,24 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
+    def _create_llm(self, model_hf_id, **overrides):
+        kwargs = self.get_default_kwargs()
+        kwargs.update(overrides)
+        model_path = hf_id_to_local_model_dir(model_hf_id)
+        return AutoDeployLLM(model=model_path, tokenizer=model_path, **kwargs)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_guided_decoding(self):
+        with self._create_llm(self.MODEL_HF_ID_BF16,
+                              guided_decoding_backend="xgrammar") as llm:
+            assert_guided_decoding_regex(llm)
+
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
-        kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_BF16)
-        with AutoDeployLLM(model=model_path, tokenizer=model_path,
-                           **kwargs) as llm:
+        with self._create_llm(self.MODEL_HF_ID_BF16) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
@@ -866,11 +877,8 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(32000)
     def test_nvfp4(self):
-        kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        model_path = hf_id_to_local_model_dir(self.MODEL_HF_ID_NVFP4)
-        with AutoDeployLLM(model=model_path, tokenizer=model_path,
-                           **kwargs) as llm:
+        with self._create_llm(self.MODEL_HF_ID_NVFP4) as llm:
             # Manually set quant_config for NVFP4 model to get the accuracy threshold
             llm.args.quant_config.quant_algo = QuantAlgo.NVFP4
             llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8

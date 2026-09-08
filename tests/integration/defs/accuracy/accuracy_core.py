@@ -16,6 +16,7 @@ import gc
 import json
 import math
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -29,7 +30,7 @@ import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
-from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -65,6 +66,26 @@ class ForceTokenLogitsProcessor(LogitsProcessor):
     def _force_token(self, logits: torch.Tensor) -> None:
         logits.fill_(float("-inf"))
         logits[..., self._forced_token_id] = 0
+
+
+def assert_guided_decoding_regex(llm: PyTorchLLM | AutoDeployLLM) -> None:
+    """Verify that an initialized model applies a regex grammar end to end."""
+    pattern = r"[0-9]{2}"
+    prompt_token_ids = llm.tokenizer.encode(
+        "Return exactly two decimal digits:")
+    outputs = llm.generate(
+        [prompt_token_ids],
+        sampling_params=SamplingParams(
+            max_tokens=8,
+            temperature=0,
+            guided_decoding=GuidedDecodingParams(regex=pattern),
+        ),
+        use_tqdm=False,
+    )
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == 1
+    assert re.fullmatch(pattern, outputs[0].outputs[0].text)
 
 
 def compute_theta(num_samples: int,

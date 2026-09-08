@@ -38,7 +38,14 @@ from ..conftest import (
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+    assert_guided_decoding_regex,
+)
 
 
 class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
@@ -261,6 +268,8 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -268,6 +277,10 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 llm,
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
             )
 
     def test_nvfp4_no_mtp(self):
@@ -277,14 +290,34 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
             max_batch_size=16,
             kv_cache_config=self.kv_cache_config,
             enable_chunked_prefill=True,
+            guided_decoding_backend="xgrammar",
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert_guided_decoding_regex(llm)
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
                 llm,
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(40000)
+class TestGemma4Unified12B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-12B-it"
+
+    def test_guided_decoding(self):
+        with LLM(
+            self.MODEL_PATH,
+            disable_mm_encoder=True,
+            max_batch_size=1,
+            max_seq_len=512,
+            max_num_tokens=512,
+            attn_backend="FLASHINFER",
+            guided_decoding_backend="xgrammar",
+        ) as llm:
+            assert_guided_decoding_regex(llm)
 
 
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
