@@ -635,7 +635,6 @@ public:
     /// @param encoderOutputLength Encoder output length if encoder input and output have different lengths (due to
     /// convolution down-sampling, etc.)
     /// @param crossAttentionMask Cross attention mask.
-    /// @param numReturnSequences The number of returning sequences.
     /// @param eagleConfig The EAGLE speculative decoding configuration
     /// @param skipCrossAttnBlocks Skip the cross attention transformer blocks or not.
     /// @param guidedDecodingParams The guided decoding parameters.
@@ -667,7 +666,7 @@ public:
         std::optional<ContextPhaseParams> contextPhaseParams = std::nullopt,
         std::optional<Tensor> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
-        std::optional<Tensor> crossAttentionMask = std::nullopt, SizeType32 numReturnSequences = 1,
+        std::optional<Tensor> crossAttentionMask = std::nullopt,
         std::optional<Tensor> skipCrossAttnBlocks = std::nullopt,
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,

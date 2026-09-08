@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,18 +37,17 @@ Request::Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming, 
     std::optional<IdType> clientId, bool returnAllGeneratedTokens, float priority, RequestType type,
     std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
     std::optional<SizeType32> encoderOutputLength, std::optional<Tensor> crossAttentionMask,
-    SizeType32 numReturnSequences, std::optional<Tensor> skipCrossAttnBlocks,
-    std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<SizeType32> languageAdapterUid,
-    std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
-    std::optional<std::string> cacheSalt)
+    std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
+    std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
+    std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt)
     : mImpl(std::make_unique<Impl>(std::move(inputTokenIds), maxTokens, streaming, samplingConfig, outputConfig, endId,
         padId, std::move(positionIds), std::move(badWords), std::move(stopWords), std::move(embeddingBias),
         std::move(pTuningConfig), std::move(multimodalInput), std::move(multimodalEmbedding), std::move(mRopeConfig),
         std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), std::move(logitsPostProcessorName),
         std::move(logitslogitsPostProcessor), std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens,
         priority, type, std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
-        crossAttentionMask, numReturnSequences, skipCrossAttnBlocks, std::move(guidedDecodingParams),
-        languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt)))
+        crossAttentionMask, skipCrossAttnBlocks, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs,
+        disaggRequestId, std::move(cacheSalt)))
 {
 }
 
