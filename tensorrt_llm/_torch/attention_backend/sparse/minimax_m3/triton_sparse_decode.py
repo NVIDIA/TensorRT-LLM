@@ -794,7 +794,13 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
     return 1 << (target.bit_length() - 1)
 
 
-def _sm103_nvfp4_num_topk_chunks(
+# These policies were tuned on GB300/SM103. They are enabled for both
+# datacenter Blackwell targets, but may not be optimal on GB200/SM100 until
+# measured there.
+_SM100F_CAPABILITIES = ((10, 0), (10, 3))
+
+
+def _sm100f_nvfp4_num_topk_chunks(
     *,
     total_q: int,
     num_kv_heads: int,
@@ -803,11 +809,11 @@ def _sm103_nvfp4_num_topk_chunks(
     decode_query_len: int,
     capability: Optional[tuple[int, int]] = None,
 ) -> Optional[int]:
-    """Select measured split-K factors for M3's SM103 DEP8 decode shape."""
+    """Select GB300-measured split-K factors for M3's SM100-family decode shape."""
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability != (10, 3)
+        capability not in _SM100F_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -833,7 +839,7 @@ def _sm103_nvfp4_num_topk_chunks(
     }.get(local_batch)
 
 
-def _sm103_nvfp4_use_linear_softmax(
+def _sm100f_nvfp4_use_linear_softmax(
     *,
     total_q: int,
     num_kv_heads: int,
@@ -842,11 +848,11 @@ def _sm103_nvfp4_use_linear_softmax(
     decode_query_len: int,
     capability: Optional[tuple[int, int]] = None,
 ) -> bool:
-    """Use the measured lower-register recurrence on validated M3 shapes."""
+    """Use the GB300-measured lower-register recurrence on validated M3 shapes."""
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability != (10, 3)
+        capability not in _SM100F_CAPABILITIES
         or num_kv_heads not in (1, 2, 4)
         or gqa_group_size != 16
         or max_topk != 16
@@ -861,7 +867,7 @@ def _sm103_nvfp4_use_linear_softmax(
     return not (num_kv_heads == 1 and local_batch == 1)
 
 
-def _sm103_nvfp4_query_group_size(
+def _sm100f_nvfp4_query_group_size(
     *,
     total_q: int,
     num_kv_heads: int,
@@ -870,11 +876,11 @@ def _sm103_nvfp4_query_group_size(
     decode_query_len: int,
     capability: Optional[tuple[int, int]] = None,
 ) -> int:
-    """Group measured Eagle queries that benefit from shared packed pages."""
+    """Group Eagle queries using the GB300-measured shared-page policy."""
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability != (10, 3)
+        capability not in _SM100F_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -888,7 +894,7 @@ def _sm103_nvfp4_query_group_size(
     return 2 if total_q // decode_query_len in (11, 12, 14) else 1
 
 
-def _sm103_nvfp4_launch_options(
+def _sm100f_nvfp4_launch_options(
     *,
     total_q: int,
     num_kv_heads: int,
@@ -897,7 +903,7 @@ def _sm103_nvfp4_launch_options(
     decode_query_len: int,
     capability: Optional[tuple[int, int]] = None,
 ) -> dict[str, int]:
-    """Select measured SM103 native-NVFP4 launch geometry.
+    """Select native-NVFP4 launch geometry for the SM100 family.
 
     The FP16 QK/PV path is register-sensitive. GB300 dense replay shows four
     warps/two stages wins through local batch 28, while two warps/one stage
@@ -908,7 +914,7 @@ def _sm103_nvfp4_launch_options(
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability != (10, 3)
+        capability not in _SM100F_CAPABILITIES
         or num_kv_heads != 4
         or gqa_group_size != 16
         or max_topk != 16
@@ -927,7 +933,7 @@ def _sm103_nvfp4_launch_options(
     return {}
 
 
-def _sm103_nvfp4_merge_launch_options(
+def _sm100f_nvfp4_merge_launch_options(
     *,
     total_q: int,
     num_kv_heads: int,
@@ -936,11 +942,11 @@ def _sm103_nvfp4_merge_launch_options(
     decode_query_len: int,
     capability: Optional[tuple[int, int]] = None,
 ) -> dict[str, int]:
-    """Select measured one-warp merge launches for M3's DEP8 graphs."""
+    """Select GB300-measured one-warp merges for M3's SM100-family graphs."""
     if capability is None:
         capability = torch.cuda.get_device_capability()
     if (
-        capability == (10, 3)
+        capability in _SM100F_CAPABILITIES
         and num_kv_heads == 4
         and gqa_group_size == 16
         and max_topk == 16
@@ -1082,7 +1088,7 @@ def minimax_m3_sparse_attn_decode(
         compute_dtype = tl.float32
 
     query_group_size = (
-        _sm103_nvfp4_query_group_size(
+        _sm100f_nvfp4_query_group_size(
             total_q=total_q,
             num_kv_heads=num_kv_heads,
             gqa_group_size=gqa_group_size,
@@ -1097,7 +1103,7 @@ def minimax_m3_sparse_attn_decode(
             measured_chunks = 8
         else:
             measured_chunks = (
-                _sm103_nvfp4_num_topk_chunks(
+                _sm100f_nvfp4_num_topk_chunks(
                     total_q=total_q,
                     num_kv_heads=num_kv_heads,
                     gqa_group_size=gqa_group_size,
@@ -1146,7 +1152,7 @@ def minimax_m3_sparse_attn_decode(
 
     use_pdl = _pdl_enabled()
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
-    use_linear_softmax = kv_nvfp4 and _sm103_nvfp4_use_linear_softmax(
+    use_linear_softmax = kv_nvfp4 and _sm100f_nvfp4_use_linear_softmax(
         total_q=total_q,
         num_kv_heads=num_kv_heads,
         gqa_group_size=gqa_group_size,
@@ -1157,7 +1163,7 @@ def minimax_m3_sparse_attn_decode(
         launch_options = {"num_warps": 4, "num_stages": 1}
     else:
         launch_options = (
-            _sm103_nvfp4_launch_options(
+            _sm100f_nvfp4_launch_options(
                 total_q=total_q,
                 num_kv_heads=num_kv_heads,
                 gqa_group_size=gqa_group_size,
@@ -1245,7 +1251,7 @@ def minimax_m3_sparse_attn_decode(
     )
     if not direct_output:
         merge_launch_options = (
-            _sm103_nvfp4_merge_launch_options(
+            _sm100f_nvfp4_merge_launch_options(
                 total_q=total_q,
                 num_kv_heads=num_kv_heads,
                 gqa_group_size=gqa_group_size,
@@ -1275,10 +1281,10 @@ def minimax_m3_sparse_attn_decode(
 __all__ = [
     "NVFP4_SF_VEC_SIZE",
     "SPARSE_BLOCK_SIZE",
-    "_sm103_nvfp4_merge_launch_options",
-    "_sm103_nvfp4_num_topk_chunks",
-    "_sm103_nvfp4_query_group_size",
-    "_sm103_nvfp4_use_linear_softmax",
+    "_sm100f_nvfp4_merge_launch_options",
+    "_sm100f_nvfp4_num_topk_chunks",
+    "_sm100f_nvfp4_query_group_size",
+    "_sm100f_nvfp4_use_linear_softmax",
     "minimax_m3_sparse_attn_decode",
     "resolve_num_topk_chunks",
 ]

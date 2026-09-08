@@ -23,11 +23,11 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.triton_sparse_decode import (
     NVFP4_SF_VEC_SIZE,
     SPARSE_BLOCK_SIZE,
-    _sm103_nvfp4_launch_options,
-    _sm103_nvfp4_merge_launch_options,
-    _sm103_nvfp4_num_topk_chunks,
-    _sm103_nvfp4_query_group_size,
-    _sm103_nvfp4_use_linear_softmax,
+    _sm100f_nvfp4_launch_options,
+    _sm100f_nvfp4_merge_launch_options,
+    _sm100f_nvfp4_num_topk_chunks,
+    _sm100f_nvfp4_query_group_size,
+    _sm100f_nvfp4_use_linear_softmax,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
 )
@@ -778,15 +778,16 @@ def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_head
         (33, {}),
     ],
 )
-def test_sm103_nvfp4_launch_options(local_batch, expected):
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_launch_options(local_batch, expected, capability):
     assert (
-        _sm103_nvfp4_launch_options(
+        _sm100f_nvfp4_launch_options(
             total_q=local_batch * 4,
             num_kv_heads=4,
             gqa_group_size=16,
             max_topk=16,
             decode_query_len=4,
-            capability=(10, 3),
+            capability=capability,
         )
         == expected
     )
@@ -809,15 +810,16 @@ def test_sm103_nvfp4_launch_options(local_batch, expected):
         (15, None),
     ],
 )
-def test_sm103_nvfp4_num_topk_chunks(local_batch, expected):
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_num_topk_chunks(local_batch, expected, capability):
     assert (
-        _sm103_nvfp4_num_topk_chunks(
+        _sm100f_nvfp4_num_topk_chunks(
             total_q=local_batch * 4,
             num_kv_heads=4,
             gqa_group_size=16,
             max_topk=16,
             decode_query_len=4,
-            capability=(10, 3),
+            capability=capability,
         )
         == expected
     )
@@ -827,7 +829,8 @@ def test_sm103_nvfp4_num_topk_chunks(local_batch, expected):
     ("local_batch", "expected"),
     [(10, 1), (11, 2), (12, 2), (14, 2), (15, 1)],
 )
-def test_sm103_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected):
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected, capability):
     common = dict(
         total_q=local_batch * 4,
         num_kv_heads=4,
@@ -835,12 +838,14 @@ def test_sm103_nvfp4_query_group_size_is_narrowly_scoped(local_batch, expected):
         max_topk=16,
         decode_query_len=4,
     )
-    assert _sm103_nvfp4_query_group_size(**common, capability=(10, 3)) == expected
-    assert _sm103_nvfp4_query_group_size(**common, capability=(10, 0)) == 1
-    assert _sm103_nvfp4_query_group_size(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == 1
+    assert _sm100f_nvfp4_query_group_size(**common, capability=capability) == expected
+    assert _sm100f_nvfp4_query_group_size(**common, capability=(12, 0)) == 1
+    assert (
+        _sm100f_nvfp4_query_group_size(**(common | {"num_kv_heads": 2}), capability=capability) == 1
+    )
 
 
-def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
+def test_sm100f_nvfp4_launch_options_rejects_unmeasured_shapes():
     common = dict(
         total_q=32,
         num_kv_heads=4,
@@ -848,10 +853,10 @@ def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
         max_topk=16,
         decode_query_len=4,
     )
-    assert _sm103_nvfp4_launch_options(**common, capability=(10, 0)) == {}
-    assert _sm103_nvfp4_launch_options(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == {}
+    assert _sm100f_nvfp4_launch_options(**common, capability=(12, 0)) == {}
+    assert _sm100f_nvfp4_launch_options(**(common | {"num_kv_heads": 2}), capability=(10, 3)) == {}
     assert (
-        _sm103_nvfp4_launch_options(**(common | {"decode_query_len": 1}), capability=(10, 3)) == {}
+        _sm100f_nvfp4_launch_options(**(common | {"decode_query_len": 1}), capability=(10, 3)) == {}
     )
 
 
@@ -868,7 +873,8 @@ def test_sm103_nvfp4_launch_options_rejects_unmeasured_shapes():
         (8, 14, False),
     ],
 )
-def test_sm103_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected):
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected, capability):
     common = dict(
         total_q=local_batch * 4,
         num_kv_heads=num_kv_heads,
@@ -876,8 +882,8 @@ def test_sm103_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected):
         max_topk=16,
         decode_query_len=4,
     )
-    assert _sm103_nvfp4_use_linear_softmax(**common, capability=(10, 3)) is expected
-    assert not _sm103_nvfp4_use_linear_softmax(**common, capability=(10, 0))
+    assert _sm100f_nvfp4_use_linear_softmax(**common, capability=capability) is expected
+    assert not _sm100f_nvfp4_use_linear_softmax(**common, capability=(12, 0))
 
 
 @pytest.mark.parametrize(
@@ -896,7 +902,8 @@ def test_sm103_nvfp4_linear_softmax_policy(num_kv_heads, local_batch, expected):
         (12, {}),
     ],
 )
-def test_sm103_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected):
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_sm100f_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expected, capability):
     common = dict(
         num_kv_heads=4,
         gqa_group_size=16,
@@ -904,10 +911,10 @@ def test_sm103_nvfp4_merge_launch_options_is_narrowly_scoped(local_batch, expect
         decode_query_len=4,
     )
     assert (
-        _sm103_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(10, 3))
+        _sm100f_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=capability)
         == expected
     )
     assert (
-        _sm103_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(10, 0))
+        _sm100f_nvfp4_merge_launch_options(total_q=local_batch * 4, **common, capability=(12, 0))
         == {}
     )
