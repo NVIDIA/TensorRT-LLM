@@ -17,7 +17,7 @@ from unittest.mock import Mock, call
 import pytest
 
 from tensorrt_llm._torch.disaggregation.executor.transfer_manager import AsyncTransferManager
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
@@ -54,7 +54,7 @@ def test_wrapper_keeps_connector_leg_without_transceiver() -> None:
 
     PyExecutor._send_kv_async(executor, [])
 
-    assert calls == ["disagg_send", "connector_save"]
+    assert calls == ["connector_save"]
 
 
 def test_disagg_send_leg_is_noop_without_transceiver() -> None:

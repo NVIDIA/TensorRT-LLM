@@ -13,14 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import tensorrt_llm  # noqa: F401  # Import to load C++ extensions
 

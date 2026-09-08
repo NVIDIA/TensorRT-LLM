@@ -36,14 +36,14 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused DSA metadata kernel requires CUDA"
 )
 
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (  # noqa: E402
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (  # noqa: E402
     _compute_slot_mappings,
     build_req_idx_per_token,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa.fused_metadata import (  # noqa: E402
+from tensorrt_llm._torch.attention.backends.sparse.dsa.fused_metadata import (  # noqa: E402
     fused_dsa_decode_metadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.dsa.metadata import (  # noqa: E402
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
     _fused_dsa_meta_enabled,
 )
 

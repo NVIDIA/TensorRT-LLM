@@ -149,6 +149,16 @@ class MoERunner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
+    def _resolve_fallback_tactic(self, tactic: int, gemm_idx: int) -> int:
+        if (tactic == -1 and get_sm_version() == 107
+                and self.x_dtype == torch.bfloat16
+                and self.weight_dtype == torch.bfloat16):
+            # MoeGemmRunner appends the SM80-style grouped-GEMM tactics after
+            # the TMA-WS tactics. Its final tactic is a shape-safe fallback on
+            # SM107, where the first SM100 TMA-WS tactic can fail to initialize.
+            return self.fused_moe_runner.get_tactic_num(gemm_idx) - 1
+        return tactic
+
     def unique_id(self):
         return (
             self.x_dtype,
@@ -178,6 +188,7 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        tactic = self._resolve_fallback_tactic(tactic, gemm_idx)
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
@@ -320,6 +331,9 @@ def fused_moe(
         ],
         gemm_idx=2,
     )
+
+    gemm_tactic_1 = moe_runner._resolve_fallback_tactic(gemm_tactic_1, 1)
+    gemm_tactic_2 = moe_runner._resolve_fallback_tactic(gemm_tactic_2, 2)
 
     lora_active = (fc1_lora_ranks is not None) or (fc1_slot_lora_ranks
                                                    is not None)
@@ -3066,4 +3080,84 @@ def _(
     return [
         input.new_empty(output_shape, dtype=torch.uint8),
         input_scale.new_empty(scale_shape, dtype=torch.uint8),
+    ]
+
+
+class Fp8PerTokenQuantTactic(enum.IntEnum):
+    """FP8 per-token quantization backend selection."""
+
+    TRTLLM = -1
+    VECTORIZED = 1
+
+
+class Fp8PerTokenQuantRunner(TunableRunner):
+    """Profiles TRT-LLM vs vectorized FP8 per-token activation quantization kernels."""
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, ()), ),
+        use_cuda_graph=False,
+    )
+
+    def unique_id(self):
+        return ()
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> List[int]:
+        return [
+            Fp8PerTokenQuantTactic.TRTLLM, Fp8PerTokenQuantTactic.VECTORIZED
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = Fp8PerTokenQuantTactic.TRTLLM,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = inputs[0]
+        if tactic == Fp8PerTokenQuantTactic.VECTORIZED:
+            qx, scale = torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant(x)
+        else:
+            qx, scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
+        return qx, scale.float()
+
+
+@fast_custom_op("trtllm::tunable_fp8_per_token_quant", mutates_args=())
+def tunable_fp8_per_token_quant(x: torch.Tensor) -> List[torch.Tensor]:
+    """FP8 per-token quantization with autotuning between TRT-LLM and vectorized kernels.
+
+    During warmup, the AutoTuner profiles both backends and caches the fastest
+    one per input shape. Subsequent calls use the cached selection.
+
+    Returns:
+        [qx, scale] — fp8_e4m3fn tensor + float32 per-token scales [..., 1]
+    """
+    runner = Fp8PerTokenQuantRunner()
+
+    # TRTLLM_FP8_QUANT_TACTIC=trtllm|vectorized forces a specific kernel.
+    forced = os.environ.get("TRTLLM_FP8_QUANT_TACTIC", "").lower()
+    if forced == "trtllm":
+        best_tactic = Fp8PerTokenQuantTactic.TRTLLM
+    elif forced == "vectorized":
+        best_tactic = Fp8PerTokenQuantTactic.VECTORIZED
+    else:
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::fp8_per_token_quant_tactic",
+            [runner],
+            Fp8PerTokenQuantRunner.tuning_config,
+            [x],
+        )
+    qx, scale = runner(inputs=[x], tactic=best_tactic)
+    return [qx, scale]
+
+
+@tunable_fp8_per_token_quant.register_fake
+def _(x: torch.Tensor) -> List[torch.Tensor]:
+    scale_shape = list(x.shape[:-1]) + [1]
+    return [
+        x.new_empty(x.shape, dtype=torch.float8_e4m3fn),
+        x.new_empty(scale_shape, dtype=torch.float32),
     ]

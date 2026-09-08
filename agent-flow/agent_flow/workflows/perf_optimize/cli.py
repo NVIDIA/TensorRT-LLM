@@ -23,14 +23,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Iteratively optimize a trtllm-serve deployment: benchmark the "
         "baseline, profile and rank optimizations into roadmap.yaml, apply the "
-        "top items one at a time (up to optimize.max_items_per_round per "
-        "round), gate each change on code quality / functionality / measured "
+        "top items serially or concurrently in isolated worktrees (up to "
+        "optimize.max_items_per_round per round), gate each candidate on "
+        "code quality / functionality / measured "
         "perf (the evaluator approves, rejects, or pushes back each attempt, "
-        "profiling every accept under nsys), run the full optimize.max_rounds "
+        "profiling candidate-ready states under nsys), directly accept serial "
+        "candidates or integrate and benchmark a parallel batch, run the full optimize.max_rounds "
         "budget unless the roadmap exhausts or the improvement target is met, "
         "verify the final state with one independent QA benchmark, and report "
         "expected-vs-measured gains — via a benchmarker -> [analyzer -> "
-        "(optimizer <-> evaluator) x items] x rounds -> qa -> reporter loop. "
+        "(optimizer <-> evaluator) items -> optional integrator] x rounds "
+        "-> qa -> reporter loop. "
         "A one-shot SOL projector stage runs between the baseline and "
         "round 1 (sol_projection.md) unless task.yaml sets "
         "`sol.enabled: false`. "
@@ -68,7 +71,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Wipe the workspace checkpoint and managed files/directories "
         f"({STATE_FILENAME}, sol_projection.md, roadmap.yaml, "
         "optimization_report.md/.html, "
-        "progress.yaml, baseline/, rounds/, tuning/, sol_work/, "
+        "progress.yaml, baseline/, rounds/, worktrees/, tuning/, sol_work/, "
         "reused_analysis/) and start fresh. The "
         "TRT-LLM checkout is not touched (abandoned perf-optimize/* branches "
         "are left for inspection). Without this flag the workflow resumes "
@@ -96,9 +99,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override `optimize.max_rounds` from task.yaml on a fresh run "
         "(each round opens with an analyzer turn — a re-profile when the "
-        "previous round accepted something, a replan otherwise — then "
-        "applies up to `optimize.max_items_per_round` roadmap items one at "
-        "a time). Ignored on resume — the checkpointed budget wins.",
+        "standing profile is stale, a replan otherwise — then evaluates up "
+        "to `optimize.max_items_per_round` roadmap items per the configured "
+        "`optimize.item_execution` mode). "
+        "Ignored on resume — the checkpointed budget wins.",
     )
     return parser.parse_args(argv)
 

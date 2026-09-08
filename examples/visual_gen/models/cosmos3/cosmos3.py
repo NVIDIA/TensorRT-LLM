@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
+from tensorrt_llm.visual_gen import MediaRef
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
@@ -131,6 +132,13 @@ def load_prompt_file(path: str) -> Dict[str, Any]:
         return {"prompt": json.dumps(data)}
     if not data["prompt"]:
         raise ValueError(f"Prompt file {path!r} is missing a non-empty 'prompt' field.")
+    if isinstance(data["prompt"], dict):
+        data["prompt"] = json.dumps(data["prompt"])
+    elif not isinstance(data["prompt"], str):
+        raise ValueError(
+            f"Prompt file {path!r} 'prompt' must be text or a JSON object, "
+            f"got {type(data['prompt']).__name__}."
+        )
     return data
 
 
@@ -244,8 +252,8 @@ def _validate_action_args(
             raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
 
 
-def _resolved_output_path(path: str, action_mode: Optional[str]) -> str:
-    if action_mode is None:
+def _resolved_output_path(path: str, action_requested: bool) -> str:
+    if not action_requested:
         return path
     output_path = Path(path)
     if output_path.suffix.lower() in _TENSOR_OUTPUT_SUFFIXES:
@@ -258,11 +266,17 @@ def _default_action_output_path(output_path: str) -> str:
     return str(stem.with_suffix(".action.json"))
 
 
-def _save_action_output(output, path: str, args: argparse.Namespace) -> None:
+def _save_action_output(
+    output,
+    path: str,
+    args: argparse.Namespace,
+    *,
+    action_mode: str,
+) -> None:
     """Write the trajectory plus the request that produced it.
 
-    The mode and embodiment are this script's own inputs, so they are read
-    from *args* rather than echoed back through the output schema.
+    The mode and embodiment are request-side facts, so they are not echoed
+    back through the output schema. A policy manifest may supply ``action_mode``.
     """
     if output.action is None:
         return
@@ -276,7 +290,7 @@ def _save_action_output(output, path: str, args: argparse.Namespace) -> None:
         shape = list(action.shape)
 
     payload = {
-        "action_mode": args.action_mode,
+        "action_mode": action_mode,
         "domain_name": args.domain_name,
         "domain_id": args.domain_id,
         "raw_action_dim": action.shape[-1],
@@ -297,7 +311,8 @@ def main():
         type=str,
         default="nvidia/Cosmos3-Nano",
         help="Model path or HuggingFace Hub ID "
-        "(nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super, nvidia/Cosmos3-Edge)",
+        "(nvidia/Cosmos3-Nano, nvidia/Cosmos3-Super, nvidia/Cosmos3-Edge, "
+        "nvidia/Cosmos3-Edge-Policy-DROID)",
     )
     parser.add_argument(
         "--visual_gen_args",
@@ -336,7 +351,7 @@ def main():
         "--image_path",
         type=str,
         default=None,
-        help="Optional conditioning image path or URL for I2V/TI2V",
+        help="Optional conditioning image path for I2V/TI2V",
     )
     parser.add_argument(
         "--output_path",
@@ -400,7 +415,10 @@ def main():
         "--action_json",
         type=str,
         default=None,
-        help="JSON file with action trajectory [T, D] for forward_dynamics",
+        help=(
+            "JSON file with an action trajectory [T, D] for forward_dynamics, "
+            "or current model-space state [D]/[1, D] for a state-conditioned policy"
+        ),
     )
     parser.add_argument(
         "--video_path",
@@ -429,7 +447,10 @@ def main():
         type=str,
         default=None,
         choices=["ego_view", "third_person_view", "wrist_view", "concat_view"],
-        help="Camera perspective for the action caption (default: ego_view).",
+        help=(
+            "Deprecated compatibility option; accepted and ignored. Supply the trained "
+            "structured action caption through --prompt or --prompt_file."
+        ),
     )
     parser.add_argument(
         "--action_output_path",
@@ -477,7 +498,7 @@ def main():
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
     if image_path is not None:
-        params.image = image_path
+        params.image_reference = [MediaRef(content=image_path, format="path")]
 
     negative_prompt = resolve_negative_prompt(
         negative_prompt=args.negative_prompt,
@@ -514,7 +535,7 @@ def main():
         with open(args.action_json, encoding="utf-8") as f:
             params.extra_params["action"] = json.load(f)
     if args.video_path is not None:
-        params.extra_params["video"] = Path(args.video_path).read_bytes()
+        params.video_reference = [MediaRef(content=args.video_path, format="path")]
     if args.extra_params:
         # Merged last: explicit JSON wins over flag-derived values.
         params.extra_params.update(args.extra_params)
@@ -529,18 +550,23 @@ def main():
         params=params,
     )
 
-    output_path = _resolved_output_path(args.output_path, args.action_mode)
+    has_action = output.action is not None
+    action_requested = args.action_mode is not None or has_action
+    output_path = _resolved_output_path(args.output_path, action_requested)
     output.save(output_path)
     print(f"Saved: {output_path}")
 
-    if args.action_mode is not None:
+    if has_action:
+        # A checkpoint policy manifest selects policy mode inside the pipeline,
+        # so action output can be present even when the request omitted the
+        # generic --action_mode discriminator.
+        action_mode = args.action_mode or "policy"
         action_path = args.action_output_path or _default_action_output_path(output_path)
-        _save_action_output(output, action_path, args)
-        if output.action is not None:
-            print(f"Saved action: {action_path}")
-            print(f"Action shape: {tuple(output.action.shape)}")
-        else:
-            print("Warning: action_mode was set but the output carried no action tensor.")
+        _save_action_output(output, action_path, args, action_mode=action_mode)
+        print(f"Saved action: {action_path}")
+        print(f"Action shape: {tuple(output.action.shape)}")
+    elif args.action_mode is not None:
+        print("Warning: action_mode was set but the output carried no action tensor.")
 
     print(output.metrics)
 

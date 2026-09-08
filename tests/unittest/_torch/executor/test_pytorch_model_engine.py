@@ -23,6 +23,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, EncoderCUDAGraphRunner, EncoderCUDAGraphRunnerConfig,
     KeyType, _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state)
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
+    setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -42,7 +44,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
 # isort: on
 from utils.util import skip_ray
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
@@ -175,10 +177,25 @@ def _create_request_with_tokens(tokens: list[int], req_id: int) -> LlmRequest:
 
 
 def test_context_prompt_lookahead_stops_at_prompt_boundary() -> None:
+    """An internal chunk hands back the next prompt token; the last one does not.
+
+    The boundary is read off the request's live chunking state rather than a
+    Python-side prompt length, which a preemption leaves stale.
+    """
     request = _create_request_with_tokens([10, 11, 12, 13, 14], 1)
 
+    request.context_chunk_size = 2
     assert _get_context_prompt_lookahead_token(request, 2) == 12
+
+    # A reused prefix advances the live cursor while py_prompt_len remains the
+    # original prompt length. Internal chunk [2, 4) still looks up token 4.
+    request.context_current_position = 2
+    request.context_chunk_size = 2
     assert _get_context_prompt_lookahead_token(request, 4) == 14
+
+    # Final chunk [2, 5): nothing follows in the prompt, so the drafter falls
+    # back to the token the target just sampled.
+    request.context_chunk_size = 3
     assert (_get_context_prompt_lookahead_token(
         request, 5) == INVALID_PROMPT_LOOKAHEAD_TOKEN)
 
@@ -1166,6 +1183,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "encoder_decoder",
             "encode_only",
             "mm_encoder_only",
+            "ple_recurrent_state",
+            "nested_ple_recurrent_state",
             "context_parallel",
         )
         for case in cases:
@@ -1189,6 +1208,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine._is_encode_only = True
                 elif case == "mm_encoder_only":
                     engine.llm_args.mm_encoder_only = True
+                elif case == "ple_recurrent_state":
+                    engine.model.has_ple = True
+                elif case == "nested_ple_recurrent_state":
+                    engine.model.model = SimpleNamespace(llm=SimpleNamespace(
+                        model=SimpleNamespace(has_ple=True)))
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
 
@@ -1753,18 +1777,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         for max_tokens_per_item, expected_max_seq_len in cases:
             with self.subTest(max_tokens_per_item=max_tokens_per_item):
                 encoder = CapturingEncoder()
-                model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-                model_engine.model = torch.nn.Sequential(encoder)
-                model_engine.encoder_max_num_tokens = encoder_max_num_tokens
-                model_engine.mm_encoder_attention_metadata_capacity = None
                 if max_tokens_per_item is None:
-                    model_engine.input_processor = Mock()
+                    input_processor = Mock()
                 else:
-                    model_engine.input_processor = Mock(
+                    input_processor = Mock(
                         spec=BaseMultimodalDummyInputsBuilder)
-                    model_engine.input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+                    input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
 
-                model_engine._set_up_multimodal_encoder_attn_metadata()
+                setup_mm_encoder_attn_metadata(torch.nn.Sequential(encoder),
+                                               input_processor,
+                                               encoder_max_num_tokens, None)
 
                 self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
                 self.assertEqual(encoder.max_seq_len, expected_max_seq_len)

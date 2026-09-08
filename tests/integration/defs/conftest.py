@@ -23,7 +23,6 @@ import platform
 import re
 import shutil
 import subprocess as sp
-import sys
 import tempfile
 import time
 import urllib.request
@@ -74,10 +73,7 @@ DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 
 
 def _get_s3_output():
-    tests_root = Path(__file__).resolve().parents[2]
-    tests_root_str = str(tests_root)
-    if tests_root_str not in sys.path:
-        sys.path.append(tests_root_str)
+    # tests/ is on the path via the pythonpath entry in pytest.ini.
     return importlib.import_module("test_common.s3_output")
 
 
