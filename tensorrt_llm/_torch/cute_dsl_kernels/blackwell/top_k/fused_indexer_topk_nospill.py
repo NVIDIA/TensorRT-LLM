@@ -607,59 +607,12 @@ def _dsv4_kernel(
     acc_full = mbar + 2 * STAGES
     acc_empty = mbar + 2 * STAGES + NACC
 
-    if tidx == 0:
-        for i in cutlass.range_constexpr(STAGES):
-            cute.arch.mbarrier_init(ab_full + i, P_THREADS)
-            cute.arch.mbarrier_init(ab_empty + i, 1)
-        for i in cutlass.range_constexpr(NACC):
-            cute.arch.mbarrier_init(acc_full + i, 1)
-            cute.arch.mbarrier_init(acc_empty + i, 128)
-        cute.arch.mbarrier_init_fence()
-
     sA_swz = cute.make_swizzle(SWZ[0], SWZ[1], SWZ[2])
     sA_ptr = cute.recast_ptr(sA_raw, sA_swz, dtype=FP4)
     sB_ptr = cute.recast_ptr(sB_raw, sA_swz, dtype=FP4)
-    sA = cute.make_tensor(sA_ptr, cute.make_layout(LAY[0][0], stride=LAY[0][1]))
-    sB = cute.make_tensor(sB_ptr, cute.make_layout(LAY[1][0], stride=LAY[1][1]))
-    # Partition the staged UMMA A layout into four independent 32x128 TMA
-    # destinations (TOK / PAGE = 4 page slots per MMA tile).  The GMEM tensor
-    # keeps the physical page pool as its residual mode, so an arbitrary
-    # block-table page ID is a legal runtime coordinate and does not require
-    # rebuilding the TMA descriptor.
-    sK_tma = cute.make_tensor(cute.recast_ptr(sA_raw, dtype=FP4), smem_layout_k_tma)
-    sK_tma, gK_tma = cute.nvgpu.cpasync.tma_partition(
-        tma_atom_k,
-        0,
-        cute.make_layout(1),
-        smem_tensor=sK_tma,
-        gmem_tensor=cute.group_modes(mKV, 0, 2),
-    )
-    sSFA = cute.make_tensor(
-        cute.recast_ptr(sSFA_raw, dtype=SF), cute.make_layout(LAY[2][0], stride=LAY[2][1])
-    )
-    sSFB = cute.make_tensor(
-        cute.recast_ptr(sSFB_raw, dtype=SF), cute.make_layout(LAY[3][0], stride=LAY[3][1])
-    )
-    acc_layout = cute.make_layout(LAY[4][0], stride=LAY[4][1])
-    sfa_tmem_layout = cute.make_layout(LAY[5][0], stride=LAY[5][1])
-    sfb_tmem_layout = cute.make_layout(LAY[6][0], stride=LAY[6][1])
     sSFB_u32 = cute.make_tensor(sSFB_raw, cute.make_layout(128))
-
-    if tidx >= 128:
-        ii = tidx - 128
-        for i in cutlass.range(ii, NBINS, NTHREADS - 128, unroll=1):
-            sHist[i] = I32(0)
-            sTot[i] = I32(0)
-    if tidx < 32:
-        sCtl[tidx] = I32(0)
-        sFine[tidx] = I32(0)
-        sFTot[tidx] = I32(0)
-
-    if warp_idx == 0:
-        cute.arch.alloc_tmem(512, tmem_hold)
-    if warp_idx == 11:
-        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
-
+    # row bookkeeping and every independent global load first: their latency overlaps the
+    # barrier, TMEM and SMEM setup below
     b = bidx // CS
     crk = bidx % CS
     CSd = I32(CS)
@@ -779,9 +732,16 @@ def _dsv4_kernel(
     if tidx >= 128:
         ii = tidx - 128
         for jj in cutlass.range(ii, RBT * 4, NTHREADS - 128, unroll=1):
-            gi = (crk + (ntl - 1 - (jj >> 2)) * CSd) * 4 + (jj & 3)
-            if ((jj >> 2) < ntl) and (gi < MAXB):
-                sBT[jj] = gBT[gi]
+            if cutlass.const_expr(NLOC <= RBT):
+                # every tile of the CTA fits the ring: slot = local tile index, independent of
+                # the context length (slots past the row's tiles are never read)
+                gi = (crk + (jj >> 2) * CSd) * 4 + (jj & 3)
+                if gi < MAXB:
+                    sBT[jj] = gBT[gi]
+            else:
+                gi = (crk + (ntl - 1 - (jj >> 2)) * CSd) * 4 + (jj & 3)
+                if ((jj >> 2) < ntl) and (gi < MAXB):
+                    sBT[jj] = gBT[gi]
 
     if tidx < 64:
         sW[tidx] = cute.make_tensor(w_ptr, cute.make_layout(1 << 20))[b * 64 + tidx]
@@ -805,6 +765,57 @@ def _dsv4_kernel(
             dst = cute.local_tile(sB_c, (CROW, DIM), (r, 0))
             cute.copy(gcpq, thr_q.partition_S(src), thr_q.partition_D(dst))
         cute.arch.cp_async_commit_group()
+
+    if tidx == 0:
+        for i in cutlass.range_constexpr(STAGES):
+            cute.arch.mbarrier_init(ab_full + i, P_THREADS)
+            cute.arch.mbarrier_init(ab_empty + i, 1)
+        for i in cutlass.range_constexpr(NACC):
+            cute.arch.mbarrier_init(acc_full + i, 1)
+            cute.arch.mbarrier_init(acc_empty + i, 128)
+        cute.arch.mbarrier_init_fence()
+
+    sA = cute.make_tensor(sA_ptr, cute.make_layout(LAY[0][0], stride=LAY[0][1]))
+    sB = cute.make_tensor(sB_ptr, cute.make_layout(LAY[1][0], stride=LAY[1][1]))
+    # Partition the staged UMMA A layout into four independent 32x128 TMA
+    # destinations (TOK / PAGE = 4 page slots per MMA tile).  The GMEM tensor
+    # keeps the physical page pool as its residual mode, so an arbitrary
+    # block-table page ID is a legal runtime coordinate and does not require
+    # rebuilding the TMA descriptor.
+    sK_tma = cute.make_tensor(cute.recast_ptr(sA_raw, dtype=FP4), smem_layout_k_tma)
+    sK_tma, gK_tma = cute.nvgpu.cpasync.tma_partition(
+        tma_atom_k,
+        0,
+        cute.make_layout(1),
+        smem_tensor=sK_tma,
+        gmem_tensor=cute.group_modes(mKV, 0, 2),
+    )
+    sSFA = cute.make_tensor(
+        cute.recast_ptr(sSFA_raw, dtype=SF), cute.make_layout(LAY[2][0], stride=LAY[2][1])
+    )
+    sSFB = cute.make_tensor(
+        cute.recast_ptr(sSFB_raw, dtype=SF), cute.make_layout(LAY[3][0], stride=LAY[3][1])
+    )
+    acc_layout = cute.make_layout(LAY[4][0], stride=LAY[4][1])
+    sfa_tmem_layout = cute.make_layout(LAY[5][0], stride=LAY[5][1])
+    sfb_tmem_layout = cute.make_layout(LAY[6][0], stride=LAY[6][1])
+
+    if tidx >= 128:
+        ii = tidx - 128
+        for i in cutlass.range(ii, NBINS, NTHREADS - 128, unroll=1):
+            sHist[i] = I32(0)
+            sTot[i] = I32(0)
+    if tidx < 32:
+        sCtl[tidx] = I32(0)
+        sFine[tidx] = I32(0)
+        sFTot[tidx] = I32(0)
+
+    if warp_idx == 0:
+        cute.arch.alloc_tmem(512, tmem_hold)
+    if warp_idx == 11:
+        cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
+
+    if tidx < 128:
         cute.arch.cp_async_wait_group(0)
 
     cute.arch.barrier()
@@ -877,14 +888,20 @@ def _dsv4_kernel(
                 if cutlass.const_expr(NCOMP >= 32768):
                     jf = j + 2
                 if jf < ntl:
-                    pgf = sBT[(jf & (RBT - 1)) * 4 + pgt]
+                    bsf = jf & (RBT - 1)
+                    if cutlass.const_expr(NLOC <= RBT):
+                        bsf = ntl - 1 - jf
+                    pgf = sBT[bsf * 4 + pgt]
                     base = kv_ptr.toint() + cutlass.Int64(pgf) * PGB
                     _pfl2(base + tkt * 128)
                     if tkt == 0:
                         _pfl2(base + 2048)
             # scale plane keeps the per-half-warp page; data plane is per warp
-            pg0 = cute.arch.make_warp_uniform(sBT[(j & (RBT - 1)) * 4 + pgw])
-            pg1 = cute.arch.make_warp_uniform(sBT[(j & (RBT - 1)) * 4 + pgw + 1])
+            bsl = j & (RBT - 1)
+            if cutlass.const_expr(NLOC <= RBT):
+                bsl = ntl - 1 - j
+            pg0 = cute.arch.make_warp_uniform(sBT[bsl * 4 + pgw])
+            pg1 = cute.arch.make_warp_uniform(sBT[bsl * 4 + pgw + 1])
             pg = pg0
             if pgt != pgw:
                 pg = pg1
