@@ -47,6 +47,14 @@ struct HelixAllToAllParams
     int cpSize;
     int channelCount; // use 0 to auto-compute
     int maxChannelCount;
+
+    // Rows this rank owns no KV for. The sender replaces them in shared memory
+    // with a no-op contribution for the combine: field 0 zeros, field 1
+    // (max, sum) = (-inf, 0). nullptr when the caller already sanitized.
+    uint8_t const* zeroKvMask;
+    // entryCount / zeroKvMask length: 1 when an entry is a token (fifo v2),
+    // num_heads when it is a (token, head) pair (fifo v1).
+    int zeroKvMaskDivisor;
 };
 
 // ============================================================================

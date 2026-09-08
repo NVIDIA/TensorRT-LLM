@@ -1260,7 +1260,12 @@ def _register_fake():
         ]
 
     @torch.library.register_fake("trtllm::alltoall_helix_native")
-    def _(partial_o, softmax_stats, workspace, cp_rank, cp_size):
+    def _(partial_o,
+          softmax_stats,
+          workspace,
+          cp_rank,
+          cp_size,
+          zero_kv_mask=None):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
