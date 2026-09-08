@@ -39,6 +39,7 @@ class _MiniMaxM3DenseKVCacheManager(Protocol):
 
     def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str) -> tuple[torch.Tensor, int]: ...
 
+
 @functools.lru_cache(maxsize=None)
 def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
     """Byte size of the multi-CTA KV counter block.
