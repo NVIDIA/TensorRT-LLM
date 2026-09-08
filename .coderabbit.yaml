@@ -31,66 +31,6 @@ reviews:
 
   commit_status: false
   high_level_summary_instructions: |
-    Produce two sections:
-
-    **Dev Engineer Review**
-    Correctness, performance, API consistency (CODING_GUIDELINES.md), error handling, regressions.
-
-    **QA Engineer Review**
-    Always include this section when any files under tests/ are touched.
-    For test-list-only changes (only tests/integration/test_lists/ files):
-      - List all modified test-list files, including waives.txt, and what entries were added or removed.
-      - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
-      - CBTS touchmap coverage evidence is not applicable: these changes are handled directly by Tier 1
-        path/diff rules, while the touchmap is used for residual source-code changes.
-      - Verdict: "sufficient" or "insufficient" based on the correctness and intended scope of the list changes.
-    For test-code changes (files outside tests/integration/test_lists/):
-      - List test functions added, modified, or removed.
-      - State whether each is covered in tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
-      - Verdict: sufficient, insufficient, or needs follow-up.
-    If no test files are touched, write "No test changes."
-    Assess whether the changed code is covered by tests outside this PR
-    (existing entries in tests/integration/test_lists/test-db/ for CI or
-    tests/integration/test_lists/qa/ for manual QA).
-    If no test files are modified, write "No test changes."
-    When CBTS artifacts are available, the verdict must cite their results:
-    "sufficient" only when the relevant coverage passes; otherwise "insufficient"
-    with the failing or missing evidence identified.
-    When CBTS artifacts are unavailable, use "needs follow-up".
-    If no test files are touched, write "No test changes."
-
-    For test-list-only changes (only tests/integration/test_lists/ files):
-    - Report which test-db/ or qa/ files were modified and what entries were added or removed.
-    - When CBTS artifacts are available: verdict is "sufficient" if coverage passes,
-      "insufficient" with the failing or missing evidence identified otherwise.
-    - When CBTS artifacts are unavailable: verdict is "needs follow-up".
-
-    For test-code changes (tests/** excluding tests/integration/test_lists/):
-    - List test functions added, modified, or removed.
-    - State whether each is covered in test-db/ (CI) or qa/ (manual QA).
-    - Apply the same CBTS-aware verdict logic above.
-
-    Keep feedback actionable: reference concrete list file names when suggesting additions.
-  walkthrough_instructions: |
-    For each changed file, include a concise QA perspective:
-    - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
-      the test covers and whether it is listed in tests/integration/test_lists/test-db/ (CI)
-      or tests/integration/test_lists/qa/ (manual QA).
-    - For source files: note any observable behavior changes a QA engineer should verify
-      (new code paths, changed APIs, altered defaults, removed functionality).
-    - For configuration files (e.g. .coderabbit.yaml, *.yml, *.yaml, *.json, *.toml):
-      note any review or workflow behavior changes introduced by the config update.
-    Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
-  collapse_walkthrough: false
-  assess_linked_issues: true
-  related_issues: true
-  related_prs: true
-  suggested_labels: true
-  suggested_reviewers: true
-  poem: false
-  review_status: false
-
-  high_level_summary_instructions: |
     Provide two concise sections:
 
     ## Dev Engineer Review
@@ -112,6 +52,24 @@ reviews:
 
     For test-list-only changes, summarize the affected list files and entries
     directly. Do not require test-function changes or CBTS touchmap evidence.
+  walkthrough_instructions: |
+    For each changed file, include a concise QA perspective:
+    - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
+      the test covers and whether it is listed in tests/integration/test_lists/test-db/ (CI)
+      or tests/integration/test_lists/qa/ (manual QA).
+    - For source files: note any observable behavior changes a QA engineer should verify
+      (new code paths, changed APIs, altered defaults, removed functionality).
+    - For configuration files (e.g. .coderabbit.yaml, *.yml, *.yaml, *.json, *.toml):
+      note any review or workflow behavior changes introduced by the config update.
+    Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
+  collapse_walkthrough: false
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  suggested_reviewers: true
+  poem: false
+  review_status: false
 
   auto_review:
     auto_incremental_review: true
@@ -121,32 +79,6 @@ reviews:
       - "release/.+"
 
   path_instructions:
-<<<<<<< HEAD
-<<<<<<< HEAD
-    - path: "tests/**"
-      instructions: |
-        Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
-        Always produce a test coverage summary, even if no issues are found.
-
-        If the change touches ONLY files under tests/integration/test_lists/ (no test-code changes):
-        - Report all modified test-list files, including waives.txt, and what entries were added or removed.
-        - Do NOT require changed test functions for this path.
-        - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
-        - CBTS touchmap coverage evidence is not applicable: test-list-only changes are handled directly by
-          Tier 1 path/diff rules, while the touchmap is used for residual source-code changes.
-        - Do NOT use verdict "needs follow-up" solely because cbts_touchmap.sqlite or a CBTS coverage report
-          is unavailable. Use "sufficient" or "insufficient" based on the correctness and intended scope of
-          the list changes.
-
-        If the change includes test-code files (outside tests/integration/test_lists/), the summary must include:
-        1. Which test functions were added, modified, or removed.
-        2. Whether each changed test is listed in the appropriate test list files under
-           tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
-        3. A coverage verdict: sufficient, insufficient, or needs follow-up.
-        Keep feedback actionable: reference concrete list file names when suggesting additions.
-=======
->>>>>>> 625037290e (update coderabbit prompt)
-=======
     # Production-code coverage review. This is required because tests/** rules
     # do not run when a PR changes source code without changing a test file.
     - path: "tensorrt_llm/**"
@@ -310,7 +242,6 @@ reviews:
         4. Concrete test-list file names whenever suggesting additions.
 
     # Manual QA lists are independently maintained from CI test-db lists.
->>>>>>> 413eb3f0fe (update coderabbit review)
     - path: "tests/integration/test_lists/qa/**"
       instructions: |
         Files here are manually-triggered QA performance/regression lists
@@ -328,18 +259,6 @@ reviews:
     # Auto-run CI lists are independently maintained from manual QA lists.
     - path: "tests/integration/test_lists/test-db/**"
       instructions: |
-<<<<<<< HEAD
-        Files here drive the auto-run CI test-db (per-GPU l0_*.yml tiers).
-        Adding or removing entries here changes what CI runs either in every PR (pre-merge) or three times a day (post-merge).
-        Do NOT suggest cross-syncing with the QA lists under
-        tests/integration/test_lists/qa/.
-    - path: "tests/integration/test_lists/**"
-      instructions: |
-        Files here (waives.txt and the *.txt/*.yml list files) are plain-text
-        test-list data files, not source code. By repo convention they carry no
-        NVIDIA copyright/license header. Do NOT require or suggest adding a
-        copyright header to these files.
-=======
         Files here drive the auto-run CI test-db, including per-GPU l0_*.yml
         tiers. Adding or removing an entry changes what CI runs either in every
         PR (pre-merge) or three times per day (post-merge).
@@ -362,7 +281,6 @@ reviews:
         Do NOT require or suggest adding a copyright, SPDX, or license header
         to files under this directory.
 
->>>>>>> 413eb3f0fe (update coderabbit review)
 knowledge_base:
   code_guidelines:
     enabled: true
