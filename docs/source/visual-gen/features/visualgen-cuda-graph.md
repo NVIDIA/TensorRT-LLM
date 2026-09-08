@@ -62,7 +62,7 @@ Models add non-shape graph-key contributors through `BaseDiffusionModel.register
 
 During key construction, the runner calls each registered callback with the same `*args` and `**kwargs` passed to the wrapped `model.forward`. If the callback returns a non-`None` hashable value, the runner appends `(name, value)` to the graph key. If it returns `None`, that key part is omitted for the current call.
 
-Use an extra key when a forward input affects captured kernels or control flow but is not already represented by tensor shapes. For example, [Skip Softmax Attention](sparse-attention.md) can require separate CUDA graphs across its dense and sparse phases even when tensor shapes are identical. The base `BaseDiffusionModel` implementation registers a callback through `runner.register_extra_key_fn(...)` for this case.
+Use an extra key when a forward input affects captured kernels or control flow but is not already represented by tensor shapes. For example, [Skip Softmax Attention](visualgen-sparse-attention.md) can require separate CUDA graphs across its dense and sparse phases even when tensor shapes are identical. The base `BaseDiffusionModel` implementation registers a callback through `runner.register_extra_key_fn(...)` for this case.
 
 Subclasses can override `register_cuda_graph_extra_key_fns()` to add model-specific contributors. They should call `super()` unless they intentionally replace the shared registrations. This changes graph capture partitioning without exposing internal CUDA graph keys as public model-forward arguments.
 

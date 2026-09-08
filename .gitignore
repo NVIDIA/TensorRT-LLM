@@ -69,7 +69,6 @@ docs/source/**/*.rst
 !docs/source/features/auto_deploy/transforms.rst
 !docs/source/features/auto_deploy/transforms/
 !docs/source/features/auto_deploy/transforms/*.rst
-!docs/source/visual-gen/features.rst
 *.swp
 .nfs*
 

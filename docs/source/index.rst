@@ -88,7 +88,9 @@ Welcome to TensorRT LLM's Documentation!
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
-   visual-gen/features.rst
+   visual-gen/features/visualgen-cuda-graph.md
+   visual-gen/features/visualgen-quantized-attention.md
+   visual-gen/features/visualgen-sparse-attention.md
 
 
 .. toctree::

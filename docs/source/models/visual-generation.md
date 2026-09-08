@@ -14,8 +14,8 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
 - Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
-- Quantized attention support: see [VisualGen Quantized Attention](../visual-gen/features/quantized-attention.md).
-- Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
+- Quantized attention support: see [VisualGen Quantized Attention](../visual-gen/features/visualgen-quantized-attention.md).
+- Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/visualgen-sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
 - CPU offloading to reduce peak GPU memory usage.
@@ -213,11 +213,11 @@ By default, `strict=True` raises when adapter tensors cannot be matched, have un
 
 ### Quantized Attention
 
-In addition to linear-layer quantization, VisualGen exposes multiple backend-specific **quantized-attention** recipes that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and can be enabled independently with any linear layer configuration.  See [VisualGen Quantized Attention](../visual-gen/features/quantized-attention.md) for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.
+In addition to linear-layer quantization, VisualGen exposes multiple backend-specific **quantized-attention** recipes that operate inside the attention kernel. They are configured through `AttentionConfig.quant_attention_config` and can be enabled independently with any linear layer configuration.  See [VisualGen Quantized Attention](../visual-gen/features/visualgen-quantized-attention.md) for the full recipe table, the V scale-granularity trade-off, and the block-scaled MXFP8 / NVFP4 recipes.
 
 ### CUDA Graphs
 
-VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../visual-gen/features/cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
+VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../visual-gen/features/visualgen-cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
 
 ### Step Caching
 
