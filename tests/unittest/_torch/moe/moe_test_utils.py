@@ -1411,6 +1411,7 @@ def should_skip_to_accelerate_ci(
     swiglu_gptoss_style: bool = False,
     parallel_mode: Optional[str] = None,
     activation_type: Optional[ActivationType] = ActivationType.Swiglu,
+    enable_locality_domains: bool = False,
 ) -> Optional[str]:
     """
     Skip low-information-density test combinations to accelerate CI.
@@ -1419,8 +1420,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
-       unquantized coverage enabled.
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16 and
+       locality domain CuteDSL BF16 coverage enabled.
     0a. MARLIN backend: only NVFP4 on Ada/Hopper (SM89-SM99); skip all other
         quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
@@ -1438,6 +1439,7 @@ def should_skip_to_accelerate_ci(
         seq_len: Sequence length
         swiglu_gptoss_style: Whether using SwiGLU gptoss style
         parallel_mode: Multi-GPU parallel mode (None for single-GPU tests)
+        enable_locality_domains: Whether the test enables locality domain execution
 
     Returns:
         Skip reason string if test should be skipped for CI, None otherwise
@@ -1449,11 +1451,16 @@ def should_skip_to_accelerate_ci(
         return None
 
     # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
+    # Keep TRTLLM BF16 for FlashInfer and CuteDSL BF16 with locality domain for the
+    # dedicated locality domain backend matrix.
+    keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
+        backend_type == MoeBackendType.TRTLLM
+        or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)
+    )
     if (
         quant_algo is None
         and is_gated_activation(activation_type)
-        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
+        and not keeps_unquantized_bf16_coverage
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 

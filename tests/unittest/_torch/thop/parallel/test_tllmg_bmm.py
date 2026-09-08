@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-import sys
 from dataclasses import dataclass
 
 import pytest
@@ -22,8 +20,6 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm.quantization.utils.fp4_utils import shuffle_matrix_a
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # TODO: add test for fp4
 

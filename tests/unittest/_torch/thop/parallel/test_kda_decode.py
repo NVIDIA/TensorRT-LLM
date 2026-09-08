@@ -420,7 +420,14 @@ def test_kda_decode_matches_fla(
         gate_lower_bound=gate_lower_bound,
     )
 
-    actual_output = torch.ops.trtllm.kda_decode(
+    # kda_decode is inplace-only: the caller supplies the output buffer and the
+    # kernel writes into it (the op returns ``()``).
+    actual_output = torch.empty(
+        (batch_size, 1, num_heads, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    torch.ops.trtllm.kda_decode(
         inputs.x_q,
         inputs.x_k,
         inputs.x_v,
@@ -449,6 +456,7 @@ def test_kda_decode_matches_fla(
         0.0 if gate_lower_bound is None else gate_lower_bound,
         head_dim**-0.5,
         OUTPUT_NORM_EPS,
+        actual_output,
     )
 
     _assert_parity("output", actual_output, expected_output)

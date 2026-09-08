@@ -31,7 +31,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 pytestmark = pytest.mark.cpu_only
 
-
 # ---------------------------------------------------------------------------
 # _align_kv_blocks: contract unchanged.
 # ---------------------------------------------------------------------------
@@ -402,6 +401,8 @@ def _build_transceiver_for_kv_slice(
         py_request_id=0,
         py_beam_width=beam_width,
         is_generation_only_request=lambda: is_generation_only,
+        # num_extra_kv_tokens == max_draft_len - 1
+        py_draft_tokens=[0 for _ in range(num_extra_kv_tokens + 1)],
     )
     return transceiver, req
 
@@ -859,6 +860,7 @@ class TestTransceiverContextManager:
         tc._send_reqs = {}
         tc._recv_reqs = {}
         tc._transfer_worker = MagicMock()
+        tc._shutdown_complete = False
         return tc
 
     def test_enter_returns_self(self):
@@ -871,7 +873,7 @@ class TestTransceiverContextManager:
         with tc:
             pass
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_exit_calls_shutdown_on_exception(self):
         tc = self._tc()
@@ -880,10 +882,10 @@ class TestTransceiverContextManager:
                 raise RuntimeError("boom")
         # __exit__ still ran shutdown despite the in-block exception.
         tc._transfer_worker.shutdown.assert_called_once()
-        assert tc._shutdown is True
+        assert tc._shutdown_complete is True
 
     def test_shutdown_is_idempotent(self):
         tc = self._tc()
         tc.shutdown()
-        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc.shutdown()  # second call short-circuits after completed teardown.
         tc._transfer_worker.shutdown.assert_called_once()

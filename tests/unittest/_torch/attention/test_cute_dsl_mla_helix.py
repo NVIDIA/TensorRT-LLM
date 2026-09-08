@@ -24,8 +24,8 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
 ) -> None:
     import cutlass
 
+    from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
-    from tensorrt_llm._torch.modules.attention import _helix_sanitize_empty_kv
 
     torch.manual_seed(17)
     device = torch.device("cuda")

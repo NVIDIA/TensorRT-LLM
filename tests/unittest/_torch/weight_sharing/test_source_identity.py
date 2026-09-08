@@ -35,6 +35,7 @@ from _source_identity_fakes import (
 
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
@@ -77,6 +78,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
     "transform_abi_id",
     [
         LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
         QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     ],
@@ -122,6 +124,16 @@ def test_model_layout_field_mismatch_flags_global_and_shard():
     assert not result.matched
     assert "model_fingerprint" in result.mismatched_fields
     assert "shard_fingerprint" in result.mismatched_fields
+
+
+def test_sliding_window_config_mismatch_flags_global():
+    # The realized sliding-window profile dimension needs no SourceIdentity
+    # change: the checkpoint config already separates windowed checkpoints.
+    a = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=None)))
+    b = identity_from(FakeModelConfig(pretrained_config=FakePretrainedConfig(sliding_window=4096)))
+    result = a.matches(b)
+    assert not result.matched
+    assert "model_fingerprint" in result.mismatched_fields
 
 
 def test_non_layout_model_metadata_does_not_affect_match():

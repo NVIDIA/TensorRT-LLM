@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 from tensorrt_llm.mapping import Mapping
 

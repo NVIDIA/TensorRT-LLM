@@ -284,9 +284,14 @@ public:
 
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
-    int numTokensBeforeHybridPruning() const noexcept
+    int numReusableTokensBeforeHybridPruning() const noexcept
     {
-        return mNumTokensBeforeHybridPruning;
+        return mNumReusableTokensBeforeHybridPruning;
+    }
+
+    int numReusableTokensBeforePruning() const noexcept
+    {
+        return mNumReusableTokensBeforePruning;
     }
 
     std::vector<TokenIdExt> const& committedTokens() const noexcept
@@ -598,7 +603,8 @@ private:
     std::vector<TokenIdExt> mCommittedTokens;
     // Resolved per-sequence text-only state after applying the manager default.
     bool mTextOnly = false;
-    int mNumTokensBeforeHybridPruning;
+    int mNumReusableTokensBeforeHybridPruning;
+    int mNumReusableTokensBeforePruning;
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

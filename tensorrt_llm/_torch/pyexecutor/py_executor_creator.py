@@ -31,7 +31,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
-from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -49,8 +49,8 @@ from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
-_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
@@ -692,11 +692,16 @@ def create_py_executor(
                                            False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
+        nvfp4_dsa_cache_reuse = (kv_cache_quant_algo == QuantAlgo.NVFP4
+                                 and getattr(sparse_attention_config,
+                                             "algorithm", None) == "dsa")
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
-                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8):
+                == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
+                or nvfp4_dsa_cache_reuse):
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled without KV cache quantization or with FP8 quantization, "
+                f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
+                f"or with NVFP4 quantization on the DSA sparse path, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False

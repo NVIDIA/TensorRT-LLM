@@ -28,7 +28,7 @@ from typing import Dict, List
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
     minimax_m3_trtllm_gen_dense_decode,
     subpage_block_table,

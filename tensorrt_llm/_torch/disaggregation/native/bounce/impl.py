@@ -379,6 +379,13 @@ class VmmBounceTransport(BounceTransport):
         or leaking it. Idempotent; a no-op once the transfer has settled."""
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
 
+    def abort_publication(self, rid_slice: RidSlice, published_writers: set[int]) -> None:
+        """Retain a failed fan-out until every successfully published writer drains."""
+        self._apply(
+            rid_slice,
+            lambda ctx: ctx.abort_publication(published_writers),
+        )
+
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
         released, never holding it across a CUDA sync, a queue put, or a callback. No-op if the
@@ -525,6 +532,9 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def orphan_reservation(self, rid_slice) -> None:
+        pass
+
+    def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
         pass
 
     def record_result(
