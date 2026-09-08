@@ -88,6 +88,7 @@ Welcome to TensorRT LLM's Documentation!
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
+   visual-gen/features.rst
 
 
 .. toctree::

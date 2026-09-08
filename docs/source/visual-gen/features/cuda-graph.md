@@ -1,7 +1,7 @@
-# VisualGen CUDA Graphs
+# VisualGen CUDA Graphs (Beta)
 
 ```{note}
-This page is an unindexed draft until the VisualGen documentation hub is introduced.
+This feature is in **beta** stage. APIs, supported models, and optimization options are actively evolving and may change in future releases.
 ```
 
 - [Overview](#overview)
