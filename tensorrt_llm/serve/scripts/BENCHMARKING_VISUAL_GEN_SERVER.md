@@ -13,19 +13,29 @@ This page repeats no field description. Each lives with its definition:
 
 | what | where |
 |---|---|
-| every flag, in five groups — Connection, Workload, Traffic, Execution, Results | `--help` |
+| every flag, with its default | `--help` |
 | what a generation parameter means | `VisualGenParams` in [`visual_gen/params.py`](../../visual_gen/params.py) |
 | which route validates which field | `ImageGenerationRequest` · `ImageEditRequest` · `VideoGenerationRequest` in [`openai_protocol.py`](../openai_protocol.py) |
 | what a result-JSON key holds | `VisualGenBenchResult` and `VisualGenRequestRecord` in [`benchmark_visual_gen.py`](benchmark_visual_gen.py) |
 
-What follows is what none of them can state on its own: the document's shape, which route
-carries which field, and how the latency series relate.
+## The flags, by group
+
+`--help` lists them under five groups, each answering one question:
+
+* **Connection** — where the server is, and what it serves.
+* **Workload** — what the run sends. The document arrives as `--workload` or spelled out as
+  field flags, never both.
+* **Traffic** — when requests are issued.
+* **Execution** — how the client drives the run, and how the media comes back.
+* **Results** — what the run writes down.
+
+The rest of this page is what none of the definitions above can state on its own: the
+document's shape, which route carries which field, and how the latency series relate.
 
 ## The workload document
 
 A YAML or JSON file, the same document inline (starting with `{` or `[`), or a bare list of
-requests, named by `--workload`. The `--help` **Workload** group spells the same document out
-as flags instead; a run gives one or the other, never both.
+requests, named by `--workload`.
 
 ```yaml
 backend: openai-videos                    # openai-videos | openai-images | openai-image-edits
