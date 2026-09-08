@@ -36,7 +36,6 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
   - unittest/llmapi/apps/test_disagg_serving_perf_metrics.py
   - disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
-  # llmapi
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8[tp2_ep1]
 - condition:
