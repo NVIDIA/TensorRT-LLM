@@ -19,7 +19,7 @@ from .workflow import PerfAnalyzeWorkflow
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Serve a model with trtllm-serve, benchmark and profile it with "
-        "benchmark_serving.py (nsys + torch profiler), and report the main "
+        "benchmark_serving.py (nsys + ncu), and report the main "
         "performance bottleneck — via a benchmarker -> projector -> analyzer "
         "-> reporter pipeline (the projector derives an analytical "
         "speed-of-light ceiling per the internal-perf-sol-analysis skill "
@@ -44,7 +44,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Workspace directory for shared state files (task.yaml, "
         "benchmark_results.md, sol_projection.md, profile_findings.md, "
         "performance_report.md/.html, progress.yaml) and run artifacts "
-        "(serve.log, result JSON, *.nsys-rep, torch_trace/).",
+        "(serve.log, result JSON, *.nsys-rep, *.ncu-rep).",
     )
     parser.add_argument(
         "--clean",
