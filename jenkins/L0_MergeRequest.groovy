@@ -423,13 +423,14 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     }
 }
 
-def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputFile)
+def checkoutTargetBranchFile(String targetBranch, String targetCommit, String sourcePath, String outputPrefix)
 {
     if (targetCommit) {
+        def outputFile = "${outputPrefix}_${targetCommit}.txt"
         try {
             sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/" +
                "${targetCommit}/${sourcePath} -O ${outputFile}"
-            return true
+            return outputFile
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -437,23 +438,21 @@ def checkoutTargetBranchFile(String targetBranch, String targetCommit, String so
         }
     }
 
-    def gitlabRefs = targetCommit ? [targetCommit, targetBranch] : [targetBranch]
-    for (def gitlabRef : gitlabRefs) {
-        try {
-            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, gitlabRef, sourcePath, ".")
-            }
-            def sourceFileName = sourcePath.tokenize('/').last()
-            sh "mv ${sourceFileName} ${outputFile}"
-            return true
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            echo "Failed to checkout ${sourcePath} from internal GitLab at ref " +
-                 "${gitlabRef}. Error: ${e.toString()}"
+    def outputFile = "${outputPrefix}.txt"
+    try {
+        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, sourcePath, ".")
         }
+        def sourceFileName = sourcePath.tokenize('/').last()
+        sh "mv ${sourceFileName} ${outputFile}"
+        return outputFile
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to checkout ${sourcePath} from internal GitLab at ref " +
+             "${targetBranch}. Error: ${e.toString()}"
     }
-    return false
+    return ""
 }
 
 def mergeWaiveList(pipeline, globalVars)
@@ -486,10 +485,9 @@ def mergeWaiveList(pipeline, globalVars)
         echo "Failed to resolve the target branch TOT commit from public GitHub. Error: ${e.toString()}"
     }
 
-    def waiveTot = "waives_TOT_${targetBranchTOTCommit}.txt"
-    def isGetTOTWaiveList = checkoutTargetBranchFile(
-        targetBranch, targetBranchTOTCommit, "tests/integration/test_lists/waives.txt", waiveTot)
-    if (!isGetTOTWaiveList) {
+    def waiveTot = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, "tests/integration/test_lists/waives.txt", "waives_TOT")
+    if (!waiveTot) {
         catchError(
             buildResult: 'SUCCESS',
             stageResult: 'UNSTABLE') {
@@ -532,11 +530,10 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
     def maintenanceConfigPath = "jenkins/config/maintenance_stages.txt"
     def targetBranch = targetBranchInfo.targetBranch
     def targetBranchTOTCommit = targetBranchInfo.targetCommit
-    def maintenanceTot = "maintenance_stages_TOT_${targetBranchTOTCommit}.txt"
     def maintenanceSource = "${LLM_ROOT}/${maintenanceConfigPath}"
-    def isGetTOTMaintenanceConfig = checkoutTargetBranchFile(
-        targetBranch, targetBranchTOTCommit, maintenanceConfigPath, maintenanceTot)
-    if (!isGetTOTMaintenanceConfig) {
+    def maintenanceTot = checkoutTargetBranchFile(
+        targetBranch, targetBranchTOTCommit, maintenanceConfigPath, "maintenance_stages_TOT")
+    if (!maintenanceTot) {
         catchError(
             buildResult: 'SUCCESS',
             stageResult: 'UNSTABLE') {
