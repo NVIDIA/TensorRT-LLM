@@ -1,4 +1,4 @@
-# Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding
+# Helix Parallelism in TensorRT LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding
 
 By NVIDIA TensorRT LLM Team
 
@@ -16,7 +16,7 @@ By NVIDIA TensorRT LLM Team
   - [Communication Volume Analysis](#communication-volume-analysis)
   - [FFN Phase: Rank Reprovisioning](#ffn-phase-rank-reprovisioning)
   - [Distributed KV Concatenation](#distributed-kv-concatenation)
-- [Implementation in TensorRT-LLM](#implementation-in-tensorrt-llm)
+- [Implementation in TensorRT LLM](#implementation-in-tensorrt-llm)
   - [Configuration](#configuration)
   - [Model Integration](#model-integration)
   - [Request Handling for Helix](#request-handling-for-helix)
@@ -36,7 +36,7 @@ Helix Parallelism addresses the two dominant bottlenecks in long-context decodin
 
 Compared to conventional parallelism approaches, Helix delivers up to **32x** concurrency improvement and **1.8x** interactivity improvement for 1M sequence length on DeepSeek-R1 with GB300 silicon NVL72, pushing forward the throughput-latency Pareto frontier and making real-time inference with ultra-long sequences practical.
 
-This blog describes how Helix Parallelism is implemented in TensorRT-LLM, covering the algorithm, architecture, configuration, kernel-level details, and how to get started. For the full algorithmic description, see the original paper: [Helix Parallelism: Rethinking Sharding Strategies for Interactive Multi-Million-Token LLM Decoding](https://arxiv.org/pdf/2507.07120).
+This blog describes how Helix Parallelism is implemented in TensorRT LLM, covering the algorithm, architecture, configuration, kernel-level details, and how to get started. For the full algorithmic description, see the original paper: [Helix Parallelism: Rethinking Sharding Strategies for Interactive Multi-Million-Token LLM Decoding](https://arxiv.org/pdf/2507.07120).
 
 ## Decoding Bottlenecks at Scale
 
@@ -132,7 +132,7 @@ After the attention All-to-All and post-attention linear projection (run in TP=N
 - **Dense FFNs** (EP=1): All N GPUs collaborate in tensor-parallel fashion (TP_F = N), each holding a shard of size H×(F/N), to amortize weight-read costs across all available devices.
 - **MoE FFNs** (EP > 1): The N GPUs are repartitioned into a TP_F × EP grid. Tokens are routed to appropriate experts, TP is applied within each expert group, and intra-expert All-Reduce + inter-expert All-Gather produce the final output.
 
-In TensorRT-LLM, this reprovisioning is implemented through the `repurpose_helix_cp_to_tp()` method in the `Mapping` class. The model holds two mappings:
+In TensorRT LLM, this reprovisioning is implemented through the `repurpose_helix_cp_to_tp()` method in the `Mapping` class. The model holds two mappings:
 - `mapping_with_cp`: the original mapping with CP ranks (used by attention layers)
 - A repurposed mapping where `tp_size = tp_size × cp_size` and `cp_size = 1` (used by FFN/MoE layers)
 
@@ -140,13 +140,13 @@ In TensorRT-LLM, this reprovisioning is implemented through the `repurpose_helix
 
 During decoding, each newly generated token is broadcast to all KVP GPUs for query computation. However, Helix staggers the KV cache updates across KVP ranks in round-robin fashion to prevent DRAM hot spots: tokens 1-32 go to KVP rank 0, tokens 33-64 to KVP rank 1, and so on, cycling through all KVP ranks. This staged concatenation guarantees uniform KV growth and balanced memory usage regardless of batch size or sequence length.
 
-TensorRT-LLM's `partition_context_for_helix()` function implements this partitioning: given the full input token sequence, it assigns blocks of tokens to CP ranks based on `tokens_per_block`, with position IDs preserved for correct rotary embeddings.
+TensorRT LLM's `partition_context_for_helix()` function implements this partitioning: given the full input token sequence, it assigns blocks of tokens to CP ranks based on `tokens_per_block`, with position IDs preserved for correct rotary embeddings.
 
-## Implementation in TensorRT-LLM
+## Implementation in TensorRT LLM
 
 ### Configuration
 
-Helix is exposed through TensorRT-LLM's context parallelism framework. The relevant configuration parameters are:
+Helix is exposed through TensorRT LLM's context parallelism framework. The relevant configuration parameters are:
 
 | Parameter | Description | Required |
 |-----------|-------------|----------|
@@ -174,7 +174,7 @@ A validation rule in [`TorchLlmArgs`](https://github.com/NVIDIA/TensorRT-LLM/blo
 
 ### Model Integration
 
-Helix in TensorRT-LLM supports all three major attention variants on Blackwell GPU architecture: Multi-Latent Attention (MLA), Grouped-Query Attention (GQA), and Multi-Head Attention (MHA).
+Helix in TensorRT LLM supports all three major attention variants on Blackwell GPU architecture: Multi-Latent Attention (MLA), Grouped-Query Attention (GQA), and Multi-Head Attention (MHA).
 
 The integration in [`DeepseekV3ForCausalLM`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py) demonstrates the rank reprovisioning pattern, driven by helpers in [`tensorrt_llm/mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/mapping.py):
 
@@ -194,7 +194,7 @@ Since Helix is a **decode-only feature** designed for **disaggregated serving**,
 
 ### KV Cache Management
 
-Helix changes both how the KV cache moves from the prefill (context) server to the decode (generation) server, and how it grows on the generation server during the decode loop. Both pieces are handled inside TensorRT-LLM's existing KV cache infrastructure, gated on `gen_cp_size > 1`.
+Helix changes both how the KV cache moves from the prefill (context) server to the decode (generation) server, and how it grows on the generation server during the decode loop. Both pieces are handled inside TensorRT LLM's existing KV cache infrastructure, gated on `gen_cp_size > 1`.
 
 #### Cache transmission from prefill to decode
 
@@ -228,7 +228,7 @@ The Helix implementation includes dedicated CUDA kernels, exposed to Python via 
 
 ### Composability
 
-Helix is implemented as an additional dimension on top of TensorRT-LLM's existing parallelism and runtime stack, so it composes seamlessly with the rest of the framework rather than replacing any of it:
+Helix is implemented as an additional dimension on top of TensorRT LLM's existing parallelism and runtime stack, so it composes seamlessly with the rest of the framework rather than replacing any of it:
 
 - **Tensor Parallelism (TP)**: Helix multiplies onto the attention TP_A factor (with the constraint TP_A ≤ K) and is then repurposed into a wider TP_F group for FFN/MoE layers via `repurpose_helix_cp_to_tp()`.
 - **Pipeline Parallelism (PP)**: PP is orthogonal to KVP. Each pipeline stage independently applies the Helix attention/FFN split across its own GPU pool.
@@ -248,7 +248,7 @@ Helix parallelism provides performance benefits when all of the following condit
 
 ## Performance Results: DeepSeek-R1 (MoE, MLA)
 
-The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT-LLM with FP4 precision in disaggregated serving mode (Helix on the generation servers).
+The following results for DeepSeek-R1 are obtained on GB300 NVL72 using TensorRT LLM with FP4 precision in disaggregated serving mode (Helix on the generation servers).
 
 <div align="center">
 <figure>
@@ -266,9 +266,9 @@ Helix breaks this ceiling on the same pool of N GPUs by pinning TP_A ≤ K (for 
 
 ## Future Work
 
-- **HOP-B pipelining**: Implement fine-grained batch-wise pipelining in TensorRT-LLM to overlap All-to-All communication with attention computation, delivering up to 12% additional improvement for dense models.
-- **Speculative decoding support**: Extend Helix to compose with TensorRT-LLM's speculative decoding (e.g. MTP, EAGLE-3, NGram, draft model) so that long-context decode workloads can additionally benefit from multi-token-per-step generation.
+- **HOP-B pipelining**: Implement fine-grained batch-wise pipelining in TensorRT LLM to overlap All-to-All communication with attention computation, delivering up to 12% additional improvement for dense models.
+- **Speculative decoding support**: Extend Helix to compose with TensorRT LLM's speculative decoding (e.g. MTP, EAGLE-3, NGram, draft model) so that long-context decode workloads can additionally benefit from multi-token-per-step generation.
 
 ## Acknowledgment
 
-Helix Parallelism in TensorRT-LLM is the result of a close collaboration between NVIDIA Research, DevTech, and the TensorRT-LLM team, spanning algorithm design, kernel engineering, runtime integration, and distributed systems. It is a concrete example of a state-of-the-art research idea, originally proposed in the [Helix paper](https://arxiv.org/pdf/2507.07120), being co-designed with hardware-aware kernels and brought all the way into a production-grade inference stack. We hope that this work helps the developer community deploy long-context LLM inference more efficiently on NVIDIA GPU systems.
+Helix Parallelism in TensorRT LLM is the result of a close collaboration between NVIDIA Research, DevTech, and the TensorRT LLM team, spanning algorithm design, kernel engineering, runtime integration, and distributed systems. It is a concrete example of a state-of-the-art research idea, originally proposed in the [Helix paper](https://arxiv.org/pdf/2507.07120), being co-designed with hardware-aware kernels and brought all the way into a production-grade inference stack. We hope that this work helps the developer community deploy long-context LLM inference more efficiently on NVIDIA GPU systems.

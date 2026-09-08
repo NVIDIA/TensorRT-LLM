@@ -79,7 +79,7 @@ Because the DSA is the only architectural modification of DeepSeek-V3.2 from the
     - KV cache: Per-tensor FP8
     - Math: Per-tensor FP8
 
-The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to [Tech Blog 1](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) for the MoE precision strategy. In addition to the NVFP4 version of DeepSeek-V3.2, TensorRT-LLM also supports the original FP8 model, as well as both BF16 and per-tensor FP8 KV caches.
+The MoE layers use NVFP4, which is the same as the DeepSeek-R1. Please refer to [Tech Blog 1](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md) and [Tech Blog 3](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md) for the MoE precision strategy. In addition to the NVFP4 version of DeepSeek-V3.2, TensorRT LLM also supports the original FP8 model, as well as both BF16 and per-tensor FP8 KV caches.
 
 We evaluated the accuracy of this NVFP4 checkpoint on the same datasets:
 |                    | GSM8k | MMLU  | GPQA-Diamond |

@@ -1,4 +1,4 @@
-# Joint Optimization of Agent Applications and TensorRT-LLM
+# Joint Optimization of Agent Applications and TensorRT LLM
 
 ## Overview
 
@@ -8,7 +8,7 @@ In this tech blog, we introduce our latest efforts to apply Scaffolding to (mult
 
 Currently, agents and inference engines operate independently: agents treat the inference engine as a black box, while inference engines remain unaware of the logical structure underlying generation requests from agents. Scaffolding addresses this gap by serving as an intermediate layer between agent application logic and the LLM inference engine. It embeds the semantic information of agents into generation requests, enabling the inference engine to make more informed decisions about request scheduling and KV cache management.
 
-Although several research projects have explored this idea and demonstrated promising results, as a production-grade LLM inference engine, TensorRT-LLM aims to advance this line of work with a more robust, sustainable, and extensible architecture. This vision is guided by two goals from the perspectives of agent applications and the LLM inference engine, respectively:
+Although several research projects have explored this idea and demonstrated promising results, as a production-grade LLM inference engine, TensorRT LLM aims to advance this line of work with a more robust, sustainable, and extensible architecture. This vision is guided by two goals from the perspectives of agent applications and the LLM inference engine, respectively:
 
 1. Decouple information collection from the agent's core logic. In other words, ensure that this process remains transparent to agent applications.
 2. Ensure that the corresponding optimization policies and mechanisms within the LLM inference engine are as universal and pluggable as possible.
@@ -29,7 +29,7 @@ The frontend-backend decoupling and modular architecture of Scaffolding support 
 From the perspective of frontend-backend decoupling, the frontend encompasses the control flow of the aforementioned Planner-Executor architecture of the Deep Research agent, while the backends primarily consist of the LLM inference engine (for reasoning, content generation, and tool calling decisions) and the MCP server (which handles search tool requests). In terms of implementation, Scaffolding:
 
 - **(Frontend)** implements agent control flow through `Controller`s. `Supervisor` serves as the entry controller for the entire agent and delegates nodes including **ResearchBrief**, **Planning**, and **FinalReport** to `NativeGenerationController`, which is a reusable controller provided by Scaffolding for text generation. The `Supervisor` delegates specific research topics to sub-agents, namely `Researcher`, which is also implemented as a `Controller`. `Researcher` uses a sub-controller called `ChatWithMCPController`, another reusable controller provided by Scaffolding for calling external tools. After multiple rounds of interaction with search tools, `Researcher` also uses `NativeGenerationController` to compress search results and model reflections.
-- **(Backend)** serves LLM generation and tool call requests through two `Worker` instances. Scaffolding provides reusable implementations including `OpenaiWorker` (serves LLM generation requests via the OpenAI endpoint), `TRTLLMWorker` (serves LLM generation requests via the TensorRT-LLM API), and `MCPWorker` (serves tool calling requests via MCP server).
+- **(Backend)** serves LLM generation and tool call requests through two `Worker` instances. Scaffolding provides reusable implementations including `OpenaiWorker` (serves LLM generation requests via the OpenAI endpoint), `TRTLLMWorker` (serves LLM generation requests via the TensorRT LLM API), and `MCPWorker` (serves tool calling requests via MCP server).
 
 From the perspective of modularity, Scaffolding supports the evolution of individual components independent of other components in the multi-agent system. For example, if we want to use a more sophisticated sub-agent to write the final report, we only need to replace the corresponding Controller in that module. Additionally, we can support other LLM endpoints (e.g., Anthropic, Google) using an implementation similar to `OpenaiWorker`.
 
@@ -73,7 +73,7 @@ class Researcher(Controller):
 
 ## Capturing Agent Application Information
 
-To jointly optimize agent applications and TensorRT-LLM, we need a way to capture application semantics that matter for performance. Scaffolding provides **Task Collection**, a mechanism designed to decouple information collection from agent logic.
+To jointly optimize agent applications and TensorRT LLM, we need a way to capture application semantics that matter for performance. Scaffolding provides **Task Collection**, a mechanism designed to decouple information collection from agent logic.
 
 Task Collection works by instrumenting a controller’s `yield` points, since `yield` is the controller’s direct interface for issuing `Task`s to backend workers (e.g., `ChatTask` to `OpenaiWorker`, `MCPTask` to `MCPWorker`). Concretely, a Task Collection is a `TaskCollection` subclass that is attached to a Controller via a decorator. The runtime calls the collection’s `before_yield()` and `after_yield()` hooks immediately before and after each `yield` in the decorated controller’s `process()` method. Each Task Collection can therefore define its own logic for extracting metrics, tracking state, or annotating tasks.
 
@@ -136,7 +136,7 @@ class TokenBudgetMajorityVoteController(Controller):
         result = self.majority_vote(candidates, **kwargs)
 ```
 
-To attach a Task Collection, decorate the controller with `@with_task_collection(name, collection_cls)` and then access it via `self.task_collections[name]`. This not only makes the controller more aware of its own inference behavior, but also enables embedding application-level information into `Task`s so TensorRT-LLM can schedule, batch, and optimize requests more intelligently. Both case studies below use this capture-and-pass mechanism.
+To attach a Task Collection, decorate the controller with `@with_task_collection(name, collection_cls)` and then access it via `self.task_collections[name]`. This not only makes the controller more aware of its own inference behavior, but also enables embedding application-level information into `Task`s so TensorRT LLM can schedule, batch, and optimize requests more intelligently. Both case studies below use this capture-and-pass mechanism.
 
 ## Case Study 1: Proactive KV Cache Drop
 
@@ -150,7 +150,7 @@ In agentic applications, however, the context lifecycle is often deterministic a
 
 Scaffolding provides a task collection called `drop_kv_cache_scope` that captures all ChatTasks issued by a controller during its process method. When the application logic completes, Scaffolding emits a corresponding `DropKVCacheTask` for each captured ChatTask to an underlying KV cache hint worker, triggering proactive release of the associated KV cache.
 
-On the TensorRT-LLM side, the executor loop listens for KV cache drop events forwarded from Scaffolding and handles them by calling the KV cache manager's `truncate_blocks` method. The cache is typically truncated rather than fully removed because agentic workflows often include long system prompts that should be preserved. The prefix tree is traversed, and only the exact KV cache blocks specified by the event are dropped.
+On the TensorRT LLM side, the executor loop listens for KV cache drop events forwarded from Scaffolding and handles them by calling the KV cache manager's `truncate_blocks` method. The cache is typically truncated rather than fully removed because agentic workflows often include long system prompts that should be preserved. The prefix tree is traversed, and only the exact KV cache blocks specified by the event are dropped.
 
 ## Case Study 2: Batch Scheduling
 
@@ -158,7 +158,7 @@ Current LLM inference engines schedule requests in batches using First-Come-Firs
 
 This information enables performance isolation through traffic control across different service types (e.g., chatbots, various agents), ensuring that a burst from one service does not degrade quality of service for others.
 
-To address performance isolation and critical path blocking when co-locating agent and chatbot services, we use Scaffolding to obtain hierarchical information about requests within an agent application's control flow graph. We then implement a workload-aware batching and scheduling strategy in TensorRT-LLM.
+To address performance isolation and critical path blocking when co-locating agent and chatbot services, we use Scaffolding to obtain hierarchical information about requests within an agent application's control flow graph. We then implement a workload-aware batching and scheduling strategy in TensorRT LLM.
 
 The hierarchical information can be represented as a tree. For example, in Open Deep Research, the tree has a depth of 3:
 
@@ -177,7 +177,7 @@ class Supervisor(Controller):
 
 The first parameter specifies the Controller's node type, while the second indicates whether it is a top-level Controller. The resulting annotation is stored in the `sub_request_markers` list of `ChatTask`, which contains the path from the root node to the leaf node in the hierarchical tree.
 
-The `sub_request_markers` list is passed to TensorRT-LLM along with the chat request. TensorRT-LLM consumes this information in `MicroBatchScheduler` to reorder requests and achieve the desired scheduling behavior. Specifically, we regulate the relative ordering of agent and chatbot requests based on a user-defined ratio, ensuring that a burst from one service type does not affect the SLO of the other.
+The `sub_request_markers` list is passed to TensorRT LLM along with the chat request. TensorRT LLM consumes this information in `MicroBatchScheduler` to reorder requests and achieve the desired scheduling behavior. Specifically, we regulate the relative ordering of agent and chatbot requests based on a user-defined ratio, ensuring that a burst from one service type does not affect the SLO of the other.
 
 ## Evaluation
 
@@ -185,7 +185,7 @@ The `sub_request_markers` list is passed to TensorRT-LLM along with the chat req
 
 We evaluate a workload with concurrent Deep Research and multi-turn conversation jobs. Deep Research jobs typically go through an average of three Plan–Execute research iterations before the final report is written. Multi-turn conversations are generated with ISL, OSL, inter-round delay, and number of rounds configured to match the Qwen trace release. The arrival rates of agents and conversations are both 4 jobs/s.
 
-Both the agent workload and the conversational workload are served by Qwen3-235B-A22B-Instruct-2507. Experiments run on 4×GB200 GPUs using TensorRT-LLM with TP=4 and EP=4, and `kv_cache_free_gpu_memory_fraction=0.8`.
+Both the agent workload and the conversational workload are served by Qwen3-235B-A22B-Instruct-2507. Experiments run on 4×GB200 GPUs using TensorRT LLM with TP=4 and EP=4, and `kv_cache_free_gpu_memory_fraction=0.8`.
 
 Below is the GPU-resident prefix cache hit rate of different types of requests in the context stage before and after enabling proactive KV cache drop. After enabling proactive KV cache drop, the mean KV cache hit rate of **Chatbot** requests increases greatly by 18.76%. In the meantime, the KV cache hit rates of different agent tasks remain consistent. The increase in KV cache hit rate directly leads to the improvement in average TTFT of **Chatbots** from 15.9s to 6.65s. We also noticed the improvement in TTFT of Brief, which can be attributed to lowered KV cache pressure leading to higher allowed concurrency, which is determined by the scheduler based on resource availability.
 
@@ -202,7 +202,7 @@ Below is the GPU-resident prefix cache hit rate of different types of requests i
 
 ### (II) Batch Schedule
 
-We evaluate how Scaffolding with agent tree would assist batch scheduling decisions of TensorRT-LLM under colocated agent and chatbot services, to ensure performance isolation between different applications.
+We evaluate how Scaffolding with agent tree would assist batch scheduling decisions of TensorRT LLM under colocated agent and chatbot services, to ensure performance isolation between different applications.
 
 We consider a serving instance with 32 concurrent agent jobs and 32 chatbot requests when a burst of 32 agent jobs arrives. To avoid KV cache pressure posing constraints on batch scheduling decisions, we choose Qwen3-30B-A3B with TP/EP=4/4 on 4×GB200 GPUs, which allows abundant GPU memory space for requests.
 

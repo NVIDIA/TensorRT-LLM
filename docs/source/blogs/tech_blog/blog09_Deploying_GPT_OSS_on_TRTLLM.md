@@ -169,7 +169,7 @@ Currently, the best throughput **19.5k tps/gpu** is achieved with DP4EP4 using 4
 
 
 
-## Launch the TensorRT-LLM Server
+## Launch the TensorRT LLM Server
 
 We can use `trtllm-serve` to serve the model by translating the benchmark commands above. For low-latency configuration, run:  
 **Note:** You can also point to a local path containing the model weights instead of the HF repo (e.g., `${local_model_path}`).
@@ -343,7 +343,7 @@ others according to your needs.
 
 ## (H200/H100 Only) Using OpenAI Triton Kernels for MoE
 
-OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA's H200 for optimal performance. `TRTLLM` MoE backend is not supported on Hopper, and `CUTLASS` backend support is still ongoing. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe) to install and enable the `TRITON` MoE kernels on Hopper GPUs.
+OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT LLM can leverage these kernels for Hopper-based GPUs like NVIDIA's H200 for optimal performance. `TRTLLM` MoE backend is not supported on Hopper, and `CUTLASS` backend support is still ongoing. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe) to install and enable the `TRITON` MoE kernels on Hopper GPUs.
 
 ### Selecting Triton as the MoE backend
 
