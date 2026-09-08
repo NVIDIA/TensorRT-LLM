@@ -15,6 +15,7 @@
 
 import gc
 import unittest
+import weakref
 
 import pytest
 from gc_utils import assert_resource_freed
@@ -40,17 +41,32 @@ class LeakyObject(TestObject):
 
 class ShutdownObject(TestObject):
 
+    lifecycle_events: list[str] = []
     shutdown_calls: int = 0
+    shutdown_fails: bool = False
+
+    def __init__(self, value):
+        """Create a resource with an observable finalization event."""
+        super().__init__(value)
+        weakref.finalize(self, type(self).lifecycle_events.append, "released")
 
     def shutdown(self) -> None:
+        """Record shutdown and optionally fail for cleanup-path tests."""
+        type(self).lifecycle_events.append("shutdown")
         type(self).shutdown_calls += 1
+        if type(self).shutdown_fails:
+            raise RuntimeError("shutdown failed")
 
 
 class TestAssertResourceFreed(unittest.TestCase):
 
-    def setUp(self):
+    def setUp(self) -> None:
+        """Reset global state used by the resource-lifetime tests."""
         # Clear any previous leaks and force a clean GC
         LEAKY_HOLD.clear()
+        ShutdownObject.lifecycle_events.clear()
+        ShutdownObject.shutdown_calls = 0
+        ShutdownObject.shutdown_fails = False
         gc.collect()
 
     def test_simple_object_freed(self):
@@ -69,15 +85,72 @@ class TestAssertResourceFreed(unittest.TestCase):
 
     def test_resource_is_shutdown(self) -> None:
         """A resource with a shutdown method should be shut down before release."""
-        ShutdownObject.shutdown_calls = 0
-
-        def factory() -> ShutdownObject:
-            return ShutdownObject("foo")
-
-        with assert_resource_freed(factory):
+        with assert_resource_freed(ShutdownObject, "foo"):
             pass
 
         self.assertEqual(ShutdownObject.shutdown_calls, 1)
+        self.assertEqual(ShutdownObject.lifecycle_events,
+                         ["shutdown", "released"])
+
+    def test_shutdown_exception_restores_gc_state(self) -> None:
+        """A shutdown failure should propagate after restoring the GC state."""
+        gc_was_enabled = gc.isenabled()
+        ShutdownObject.shutdown_fails = True
+
+        try:
+            for expected_gc_enabled in (False, True):
+                with self.subTest(gc_enabled=expected_gc_enabled):
+                    ShutdownObject.lifecycle_events.clear()
+                    ShutdownObject.shutdown_calls = 0
+                    if expected_gc_enabled:
+                        gc.enable()
+                    else:
+                        gc.disable()
+
+                    with self.assertRaisesRegex(RuntimeError,
+                                                "shutdown failed"):
+                        with assert_resource_freed(ShutdownObject, "foo"):
+                            pass
+
+                    self.assertEqual(gc.isenabled(), expected_gc_enabled)
+                    self.assertEqual(ShutdownObject.shutdown_calls, 1)
+                    self.assertEqual(ShutdownObject.lifecycle_events,
+                                     ["shutdown", "released"])
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+
+    def test_shutdown_exception_does_not_mask_body_exception(self) -> None:
+        """A context-body exception should take priority over shutdown errors."""
+        expected_gc_enabled = gc.isenabled()
+        ShutdownObject.shutdown_fails = True
+
+        with self.assertRaisesRegex(ValueError, "body failed"):
+            with assert_resource_freed(ShutdownObject, "foo"):
+                raise ValueError("body failed")
+
+        self.assertEqual(ShutdownObject.shutdown_calls, 1)
+        self.assertEqual(ShutdownObject.lifecycle_events,
+                         ["shutdown", "released"])
+        self.assertEqual(gc.isenabled(), expected_gc_enabled)
+
+    def test_shutdown_exception_propagates_inside_exception_handler(
+            self) -> None:
+        """An outer handled exception should not suppress a shutdown error."""
+        ShutdownObject.shutdown_fails = True
+
+        try:
+            raise ValueError("outer error")
+        except ValueError:
+            with self.assertRaisesRegex(RuntimeError, "shutdown failed"):
+                with assert_resource_freed(ShutdownObject, "foo"):
+                    pass
+
+        self.assertEqual(ShutdownObject.shutdown_calls, 1)
+        self.assertEqual(ShutdownObject.lifecycle_events,
+                         ["shutdown", "released"])
 
     def test_leaky_object_raises(self):
         """LeakyObject holds itself in a global list → should raise."""
