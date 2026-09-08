@@ -18,6 +18,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestAdmissionState,
     RequestQueueItem)
+from tensorrt_llm.bindings.executor import RequestType
 
 pytestmark = pytest.mark.cpu_only
 
@@ -367,3 +368,31 @@ def test_queue_size_methods(executor_queue):
     # Add some data and test
     executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
     assert executor_queue.get_request_queue_size() == 1
+
+
+def test_queued_request_stats_are_updated_without_scanning(executor_queue):
+    context = Mock(
+        disagg_request_id=None,
+        input_token_ids=[1, 2, 3],
+        request_type=RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION,
+    )
+    generation = Mock(
+        disagg_request_id=None,
+        input_token_ids=[1, 2, 3, 4, 5],
+        request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+    )
+
+    with patch.object(executor_queue,
+                      "_generate_child_request_ids",
+                      return_value=None):
+        executor_queue.enqueue_requests([context, generation])
+
+    queued = executor_queue.get_queued_request_stats()
+    assert queued.num_context_requests == 1
+    assert queued.num_ctx_tokens == 3
+    assert queued.num_gen_requests == 1
+    assert queued.num_gen_kv_tokens == 5
+
+    executor_queue.get_from_request_queue(None)
+
+    assert executor_queue.get_queued_request_stats() == type(queued)()

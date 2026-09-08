@@ -176,19 +176,32 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
         ``IterationStats``)
 
     Per-request aggregation reads:
-      * ``executor_request_queue.get_request_queue().queue`` — source for
-        ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
+      * ``executor_request_queue.get_queued_request_stats()`` — cached source
+        for queued request and token counters
       * ``model_engine.iter_states`` — stubbed as the post-forward side
         channel so regression tests can verify ``_update_iter_stats`` uses
         the explicit scheduled-batch stats argument instead.
     """
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import QueuedRequestStats
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.bindings.executor import RequestType
 
     fake = MagicMock()
     fake.max_num_active_requests = 64
     fake.iter_counter = 1
     fake.executor_request_queue.get_request_queue_size.return_value = len(queued_items)
-    fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
+    queued_stats = QueuedRequestStats()
+    for item in queued_items:
+        if not item.is_normal_request or item.request is None:
+            continue
+        token_count = len(item.request.input_token_ids)
+        if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+            queued_stats.num_gen_requests += 1
+            queued_stats.num_gen_kv_tokens += token_count
+        else:
+            queued_stats.num_context_requests += 1
+            queued_stats.num_ctx_tokens += token_count
+    fake.executor_request_queue.get_queued_request_stats.return_value = queued_stats
     fake.resource_manager.resource_managers.get.return_value = None
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)

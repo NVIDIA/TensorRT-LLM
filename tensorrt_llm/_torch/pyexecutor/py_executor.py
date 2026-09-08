@@ -37,7 +37,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            RequestType, SpecDecodingStats,
+                                            SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
@@ -2261,34 +2261,7 @@ class PyExecutor:
         #     before they can start decoding) -> queued-gen counters.
         # On a non-disagg engine all items land in the context counters;
         # on a disagg-decode engine all items land in the gen counters.
-        num_queued_context_requests = 0
-        num_queued_ctx_tokens = 0
-        num_queued_gen_requests = 0
-        num_queued_gen_kv_tokens = 0
-        for item in list(self.executor_request_queue.get_request_queue().queue):
-            if not item.is_normal_request:
-                continue
-            if item.request is None:
-                continue
-            try:
-                token_count = len(item.request.input_token_ids)
-            except (AttributeError, TypeError) as e:
-                # Unusual request shape with no usable token payload;
-                # exclude from all queued counters so downstream consumers
-                # see consistent per-request averages. Not expected on the
-                # current API (ExecutorRequest construction requires a
-                # non-empty input_token_ids), logged so future API drift
-                # surfaces instead of being silently dropped.
-                logger.warning(f"Excluding queued item {item.id} from queued "
-                               f"counters: input_token_ids not readable "
-                               f"({type(e).__name__})")
-                continue
-            if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
-                num_queued_gen_requests += 1
-                num_queued_gen_kv_tokens += token_count
-            else:
-                num_queued_context_requests += 1
-                num_queued_ctx_tokens += token_count
+        queued_stats = self.executor_request_queue.get_queued_request_stats()
 
         # Total KV context length summed across paused (preempted-decode)
         # requests — were decoding but got evicted back to the waiting
@@ -2304,10 +2277,11 @@ class PyExecutor:
 
         stats.inflight_batching_stats.num_ctx_kv_tokens = num_ctx_kv_tokens
         stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
-        stats.inflight_batching_stats.num_queued_context_requests = num_queued_context_requests
-        stats.inflight_batching_stats.num_queued_ctx_tokens = num_queued_ctx_tokens
-        stats.inflight_batching_stats.num_queued_gen_requests = num_queued_gen_requests
-        stats.inflight_batching_stats.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
+        stats.inflight_batching_stats.num_queued_context_requests = \
+            queued_stats.num_context_requests
+        stats.inflight_batching_stats.num_queued_ctx_tokens = queued_stats.num_ctx_tokens
+        stats.inflight_batching_stats.num_queued_gen_requests = queued_stats.num_gen_requests
+        stats.inflight_batching_stats.num_queued_gen_kv_tokens = queued_stats.num_gen_kv_tokens
         stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
 
         return stats
@@ -8342,6 +8316,7 @@ class PyExecutor:
             raw_queue = self.executor_request_queue.get_request_queue()
             while not raw_queue.empty():
                 item = raw_queue.get_nowait()
+                self.executor_request_queue._update_queued_stats(item, -1)
                 if item.is_shutdown_request:
                     continue
                 if ((self.gather_all_responses or self.dist.rank == 0)
