@@ -371,7 +371,7 @@ def test_detokenize_single(client: openai.OpenAI, model_name):
 
 
 @pytest.mark.asyncio(loop_scope="module")
-async def test_completion_streaming(async_client: openai.AsyncOpenAI,
+async def test_detokenize_streaming(async_client: openai.AsyncOpenAI,
                                     model_name: str):
     prompt = "Hello, my name is"
 
