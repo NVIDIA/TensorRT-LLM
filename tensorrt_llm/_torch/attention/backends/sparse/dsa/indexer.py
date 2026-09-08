@@ -38,7 +38,7 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .params import DSAParams
+from .params import DSAParams, use_self_sampling_gvr
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
@@ -690,51 +690,85 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
-        # Opt-in self-sampling GVR top-K decode (CuTeDSL, env-gated:
-        # TRTLLM_GVR_SELF_SAMPLING=1). Same operator contract as the tiered
-        # heuristic path (per-request device kv_lens, raw prev-top-K hints,
-        # per-row MTP window, in-kernel n <= topK short path); tuning is
-        # frozen from indexer_max_seq_len at capture time, so the launch is
-        # CUDA-graph-replay safe. The TopK module's hardware-format gate
-        # falls through to the CUDA GVR path with a one-time warning;
-        # contract violations inside the engine raise.
-        self._use_self_sampling_topk = (
-            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
-            and IS_CUTLASS_DSL_AVAILABLE
-            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
-            # lacks thread-block clusters
-            and get_sm_version() in (100, 103)
-            and sparse_params.index_topk in (512, 1024, 2048)
-            and compress_ratio in (1, 4)
+        # Two-level GVR dispatch: enable_heuristic_topk selects the GVR
+        # family over the exact radix path; use_self_sampling_topk (default
+        # True) selects the hint-free self-sampling engine over the
+        # temporal-hint engines. Tuning is frozen from indexer_max_seq_len
+        # at capture time, so the launch is CUDA-graph-replay safe. The
+        # TopK module's hardware-format gate falls back to the exact
+        # insertion/radix path with a one-time warning; contract violations
+        # inside the engine raise.
+        self._use_self_sampling_topk = use_self_sampling_gvr(
+            enable_heuristic_topk=self._enable_heuristic_topk,
+            use_self_sampling_topk=sparse_params.use_self_sampling_topk,
+            index_topk=sparse_params.index_topk,
+            compress_ratio=compress_ratio,
+            is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            sm_version=get_sm_version(),
         )
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
+            logger.warning_once(
+                "TRTLLM_GVR_SELF_SAMPLING is retired and ignored: the "
+                "self-sampling GVR engine is selected by the "
+                "use_self_sampling_topk sparse-attention config field "
+                "(default True) when enable_heuristic_topk is set.",
+                key="gvr_self_sampling_env_retired",
+            )
+        if (
+            self._enable_heuristic_topk
+            and sparse_params.use_self_sampling_topk
+            and not self._use_self_sampling_topk
+        ):
+            logger.warning_once(
+                "use_self_sampling_topk=True but the self-sampling GVR "
+                "prerequisites are not met "
+                f"(cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                f"sm={get_sm_version()}, "
+                f"index_topk={sparse_params.index_topk}, "
+                f"compress_ratio={compress_ratio}); falling back to the "
+                "temporal GVR path (exact radix when the DSL engine is "
+                "unavailable).",
+                key="gvr_self_sampling_prereq_fallback",
+            )
         self.mtp_index_share = sparse_params.mtp_index_share
 
-        if self.use_cute_dsl_topk:
-            decode_top_k_implementation = (
-                TopKImplementation.CUTE_DSL_GVR
-                if self._enable_heuristic_topk
-                else TopKImplementation.CUTE_DSL_RADIX
-            )
-        elif self._enable_heuristic_topk:
-            decode_top_k_implementation = TopKImplementation.CUDA_GVR
+        if (
+            self._enable_heuristic_topk
+            and IS_CUTLASS_DSL_AVAILABLE
+            # datacenter Blackwell only; consumer Blackwell (sm_120/121)
+            # lacks the thread-block clusters both GVR engines use
+            and get_sm_version() in (100, 103)
+        ):
+            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR
         else:
-            decode_top_k_implementation = TopKImplementation.CUDA_RADIX
-        if self._use_self_sampling_topk and self._enable_heuristic_topk:
-            # env opt-in overrides the decode implementation; the GVR prior
-            # contract is identical
-            decode_top_k_implementation = TopKImplementation.CUTE_DSL_GVR_V2
+            if self._enable_heuristic_topk:
+                logger.warning_once(
+                    "enable_heuristic_topk=True but the DSL GVR engine is "
+                    f"unavailable (cutlass_dsl={IS_CUTLASS_DSL_AVAILABLE}, "
+                    f"sm={get_sm_version()}); using the exact radix decode "
+                    "top-K instead.",
+                    key="gvr_prereq_radix_fallback",
+                )
+            decode_top_k_implementation = (
+                TopKImplementation.CUTE_DSL_RADIX
+                if self.use_cute_dsl_topk
+                else TopKImplementation.CUDA_RADIX
+            )
         self.top_k = TopK(
             self.index_topk,
             prefill_implementation=TopKImplementation.CUDA_RADIX,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
+            gvr_self_sampling=self._use_self_sampling_topk,
         )
-        # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
-        # indexer epilogue emits candidates the GVR Top-K consumes (see
-        # gvr_emission / gvr_routing; state lives on the TopK module)
-        # only the FP4 scoring op accepts emission kwargs
+        # Emission block-skip is a temporal-hint (V1) optimization: the FP4
+        # indexer epilogue emits per-block max logits the GVR Top-K consumes to
+        # skip whole blocks (see gvr_emission / gvr_routing; state lives on the
+        # TopK module). Off on the self-sampling path (no cross-step state to
+        # assist) and off non-FP4 / non-paged-MQA layers.
         self.use_gvr_emission = (
-            os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
+            sparse_params.use_gvr_emission
+            and not self._use_self_sampling_topk
             and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
             and self.use_cute_dsl_paged_mqa_logits
             and self.use_fp4
@@ -1441,7 +1475,8 @@ class Indexer(nn.Module):
 
         num_gen_tokens = num_tokens - num_ctx_tokens
         gvr_prior_indices = None
-        if self._enable_heuristic_topk:
+        if self.top_k.needs_gvr_prior:
+            assert metadata.gvr_prior_indices is not None
             local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
             gvr_prior_indices = metadata.gvr_prior_indices[local_layer]
         if is_generation is None:

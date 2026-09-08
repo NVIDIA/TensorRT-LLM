@@ -57,39 +57,6 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-//! \brief Get all blocks in a sequence by traversing backwards from the last block.
-//! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
-//! \return Vector of BlockPtr-s in sequence order
-std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
-{
-    // First count the number of blocks to pre-allocate the vector
-    auto currentBlock = lastBlock;
-    size_t blockCount = 0;
-    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-    {
-        blockCount++;
-        currentBlock = currentBlock->getPrevBlockInSeq();
-    }
-
-    if (blockCount == 0)
-    {
-        return {};
-    }
-    // Create and pre-allocate the vector with the correct size
-    std::vector<BlockPtr> sequenceBlocks(blockCount);
-
-    // Now traverse backwards and fill from the end
-    currentBlock = lastBlock;
-    size_t currentIndex = blockCount - 1;
-    while (currentBlock != nullptr && currentBlock->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-    {
-        sequenceBlocks[currentIndex--] = currentBlock;
-        currentBlock = currentBlock->getPrevBlockInSeq();
-    }
-
-    return sequenceBlocks;
-}
-
 // Compute maximum number of tokens that have been computed by prefill and generation.
 // Accounts for chunked prefill to avoid storing state that hasn't been written to KV cache yet.
 // We call LlmRequest::getContextRemainingLength to see how many tokens are still waiting to be computed in prefill.
@@ -529,59 +496,6 @@ bool KVCacheBlock::isDetached() const
     // (mLookupNode == nullptr), i.e. it holds no state that future requests can reuse.
     // This mirrors the reuse condition used by isShared().
     return mLookupNode == nullptr;
-}
-
-// This function calculates the number of block a layer should have, given
-// the total free memory and the window size of each layer.
-// For example, if we have 1 layer of window size 1024, and 2 layer of window
-// size 2048, and 3 layers of 4096.
-// Each layer of window size 1024 should have
-//     1024 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// Each layer of window size 2048 should have
-//     2048 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// Each layer of window size 4096 should have
-//     4096 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
-// NOTE: Currently the use of this function is not used for
-// BaseKVCacheManager::calculateMaxNumBlocks because the we want to first
-// achieve identical performance as assuming all layers as full attention.
-std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
-    std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
-    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
-{
-    if (windowSizeToLayers.size() == 1)
-    {
-        return {{windowSizeToLayers.begin()->first, 1.0f}};
-    }
-
-    std::map<SizeType32, float> windowSizeToContribution;
-
-    SizeType32 cacheSizePerTokenTotal
-        = std::accumulate(windowSizeToCacheSizePerToken.begin(), windowSizeToCacheSizePerToken.end(), SizeType32{0},
-            [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    for (auto const& [windowSize, cacheSizePerToken] : windowSizeToCacheSizePerToken)
-    {
-        auto const cacheSizeWeight = static_cast<float>(cacheSizePerToken) / cacheSizePerTokenTotal;
-        windowSizeToContribution[windowSize] = cacheSizeWeight;
-    }
-
-    for (auto const& [windowSize, _] : windowSizeToLayers)
-    {
-        windowSizeToContribution.at(windowSize) *= windowSize;
-    }
-    auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
-        0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-
-    std::map<SizeType32, float> windowSizeToShare;
-    for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
-    {
-        float const fraction = windowSizeSum / windowSizesTotalSum;
-        TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
-        windowSizeToShare[windowSize] = fraction;
-    }
-    auto total = std::accumulate(windowSizeToShare.begin(), windowSizeToShare.end(), 0.0f,
-        [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    TLLM_CHECK(total == 1.0f);
-    return windowSizeToShare;
 }
 
 BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
@@ -1425,12 +1339,6 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, tensorrt_llm::
             offsetsPtr[offsetIndex] = blockIndex;
         }
     }
-}
-
-void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
-    SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const
-{
-    mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
 }
 
 void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock, SizeType32 windowSize,
@@ -2411,11 +2319,6 @@ void WindowBlockManager::addBlockToAllBeams(BlockPtr const& block, GenerationReq
     }
 }
 
-void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowSize)
-{
-    mWindowBlockManagers.at(windowSize).allocateBlock(sequence, false);
-}
-
 bool BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequest const& llmRequest)
 {
     bool didCopy = false;
@@ -2828,58 +2731,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
         }
     }
     return {numBlocksStoredForReuse, pinnedBlockIds};
-}
-
-void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
-}
-
-void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx)
-{
-    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
-    auto const requestId = sequence.getRequestId();
-    auto const beamWidth = sequence.getBeamWidth();
-    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-
-    if (!allocatedBlocks.at((blockIdx + 1) * beamWidth - 1)->isShared())
-    {
-        return;
-    }
-    BlockKey blockKey = allocatedBlocks.at(blockIdx * beamWidth)->getBlockKey();
-    bool isFull = allocatedBlocks.at(blockIdx * beamWidth)->isFull();
-
-    // Free shared block
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = allocatedBlocks.at(blockIdx * beamWidth + beamIdx);
-        block->decRefCount();
-        if (!block->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(block);
-        }
-    }
-
-    // Allocate new blocks
-    TLLM_CHECK_WITH_INFO(hasFreeBlocks(beamWidth), "Can't allocate new blocks. No free blocks left.");
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = getFreeBlock(sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt,
-            sequence.getTransferMode(), sequence.getDirectory());
-        block->incRefCount();
-        if (sequence.getCacheBlockIds(mWindowSize).at(beamIdx).size() == 0)
-        {
-            block->setPrevBlockInSeq(nullptr);
-        }
-        else
-        {
-            block->setPrevBlockInSeq(getBlockById(sequence.getCacheBlockIds(mWindowSize)[beamIdx].back()));
-        }
-        block->setBlockKey(blockKey, isFull);
-        block->setHash();
-        sequence.changeCacheBlock(mWindowSize, beamIdx, blockIdx, block->getBlockId());
-        allocatedBlocks.at(blockIdx * beamWidth + beamIdx) = block;
-    }
 }
 
 void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize)
@@ -3790,23 +3641,6 @@ void WindowBlockManager::updateLastCacheBlockOffsets(GenerationRequest& sequence
     }
 }
 
-void BlockManager::updateCacheBlockOffsetsAtIdx(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
-    auto const beamWidth = sequence.getBeamWidth();
-
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
-    auto const& offsetsShape = cacheBlocksTensor.getShape();
-
-    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        auto const blockId = beamCacheBlock.at(blockIdx);
-        mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
-    }
-}
-
 void KVCacheManager::addToken(RequestIdType requestId)
 {
     // TODO: add streamLLM support
@@ -4221,41 +4055,6 @@ void KVCacheManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, S
     {
         mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
     }
-}
-
-std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
-    runtime::BufferManager const& bufferManager, executor::KvCacheConfig const& config)
-{
-    auto const freeMemFraction
-        = config.getFreeGpuMemoryFraction().value_or(executor::KvCacheConfig::kDefaultGpuMemFraction);
-    TLLM_CHECK_WITH_INFO(freeMemFraction < 1.0F,
-        "Invalid freeMemFraction, freeMemFraction (%f) must be smaller than 1.0f", freeMemFraction);
-    if (config.getMaxTokens().has_value())
-    {
-        if (config.getFreeGpuMemoryFraction().has_value())
-        {
-            TLLM_LOG_WARNING(
-                "Both freeGpuMemoryFraction (aka kv_cache_free_gpu_mem_fraction) "
-                "and maxTokens (aka max_tokens_in_paged_kv_cache) "
-                "are set (to %f and %ld, respectively). The smaller value will be used.",
-                freeMemFraction, (int64_t) config.getMaxTokens().value());
-        }
-    }
-
-    TLLM_CUDA_CHECK(::cudaDeviceSynchronize());
-    auto const [freeMem, totalMem] = tc::getDeviceMemoryInfo(config.getUseUvm());
-    auto const finalFreeMem = freeMem + bufferManager.memoryPoolFree();
-    TLLM_LOG_INFO("Memory usage when calculating max tokens in paged kv cache: total: %0.2f GiB, available: %0.2f GiB",
-        totalMem / static_cast<double>(1 << 30), finalFreeMem / static_cast<double>(1 << 30));
-    TLLM_CHECK_WITH_INFO(finalFreeMem <= totalMem, "Free memory cannot exceed total memory");
-
-    auto const freePrimaryMemBytes = static_cast<uint64_t>(finalFreeMem * freeMemFraction);
-    auto const freeSecondaryMemBytes = config.getHostCacheSize().value_or(0);
-
-    TLLM_LOG_DEBUG("Calculated free memory: {.freePrimaryMemBytes=%" PRIu64 ", .freeSecondaryMemBytes=%" PRIu64 "}",
-        freePrimaryMemBytes, freeSecondaryMemBytes);
-
-    return std::make_tuple(freePrimaryMemBytes, freeSecondaryMemBytes);
 }
 
 namespace
