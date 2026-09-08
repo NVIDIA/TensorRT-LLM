@@ -3124,13 +3124,15 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
       killing the rank mid-collective.
 
     Managers that do not publish ``max_admissible_sequences`` (V1, hybrid) are
-    skipped rather than guessed at; adding the attribute is how a manager opts
-    into the check.
+    skipped rather than guessed at; publishing the attribute *as an int* is how a
+    manager opts into the check. Anything non-integral means the same thing as
+    absent -- this manager did not opt in -- so the check is skipped rather than
+    attempted against a value it cannot order.
     """
     if kv_cache_manager is None:
         return
     admissible = getattr(kv_cache_manager, "max_admissible_sequences", None)
-    if admissible is None:
+    if not isinstance(admissible, int):
         return
     if admissible == max_num_sequences:
         return
@@ -3152,7 +3154,7 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
 def resolve_max_num_sequences(model_engine,
                               mapping: Mapping,
                               max_batch_size: int,
-                              disable_overlap_scheduler: bool,
+                              llm_args,
                               is_disagg: bool,
                               max_num_sequences: Optional[int] = None) -> int:
     """Resolve the seat-pool size for a consumer, without re-deriving it.
@@ -3170,6 +3172,12 @@ def resolve_max_num_sequences(model_engine,
     silently sized the sampler and the executor's ``SeqSlotManager`` below the
     index pool they share indices with, i.e. it reintroduced the very skew this
     number exists to eliminate, in the one code path that has no test coverage.
+
+    ``llm_args`` is taken whole rather than as an already-read
+    ``disable_overlap_scheduler`` flag so that the fallback's inputs are read
+    only when the fallback runs. Passing the flag made the caller evaluate it
+    eagerly, which reintroduced a hard dependency on the field in the branch
+    that never uses it -- and broke callers holding a lighter args object.
     """
     if max_num_sequences is not None:
         return max_num_sequences
@@ -3181,7 +3189,7 @@ def resolve_max_num_sequences(model_engine,
     return compute_max_num_sequences(
         mapping,
         max_batch_size,
-        disable_overlap_scheduler,
+        llm_args.disable_overlap_scheduler,
         enable_overlap_headroom=getattr(
             model_engine, "_enable_adp_overlap_seq_slot_headroom", False),
         is_disagg=is_disagg)
@@ -3238,6 +3246,19 @@ def should_enable_adp_overlap_seq_slot_headroom(
     the last stage marks generation requests GENERATION_TO_COMPLETE. Opening the
     gate before that is fixed would allocate headroom no rank ever spends.
 
+    Measured, so that the next attempt starts from the number rather than the
+    argument: a generation-bearing pp=2 + ADP + overlap A/B (GLM-5 NVFP4, 4-way
+    GB300, max_batch_size=4, 1920 requests per arm) produced *byte-identical*
+    scheduling on both arms -- mean scheduled batch 3.997 of a cap of 4, the same
+    per-iteration histogram, and zero index-pool exhaustions. The seats are
+    unspendable at pp>1 because admission is capped independently at
+    ``pp_size * max_batch_size`` by ``get_max_num_sequences()``, which is already
+    below the unpatched index pool of ``pp_size * max_batch_size + 1``: the
+    per-micro-batch batch size, not the seat pool, is the limiter. So the PP cell
+    needs a case where admission is the binding constraint before it can show a
+    benefit; the throughput difference between those two arms (-2.34%) is this
+    configuration's noise floor, not a result.
+
     Hybrid (Mamba/SSM) architectures are excluded. MambaHybridCacheManagerV2
     sizes its state-index pool from max_batch_size alone
     (mamba_cache_manager.py: state_index_capacity), with neither pp_size nor the
@@ -3293,7 +3314,7 @@ def create_py_executor_instance(
         model_engine,
         mapping,
         max_batch_size,
-        llm_args.disable_overlap_scheduler,
+        llm_args,
         is_disagg,
         max_num_sequences=max_num_sequences)
 
@@ -3739,8 +3760,8 @@ def instantiate_sampler(
         engine,
         mapping,
         max_batch_size,
-        llm_args.disable_overlap_scheduler,
-        is_disagg_enabled(llm_args.cache_transceiver_config),
+        llm_args,
+        is_disagg_enabled(getattr(llm_args, "cache_transceiver_config", None)),
         max_num_sequences=max_num_sequences)
 
     sampler_args = create_torch_sampler_args(

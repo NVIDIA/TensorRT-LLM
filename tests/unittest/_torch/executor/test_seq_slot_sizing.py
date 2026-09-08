@@ -205,18 +205,53 @@ def test_resolve_max_num_sequences_prefers_the_published_pool(explicit, engine_s
         _enable_adp_overlap_seq_slot_headroom=True,
     )
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
+    llm_args = SimpleNamespace(disable_overlap_scheduler=False)
 
     assert (
         resolve_max_num_sequences(
             engine,
             mapping,
             8,
-            False,
+            llm_args,
             False,
             max_num_sequences=explicit,
         )
         == expected
     )
+
+
+def test_resolve_max_num_sequences_reads_llm_args_only_in_the_fallback():
+    """The two short-circuit branches must not touch ``llm_args`` at all.
+
+    Reading ``disable_overlap_scheduler`` at the *call site* made every caller
+    depend on a field only the third branch uses, which broke callers that hold a
+    lighter args object and pass ``max_num_sequences`` explicitly. An args object
+    that raises on attribute access is the only way to state that as a test:
+    asserting on the return value cannot distinguish "not used" from "used and
+    happened to agree".
+    """
+
+    class _Exploding:
+        def __getattr__(self, name):
+            raise AssertionError(f"llm_args.{name} read on a path that must not need it")
+
+    engine_with_pool = SimpleNamespace(max_num_seq_slots=16)
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
+
+    # Branch 1: an explicit value wins, even with no pool published at all.
+    assert (
+        resolve_max_num_sequences(
+            SimpleNamespace(),
+            mapping,
+            8,
+            _Exploding(),
+            False,
+            max_num_sequences=24,
+        )
+        == 24
+    )
+    # Branch 2: the engine's published pool.
+    assert resolve_max_num_sequences(engine_with_pool, mapping, 8, _Exploding(), False) == 16
 
 
 def test_sampler_args_require_the_resolved_pool():
@@ -280,6 +315,13 @@ def test_validator_is_two_sided(admissible):
     [
         None,  # non-generation models have no KV cache manager
         SimpleNamespace(),  # V1 sizes its index pool by an unrelated rule
+        # A test double auto-creates every attribute, so "absent" reaches the
+        # validator as a non-integral value rather than as None. Ordering it
+        # against an int raises TypeError, which is a crash in an unrelated
+        # caller's test rather than a finding about this PR -- so non-integral
+        # has to mean the same thing as absent.
+        Mock(),
+        _FakeManager(None),
     ],
 )
 def test_validator_skips_managers_that_do_not_publish_capacity(manager):
