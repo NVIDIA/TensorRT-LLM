@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -17,16 +20,16 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        DynamicBatchConfig, Eagle3DecodingConfig,
                        EagleDecodingConfig, EncodeCudaGraphConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
-                       LookaheadDecodingConfig, MambaStateConfig,
-                       MedusaDecodingConfig, MiniMaxM3SparseAttentionConfig,
+                       MambaStateConfig, MiniMaxM3SparseAttentionConfig,
                        MoeConfig, MTPDecodingConfig, MultimodalConfig,
                        NGramDecodingConfig, PARDDecodingConfig,
                        PrefillCudaGraphBackend, PrometheusMetricsConfig,
-                       ReorderRequestPolicyConfig, RocketSparseAttentionConfig,
-                       SADecodingConfig, SAEnhancerConfig,
-                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
+                       QSASparseAttentionConfig, ReorderRequestPolicyConfig,
+                       RocketSparseAttentionConfig, SADecodingConfig,
+                       SAEnhancerConfig, SaveHiddenStatesDecodingConfig,
+                       SchedulerConfig, SkipSoftmaxAttentionConfig,
+                       TorchCompileConfig, TorchLlmArgs,
+                       TriAttentionKvCacheCompressionConfig,
                        UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
@@ -53,8 +56,6 @@ __all__ = [
     'DecodeCudaGraphConfig',
     'EncodeCudaGraphConfig',
     'MoeConfig',
-    'LookaheadDecodingConfig',
-    'MedusaDecodingConfig',
     'EagleDecodingConfig',
     'Eagle3DecodingConfig',
     'MTPDecodingConfig',
@@ -86,6 +87,7 @@ __all__ = [
     'LoRARequest',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
+    'QSASparseAttentionConfig',
     'ReorderRequestPolicyConfig',
     'DeepSeekSparseAttentionConfig',
     'DeepSeekV4SparseAttentionConfig',

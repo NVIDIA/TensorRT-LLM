@@ -23,10 +23,9 @@ from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
                                  maybe_pin_memory, nvtx_range, prefer_pinned,
-                                 release_gc, torch_dtype_to_str, trace_func)
+                                 release_gc, trace_func)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
-from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
@@ -46,11 +45,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..attention_backend.interface import (AttentionMetadata,
-                                           AttentionRuntimeFeatures)
-from ..attention_backend.trtllm import TrtllmAttentionMetadata
-from ..attention_backend.utils import get_attention_backend
-from ..attention_backend.vanilla import VanillaAttentionMetadata
+from ..attention.backends.interface import (AttentionMetadata,
+                                            AttentionRuntimeFeatures)
+from ..attention.backends.trtllm import TrtllmAttentionMetadata
+from ..attention.backends.utils import get_attention_backend
+from ..attention.backends.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
@@ -86,29 +85,35 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
+from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
+                          make_lora_model_config)
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
 from .guided_decoder import CapturableGuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
+                                           MambaHybridCacheManager)
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+                               ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
-from .sampler.ops.flashinfer import warmup_sampling_module
+from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
+                                     warmup_sampling_module)
+from .sampler.sampler_common import SampleType
 from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest,
                                         chunk_end: int) -> int:
-    """Read the prompt token immediately following a context chunk."""
-    if chunk_end >= request.py_prompt_len:
+    """Prompt token immediately following a context chunk. Uses the live C++
+    ``mPromptLen``; ``py_prompt_len`` goes stale after a non-recompute preemption.
+    """
+    if request.is_last_context_chunk:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
 
@@ -143,7 +148,7 @@ def _make_single_token_context_graph_batch(
                 or request.py_beam_width != 1
                 or get_draft_token_length(request) > 0
                 or request.py_is_first_draft or request.is_context_only_request
-                or request.is_generation_only_request()
+                or request.is_generation_only_request
                 or request.py_disaggregated_params is not None
                 or request.py_mm_encoder_event is not None
                 or (request.py_multimodal_data is not None and
@@ -392,6 +397,14 @@ class PyTorchModelEngine(ModelEngine):
 
         self.forward_pass_callable = None
         self._cleanup_done = False
+        # Optional in-graph sampling hook, registered by PyExecutor. Called at
+        # the tail of _forward_step -- i.e. right after the LM head, and inside
+        # capture_forward_fn -- so that for graph-capturable sampling tiers the
+        # sampling lands at the end of the captured forward graph instead of
+        # costing a separate launch. Left None when the sampler does not opt in.
+        self.sample_in_graph_callable = None
+        # Stages (or clears) in-graph sampling state once the batch is settled.
+        self._stage_in_graph_sampling = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
                 "encode_only and mm_encoder_only are mutually exclusive.")
@@ -453,6 +466,12 @@ class PyTorchModelEngine(ModelEngine):
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
         self.llm_args = llm_args
+        # Opt-in tiered sampling captured into the forward graph. Off by
+        # default: it captures one extra graph per enabled tier, which costs
+        # startup time and memory that deployments not bound by sampling
+        # overhead should not pay.
+        self.enable_in_graph_sampling = bool(
+            getattr(llm_args, "enable_in_graph_sampling", False))
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
             spec_config.tokens_per_gen_step -
@@ -524,6 +543,18 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.model = model
         self._validate_breakable_cuda_graph_compatibility()
+        # In-graph sampling needs the full vocabulary: top-k / top-p over a
+        # tensor-parallel shard would rank against a slice of the logits and
+        # emit the wrong token, silently. The LM head gathers by default, but
+        # the draft models of some speculation modes turn that off, so refuse
+        # the fast path rather than sample a sharded row.
+        if self.enable_in_graph_sampling and not getattr(
+                self.model.model_config, "lm_head_gather_output", True):
+            logger.warning(
+                "Disabling enable_in_graph_sampling: this model's LM head does not "
+                "gather its output, so the logits are sharded across tensor "
+                "parallel ranks and cannot be sampled in-graph.")
+            self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
         self._enable_scheduler_aware_adp_dummy = (
@@ -1024,6 +1055,7 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
             enable_encoder_decoder_mixed_cuda_graph=(
                 enable_encoder_decoder_mixed_cuda_graph),
+            enable_in_graph_sampling=self.enable_in_graph_sampling,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
         self.breakable_cuda_graph_runner = None
@@ -1041,6 +1073,15 @@ class PyTorchModelEngine(ModelEngine):
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
         self._force_lora_graph_for_capture: Optional[bool] = None
+        # Every LoRA parameter decision lives in engine/lora.py. The builder
+        # holds no model and no manager: `enable_spec_decode` and
+        # `runtime_draft_len` are rewritten during capture, so they -- and the
+        # manager the two `_util.py` hooks below install -- are passed per call.
+        self._lora = LoraParamBuilder(spec_config=self.spec_config,
+                                      attn_backend=self.attn_backend)
+        # Sampling tier pinned during an in-graph sampling capture pass; None outside
+        # capture, where the tier comes from the batch instead.
+        self._capture_sample_type: Optional[SampleType] = None
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1065,6 +1106,17 @@ class PyTorchModelEngine(ModelEngine):
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
+    def register_sample_in_graph_callable(self, callable: Optional[Callable]):
+        """Register the hook that samples at the tail of the forward graph."""
+        self.sample_in_graph_callable = callable
+
+    def register_sample_type_resolver(self,
+                                      resolver: Optional[Callable],
+                                      stage: Optional[Callable] = None):
+        """Register how a batch maps to its sampling tier, for the graph key."""
+        self.cuda_graph_runner.register_sample_type_resolver(resolver)
+        self._stage_in_graph_sampling = stage
+
     def get_kv_cache_dtype_byte_size(self) -> float:
         """
         Returns the size (in bytes) occupied by kv cache type.
@@ -1082,38 +1134,25 @@ class PyTorchModelEngine(ModelEngine):
                               lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str],
                               swap_gate_up_proj_lora_b_weight: bool = True):
-        self.lora_model_config = LoraModelConfig(
-            lora_target_modules=lora_target_modules,
-            trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
-            hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
-            swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+        # Called by `_util.py` after the engine exists. Both LoRA handles stay
+        # engine state: warmup, capture and the enc-dec fast path read them.
+        self.lora_model_config = make_lora_model_config(
+            self.model, lora_target_modules, trtllm_modules_to_hf_modules,
+            swap_gate_up_proj_lora_b_weight)
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Initialize CUDA Graph LoRA manager with model configuration."""
-        # Get model configuration
         if self.cuda_graph_runner.enabled:
-            max_lora_size = lora_config.max_loras or 8  # Default fallback
-            max_batch_size = self.batch_size  # Use engine's max batch size
-
             # For spec decode, each generation request contributes
             # max_draft_len + 1 tokens per forward pass.
             max_tokens_per_seq = (self.original_max_draft_len +
                                   1) if self.is_spec_decode else 1
-            self.cuda_graph_lora_manager = CudaGraphLoraManager(
-                max_lora_size=max_lora_size,
-                max_batch_size=max_batch_size,
-                max_lora_rank=lora_config.max_lora_rank,
-                model=self.model,
-                lora_model_config=self.lora_model_config,
-                overlap_lora_and_base=lora_config.overlap_lora_and_base,
-                device='cuda',
-                max_tokens_per_seq=max_tokens_per_seq)
-
-            logger.info(
-                f"Initialized CUDA Graph LoRA manager, "
-                f"max {max_lora_size} adapters, max rank {lora_config.max_lora_rank}"
-            )
+            self.cuda_graph_lora_manager = make_cuda_graph_lora_manager(
+                self.model,
+                lora_config,
+                self.lora_model_config,
+                self.batch_size,  # Use engine's max batch size
+                max_tokens_per_seq)
 
     def _use_lora_cuda_graph(self,
                              scheduled_requests: ScheduledRequests) -> bool:
@@ -1394,6 +1433,12 @@ class PyTorchModelEngine(ModelEngine):
         # exercises the non-greedy sampler, so with cuda_graph_config=None
         # flashinfer's sampling kernels would be JIT-built mid-serving.
         warmup_sampling_module()
+        if self.enable_in_graph_sampling:
+            # The fast tier samples inside the captured graph via a
+            # torch.compile'd op; compile it now so capture does not.
+            warmup_sample_from_logits_op(self.model.config.vocab_size,
+                                         torch.device('cuda'), self.dtype,
+                                         self._cuda_graph_batch_sizes or [])
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -1566,7 +1611,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+            from tensorrt_llm._torch.attention.backends.sparse.dsa import (
                 _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
         except ImportError:
             return
@@ -1638,7 +1683,7 @@ class PyTorchModelEngine(ModelEngine):
         No-op on non-DSA models. See nvbugs/6482566.
         """
         try:
-            from ..attention_backend.sparse.deepseek_v4.deepseek_v4 import \
+            from ..attention.backends.sparse.deepseek_v4.deepseek_v4 import \
                 DeepseekV4Indexer
         except ImportError:
             return
@@ -1691,7 +1736,7 @@ class PyTorchModelEngine(ModelEngine):
         if attn_meta is None:
             return
         try:
-            from ..attention_backend.sparse.dsa import \
+            from ..attention.backends.sparse.dsa import \
                 DSAtrtllmAttentionMetadata
         except ImportError:
             return
@@ -2684,10 +2729,20 @@ class PyTorchModelEngine(ModelEngine):
                 request._cached_tokens = cached_tokens
                 request._cached_tokens_set = cached_tokens_set
 
-        def _run_capture_pass(force_non_greedy: bool, label: str,
-                              force_lora_graph: bool) -> None:
+        def _run_capture_pass(force_non_greedy: bool,
+                              label: str,
+                              force_lora_graph: bool,
+                              sample_type: Optional[SampleType] = None) -> None:
             assert self._force_lora_graph_for_capture is None
             self._force_lora_graph_for_capture = force_lora_graph
+            # Pin the sampling tier for this pass. maybe_get_cuda_graph reads
+            # it to build the graph key, so every graph captured below records
+            # the kernels of this tier and nothing else. Passes that do not name
+            # a tier capture FULL graphs -- ones carrying no sampling at all --
+            # which is what a batch resolving to FULL replays.
+            pinned_tier = sample_type or SampleType.FULL
+            self._capture_sample_type = pinned_tier
+            self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
                 for bs, draft_len in graphs_to_capture:
                     if bs > self.batch_size:
@@ -2730,6 +2785,8 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
             finally:
                 self._force_lora_graph_for_capture = None
+                self._capture_sample_type = None
+                self.cuda_graph_runner.set_capture_sample_type(None)
 
         if self.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
@@ -2740,32 +2797,62 @@ class PyTorchModelEngine(ModelEngine):
         else:
             lora_graph_cases = [True]
 
-        # Pass 1: greedy fast-path (dummy requests carry no sampling params,
-        # so is_all_greedy_sample is naturally True).
-        for use_lora_graph in lora_graph_cases:
-            label = "greedy"
-            if self.cuda_graph_lora_manager is not None:
-                label += ", LoRA" if use_lora_graph else ", base-only"
-            _run_capture_pass(force_non_greedy=False,
-                              label=label,
-                              force_lora_graph=use_lora_graph)
-        # Pass 2: advanced sampling variant. Required because on-the-fly capture
-        # is disabled outside warmup, so any inference batch that contains a
-        # non-greedy request would otherwise fall back to eager. Only meaningful
-        # for one-engine spec dec (where is_all_greedy_sample participates in
-        # the graph key); other paths default to True and would never key into
-        # this variant.
-        needs_non_greedy_capture = (
+        # Which variants to capture depends on which sampler this engine will
+        # actually run, and the two are mutually exclusive: a spec-decoding mode
+        # in a one-engine mode samples inside its worker and gets a dedicated
+        # sampler from get_spec_decoder, so TorchSampler -- the only sampler
+        # implementing in-graph sampling -- never runs. Capturing the other
+        # branch's variants would spend warmup on graphs whose keys no batch can
+        # ever produce.
+        #
+        # The predicate is use_one_engine() rather than has_spec_decoder(): the
+        # two-model eagle3 / mtp_eagle modes also "have a spec decoder", but
+        # get_spec_decoder hands them a plain TorchSampler, so they belong on
+        # the TorchSampler branch and do need the FAST graphs.
+        uses_own_spec_decoder = (
             self.spec_config is not None
             and self.spec_config.spec_dec_mode.use_one_engine())
-        if needs_non_greedy_capture:
+
+        def _capture_variant(label: str,
+                             force_non_greedy: bool = False,
+                             sample_type: Optional[SampleType] = None) -> None:
             for use_lora_graph in lora_graph_cases:
-                label = "advanced sampling"
+                variant_label = label
                 if self.cuda_graph_lora_manager is not None:
-                    label += ", LoRA" if use_lora_graph else ", base-only"
-                _run_capture_pass(force_non_greedy=True,
-                                  label=label,
-                                  force_lora_graph=use_lora_graph)
+                    variant_label += (", LoRA"
+                                      if use_lora_graph else ", base-only")
+                _run_capture_pass(force_non_greedy=force_non_greedy,
+                                  label=variant_label,
+                                  force_lora_graph=use_lora_graph,
+                                  sample_type=sample_type)
+
+        if uses_own_spec_decoder:
+            # One-engine spec branch: the greedy argmax fast path plus the
+            # advanced-sampling variant. The latter is needed because on-the-fly
+            # capture is disabled outside warmup, so a batch containing a
+            # non-greedy request would otherwise fall back to eager.
+            #
+            # Dummy warmup requests carry no sampling params, so the greedy pass
+            # needs no override while the advanced one has to force the flag.
+            _capture_variant("greedy")
+            _capture_variant("advanced sampling", force_non_greedy=True)
+        else:
+            # TorchSampler branch: FULL carries no sampling in the graph and is
+            # what every batch replays unless in-graph sampling is enabled, so it
+            # is always captured. FAST adds the in-graph sampling kernels and is
+            # captured only when opted in, since it costs extra warmup time and
+            # memory.
+            _capture_variant("full", sample_type=SampleType.FULL)
+            if self.enable_in_graph_sampling:
+                # Give the warmup requests real non-greedy sampling params:
+                # dummies otherwise carry none, resolve to greedy, and the
+                # capture would record argmax rather than the fast tier's
+                # top-k/top-p kernels. Same substitution the advanced-sampling
+                # pass relies on.
+                _capture_variant("fast",
+                                 force_non_greedy=True,
+                                 sample_type=SampleType.FAST)
+
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
         # update_is_all_greedy_sample inside each forward call during the
@@ -2950,10 +3037,6 @@ class PyTorchModelEngine(ModelEngine):
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
-
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
 
         # The logits allocations grow with the number of requests and are not
         # part of the captured model body. Warm up the largest request count so
@@ -3928,15 +4011,15 @@ class PyTorchModelEngine(ModelEngine):
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-                return list(
-                    self.dist.tp_cp_allgather(num_tokens, small_payload=True))
-            return list(self.dist.tp_allgather(num_tokens, small_payload=True))
+                return self.dist.tp_cp_allgather_int64([num_tokens
+                                                        ])[:, 0].tolist()
+            return self.dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
-            return list(
-                self.dist.tp_allgather(num_ctx_requests, small_payload=True))
+            return self.dist.tp_allgather_int64([num_ctx_requests])[:,
+                                                                    0].tolist()
         return None
 
     def _get_all_rank_num_tokens_and_spec_counts(
@@ -3949,16 +4032,14 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.cp_size > 1 and not self.mapping.has_cp_helix():
             # attn counts span TP only while spec counts span TP*CP; keep the
             # two exchanges separate.
-            gathered = self.dist.tp_cp_allgather(list(spec_counts),
-                                                 small_payload=True)
+            gathered = self.dist.tp_cp_allgather_int64(list(spec_counts))
             return (self._get_all_rank_num_tokens(attn_metadata),
-                    [list(col) for col in zip(*gathered)])
+                    gathered.T.tolist())
         num_tokens = attn_metadata.num_tokens
         if self.mapping.has_cp_helix():
             num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
-        gathered = self.dist.tp_cp_allgather([num_tokens, *spec_counts],
-                                             small_payload=True)
-        cols = [list(col) for col in zip(*gathered)]
+        gathered = self.dist.tp_cp_allgather_int64([num_tokens, *spec_counts])
+        cols = gathered.T.tolist()
         return cols[0], cols[1:]
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
@@ -3981,8 +4062,8 @@ class PyTorchModelEngine(ModelEngine):
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
-        all_flags = self.dist.tp_allgather(local_flag, small_payload=True)
-        spec_metadata.group_all_greedy_sample = all(all_flags)
+        all_flags = self.dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
         # Also overwrite the live flag directly: this iteration's scan already
         # ran (update_is_all_greedy_sample just returned) and the CUDA graph
         # key reads the flag next -- the stored override only takes effect on
@@ -4045,10 +4126,9 @@ class PyTorchModelEngine(ModelEngine):
                 can_run_prefill_cuda_graph = (has_ctx_requests
                                               and max(attn_all_rank_num_tokens)
                                               <= max_captured_num_tokens)
-                all_ranks_can_run_prefill_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_prefill_cuda_graph,
-                                           small_payload=True))
-                if all(all_ranks_can_run_prefill_cuda_graph):
+                # Inputs are rank-uniform, so the flag already agrees on
+                # every rank.
+                if can_run_prefill_cuda_graph:
                     padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
                     logger.debug(
@@ -4190,6 +4270,20 @@ class PyTorchModelEngine(ModelEngine):
         model = getattr(self.model, "_orig_mod", self.model)
         top_level_model = getattr(model, "model", model)
         return getattr(top_level_model, "_orig_mod", top_level_model)
+
+    @functools.cached_property
+    def _model_uses_ple_recurrent_state(self) -> bool:
+        """Detect PLE on text-only and multimodal model wrappers.
+
+        The answer is fixed once the model is loaded, and the CUDA-graph gate
+        below consults it on every forward that has context requests.
+        """
+        top_level_model = self._get_top_level_model()
+        if getattr(top_level_model, "has_ple", False):
+            return True
+        llm = getattr(top_level_model, "llm", None)
+        text_model = getattr(llm, "model", llm)
+        return bool(getattr(text_model, "has_ple", False))
 
     def _get_position_id_offset(self) -> int:
         offset = getattr(self._get_top_level_model(), "position_id_offset", 0)
@@ -4715,8 +4809,12 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.prepare()
 
         # Get LoRA parameters
-        lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+        lora_params = self._lora.build(
+            scheduled_requests,
+            attn_metadata,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len)
 
         # Handle padding for piecewise CUDA graphs
         attn_metadata.padded_num_tokens = None
@@ -5175,10 +5273,13 @@ class PyTorchModelEngine(ModelEngine):
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
         # are unchanged since the last full pass.
         previous_slots = self.previous_batch_indices_cuda[:num_requests]
-        new_tokens = new_tensors_device.new_tokens[:1, previous_slots, :self.
-                                                   max_beam_width]
-        self.input_ids_cuda[:num_requests * self.max_beam_width].copy_(
-            new_tokens.flatten(), non_blocking=True)
+        torch.index_select(
+            new_tensors_device.new_tokens[0, :, :self.max_beam_width],
+            0,
+            previous_slots,
+            out=self.input_ids_cuda[:num_requests * self.max_beam_width].view(
+                num_requests, self.max_beam_width),
+        )
 
         if not attn_metadata.is_cuda_graph:
             attn_metadata.seq_lens = cache['seq_lens_ones']
@@ -6400,11 +6501,14 @@ class PyTorchModelEngine(ModelEngine):
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
-        lora_params = self._get_lora_params_from_requests(
+        lora_params = self._lora.build(
             scheduled_requests,
             attn_metadata,
-            peft_cache_manager,
-            maybe_graph,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len,
+            peft_cache_manager=peft_cache_manager,
+            maybe_graph=maybe_graph,
             use_lora_graph=use_lora_graph)
 
         spec_all_rank_counts = None
@@ -6703,8 +6807,12 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
 
-        lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata)
+        lora_params = self._lora.build(
+            scheduled_requests,
+            attn_metadata,
+            cuda_graph_lora_manager=self.cuda_graph_lora_manager,
+            enable_spec_decode=self.enable_spec_decode,
+            runtime_draft_len=self.runtime_draft_len)
 
         inputs = {
             'attn_metadata': attn_metadata,
@@ -6746,10 +6854,10 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                all_rank_num_tokens = self.dist.tp_cp_allgather_int64([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
                     len(sequence_lengths), spec_metadata.num_generations
-                ])
+                ]).tolist()
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -6758,175 +6866,11 @@ class PyTorchModelEngine(ModelEngine):
                     [item[2] for item in all_rank_num_tokens],
                     [item[3] for item in all_rank_num_tokens])
             else:
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    attn_metadata.num_tokens)
+                all_rank_num_tokens = self.dist.tp_cp_allgather_int64(
+                    [attn_metadata.num_tokens])[:, 0].tolist()
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None
-
-    def _get_lora_params_from_requests(
-            self,
-            scheduled_requests: ScheduledRequests,
-            attn_metadata: AttentionMetadata,
-            peft_cache_manager: Optional[PeftCacheManager] = None,
-            maybe_graph: bool = False,
-            use_lora_graph: bool = False):
-        '''
-        Get LoRA parameters from scheduled requests.
-
-        Uses CUDA Graph compatible mode in decode only batch, otherwise falls back to eager mode.
-
-        Returns:
-            Dictionary containing LoRA parameters, or None if no LoRA requests
-        '''
-        use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
-
-        if use_cuda_graph_mode:
-            if not use_lora_graph:
-                self.cuda_graph_lora_manager.prepare_base_only_batch(
-                    peft_cache_manager)
-                return None
-            # For spec decode verification (non-extend_ctx), each sequence has
-            # runtime_draft_len + 1 tokens in the forward pass.
-            tokens_per_seq = 1
-            if (self.enable_spec_decode and self.runtime_draft_len > 0
-                    and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend)):
-                tokens_per_seq = self.runtime_draft_len + 1
-            return self.cuda_graph_lora_manager.prepare_cuda_graph_lora_params(
-                scheduled_requests, attn_metadata, peft_cache_manager,
-                tokens_per_seq)
-        else:
-            if self.cuda_graph_lora_manager is not None:
-                self.cuda_graph_lora_manager.adapter_slot_manager.remove_evicted_slots_in_cpp(
-                    peft_cache_manager)
-            peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
-            ) if peft_cache_manager is not None else None
-            lora_params = peft_table and self._get_eager_lora_params_from_requests(
-                scheduled_requests, attn_metadata, peft_table)
-            if lora_params:
-                lora_params["data_type"] = peft_cache_manager.data_type
-            return lora_params
-
-    def _get_eager_lora_params_from_requests(
-            self, scheduled_requests: ScheduledRequests,
-            attn_metadata: AttentionMetadata,
-            peft_table: Dict[int, list[TaskLayerModuleConfig]]):
-        '''
-        Eager mode LoRA parameter preparation logic.
-
-        lora_params: dict
-        {
-            layer_id: dict
-            {
-                module_id: dict
-                {
-                    adapter_size: torch tensor: int
-                    weight_pointers: torch tensor: int64
-                }
-            }
-        }
-        '''
-        lora_params = {}
-        tmp_lora_params = {}
-
-        request_list = scheduled_requests.all_requests()
-
-        # trace all requests to get the union set of the lora params
-        for request in request_list:
-            if request.lora_task_id is None:
-                continue
-
-            layer_module_configs = peft_table[request.lora_task_id]
-
-            for module in layer_module_configs:
-                module_id = module.module_id
-                layer_id = module.layer_id
-
-                if layer_id not in lora_params:
-                    lora_params[layer_id] = {}
-                if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {
-                        'adapter_size': [],
-                        'weight_pointers': [],
-                    }
-
-                scaling_vec_pointer = module.scaling_vec_pointer
-                if scaling_vec_pointer is None:
-                    scaling_vec_pointer = 0
-                tmp_lora_params[(request.py_request_id, layer_id,
-                                 module_id)] = {
-                                     'adapter_size': [module.adapter_size],
-                                     'weight_pointers': [
-                                         module.weights_in_pointer,
-                                         module.weights_out_pointer,
-                                         scaling_vec_pointer
-                                     ],
-                                 }
-
-        for request in request_list:
-            # Need to set default values for this case
-            if request.lora_task_id is None:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_lora_params = lora_params[layer_id][module_id]
-                        current_lora_params['adapter_size'].append(0)
-                        current_lora_params['weight_pointers'] += [0, 0, 0]
-
-            else:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_tmp_lora_params = tmp_lora_params.get(
-                            (request.py_request_id, layer_id, module_id), None)
-                        current_lora_params = lora_params[layer_id][module_id]
-                        if current_tmp_lora_params is None:
-                            current_lora_params['adapter_size'].append(0)
-                            current_lora_params['weight_pointers'] += [0, 0, 0]
-                        else:
-                            current_lora_params[
-                                'adapter_size'] += current_tmp_lora_params[
-                                    'adapter_size']
-                            current_lora_params[
-                                'weight_pointers'] += current_tmp_lora_params[
-                                    'weight_pointers']
-
-        for layer_id in lora_params:
-            for module_id in lora_params[layer_id]:
-                current_lora_params = lora_params[layer_id][module_id]
-                current_lora_params['adapter_size'] = torch.IntTensor(
-                    current_lora_params['adapter_size'])
-                current_lora_params['weight_pointers'] = torch.LongTensor(
-                    current_lora_params['weight_pointers'])
-
-        if lora_params:
-            host_request_types = attn_metadata.host_request_types
-            prompt_lens_cpu = attn_metadata.prompt_lens_cpu
-            num_seqs = attn_metadata.num_seqs
-            num_contexts = attn_metadata.num_contexts
-            num_generations = attn_metadata.num_generations
-
-            # During spec decode verification (non-extend_ctx mode), each
-            # generation request processes (runtime_draft_len + 1) tokens at
-            # once. The LoRA op's C++ kernel only advances 1 token per
-            # kGENERATION request, so we re-label generation requests as
-            # kCONTEXT and set prompt_lens_cpu to the actual per-request token
-            # count so the kernel correctly expands LoRA weights for all tokens.
-            if (self.enable_spec_decode and self.runtime_draft_len > 0
-                    and self.spec_config.is_linear_tree
-                    and not self.spec_config.spec_dec_mode.extend_ctx(
-                        self.attn_backend) and num_generations > 0):
-                tokens_per_req = self.runtime_draft_len + 1
-                host_request_types = host_request_types.clone()
-                host_request_types[num_contexts:num_seqs].fill_(0)  # kCONTEXT
-                prompt_lens_cpu = prompt_lens_cpu.clone()
-                prompt_lens_cpu[num_contexts:num_seqs].fill_(tokens_per_req)
-
-            lora_params['host_request_types'] = host_request_types
-            lora_params['prompt_lens_cpu'] = prompt_lens_cpu
-            lora_params['num_seqs'] = num_seqs
-
-        return lora_params
 
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
@@ -7484,7 +7428,10 @@ class PyTorchModelEngine(ModelEngine):
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
                 and not self.llm_args.mm_encoder_only
-                and self.mapping.cp_size == 1):
+                # PLE owns recurrent n-gram and convolution state. Promoting a
+                # fresh final-context row would skip its cache-slot reset.
+                and not self._model_uses_ple_recurrent_state and
+                self.mapping.cp_size == 1):
             graph_requests, promoted_context_request_ids = \
                 _make_single_token_context_graph_batch(
                     scheduled_requests,
@@ -7546,6 +7493,24 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata = None
                 execution_requests = scheduled_requests
                 execution_promoted_context_ids = frozenset()
+
+            # Stage in-graph sampling now that the batch is settled: the staged
+            # scatter width has to match the batch the forward actually runs on,
+            # which differs between the graph (padded) and eager (unpadded)
+            # branches above. Falling back to eager also means no graph replays,
+            # so the tier is dropped and the sampler runs after the forward.
+            #
+            # Promoted one-token contexts join the graph batch's generation
+            # requests, but sample_async is handed the original scheduled batch,
+            # which excludes them. Staging a tier here would sample rows that
+            # are then discarded and advance those requests' Philox streams an
+            # extra time, so keep those steps on the eager path.
+            if self._stage_in_graph_sampling is not None:
+                staged_sample_type = (key.sample_type if can_run_graph
+                                      and not execution_promoted_context_ids
+                                      else SampleType.FULL)
+                self._stage_in_graph_sampling(execution_requests,
+                                              staged_sample_type)
 
             # Fill slot-ID buffer for scatter inside draft loop
             if (self.enable_spec_decode and spec_tree_manager is not None
@@ -7713,6 +7678,19 @@ class PyTorchModelEngine(ModelEngine):
         # If we have special gather_ids, gather the logits
         if gather_ids is not None:
             outputs['logits'] = logits[gather_ids]
+
+        # Sample at the tail of the forward pass, so that under CUDA graph
+        # capture the sampling kernels are recorded as part of this graph. The
+        # hook is a no-op unless the sampler staged a graph-capturable tier for
+        # this batch.
+        #
+        # Only the last PP rank runs the LM head. The others get a placeholder
+        # that is the right shape but never filled, so a shape check waves it
+        # through and they would sample garbage every step -- discarded, but
+        # not free. _execute_logit_post_processors skips them for this reason.
+        if (self.sample_in_graph_callable is not None
+                and self.mapping.is_last_pp_rank()):
+            self.sample_in_graph_callable(outputs)
 
         return outputs
 
