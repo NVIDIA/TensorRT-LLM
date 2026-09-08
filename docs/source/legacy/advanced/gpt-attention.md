@@ -218,8 +218,7 @@ the MHA/MQA kernel, dequantization can be described as
 TensorRT-LLM has a feature called `Cyclic KV Cache`, which treats the kv cache
 as a circular buffer. This means that it only stores the kv cache for the last N
 tokens, where N is determined by the `max_attention_window_size` parameter in
-`GenerationSession.setup`. You can see examples of this in the `run.py` or
-`summarize.py` files. When the cache is full, new tokens’ kv cache will
+`GenerationSession.setup`. When the cache is full, new tokens’ kv cache will
 overwrite the "least recently used" caches.
 
 In the context phase, if the input length surpasses the `max_attention_window_size`,
