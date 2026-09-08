@@ -40,8 +40,8 @@ TestKimiK3::test_w4a16_mxfp4:
   ref_al: 1.318
   min_al: 1.15
 TestKimiK3::test_w4a16_mxfp4[dspark]:
-  ref_al: null
-  min_al: null
+  ref_al: 4.354
+  min_al: 4.1363
 TestQwen3_8B::test_dspark:
   ref_al: 6.259
   min_al: 5.946

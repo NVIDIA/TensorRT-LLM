@@ -189,7 +189,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 assert llm.args.cuda_graph_config is None
                 assert llm.args.speculative_config.decoding_type == "DSpark"
                 assert (
-                    llm.args.speculative_config.speculative_model
+                    str(llm.args.speculative_config.speculative_model)
                     == TestKimiK3.DSPARK_MODEL_PATH
                 )
         else:
