@@ -26,23 +26,23 @@ from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
 
 
 def _assignment(
-    arm: str = "auto", source: str = "randomized"
+    arm: str = "auto", source: str = "pr_number"
 ) -> perf_sanity.CheckpointIoExperimentAssignment:
     return perf_sanity.CheckpointIoExperimentAssignment(
         version=perf_sanity.CHECKPOINT_IO_EXPERIMENT_VERSION,
-        bucket=(0 if arm == "native" else 1) if source == "randomized" else -1,
+        bucket=(0 if arm == "native" else 1) if source == "pr_number" else -1,
         assigned_arm=arm,
         assignment_source=source,
-        root_build_number=(100 if arm == "native" else 101) if source == "randomized" else None,
+        pr_number=(100 if arm == "native" else 101) if source == "pr_number" else None,
     )
 
 
 @pytest.mark.parametrize(
-    ("build_number", "expected_bucket", "expected_arm"),
+    ("pr_number", "expected_bucket", "expected_arm"),
     [(100, 0, "native"), (101, 1, "auto"), (102, 2, "auto"), (103, 3, "auto")],
 )
-def test_checkpoint_io_experiment_uses_deterministic_75_25_split(
-    build_number: int,
+def test_checkpoint_io_experiment_uses_pr_number_for_deterministic_75_25_split(
+    pr_number: int,
     expected_bucket: int,
     expected_arm: str,
 ) -> None:
@@ -52,16 +52,39 @@ def test_checkpoint_io_experiment_uses_deterministic_75_25_split(
         configs,
         telemetry_eligible=True,
         environment={},
-        job_info={"s_job_id": str(build_number)},
+        job_info={"b_is_pr_job": True, "s_trigger_mr_id": str(pr_number)},
     )
 
     assert assignment.bucket == expected_bucket
     assert assignment.assigned_arm == expected_arm
-    assert assignment.assignment_source == "randomized"
+    assert assignment.assignment_source == "pr_number"
+    assert assignment.pr_number == pr_number
     assert configs == [
         {"checkpoint_io_policy": expected_arm},
         {"checkpoint_io_policy": expected_arm},
     ]
+
+
+@pytest.mark.parametrize("build_number", [100, 101])
+def test_checkpoint_io_experiment_ignores_build_number_within_one_pr(
+    build_number: int,
+) -> None:
+    config = {}
+
+    assignment = perf_sanity.assign_checkpoint_io_experiment(
+        [config],
+        telemetry_eligible=True,
+        environment={},
+        job_info={
+            "b_is_pr_job": True,
+            "s_job_id": str(build_number),
+            "s_trigger_mr_id": "18608",
+        },
+    )
+
+    assert assignment.assigned_arm == "native"
+    assert assignment.pr_number == 18608
+    assert config["checkpoint_io_policy"] == "native"
 
 
 def test_checkpoint_io_experiment_writes_concrete_generated_config() -> None:
@@ -70,7 +93,7 @@ def test_checkpoint_io_experiment_writes_concrete_generated_config() -> None:
         [config],
         telemetry_eligible=True,
         environment={},
-        job_info={"s_job_id": "100"},
+        job_info={"b_is_pr_job": True, "s_trigger_mr_id": "100"},
     )
 
     server_config = perf_sanity.ServerConfig(config, checkpoint_io_experiment=assignment)
@@ -103,7 +126,7 @@ def test_checkpoint_io_experiment_preserves_explicit_policy() -> None:
         configs,
         telemetry_eligible=True,
         environment={perf_sanity.CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV: "native"},
-        job_info={"s_job_id": "100"},
+        job_info={"b_is_pr_job": True, "s_trigger_mr_id": "100"},
     )
 
     assert assignment.assigned_arm == "unassigned"
@@ -127,7 +150,7 @@ def test_checkpoint_io_experiment_excludes_incompatible_config(config: dict) -> 
         [config],
         telemetry_eligible=True,
         environment={},
-        job_info={"s_job_id": "100"},
+        job_info={"b_is_pr_job": True, "s_trigger_mr_id": "100"},
     )
 
     assert assignment.assigned_arm == "unassigned"
@@ -136,17 +159,19 @@ def test_checkpoint_io_experiment_excludes_incompatible_config(config: dict) -> 
 
 
 @pytest.mark.parametrize(
-    ("telemetry_eligible", "job_id", "source"),
+    ("telemetry_eligible", "is_pr_job", "pr_number", "source"),
     [
-        (False, "100", "non_telemetry"),
-        (True, "", "missing_root_build"),
-        (True, "0", "missing_root_build"),
-        (True, "bad", "missing_root_build"),
+        (False, True, "100", "non_telemetry"),
+        (True, False, "100", "non_pr_pipeline"),
+        (True, True, "", "missing_pr_number"),
+        (True, True, "0", "missing_pr_number"),
+        (True, True, "bad", "missing_pr_number"),
     ],
 )
 def test_checkpoint_io_experiment_defaults_to_auto_without_assignment(
     telemetry_eligible: bool,
-    job_id: str,
+    is_pr_job: bool,
+    pr_number: str,
     source: str,
 ) -> None:
     config = {}
@@ -155,11 +180,12 @@ def test_checkpoint_io_experiment_defaults_to_auto_without_assignment(
         [config],
         telemetry_eligible=telemetry_eligible,
         environment={},
-        job_info={"s_job_id": job_id},
+        job_info={"b_is_pr_job": is_pr_job, "s_trigger_mr_id": pr_number},
     )
 
     assert assignment.assigned_arm == "unassigned"
     assert assignment.assignment_source == source
+    assert assignment.pr_number is None
     assert "checkpoint_io_policy" not in config
 
 
@@ -169,7 +195,7 @@ def test_checkpoint_io_experiment_rejects_invalid_override() -> None:
             [{}],
             telemetry_eligible=True,
             environment={perf_sanity.CHECKPOINT_IO_EXPERIMENT_OVERRIDE_ENV: "random"},
-            job_info={"s_job_id": "100"},
+            job_info={"b_is_pr_job": True, "s_trigger_mr_id": "100"},
         )
 
 
@@ -191,7 +217,7 @@ def test_checkpoint_io_experiment_rejects_invalid_override() -> None:
             "native",
             "auto_fallback",
         ),
-        (_assignment("native"), "native", False, "native", "randomized_control"),
+        (_assignment("native"), "native", False, "native", "native_control"),
     ],
 )
 def test_checkpoint_io_experiment_classification_preserves_assigned_arm(
@@ -529,6 +555,7 @@ def test_startup_observation_bundle_and_primary_row_are_deduplicatable(
     assert second_row["b_startup_observation_primary_row"] is False
     assert first_row["s_checkpoint_io_experiment_assigned_arm"] == "auto"
     assert first_row["l_checkpoint_io_experiment_bucket"] == 1
+    assert first_row["l_checkpoint_io_experiment_pr_number"] == 101
 
 
 @pytest.mark.parametrize("contents", ["", "{"])
