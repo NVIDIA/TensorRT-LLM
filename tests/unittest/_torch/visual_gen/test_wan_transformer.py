@@ -37,13 +37,25 @@ import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
 
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     DiffusionPipelineConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+    WanBlock,
+    WanTransformer3DModel,
+)
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig
+
+FA4_AVAILABLE = _flash_attn_fwd is not None
+fa4_cuda_only = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="FA4 requires CUDA"),
+    pytest.mark.skipif(not FA4_AVAILABLE, reason="FA4 kernel not available"),
+]
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -340,6 +352,88 @@ class TestWanUnit:
             ).float()
 
         torch.testing.assert_close(trt_out, hf_out, atol=0.4, rtol=0.4)
+
+
+def _make_fa4_model_config(config_dict: dict) -> DiffusionModelConfig:
+    return DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(**config_dict),
+        quant_config=QuantConfig(),
+        quant_config_dict=None,
+        dynamic_weight_quant=False,
+        force_dynamic_quantization=False,
+        skip_create_weights_in_init=False,
+        attention=AttentionConfig(backend="FA4"),
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.wan_t2v
+class TestWanBlockVarlenCrossAttn:
+    """Calls attn2 directly; ragged cu_seqlens output vs. a masked-padded oracle."""
+
+    pytestmark = fa4_cuda_only
+    DEVICE = "cuda"
+    DTYPE = torch.bfloat16
+
+    def test_varlen_matches_masked_padded_oracle(self):
+        torch.manual_seed(7)
+        hidden_size = 128
+        cfg = {
+            **WAN_1_3B_CONFIG,
+            "num_layers": 1,
+            "hidden_size": hidden_size,
+            "num_attention_heads": 2,
+            "attention_head_dim": 64,
+            "ffn_dim": hidden_size * 4,
+            "text_dim": 64,
+        }
+        block = (
+            WanBlock(model_config=_make_fa4_model_config(cfg), _layer_idx=0)
+            .to(self.DEVICE, dtype=self.DTYPE)
+            .eval()
+        )
+
+        B, seq_len, max_text_len = 2, 16, 16
+        text_lens = torch.tensor([5, max_text_len], dtype=torch.int32, device=self.DEVICE)
+
+        norm_x = torch.randn(B, seq_len, hidden_size, device=self.DEVICE, dtype=self.DTYPE)
+        encoder_hidden_states_text = torch.zeros(
+            B, max_text_len, hidden_size, device=self.DEVICE, dtype=self.DTYPE
+        )
+        for i, n in enumerate(text_lens.tolist()):
+            encoder_hidden_states_text[i, :n] = torch.randn(
+                n, hidden_size, device=self.DEVICE, dtype=self.DTYPE
+            )
+
+        with torch.inference_mode():
+            q, k, v = block.attn2.get_qkv(norm_x, encoder_hidden_states_text)
+            q, k = block.attn2.apply_qk_norm(q, k)
+
+            k_ragged, v_ragged, cu_seqlens_kv = Attention.pack_ragged_kv(k, v, text_lens)
+            varlen_out = block.attn2._attn_impl(
+                q,
+                k_ragged,
+                v_ragged,
+                batch_size=B,
+                seq_len=seq_len,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_kv=int(text_lens.max().item()),
+            )
+
+            key_padding_mask = (
+                torch.arange(max_text_len, device=self.DEVICE)[None, :] < text_lens[:, None]
+            )
+            masked_padded_out = block.attn2._attn_impl(
+                q,
+                k,
+                v,
+                batch_size=B,
+                seq_len=seq_len,
+                kv_seq_len=max_text_len,
+                key_padding_mask=key_padding_mask,
+            )
+
+        torch.testing.assert_close(varlen_out, masked_padded_out, atol=2e-2, rtol=2e-2)
 
 
 # ============================================================================

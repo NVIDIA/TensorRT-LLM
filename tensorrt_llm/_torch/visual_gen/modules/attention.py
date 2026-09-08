@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
@@ -268,6 +269,9 @@ class Attention(nn.Module):
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+        # Checked post-wrap so this reflects self.attn as it's actually called.
+        self.supports_varlen = self.attn.supports_varlen()
 
     @staticmethod
     def _qualified_module_name(
@@ -541,7 +545,13 @@ class Attention(nn.Module):
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
+
+        A third path (see ``_attn_impl_varlen_kv``) handles ragged K/V when the
+        caller passes ``cu_seqlens_kv``.
         """
+        if kwargs.get("cu_seqlens_kv") is not None:
+            return self._attn_impl_varlen_kv(q, k, v, **kwargs)
+
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
         batch_size = q.shape[0]
@@ -588,6 +598,66 @@ class Attention(nn.Module):
             return out.transpose(1, 2).flatten(2)
         else:
             return out.flatten(2)
+
+    @staticmethod
+    def pack_ragged_kv(
+        k: torch.Tensor, v: torch.Tensor, kv_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice each sample's true K/V rows out of padded [B, S, H*D] K/V
+        into [total_kv_tokens, H*D], plus cu_seqlens_kv for _attn_impl_varlen_kv.
+        """
+        k_parts, v_parts = [], []
+        for i, n in enumerate(kv_lens.tolist()):
+            k_parts.append(k[i, :n])
+            v_parts.append(v[i, :n])
+        k_ragged = torch.cat(k_parts, dim=0)
+        v_ragged = torch.cat(v_parts, dim=0)
+        cu_seqlens_kv = F.pad(torch.cumsum(kv_lens, dim=0), (1, 0)).to(torch.int32)
+        return k_ragged, v_ragged, cu_seqlens_kv
+
+    def _attn_impl_varlen_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Ragged K/V cross-attention: Q is uniform-length [B, S, H*D], K/V arrive
+        pre-packed as [total_kv_tokens, H_kv*D]. The caller builds
+        ``cu_seqlens_kv``/``max_seqlen_kv`` from the real per-sample lengths.
+        """
+        if not self.supports_varlen:
+            raise ValueError(
+                f"{type(self.attn).__name__} does not support varlen cross-attention "
+                "(cu_seqlens_kv); check `Attention.supports_varlen` before passing "
+                "ragged K/V, and fall back to the padded K/V path otherwise."
+            )
+
+        cu_seqlens_kv = kwargs.pop("cu_seqlens_kv")
+        max_seqlen_kv = kwargs.pop("max_seqlen_kv")
+
+        batch_size, seq_len_q = q.shape[0], q.shape[1]
+        total_q = batch_size * seq_len_q
+        cu_seqlens_q = torch.arange(
+            0, total_q + seq_len_q, seq_len_q, dtype=torch.int32, device=q.device
+        )
+
+        q = q.reshape(total_q, self.local_num_attention_heads, self.head_dim)
+        k = k.reshape(-1, self.local_num_key_value_heads, self.head_dim)
+        v = v.reshape(-1, self.local_num_key_value_heads, self.head_dim)
+
+        kwargs.update(
+            {
+                "batch_size": batch_size,
+                "seq_len": seq_len_q,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_kv": cu_seqlens_kv,
+                "max_seqlen_q": seq_len_q,
+                "max_seqlen_kv": max_seqlen_kv,
+            }
+        )
+        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        return out.reshape(batch_size, seq_len_q, -1)
 
     def forward(
         self,

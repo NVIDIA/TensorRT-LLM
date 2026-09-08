@@ -119,6 +119,14 @@ class AttentionConfig(StrictBaseModel):
             "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
         ),
     )
+    enable_varlen_cfg: bool = Field(
+        False,
+        status="prototype",
+        description=(
+            "Pack unequal-length CFG text cross-attention via cu_seqlens instead of "
+            "padding. Requires an FA4 backend. Not yet wired through any model."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
