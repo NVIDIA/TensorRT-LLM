@@ -578,6 +578,86 @@ TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 }
 #endif
 
+// Onboarding a block from secondary memory swaps a fresh primary block into the host slot the
+// content came from, leaving that slot empty. The emptied slot must be the next secondary block
+// handed out, so the following offload lands in it instead of evicting a host block that still
+// holds reusable content.
+TEST_F(KVCacheManagerTest, BlockManagerOnboardReleasesEmptiedHostSlotFirst)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr maxAttentionWindow = 4096;
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    SizeType32 constexpr maxNewTokens{0};
+    bool constexpr isStreaming{false};
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tle::SamplingConfig const samplingConfig{beamWidth};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, stream, maxAttentionWindow, beamWidth,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0,
+        maxAttentionWindow);
+    blockManager.allocatePools(false);
+
+    // One sequence of 17 tokens holding three primary blocks.
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    LlmRequest::RequestIdType constexpr requestId{0};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    GenerationRequest seq{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
+    auto const promptLen = llmRequest->getNumTokens(beamIdx);
+    auto const numContextBlocks = tc::ceilDiv(promptLen, blockManager.getTokensPerBlock());
+    auto const prepopulatedPromptLen = blockManager
+                                           .addSequenceBatch({&seq}, {promptLen}, {numContextBlocks},
+                                               {std::ref(*llmRequest)}, maxAttentionWindow, /*isEnableBlockReuse=*/true)
+                                           .front()
+                                           .prepopulatedLen;
+    llmRequest->setPrepopulatedPromptLen(prepopulatedPromptLen, blockManager.getTokensPerBlock());
+    EXPECT_EQ(prepopulatedPromptLen, 0);
+    auto const cacheBlockIds = seq.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    ASSERT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
+
+    auto const firstBlock = blockManager.getBlockById(cacheBlockIds[0], maxAttentionWindow);
+    auto const secondBlock = blockManager.getBlockById(cacheBlockIds[1], maxAttentionWindow);
+
+    // Offload the first block. It lands in the host slot at the front of the secondary free queue.
+    blockManager.offloadBlock(firstBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
+    ASSERT_FALSE(firstBlock->isPrimary());
+    auto const hostSlot = firstBlock->getMemoryPoolBlockIndex();
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+
+    // Onboard it again. The fresh primary block that receives the content swaps offsets with the
+    // host slot, which is now empty in secondary memory.
+    blockManager.onboardBlock(seq, firstBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
+    ASSERT_TRUE(firstBlock->isPrimary());
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+
+    // The emptied slot is the next secondary block handed out: offloading another block reuses it
+    // instead of consuming a never-used host slot further along the queue.
+    blockManager.offloadBlock(secondBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
+    ASSERT_FALSE(secondBlock->isPrimary());
+    EXPECT_EQ(secondBlock->getMemoryPoolBlockIndex(), hostSlot);
+    // Offloading preserves the offloaded block's own retention priority.
+    EXPECT_EQ(secondBlock->getPriority(), KvCacheRetentionConfig::kDefaultRetentionPriority);
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+
+    blockManager.onboardBlock(seq, secondBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
+    ASSERT_TRUE(secondBlock->isPrimary());
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    blockManager.releaseBlocks(seq, llmRequest);
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+}
+
 TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
 {
     auto constexpr numLayers = 12;
@@ -3994,15 +4074,15 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
 
     events = getEvents(kvCacheManager);
 
-    // Replacing block 1 removes its detached child block 2 from the search tree. Block 2 is then recycled before a
-    // reusable block needs to be offloaded, producing one offload, one onboard, and one remove event.
+    // The offload following the onboard reuses the empty secondary slot, producing one onboard and one offload event
+    // without evicting reusable host content.
     auto onboardedBlocks = 0;
     auto offloadedBlocks = 0;
     auto removedBlocks = 0;
 
-    ASSERT_EQ(events.size(), 3);
+    ASSERT_EQ(events.size(), 2);
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 2; i++)
     {
         if (std::holds_alternative<tle::KVCacheUpdatedData>(events.front().data))
         {
@@ -4028,7 +4108,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
 
     EXPECT_EQ(onboardedBlocks, 1);
     EXPECT_EQ(offloadedBlocks, 1);
-    EXPECT_EQ(removedBlocks, 1);
+    EXPECT_EQ(removedBlocks, 0);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest4);
     kvCacheManager.storeContextBlocks(*llmRequest4);

@@ -1365,8 +1365,17 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
                 tle::KVCacheUpdatedData(offloadBlock->getHash()).cacheLevelUpdated(kSecondaryLevel, kPrimaryLevel),
                 mWindowSize);
         }
-        mEvictionPolicy->releaseBlock(block); // append block to offload queue
-                                              // offloadBlock is now in primary memory pool
+        // The swapped-out secondary slot holds no content: the fresh primary block returned by
+        // getFreeBlock carried no references and was detached from the lookup tree. Release it to
+        // the front of the secondary free queue at the minimum retention priority so that the next
+        // offload reuses this empty slot before evicting a host block that still holds reusable
+        // content (the treatment freeChildren gives detached blocks). Appending it at the default
+        // priority instead kept the slot idle for a full rotation of the host LRU queue. The
+        // priority is reset by claimBlock when the slot is handed out again, and the slot never
+        // enters the expiration heap because getFreeBlock cleared its duration.
+        block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+        mEvictionPolicy->releaseBlock(block, /*toFront=*/true);
+        // offloadBlock is now in primary memory pool.
     }
 }
 
