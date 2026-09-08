@@ -25,7 +25,7 @@ On the client side, run:
 
 Generation parameters live in the ``--workload`` document rather than on the CLI.
 Its format and the metrics reported are documented in
-``examples/visual_gen/serve/BENCHMARKING.md``.
+``BENCHMARKING_VISUAL_GEN_SERVER.md``, beside this file.
 """
 
 import argparse
@@ -1387,84 +1387,81 @@ def build_arg_parser() -> FlexibleArgumentParser:
         description="Benchmark VisualGen (image/video generation) serving."
     )
 
-    conn_group = parser.add_argument_group("Connection")
+    conn_group = parser.add_argument_group("Connection", "Where the server is, and what it serves.")
+    conn_group.add_argument("--host", type=str, default="127.0.0.1", help="Server host.")
+    conn_group.add_argument("--port", type=int, default=8000, help="Server port.")
     conn_group.add_argument(
         "--model",
         type=str,
         default=None,
         help="Model id or checkpoint path sent as the request 'model' field and used to "
-        "label results. Default: the id reported by GET /v1/models.",
+        "label results, so a stored result names what produced it. Default: the id "
+        "reported by GET /v1/models; passing it cross-checks against that id rather "
+        "than replacing it.",
     )
-    conn_group.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        choices=list(BACKEND_ENDPOINTS),
-        help="Backend API type. Supplies the 'backend' key when --workload omits it; "
-        "conflicting with it is an error. Required from one of the two.",
-    )
-    conn_group.add_argument(
-        "--num-gpus",
-        type=int,
-        default=None,
-        help="GPUs the server runs on, recorded in the result and used for "
-        "per_gpu_throughput. The same model and workload at 1, 4 or 8 GPUs are different "
-        "measurements, and the server reports no topology of its own. Its value is the "
-        "product of the server's parallel sizes.",
-    )
-    conn_group.add_argument("--host", type=str, default="127.0.0.1", help="Server host.")
-    conn_group.add_argument("--port", type=int, default=8000, help="Server port.")
 
-    input_group = parser.add_argument_group("Input")
-    input_group.add_argument(
-        "--num-requests",
-        type=int,
-        default=None,
-        help="Resize the workload to exactly this many requests, cycling the list "
-        "in order or truncating it. Default: send the document as written.",
+    workload_group = parser.add_argument_group(
+        "Workload",
+        "What the run sends. The document arrives one of two ways and never both: "
+        "--workload, or the field flags below spelling the same document out. "
+        "--backend and --num-requests apply to whichever way it arrived.",
     )
-    input_group.add_argument(
+    workload_group.add_argument(
         "--workload",
         type=str,
         default=None,
         help="Workload document: a YAML/JSON file path, or inline content starting with "
         "'{' (full mapping) or '[' (bare requests list) -- a path starting with either "
-        "character is not addressable. Top-level keys: backend, common_params, "
-        "requests. Alternative to spelling the same document out below.",
+        "character is not addressable. Top-level keys: backend, common_params, requests.",
     )
-
-    # One flag per document key, same name, so a command line and a file
-    # describe a workload identically. Either spelling, never both.
-    request_group = parser.add_argument_group(
-        "Workload on the CLI",
-        "The same document, spelled out: these fields are its common_params, and "
-        "--requests is its requests list, which it needs just as a file does. "
-        "Alternative to --workload.",
+    workload_group.add_argument(
+        "--backend",
+        type=str,
+        default=None,
+        choices=list(BACKEND_ENDPOINTS),
+        help="The route to measure. Supplies the document's 'backend' key when it omits "
+        "one, and disagreeing with it is an error; required from one of the two. A "
+        "checkpoint serving both modes answers the wrong one without complaining.",
     )
-    request_group.add_argument(
+    workload_group.add_argument(
+        "--num-requests",
+        type=int,
+        default=None,
+        help="Resize the resolved requests list to exactly this many, cycling it in "
+        "order or truncating it. Default: send the document as written.",
+    )
+    # One flag per document key, same name, so a command line and a file describe a
+    # workload identically.
+    workload_group.add_argument(
         "--requests",
         type=str,
         default=None,
         help="The requests list as JSON, in the document's own form, e.g. "
         '\'[{"prompt": "a fox"}, {"prompt": "a cat", "seed": 7}]\'. Each entry '
-        "overrides the fields below per key. Required, as it is in a file.",
+        "overrides the fields below per key. Required when spelling the document out, "
+        "as it is in a file.",
     )
     for name, kind in SCALAR_PARAM_FIELDS.items():
-        request_group.add_argument(
+        workload_group.add_argument(
             f"--{name.replace('_', '-')}",
             type=kind,
             default=None,
             help=VisualGenParams.model_fields[name].description,
         )
     for name, text in zip(COMMON_INPUT_KEYS, ("The prompt text.", "Path to a prompt file.")):
-        request_group.add_argument(f"--{name.replace('_', '-')}", type=str, default=None, help=text)
-    request_group.add_argument(
+        workload_group.add_argument(
+            f"--{name.replace('_', '-')}", type=str, default=None, help=text
+        )
+    workload_group.add_argument(
         "--extra-params", type=str, default=None, help="Per-pipeline parameters, as a JSON object."
     )
 
-    traffic_group = parser.add_argument_group("Traffic Control")
+    traffic_group = parser.add_argument_group("Traffic", "When requests are issued.")
     traffic_group.add_argument(
-        "--max-concurrency", type=int, default=None, help="Maximum concurrent requests."
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help="Maximum requests in flight (default: unbounded).",
     )
     traffic_group.add_argument(
         "--request-rate",
@@ -1482,20 +1479,42 @@ def build_arg_parser() -> FlexibleArgumentParser:
         "lower value (0 < burstiness < 1) results in more bursty requests, while a higher "
         "value (burstiness > 1) results in a more uniform arrival of requests.",
     )
-    traffic_group.add_argument(
+
+    exec_group = parser.add_argument_group(
+        "Execution", "How the client drives the run, and how the media comes back."
+    )
+    exec_group.add_argument(
+        "--no-test-input",
+        action="store_true",
+        help="Skip the single probe request sent before the measured run. The probe is "
+        "not counted, and it fails fast on a workload the server rejects.",
+    )
+    exec_group.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.1,
+        help=f"Job status poll interval in seconds for {VIDEO_BACKEND} "
+        "(default: %(default)s). It is the granularity of gen_latency and e2e_latency; "
+        "the image routes are synchronous and ignore it.",
+    )
+    exec_group.add_argument(
         "--request-timeout",
         type=float,
         default=6 * 60 * 60,
         help="Request timeout in seconds (default: 6 hours).",
     )
-    traffic_group.add_argument(
+    exec_group.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    exec_group.add_argument(
         "--response-format",
         type=str,
         default="path",
-        help="How the server returns media (default: %(default)s). Run-level: mixing "
-        "transport modes within one run makes the aggregate latency incomparable.",
+        help="How the server returns media (default: %(default)s): 'path' returns a "
+        "locator, the others return the bytes. The routes otherwise accept 'file' "
+        "(video, its own default) and 'url' / 'b64_json' (images, default 'url'). "
+        "Run-level: mixing transport modes within one run makes the aggregate latency "
+        "incomparable.",
     )
-    traffic_group.add_argument(
+    exec_group.add_argument(
         "--format",
         type=str,
         default=None,
@@ -1503,47 +1522,51 @@ def build_arg_parser() -> FlexibleArgumentParser:
         "images. Default: the server's, which for video is 'auto' -- without ffmpeg "
         "that is AVI/MJPEG, a different encode inside the measured window.",
     )
-    traffic_group.add_argument(
-        "--poll-interval",
-        type=float,
-        default=0.1,
-        help=f"Job status poll interval in seconds for {VIDEO_BACKEND} "
-        "(default: %(default)s). Image backends are synchronous and ignore it.",
-    )
-    traffic_group.add_argument(
-        "--no-test-input", action="store_true", help="Skip the initial single-prompt test run."
-    )
-    traffic_group.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
 
-    output_group = parser.add_argument_group("Output")
-    output_group.add_argument(
-        "--save-result", action="store_true", help="Save results to JSON file."
+    results_group = parser.add_argument_group("Results", "What the run writes down.")
+    results_group.add_argument(
+        "--save-result",
+        action="store_true",
+        help="Write the result JSON. Without it the run only prints.",
     )
-    output_group.add_argument(
+    results_group.add_argument(
+        "--save-detailed",
+        action="store_true",
+        help="Add the timings.server_* series and a per-request record to the result "
+        "JSON. A heterogeneous run cannot be attributed without them.",
+    )
+    results_group.add_argument(
+        "--result-dir", type=str, default=None, help="Directory for result files."
+    )
+    results_group.add_argument(
+        "--result-filename", type=str, default=None, help="Custom result filename."
+    )
+    results_group.add_argument(
         "--output-media-dir",
         type=str,
         default=None,
-        help="Write each successful request's media here, and record where it landed in "
-        "output_paths. A 'path' response is copied from the server's file, which the client "
-        "has to be able to read; the other transports are written from the bytes they carry, "
-        "a URL after fetching it. Writing happens outside the measured window.",
+        help="Write each successful request's media here as {index}_{i}{ext}, and record "
+        "where it landed in output_paths. A 'path' response is copied from the server's "
+        "file, which the client has to be able to read; the other transports are written "
+        "from the bytes they carry, a URL after fetching it. Writing happens outside the "
+        "measured window.",
     )
-    output_group.add_argument(
-        "--save-detailed", action="store_true", help="Include per-request details in saved results."
+    results_group.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="GPUs the server runs on, recorded in the result and used to divide "
+        "request_throughput into per_gpu_throughput. The same model and workload at 1, 4 "
+        "or 8 GPUs are different measurements, and the server reports no topology of its "
+        "own. Its value is the product of the server's parallel sizes.",
     )
-    output_group.add_argument(
-        "--result-dir", type=str, default=None, help="Directory for result files."
-    )
-    output_group.add_argument(
-        "--result-filename", type=str, default=None, help="Custom result filename."
-    )
-    output_group.add_argument(
+    results_group.add_argument(
         "--metric-percentiles",
         type=str,
         default="50,90,99",
         help="Comma-separated percentile values (default: '50,90,99').",
     )
-    output_group.add_argument(
+    results_group.add_argument(
         "--metadata",
         metavar="KEY=VALUE",
         type=str,
