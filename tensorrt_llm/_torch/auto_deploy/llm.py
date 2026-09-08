@@ -27,6 +27,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
+from .model_config_loader import inject_autodeploy_registry_defaults
 from .models.factory import ModelFactory
 from .shim.demollm import DemoGenerationExecutor
 
@@ -147,6 +148,7 @@ class LLM(_TorchLLM):
 
     def __init__(self, *args, **kwargs):
         kwargs["backend"] = "_autodeploy"
+        inject_autodeploy_registry_defaults(kwargs)
         super().__init__(*args, **kwargs)
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
