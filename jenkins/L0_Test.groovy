@@ -6059,13 +6059,68 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     }
 }
 
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false, useClusterDurations=false) {
+// Expands a compact Slurm test config spec into the shard-keyed map format
+// consumed by launchTestJobs: "stageName-<k>": [platform, testlist, k,
+// splitCount, gpuCount, nodeCount, runWithSbatch, useClusterDurations] for
+// k in 1..splitCount. Each named param applies identically to every shard.
+def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount = 1, nodeCount = 1, runWithSbatch = false, useClusterDurations = false) {
     def configs = [:]
-    for (int k = 1; k <= testCount; k++) {
-        def key = "${stageName}-${k}"
-        configs[key] = [platform, testlist, k, testCount, gpuCount, nodeCount, runWithSbatch, useClusterDurations]
+    for (int k = 1; k <= splitCount; k++) {
+        configs["${stageName}-${k}"] = [platform, testlist, k, splitCount, gpuCount, nodeCount, runWithSbatch, useClusterDurations]
     }
     return configs
+}
+
+// Expands a compact K8s test config spec into the shard-keyed map format
+// consumed by launchTestJobs: "stageName-<k>": [platform, testlist, k,
+// splitCount, gpuCount, modelExpressSidecar] for k in 1..splitCount. Each
+// named param applies identically to every shard.
+def buildK8sStageConfigs(stageName, platform, testlist, splitCount, gpuCount = 1, modelExpressSidecar = false) {
+    def configs = [:]
+    for (int k = 1; k <= splitCount; k++) {
+        configs["${stageName}-${k}"] = [platform, testlist, k, splitCount, gpuCount, modelExpressSidecar]
+    }
+    return configs
+}
+
+// Loads ${LLM_ROOT}/jenkins/scripts/test_stage_configs.json -- the single
+// source of truth for every sharded L0 test stage family (x86/SBSA, K8s/Slurm),
+// one entry per family (not per shard). scripts/test_to_stage_mapping.py reads
+// the same file and replicates this expansion in Python, so the two stay in
+// sync without either one parsing the other's source.
+def loadStageConfigSpecs(pipeline) {
+    // The top-level pipeline pod runs with skipDefaultCheckout() and never
+    // clones the full repo, so fetch just this one file instead of requiring
+    // a full checkoutSource() on that pod.
+    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/test_stage_configs.json", "${LLM_ROOT}/jenkins/scripts")
+    def specText = pipeline.readFile(file: "${LLM_ROOT}/jenkins/scripts/test_stage_configs.json")
+    return (pipeline.readJSON(text: specText, returnPojo: true)).configs
+}
+
+// Expands the loaded specs into the 5 stage maps launchTestJobs consumes.
+// Each spec: {name, arch ("x86"|"SBSA"), slurm (K8s dispatch if false),
+// platform, testDB, splits, and optionally gpuCount, nodeCount, runWithSbatch,
+// useClusterDurations (slurm only), modelExpressSidecar (K8s only)}.
+// Bucket is normally derived from (arch, slurm); an explicit "target" field
+// overrides that when a spec belongs to a differently-consumed map that
+// shares the same (arch, slurm) combo, e.g. "multiNodesSBSA" for the SBSA
+// multi-node Slurm jobs (distinct from the single-node SBSASlurmTestConfigs).
+// `splits` drives per-shard "<name>-<k>" expansion via buildStageConfigs /
+// buildK8sStageConfigs. Returns [x86: ..., x86Slurm: ..., sbsa: ..., sbsaSlurm: ..., multiNodesSBSA: ...].
+def buildStageConfigsFromSpecs(specs) {
+    def grouped = [x86: [:], x86Slurm: [:], sbsa: [:], sbsaSlurm: [:], multiNodesSBSA: [:]]
+    specs.each { spec ->
+        def bucket = spec.target ?: ((spec.arch == "SBSA") ? (spec.slurm ? "sbsaSlurm" : "sbsa")
+                                                            : (spec.slurm ? "x86Slurm" : "x86"))
+        def expanded = spec.slurm ?
+            buildStageConfigs(spec.name, spec.platform, spec.testDB, spec.splits,
+                               spec.gpuCount ?: 1, spec.nodeCount ?: 1,
+                               spec.runWithSbatch ?: false, spec.useClusterDurations ?: false) :
+            buildK8sStageConfigs(spec.name, spec.platform, spec.testDB, spec.splits,
+                                  spec.gpuCount ?: 1, spec.modelExpressSidecar ?: false)
+        grouped[bucket] += expanded
+    }
+    return grouped
 }
 
 // Deferrable-infra predicate for trtllm_utils.runBranchesWithInfraDefer. Every
@@ -6091,71 +6146,32 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
-    // The test_to_stage_mapping.py script expects stage definitions in the following format:
-    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
+    // The x86/SBSA K8s/Slurm stage families below are driven by
+    // jenkins/scripts/test_stage_configs.json (see loadStageConfigSpecs /
+    // buildStageConfigsFromSpecs). scripts/test_to_stage_mapping.py reads that
+    // same JSON file directly -- any change to its schema (name, arch, slurm,
+    // platform, testDB, splits, gpuCount, nodeCount, runWithSbatch,
+    // useClusterDurations, modelExpressSidecar) must be mirrored there.
     //
-    // Where:
-    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
-    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
-    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
-    // - splitId: Current split number (1-based)
-    // - split_count: Total number of splits
-    // - gpu_count: Number of GPUs required (optional, defaults to 1)
-    //
-    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
-    // mapping between test names and Jenkins stage names. Any changes to this syntax
-    // may break the mapping functionality.
+    // Other stage maps further below (e.g. multiNodesSBSAConfigs,
+    // agentFlowTestConfigs) are still literal "Stage-Name": ["platform",
+    // "yaml_file", splitId, split_count, gpu_count, ...] entries, which
+    // scripts/test_to_stage_mapping.py parses by regex-scanning this file's
+    // source text line by line. Keep those literal -- generating them via a
+    // helper (as buildStageConfigsFromSpecs used to, before moving to the
+    // JSON file) breaks that parser silently.
 
-    x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
-        "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
-        "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
-        "A10-PyTorch-3": ["a10", "l0_a10", 3, 3],
-        "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
-        "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
-        "A30-CPP-1": ["a30", "l0_a30", 1, 1],
-        "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
-        "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
-        "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
-        // platform, test DB, split, splits, GPU count, ModelExpress sidecars
-        "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
-        "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
-        "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
-        "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
-        "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
-        // Currently post-merge test stages only run tests with "stage: post_merge" mako
-        // in the test-db. This behavior may change in the future.
-        "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 4],
-        "A10-PyTorch-Post-Merge-2": ["a10", "l0_a10", 2, 4],
-        "A10-PyTorch-Post-Merge-3": ["a10", "l0_a10", 3, 4],
-        "A10-PyTorch-Post-Merge-4": ["a10", "l0_a10", 4, 4],
-        "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
-        "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        // "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
-        // "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
-        "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
-        "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
-        "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
-        // Disable RTXPro6000 stages due to nodes will be offline temporarily.
-        // [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable mount of tests to pre-merge.
-        // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        // "RTXPro6000-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
-        "RTXPro6000D-PyTorch-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
-        "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
-        // Disable RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1 and RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2 due to some nodes are offline temporarily.
-        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
-        // "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
-    ]
+    // Loads the single source of truth for every sharded L0 test stage family
+    // (x86/SBSA, K8s/Slurm) from jenkins/scripts/test_stage_configs.json.
+    // scripts/test_to_stage_mapping.py reads the same file directly instead
+    // of parsing this Groovy source, so the two never drift out of sync.
+    def allTestConfigs = loadStageConfigSpecs(pipeline)
+    def groupedTestConfigs = buildStageConfigsFromSpecs(allTestConfigs)
+    x86TestConfigs = groupedTestConfigs.x86
+    x86SlurmTestConfigs = groupedTestConfigs.x86Slurm
+    SBSATestConfigs = groupedTestConfigs.sbsa
+    SBSASlurmTestConfigs = groupedTestConfigs.sbsaSlurm
+    multiNodesSBSAConfigs = groupedTestConfigs.multiNodesSBSA
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
@@ -6170,89 +6186,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }]]}
     fullSet = parallelJobs.keySet()
 
-    x86SlurmTestConfigs = [
-        "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
-        "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
-        "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 6],
-        "DGX_H100-PyTorch-4": ["auto:dgx-h100-x1", "l0_h100", 4, 6],
-        "DGX_H100-PyTorch-5": ["auto:dgx-h100-x1", "l0_h100", 5, 6],
-        "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
-        "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
-        "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
-        "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
-        "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],
-        "DGX_H100-2_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-2_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 1, 2],
-        "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
-        "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
-        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
-        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
-        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
-        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 9, 1, 1, true],
-        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 9, 1, 1, true],
-        "DGX_B200-PyTorch-6": ["auto:dgx-b200-flex", "l0_b200", 6, 9, 1, 1, true],
-        "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 9, 1, 1, true],
-        "DGX_B200-PyTorch-8": ["auto:dgx-b200-flex", "l0_b200", 8, 9, 1, 1, true],
-        "DGX_B200-PyTorch-9": ["auto:dgx-b200-flex", "l0_b200", 9, 9, 1, 1, true],
-        "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
-        "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
-        "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 3, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 3, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 3, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
-        "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
-        "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
-        // VisualGen PerfSanity post-merge test
-        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
-        // Single-GPU Gemma4 PerfSanity post-merge baseline
-        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
-        // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
-    ]
-    // B200 PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        1,
-        16,
-        2
-    )
-    // B200 PerfSanity post-merge disaggregated
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        2,
-        16,
-        2
-    )
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -6283,305 +6216,18 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     parallelJobs += parallelSlurmJobs
 
     // SBSA machines from the Blossom machine pool
-    SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
-        "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
-        // DGX Spark is also named as GB10 Grace Blackwell Superchip.
-        "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
-    ]
     SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
 
-    SBSASlurmTestConfigs = [
-        // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
-        // useClusterDurations=true: record actual test times so each cluster builds its own
-        // .test_durations_<clusterName> baseline for load-balanced sharding.
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
-        "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
-        "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
-        // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
-    ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
-    multiNodesSBSAConfigs = [
-        // Each GB200 testcase below uses 8 GPUs and 2 nodes.
-        // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
-        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
-        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
-        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
-        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
-        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
-        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
-    ]
-    // PerfSanity post-merge aggregated
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        6,
-        8,
-        2
-    )
-    // PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        1,
-        8,
-        2
-    )
-    // PerfSanity post-merge disaggregated
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
-        1,
-        8,
-        2
-    )
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        5,
-        8,
-        2
-    )
-    // 3 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
-        2,
-        12,
-        3
-    )
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
-    // 4 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        1,
-        16,
-        4
-    )
-    // 5 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
-        20,
-        5
-    )
-    // 6 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16",
-        2,
-        24,
-        6
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
-    )
-    // GB300 PerfSanity post-merge aggregated
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
-        2,
-        8,
-        2
-    )
-    // GB300 PerfSanity post-merge disaggregated
-    // 3 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        4,
-        12,
-        3
-    )
-    // 5 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
-        20,
-        5
-    )
-    // GB300 GLM-5 disaggregated (ctx DEP2)
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
-    // 3 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        2,
-        12,
-        3
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32",
-        1,
-        36,
-        9
-    )
-    // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
-        3,
-        36,
-        9
-    )
-    // 10 Nodes: ctx6 (1 node, 4 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
-        3,
-        40,
-        10
-    )
-    // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
-        3,
-        44,
-        11
-    )
-    // 14 Nodes: ctx12 (1 node, 4 GPUs each) + gen1 (2 nodes, 8 GPUs) = 56 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
-        3,
-        56,
-        14
-    )
-    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        2,
-        8,
-        2
-    )
-    // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
-        2,
-        28,
-        7
-    )
-    // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
-        2,
-        24,
-        6
-    )
-    // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
-    // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
-    // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
-    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
-    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
-    // wall-clock duration instead of a fixed prompt count. They require the
-    // DSpark checkpoint and the trace corpus to be staged on whichever
-    // gb300-flex cluster the stage lands on.
-    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
-        1,
-        24,
-        6
-    )
-    // 10 Nodes: ctx3 (2 nodes, 8 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX3-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx3_node2_gpu8_gen1_node4_gpu16",
-        1,
-        40,
-        10
-    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[7] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
