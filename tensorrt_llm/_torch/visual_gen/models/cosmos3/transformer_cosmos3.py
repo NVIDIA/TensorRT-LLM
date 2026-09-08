@@ -1611,7 +1611,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             )
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        max_real_len = text_mask.sum(dim=1).max().item()
         real_text_lens = text_mask.sum(dim=1).tolist()
 
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
@@ -1642,8 +1641,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
         if self.cached_kv is None:
+            max_real_len = int(max(real_text_lens))
+            # Trim the tower inputs as views so its per-layer K/V outputs have
+            # the required length without copying every cached K/V tensor.
+            text_ids_for_cache = text_ids[:, :max_real_len]
+            text_mask_for_cache = text_mask[:, :max_real_len]
             freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask,
+                text_mask_for_cache,
                 T,
                 Hp,
                 Wp,
@@ -1654,28 +1658,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             with offload_context("reasoner"):
-                cached_kv_full = self.language_model(
-                    text_ids,
-                    text_mask,
+                self.cached_kv = self.language_model(
+                    text_ids_for_cache,
+                    text_mask_for_cache,
                     freqs_und,
                     timestep=timestep,
                 )
             self.cached_freqs_gen = freqs_gen
-
-            if self.sharder.is_active:
-                # Keep text K/V replicated. Ulysses shards their heads after
-                # its all-to-all; Attention2D partitions their sequence across
-                # partial-attention columns. This preserves a valid-prefix
-                # layout for unequal prompt lengths without padded keys.
-                self.cached_kv = [
-                    (
-                        k[:, : int(max_real_len)].contiguous(),
-                        v[:, : int(max_real_len)].contiguous(),
-                    )
-                    for k, v in cached_kv_full
-                ]
-            else:
-                self.cached_kv = cached_kv_full
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
@@ -1802,8 +1791,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             for i, layer in enumerate(self.gen_layers):
                 k_und, v_und = self.cached_kv[i]
                 if not self.sharder.is_active:
-                    k_und = k_und[:, :max_real_len]
-                    v_und = v_und[:, :max_real_len]
                     hidden_gen = layer(
                         hidden_gen,
                         k_und,

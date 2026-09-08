@@ -717,23 +717,54 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
 
 
 def _logic_cosmos3_ulysses_unequal_text_vs_single_gpu(rank, world_size):
+    """Text-tower K/V trimming under Ulysses is T1 against the unsharded forward."""
     ref_model, ulysses_model, _, device = _build_ref_and_parallel(ulysses_size=world_size)
     text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
 
     ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
-    ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+
+    captured_text_tower = {}
+
+    def capture_text_tower(_module, inputs, output):
+        captured_text_tower["text_ids_shape"] = inputs[0].shape
+        captured_text_tower["text_mask_shape"] = inputs[1].shape
+        captured_text_tower["cached_kv"] = output
+
+    handle = ulysses_model.language_model.register_forward_hook(capture_text_tower)
+    try:
+        ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+    finally:
+        handle.remove()
 
     # The sequence-parallel cache must remain a full, trimmed text prefix on
     # every rank. Ulysses shards its heads only after the generated-token A2A.
+    expected_text_shape = torch.Size((2, _TEXT_LEN))
+    assert captured_text_tower["text_ids_shape"] == expected_text_shape
+    assert captured_text_tower["text_mask_shape"] == expected_text_shape
     assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
+    assert ulysses_model.cached_kv is captured_text_tower["cached_kv"]
+    ulysses_out_float = ulysses_out.float()
+    ref_out_float = ref_out.float()
+    error = ulysses_out_float - ref_out_float
+    diff = error.abs()
+    ref_norm = torch.linalg.vector_norm(ref_out_float)
+    assert ref_norm > 0, "Reference output must have nonzero norm"
+    relative_l2 = torch.linalg.vector_norm(error) / ref_norm
+    cosine = torch.nn.functional.cosine_similarity(
+        ulysses_out_float.flatten(), ref_out_float.flatten(), dim=0
+    )
     if rank == 0:
-        diff = (ulysses_out.float() - ref_out.float()).abs()
         print(
             f"[ulysses={world_size},text_lens=2/{_TEXT_LEN}] "
             f"max_abs_diff={diff.max().item():.6e}, "
-            f"mean_abs_diff={diff.mean().item():.6e}",
+            f"mean_abs_diff={diff.mean().item():.6e}, "
+            f"relative_l2={relative_l2.item():.6e}, "
+            f"cosine={cosine.item():.6e}",
             flush=True,
         )
+
+    assert relative_l2 <= 1e-2
+    assert cosine >= 0.9999
 
     _assert_parity(
         ulysses_out,
@@ -741,8 +772,8 @@ def _logic_cosmos3_ulysses_unequal_text_vs_single_gpu(rank, world_size):
         msg=f"Rank {rank}: unequal-length Ulysses output differs from single-GPU reference",
     )
     torch.testing.assert_close(
-        ulysses_out.float(),
-        ref_out.float(),
+        ulysses_out_float,
+        ref_out_float,
         rtol=1e-4,
         atol=1e-5,
         msg=f"Rank {rank}: unequal-length Ulysses regression exceeded tight tolerance",
