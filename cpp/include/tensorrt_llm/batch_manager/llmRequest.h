@@ -134,7 +134,7 @@ public:
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> const& draftTokens = std::nullopt,
-        std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
+        bool excludeInputFromOutput = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
@@ -187,7 +187,6 @@ public:
         , mLogProbs(samplingConfig.getBeamWidth())
         , mCumLogProbs(samplingConfig.getBeamWidth())
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
-        , mDraftLogits(std::move(draftLogits))
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
@@ -228,9 +227,9 @@ public:
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
-        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
-        bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
-        bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
+        std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
+        std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
+        std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
@@ -257,7 +256,6 @@ public:
         , mLogProbs(samplingConfig.getBeamWidth())
         , mCumLogProbs(samplingConfig.getBeamWidth())
         , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
-        , mDraftLogits(draftLogits)
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
         , mReturnContextLogits(returnContextLogits)
         , mReturnGenerationLogits(returnGenerationLogits)
@@ -706,13 +704,6 @@ public:
     [[nodiscard]] std::shared_ptr<VecTokens> const& getDraftTokens() const
     {
         return mDraftTokens;
-    }
-
-    /// @brief Get the logits for the draft tokens
-    /// @return Tensor of draft logits
-    [[nodiscard]] std::optional<TensorPtr> getDraftLogits() const
-    {
-        return mDraftLogits;
     }
 
     /// @brief Returns true if request has draft tokens
@@ -1186,11 +1177,6 @@ public:
         mDraftTokens = draftTokens;
     }
 
-    void setDraftLogits(std::optional<TensorPtr> const& draftLogits)
-    {
-        mDraftLogits = draftLogits;
-    }
-
     [[nodiscard]] SizeType32 getNumDraftTokens() const noexcept
     {
         return hasDraftTokens() ? static_cast<SizeType32>(mDraftTokens->size()) : 0;
@@ -1203,13 +1189,6 @@ public:
         TLLM_CHECK_WITH_INFO(numTokensToDiscard <= getNumDraftTokens(),
             "Can't discard more draft tokens (%d) than exists (%d).", numTokensToDiscard, getNumDraftTokens());
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
-
-        if (mDraftLogits)
-        {
-            auto shape = mDraftLogits.value()->getShape();
-            shape.d[0] = getNumDraftTokens();
-            mDraftLogits.value()->reshape(shape);
-        }
     }
 
     void updateNumTokensPerIteration(SizeType32 numTokensPerIteration, runtime::ModelConfig const& modelConfig)
@@ -2074,7 +2053,6 @@ protected:
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
     std::shared_ptr<VecTokens> mDraftTokens{nullptr};
-    std::optional<TensorPtr> mDraftLogits{std::nullopt};
     SizeType32 mNumTokensPerIteration{1};
 
     // whether to return the full beams on each iteration. True when doing streaming + beamsearch
@@ -2247,11 +2225,6 @@ private:
             TLLM_THROW(errStr);
         }
 
-        if (mDraftLogits.has_value() && mDraftTokens->empty())
-        {
-            TLLM_THROW("Draft tokens must be specified when draft logits are given.");
-        }
-
         setReturnLogProbs(outputLogProbs);
 
         if (!isChild())
@@ -2316,9 +2289,9 @@ public:
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
-        std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
-        bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
-        bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
+        std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
+        std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
+        std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
@@ -2358,7 +2331,7 @@ public:
             returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
-            std::move(draftLogits), excludeInputFromOutput,
+            excludeInputFromOutput,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
             returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), encoderOutputLength,
