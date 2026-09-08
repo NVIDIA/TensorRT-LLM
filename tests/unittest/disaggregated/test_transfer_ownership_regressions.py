@@ -38,7 +38,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -1382,6 +1382,39 @@ def test_pre_cancelled_sender_settles_saved_generation_first_request(monkeypatch
 
 
 @pytest.mark.cpu_only
+def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> None:
+    rid = 98
+    sender = object.__new__(transfer_mod.Sender)
+    sender._instance_rank = 5
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
+    )
+    dealer = Mock()
+    sender._get_or_connect_dealer = Mock(return_value=dealer)
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=18,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+    )
+    kv_message = [MessageType.KV_AGENT_RESULT, b"kv"]
+    aux_message = [MessageType.AUX_AGENT_RESULT, b"aux"]
+    make_kv_result = Mock(return_value=kv_message)
+    make_aux_result = Mock(return_value=aux_message)
+    monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_kv_result)
+    monkeypatch.setattr(transfer_mod, "_make_aux_result_msg", make_aux_result)
+
+    sender._send_failed_result_to_receiver(info, include_aux=True)
+
+    sender._registrar.get_peer_rank_info.assert_called_once_with("gen", 2)
+    make_kv_result.assert_called_once_with(5, rid, 0, True, AgentResult.FAILED)
+    make_aux_result.assert_called_once_with(5, rid, AgentResult.FAILED)
+    sender._get_or_connect_dealer.assert_called_once_with("receiver")
+    assert [send.args[0] for send in dealer.send.call_args_list] == [kv_message, aux_message]
+
+
+@pytest.mark.cpu_only
 def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -1551,7 +1584,7 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
     session._sender = sender
     session._enforce_physical_ownership = True
     session._need_aux = True
-    session._aux_result_reported = set()
+    session._reported_aux_peer_ranks = set()
     session.kv_tasks = []
     session.lock = threading.Lock()
     session._exception = None
@@ -1569,10 +1602,45 @@ def test_terminal_sender_settles_known_unsubmitted_aux_peer_once() -> None:
 
     assert session.aux_task.has_started_physical_operation(active_info.instance_rank)
     assert not session.aux_task.has_started_physical_operation(unsubmitted_info.instance_rank)
-    assert session._aux_result_reported == {unsubmitted_info.instance_rank}
+    assert session._reported_aux_peer_ranks == {unsubmitted_info.instance_rank}
     assert not session.aux_task.resources_drained
     session.aux_task.retire_unsubmitted_physical_operation(active_info.instance_rank)
     assert session.aux_task.resources_drained
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("session_still_registered", [True, False])
+def test_late_request_data_to_terminal_sender_settles_aux(
+    session_still_registered: bool,
+) -> None:
+    rid = 105
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=18,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[],
+        unique_rid=rid,
+    )
+    sender = _make_owned_sender()
+    sender._save_peer_req_info = Mock()
+    sender._send_failed_result_to_receiver = Mock()
+    session = SimpleNamespace(
+        lock=threading.Lock(),
+        _closed=False,
+        kv_tasks=[],
+        has_failed=Mock(return_value=True),
+        _claim_unsubmitted_aux_failures_locked=Mock(return_value=[info]),
+    )
+    sender._get_session = Mock(side_effect=[session, session if session_still_registered else None])
+
+    sender._respond_with_kv(b"receiver", [MessageType.REQUEST_DATA, info.to_bytes()])
+
+    if session_still_registered:
+        sender._save_peer_req_info.assert_called_once_with(info)
+    else:
+        sender._save_peer_req_info.assert_not_called()
+    session._claim_unsubmitted_aux_failures_locked.assert_called_once_with((info,))
+    sender._send_failed_result_to_receiver.assert_called_once_with(info, include_aux=True)
 
 
 @pytest.mark.cpu_only
@@ -1596,7 +1664,7 @@ def test_aux_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> N
     session = SimpleNamespace(
         aux_task=task,
         set_exception=Mock(),
-        _claim_aux_result=Mock(return_value=True),
+        _claim_aux_terminal_result=Mock(return_value=True),
     )
     sender._sessions = {rid: session}
     write_meta = transfer_mod.WriteMeta(
@@ -1622,7 +1690,7 @@ def test_aux_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> N
     sender._agent.submit_transfer_requests.assert_not_called()
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
-    session._claim_aux_result.assert_called_once_with(peer_rank)
+    session._claim_aux_terminal_result.assert_called_once_with(peer_rank)
     dealer.send.assert_called_once_with(
         [
             MessageType.AUX_AGENT_RESULT,
@@ -1832,7 +1900,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
         session = SimpleNamespace(
             aux_task=task,
             set_exception=set_exception,
-            _claim_aux_result=Mock(return_value=True),
+            _claim_aux_terminal_result=Mock(return_value=True),
         )
     assert task.begin_physical_operation(peer_rank)
     sender._sessions = {rid: session}

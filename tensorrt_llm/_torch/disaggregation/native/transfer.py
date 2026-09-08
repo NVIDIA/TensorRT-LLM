@@ -1189,7 +1189,10 @@ class Sender(SenderBase):
                 if owned:
                     aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
-                if not owned or session._claim_aux_result(write_meta.peer_rank):
+                # An admitted operation normally makes this worker the only
+                # eligible claimant. Keep the claim at the send boundary so
+                # duplicate dispatch cannot publish contradictory evidence.
+                if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
                     self._get_result_dealer(write_meta.peer_endpoint).send(
                         _make_aux_result_msg(
                             self._instance_rank,
@@ -1217,7 +1220,10 @@ class Sender(SenderBase):
         elif owned:
             aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
 
-        if not owned or session._claim_aux_result(write_meta.peer_rank):
+        # An admitted operation normally makes this worker the only eligible
+        # claimant. Keep the claim at the send boundary so future cleanup-path
+        # changes cannot publish contradictory evidence.
+        if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
             self._get_result_dealer(write_meta.peer_endpoint).send(
                 _make_aux_result_msg(
                     self._instance_rank,
@@ -1667,15 +1673,19 @@ class Sender(SenderBase):
                 if self._get_session(info.unique_rid) is not session or session._closed:
                     tasks = None
                     terminal = True
+                    include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
                     terminal = session.has_failed()
+                    include_aux = terminal and bool(
+                        session._claim_unsubmitted_aux_failures_locked((info,))
+                    )
             if tasks is None:
-                self._send_failed_result_to_receiver(info)
+                self._send_failed_result_to_receiver(info, include_aux=include_aux)
                 return
             if terminal:
-                self._send_failed_result_to_receiver(info)
+                self._send_failed_result_to_receiver(info, include_aux=include_aux)
                 return
         for task in tasks:
             self._dispatch_task_to_peer(task, info)
@@ -1688,7 +1698,7 @@ class Sender(SenderBase):
         defer_to_worker: bool = False,
     ):
         try:
-            peer_ri = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+            endpoint = self._get_result_receiver_endpoint(info)
             slice_id = info.slice_id if info.slice_id is not None else 0
             messages = [
                 _make_kv_result_msg(
@@ -1707,14 +1717,12 @@ class Sender(SenderBase):
                         AgentResult.FAILED,
                     )
                 )
-            if defer_to_worker:
-                thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
-                for message in messages:
-                    self._send_task_queues[thread_idx].put((peer_ri.self_endpoint, message))
-            else:
-                dealer = self._get_or_connect_dealer(peer_ri.self_endpoint)
-                for message in messages:
-                    dealer.send(message)
+            self._route_result_messages_to_receiver(
+                info,
+                endpoint,
+                messages,
+                defer_to_worker=defer_to_worker,
+            )
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
@@ -1728,19 +1736,18 @@ class Sender(SenderBase):
         defer_to_worker: bool = True,
     ) -> None:
         try:
-            endpoint = self._registrar.get_peer_rank_info(
-                info.instance_name, info.instance_rank
-            ).self_endpoint
+            endpoint = self._get_result_receiver_endpoint(info)
             message = _make_aux_result_msg(
                 self._instance_rank,
                 info.unique_rid,
                 result,
             )
-            if defer_to_worker:
-                thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
-                self._send_task_queues[thread_idx].put((endpoint, message))
-            else:
-                self._get_or_connect_dealer(endpoint).send(message)
+            self._route_result_messages_to_receiver(
+                info,
+                endpoint,
+                [message],
+                defer_to_worker=defer_to_worker,
+            )
         except Exception as error:
             logger.warning(
                 f"failed to report auxiliary transfer result for rid={info.unique_rid}: {error}"
@@ -1750,9 +1757,7 @@ class Sender(SenderBase):
         if not task.is_done:
             task.fail(RuntimeError("transfer rejected before backend submission"))
         try:
-            endpoint = self._registrar.get_peer_rank_info(
-                info.instance_name, info.instance_rank
-            ).self_endpoint
+            endpoint = self._get_result_receiver_endpoint(info)
             if isinstance(task, KVSendTask):
                 receiver_slice_id = info.slice_id if info.slice_id is not None else 0
                 message = _make_kv_result_msg(
@@ -1765,17 +1770,45 @@ class Sender(SenderBase):
             else:
                 with self._sessions_lock:
                     session = self._get_session(info.unique_rid)
-                if session is not None and not session._claim_aux_result(info.instance_rank):
+                if session is not None and not session._claim_aux_terminal_result(
+                    info.instance_rank
+                ):
                     return
                 message = _make_aux_result_msg(
                     self._instance_rank,
                     info.unique_rid,
                     AgentResult.FAILED,
                 )
-            thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
-            self._send_task_queues[thread_idx].put((endpoint, message))
+            self._route_result_messages_to_receiver(
+                info,
+                endpoint,
+                [message],
+                defer_to_worker=True,
+            )
         except Exception as error:
             logger.warning(f"failed to settle rejected transfer {info.unique_rid}: {error}")
+
+    def _get_result_receiver_endpoint(self, info: RecvReqInfo) -> Optional[str]:
+        return self._registrar.get_peer_rank_info(
+            info.instance_name, info.instance_rank
+        ).self_endpoint
+
+    def _route_result_messages_to_receiver(
+        self,
+        info: RecvReqInfo,
+        endpoint: Optional[str],
+        messages: Iterable[list[bytes]],
+        *,
+        defer_to_worker: bool,
+    ) -> None:
+        if defer_to_worker:
+            thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
+            for message in messages:
+                self._send_task_queues[thread_idx].put((endpoint, message))
+            return
+        dealer = self._get_or_connect_dealer(endpoint)
+        for message in messages:
+            dealer.send(message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -1905,7 +1938,7 @@ class TxSession(TxSessionBase):
         self.receiver_ready: bool = False
         self.kv_tasks = []
         self.aux_task = None
-        self._aux_result_reported: set[int] = set()
+        self._reported_aux_peer_ranks: set[int] = set()
         self._has_last_slice = False
         self.lock = threading.Lock()
 
@@ -2013,20 +2046,27 @@ class TxSession(TxSessionBase):
                 peer_rank
             ):
                 continue
-            if not self._claim_aux_result_locked(peer_rank):
+            if not self._claim_aux_terminal_result_locked(peer_rank):
                 continue
             claimed.append(info)
         return claimed
 
-    def _claim_aux_result_locked(self, peer_rank: int) -> bool:
-        if peer_rank in self._aux_result_reported:
+    def _claim_aux_terminal_result_locked(self, peer_rank: int) -> bool:
+        """Claim the only terminal AUX result report permitted for one peer.
+
+        Terminal cleanup and worker completion both use this claim. Exactly one
+        path may publish terminal evidence so the receiver never sees
+        contradictory results for the same operation. The caller must hold
+        ``lock``.
+        """
+        if peer_rank in self._reported_aux_peer_ranks:
             return False
-        self._aux_result_reported.add(peer_rank)
+        self._reported_aux_peer_ranks.add(peer_rank)
         return True
 
-    def _claim_aux_result(self, peer_rank: int) -> bool:
+    def _claim_aux_terminal_result(self, peer_rank: int) -> bool:
         with self.lock:
-            return self._claim_aux_result_locked(peer_rank)
+            return self._claim_aux_terminal_result_locked(peer_rank)
 
     def _claim_unsubmitted_aux_failure(self, info: RecvReqInfo) -> bool:
         with self.lock:
@@ -3014,6 +3054,13 @@ class RxSession(RxSessionBase):
         if poison is not None:
             poison(error)
 
+    def _record_ownership_evidence_error(self, error: Exception) -> None:
+        """Record a fatal ownership-evidence error and close receiver admission."""
+        self._exception = error
+        if self._terminal_status is None:
+            self._terminal_status = SessionStatus.ERROR
+        self._poison_receiver_ownership(error)
+
     @property
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
@@ -3195,10 +3242,7 @@ class RxSession(RxSessionBase):
                     accepted = task.record_writer_in_doubt(peer_rank)
                 except Exception as error:
                     task.fail(error)
-                    self._exception = error
-                    if self._terminal_status is None:
-                        self._terminal_status = SessionStatus.ERROR
-                    self._poison_receiver_ownership(error)
+                    self._record_ownership_evidence_error(error)
                     raise
                 if not accepted:
                     return
@@ -3207,10 +3251,7 @@ class RxSession(RxSessionBase):
                     f"slice={receiver_slice_id} peer_rank={peer_rank}"
                 )
                 task.fail(error)
-                self._exception = error
-                if self._terminal_status is None:
-                    self._terminal_status = SessionStatus.ERROR
-                self._poison_receiver_ownership(error)
+                self._record_ownership_evidence_error(error)
                 return
             if self._enforce_physical_ownership:
                 if status == AgentResult.FAILED or is_last_slice:
@@ -3222,10 +3263,7 @@ class RxSession(RxSessionBase):
                         )
                     except Exception as error:
                         task.fail(error)
-                        self._exception = error
-                        if self._terminal_status is None:
-                            self._terminal_status = SessionStatus.ERROR
-                        self._poison_receiver_ownership(error)
+                        self._record_ownership_evidence_error(error)
                         raise
                     if not accepted:
                         return
@@ -3341,10 +3379,7 @@ class RxSession(RxSessionBase):
                     accepted = self._aux_physical_owner.record_writer_in_doubt(peer_rank)
                 except Exception as error:
                     self._aux_status = TaskStatus.ERROR
-                    self._exception = error
-                    if self._terminal_status is None:
-                        self._terminal_status = SessionStatus.ERROR
-                    self._poison_receiver_ownership(error)
+                    self._record_ownership_evidence_error(error)
                     raise
                 if not accepted:
                     return
@@ -3353,10 +3388,7 @@ class RxSession(RxSessionBase):
                     f"{self.request_id} peer_rank={peer_rank}"
                 )
                 self._aux_status = TaskStatus.ERROR
-                self._exception = error
-                if self._terminal_status is None:
-                    self._terminal_status = SessionStatus.ERROR
-                self._poison_receiver_ownership(error)
+                self._record_ownership_evidence_error(error)
                 return
             if self._aux_physical_owner is not None:
                 try:
@@ -3367,10 +3399,7 @@ class RxSession(RxSessionBase):
                     )
                 except Exception as error:
                     self._aux_status = TaskStatus.ERROR
-                    self._exception = error
-                    if self._terminal_status is None:
-                        self._terminal_status = SessionStatus.ERROR
-                    self._poison_receiver_ownership(error)
+                    self._record_ownership_evidence_error(error)
                     raise
                 if not accepted:
                     return
