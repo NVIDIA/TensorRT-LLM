@@ -690,22 +690,26 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         (stageNames.ciImageSBSA): [
             arch: "arm64",
         ],
-        (stageNames.ciImageRockyPy310): [
-            target: "rockylinux8",
-            args: "PYTHON_VERSION=3.10.12",
-            postTag: "-py310",
-        ],
-        (stageNames.ciImageRockyPy312): [
-            target: "rockylinux8",
-            args: "PYTHON_VERSION=3.12.3",
-            postTag: "-py312",
-        ],
-        (stageNames.ciImageSBSAUbuntu): [
-            arch: "arm64",
-            target: "ubuntu24",
-            args: "PYTHON_VERSION=3.12.3",
-            postTag: "-py312",
-        ],
+        // TODO(dlfw-26.08): re-enable once the RockyLinux 8 images can be built
+        // against this base image. Disabled by commenting out the build configs
+        // rather than the stage names, so the names stay valid where they are
+        // referenced below.
+        // (stageNames.ciImageRockyPy310): [
+        //     target: "rockylinux8",
+        //     args: "PYTHON_VERSION=3.10.12",
+        //     postTag: "-py310",
+        // ],
+        // (stageNames.ciImageRockyPy312): [
+        //     target: "rockylinux8",
+        //     args: "PYTHON_VERSION=3.12.3",
+        //     postTag: "-py312",
+        // ],
+        // (stageNames.ciImageSBSAUbuntu): [
+        //     arch: "arm64",
+        //     target: "ubuntu24",
+        //     args: "PYTHON_VERSION=3.12.3",
+        //     postTag: "-py312",
+        // ],
         (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
@@ -758,7 +762,9 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        // TODO(dlfw-26.08): restore ciImageRockyPy310, ciImageRockyPy312 and
+        // ciImageSBSAUbuntu here when their build configs above are uncommented.
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
