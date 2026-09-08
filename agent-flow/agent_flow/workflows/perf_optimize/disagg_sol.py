@@ -37,13 +37,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agent_flow.workflows.perf_optimize.bench_cli import (
     GEN_ONLY_CSV,
     BenchCliError,
+    ctx_cases,
+    gen_cases,
     gen_only_points,
 )
+from agent_flow.workflows.perf_optimize.sweep_design import designer_instruction, load_yaml
 
 DISAGG_SOL_FIELD = "disagg_sol"
 TRACKS_KEY = "tracks"
@@ -629,6 +632,64 @@ def campaign_spec(
     return spec
 
 
+def verify_sweep_matches_point(sweep: Path, track: str, point: Mapping[str, Any]) -> None:
+    """Refuse a sweep that does not contain the point this layer selected.
+
+    Without this the selection is a **report**, not a decision. The chosen
+    point is written into every campaign's ``point_provenance``, and the
+    campaign runs whatever its sweep says — so a sweep that names a different
+    row produces a record claiming an operating point the run never used.
+    That is worse than not selecting at all: the whole reason this layer
+    exists is to make a campaign's starting point traceable, and an
+    untraceable point is at least honest about being untraceable.
+
+    Checked rather than generated. Writing the sweep here would put this
+    module back in the business of authoring configs it does not own, which
+    is the mistake :mod:`.sweep_design` was just unwound for. The sweep stays
+    something a person or the design skill wrote; this refuses the pairing.
+    """
+    try:
+        config = load_yaml(Path(sweep))
+    except Exception as exc:  # noqa: BLE001 - re-raised with the pairing named
+        raise DisaggSolError(f"could not read the {track} sweep {sweep}: {exc}") from exc
+
+    if track == GEN_TRACK:
+        wanted = (point.get("shape"), point.get("concurrency"))
+        if wanted[0] is None:
+            return  # a ctx-only selection: nothing to check the gen sweep against
+        try:
+            available = {
+                (case["name"], (case["config"] or {}).get("concurrency"))
+                for case in gen_cases(config)
+            }
+        except BenchCliError as exc:  # pragma: no cover - message path
+            raise DisaggSolError(str(exc)) from exc
+        if wanted not in available:
+            raise DisaggSolError(
+                f"the gen sweep {sweep} does not contain the selected point "
+                f"{wanted[0]} @ concurrency {wanted[1]}. It expands to "
+                f"{sorted(available)}. The campaign would run one of those while "
+                f"its point_provenance claimed the selected one -- a record that "
+                f"says the run used an operating point it did not."
+            )
+        return
+
+    wanted_ctx = (point.get("ctx_gpus"), point.get("max_batch"))
+    if wanted_ctx[0] is None:
+        return
+    available_ctx = {
+        ((case["config"] or {}).get("tp_size"), (case["config"] or {}).get("max_batch"))
+        for case in ctx_cases(config)
+    }
+    if wanted_ctx not in available_ctx:
+        raise DisaggSolError(
+            f"the ctx sweep {sweep} does not contain the selected point "
+            f"tp_size {wanted_ctx[0]} @ max_batch {wanted_ctx[1]}. It expands to "
+            f"{sorted(available_ctx)}. The campaign would run one of those while "
+            f"its point_provenance claimed the selected one."
+        )
+
+
 class CampaignLaunch:
     """One campaign, described completely enough to be checked before it runs.
 
@@ -697,6 +758,7 @@ def launch_plan(
                 f"measurement that followed would be of neither's code."
             )
         seen_repos[str(repo)] = track
+        verify_sweep_matches_point(Path(sweeps[track]), track, point)
         workspace = campaign_workspace(workspace_root, track, label)
         launches.append(
             CampaignLaunch(
@@ -732,6 +794,7 @@ def supervise(
     label: str,
     incumbent: Mapping[str, Any] | None = None,
     dry_run: bool = False,
+    designer: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Fix the point from an established design, then start each half at it.
 
@@ -753,6 +816,19 @@ def supervise(
     wanted = tracks(base)
 
     unready = [t for t in wanted if not established(design, t)]
+    if unready and designer is not None:
+        # The design is normally an input -- it is reused across campaigns and
+        # costs an order of magnitude more than any of them. But "an input"
+        # degenerated into "nobody ran it" once already, which is how the two
+        # campaigns this layer replaces came to inherit an unmeasured row. So
+        # when a designer is available the run establishes what it needs and
+        # then re-checks: not a fallback, a first step.
+        designer(
+            designer_instruction(
+                model_dir=Path(design).parent.name, design_dir=design, tracks=unready
+            )
+        )
+        unready = [t for t in wanted if not established(design, t)]
     if unready:
         what = {
             CTX_TRACK: "no scored ctx case (a `run_*.json` the harness validated)",
