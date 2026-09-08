@@ -89,7 +89,10 @@ class _ScriptedMatcher:
     """Grammar matcher whose per-position bitmask rows are scripted by the test.
 
     `rows[i]` says whether the i-th `fill_next_token_bitmask` call should
-    produce a row with a valid token; a False entry is a dead-end state.
+    produce a row with a valid token; a False entry is a dead-end state. Calls
+    past the end of the script produce a valid row, so that a regression which
+    fails to stop at a dead end is caught by an assertion rather than by this
+    helper running out of scripted rows.
     """
 
     def __init__(self, rows: List[bool]):
@@ -107,7 +110,7 @@ class _ScriptedMatcher:
         del self.accepted[len(self.accepted) - num_tokens :]
 
     def fill_next_token_bitmask(self, bitmask: torch.Tensor, index: int) -> None:
-        has_valid_token = self._rows[self._num_fills]
+        has_valid_token = self._rows[self._num_fills] if self._num_fills < len(self._rows) else True
         self._num_fills += 1
         bitmask[index].zero_()
         if has_valid_token:
