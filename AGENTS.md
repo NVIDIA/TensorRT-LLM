@@ -108,7 +108,7 @@ PyTorch backend where it makes sense (attention, quantization, parallelism).
 
 Key entry points:
 - Public Python API: `from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams`.
-- Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
+- Serving CLI: `trtllm-serve <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.
