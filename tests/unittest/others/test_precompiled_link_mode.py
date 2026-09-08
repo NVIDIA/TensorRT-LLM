@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _SETUP_PY = Path(__file__).resolve().parents[3] / "setup.py"
 _WANTED = ("should_skip_precompiled_package_data", "warn_on_build_skew", "extract_from_precompiled")
 
