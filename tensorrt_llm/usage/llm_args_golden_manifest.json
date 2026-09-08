@@ -428,6 +428,13 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "enable_in_graph_sampling"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "enable_iter_perf_stats"
     },
     {
@@ -1828,6 +1835,20 @@
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.use_cute_dsl_topk"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_gvr_emission"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.use_self_sampling_topk"
     },
     {
       "allowed_values": [],
