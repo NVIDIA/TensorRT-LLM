@@ -24,7 +24,7 @@ import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, List, Optional, Union
 
 import msgpack
 import numpy as np
@@ -429,6 +429,44 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
     ]
 
 
+class _PhysicalOperationState(Enum):
+    """Sender-side evidence for one peer's access to a task's source memory.
+
+    The legal forward paths are::
+
+        ADMITTED -> NOT_SUBMITTED
+        ADMITTED -> SUBMITTING -> SUBMITTED -> BACKEND_DONE
+        SUBMITTING -> IN_DOUBT
+        SUBMITTED -> IN_DOUBT
+
+    Only NOT_SUBMITTED and BACKEND_DONE prove that the operation can no longer
+    access the source. IN_DOUBT deliberately has no retirement transition in
+    this bridge. Repeating a terminal transition is idempotent, and repeating
+    IN_DOUBT preserves the retained backend evidence.
+    """
+
+    ADMITTED = "ADMITTED"
+    SUBMITTING = "SUBMITTING"
+    SUBMITTED = "SUBMITTED"
+    NOT_SUBMITTED = "NOT_SUBMITTED"
+    BACKEND_DONE = "BACKEND_DONE"
+    IN_DOUBT = "IN_DOUBT"
+
+
+_DRAINED_PHYSICAL_OPERATION_STATES = frozenset(
+    (_PhysicalOperationState.NOT_SUBMITTED, _PhysicalOperationState.BACKEND_DONE)
+)
+
+
+@dataclass
+class _PhysicalOperation:
+    """State plus strong backend roots retained until physical quiescence."""
+
+    state: _PhysicalOperationState
+    request: Optional[TransferRequest] = None
+    status: Optional[object] = None
+
+
 class SendTaskBase:
     def __init__(self, params: DisaggregatedParams):
         self.status = TaskStatus.INIT
@@ -439,8 +477,7 @@ class SendTaskBase:
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_lock = threading.Lock()
-        self._physical_started: set[int] = set()
-        self._physical_ops: dict[int, list[Any]] = {}
+        self._physical_operations: dict[int, _PhysicalOperation] = {}
 
     def fail(self, exc: Exception) -> None:
         self._exception = exc
@@ -461,41 +498,95 @@ class SendTaskBase:
 
     def begin_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
-            if peer_rank in self._physical_started:
+            if peer_rank in self._physical_operations:
                 return False
-            self._physical_started.add(peer_rank)
-            self._physical_ops[peer_rank] = []
+            self._physical_operations[peer_rank] = _PhysicalOperation(
+                _PhysicalOperationState.ADMITTED
+            )
             return True
 
-    def retain_physical_request(
+    def _require_physical_operation_locked(
+        self,
+        peer_rank: int,
+        expected_states: tuple[_PhysicalOperationState, ...],
+    ) -> _PhysicalOperation:
+        operation = self._physical_operations.get(peer_rank)
+        if operation is None:
+            raise RuntimeError(f"physical operation {peer_rank} was not admitted")
+        if operation.state not in expected_states:
+            expected = ", ".join(state.value for state in expected_states)
+            raise RuntimeError(
+                f"physical operation {peer_rank} is {operation.state.value}, expected {expected}"
+            )
+        return operation
+
+    def begin_backend_submission(
         self,
         peer_rank: int,
         request: TransferRequest,
     ) -> None:
         with self._physical_lock:
-            evidence = self._physical_ops.get(peer_rank)
-            if evidence is None or evidence:
-                raise RuntimeError(f"physical operation {peer_rank} is not awaiting submission")
-            evidence.extend((request, None))
+            operation = self._require_physical_operation_locked(
+                peer_rank, (_PhysicalOperationState.ADMITTED,)
+            )
+            operation.request = request
+            operation.state = _PhysicalOperationState.SUBMITTING
 
-    def attach_physical_status(self, peer_rank: int, status: object) -> None:
+    def record_backend_submission(self, peer_rank: int, status: object) -> None:
         with self._physical_lock:
-            self._physical_ops[peer_rank][1] = status
+            operation = self._require_physical_operation_locked(
+                peer_rank, (_PhysicalOperationState.SUBMITTING,)
+            )
+            operation.status = status
+            operation.state = _PhysicalOperationState.SUBMITTED
 
-    def finish_physical_operation(self, peer_rank: int) -> None:
+    def mark_physical_operation_in_doubt(self, peer_rank: int) -> None:
         with self._physical_lock:
-            evidence = self._physical_ops.pop(peer_rank, None)
-            if evidence:
-                evidence.clear()
+            operation = self._require_physical_operation_locked(
+                peer_rank,
+                (
+                    _PhysicalOperationState.SUBMITTING,
+                    _PhysicalOperationState.SUBMITTED,
+                    _PhysicalOperationState.IN_DOUBT,
+                ),
+            )
+            operation.state = _PhysicalOperationState.IN_DOUBT
+
+    def retire_unsubmitted_physical_operation(self, peer_rank: int) -> None:
+        with self._physical_lock:
+            operation = self._require_physical_operation_locked(
+                peer_rank,
+                (
+                    _PhysicalOperationState.ADMITTED,
+                    _PhysicalOperationState.NOT_SUBMITTED,
+                ),
+            )
+            operation.state = _PhysicalOperationState.NOT_SUBMITTED
+
+    def retire_backend_done_physical_operation(self, peer_rank: int) -> None:
+        with self._physical_lock:
+            operation = self._require_physical_operation_locked(
+                peer_rank,
+                (
+                    _PhysicalOperationState.SUBMITTED,
+                    _PhysicalOperationState.BACKEND_DONE,
+                ),
+            )
+            operation.request = None
+            operation.status = None
+            operation.state = _PhysicalOperationState.BACKEND_DONE
 
     def has_started_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
-            return peer_rank in self._physical_started
+            return peer_rank in self._physical_operations
 
     @property
     def resources_drained(self) -> bool:
         with self._physical_lock:
-            return not self._physical_ops
+            return all(
+                operation.state in _DRAINED_PHYSICAL_OPERATION_STATES
+                for operation in self._physical_operations.values()
+            )
 
     def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         if self._perf_timer is None:
@@ -710,16 +801,16 @@ class Sender(SenderBase):
             return None
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
-                task.finish_physical_operation(peer_rank)
+                task.retire_unsubmitted_physical_operation(peer_rank)
                 return False
         with self._sessions_lock:
             session = self._get_session(task._unique_rid)
         if session is None:
-            task.finish_physical_operation(peer_rank)
+            task.retire_unsubmitted_physical_operation(peer_rank)
             return False
         with session.lock:
             if session._closed or session.has_failed() or task.is_done:
-                task.finish_physical_operation(peer_rank)
+                task.retire_unsubmitted_physical_operation(peer_rank)
                 return False
             if task.status == TaskStatus.INIT:
                 task.status = TaskStatus.TRANSFERRING
@@ -768,19 +859,20 @@ class Sender(SenderBase):
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
                 error = self._ownership_poisoned
-                task.finish_physical_operation(peer_rank)
+                task.retire_unsubmitted_physical_operation(peer_rank)
                 raise _TransferNotSubmittedError(
                     "NIXL sender rejected transfer before backend submission"
                 ) from error
-            task.retain_physical_request(peer_rank, request)
+            task.begin_backend_submission(peer_rank, request)
             try:
                 # Serialize only the backend admission call with the sticky
                 # quarantine transition. Waiting for completion remains fully
                 # concurrent across worker threads.
                 status = self._agent.submit_transfer_requests(request)
-                task.attach_physical_status(peer_rank, status)
+                task.record_backend_submission(peer_rank, status)
             except Exception as error:
                 self._ownership_poisoned = error
+                task.mark_physical_operation_in_doubt(peer_rank)
                 return False, str(error)
         try:
             if not status.wait():
@@ -792,12 +884,15 @@ class Sender(SenderBase):
                 error = RuntimeError(f"NIXL transfer outcome is ambiguous: {detail}")
                 with self._ownership_poison_lock:
                     self._ownership_poisoned = error
+                    task.mark_physical_operation_in_doubt(peer_rank)
                 return False, detail
-            return True, None
         except Exception as error:
             with self._ownership_poison_lock:
                 self._ownership_poisoned = error
+                task.mark_physical_operation_in_doubt(peer_rank)
             return False, str(error)
+        task.retire_backend_done_physical_operation(peer_rank)
+        return True, None
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -901,7 +996,7 @@ class Sender(SenderBase):
             )
             logger.error(msg)
             if owned:
-                write_meta.task.finish_physical_operation(write_meta.peer_rank)
+                write_meta.task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             write_meta.task.fail(RuntimeError(msg))
             return
         assert write_meta.slice_id is not None
@@ -929,7 +1024,7 @@ class Sender(SenderBase):
             # Task may have been enqueued after cancel() already iterated kv_tasks,
             # so its future was never set by cancel(). Set it here as a fallback.
             if owned:
-                task.finish_physical_operation(write_meta.peer_rank)
+                task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
@@ -963,7 +1058,7 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 if owned:
-                    task.finish_physical_operation(write_meta.peer_rank)
+                    task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
                 self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                     _make_kv_result_msg(
@@ -984,7 +1079,6 @@ class Sender(SenderBase):
                 )
                 if transfer_finished:
                     del request
-                    task.finish_physical_operation(write_meta.peer_rank)
                 if not transfer_finished:
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     agent_name = getattr(self._agent, "name", "<?>")
@@ -1012,7 +1106,7 @@ class Sender(SenderBase):
                 if send_slot_id is not None and (not owned or transfer_finished):
                     self._bounce.release_send(send_slot_id)
         elif owned:
-            task.finish_physical_operation(write_meta.peer_rank)
+            task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
@@ -1074,7 +1168,7 @@ class Sender(SenderBase):
             msg = f"_deliver_aux_to_agent: TxSession {write_meta.unique_rid} not found or already GC'd"
             logger.error(msg)
             if owned:
-                write_meta.task.finish_physical_operation(write_meta.peer_rank)
+                write_meta.task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
             write_meta.task.fail(RuntimeError(msg))
             return
         aux_task = session.aux_task
@@ -1093,7 +1187,7 @@ class Sender(SenderBase):
                     f"request for {write_meta.unique_rid}: {error}"
                 )
                 if owned:
-                    aux_task.finish_physical_operation(write_meta.peer_rank)
+                    aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
                 if not owned or session._claim_aux_result(write_meta.peer_rank):
                     self._get_result_dealer(write_meta.peer_endpoint).send(
@@ -1112,7 +1206,6 @@ class Sender(SenderBase):
                 )
                 if transfer_finished:
                     del request
-                    aux_task.finish_physical_operation(write_meta.peer_rank)
                 if not transfer_finished:
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     session.set_exception(f"aux transfer agent request failed: {last_status}")
@@ -1122,7 +1215,7 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
         elif owned:
-            aux_task.finish_physical_operation(write_meta.peer_rank)
+            aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
 
         if not owned or session._claim_aux_result(write_meta.peer_rank):
             self._get_result_dealer(write_meta.peer_endpoint).send(
@@ -1491,7 +1584,7 @@ class Sender(SenderBase):
             self._enqueue(trans_meta)
         except Exception:
             if owned:
-                task.finish_physical_operation(info.instance_rank)
+                task.retire_unsubmitted_physical_operation(info.instance_rank)
                 self._send_failed_task_result_to_receiver(task, info)
             raise
 

@@ -1582,7 +1582,7 @@ def test_terminal_sender_settles_late_unsubmitted_aux_peer_once(
     assert not session.aux_task.has_started_physical_operation(2)
     assert session._aux_result_reported == {1, 2}
     sender._save_peer_req_info.assert_not_called()
-    session.aux_task.finish_physical_operation(0)
+    session.aux_task.retire_unsubmitted_physical_operation(0)
     sender._sessions.clear()
 
 
@@ -1799,8 +1799,10 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     assert task.status == transfer_mod.TaskStatus.ERROR
     assert not task.resources_drained
     expected_status = None if failure_mode == "submit_exception" else status
-    evidence = task._physical_ops[peer_rank]
-    assert evidence == [request, expected_status]
+    operation = task._physical_operations[peer_rank]
+    assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is expected_status
     assert sender._ownership_poisoned is not None
 
 
@@ -1966,18 +1968,144 @@ def test_sender_result_dealer_preserves_legacy_early_failure_routing(
 
 
 @pytest.mark.cpu_only
-def test_sender_retires_only_after_done() -> None:
+def test_sender_physical_operation_records_explicit_safe_terminals() -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
+    assert task.resources_drained
+
+    unsubmitted_peer = 6
+    assert task.begin_physical_operation(unsubmitted_peer)
+    assert not task.resources_drained
+    assert (
+        task._physical_operations[unsubmitted_peer].state
+        is transfer_mod._PhysicalOperationState.ADMITTED
+    )
+    task.retire_unsubmitted_physical_operation(unsubmitted_peer)
+    assert (
+        task._physical_operations[unsubmitted_peer].state
+        is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    )
+    assert task.resources_drained
+    task.retire_unsubmitted_physical_operation(unsubmitted_peer)
+    assert not task.begin_physical_operation(unsubmitted_peer)
+
+    submitted_peer = 7
+    request = Mock()
+    status = Mock()
+    assert task.begin_physical_operation(submitted_peer)
+    # One safely retired peer cannot authorize source reuse while a sibling
+    # operation remains active.
+    assert not task.resources_drained
+    with pytest.raises(RuntimeError, match="expected SUBMITTING"):
+        task.record_backend_submission(submitted_peer, status)
+    task.begin_backend_submission(submitted_peer, request)
+    operation = task._physical_operations[submitted_peer]
+    assert operation.state is transfer_mod._PhysicalOperationState.SUBMITTING
+    assert operation.request is request
+    assert operation.status is None
+    task.record_backend_submission(submitted_peer, status)
+    assert operation.state is transfer_mod._PhysicalOperationState.SUBMITTED
+    assert operation.status is status
+    assert not task.resources_drained
+    task.retire_backend_done_physical_operation(submitted_peer)
+    assert operation.state is transfer_mod._PhysicalOperationState.BACKEND_DONE
+    assert operation.request is None
+    assert operation.status is None
+    assert task.resources_drained
+    task.retire_backend_done_physical_operation(submitted_peer)
+    assert not task.begin_physical_operation(submitted_peer)
+
+
+@pytest.mark.cpu_only
+def test_sender_physical_operation_admission_is_atomic_and_preserves_evidence() -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=93))
+    peer_rank = 7
+    contender_count = 8
+    start = threading.Barrier(contender_count + 1, timeout=10)
+    admissions: queue.Queue[bool] = queue.Queue()
+    thread_results: queue.Queue[Exception | None] = queue.Queue()
+
+    def admit() -> None:
+        start.wait()
+        admissions.put(task.begin_physical_operation(peer_rank))
+
+    contenders = [_start_checked_thread(admit, thread_results) for _ in range(contender_count)]
+    start.wait()
+    for contender in contenders:
+        contender.join(timeout=10)
+        assert not contender.is_alive()
+    _raise_thread_errors(thread_results, expected=contender_count)
+
+    assert sum(admissions.get_nowait() for _ in range(contender_count)) == 1
+    operation = task._physical_operations[peer_rank]
+    request = Mock()
+    status = Mock()
+    task.begin_backend_submission(peer_rank, request)
+    task.record_backend_submission(peer_rank, status)
+
+    assert not task.begin_physical_operation(peer_rank)
+    assert task._physical_operations[peer_rank] is operation
+    assert operation.request is request
+    assert operation.status is status
+
+    task.mark_physical_operation_in_doubt(peer_rank)
+    task.mark_physical_operation_in_doubt(peer_rank)
+    assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is status
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("submitted", [False, True])
+def test_sender_physical_operation_rejects_unproven_retirement(submitted: bool) -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=93))
+    peer_rank = 7
+    request = Mock()
+    status = Mock()
+    assert task.begin_physical_operation(peer_rank)
+    task.begin_backend_submission(peer_rank, request)
+    if submitted:
+        task.record_backend_submission(peer_rank, status)
+
+    with pytest.raises(RuntimeError, match="expected ADMITTED"):
+        task.retire_unsubmitted_physical_operation(peer_rank)
+    if not submitted:
+        with pytest.raises(RuntimeError, match="expected SUBMITTED, BACKEND_DONE"):
+            task.retire_backend_done_physical_operation(peer_rank)
+    task.mark_physical_operation_in_doubt(peer_rank)
+    operation = task._physical_operations[peer_rank]
+    assert operation.state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert operation.request is request
+    assert operation.status is (status if submitted else None)
+    assert not task.resources_drained
+    with pytest.raises(RuntimeError, match="IN_DOUBT"):
+        task.retire_unsubmitted_physical_operation(peer_rank)
+    with pytest.raises(RuntimeError, match="IN_DOUBT"):
+        task.retire_backend_done_physical_operation(peer_rank)
+
+
+@pytest.mark.cpu_only
+def test_sender_retires_only_after_backend_done() -> None:
     sender = _make_owned_sender()
-    done_status = SimpleNamespace(wait=lambda: True)
-    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: done_status)
     done = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=92))
     done_request = Mock()
 
+    def wait() -> bool:
+        operation = done._physical_operations[7]
+        assert operation.state is transfer_mod._PhysicalOperationState.SUBMITTED
+        assert operation.request is done_request
+        assert operation.status is done_status
+        assert not done.resources_drained
+        return True
+
+    done_status = SimpleNamespace(wait=wait)
+    sender._agent = SimpleNamespace(submit_transfer_requests=lambda _request: done_status)
+
     assert done.begin_physical_operation(7)
     assert sender._submit_transfer(done, 7, done_request) == (True, None)
-    assert not done.resources_drained
-    assert done._physical_ops[7][:2] == [done_request, done_status]
-    done.finish_physical_operation(7)
+    operation = done._physical_operations[7]
+    assert operation.state is transfer_mod._PhysicalOperationState.BACKEND_DONE
+    assert operation.request is None
+    assert operation.status is None
     assert done.resources_drained
 
 
