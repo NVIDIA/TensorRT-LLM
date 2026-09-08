@@ -35,19 +35,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
     """Flatten a block table into the per-request page ids fmha_sm100 consumes.
 
-    build_kv_page_indices reads those ids out of a token-level slot map, so this
-    rebuilds the map the block table implies and lets the production helper do
-    the flattening.
+    The production helper concatenates the valid prefix of each request's
+    block-id row according to its KV length.
     """
-    batch, max_pages = block_table.shape
-    intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
-    req_to_token = (block_table.cpu().to(torch.int32) * PAGE_SIZE).unsqueeze(2) + intra
-    return build_kv_page_indices(
-        req_to_token.reshape(batch, max_pages * PAGE_SIZE),
-        torch.arange(batch, dtype=torch.int32),
-        kv_lens_cpu,
-        PAGE_SIZE,
-    )
+    return build_kv_page_indices(block_table.cpu(), kv_lens_cpu, PAGE_SIZE)
 
 
 def _runner():
