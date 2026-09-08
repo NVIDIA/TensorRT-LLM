@@ -251,7 +251,7 @@ def apply_tool_parser(args: ChatPostprocArgs,
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
-        elif not streaming:
+        if not streaming:
             warn_if_tool_call_unparsed(args.tool_parser, tool_parser, text,
                                        calls)
     else:

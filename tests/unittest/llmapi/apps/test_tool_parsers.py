@@ -5498,10 +5498,10 @@ class TestUnparsedToolCallWarning:
     """A detected-but-unparsed tool call must leave a diagnostic in the logs.
 
     When ``has_tool_call`` is true but the parser extracts zero calls, the
-    request still returns 200 with an empty ``tool_calls`` list, which a client
-    cannot tell apart from the model choosing not to call a tool (GitHub issue
-    #17917). The serving layer therefore logs one warning naming the
-    configured parser on the non-streaming path.
+    request still returns 200 and the response carries no tool call, which a
+    client cannot tell apart from the model choosing not to call a tool
+    (GitHub issue #17917). The serving layer therefore logs one warning per
+    parser name on the non-streaming path.
     """
 
     class _MarkupOnlyParser(BaseToolParser):
@@ -5573,10 +5573,14 @@ class TestUnparsedToolCallWarning:
                                          streaming=False)
 
         assert calls == []
-        assert mock_logger.warning.call_count == 1
-        message = mock_logger.warning.call_args.args[0]
+        assert mock_logger.warning_once.call_count == 1
+        message = mock_logger.warning_once.call_args.args[0]
         assert self._PARSER_NAME in message
         assert "--tool_parser" in message
+        # De-duplicated per parser: a misconfigured server must not log once
+        # per request.
+        assert mock_logger.warning_once.call_args.kwargs["key"] == (
+            self._PARSER_NAME)
 
     def test_chat_non_streaming_silent_without_markup(self):
         """Chat, non-streaming: plain text without markup stays silent."""
@@ -5586,7 +5590,7 @@ class TestUnparsedToolCallWarning:
         with self._patched_logger() as mock_logger:
             apply_tool_parser(args, 0, "The weather is sunny.", streaming=False)
 
-        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
 
     def test_chat_non_streaming_silent_when_calls_extracted(self):
         """Chat, non-streaming: a successfully parsed call stays silent."""
@@ -5599,7 +5603,7 @@ class TestUnparsedToolCallWarning:
             _, calls = apply_tool_parser(args, 0, text, streaming=False)
 
         assert len(calls) == 1
-        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
 
     def test_chat_streaming_path_is_out_of_scope(self):
         """Chat, streaming: the warning is not emitted on the streaming path."""
@@ -5613,7 +5617,7 @@ class TestUnparsedToolCallWarning:
                               streaming=True,
                               finished=True)
 
-        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
 
     def test_responses_non_streaming_warns_and_names_parser(self):
         """Responses, non-streaming: one warning that names the parser."""
@@ -5628,8 +5632,8 @@ class TestUnparsedToolCallWarning:
                                           streaming=False)
 
         assert calls == []
-        assert mock_logger.warning.call_count == 1
-        assert self._PARSER_NAME in mock_logger.warning.call_args.args[0]
+        assert mock_logger.warning_once.call_count == 1
+        assert self._PARSER_NAME in mock_logger.warning_once.call_args.args[0]
 
     def test_responses_non_streaming_silent_without_markup(self):
         """Responses, non-streaming: plain text without markup stays silent."""
@@ -5643,4 +5647,4 @@ class TestUnparsedToolCallWarning:
                                "The weather is sunny.",
                                streaming=False)
 
-        mock_logger.warning.assert_not_called()
+        mock_logger.warning_once.assert_not_called()
