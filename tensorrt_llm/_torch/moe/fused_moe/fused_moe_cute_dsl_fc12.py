@@ -206,27 +206,15 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             tile_tokens_dim=tile_size,
         )
 
-        # Zero moe_output for the scatter-add finalize via the sparse memset;
-        # faster than a full-buffer output zero_() at large token counts (the
-        # fused op's finalize scatter-ADDs into moe_output, so it must start
-        # zeroed). Replaces the in-kernel fc2_c.zero_().
-        torch.ops.trtllm.moe_output_memset_inplace(
-            input=moe_output,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_tokens_dim=tile_size,
-            top_k=effective_top_k,
-            ep_size=self.mapping.moe_ep_size,
-            enable_alltoall=enable_alltoall,
-        )
-
         # One fused op: gather + FC1 GEMM + SwiGLU + requant + FC2 GEMM +
         # finalize (scatter-add into moe_output = a2a combine workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
-        # allocated + memset inside the op runner.
+        # allocated + memset inside the op runner. The moe_output zeroing memset
+        # is issued inside the op too (right before the fused kernel, so it is
+        # the kernel's immediate stream predecessor and the PDL prologue can
+        # overlap it); expanded_idx_to_permuted_idx / ep_size / enable_alltoall
+        # are passed through for that memset.
         torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
             input=x.view(torch.float4_e2m1fn_x2),
             fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
@@ -243,12 +231,15 @@ class CuteDslFc12FusedMoE(CuteDslFusedMoE):
             fc2_alpha=weight_view.fc2_global_scale,
             output=moe_output,
             token_final_scales=token_final_scales,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             num_experts=self.num_slots,
             top_k=effective_top_k,
             num_local_experts=esp,
             local_expert_offset=slot_start,
             tile_size=tile_size,
-            scaling_vector_size=16,
             swiglu_limit=self.act_clamp,
+            ep_size=self.mapping.moe_ep_size,
+            enable_alltoall=enable_alltoall,
+            scaling_vector_size=16,
         )
         return moe_output
