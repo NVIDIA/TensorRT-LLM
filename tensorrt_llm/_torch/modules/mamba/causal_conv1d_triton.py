@@ -18,6 +18,7 @@
 # and https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py
 # -*- coding: utf-8 -*-
 
+import functools
 import os
 from typing import List, Optional, Union
 
@@ -1035,6 +1036,52 @@ def _packed_conv_applicable(
     return True
 
 
+_DEFAULT_NUM_WARPS = 4
+# Programs per SM above which halving the warp count pays. Set at the
+# conservative edge of the measured crossover, which sits inside [8, 16).
+_WARP2_MIN_PROGRAMS_PER_SM = 16
+# Bytes of conv_state per feature above which it stops paying: past this the
+# state traffic dominates and the lost parallelism is not recovered.
+_WARP2_MAX_WINDOW_BYTES = 8
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _select_num_warps(
+    batch: int, dim: int, block_n: int, window_bytes: int, save_intermediate: bool
+) -> int:
+    """Warp count for the update kernel.
+
+    With no intermediate window to write, what the kernel moves is dominated by
+    the feature-contiguous tensors (x, out, weight, bias). Halving the warps
+    gives each thread two features instead of one, which is enough for the
+    compiler to widen those accesses, and that is worth more than the warps it
+    costs -- but only once there are enough programs to keep every SM busy
+    several times over. Below that the lost parallelism dominates.
+
+    The intermediate-window stores are stride-(width-1) 2-byte accesses that
+    cannot be widened at any warp count, so when they are present the wider
+    default stays best.
+
+    It also stops paying once a feature's conv-state window is wide enough to
+    dominate what the kernel moves -- measured at (width - 1) * itemsize > 8 B,
+    i.e. fp32 at width 4, which is the one combination that regresses.
+
+    Measured on B200 over ~720 shapes (width 2-4, bf16/fp16/fp32, seqlen 1-4,
+    dim 768-6144, batch 1-640): no regression where it applies, median 1.25x.
+    """
+    if save_intermediate:
+        return _DEFAULT_NUM_WARPS
+    if window_bytes > _WARP2_MAX_WINDOW_BYTES:
+        return _DEFAULT_NUM_WARPS
+    programs = batch * triton.cdiv(dim, block_n)
+    if programs >= _WARP2_MIN_PROGRAMS_PER_SM * _sm_count(torch.cuda.current_device()):
+        return 2
+    return _DEFAULT_NUM_WARPS
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1171,6 +1218,19 @@ def causal_conv1d_update(
         out = out_packed.transpose(1, 2)
         return out.squeeze(-1) if unsqueeze else out
 
+    block_n = _block_n if _block_n is not None else 128
+    num_warps = (
+        _num_warps
+        if _num_warps is not None
+        else _select_num_warps(
+            batch,
+            dim,
+            block_n,
+            (width - 1) * conv_state.element_size(),
+            intermediate_conv_window is not None,
+        )
+    )
+
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -1289,11 +1349,11 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=_block_n if _block_n is not None else 128,
+        BLOCK_N=block_n,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
-        num_warps=_num_warps if _num_warps is not None else 4,
+        num_warps=num_warps,
         **({"num_stages": _num_stages} if _num_stages else {}),
     )
     if unsqueeze:
