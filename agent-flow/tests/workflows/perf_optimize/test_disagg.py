@@ -225,11 +225,19 @@ def test_the_disagg_section_is_composed_only_for_a_disagg_campaign():
     per-turn inference the agent can get wrong.
     """
     aggregate = build_perf_optimize_prompts()
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa", "reporter"):
+    for role in (
+        "benchmarker",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "integrator",
+        "qa",
+        "reporter",
+    ):
         assert DISAGG_CAMPAIGN not in getattr(aggregate, role)
 
     disagg_bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
         assert DISAGG_CAMPAIGN in getattr(disagg_bundle, role)
     # The reporter only synthesizes artifacts, the projector launches nothing.
     assert DISAGG_CAMPAIGN not in disagg_bundle.reporter
@@ -243,7 +251,7 @@ def test_the_disagg_section_is_composed_last_so_its_overrides_win():
     reads it after the guidance it replaces.
     """
     bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
         assert getattr(bundle, role).rstrip().endswith(DISAGG_CAMPAIGN.rstrip())
 
 
