@@ -192,9 +192,9 @@ To remove that overhead, we extend the cuteDSL groupedGEMM kernels to support Te
 
 The relevant code changes in [PR #12136](https://github.com/NVIDIA/TensorRT-LLM/pull/12136) are in:
 
-- [`tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py)
+- [`tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py)
 - [`tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py)
-- [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py)
+- [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py)
 - [`tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/be12482/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py)
 
 ### Mitigating Asynchronous Communication Contention
