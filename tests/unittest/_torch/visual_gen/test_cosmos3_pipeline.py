@@ -438,9 +438,9 @@ class TestFormatPromptWithMetadataJson:
     ):
         """Disabling templates makes a structured prompt an exact pass-through."""
         prompt = (
-            '{"actions":[{"time":"0:03-0:05","description":"A full backflip"}],'
-            '"duration":"7s","fps":24,"resolution":{"W":1280,"H":720},'
-            '"aspect_ratio":"16,9"}'
+            ' \n{"aspect_ratio":"16,9", "actions": ['
+            '{"description":"A full backflip","time":"0:03-0:05"}],'
+            ' "duration":"7s", "fps":24, "resolution":{"W":1280,"H":720}} \n'
         )
 
         result = _format_prompt_with_metadata(
