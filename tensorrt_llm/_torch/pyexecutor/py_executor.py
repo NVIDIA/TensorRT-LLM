@@ -2053,11 +2053,14 @@ class PyExecutor:
         num_completed_requests,
         scheduled_batch,
         micro_batch_id,
-        scheduled_batch_stats: Optional[ScheduledBatchStats] = None
+        scheduled_batch_stats: Optional[ScheduledBatchStats] = None,
+        num_active_requests: Optional[int] = None,
     ) -> IterationStats:
         stats.iter_latency_ms = iter_latency_ms
         scheduled_batch_stats = (scheduled_batch_stats or ScheduledBatchStats())
 
+        if num_active_requests is not None:
+            stats.num_active_requests = num_active_requests
         stats.num_queued_requests = self.executor_request_queue.get_request_queue_size(
         )
         stats.num_completed_requests = num_completed_requests
@@ -2488,11 +2491,14 @@ class PyExecutor:
                 self.enable_iter_req_stats
                 and self.enable_iter_perf_stats) else None
 
-        stats = self._update_iter_stats(batch_state.iter_stats, iter_latency_ms,
-                                        len(finished_requests),
-                                        batch_state.scheduled_requests,
-                                        micro_batch_id,
-                                        batch_state.scheduled_batch_stats)
+        stats = self._update_iter_stats(
+            batch_state.iter_stats,
+            iter_latency_ms,
+            len(finished_requests),
+            batch_state.scheduled_requests,
+            micro_batch_id,
+            batch_state.scheduled_batch_stats,
+            num_active_requests=len(active_requests))
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(
                 stats,

@@ -1082,3 +1082,31 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
+
+
+def test_update_iter_stats_finalizes_idle_active_request_count():
+    """The last completed batch must clear the running-request gauge."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states=None)
+    stats = IterationStats()
+    stats.iter = 10
+    stats.num_active_requests = 1
+    stats.inflight_batching_stats = InflightBatchingStats()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=1,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+            num_active_requests=0,
+        )
+
+    assert stats.num_active_requests == 0
+    assert stats.num_completed_requests == 1
