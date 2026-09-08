@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Torch Compile & Prefill CUDA Graph
 
 In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.
@@ -50,6 +55,10 @@ torch_compile_config:
 `TorchCompileConfig.enable_piecewise_cuda_graph` and
 `TorchCompileConfig.capture_num_tokens` are deprecated aliases for these
 prefill-specific options.
+
+Keep `torch_compile_config.enable_inductor` unset, or set it to `false`, for the
+recommended Piecewise CUDA Graph path. Setting `enable_inductor` to `true` with
+`enable_piecewise_cuda_graph` is experimental and not recommended.
 
 The experimental breakable implementation can capture the model body without
 torch.compile:
@@ -115,7 +124,7 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 ## Known Issue
 
-Torch compile cannot work with multi-ModelEngine config.
+Torch compile cannot work with multi-ModelEngine config:
 
 1. Speculative Decoding in Two-Model Style
 
