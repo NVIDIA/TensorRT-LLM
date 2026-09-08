@@ -1518,3 +1518,24 @@ def test_reserve_guard_page_failure_releases_the_reservation(
         )
 
 
+def test_guard_page_request_id_clears_cuda_graph_draft_window() -> None:
+    """The guard id must not collide with the CUDA-graph dummy request range.
+
+    Spec-decode capture uses ``CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len``;
+    at ``runtime_draft_len == 1`` the old guard id ``(1 << 64) - 2`` collided and
+    aborted capture with the "already exists" assert in ``_create_kv_cache``. The
+    guard now sits a full reserved window below the dummy, clear of any draft id.
+    """
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+    guard = kv_cache_v2_module._GUARD_PAGE_REQUEST_ID
+    window = kv_cache_v2_module._CUDA_GRAPH_DUMMY_RESERVED_WINDOW
+    assert guard == CUDA_GRAPH_DUMMY_REQUEST_ID - window
+    # The regression: the draft dummy at length 1 used to be the guard id.
+    assert CUDA_GRAPH_DUMMY_REQUEST_ID - 1 != guard
+    # Margin far above any supported max_draft_len, so the whole dummy range
+    # [dummy - max_draft_len, dummy] stays clear of the guard.
+    assert guard < CUDA_GRAPH_DUMMY_REQUEST_ID - 4096
+    assert guard in kv_cache_v2_module._RESERVED_REQUEST_IDS
+
+
