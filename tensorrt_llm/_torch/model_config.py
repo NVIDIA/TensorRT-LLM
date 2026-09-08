@@ -321,12 +321,6 @@ class ModelConfig(Generic[TConfig]):
         """Publish unsharded per-layer KV geometry to generic runtime code."""
         self.extra_attrs["kv_cache_layer_specs"] = tuple(layer_specs)
 
-    def has_variable_kv_cache_geometry(self) -> bool:
-        """Whether attention layers require different KV buffer shapes."""
-        layer_specs = self.kv_cache_layer_specs
-        return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
-                                          for spec in layer_specs}) > 1
-
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.

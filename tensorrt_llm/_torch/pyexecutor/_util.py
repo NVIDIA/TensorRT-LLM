@@ -97,11 +97,17 @@ def _get_initial_lora_data_type(
     return None
 
 
+def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
+                                      for spec in layer_specs}) > 1
+
+
 def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
                                      kv_cache_config: KvCacheConfig):
     # Variable per-layer geometry requires V2's per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
-                or model_config.has_variable_kv_cache_geometry())
+                or _has_variable_kv_cache_geometry(model_config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -721,7 +727,7 @@ class KvCacheCreator:
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
                         f"run sparse-attention models.")
-                if model_config.has_variable_kv_cache_geometry():
+                if _has_variable_kv_cache_geometry(model_config):
                     raise NotImplementedError(
                         f"Variable per-layer KV geometry requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "

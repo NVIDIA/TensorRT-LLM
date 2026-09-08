@@ -282,7 +282,7 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         model = Gemma4ForCausalLM(model_config)
         layer_specs = model.model_config.kv_cache_layer_specs
         self.assertIsNotNone(layer_specs)
-        self.assertTrue(model.model_config.has_variable_kv_cache_geometry())
+        self.assertGreater(len({(spec.head_dim, spec.num_kv_heads) for spec in layer_specs}), 1)
 
         for layer_idx, layer in enumerate(model.model.layers):
             expected_head_dim = 64 if layer.is_sliding else 128
