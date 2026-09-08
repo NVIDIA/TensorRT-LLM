@@ -125,11 +125,16 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
         auto chunkSize = su::deserialize<size_t>(is);
         regions.push_back({baseAddr, totalLen, chunkSize});
     }
-    auto bounceHandshake = su::deserialize<std::string>(is);
+    // Peers built before the handshake field existed end the stream right after the regions. An empty handshake
+    // means "bounce not advertised" and the peer stays on standard NIXL (registerPeerHandshake treats it that way).
+    std::string bounceHandshake;
+    if (is.peek() != std::char_traits<char>::eof())
+    {
+        bounceHandshake = su::deserialize<std::string>(is);
+    }
     TLLM_CHECK_WITH_INFO(!is.fail(),
-        "AgentDesc::deserialize failed: stream truncated after %zu/%zu regions while reading the bounce handshake "
-        "field (data size=%zu) - peer built from an older TensorRT-LLM without it?",
-        regions.size(), numRegions, data.size());
+        "AgentDesc::deserialize failed: stream error after reading %zu/%zu regions (data size=%zu)", regions.size(),
+        numRegions, data.size());
     return AgentDesc{std::move(backendAgentDesc), std::move(regions), std::move(bounceHandshake)};
 }
 
