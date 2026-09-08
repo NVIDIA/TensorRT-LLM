@@ -1591,8 +1591,6 @@ def executor_request_to_llm_request(
         draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
-        logits_post_processor=None,
-        apply_logits_post_processor_batched=False,
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
