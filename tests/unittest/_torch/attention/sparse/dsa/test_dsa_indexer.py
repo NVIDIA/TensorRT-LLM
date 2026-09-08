@@ -287,7 +287,8 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         (True, 100, 65536, True),
         (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
         (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
-        (True, 90, 65536, False),  # non-datacenter Blackwell
+        (True, 90, 65536, False),  # Hopper
+        (True, 120, 65536, False),  # consumer Blackwell (SM120): engine is SM100/103-only
     ],
 )
 def test_metadata_warmup_selfsampling_prefill_leg(

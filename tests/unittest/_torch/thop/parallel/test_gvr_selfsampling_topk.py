@@ -1113,8 +1113,10 @@ def _make_prefill_case(rows, ncols, ks_list, ke_list, *, top_k, seed, dist="rand
 
 @pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
 def test_prefill_causal_ramp(top_k):
-    """Single-request causal ramp (ks=0): a run of short rows then long rows
-    in one launch straddles the k boundary. Covers nv < k, == k, > k."""
+    """Single-request causal ramp (ks=0), 148 rows with nv = 1..148 < k: one
+    tier-0 launch where every row takes the short-row identity path. The k
+    boundary is test_prefill_short_rows; mixed short/long rows in one launch is
+    test_prefill_packed_misaligned_ks."""
     rows = 148
     ks = [0] * rows
     ke = list(range(1, rows + 1))
