@@ -89,10 +89,12 @@ class DisaggTransferCoordinator:
         enable_attention_dp: bool,
         force_terminate_ctx_for_partial_reuse: bool,
         delegates: DisaggLoopDelegates,
+        draft_kv_cache_manager=None,
     ) -> None:
         self._transceiver = transceiver
         self._transfers = transfer_manager
         self._kv_cache_manager = kv_cache_manager
+        self._draft_kv_cache_manager = draft_kv_cache_manager
         self._dist = dist
         self._effects = effects
         self._registry = registry
@@ -216,10 +218,12 @@ class DisaggTransferCoordinator:
                 # further slice can land.
                 continue
             if req.is_context_finished or req.is_finished_due_to_length:
-                # Forward is done: release the IndexMapper slot so new requests
-                # can reuse it. KV blocks stay allocated for the transfer.
-                if hasattr(self._kv_cache_manager, "release_index_slot"):
-                    self._kv_cache_manager.release_index_slot(req.py_request_id)
+                # Forward is done: release the IndexMapper slot on every KV
+                # manager that has one so new requests can reuse it. KV blocks
+                # stay allocated for the transfer.
+                for manager in (self._kv_cache_manager, self._draft_kv_cache_manager):
+                    if hasattr(manager, "release_index_slot"):
+                        manager.release_index_slot(req.py_request_id)
                 # start_transfer commits the request's blocks to the reuse tree
                 # and pins them; it must run before respond_and_send_async
                 # sends the final slice and (for the Python transceiver) moves

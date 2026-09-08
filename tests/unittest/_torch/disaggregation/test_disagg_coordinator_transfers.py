@@ -69,6 +69,7 @@ class _Harness:
         world_size=1,
         tp_size=1,
         force_terminate_ctx_for_partial_reuse=False,
+        draft_kv_cache_manager=None,
     ) -> None:
         self.transceiver = FakeKvCacheTransceiver(
             kv_transfer_timeout_ms=kv_transfer_timeout_ms,
@@ -97,6 +98,7 @@ class _Harness:
             enable_attention_dp=enable_attention_dp,
             force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
             delegates=self.delegates,
+            draft_kv_cache_manager=draft_kv_cache_manager,
         )
 
     def send(self, *requests: _Request) -> None:
@@ -152,6 +154,22 @@ def test_send_stamps_the_timeout_clock_only_when_a_timeout_is_configured(clock) 
 
     assert req_timed.py_kv_transfer_start_time == clock["t"]
     assert req_untimed.py_kv_transfer_start_time is None
+
+
+def test_send_releases_the_index_slot_on_the_target_and_draft_kv_managers() -> None:
+    """Forward is done once the final slice is sent, so the IndexMapper slot is
+    released on every KV manager that has one; the draft manager is optional
+    and a manager without index slots is skipped."""
+    draft = Mock(spec=["release_index_slot"])
+    h = _Harness(draft_kv_cache_manager=draft)
+    h.kv_cache_manager.release_index_slot = Mock()
+    req = _Request(1)
+
+    h.send(req)
+
+    h.kv_cache_manager.release_index_slot.assert_called_once_with(1)
+    draft.release_index_slot.assert_called_once_with(1)
+    assert h.in_transfer(req)
 
 
 def test_send_skips_requests_that_must_not_send() -> None:

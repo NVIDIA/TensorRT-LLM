@@ -3654,6 +3654,8 @@ class PyExecutor:
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
             kv_cache_manager=getattr(self, "kv_cache_manager", None),
+            draft_kv_cache_manager=getattr(self, "draft_kv_cache_manager",
+                                           None),
             dist=getattr(self, "dist", None),
             effects=PyExecutorEffects(self),
             registry=PyExecutorRequestRegistry(self),
