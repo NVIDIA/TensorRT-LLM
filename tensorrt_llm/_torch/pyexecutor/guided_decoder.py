@@ -329,11 +329,30 @@ class GuidedDecoder:
             d2t_end = d2t_start + vocab_size_padded // tp_size
             d2t = d2t[d2t_start:d2t_end]
 
-        torch.ops.trtllm.logits_bitmask(
-            logits[:num_bitmask_tokens],
-            self.bitmask[:num_bitmask_tokens, bitmask_start:bitmask_end],
-            token_mask=self.token_mask[:num_bitmask_tokens],
-            d2t=d2t)
+        # A grammar state with zero valid tokens would mask the whole logits row
+        # to -inf; softmax then yields NaN for that row, which trips the
+        # sampler's async NaN assert and hard-kills every rank. Skip the apply
+        # for such a row instead: it samples one unconstrained token, which the
+        # matcher rejects at the next build, failing that single request through
+        # the regular guided-decoding error path.
+        # The check must span the full bitmask row rather than this rank's
+        # slice, since an all-masked local shard is legitimate when the logits
+        # are sharded in the vocabulary dimension. Only the bits below
+        # vocab_size_padded count: the trailing bits of a partial last word are
+        # never read by the kernel, and the backends do set them (xgrammar
+        # writes a full word), so reading them would mask the row as valid.
+        bitmask = self.bitmask[:num_bitmask_tokens]
+        num_words, num_tail_bits = divmod(self.vocab_size_padded, 32)
+        has_valid_token = bitmask[:, :num_words].any(dim=1)
+        if num_tail_bits > 0:
+            has_valid_token |= (bitmask[:, num_words]
+                                & ((1 << num_tail_bits) - 1)) != 0
+        token_mask = self.token_mask[:num_bitmask_tokens] * has_valid_token
+
+        torch.ops.trtllm.logits_bitmask(logits[:num_bitmask_tokens],
+                                        bitmask[:, bitmask_start:bitmask_end],
+                                        token_mask=token_mask,
+                                        d2t=d2t)
 
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
