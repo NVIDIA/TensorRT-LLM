@@ -1,6 +1,6 @@
 ---
 name: perf-optimize
-description: Launch and operate this repo's perf-optimize workflow, which iteratively APPLIES TensorRT-LLM serving optimizations — baseline benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill) sizing the headroom the campaign chases, profile-ranked roadmap.yaml (nsys + torch-profiler + ncu per-kernel analysis via the perf-nsight-compute-analysis skill), a fixed budget of rounds applying items one at a time gated on measured gain (curve mode uses a Pareto gate; the evaluator accepts, rejects, or pushes back each attempt and nsys-profiles every accept), one final-verification QA benchmark, expected-vs-measured report with Pareto improvement results. Use when the user wants to optimize / improve / speed up a trtllm-serve deployment (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-optimize". For diagnosis WITHOUT applying changes, use the perf-analyze workflow instead.
+description: Launch and operate this repo's perf-optimize workflow, which iteratively APPLIES TensorRT-LLM serving optimizations — baseline benchmark at one concurrency or a Pareto curve of them (tok/s/user vs tok/s/gpu), analytical SOL projection on by default (via the internal-perf-sol-analysis skill) sizing the headroom the campaign chases, profile-ranked roadmap.yaml (nsys + ncu per-kernel analysis via the perf-nsight-compute-analysis skill), a fixed budget of rounds applying items one at a time gated on measured gain (curve mode uses a Pareto gate; the evaluator accepts, rejects, or pushes back each attempt and nsys-profiles every accept), one final-verification QA benchmark, expected-vs-measured report with Pareto improvement results. Use when the user wants to optimize / improve / speed up a trtllm-serve deployment (throughput, TTFT, TPOT, ITL, e2e latency) or says "run perf-optimize". For diagnosis WITHOUT applying changes, use the perf-analyze workflow instead.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -156,26 +156,42 @@ than inventing values:
   changes — attempts that touch the tuning file are auto-rejected;
   requires the editable install from preflight step 4), or `[config]`
   when the TRT-LLM checkout must not be modified at all.
-- `profile`: `methods` (subset of `[nsys, torch, ncu]`, default all
-  three — what a profiling round captures: nsys timeline + torch ops +
-  a bounded ncu per-kernel deep dive on the top nsys kernels,
-  interpreted with the `perf-nsight-compute-analysis` skill; drop
+- `profile`: `methods` (subset of `[nsys, ncu]`, default both — what a
+  profiling round captures: nsys timeline + a bounded ncu per-kernel
+  deep dive on the top nsys kernels, interpreted with the
+  `perf-nsight-compute-analysis` skill; drop
   entries to trim the cost of the rounds that pay it) and
   `nsys_iter_range` (default `"100-150"`).
 - `profile.kernel_coverage`: include (an empty mapping enables the
   defaults `min_share_pct: 0.5`, `coverage_target_pct: 95`) when the
   user wants the **per-kernel coverage contract** — ncu SOL analysis on
   every kernel above the share bar (multi-pass capture) and, per
-  kernel, an explicit answer to *can it be made faster?* and *can it be
-  fused with its neighbors?* recorded in a schema-validated
+  kernel, an explicit answer to *can it be eliminated?*, *can it be
+  made faster?*, *can it be fused with its neighbors?* and *can it be
+  overlapped with independent work on another stream?* recorded in a
+  schema-validated
   `kernel_ledger.yaml` each profiling round (a roadmap item or an
   evidence-backed dismissal per question; the orchestrator aborts the
   round on an incomplete ledger — replan-only rounds run no ncu and are
   waived — and the report gains a Kernel Coverage accountability section
-  resolving every disposition to its outcome). This is the "every kernel
-  fusion/optimization possibility considered before done" guarantee; it
-  needs `nsys` + `ncu` in `profile.methods` and adds profiling
-  wall-clock to every round that profiles.
+  resolving every disposition to its outcome). The four are ordered by
+  how much they presuppose. *Elimination* comes first because it assumes
+  only that the kernel runs today, and a `yes` recovers its whole share
+  rather than a fraction — redundant work, work over padded/masked data,
+  per-step recompute of an invariant, or a fallback kernel firing
+  because a gated fast path did not. *Overlap* catches what faster and
+  fusion structurally cannot: both presuppose the kernel runs *alone*,
+  so a kernel at its bound-class ceiling whose neighbors move only
+  mandatory bytes is legitimately closed on both and can still give back
+  most of its share on an aux stream (it needs CUDA graphs enabled —
+  multi-stream no-ops without them, so mention that if the user is
+  running graphs off). The ledger also records the profiled
+  window's `gpu_busy_pct`, because a kernel's share of GPU time is not
+  its share of wall clock and only the latter can move the target
+  metric. This is the "every kernel elimination/optimization/fusion/
+  overlap possibility considered before done" guarantee; it needs `nsys` +
+  `ncu` in `profile.methods` and adds profiling wall-clock to every
+  round that profiles.
 - `accuracy`: include only if the user has an eval command they want the
   final verification to run at campaign end; omit the block otherwise.
 - `extra_llm_api_options`: starting server tuning YAML, if they have one.
