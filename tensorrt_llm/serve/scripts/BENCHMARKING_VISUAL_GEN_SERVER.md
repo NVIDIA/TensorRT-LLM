@@ -117,8 +117,6 @@ that follows it, and `gen_latency` stops where the second begins. The encode's c
 `--format` and to whether ffmpeg is installed, so folding it into `server_gen` would move the
 engine's number when only the output container changed.
 
-Not in the schema: per-step denoising latency. `server_denoise / steps` is a mean.
-
 ### Before trusting a run
 
 The run exits non-zero when `completed` differs from `total_requests`, after writing the
