@@ -13552,9 +13552,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             The only interface delta versus the existing CuteDSL backend is the
             three int32 atomic counters (fc1_ready / fc1_scheduler_counter /
             fc2_scheduler_counter), which are allocated and memset to zero here
-            on every launch.  v1 exposes the GEN-phase geometry only:
-            mma_tiler 128x{128,256}, cluster (1,1), scheduler="l2_atomic".
-            2CTA/CTX geometries are added once CTX perf tuning lands.
+            on every launch.  Geometry follows the routing tile: tile_size=128
+            runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
+            tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
+            the autotuner picks between them per shape.  scheduler="l2_atomic".
             """
             kernel_class = Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel
             kernel_cache = dict()
@@ -13586,11 +13587,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         f"{self.__class__.kernel_class.__name__} supports SM 107 "
                         f"(Rubin) only, but got SM {sm_version}")
-                # v1 fused kernel only supports the 128-wide routing tile.
-                if self.tile_size != 128:
+                # Routing tiles: 128 (1-CTA) or 256 (2-CTA, cluster (2,1)).
+                if self.tile_size not in (128, 256):
                     raise ValueError(
-                        f"{self.__class__.kernel_class.__name__} v1 supports "
-                        f"tile_size 128 only, but got {self.tile_size}")
+                        f"{self.__class__.kernel_class.__name__} supports "
+                        f"tile_size 128 (1-CTA) or 256 (2-CTA) only, but got "
+                        f"{self.tile_size}")
 
             def unique_id(self):
                 return (
@@ -13620,19 +13622,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # Fixed K for FP4: mma_tiler_k=256, mma_inst_k=128.
                 mma_tiler_k = 256
                 mma_inst_k = 128
-                # v1 GEN-phase geometry: 1-CTA, no B-reuse, cluster (1,1).
-                # mma_tiler_m == mma_inst_m == tile_size (128).
-                mma_m_candidates = [(128, 128)]
+                # Mirror the CuteDSL grouped-GEMM runners: the MMA M-tile equals
+                # the routing tile_size and the cluster M = tile_size // 128, so
+                # tile_size=128 -> 1-CTA cluster (1,1), tile_size=256 -> 2-CTA
+                # cluster (2,1). moe_sort tiles the tokens by tile_size, so the
+                # kernel's M-tile always matches the routing tile. mma_n is free
+                # {128, 256}.
+                mma_tiler_m = self.tile_size
+                mma_inst_m = self.tile_size
+                cluster_shape_mn = (self.tile_size // 128, 1)
                 mma_n_candidates = [128, 256]
-                cluster_shape_mn_candidates = [(1, 1)]
 
                 valid_tactics = []
-                for (mma_tiler_m,
-                     mma_inst_m), mma_n, cluster_shape_mn in (itertools.product(
-                         mma_m_candidates, mma_n_candidates,
-                         cluster_shape_mn_candidates)):
-                    if mma_tiler_m != self.tile_size:
-                        continue
+                for mma_n in mma_n_candidates:
+                    # No "cluster CTAs > tiles" guard here (unlike the Sm100
+                    # runners): this kernel's per-CTA M-tile is 128, so one
+                    # 256-row logical tile is exactly one (2,1) cluster and a
+                    # single-tile problem is valid for 2-CTA.
                     # The fused N-tile must divide both FC1 and FC2 output N.
                     if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
                         continue
@@ -13735,9 +13741,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if isinstance(tactic, tuple):
                     mma_tiler, mma_inst_shape, cluster_shape_mn = tactic
                 else:
+                    # Fallback geometry must satisfy the kernel validator
+                    # (is_valid_mma_tiler_and_cluster_shape): inst_m ==
+                    # tile_m and cluster_m == inst_m // 128. Mirrors
+                    # _get_sm107_nvfp4_default_mma_config used by the sibling
+                    # runners; the old fixed cluster (1,1) was illegal for
+                    # tile_size=256 (a 2-CTA MMA in a 1-CTA cluster).
+                    mma_inst_m = min(self.tile_size, 256)
                     mma_tiler = (self.tile_size, 128, 256)
-                    mma_inst_shape = (self.tile_size, 128, 128)
-                    cluster_shape_mn = (1, 1)
+                    mma_inst_shape = (mma_inst_m, 128, 128)
+                    cluster_shape_mn = (mma_inst_m // 128, 1)
+                # The MMA M-tile and cluster M must match the routing tile this
+                # runner was built for; a mismatch (e.g. a tactic captured under
+                # another tile_size) would index routing metadata wrongly and
+                # can read uninitialised permuted-index padding.
+                assert (mma_tiler[0] == self.tile_size
+                        and cluster_shape_mn[0] == self.tile_size // 128), (
+                            f"FC12 tactic/tile mismatch: mma_tiler={mma_tiler} "
+                            f"mma_inst_shape={mma_inst_shape} "
+                            f"cluster_shape_mn={cluster_shape_mn} "
+                            f"tile_size={self.tile_size}")
 
                 # FC1 intermediate output (kept on-chip by the kernel; passed as
                 # a scratch tensor) + its dynamic block scale.
