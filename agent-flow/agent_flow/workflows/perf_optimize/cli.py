@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import yaml
+
 from agent_flow.agent_runtime import resolve_agent_config
 from agent_flow.prompts import dump_prompt_bundle
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
@@ -111,13 +113,68 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "`optimize.item_execution` mode). "
         "Ignored on resume — the checkpointed budget wins.",
     )
+    _add_dry_run(parser)
     return parser.parse_args(argv)
+
+
+def _run_disagg_sol(args) -> None:
+    """The staged two-track path: fix the operating point, then optimize at it.
+
+    Dispatched on the shape of `task.yaml` rather than on a flag, so one file
+    describes the whole campaign and there is one place to look for what it
+    will do. The single-track path below is untouched: a spec without a
+    `disagg_sol` block reaches it exactly as before.
+    """
+    import json
+
+    import yaml
+
+    from .disagg_sol import DisaggSolError, supervise
+
+    raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
+    block = raw.get("disagg_sol") or {}
+    root = Path(args.workspace)
+    try:
+        record = supervise(
+            raw,
+            sweeps={k: Path(v) for k, v in (block.get("sweeps") or {}).items()},
+            repos={k: Path(v) for k, v in (block.get("repos") or {}).items()},
+            workspace_root=root,
+            label=block.get("label") or root.name,
+            incumbent=block.get("incumbent"),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except DisaggSolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(record, indent=2, default=str))
+
+
+def _add_dry_run(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "staged disagg only: select the operating point and write every "
+            "campaign's task.yaml, then stop without starting them"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     resume = not args.clean and (args.workspace / STATE_FILENAME).is_file()
     task_path = args.workspace / "task.yaml" if resume else args.task
+    # Before schema validation: a staged spec is a different shape, and the
+    # single-track schema would reject it for the fields it deliberately lacks.
+    try:
+        _raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        print(f"error: could not read {args.task}: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if isinstance(_raw, dict) and "disagg_sol" in _raw:
+        _run_disagg_sol(args)
+        return
     try:
         task_data = load_and_validate_task_yaml(
             task_path,

@@ -701,3 +701,91 @@ def launch_plan(
             )
         )
     return launches
+
+
+# --------------------------------------------------------------- the run
+
+
+#: Where the supervisor records what it selected and started.
+RUN_RECORD = "disagg_sol_run.json"
+
+
+def supervise(
+    base: Mapping[str, Any],
+    *,
+    sweeps: Mapping[str, Path],
+    repos: Mapping[str, Path],
+    workspace_root: Path,
+    label: str,
+    incumbent: Mapping[str, Any] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Fix the point from an established design, then start each half at it.
+
+    The design is an **input**, not something this produces: establishing it
+    costs roughly an order of magnitude more than the campaigns it enables,
+    so it is run once per (model, cluster, workload) and reused. A spec whose
+    design has not been scored is refused here rather than silently falling
+    back to whatever operating point the sweeps happen to carry — falling
+    back is exactly the behaviour this layer exists to remove.
+
+    Returns the record it writes: what was selected, against what incumbent,
+    and what was started. ``dry_run`` stops after the record, which is the
+    same code path minus the processes.
+    """
+    from agent_flow.workflows.perf_optimize import spawn
+
+    design = design_dir(base)
+    prefer = preference(base)
+    wanted = tracks(base)
+
+    if not established(design):
+        raise DisaggSolError(
+            f"{design} has no scored concurrency sweep, so there is no measured "
+            f"space to choose an operating point from. Establish the design first "
+            f"— it is reused across campaigns, so this is paid once — or point "
+            f"'{DISAGG_SOL_FIELD}.{DESIGN_KEY}.{DESIGN_DIR_KEY}' at one that was."
+        )
+
+    record: dict[str, Any] = {
+        "design_dir": str(design),
+        "design_state": design_state(design).get("phase"),
+        "tracks": wanted,
+        "label": label,
+    }
+
+    if GEN_TRACK in wanted:
+        record["gen_point"] = select_point(sweep_points(design), prefer=prefer, incumbent=incumbent)
+    if CTX_TRACK in wanted:
+        # No `prefer`: the ctx objective is scalar. See `select_ctx_point`.
+        record["ctx_point"] = select_ctx_point(ctx_points(design), incumbent=incumbent)
+
+    point = record.get("gen_point") or record.get("ctx_point") or {}
+    launches = launch_plan(
+        base,
+        sweeps=sweeps,
+        repos=repos,
+        workspace_root=workspace_root,
+        label=label,
+        point=point,
+        design=design,
+    )
+    record["campaigns"] = [
+        {"track": run.track, "workspace": str(run.workspace), "argv": run.argv} for run in launches
+    ]
+
+    Path(workspace_root).mkdir(parents=True, exist_ok=True)
+    (Path(workspace_root) / RUN_RECORD).write_text(
+        json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+    if dry_run:
+        record["started"] = False
+        return record
+
+    started = spawn.start_all(launches)
+    record["started"] = True
+    record["exit_status"] = spawn.wait_all(started)
+    (Path(workspace_root) / RUN_RECORD).write_text(
+        json.dumps(record, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+    return record
