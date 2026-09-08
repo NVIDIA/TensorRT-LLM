@@ -1,8 +1,20 @@
 # TensorRT-LLM Model Weights Loader
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
+> [!WARNING]
+> This page describes the **legacy** TensorRT `ModelWeightsLoader` weight-conversion helper
+> (`tensorrt_llm.models.model_weights_loader`), which was removed with the TensorRT backend.
+> For new projects, use the PyTorch checkpoint-loading guides:
+> [torch/features/checkpoint_loading.md](../../torch/features/checkpoint_loading.md)
+> and [features/checkpoint-loading.md](../../features/checkpoint-loading.md).
+> HuggingFace checkpoints load directly via `trtllm-serve` / the LLM API — no separate convert step.
+
 ## Overview
 
-The weights loader is designed for easily converting and loading external weight checkpoints into TensorRT-LLM models.
+The weights loader was designed for converting and loading external weight checkpoints into **legacy** TensorRT-LLM engine models. The `ModelWeightsLoader` module and the per-model `tensorrt_llm.models.<name>` packages it targeted are no longer present in the tree.
 
 ## Workflow
 
@@ -229,7 +241,7 @@ for tllm_key, _ in tqdm(trtllm_model.named_parameters()):
 loader.fill(tllm_weights)
 ```
 This will apply `preprocess` after `load_tensor()` and before `postprocess`, and demonstrates how to convert the loaded shard into default HF layout. The loader still have support for precisions quantized from FP16/BF16 (e.g. INT8-wo/INT4-wo), the other precisions may require special operations, and can be addressed inside the `preprocess` function.
-The support for Qwen-1 is in `QWenForCausalLM.from_hugging_face()` of [model.py](../../../tensorrt_llm/models/qwen/model.py), and can also be taken as example.
+Historically, Qwen-1 support lived in `QWenForCausalLM.from_hugging_face()` under the removed `tensorrt_llm/models/qwen/model.py` package.
 
 ### Fully customized
 If the model weights loader cannot satisfy the requirements, users can write the conversion loop totally on their own.
@@ -249,8 +261,7 @@ for tllm_key, param in tqdm(trtllm_model.named_parameters()):
 In this mode, every precision require user's own support.
 
 ## Troubleshooting
-The weights loader is enabled for LLaMA family models and Qwen models by default with TensorRT flow only.
 
-If users encounter failure caused by `ModelWeightsLoader`, a workaround is passing environmental variable `TRTLLM_DISABLE_UNIFIED_CONVERTER=1` to disable the model weights loader and fallback to the legacy path.
+The weights loader applied only to the removed TensorRT engine flow (historically LLaMA-family and Qwen). The `ModelWeightsLoader` import path, `TRTLLM_DISABLE_UNIFIED_CONVERTER`, and the per-model `tensorrt_llm.models.*` convert packages are gone with that backend.
 
-This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.
+For current checkpoint loading on the PyTorch backend, see [torch/features/checkpoint_loading.md](../../torch/features/checkpoint_loading.md).
