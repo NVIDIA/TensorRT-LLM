@@ -140,10 +140,9 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
-        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
+        bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
@@ -196,11 +195,9 @@ public:
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
-        , mCrossAttentionMask(std::move(crossAttentionMask))
         , mLlmRequestType(llmRequestType)
         , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
-        , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mReturnPerfMetrics(returnPerfMetrics)
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
@@ -436,26 +433,6 @@ public:
         else
         {
             mEncoderInputFeatures = std::nullopt;
-        }
-
-        auto const& crossAttentionMask = req.getCrossAttentionMask();
-        if (crossAttentionMask.has_value())
-        {
-            mCrossAttentionMask = executor::detail::toITensor(crossAttentionMask.value());
-        }
-        else
-        {
-            mCrossAttentionMask = std::nullopt;
-        }
-
-        auto const& skipCrossAttnBlocks = req.getSkipCrossAttnBlocks();
-        if (skipCrossAttnBlocks.has_value())
-        {
-            mSkipCrossAttnBlocks = executor::detail::toITensor(skipCrossAttnBlocks.value());
-        }
-        else
-        {
-            mSkipCrossAttnBlocks = std::nullopt;
         }
 
         switch (req.getRequestType())
@@ -1278,16 +1255,6 @@ public:
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     }
 
-    [[nodiscard]] TensorPtr getCrossAttentionMask() const
-    {
-        return mCrossAttentionMask.value_or(nullptr);
-    }
-
-    [[nodiscard]] TensorPtr getSkipCrossAttnBlocks() const
-    {
-        return mSkipCrossAttnBlocks.value_or(nullptr);
-    }
-
     [[nodiscard]] bool constexpr getReturnPerfMetrics() const noexcept
     {
         return mReturnPerfMetrics;
@@ -2087,9 +2054,6 @@ protected:
     // which encoder output shape cannot be inferred from encoder input shape due to downsampling.
     std::optional<SizeType32> mEncoderOutputLength{std::nullopt};
 
-    // Input cross attention mask.
-    std::optional<TensorPtr> mCrossAttentionMask{std::nullopt};
-
     LlmRequestType mLlmRequestType;
 
     std::optional<executor::ContextPhaseParams> mContextPhaseParams{std::nullopt};
@@ -2111,8 +2075,6 @@ protected:
 
     // Indicators whether each sibling completes generation.
     std::shared_ptr<std::vector<bool>> mSequenceFinalVec;
-
-    std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
 
     // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
@@ -2291,10 +2253,8 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
-        std::optional<TensorPtr> crossAttentionMask = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt,
-        std::optional<TensorPtr> skipCrossAttnBlocks = std::nullopt, bool returnPerfMetrics = false,
+        std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, bool returnPerfMetrics = false,
         std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
@@ -2331,11 +2291,11 @@ public:
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
             returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), encoderOutputLength,
-            std::move(crossAttentionMask), llmRequestType,
+            llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            skipCrossAttnBlocks, returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs,
-            contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
+            returnPerfMetrics, std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams,
+            arrivalTime, std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
