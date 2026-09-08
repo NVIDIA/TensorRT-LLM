@@ -2,7 +2,7 @@
 
 By NVIDIA TensorRT LLM Team
 
-CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GPU operations and replaying them as a single unit. In TensorRT-LLM, CUDA graphs are captured for a fixed set of batch sizes; when CUDA graph padding is enabled, an incoming batch is padded to the next available captured size, wasting some compute on empty slots. The default configuration captures only 23 batch sizes using a roughly-doubling progression, leaving gaps of up to 1024 between consecutive sizes in the high-concurrency range. This post investigates the throughput impact of filling those gaps with finer-grained batch size sets, and characterizes the resulting GPU memory and server startup time overhead.
+CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GPU operations and replaying them as a single unit. In TensorRT LLM, CUDA graphs are captured for a fixed set of batch sizes; when CUDA graph padding is enabled, an incoming batch is padded to the next available captured size, wasting some compute on empty slots. The default configuration captures only 23 batch sizes using a roughly-doubling progression, leaving gaps of up to 1024 between consecutive sizes in the high-concurrency range. This post investigates the throughput impact of filling those gaps with finer-grained batch size sets, and characterizes the resulting GPU memory and server startup time overhead.
 
 ## Table of Contents
 
@@ -22,7 +22,7 @@ CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GP
 
 ## Background: CUDA Graph Padding
 
-TensorRT-LLM captures CUDA graphs for a predetermined set of batch sizes before inference begins. At each generation step, the scheduler assembles a batch of requests; if the batch size does not match any captured size, the runtime pads it up to the nearest larger captured size, running the model over some empty slots. The wasted computation is proportional to the gap between the actual batch and the next captured size.
+TensorRT LLM captures CUDA graphs for a predetermined set of batch sizes before inference begins. At each generation step, the scheduler assembles a batch of requests; if the batch size does not match any captured size, the runtime pads it up to the nearest larger captured size, running the model over some empty slots. The wasted computation is proportional to the gap between the actual batch and the next captured size.
 
 The default **x2 configuration** covers 23 batch sizes using a coarsely-doubling sequence:
 
@@ -46,7 +46,7 @@ Both +64 and +8 configs share the same fine-grained coverage up to 128 as the de
 
 ## Experiment Setup
 
-All experiments are conducted on NVIDIA GB200 servers using TensorRT-LLM v1.3.0rc8. We evaluate four frontier NVFP4-quantized models under two serving topologies:
+All experiments are conducted on NVIDIA GB200 servers using TensorRT LLM v1.3.0rc8. We evaluate four frontier NVFP4-quantized models under two serving topologies:
 
 - **Aggregated mode**: a single server with 4×GB200 GPUs handling both prefill and decode, with tensor parallelism (TP)
 - **Disaggregated mode**: 4 or 8×GB200 GPUs for the prefill (context) server and 4×GB200 GPUs for the decode (generation) server, with expert parallelism (EP)
@@ -83,7 +83,7 @@ DeepSeek-R1 shows the largest gains, reaching **up to 1.5x** around concurrency 
 
 ### GPU Memory Overhead
 
-Capturing more CUDA graphs requires more GPU memory for graph data. TensorRT-LLM already uses `graph.pool()` to share a memory pool across all captured graphs when capturing various tensor buffers for decoding passes, so the memory pool size is determined by the memory footprint of the largest graph — which is identical in the x2 and +64 configurations. The observable memory difference lies instead in the CUDA graph metadata outside the pool.
+Capturing more CUDA graphs requires more GPU memory for graph data. TensorRT LLM already uses `graph.pool()` to share a memory pool across all captured graphs when capturing various tensor buffers for decoding passes, so the memory pool size is determined by the memory footprint of the largest graph — which is identical in the x2 and +64 configurations. The observable memory difference lies instead in the CUDA graph metadata outside the pool.
 
 Using `torch.cuda.mem_get_info()` on an aggregated-mode DeepSeek-R1 model at TP=4, we find on average each CUDA graph adds approximately 10 MB of dedicated data. The 26 additional graphs in the +64 configuration therefore account for approximately **260 MB** more GPU memory consumption, which reduces the amount of memory available for the KV cache.
 
@@ -135,7 +135,7 @@ The table below profiles CUDA graph and KV cache GPU memory usage for DeepSeek-V
 | KV cache token reduction | −17.2% | — | −8.6% | — |
 | KV cache memory reduction | 4.86 GB | — | 1.99 GB | — |
 
-DeepSeek-V3.2's 210 additional graphs (over +64) consume 4.86 GB of GPU memory, compared to 1.99 GB for the same 210 graphs in DeepSeek-R1. V3.2's CUDA graphs thus consume 2.4× more GPU memory per graph than R1's, probably due to V3.2's complex DeepSeek Sparse Attention (DSA) mechanism. This larger footprint reduces the KV cache token capacity by 17.2% for V3.2, versus 8.6% for R1. TensorRT-LLM's batch autotuner prevents active requests' KV cache from being evicted mid-generation, so a smaller KV cache directly caps the number of concurrent in-flight requests, reducing output throughput.
+DeepSeek-V3.2's 210 additional graphs (over +64) consume 4.86 GB of GPU memory, compared to 1.99 GB for the same 210 graphs in DeepSeek-R1. V3.2's CUDA graphs thus consume 2.4× more GPU memory per graph than R1's, probably due to V3.2's complex DeepSeek Sparse Attention (DSA) mechanism. This larger footprint reduces the KV cache token capacity by 17.2% for V3.2, versus 8.6% for R1. TensorRT LLM's batch autotuner prevents active requests' KV cache from being evicted mid-generation, so a smaller KV cache directly caps the number of concurrent in-flight requests, reducing output throughput.
 
 The adoption of the +8 config is therefore more situation-dependent: it benefits models whose CUDA graphs have a modest per-graph memory footprint (relative to available GPU memory for the KV cache), and regresses on models with larger per-graph footprints where KV cache reduction is the dominant effect.
 

@@ -1,6 +1,6 @@
 # Accelerating Long-Context Inference with Skip Softmax Attention
 
-As context lengths grow from thousands to hundreds of thousands of tokens, attention computation becomes a major bottleneck in long-context LLM inference. TensorRT-LLM provides a [sparse attention framework](../../features/sparse-attention.md#framework-level-sparse-attention) that supports techniques like KV cache compression and sparse pattern prediction, featured in [RocketKV](https://arxiv.org/pdf/2502.14051) and [DSA](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf). However, these require framework-level support—additional token selection steps, auxiliary data structures, and kernel modifications are required, compared to the vanilla attention architecture. This complexity introduces **runtime overhead** that can offset performance gains, particularly when context lengths are not long enough to amortize the extra work.
+As context lengths grow from thousands to hundreds of thousands of tokens, attention computation becomes a major bottleneck in long-context LLM inference. TensorRT LLM provides a [sparse attention framework](../../features/sparse-attention.md#framework-level-sparse-attention) that supports techniques like KV cache compression and sparse pattern prediction, featured in [RocketKV](https://arxiv.org/pdf/2502.14051) and [DSA](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf). However, these require framework-level support—additional token selection steps, auxiliary data structures, and kernel modifications are required, compared to the vanilla attention architecture. This complexity introduces **runtime overhead** that can offset performance gains, particularly when context lengths are not long enough to amortize the extra work.
 
 In this blog, we introduce **Skip Softmax Attention**, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention is built on top of the Flash Attention algorithm and only requires modifying the existing **attention kernels**. Due to this simplicity, the end-to-end performance gain is more predictable. In addition, it is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.
 
@@ -26,7 +26,7 @@ $$\exp(\tilde{m}_i^{(j)} - m_i^{(j)}) < \lambda$$
 
 In this way, we can indirectly control the sparsity via the threshold. The threshold is set to be inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.
 
-The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087). We have also published a [Developer Blog](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/) for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.
+The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087). We have also published a [Developer Blog](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/) for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT LLM to accelerate long-context inference.
 
 <p align="center">
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_blasst.jpg" alt="BLASST Illustration" style="width: 50%; min-width: 300px; display: block; margin: auto;" />
@@ -111,7 +111,7 @@ Note that the number of samples in LongBench V2 is very small (~200), so the res
 
 
 ## Performance Benchmark
-Skip Softmax Attention is supported on both Hopper and Blackwell GPUs and builds on top of the SoTA performance of the TensorRT-LLM's attention kernels. Hopper prefilling is implemented in [fmha_v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2), Hopper decoding is implemented in [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa), and Blackwell is implemented in [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels).
+Skip Softmax Attention is supported on both Hopper and Blackwell GPUs and builds on top of the SoTA performance of the TensorRT LLM's attention kernels. Hopper prefilling is implemented in [fmha_v2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/fmha_v2), Hopper decoding is implemented in [XQA](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/kernels/xqa), and Blackwell is implemented in [trtllm-gen](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/kernels/trtllmGenKernels).
 
 ### Kernel Performance
 
@@ -213,7 +213,7 @@ We provide the commands to reproduce the results in the previous context, as a s
 
 ### Accuracy evaluation (LongBench V1/V2)
 
-Both LongBench V1 and V2 are integrated into the TensorRT-LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
+Both LongBench V1 and V2 are integrated into the TensorRT LLM accuracy test suite, `trtllm-eval`. Here are the example scripts to run the accuracy evaluation:
 
 ```bash
 # Dump the extra LLM API options YAML file.

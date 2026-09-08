@@ -17,7 +17,7 @@ By NVIDIA TensorRT LLM team
   - [Phase 3: Ballot-Free Candidate Collection](#phase-3-ballot-free-candidate-collection)
   - [Phase 4: Exact Refinement in Shared Memory](#phase-4-exact-refinement-in-shared-memory)
   - [Why This Is Still Exact](#why-this-is-still-exact)
-- [TensorRT-LLM Integration](#tensorrt-llm-integration)
+- [TensorRT LLM Integration](#tensorrt-llm-integration)
   - [Where GVR Fits in the DSA Stack](#where-gvr-fits-in-the-dsa-stack)
   - [How to Enable It](#how-to-enable-it)
   - [When It Falls Back to Radix Select](#when-it-falls-back-to-radix-select)
@@ -33,7 +33,7 @@ By NVIDIA TensorRT LLM team
 
 Long-context and code-centric LLM workloads routinely push decode-time context lengths into the 100K+ regime. Sparse attention reduces the quadratic attention bottleneck, but it does **not** remove the need to rank a long vector of indexer scores at every decode step. In practical sparse-attention deployments such as DeepSeek DSA, exact **Top-K selection** remains on the critical path, and its cost still grows with sequence length.
 
-TensorRT-LLM already ships a highly tuned production radix-select Top-K kernel for DeepSeek Sparse Attention (DSA), as described in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md). This blog introduces the next step: **Guess-Verify-Refine (GVR)**, a data-aware **exact** Top-K algorithm that uses the previous decode step's Top-K result as a prediction signal.
+TensorRT LLM already ships a highly tuned production radix-select Top-K kernel for DeepSeek Sparse Attention (DSA), as described in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md). This blog introduces the next step: **Guess-Verify-Refine (GVR)**, a data-aware **exact** Top-K algorithm that uses the previous decode step's Top-K result as a prediction signal.
 
 The core observation is simple:
 
@@ -48,7 +48,7 @@ On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, GVR d
 - up to **2.42x** per layer per decode step,
 - and end-to-end TPOT reduction of up to **7.52%** in fixed-OSL TEP8 min-latency deployment.
 
-This blog explains the motivation, algorithm, TensorRT-LLM integration, enablement path, and measured operator-level and end-to-end gains. For full derivations, correctness arguments, iteration statistics, and supplementary methodology, see Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
+This blog explains the motivation, algorithm, TensorRT LLM integration, enablement path, and measured operator-level and end-to-end gains. For full derivations, correctness arguments, iteration statistics, and supplementary methodology, see Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
 
 ## Why Decode-Time Top-K Matters in DSA
 
@@ -223,11 +223,11 @@ In practice:
 
 For the full correctness argument, the exact candidate-set condition, detailed pseudocode, and the GPU performance model, see the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
-## TensorRT-LLM Integration
+## TensorRT LLM Integration
 
 ### Where GVR Fits in the DSA Stack
 
-GVR is integrated into the existing TensorRT-LLM DSA decode path rather than as a separate code path. The high-level dispatch is:
+GVR is integrated into the existing TensorRT LLM DSA decode path rather than as a separate code path. The high-level dispatch is:
 
 1. Python-level DSA code decides whether a small-batch CuTE DSL path is appropriate,
 2. otherwise the request falls through to the C++ `indexer_topk_decode` operator, carrying the previous-step Top-K indices and a graph-safe scratch buffer when GVR is enabled,
@@ -239,9 +239,9 @@ GVR is integrated into the existing TensorRT-LLM DSA decode path rather than as 
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_dispatch_logic.png" alt="Dispatch Logic" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7. Full decode-stage Top-K dispatch in TensorRT-LLM. GVR takes priority only when `preIdx`, scratch buffers, and hardware-aware thresholds are satisfied; otherwise dispatch falls back to the original insertion/radix-select pipeline.</em></sub></p>
+<p align="center"><sub><em>Figure 7. Full decode-stage Top-K dispatch in TensorRT LLM. GVR takes priority only when `preIdx`, scratch buffers, and hardware-aware thresholds are satisfied; otherwise dispatch falls back to the original insertion/radix-select pipeline.</em></sub></p>
 
-From a system point of view, this fits naturally into the broader TensorRT-LLM sparse attention stack described in [Tech Blog 17](blog17_Sparse_Attention_in_TensorRT-LLM.md), while specifically accelerating the DSA Top-K selector discussed in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
+From a system point of view, this fits naturally into the broader TensorRT LLM sparse attention stack described in [Tech Blog 17](blog17_Sparse_Attention_in_TensorRT-LLM.md), while specifically accelerating the DSA Top-K selector discussed in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
 
 ### How to Enable It
 
@@ -320,7 +320,7 @@ The GVR fast path is only taken when the required conditions are satisfied. Nota
 - **very long rows** where the implementation still prefers the existing split-work radix path,
 - unsupported architectures.
 
-In other words, enabling GVR is designed to be low-risk: if the heuristic path is not applicable, TensorRT-LLM simply continues to use the production radix-select implementation.
+In other words, enabling GVR is designed to be low-risk: if the heuristic path is not applicable, TensorRT LLM simply continues to use the production radix-select implementation.
 
 Today, the heuristic path is targeted at **Blackwell (sm_100+)**. On older architectures, the flag is effectively ignored.
 
@@ -381,7 +381,7 @@ This is a useful way to think about GVR:
 
 ### End-to-End Accuracy
 
-We validated that enabling GVR does not introduce measurable end-to-end quality regression in the TensorRT-LLM stack. Using `trtllm-eval` on DeepSeek-V3.2 NVFP4 on B200, all observed deltas stay within run-to-run variance across:
+We validated that enabling GVR does not introduce measurable end-to-end quality regression in the TensorRT LLM stack. Using `trtllm-eval` on DeepSeek-V3.2 NVFP4 on B200, all observed deltas stay within run-to-run variance across:
 
 - MMLU
 - GSM8K
@@ -394,7 +394,7 @@ For the detailed benchmark table and discussion of why long-context evaluation i
 
 ### End-to-End TPOT Reduction
 
-To isolate the length-scaling behavior of the decode-stage optimization, we measured fixed-OSL min-latency serving on DeepSeek-V3.2-Exp NVFP4 with TensorRT-LLM on B200 x8 under TEP8 parallelism.
+To isolate the length-scaling behavior of the decode-stage optimization, we measured fixed-OSL min-latency serving on DeepSeek-V3.2-Exp NVFP4 with TensorRT LLM on B200 x8 under TEP8 parallelism.
 
 The benchmark is intentionally set up so that decode-time Top-K is a meaningful fraction of end-to-end latency:
 
@@ -430,7 +430,7 @@ If you want the paper-level version of this work, start with Cheng, Long, et al.
 
 The arXiv paper contains the low-level algorithm, pseudocode, replay statistics, and GPU performance model behind the implementation summarized here.
 
-For surrounding TensorRT-LLM context, the most relevant companion reads are:
+For surrounding TensorRT LLM context, the most relevant companion reads are:
 
 - [Tech Blog 15: Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)
 - [Tech Blog 17: Sparse Attention in TensorRT LLM](blog17_Sparse_Attention_in_TensorRT-LLM.md)
@@ -438,7 +438,7 @@ For surrounding TensorRT-LLM context, the most relevant companion reads are:
 Those cover:
 
 - the original DSA production path,
-- the broader sparse attention framework in TensorRT-LLM,
+- the broader sparse attention framework in TensorRT LLM,
 - and the system context in which GVR is integrated.
 
 For end-to-end benchmarking, use `trtllm-bench` with the standard DSA config path and only toggle `enable_heuristic_topk` between the A/B runs. A representative setup looks like this:
@@ -490,7 +490,7 @@ In the benchmark script, the only A/B difference between the two runs is:
 - `enable_heuristic_topk: false` for the production radix-select path,
 - `enable_heuristic_topk: true` for the GVR path.
 
-The benchmark configuration above is the self-contained TensorRT-LLM setup for the technical-blog reproduction path; additional methodology details are available in the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
+The benchmark configuration above is the self-contained TensorRT LLM setup for the technical-blog reproduction path; additional methodology details are available in the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ## Conclusion
 
@@ -503,4 +503,4 @@ In DeepSeek Sparse Attention decode, the previous step's Top-K is exactly such a
 - lowers synchronization overhead in candidate collection,
 - and still preserves exact Top-K outputs.
 
-That combination is what makes GVR interesting: it is not an approximate pruning trick and it is not just a micro-optimization of radix select. It is a workload-aware exact algorithm that fits naturally into TensorRT-LLM's DSA path and converts temporal stability into real operator-level and end-to-end gains. As DSA-style models evolve toward long-sequence `index_topk=512/1024` use cases, the same GVR Top-K direction is expected to remain useful beyond the current `index_topk=2048` deployment.
+That combination is what makes GVR interesting: it is not an approximate pruning trick and it is not just a micro-optimization of radix select. It is a workload-aware exact algorithm that fits naturally into TensorRT LLM's DSA path and converts temporal stability into real operator-level and end-to-end gains. As DSA-style models evolve toward long-sequence `index_topk=512/1024` use cases, the same GVR Top-K direction is expected to remain useful beyond the current `index_topk=2048` deployment.

@@ -96,7 +96,7 @@ Figure 1 shows the pipeline: a trace-collection phase (top), in which agents run
 
 The pieces, one by one:
 
-- **Scaffolding agents.** The traced agents are built on [Scaffolding](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding), TensorRT-LLM's inference-time-compute framework introduced in [Tech Blog 13](blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md), whose controller/worker structure makes an agent's execution graph explicit and therefore traceable.
+- **Scaffolding agents.** The traced agents are built on [Scaffolding](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding), TensorRT LLM's inference-time-compute framework introduced in [Tech Blog 13](blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.md), whose controller/worker structure makes an agent's execution graph explicit and therefore traceable.
 - **Trace hooks.** Two decorators attach tracing to an existing agent with no change to its logic, so collecting a trace is one CLI switch.
 - **Trace files.** Each run is serialized as one `ExecutionTrace` JSON file in the format above; a directory of them forms a replayable dataset.
 - **Replay engine.** It applies the replay rules and runs one queue per branch path, so parallel sections and their join points execute concurrently rather than serially.
@@ -106,7 +106,7 @@ The pieces, one by one:
 
 ### Running the Pipeline
 
-All of these pieces ship in TensorRT-LLM: the tracing hooks and replay engine in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), and an example trace, the replay drivers, and the offline analyzer in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). Four steps cover the flow.
+All of these pieces ship in TensorRT LLM: the tracing hooks and replay engine in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), and an example trace, the replay drivers, and the offline analyzer in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). Four steps cover the flow.
 
 Collecting a trace is one switch on a Scaffolding agent run, which writes a compact `*.trace.json` alongside a full one:
 
@@ -182,7 +182,7 @@ The rest of this blog follows two representative traces at opposite ends of this
 
 ## Experimental Findings
 
-We serve Qwen3-235B-A22B-Instruct-2507 through TensorRT-LLM on a single GB200 node (4 GPUs) and replay the two representative traces while varying the server maximum batch size **B** and the user concurrency **C** (the number of agent sessions replayed at once).
+We serve Qwen3-235B-A22B-Instruct-2507 through TensorRT LLM on a single GB200 node (4 GPUs) and replay the two representative traces while varying the server maximum batch size **B** and the user concurrency **C** (the number of agent sessions replayed at once).
 
 ### Token-Level and Job-Level Metrics Can Disagree
 
@@ -209,7 +209,7 @@ Figure 6 sweeps concurrency (with TP4+EP4 fixed) and annotates each job-level Pa
 </div>
 <p align="center"><sub><em>Figure 6. Measured versus optimal prefix-cache hit rate, with the job-level Pareto alongside, as concurrency grows (Coder top, Open Deep Research bottom).</em></sub></p>
 
-Host offloading pushes the cliff back. In TensorRT-LLM this is one line in the serving config:
+Host offloading pushes the cliff back. In TensorRT LLM this is one line in the serving config:
 
 ```yaml
 # extra-llm-api-config.yml
@@ -247,4 +247,4 @@ Fan-out also makes the serving behavior harder to reason about in general. A sin
 
 Agent workloads keep changing, and with them the shapes that reach the serving system: agent architectures evolve, context-management strategies such as compaction alter how much prefix survives across turns, and tool usage shifts the balance between waiting and computing. Any of these can move where the bottleneck sits, and a configuration tuned for today's traces may not hold for tomorrow's.
 
-The TensorRT-LLM team treats real agentic workloads as a first-class target, not a variant of chat serving. We will therefore keep tracking the workload characteristics of real agentic scenarios — extending the trace dataset as new agent patterns appear and re-measuring the job-level behavior they produce — and keep investing in the optimizations these measurements point to, from prefix-cache capacity and KV offloading to routing, scheduling, and configuration that follows an agent's branching structure. The goal is that our performance work is driven by what deployments actually run, and lands where it matters in the real world.
+The TensorRT LLM team treats real agentic workloads as a first-class target, not a variant of chat serving. We will therefore keep tracking the workload characteristics of real agentic scenarios — extending the trace dataset as new agent patterns appear and re-measuring the job-level behavior they produce — and keep investing in the optimizations these measurements point to, from prefix-cache capacity and KV offloading to routing, scheduling, and configuration that follows an agent's branching structure. The goal is that our performance work is driven by what deployments actually run, and lands where it matters in the real world.

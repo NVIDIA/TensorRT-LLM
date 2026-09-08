@@ -10,13 +10,13 @@ routed MoE layer, the routed experts are still largely memory-bound, while group
 overheads from small per-expert shapes, expert scheduling, input permutation, and routed-output
 accumulation.
 
-This post introduces **DENSEGEMM**, a TensorRT-LLM backend for NVFP4 MoE on NVIDIA Blackwell
+This post introduces **DENSEGEMM**, a TensorRT LLM backend for NVFP4 MoE on NVIDIA Blackwell
 (SM100 / SM103). The target workflow is deliberately counterintuitive: express the MoE FFN as dense
 FC1/FC2 GEMMs over all experts, including the always-on shared expert, then use per-token alpha masks to
 keep only the selected routed experts. In the memory-bound low-latency regime, the extra arithmetic has
 limited latency impact, while the denser GEMM shapes improve hardware utilization.
 
-The implementation in TensorRT-LLM is staged. The current backend applies this dense formulation to the
+The implementation in TensorRT LLM is staged. The current backend applies this dense formulation to the
 routed experts first, while shared experts and Router/TopK scheduling remain outside the dense backend.
 On a DeepSeek-V3-style B200 profile, this current routed-expert implementation is best in the
 `num_tokens = 64-208` range, reaching up to 1.12x speedup over the TRTLLM-Gen grouped-GEMM path in the
@@ -59,7 +59,7 @@ expensive; at larger batches, the redundant dense arithmetic starts to appear on
 
 ## Scope and Takeaways
 
-This post separates the target DENSEGEMM workflow from the current TensorRT-LLM implementation. The
+This post separates the target DENSEGEMM workflow from the current TensorRT LLM implementation. The
 main claims should be read with the following scope:
 
 - **Target workflow** describes the intended end state: routed experts and shared experts use one dense
@@ -127,9 +127,9 @@ FFN, while the current implementation realizes the routed-expert dense FC1/FC2 p
 <p align="center"><em>Figure 2. Target DENSEGEMM TP flow. The current implementation realizes the
 routed-expert dense FC1/FC2 portion and keeps shared experts plus Router/TopK scheduling staged.</em></p>
 
-### Current Implementation in TensorRT-LLM
+### Current Implementation in TensorRT LLM
 
-The current TensorRT-LLM implementation is the first stage of that workflow. It implements dense GEMM
+The current TensorRT LLM implementation is the first stage of that workflow. It implements dense GEMM
 for routed experts and keeps the remaining pieces conservative:
 
 - **Routed experts only**: FC1 packs W1 / W3 as `[num_experts x 2 x intermediate, hidden]`; FC2 stores W2

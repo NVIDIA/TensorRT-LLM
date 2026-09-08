@@ -236,4 +236,4 @@ To review how wide EP helps with Blackwell's leading inference benchmarks, also 
 * [NVIDIA Blackwell Raises Bar in New InferenceMAX Benchmarks, Delivering Unmatched Performance and Efficiency](https://blogs.nvidia.com/blog/blackwell-inferencemax-benchmark-results/)
 
 ## Acknowledgements
-This is a great continuation of previous work on TensorRT-LLM wide EP and another demonstration of excellent teamwork. It stems from brilliant performance optimization ideas, solid performance analysis and benchmarking, and rapid engineering support and implementation. By sharing these experiences, we hope to help more people who are interested in deploying large-scale LLM models on NVIDIA GPUs to run AI faster.
+This is a great continuation of previous work on TensorRT LLM wide EP and another demonstration of excellent teamwork. It stems from brilliant performance optimization ideas, solid performance analysis and benchmarking, and rapid engineering support and implementation. By sharing these experiences, we hope to help more people who are interested in deploying large-scale LLM models on NVIDIA GPUs to run AI faster.

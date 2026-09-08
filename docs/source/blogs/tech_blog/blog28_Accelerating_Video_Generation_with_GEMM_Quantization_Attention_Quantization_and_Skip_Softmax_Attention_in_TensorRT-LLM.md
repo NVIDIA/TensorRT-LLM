@@ -1,6 +1,6 @@
-# Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM
+# Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT LLM
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team
 
 ## Introduction
 
@@ -13,7 +13,7 @@ Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVID
 </p>
 <p align="center"><sub><em>Figure 1. Diffusion pipeline-forward breakdown for Wan 2.2 T2V-A14B in BF16 on B200.</em></sub></p>
 
-Our earlier post, [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md), showed how to accelerate video generation with multiple GPUs. This post focuses on three complementary techniques within one GPU: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.
+Our earlier post, [Scaling Video Generation Across NVL72 Rack with TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md), showed how to accelerate video generation with multiple GPUs. This post focuses on three complementary techniques within one GPU: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ Our earlier post, [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM]
 
 ## GEMM Quantization
 
-GEMM quantization reduces the numerical precision of weights and activations so linear-layer GEMMs can use higher-throughput, low-precision Tensor Core paths. TensorRT-LLM VisualGen supports the following GEMM quantization paths:
+GEMM quantization reduces the numerical precision of weights and activations so linear-layer GEMMs can use higher-throughput, low-precision Tensor Core paths. TensorRT LLM VisualGen supports the following GEMM quantization paths:
 
 | `quant_algo` | Weight precision | Weight scaling | Activation precision | Activation scaling |
 | :--- | :--- | :--- | :--- | :--- |
@@ -212,7 +212,7 @@ Figure 5 expands the first-frame comparison to all seven prompts. Each row compa
 
 ## Reproduction
 
-The commands below target TensorRT-LLM 1.3.0rc26. The ModelOpt [static FP8 per-tensor checkpoint](https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-FP8) or the [static NVFP4 checkpoint](https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4) has contained the Skip Softmax calibration config, and you may need to manually copy the configs into the official BF16 checkpoint for reproduction.
+The commands below target TensorRT LLM 1.3.0rc26. The ModelOpt [static FP8 per-tensor checkpoint](https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-FP8) or the [static NVFP4 checkpoint](https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4) has contained the Skip Softmax calibration config, and you may need to manually copy the configs into the official BF16 checkpoint for reproduction.
 
 ### VisualGen configuration
 
@@ -300,15 +300,15 @@ For the reported latency, the pipeline forward is bracketed by CUDA synchronizat
 
 ## Conclusion
 
-Accelerating video diffusion is a process of trading off between the desired accuracy and speedup. TensorRT-LLM exposes GEMM quantization, quantized attention, and Skip Softmax as composable controls, so deployments can choose an operating point that matches their own quality bar instead of inheriting one fixed recipe.
+Accelerating video diffusion is a process of trading off between the desired accuracy and speedup. TensorRT LLM exposes GEMM quantization, quantized attention, and Skip Softmax as composable controls, so deployments can choose an operating point that matches their own quality bar instead of inheriting one fixed recipe.
 
 That operating point is model-, prompt-, and hardware-dependent. A useful optimization workflow therefore combines representative prompts, deployment-relevant latency, aggregate quality metrics, and direct inspection of generated videos. In the future, we will explore agentic search to automate these experiments and navigate the speed-quality tradeoff.
 
-These single-GPU techniques complement the multi-GPU methods described in [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md) and can be combined with multi-GPU parallelism when the deployment requires higher throughput or larger workloads.
+These single-GPU techniques complement the multi-GPU methods described in [Scaling Video Generation Across NVL72 Rack with TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md) and can be combined with multi-GPU parallelism when the deployment requires higher throughput or larger workloads.
 
 ## References
 
-1. [Scaling Video Generation Across NVL72 Rack with TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
+1. [Scaling Video Generation Across NVL72 Rack with TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
 2. [SageAttention: Accurate 8-Bit Attention for Plug-and-play Inference Acceleration](https://arxiv.org/abs/2410.02367)
 3. [SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization](https://arxiv.org/abs/2411.10958)
 4. [NVIDIA Model Optimizer Diffusers Quantization Example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers)
