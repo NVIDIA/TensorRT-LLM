@@ -547,8 +547,15 @@ def select_ctx_point(
 #: on the artefacts rather than on ``state.json``'s ``phase`` string: the
 #: phase is what the design *says* it reached, the CSVs are what it left, and
 #: a resumed or interrupted design can have the first without the second.
-def established(directory: Path) -> bool:
-    """Whether this design can be selected from without re-running it.
+def established(directory: Path, track: str = GEN_TRACK) -> bool:
+    """Whether this design can be selected from for ``track``.
+
+    Per track, because the two halves are established by different artefacts
+    and — under this module's no-join scope — neither waits on the other. A
+    design whose prefill candidates have been measured can start the ctx
+    campaign while its generation sweep is still running; requiring both
+    would idle a half that is ready on a half that is not, for a dependency
+    the scope does not have.
 
     The reason this is a question at all: fixing the operating point costs
     roughly an order of magnitude more than the campaigns it enables — six
@@ -556,7 +563,13 @@ def established(directory: Path) -> bool:
     campaign would be absurd; paying it once per (model, cluster, workload)
     and reusing it is the only shape in which the staging is affordable.
     """
-    return bool(sorted(Path(directory).rglob(GEN_ONLY_CSV)))
+    root = Path(directory)
+    if track == CTX_TRACK:
+        return any(
+            path.name.startswith("run_") and not path.name.endswith("_timing.json")
+            for path in root.rglob("run_*.json")
+        )
+    return bool(sorted(root.rglob(GEN_ONLY_CSV)))
 
 
 def campaign_workspace(root: Path, track: str, label: str) -> Path:
@@ -739,12 +752,19 @@ def supervise(
     prefer = preference(base)
     wanted = tracks(base)
 
-    if not established(design):
+    unready = [t for t in wanted if not established(design, t)]
+    if unready:
+        what = {
+            CTX_TRACK: "no scored ctx case (a `run_*.json` the harness validated)",
+            GEN_TRACK: f"no scored concurrency sweep (a `{GEN_ONLY_CSV}`)",
+        }
         raise DisaggSolError(
-            f"{design} has no scored concurrency sweep, so there is no measured "
-            f"space to choose an operating point from. Establish the design first "
-            f"— it is reused across campaigns, so this is paid once — or point "
-            f"'{DISAGG_SOL_FIELD}.{DESIGN_KEY}.{DESIGN_DIR_KEY}' at one that was."
+            f"{design} has "
+            + "; ".join(f"{what[t]} for track '{t}'" for t in unready)
+            + f". There is no measured space to choose those halves' operating "
+            f"points from. Establish the design first — it is reused across "
+            f"campaigns, so this is paid once — or narrow "
+            f"'{DISAGG_SOL_FIELD}.{TRACKS_KEY}' to the halves it already covers."
         )
 
     record: dict[str, Any] = {
