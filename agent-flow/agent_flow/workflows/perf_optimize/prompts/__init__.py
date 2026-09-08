@@ -9,6 +9,8 @@ from ._common import (
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
+    SOL_TRACK_CTX,
+    SOL_TRACK_GEN,
     approach_restriction_note,
     kernel_coverage_analyzer_note,
 )
@@ -84,6 +86,12 @@ DEFAULT_PROMPTS = PromptBundle(
 )
 
 
+#: The section each SOL track composes. Keyed by
+#: ``sol_track.track_name()``'s values so the caller passes the track
+#: through rather than translating it here.
+SOL_TRACK_SECTIONS: dict[str, str] = {"ctx": SOL_TRACK_CTX, "gen": SOL_TRACK_GEN}
+
+
 def build_perf_optimize_prompts(
     include_slurm_environment: bool = False,
     approaches: Sequence[str] | None = None,
@@ -91,6 +99,7 @@ def build_perf_optimize_prompts(
     kernel_coverage: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
+    sol_track: str | None = None,
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, augmented per the task spec.
 
@@ -152,6 +161,14 @@ def build_perf_optimize_prompts(
     projector are left alone: neither stands up a server, and the
     reporter reads the artifacts the others produced either way.
 
+    ``sol_track`` is ``"ctx"`` or ``"gen"`` when the task spec carries a
+    ``sol_track`` block: the campaign optimizes one half of a
+    disaggregated deployment in isolation. The track's section is
+    appended to the same five roles and for the same reason as
+    ``include_disagg``, and the two are mutually exclusive — the schema
+    refuses a spec carrying both, since each reconciles ``benchmark``
+    from a different file.
+
     Composing it here rather than carrying it unconditionally is what
     keeps the override unambiguous — a role either has the section and it
     applies, or it does not have it at all. The alternative (always
@@ -191,6 +208,15 @@ def build_perf_optimize_prompts(
             optimizer=DISAGG_CAMPAIGN,
             evaluator=DISAGG_CAMPAIGN,
             qa=DISAGG_CAMPAIGN,
+        )
+    if sol_track is not None:
+        section = SOL_TRACK_SECTIONS[sol_track]
+        bundle = bundle.with_extensions(
+            benchmarker=section,
+            analyzer=section,
+            optimizer=section,
+            evaluator=section,
+            qa=section,
         )
     if kernel_coverage is not None:
         bundle = bundle.with_extensions(
