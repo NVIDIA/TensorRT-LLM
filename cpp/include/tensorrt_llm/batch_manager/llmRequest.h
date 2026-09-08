@@ -111,8 +111,6 @@ public:
     using VecUniqueTokens = runtime::VecUniqueTokens;
     using BeamUniqueTokens = std::vector<VecUniqueTokens>;
     using TensorPtr = TTensor;
-    using LogitsPostProcessor = std::function<void(
-        RequestIdType, TensorPtr&, BeamTokens const&, TStream const&, std::optional<RequestIdType>)>;
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
@@ -138,8 +136,6 @@ public:
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> const& draftTokens = std::nullopt,
         std::optional<TensorPtr> draftLogits = std::nullopt, bool excludeInputFromOutput = false,
-        std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
-        bool applyLogitsPostProcessorBatched = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
@@ -165,8 +161,6 @@ public:
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
         , mPadId(padId)
-        , mLogitsPostProcessor(std::move(logitsPostProcessor))
-        , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
@@ -238,8 +232,7 @@ public:
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
-        bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
-        bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
+        bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
@@ -251,8 +244,6 @@ public:
         , mSamplingConfig(samplingConfig)
         , mEndId(endId)
         , mPadId(padId)
-        , mLogitsPostProcessor(logitsPostProcessor)
-        , mApplyLogitsPostProcessorBatched(applyLogitsPostProcessorBatched)
         , mClientId(clientId)
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
@@ -2026,8 +2017,6 @@ public:
     std::optional<TokenIdType> mEndId{std::nullopt};
     std::optional<TokenIdType> mPadId{std::nullopt};
     std::optional<SizeType32> mSeqSlot{std::nullopt};
-    std::optional<LogitsPostProcessor> mLogitsPostProcessor{std::nullopt};
-    bool mApplyLogitsPostProcessorBatched{false};
     std::optional<RequestIdType> mClientId{std::nullopt};
 
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
@@ -2350,8 +2339,7 @@ public:
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
-        bool excludeInputFromOutput = false, std::optional<LogitsPostProcessor> logitsPostProcessor = std::nullopt,
-        bool applyLogitsPostProcessorBatched = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
+        bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
         bool returnEncoderOutput = false, std::optional<RequestIdType> clientId = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
@@ -2392,8 +2380,7 @@ public:
             returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
-            std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
-            applyLogitsPostProcessorBatched,
+            std::move(draftLogits), excludeInputFromOutput,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
             returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures), encoderOutputLength,
@@ -2415,13 +2402,9 @@ public:
     {
     }
 
-    LlmRequest(RequestIdType requestId, executor::Request const& request,
-        std::optional<Base::LogitsPostProcessor> logitsPostProcessor = std::nullopt,
-        bool applyLogitsPostProcessorBatched = false)
+    LlmRequest(RequestIdType requestId, executor::Request const& request)
         : Base(requestId, request)
     {
-        mLogitsPostProcessor = std::move(logitsPostProcessor);
-        mApplyLogitsPostProcessorBatched = applyLogitsPostProcessorBatched;
         mLookaheadConfig = request.getLookaheadConfig();
         mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
