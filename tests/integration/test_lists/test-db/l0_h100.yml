@@ -83,6 +83,8 @@ l0_h100:
   # reuse dense-8B greedy/logprob equality; accuracy stays on GSM8K/MMLU).
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_cuda_graph_overlap_scheduler
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_chunked_prefill
+  # Breakable prefill CUDA graphs (BCG) on the hybrid Mamba path; mpi_ray_parity (Ray id runs in the ray stage below).
+  - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph[tp1] TIMEOUT (90)
   - unittest/_torch/modeling/test_multimodal_encoder_graph.py
   # Qwen3.5-MoE-VL is hybrid (Mamba SSM + attention); FlashInfer's
   # chunk_gated_delta_rule GDN prefill kernel is sm90+ only, so this
@@ -245,6 +247,7 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor/test_overlap_scheduler.py
+    - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" TIMEOUT (90)
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
