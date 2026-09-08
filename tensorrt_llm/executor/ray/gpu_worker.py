@@ -73,9 +73,12 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
-        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
-            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
+        # Keep the existing per-worker fallback unless the cache was configured
+        # explicitly or through TRTLLM_CACHE_DIR before this actor started.
+        os.environ.setdefault(
+            "DG_JIT_CACHE_DIR",
+            os.path.join(tempfile.gettempdir(),
+                         f"deep_gemm_rank{rank}_gpu{self.gpu}"))
 
         torch.cuda.set_device(self.local_gpu)
 
