@@ -15,6 +15,7 @@
 
 import gc
 import inspect
+import traceback
 import types
 import weakref
 from contextlib import contextmanager
@@ -105,8 +106,9 @@ def assert_resource_freed(object_creation_func, *args, **kwargs):
                 shutdown_failed = True
                 if not body_exception_active:
                     raise
-                logger.exception(
-                    "Resource shutdown failed while handling another exception")
+                logger.error(
+                    "Resource shutdown failed while handling another exception:\n"
+                    f"{traceback.format_exc()}")
         finally:
             try:
                 # Drop our own strong reference
