@@ -16,6 +16,7 @@
 
 from unittest.mock import MagicMock, call, patch
 
+import pytest
 import torch.nn as nn
 
 from tensorrt_llm._torch.modules.dwdp.setup import teardown_dwdp
@@ -52,6 +53,42 @@ def _model():
     model.model = nn.Module()
     model.model.layers = nn.ModuleList()
     return model
+
+
+def test_weight_manager_release_frees_transport_when_the_buffer_raises():
+    """A failing buffer release must not strand the MNNVL transport."""
+    manager = DWDPWeightManager.__new__(DWDPWeightManager)
+    manager._released = False
+    manager._weight_buffer = MagicMock(device_id=0)
+    manager._peer_views = {}
+    manager._transport = MagicMock()
+    manager._batched_copy_plans = {}
+    manager._weight_buffer.release.side_effect = RuntimeError("buffer release failed")
+
+    with patch("tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.synchronize"):
+        transport = manager._transport
+        with pytest.raises(RuntimeError, match="buffer release failed"):
+            manager.release()
+
+    transport.release.assert_called_once_with()
+    assert manager._released is True
+
+
+def test_teardown_releases_every_manager_when_one_fails():
+    """One failing release must not strand the managers after it."""
+    first = MagicMock()
+    first.release.side_effect = RuntimeError("first failed")
+    second = MagicMock()
+
+    model = _model()
+    model.dwdp_weight_manager = first
+    model.model.dwdp_weight_manager = second
+
+    with pytest.raises(RuntimeError, match="first failed"):
+        teardown_dwdp(model)
+
+    first.release.assert_called_once_with()
+    second.release.assert_called_once_with()
 
 
 def test_teardown_detaches_both_model_references_and_releases_once():

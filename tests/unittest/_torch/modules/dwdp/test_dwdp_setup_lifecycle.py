@@ -114,6 +114,34 @@ def test_edge_fill_failure_releases_buffer_and_transport():
     transport.release.assert_called_once_with()
 
 
+def test_keyboard_interrupt_after_transport_allocation_still_rolls_back():
+    """Ctrl-C is not an ``Exception``; rollback must still run for it."""
+    with ExitStack() as stack:
+        transport, _weight_buffer, _weight_manager = _setup_mocks(stack)
+        dwdp_setup_module.WeightBuffer.create.side_effect = KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            _run_setup()
+
+    transport.release.assert_called_once_with()
+
+
+def test_rollback_release_failure_preserves_the_original_error():
+    """A raise from release() must not replace the error that broke setup."""
+    with ExitStack() as stack:
+        transport, weight_buffer, _weight_manager = _setup_mocks(stack)
+        dwdp_setup_module.fill_edge_bytes.side_effect = RuntimeError("fill failed")
+        weight_buffer.release.side_effect = RuntimeError("release failed")
+
+        # "fill failed", not "release failed".
+        with pytest.raises(RuntimeError, match="fill failed"):
+            _run_setup()
+
+    # The buffer release raised, yet the transport was still released.
+    weight_buffer.release.assert_called_once_with()
+    transport.release.assert_called_once_with()
+
+
 def test_backend_fixup_failure_releases_owned_manager():
     with ExitStack() as stack:
         transport, _weight_buffer, weight_manager = _setup_mocks(stack)
