@@ -46,6 +46,9 @@ class EvictablePage(Protocol):
     @property
     def status(self) -> PageStatus: ...
 
+    @property
+    def locality_domain_id(self) -> int | None: ...
+
     def is_committed(self) -> bool: ...
 
     node_ref: "NodeRef | None"

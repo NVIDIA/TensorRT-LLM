@@ -82,6 +82,11 @@ def _unwrap(
         return ret[1] if len(ret) == 2 else ret[1:]
 
 
+def get_current_device_id() -> int:
+    device_id = _unwrap(drv.cuCtxGetDevice())  # pyright: ignore
+    return int(device_id)
+
+
 def div_up(x: int, y: int) -> int:
     return (x + y - 1) // y
 
