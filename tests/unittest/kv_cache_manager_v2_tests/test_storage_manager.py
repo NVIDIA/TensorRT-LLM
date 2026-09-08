@@ -187,6 +187,13 @@ class _FakeEvictablePage:
         return True
 
 
+def setUpModule() -> None:
+    # Every test here builds a Python StorageManager; under the C++ backend the
+    # config classes are the C++ ones and the two cannot be mixed.
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python":
+        raise unittest.SkipTest("requires the Python KVCacheManagerV2 backend")
+
+
 class TestStorageManagerInit(unittest.TestCase):
     """Tests for StorageManager instantiation and post-init invariants."""
 
@@ -517,11 +524,6 @@ class TestSlotAllocatorOffset(unittest.TestCase):
         alloc.release(recycled)
 
 
-# Locality domains only exist in the Python backend.
-@unittest.skipIf(
-    os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python",
-    "locality domains require the Python KVCacheManagerV2 backend",
-)
 class TestStorageManagerLocalized(unittest.TestCase):
     """Tests for StorageManager when GpuCacheLevelStorage has num_locality_domains > 1.
 

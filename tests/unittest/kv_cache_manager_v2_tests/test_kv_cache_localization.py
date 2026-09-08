@@ -695,7 +695,7 @@ class TestKVCachePlacement(unittest.TestCase):
         """Localized prepare_context() uses the request's assigned placement."""
         from unittest.mock import MagicMock
 
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         stream = self._make_mock_stream()
         kv_cache = MagicMock()
@@ -761,7 +761,7 @@ class TestKVCachePlacement(unittest.TestCase):
         return stub
 
     def test_create_kv_cache_requires_locality_domain_id_when_localized(self) -> None:
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         stub = self._make_create_kv_cache_stub(num_locality_domains=2)
 
@@ -771,7 +771,7 @@ class TestKVCachePlacement(unittest.TestCase):
         stub.impl.create_kv_cache.assert_not_called()
 
     def test_create_kv_cache_rejects_locality_domain_id_when_non_localized(self) -> None:
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         stub = self._make_create_kv_cache_stub(num_locality_domains=1)
 
@@ -784,7 +784,7 @@ class TestKVCachePlacement(unittest.TestCase):
         """Dummy requests follow the request-id modulo placement rule."""
         from unittest.mock import MagicMock
 
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         stream = self._make_mock_stream()
         kv_cache = MagicMock()
@@ -829,7 +829,7 @@ class TestLocalizedInvalidValueCheck(unittest.TestCase):
     def test_invalid_value_check_skips_localization_gap(self) -> None:
         from unittest.mock import patch
 
-        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         manager = object.__new__(KVCacheManagerV2)
         manager.layer_offsets = {0: 0}
