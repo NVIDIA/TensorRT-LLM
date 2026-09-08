@@ -264,7 +264,7 @@ private:
     }
 
     //! Mutable: launch() reuses per-dispatcher descriptor scratch, and dispatch() is const.
-    mutable BatchedPageCopier mCopier;
+    BatchedPageCopier mCopier;
     TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;
     TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleToGroup;
 };

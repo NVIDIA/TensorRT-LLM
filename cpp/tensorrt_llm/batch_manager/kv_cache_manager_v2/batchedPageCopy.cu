@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -832,7 +833,7 @@ void BatchedPageCopier::computeConfigs()
         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(mOnboard.sharedBytes)));
 }
 
-void BatchedPageCopier::launch(PoolCopyArgs const& args, CopyDirection direction, CUstream stream)
+void BatchedPageCopier::launch(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const
 {
     if (args.numPairs == 0 || args.bytesPerPage == 0)
     {
@@ -886,17 +887,25 @@ void BatchedPageCopier::launchGenericKernel(PoolCopyArgs const& args, CopyDirect
 //! Copy-engine path: expand the index pairs into per-page descriptors and submit them as one
 //! batch. Descriptor construction is O(numPairs) on the CPU and on the critical path, which is
 //! why the kernel path exists at all -- but on PCIe the copy engine still wins overall.
-void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stream)
+void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stream) const
 {
-    mCopyEngineDsts.resize(args.numPairs);
-    mCopyEngineSrcs.resize(args.numPairs);
-    mCopyEngineSizes.assign(args.numPairs, args.bytesPerPage);
+    // Descriptor scratch. Page identities change on every eviction so the contents cannot be
+    // cached, only the allocation. Kept thread-local rather than in the object so the copier stays
+    // immutable after construction and two threads submitting migrations cannot overwrite each
+    // other's descriptors.
+    thread_local std::vector<CUdeviceptr> copyEngineDsts;
+    thread_local std::vector<CUdeviceptr> copyEngineSrcs;
+    thread_local std::vector<size_t> copyEngineSizes;
+
+    copyEngineDsts.resize(args.numPairs);
+    copyEngineSrcs.resize(args.numPairs);
+    copyEngineSizes.assign(args.numPairs, args.bytesPerPage);
     for (uint32_t slot = 0; slot < args.numPairs; ++slot)
     {
         PageIndexPair const pair = args.pairs[slot]; // host memory; see pageIndexLocation()
         TLLM_CHECK_DEBUG(pair.dst >= 0 && pair.src >= 0);
-        mCopyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
-        mCopyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+        copyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
+        copyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
     }
 #if CUDA_VERSION >= 12080
     CUmemcpyAttributes attributes{};
@@ -905,17 +914,17 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
     size_t firstCopy = 0;
 #if CUDA_VERSION < 13000
     size_t failIdx = std::numeric_limits<size_t>::max();
-    TLLM_CU_CHECK(cuMemcpyBatchAsync(mCopyEngineDsts.data(), mCopyEngineSrcs.data(), mCopyEngineSizes.data(),
+    TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
         args.numPairs, &attributes, &firstCopy, 1, &failIdx, stream));
 #else
-    TLLM_CU_CHECK(cuMemcpyBatchAsync(mCopyEngineDsts.data(), mCopyEngineSrcs.data(), mCopyEngineSizes.data(),
+    TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
         args.numPairs, &attributes, &firstCopy, 1, stream));
 #endif
 #else
     // cuMemcpyBatchAsync needs CUDA 12.8; fall back to one enqueue per page.
     for (uint32_t slot = 0; slot < args.numPairs; ++slot)
     {
-        TLLM_CU_CHECK(cuMemcpyAsync(mCopyEngineDsts[slot], mCopyEngineSrcs[slot], mCopyEngineSizes[slot], stream));
+        TLLM_CU_CHECK(cuMemcpyAsync(copyEngineDsts[slot], copyEngineSrcs[slot], copyEngineSizes[slot], stream));
     }
 #endif
 }

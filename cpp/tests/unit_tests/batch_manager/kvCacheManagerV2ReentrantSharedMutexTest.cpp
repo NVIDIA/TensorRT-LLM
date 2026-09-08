@@ -29,6 +29,25 @@ namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 namespace
 {
 
+//! Spins until `pred` holds, or the deadline passes. Returns whether it held.
+//!
+//! Bounded so a regression fails the test instead of hanging CI, and used instead of a fixed sleep
+//! so the test does not depend on how promptly the scheduler runs a thread.
+template <typename Pred>
+bool waitFor(Pred pred, std::chrono::milliseconds timeout = std::chrono::seconds{5})
+{
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    while (!pred())
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
+        std::this_thread::yield();
+    }
+    return true;
+}
+
 // Nested exclusive acquisition on the owning thread must not deadlock, and only the outermost
 // guard may own the lock. This is the property that lets public APIs call one another.
 TEST(ReentrantSharedMutexTest, NestedExclusiveIsNoOpAndDoesNotDeadlock)
@@ -80,15 +99,21 @@ TEST(ReentrantSharedMutexTest, NestingDoesNotLeakToOtherThreads)
         auto const nested = mutex.lockExclusive();
         EXPECT_FALSE(nested.owns());
 
+        std::atomic<bool> otherAttempting{false};
         other = std::thread(
             [&]
             {
                 EXPECT_FALSE(mutex.heldExclusiveByThisThread()); // not this thread's lock
+                otherAttempting.store(true);
                 auto const guard = mutex.lockExclusive();
                 otherEntered.store(true);
             });
-        // Give the other thread a chance to (incorrectly) proceed.
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Assert the thread is blocked, not merely unscheduled: wait until it reports that it is
+        // about to acquire. The remaining window between that store and the lock() call itself is
+        // inherent, so still allow a brief grace period -- but the test now fails if the thread
+        // never runs at all, which a fixed sleep alone would have passed.
+        ASSERT_TRUE(waitFor([&] { return otherAttempting.load(); })) << "contending thread never ran";
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         EXPECT_FALSE(otherEntered.load()) << "another thread entered while the lock was held";
     } // both guards released here
     other.join();
@@ -101,28 +126,39 @@ TEST(ReentrantSharedMutexTest, SharedLocksAreConcurrent)
     kv::ReentrantSharedMutex mutex;
     constexpr int kReaders = 4;
     std::atomic<int> inside{0};
-    std::atomic<int> maxInside{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> allInside{false};
     std::vector<std::thread> readers;
     for (int i = 0; i < kReaders; ++i)
     {
         readers.emplace_back(
             [&]
             {
+                // Released together, so the test does not depend on the first reader still holding
+                // the lock by the time the last one is scheduled.
+                waitFor([&] { return go.load(); });
                 auto const guard = mutex.lockShared();
-                int const now = ++inside;
-                int prev = maxInside.load();
-                while (now > prev && !maxInside.compare_exchange_weak(prev, now))
-                {
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                ++inside;
+                // Hold until every reader is inside. If the lock serialised them this never
+                // happens and the bounded wait expires, failing rather than hanging.
+                waitFor(
+                    [&]
+                    {
+                        if (inside.load() == kReaders)
+                        {
+                            allInside.store(true);
+                        }
+                        return allInside.load();
+                    });
                 --inside;
             });
     }
+    go.store(true);
     for (auto& t : readers)
     {
         t.join();
     }
-    EXPECT_GT(maxInside.load(), 1) << "readers serialised; shared lock is behaving exclusively";
+    EXPECT_TRUE(allInside.load()) << "readers serialised; shared lock is behaving exclusively";
 }
 
 // A writer must be excluded while readers hold the lock.
@@ -133,13 +169,18 @@ TEST(ReentrantSharedMutexTest, WriterWaitsForReaders)
     std::thread writer;
     {
         auto const reader = mutex.lockShared();
+        std::atomic<bool> writerAttempting{false};
         writer = std::thread(
             [&]
             {
+                writerAttempting.store(true);
                 auto const guard = mutex.lockExclusive();
                 writerIn.store(true);
             });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // As above: confirm the writer actually reached its acquisition point before asserting
+        // that it is still outside.
+        ASSERT_TRUE(waitFor([&] { return writerAttempting.load(); })) << "writer thread never ran";
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
         EXPECT_FALSE(writerIn.load()) << "writer entered while a reader held the lock";
     } // reader released here
     writer.join();

@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -171,10 +172,22 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
             }
         });
 
-    // Keep the writer going until the reader has demonstrably made progress alongside it, so the
-    // test cannot pass by finishing before the prober thread is scheduled.
+    // Do not start the writer until the prober is demonstrably running, so "probes progressed
+    // alongside exclusive work" cannot be satisfied by the writer finishing first. Bounded, so a
+    // prober that never starts fails the test instead of hanging.
+    auto const proberDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (probeCount.load(std::memory_order_relaxed) == 0 && std::chrono::steady_clock::now() < proberDeadline)
+    {
+        std::this_thread::yield();
+    }
+    ASSERT_GT(probeCount.load(), 0) << "prober never ran";
+
+    // Now require further progress while the writer holds the exclusive lock repeatedly.
+    long long const probesBeforeWriter = probeCount.load(std::memory_order_relaxed);
     constexpr long long kMinProbes = 1000;
-    for (int iteration = 0; iteration < 100000 && probeCount.load(std::memory_order_relaxed) < kMinProbes; ++iteration)
+    for (int iteration = 0;
+         iteration < 100000 && probeCount.load(std::memory_order_relaxed) - probesBeforeWriter < kMinProbes;
+         ++iteration)
     {
         // Exclusive-locked, and re-entrant into other locked methods.
         manager->getAndResetIterationStats();
@@ -184,7 +197,8 @@ TEST(KvCacheManagerV2ConcurrencyTest, ProbeReuseInterleavesWithExclusiveWork)
 
     stop.store(true, std::memory_order_relaxed);
     prober.join();
-    EXPECT_GE(probeCount.load(), kMinProbes) << "probes made no progress against concurrent exclusive work";
+    EXPECT_GE(probeCount.load() - probesBeforeWriter, kMinProbes)
+        << "probes made no progress against concurrent exclusive work";
 }
 
 } // namespace

@@ -23,7 +23,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -157,8 +156,9 @@ public:
     //! budget has to be divided. (Coalesced K+V gives poolsPerGroup == 1 in the common case, so
     //! this usually is a single call anyway.)
     //!
-    //! Not thread-safe: the copy-engine path reuses per-dispatcher descriptor scratch.
-    void launch(PoolCopyArgs const& args, CopyDirection direction, CUstream stream);
+    //! Const and thread-safe: everything the dispatcher needs is fixed at construction, and the
+    //! copy-engine path keeps its descriptor scratch in thread-local storage.
+    void launch(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const;
 
 private:
     void detect();
@@ -166,17 +166,11 @@ private:
     void launchKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const;
     //! Alignment-agnostic fallback, used when the pool layout is not a multiple of 16 bytes.
     void launchGenericKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const;
-    void launchCopyEngine(PoolCopyArgs const& args, CUstream stream);
+    void launchCopyEngine(PoolCopyArgs const& args, CUstream stream) const;
 
     Topology mTopology{};
     KernelConfig mOffload{};
     KernelConfig mOnboard{};
-
-    //! Descriptor scratch for the copy-engine path, reused across calls. Page identities change every
-    //! eviction, so these cannot be cached -- only the allocation is.
-    std::vector<CUdeviceptr> mCopyEngineDsts;
-    std::vector<CUdeviceptr> mCopyEngineSrcs;
-    std::vector<size_t> mCopyEngineSizes;
 };
 
 namespace detail
