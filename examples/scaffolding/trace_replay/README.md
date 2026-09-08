@@ -76,7 +76,7 @@ Key design choices:
 
 ### The trace schema
 
-The canonical schema lives in `tensorrt_llm/scaffolding/execution_trace.py`:
+The canonical schema lives in `tensorrt_llm/scaffolding/trace_replay/execution_trace.py`:
 
 - `TraceEvent`
 - `ExecutionTrace`
@@ -184,7 +184,7 @@ Flow for `run_trace_replay.py`:
 
 ### Queue-based branch routing
 
-Replay core is in `tensorrt_llm/scaffolding/replay.py`:
+Replay core is in `tensorrt_llm/scaffolding/trace_replay/replay.py`:
 
 - `ReplayEngine`
 - `QueueManager`
