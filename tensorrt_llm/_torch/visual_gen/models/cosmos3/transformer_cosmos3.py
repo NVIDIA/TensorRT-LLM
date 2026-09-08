@@ -14,15 +14,17 @@
 # limitations under the License.
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple, TypeVar
+from types import SimpleNamespace
+from typing import Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
@@ -57,6 +59,11 @@ def apply_pretrained_config_compat_defaults(
         if getattr(pretrained_config, key, None) is None:
             setattr(pretrained_config, key, value)
     return pretrained_config
+
+
+def _noop_offload_context(_tower_name: str) -> ContextManager:
+    """Default offload context: no staging, used when callers don't offload."""
+    return nullcontext()
 
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
@@ -124,9 +131,32 @@ NEMOTRON_DENSE_RECIPE = Cosmos3ArchRecipe(
 )
 
 
-def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
+def backbone_type_heuristic(pretrained_config: SimpleNamespace) -> str | None:
+    """Infer Nemotron-dense for the initial Policy-DROID export that omitted the field."""
+    if all(
+        (
+            getattr(pretrained_config, "hidden_act", None) == "relu2",
+            getattr(pretrained_config, "qk_norm_for_text", None) is False,
+            getattr(pretrained_config, "use_und_k_norm_for_gen", None) is True,
+            getattr(pretrained_config, "sound_gen", None) is False,
+            getattr(pretrained_config, "attention_bias", None) is False,
+            getattr(pretrained_config, "rms_norm_eps", None) == 1e-5,
+        )
+    ):
+        return COSMOS3_EDGE_BACKBONE_TYPE
+    return None
+
+
+def resolve_arch_recipe(pretrained_config: SimpleNamespace) -> Cosmos3ArchRecipe:
     """Select and validate the architecture recipe declared by the config."""
     backbone_type = getattr(pretrained_config, "backbone_type", None)
+    if backbone_type is None:
+        backbone_type = backbone_type_heuristic(pretrained_config)
+        if backbone_type is not None:
+            logger.warning(
+                f"Cosmos3 config omits backbone_type; inferred {backbone_type!r} "
+                "from the config signature."
+            )
     if backbone_type is None:
         recipe = QWEN3_RECIPE
         expected_flags = {
@@ -1454,6 +1484,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         video_shape: Optional[Tuple[int, int, int]] = None,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
         fps: float | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         audio_latents: Optional[torch.Tensor] = None,
@@ -1477,6 +1508,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
+            offload_context: Callable supplied by the pipeline that maps a tower
+                name ("reasoner" for the understanding pathway, "generator" for
+                the generation pathway) to a context manager staging that tower's
+                weights onto the GPU for the duration of its execution. The
+                pipeline returns a no-op context for towers that are not being
+                offloaded, so the transformer itself stays offload-agnostic.
             fps: video frame rate; when provided, temporal mRoPE positions are
                  scaled to reflect real time (FPS modulation).
             noisy_frame_mask: Optional [B, 1, T, 1, 1] mask where 1=noisy (add
@@ -1560,12 +1597,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 num_vision_items=len(control_lantent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
-            cached_kv_full = self.language_model(
-                text_ids,
-                text_mask,
-                freqs_und,
-                timestep=timestep,
-            )
+            with offload_context("reasoner"):
+                cached_kv_full = self.language_model(
+                    text_ids,
+                    text_mask,
+                    freqs_und,
+                    timestep=timestep,
+                )
             self.cached_freqs_gen = freqs_gen
 
             if self.sharder.is_active:
@@ -1708,27 +1746,28 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         freqs_gen = (cos, sin)
 
-        for i, layer in enumerate(self.gen_layers):
-            k_und, v_und = self.cached_kv[i]
-            if not self.sharder.is_active:
-                k_und = k_und[:, :max_real_len]
-                v_und = v_und[:, :max_real_len]
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    freqs_gen,
-                    timestep=timestep,
-                    real_text_lens=real_text_lens,
-                )
-            else:
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    freqs_gen,
-                    timestep=timestep,
-                )
+        with offload_context("generator"):
+            for i, layer in enumerate(self.gen_layers):
+                k_und, v_und = self.cached_kv[i]
+                if not self.sharder.is_active:
+                    k_und = k_und[:, :max_real_len]
+                    v_und = v_und[:, :max_real_len]
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=real_text_lens,
+                    )
+                else:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                    )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 

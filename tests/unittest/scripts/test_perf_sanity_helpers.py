@@ -21,9 +21,7 @@ import pytest
 
 pytest.importorskip("torch._inductor")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-sys.path.insert(0, str(REPO_ROOT / "tests" / "integration"))
-
+__extra_import_path__ = ["~/tests/integration"]
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
 
 

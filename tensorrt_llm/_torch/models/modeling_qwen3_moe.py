@@ -7,20 +7,20 @@ from transformers import Qwen3MoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 MoEImplClass, RenormalizeMoeRoutingMethod,
-                                 RenormalizeNaiveMoeRoutingMethod,
-                                 RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, resolve_moe_cls)
-from ..modules.fused_moe.interface import MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+                             MoEImplClass, RenormalizeMoeRoutingMethod,
+                             RenormalizeNaiveMoeRoutingMethod,
+                             RoutingMethodType, TRTLLMGenFusedMoE, create_moe,
+                             resolve_moe_cls)
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention

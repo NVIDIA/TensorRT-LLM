@@ -25,14 +25,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
-from .mapping import _resolve_mapping_layout
+from .mapping import PARALLEL_MODE_SYNTAX_HINT, _resolve_mapping_layout, is_named_parallel_mode
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
+    _default_parallel_axis_values,
     _maybe_auto_enable_search_axes,
     _parse_analysis,
     _parse_search_axes,
@@ -85,6 +86,17 @@ def _resolve_benchmark_context(args: argparse.Namespace) -> _BenchmarkContext:
 
 
 def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int) -> Dict[str, Any]:
+    # A parallel-mode sweep can mix attention-DP and attention-TP layouts, so
+    # there is no single header-level token distribution. Candidate rows carry
+    # the resolved distribution; leave the shared workload metadata unset.
+    per_rank_num_tokens: Optional[List[List[int]]] = None
+    if not ctx.search.parallel_modes:
+        enable_dp = bool(_resolve_mapping_layout(ctx.base_config, world_size)[2])
+        per_rank_num_tokens = [
+            _per_rank_tokens(workload, world_size, enable_dp=enable_dp)
+            for workload in ctx.workloads
+        ]
+
     return {
         "benchmark": "bench_moe",
         "launcher": launcher,
@@ -94,16 +106,29 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         "analysis": list(ctx.analysis) or ["summary"],
         "workloads": [
             w.to_dict(
-                per_rank_num_tokens=_per_rank_tokens(
-                    w,
-                    world_size,
-                    enable_dp=bool(_resolve_mapping_layout(ctx.base_config, world_size)[2]),
+                per_rank_num_tokens=(
+                    per_rank_num_tokens[index] if per_rank_num_tokens is not None else None
                 )
             )
-            for w in ctx.workloads
+            for index, w in enumerate(ctx.workloads)
         ],
         "base_config": ctx.base_config.to_dict(),
     }
+
+
+def _parallel_mode_arg(value: str) -> str:
+    """Argparse ``type`` for ``--parallel_mode``.
+
+    A fixed ``choices=`` tuple cannot express the hybrid ``(D|T)TP<k>EP<m>``
+    grammar, so validation happens here instead. The four legacy names and
+    ``CUSTOM`` are accepted exactly as before.
+    """
+    mode = str(value).upper()
+    if mode == "CUSTOM" or is_named_parallel_mode(mode):
+        return mode
+    raise argparse.ArgumentTypeError(
+        f"invalid parallel mode {value!r}; {PARALLEL_MODE_SYNTAX_HINT}"
+    )
 
 
 def _add_search_arguments(parser: argparse.ArgumentParser) -> None:
@@ -338,15 +363,17 @@ def parse_args() -> argparse.Namespace:
     parallel_group = parser.add_argument_group("Parallel layout")
     parallel_group.add_argument(
         "--parallel_mode",
-        type=str,
+        type=_parallel_mode_arg,
         nargs="+",
         default=("DEP",),
-        choices=("DEP", "TEP", "DTP", "TTP", "CUSTOM"),
+        metavar="MODE",
         help=(
             "Parallel layout(s) to benchmark. Pass multiple values to sweep, e.g. "
             "--parallel_mode DEP TEP. DEP=attention DP + MoE EP; TEP=attention TP + "
-            "MoE EP; DTP/TTP use MoE TP; CUSTOM requires --moe_ep_size and "
-            "--moe_tp_size and must be passed alone."
+            "MoE EP; DTP/TTP use MoE TP. Hybrid MoE TP x EP layouts have their own "
+            "sweepable names, (D|T)TP<k>EP<m> with moe_tp_size=k and moe_ep_size=m "
+            "(e.g. DTP2EP2, TTP2EP4); k*m must equal world_size. CUSTOM requires "
+            "--moe_ep_size and --moe_tp_size and must be passed alone."
         ),
     )
     parallel_group.add_argument(
@@ -645,8 +672,51 @@ def _resolve_base_config_from_args(args: argparse.Namespace) -> ConfigSpec:
 
     parallel_mode = parallel_list[0] if parallel_list else "DEP"
 
+    explicit_sizes = args.moe_ep_size is not None or args.moe_tp_size is not None
+
+    search_axes = _parse_search_axes(args.search)
+    parallel_search_enabled = "parallel" in search_axes or "full" in search_axes
+    if parallel_search_enabled:
+        provided = set(getattr(args, "_cli_provided", set()))
+        config_parallel_modes = tuple(
+            (getattr(args, "_config_search_axes", {}) or {}).get("parallel_mode", ())
+        )
+        if "parallel_mode" in provided:
+            effective_parallel_modes = parallel_list
+        elif config_parallel_modes:
+            effective_parallel_modes = config_parallel_modes
+        else:
+            effective_parallel_modes = _default_parallel_axis_values(
+                int(getattr(args, "world_size", 1) or 1)
+            )
+    else:
+        effective_parallel_modes = parallel_list
+
+    # A hybrid (D|T)TP<k>EP<m> name already spells the grid out; combining it with
+    # explicit size flags would silently discard one of the two intents. Explicit
+    # sizes also cannot describe more than one candidate in a parallel-mode sweep.
+    if explicit_sizes:
+        if len(effective_parallel_modes) != 1:
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size describe one CUSTOM layout and cannot be "
+                "combined with a parallel-mode sweep; drop the size flags or pass "
+                "--parallel_mode CUSTOM alone."
+            )
+        selected_mode = effective_parallel_modes[0]
+        if selected_mode not in ("DEP", "TEP", "DTP", "TTP", "CUSTOM"):
+            raise ValueError(
+                f"--parallel_mode={selected_mode} already specifies "
+                "moe_tp_size/moe_ep_size; drop --moe_ep_size/--moe_tp_size, or use "
+                "--parallel_mode CUSTOM with them."
+            )
+        if parallel_search_enabled and selected_mode != "CUSTOM":
+            raise ValueError(
+                "--moe_ep_size/--moe_tp_size require --parallel_mode CUSTOM when "
+                "parallel search is enabled; named layouts ignore explicit size flags."
+            )
+
     # parallel_mode CUSTOM if explicit EP/TP overrides are present.
-    if (args.moe_ep_size is not None or args.moe_tp_size is not None) and parallel_mode in (
+    if explicit_sizes and parallel_mode in (
         "DEP",
         "TEP",
         "DTP",
@@ -721,10 +791,14 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
     def normalize_search_axis(key: str, value: Any) -> Optional[Tuple[str, ...]]:
         """Project a config-file search-axis entry onto ``args`` (list form).
 
-        Returns the tuple of canonical values if it should be recorded as a
-        sweep axis in ``_config_search_axes`` (multi-value or backend=ALL).
-        Returns ``None`` when the value was instead written to the matching
-        ``args.<key>`` scalar-list flag.
+        Returns the tuple of canonical values to record as a sweep axis in
+        ``_config_search_axes``, or ``None`` when the entry carries no explicit
+        axis of its own. Living in the ``search`` block *is* the explicit
+        request, so a single-value entry is recorded too -- otherwise it would
+        fall through to the world-size default set and be silently replaced
+        (and, combined with explicit --moe_ep_size/--moe_tp_size, rejected as a
+        sweep). ``backend=ALL`` is the one entry that genuinely means "no
+        explicit set, expand to everything".
         """
         if key in provided:
             return None
@@ -738,9 +812,9 @@ def _maybe_load_config_file(args: argparse.Namespace) -> argparse.Namespace:
             set_if_unset("backend", ("ALL",))
             return None
         if len(values) == 1:
-            # Single-value config entry behaves like a CLI scalar default.
+            # Still seed the matching scalar flag (base-config resolution reads
+            # it), but record the axis as well.
             set_if_unset(key, values)
-            return None
         return values
 
     if search_cfg:

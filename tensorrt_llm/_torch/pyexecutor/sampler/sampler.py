@@ -17,20 +17,12 @@
 Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
 early-stop samplers (:class:`EarlyStopSampler` for non-generation models,
 :class:`EarlyStopWithMMResult` for the multimodal-encoder-only engine), and
-the two real implementations:
-
-* :class:`TorchSampler` -- the PyTorch path. It owns no sampling logic of its
-  own beyond batching and orchestration: each feature (beam search, penalties,
-  token bans, top-p decay, finish reasons, log-probs, two-model speculation,
-  seeds) lives in its own module and is held here as a handler, driven through
-  ``setup_sampler_step`` / ``sample_async`` / ``update_requests``.
-* :class:`TRTLLMSampler` -- the C++ decoder path.
-
-NOTE: ``TRTLLMSampler`` is deprecated and slated for removal (``_util.py``
-warns that it goes away in release 1.4). Dropping it -- together with
-:class:`Algorithms` and its ``SampleState*`` types -- leaves only the ABC, the
-state types and ``TorchSampler``, which do not need to share a file; this
-module is worth reorganizing at that point.
+:class:`TorchSampler` -- the PyTorch sampling path. ``TorchSampler`` owns no
+sampling logic of its own beyond batching and orchestration: each feature
+(beam search, penalties, token bans, top-p decay, finish reasons, log-probs,
+two-model speculation, seeds) lives in its own module and is held here as a
+handler, driven through ``setup_sampler_step`` / ``sample_async`` /
+``update_requests``.
 """
 
 import sys
@@ -55,55 +47,33 @@ from typing import (
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
-    MakeDecodingBatchInputOutput,
-)
-from tensorrt_llm._utils import mpi_disabled, nvtx_range, prefer_pinned, torch_dtype_to_binding
-from tensorrt_llm.bindings import (
-    CudaStream,
-    DataType,
-    ModelConfig,
-    SamplingConfigVector,
-    WorldConfig,
-    make_sampling_config,
-)
-from tensorrt_llm.bindings.executor import DecodingConfig, DecodingMode, FinishReason
-from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
-from tensorrt_llm.bindings.internal.batch_manager import (
-    DecoderInputBuffers,
-    add_new_tokens_to_requests,
-    make_decoding_batch_input,
-)
-from tensorrt_llm.bindings.internal.runtime import (
-    BufferManager,
-    CudaEvent,
-    DecoderState,
-    GptDecoderBatched,
-)
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ...utils import torch_multi_arange
-from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
 from .beam_search import BeamHistoryBuilder, BeamSearchHandler, finalize_beam, prepare_beam_search
 from .finish_reasons import FinishReasonsHandler
 from .logprobs import LogProbsHandler, LogProbsState, LogProbsStateList, LogProbsStore
+from .ops.flashinfer import sample_from_logits_op
 from .penalties import PenaltyHandler, has_occurrence_penalty
 from .sampler_common import (
     DEFAULT_BEAM_IDX,
     DEFAULT_STEP_IDX,
     FinishReasonsList,
+    SampleType,
     _BatchedSamplingResult,
     _get_beam_width_out,
     _request_get_sampling_params,
     add_token,
     int_tensor,
+    top_p_decay_active,
 )
 from .sampler_features import (
     AsyncWorkerMixin,
@@ -114,6 +84,7 @@ from .sampler_features import (
     apply_embedding_bias,
     check_stop_words_length,
     fast_greedy_sample_kernel,
+    scatter_new_tokens,
 )
 from .sampler_strategy import (
     GREEDY,
@@ -126,6 +97,7 @@ from .sampler_strategy import (
     RequestGroupValue,
     RequestGroupValueWithMetadata,
     RequestSeeds,
+    Strategy,
     StrategyMetadata,
     TopPDecayMetadata,
     _CachingRequestGrouper,
@@ -146,10 +118,6 @@ else:
     from typing_extensions import override
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig
-
-    from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-
     # Type-only: importing the speculative package at module level would
     # re-create the import cycle sampler.sampler -> speculative ->
     # (draft_target/mtp) -> pyexecutor.sampler that this package's lazy
@@ -157,9 +125,6 @@ if TYPE_CHECKING:
     # imported first; a process whose first touch is sampler.sampler (e.g. a
     # test module, with the top-level package now lazy) would break.
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
-
-    _ModelType = TypeVar("_ModelType", bound=DecoderModel)
-    _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
 
 T = TypeVar("T")
 
@@ -189,6 +154,30 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)  # type: ignore
 
 
+def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float]:
+    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p)``.
+
+    Disabled filters use the neutral values ``sample_from_logits_op`` expects:
+    top_k 0 means "keep all" (not vocab_size, which can overflow the int32
+    buffer) and top_p 1.0 keeps the whole nucleus.
+    """
+    match strategy:
+        case ("temperature", temperature):
+            return cast(float, temperature), 0, 1.0
+        case ("top_k", top_k, temperature):
+            return cast(float, temperature), cast(int, top_k), 1.0
+        case ("top_p", top_p, temperature):
+            return cast(float, temperature), 0, cast(float, top_p)
+        case ("top_k_top_p", top_k, top_p, temperature):
+            return cast(float, temperature), cast(int, top_k), cast(float, top_p)
+        case ("greedy", None):
+            # Only padding dummies reach this: they carry no sampling params of
+            # their own, and the graph samples their rows only to discard them.
+            # Neutral filters keep them out of the way of the live rows.
+            return 1.0, 0, 1.0
+    raise AssertionError(f"strategy {strategy[0]!r} is not a fast-tier strategy")
+
+
 class Sampler(ABC, Generic[GenericSampleState]):
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
@@ -205,6 +194,29 @@ class Sampler(ABC, Generic[GenericSampleState]):
         resource_manager: Optional[ResourceManager] = None,
     ) -> GenericSampleState:
         raise NotImplementedError
+
+    def sample_in_graph(
+        self,
+        model_outputs: dict[str, Any],
+        sample_type: SampleType,
+    ) -> None:
+        """Sample inside the model-forward CUDA graph.
+
+        Called while the forward graph is being captured/replayed, after the
+        model has written its logits, so that sampling for graph-capturable
+        tiers is recorded as the tail of that graph instead of costing a
+        separate launch.
+
+        Implementations must stay capture-safe: device work only, no host
+        synchronization, no allocation, and no dependence on tensor shapes that
+        vary across replays. Any host-side preparation (index computation,
+        strategy resolution) belongs outside the graph, staged into persistent
+        buffers that this method reads.
+
+        The base implementation is a no-op, which keeps samplers that do not
+        opt in unaffected: they leave the graph without sampling, and
+        ``sample_async`` performs the whole sampling step eagerly as before.
+        """
 
     @abstractmethod
     def update_requests(
@@ -458,6 +470,14 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    sample_type: SampleType = SampleType.FULL
+    """Tier this batch was sampled at.
+
+    Carried on the state rather than passed through ``sample_async`` /
+    ``update_requests`` so the base-class signatures -- and therefore every
+    other Sampler implementation -- stay untouched. ``TorchSampler`` decides it
+    from the batch and is the only reader.
+    """
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
@@ -482,7 +502,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens: torch.Tensor
         """Device tensor containing latest sampled tokens.
 
-        Shape: See cpp DecoderState.getAllNewTokens().
+        Shape: ``NEW_TOKENS_SHAPE`` -- (max_tokens, max_num_sequences, max_beam_width).
         """
         beam_search_store: "BeamSearchStore | None" = None
         """Holds data related to beam search."""
@@ -556,7 +576,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # to decide whether the newest token must be read device-side.
         self._track_pending_steps = not args.disable_overlap_scheduler
         self._pending_steps = [0] * self.max_num_sequences
-        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences, self.max_beam_width)
+        # One row past the real sequence slots. CUDA graph padding rows own no
+        # slot, but the captured graph scatters a token for every row it
+        # replays, so they need a destination that belongs to nobody: every
+        # index in range(max_num_sequences) is owned by some request, and the
+        # overlap scheduler reads a slot's row back as that request's next input
+        # token. Mirrors the spec path's dummy_slot_row.
+        self.dummy_slot_row = self.max_num_sequences
+        self.NEW_TOKENS_SHAPE = (
+            self.max_tokens,
+            self.max_num_sequences + 1,
+            self.max_beam_width,
+        )
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
             self.max_beam_width,
@@ -589,6 +620,29 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else SynchronousTokenBanHandler()
         )
 
+        # State the in-graph step reads, staged by the host before the forward.
+        # Every buffer below is allocated once, sized for the widest batch, and
+        # updated in place: a captured graph bakes in the ADDRESSES it reads and
+        # scatters through, so a fresh tensor each step would leave it pointing
+        # at freed memory. _in_graph_staged is False when no in-graph step is
+        # prepared, which keeps sample_in_graph a no-op.
+        self._in_graph_dest_indices: torch.Tensor | None = None
+        self._in_graph_staged: bool = False
+        self._in_graph_rows: int = 0
+        # Tier resolved for the batch being staged, read back by the in-graph
+        # callback (which the engine invokes without the batch).
+        self._current_sample_type: SampleType = SampleType.FULL
+        self._in_graph_request_ids: list[int] = []
+        self._in_graph_live_rows: int = 0
+        # Per-row sampling params for the fast tier.
+        self._fast_temperatures: torch.Tensor | None = None
+        self._fast_top_ks: torch.Tensor | None = None
+        self._fast_top_ps: torch.Tensor | None = None
+        self._fast_seeds: torch.Tensor | None = None
+        self._fast_offsets: torch.Tensor | None = None
+        # Number of leading rows of the fast-tier buffers the staged batch fills.
+        self._fast_num_rows: int = 0
+
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
@@ -605,10 +659,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 max_tokens=self.max_tokens,
                 max_seq_len=self.max_seq_len,
             )
+            # Both are indexed by sequence slot, so they must agree on every
+            # dimension except that new_tokens carries one extra slot row as
+            # scratch for CUDA graph padding (see dummy_slot_row). Nothing
+            # indexes either buffer by that row.
+            new_tokens_shape = self.store.new_tokens.shape
+            finish_reasons_shape = self._finish_reasons_handler.store.finish_reasons_cuda.shape
             assert (
-                self.store.new_tokens.shape
-                == self._finish_reasons_handler.store.finish_reasons_cuda.shape
-            )
+                new_tokens_shape[0] == finish_reasons_shape[0]
+                and new_tokens_shape[1] == finish_reasons_shape[1] + 1
+                and new_tokens_shape[2] == finish_reasons_shape[2]
+            ), f"{new_tokens_shape} is not {finish_reasons_shape} plus a scratch slot row"
+
             self._penalty_handler = PenaltyHandler(
                 max_num_sequences=self.max_num_sequences,
                 max_beam_width=self.max_beam_width,
@@ -716,6 +778,410 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
+
+    # Strategy tags the fast tier can sample, i.e. those expressible as
+    # per-row (temperature, top_k, top_p) for sample_from_logits_op. "greedy"
+    # is absent on purpose: greedy batches stay on the eager path. Capturing
+    # argmax saves about as much launch overhead as staging for it costs (on
+    # Qwen2-0.5B the two cancelled out), the eager stable-greedy path already
+    # handles them, and expressing greedy rows as top_k=1 would drag them onto
+    # the seeded sampling path for no gain.
+    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = frozenset(
+        {"temperature", "top_k", "top_p", "top_k_top_p"}
+    )
+
+    @staticmethod
+    def _request_rewrites_logits(request: LlmRequest) -> bool:
+        """Whether a feature rewrites the logits before sampling.
+
+        These have to run before the token is picked, and none of them run
+        in-graph, so a request using one cannot be sampled there at all.
+        """
+        return (
+            request._py_embedding_bias_1d is not None
+            or bool(getattr(request, "py_bad_words", None))
+            or bool(getattr(request, "py_no_repeat_ngram_size", None))
+            or has_occurrence_penalty(request)
+            # min_length is enforced prospectively, by banning end_id out of the
+            # logits until the request is long enough (see
+            # TokenBanHandler._add_min_length_bans), not by a finish-reason
+            # check. Sampling in-graph would skip that ban and let EOS through.
+            or bool(request.py_min_length)
+        )
+
+    @staticmethod
+    def _request_needs_finish_reason_kernel(request: LlmRequest) -> bool:
+        """Whether stopping needs the finish-reason kernel rather than host checks.
+
+        Min length compares against a running count the host path does not
+        track, and a multi-token stop word needs history matching. Everything
+        else reduces to the per-token checks
+        ``_update_requests_single_beam_single_step`` performs.
+        """
+        return bool(request.py_min_length) or check_stop_words_length(request)
+
+    def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
+        """Whether every request is plain temperature / top_k / top_p sampling.
+
+        Rejects anything the fast-tier kernel cannot express per row: beam search
+        and min_p (different strategy tags), top-p decay (its top_p is per-step
+        state, not a fixed per-row value), and the feature handlers that rewrite
+        logits or need extra outputs -- penalties, token bans, embedding bias,
+        logprobs and speculation, none of which the fast path runs.
+        """
+        if self._use_beam_search:
+            return False
+        for req in requests:
+            # vocab_size only decides top_k/top_p redundancy, not the tag set
+            # the tier check below keys on.
+            strategy = _request_strategy(req, vocab_size=2**31)
+            if strategy[0] not in self._FAST_STRATEGY_TAGS:
+                return False
+            if top_p_decay_active(_request_get_sampling_params(req)):
+                return False
+            # The fast tier emits tokens only and samples the raw logits, so
+            # anything that rewrites them first is excluded. Stop words are
+            # allowed: they only decide when a request finishes, which still
+            # runs after the forward.
+            if req.py_return_log_probs or self._request_rewrites_logits(req):
+                return False
+        return True
+
+    @staticmethod
+    def _request_bypasses_in_graph_sampling(request: LlmRequest) -> bool:
+        """Whether sampling this request in-graph would skip work it depends on.
+
+        The hook runs at the tail of the forward, before anything the executor
+        does to the logits afterwards: the guided-decoding bitmask applied by
+        ``guided_decoder.execute()``, and the user's own logits processors run
+        by ``_execute_logit_post_processors``. Both happen once
+        ``_forward_step`` has returned, so sampling in-graph would read unmasked
+        logits and emit a token they were meant to forbid, while their output is
+        discarded. Any future post-forward logits mutator belongs here too.
+
+        Draft requests are excluded as well: the draft engine registers neither
+        hook yet shares this sampler, so a draft batch must not be served from
+        state staged for its target.
+        """
+        return (
+            request.guided_decoding_params is not None
+            or bool(getattr(request, "py_logits_post_processors", None))
+            or bool(getattr(request, "py_is_draft", False))
+        )
+
+    def get_sample_type(self, requests: list[LlmRequest]) -> SampleType:
+        """Pick the simplest tier that satisfies every request in the batch.
+
+        A batch runs at the capability of its most demanding request, so a tier
+        is chosen only when *every* request in the batch fits it.
+        """
+        if any(self._request_bypasses_in_graph_sampling(request) for request in requests):
+            return SampleType.FULL
+        if self._can_use_fast_path(requests):
+            return SampleType.FAST
+        return SampleType.FULL
+
+    @property
+    def current_sample_type(self) -> SampleType:
+        """Tier staged for the current batch; FULL when nothing was staged."""
+        return self._current_sample_type
+
+    def invalidate_in_graph_sampling(self) -> None:
+        """Drop any staged in-graph sampling state."""
+        self._consume_in_graph_staging()
+        self._current_sample_type = SampleType.FULL
+
+    def _consume_in_graph_staging(self) -> None:
+        """Drop the staged buffers, keeping the tier this step ran at.
+
+        Used once the staged tokens have been read: the buffers must not be
+        matched against another batch, but ``current_sample_type`` still
+        describes the step in progress and is recorded on its SampleState.
+        """
+        self._in_graph_staged = False
+        self._in_graph_request_ids = []
+        self._in_graph_live_rows = 0
+
+    def resolve_in_graph_sample_type(
+        self,
+        scheduled_requests: ScheduledRequests,
+        pinned_sample_type: SampleType | None = None,
+    ) -> SampleType:
+        """Pick the tier for this batch, without staging anything.
+
+        Runs while the CUDA graph key is being built, so the tier can become
+        part of that key. Staging is deliberately left to
+        ``stage_in_graph_sampling``, which runs once the engine has committed to
+        a batch -- see its docstring.
+
+        Restricted to the plain generation-only step the graphs are captured
+        for: one token per request, beam width 1, no context requests, no
+        drafts.
+        """
+        if scheduled_requests.num_context_requests != 0 or self.max_beam_width != 1:
+            return SampleType.FULL
+        requests = scheduled_requests.generation_requests
+        if not requests:
+            return SampleType.FULL
+        if any(get_draft_token_length(request) != 0 for request in requests):
+            return SampleType.FULL
+
+        live_requests = [request for request in requests if not request.is_dummy]
+        if not live_requests:
+            # An all-dummy batch is a capture pass: the pinned tier decides,
+            # since the warmup requests carry no sampling params of their own.
+            return pinned_sample_type or SampleType.FULL
+        if any(request.is_dummy for request in requests[: len(live_requests)]):
+            # Dummies are expected to be a trailing run; the live rows are taken
+            # to be the leading prefix when the results are read back.
+            return SampleType.FULL
+        return pinned_sample_type or self.get_sample_type(live_requests)
+
+    def stage_in_graph_sampling(
+        self,
+        scheduled_requests: ScheduledRequests,
+        sample_type: SampleType,
+    ) -> None:
+        """Stage the buffers ``sample_in_graph`` reads for this batch.
+
+        Called after the engine has settled which batch the forward runs on, so
+        the staged width matches the width the graph replays at. Staging while
+        the key is built would instead capture the padded batch even on steps
+        that then fall back to eager on the unpadded one, leaving the scatter
+        indices wider than the logits.
+
+        FULL is a no-op: it covers both "this batch needs the eager sampler" and
+        "the engine dropped the graph for this step".
+        """
+        self.invalidate_in_graph_sampling()
+        if sample_type is SampleType.FULL:
+            return
+
+        requests = scheduled_requests.generation_requests
+        if not requests:
+            return
+        live_requests = [request for request in requests if not request.is_dummy]
+
+        # The graph samples and scatters every padded row on every replay, so
+        # stage the whole padded batch to keep the staged width equal to the
+        # width the graph runs at. Padding rows own no sequence slot, so they go
+        # to the scratch row, which no request reads back.
+        seq_slots = [
+            cast(int, request.py_seq_slot)
+            if request.py_seq_slot is not None
+            else self.dummy_slot_row
+            for request in requests
+        ]
+
+        # Write through the persistent buffer: a captured graph scatters through
+        # a fixed address, so this is sized once for the widest batch and only
+        # its leading rows are used.
+        num_rows = len(seq_slots)
+        device = self.store.new_tokens.device
+        if self._in_graph_dest_indices is None or self._in_graph_dest_indices.numel() < num_rows:
+            self._in_graph_dest_indices = torch.zeros(
+                max(num_rows, self.max_num_sequences), dtype=torch.int64, device=device
+            )
+        seq_slots_host = torch.tensor(seq_slots, dtype=torch.int64, pin_memory=prefer_pinned())
+        self._in_graph_dest_indices[:num_rows].copy_(seq_slots_host, non_blocking=True)
+
+        if sample_type is SampleType.FAST:
+            # Padding dummies carry no sampling params of their own and resolve
+            # to greedy, which the fast-tier kernels cannot express. Their rows
+            # are sampled but discarded, so stage neutral filters for them.
+            self.stage_fast_sampling_params(
+                requests,
+                slots_per_row=seq_slots,
+                rows_per_request=[1] * len(requests),
+                live_rows=len(live_requests),
+            )
+
+        self._in_graph_live_rows = len(live_requests)
+        self._in_graph_rows = num_rows
+        self._in_graph_request_ids = [request.py_request_id for request in live_requests]
+        self._in_graph_staged = True
+        self._current_sample_type = sample_type
+
+    def _ensure_fast_buffers(self, num_rows: int) -> None:
+        """Allocate the fast-tier per-row param buffers, once, for the widest batch.
+
+        Never reallocated for a batch that already fits, since a captured graph
+        holds these addresses. Initial values are neutral (temperature 1,
+        top_k 0 = keep all, top_p 1), so rows past the staged batch filter
+        nothing even if a replay reads them.
+        """
+        if self._fast_temperatures is not None and (self._fast_temperatures.numel() >= num_rows):
+            return
+        capacity = max(num_rows, self.max_num_sequences * self.max_tokens)
+        device = self.store.new_tokens.device
+        self._fast_temperatures = torch.ones(capacity, dtype=torch.float32, device=device)
+        self._fast_top_ks = torch.zeros(capacity, dtype=torch.int32, device=device)
+        self._fast_top_ps = torch.ones(capacity, dtype=torch.float32, device=device)
+        self._fast_seeds = torch.zeros(capacity, dtype=torch.int64, device=device)
+        self._fast_offsets = torch.zeros(capacity, dtype=torch.int64, device=device)
+
+    def stage_fast_sampling_params(
+        self,
+        requests: list[LlmRequest],
+        slots_per_row: list[int],
+        rows_per_request: list[int],
+        live_rows: int,
+    ) -> None:
+        """Stage this batch's per-row sampling params for the in-graph fast-tier step.
+
+        Runs on the host *before* the forward graph, because resolving each
+        request's strategy and expanding it per logits row is host work that
+        cannot happen during capture. ``slots_per_row`` gives the sequence slot
+        of each logits row and ``rows_per_request`` how many rows each request
+        owns, matching the expansion the spec-decoding path performs for its own
+        per-token param buffers.
+        """
+        num_rows = len(slots_per_row)
+        self._ensure_fast_buffers(num_rows)
+        temperatures_buf = self._fast_temperatures
+        top_ks_buf = self._fast_top_ks
+        top_ps_buf = self._fast_top_ps
+        seeds_buf = self._fast_seeds
+        offsets_buf = self._fast_offsets
+        assert (
+            temperatures_buf is not None
+            and top_ks_buf is not None
+            and top_ps_buf is not None
+            and seeds_buf is not None
+            and offsets_buf is not None
+        ), "_ensure_fast_buffers must have allocated every fast-tier buffer"
+
+        # The real vocab size is only known from the logits at sample time, so
+        # resolve with the same 2**31 probe the greedy check uses: it only makes
+        # resolve_sampling_strategy keep a top_k it would otherwise drop as
+        # redundant, and sample_from_logits_op sanitizes top_k against the
+        # actual vocab size anyway.
+        vocab_size = 2**31
+        temperatures: list[float] = []
+        top_ks: list[int] = []
+        top_ps: list[float] = []
+        for request, num_request_rows in zip(requests, rows_per_request, strict=True):
+            strategy = _request_strategy(request, vocab_size=vocab_size)
+            temperature, top_k, top_p = _fast_strategy_params(strategy)
+            temperatures.extend([temperature] * num_request_rows)
+            top_ks.extend([top_k] * num_request_rows)
+            top_ps.extend([top_p] * num_request_rows)
+
+        pin = prefer_pinned()
+        temperatures_buf[:num_rows].copy_(
+            torch.tensor(temperatures, dtype=torch.float32, pin_memory=pin), non_blocking=True
+        )
+        top_ks_buf[:num_rows].copy_(
+            torch.tensor(top_ks, dtype=torch.int32, pin_memory=pin), non_blocking=True
+        )
+        top_ps_buf[:num_rows].copy_(
+            torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
+        )
+
+        # Philox (seed, offset) per row, from the sampler's own seed manager so
+        # a request's stream stays tied to how far it has decoded.
+        self._seed_manager.observe(requests)
+        # _SeedManager is indexed by sequence slot and has no entry for the
+        # scratch row, so ask it only about the live rows. The padded rows keep
+        # whatever the buffers already hold; their tokens are discarded.
+        live_slots_per_row = slots_per_row[:live_rows]
+        row_seeds = self._seed_manager.make_row_seeds(live_slots_per_row, device=seeds_buf.device)
+        seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
+        offsets_buf[:live_rows].copy_(row_seeds.offset, non_blocking=True)
+        # Only the live rows consume RNG stream. Padding rows borrow a slot that
+        # may belong to an active request this batch simply did not schedule;
+        # advancing it would move that request's Philox offset by an amount that
+        # depends on concurrent load, breaking the guarantee _SeedManager exists
+        # for -- that a seeded request's stream depends only on its own draws.
+        # The padded rows still read the borrowed slot's current offset, since
+        # their tokens are discarded.
+        self._seed_manager.advance(live_slots_per_row)
+
+        self._fast_num_rows = num_rows
+
+    @override
+    def sample_in_graph(
+        self,
+        model_outputs: dict[str, Any],
+        sample_type: SampleType,
+    ) -> None:
+        """Sample the fast tier as the tail of the forward graph.
+
+        ``FULL`` is eager by definition and a no-op here; those batches are
+        sampled by ``sample_async`` after the forward instead.
+
+        The destination indices are not computed here -- they depend on batch
+        composition, which is host state unreadable during capture -- but staged
+        into ``_in_graph_dest_indices`` before the graph is launched.
+        """
+        if sample_type is SampleType.FULL:
+            return
+
+        dest_indices = self._in_graph_dest_indices
+        if not self._in_graph_staged or dest_indices is None:
+            # Nothing staged: leave sampling to sample_async rather than
+            # sampling against stale buffers.
+            return
+
+        logits_cuda = model_outputs["logits"]
+        d2t = model_outputs.get("d2t", None)
+
+        # Staging runs after the batch is settled, so the staged width has to
+        # equal the rows the forward produced. A mismatch means an unexpected
+        # path reached here; skipping silently would be the worst outcome,
+        # because the staged state stays valid and every later replay of this
+        # key would report new_tokens rows nothing ever wrote. Drop the staged
+        # state first so the eager path takes over even when assertions are
+        # compiled out, then fail loudly.
+        if logits_cuda.shape[0] != self._in_graph_rows:
+            staged_rows = self._in_graph_rows
+            self.invalidate_in_graph_sampling()
+            raise AssertionError(
+                f"in-graph sampling staged {staged_rows} rows but the forward "
+                f"produced {logits_cuda.shape[0]}"
+            )
+        dest_indices = dest_indices[: self._in_graph_rows]
+
+        self._fast_sample_in_graph(logits_cuda, dest_indices, d2t)
+
+    def _fast_sample_in_graph(
+        self,
+        logits_cuda: torch.Tensor,
+        dest_indices: torch.Tensor,
+        d2t: torch.Tensor | None,
+    ) -> None:
+        """Sample the fast tier from the staged per-row params.
+
+        Uses the same op as the one-model speculation path, built for exactly
+        this: per-row temperature / top_k / top_p with explicit Philox
+        (seed, offset) and no host synchronization, so it is capture-safe.
+        """
+        temperatures_buf = self._fast_temperatures
+        top_ks_buf = self._fast_top_ks
+        top_ps_buf = self._fast_top_ps
+        seeds_buf = self._fast_seeds
+        offsets_buf = self._fast_offsets
+        assert (
+            temperatures_buf is not None
+            and top_ks_buf is not None
+            and top_ps_buf is not None
+            and seeds_buf is not None
+            and offsets_buf is not None
+        ), "fast-tier sampling params were not staged; call stage_fast_sampling_params"
+        # Rows staged for this batch, padding included; the buffers are wider.
+        num_rows = dest_indices.shape[0]
+        logits_cuda = logits_cuda[:num_rows]
+        next_tokens = sample_from_logits_op(
+            logits_cuda,
+            temperatures_buf[:num_rows],
+            top_ks_buf[:num_rows],
+            top_ps_buf[:num_rows],
+            seed=seeds_buf[:num_rows],
+            offset=offsets_buf[:num_rows],
+        )
+        if d2t is not None:
+            next_tokens = next_tokens + d2t[next_tokens]
+        scatter_new_tokens(next_tokens, self.store.new_tokens, dest_indices, self.max_beam_width)
 
     def _can_use_fast_greedy_path(self, requests: list[LlmRequest]) -> bool:
         """
@@ -1259,9 +1725,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # this qualified path; completion is derived from compact host tokens.
         assert state.host.finish_reasons is None
         for request, new_token in zip(requests, new_tokens):
-            # The stable greedy path excludes stop words. Keep EOS ahead of the
-            # length check so a terminal EOS at the token limit is reported as
-            # END_ID, matching _handle_stop_criteria.
+            # Only single-token stop words reach this path (multi-token ones
+            # need history matching, so they take the finish-reason kernel).
+            # Order matches handle_stop_criteria: END_ID, then LENGTH, then
+            # STOP_WORDS, so a terminal EOS at the token limit is reported as
+            # END_ID.
             if new_token == request.py_end_id:
                 request.finish_by(FinishReason.END_ID, DEFAULT_BEAM_IDX)
             elif (
@@ -1270,6 +1738,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 or request.max_beam_num_tokens >= self.max_seq_len
             ):
                 request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
+            elif request.py_stop_words_list and new_token in request.py_stop_words_list[0]:
+                request.finish_by(FinishReason.STOP_WORDS, DEFAULT_BEAM_IDX)
             request.py_num_accepted_draft_tokens = 0
             request.py_rewind_len = 0
             request.py_decoding_iter += 1
@@ -1404,6 +1874,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            sample_type=self._current_sample_type,
         )
 
     @nvtx_range("sample_batched_by_strategy")
@@ -1945,8 +2416,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # another request's rows. logits.view() succeeds for any shape whose
         # element count divides, so that is silent corruption rather than an
         # error. Match the layout here and slice down to the per-iteration
-        # width where the beams are actually consumed. TRTLLMSampler already
-        # offsets by the static width for the same reason.
+        # width where the beams are actually consumed.
         # NB: context requests do not have multiple beams yet, hence the 1s.
         req_num_beams_list = [1] * len(finished_context_requests) + [
             req.py_beam_width for req in scheduled_requests.generation_requests
@@ -2067,18 +2537,111 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             and (
                 has_stable_greedy_batch
                 or all(
-                    request._py_embedding_bias_1d is None
+                    request.py_embedding_bias is None
                     and not getattr(request, "py_bad_words", None)
                     and not getattr(request, "py_no_repeat_ngram_size", None)
                     and not has_occurrence_penalty(request)
                     and not request.py_min_length
                     and not request.py_return_log_probs
-                    and not request.py_stop_words_list
+                    # Single-token stop words are checked on the host by
+                    # _update_requests_single_beam_single_step, like py_end_id;
+                    # only multi-token ones need the finish-reason kernel.
+                    and not check_stop_words_length(request)
                     and _request_strategy(request, vocab_size=2**31) == GREEDY
                     for request in generation_requests
                 )
             )
         )
+        # Sampled inside the forward graph: the tokens are already in
+        # new_tokens_cuda and only the D2H copy update_requests reads is left.
+        # Re-sampling would waste a launch and, for the fast tier, draw different
+        # tokens (this step's Philox offsets were already consumed).
+        #
+        # Staging happened before the forward, so verify the staged buffers
+        # really describe this batch: a forward that was skipped, repeated or
+        # replaced (context-only steps, draft batches, eager fallbacks) would
+        # otherwise be sampled against another batch's destinations.
+        if self._current_sample_type is not SampleType.FULL:
+            live_requests = [request for request in generation_requests if not request.is_dummy]
+            staged_matches_batch = (
+                self._in_graph_staged
+                and self._in_graph_dest_indices is not None
+                # A draft request reuses its target's py_request_id, so the id
+                # list alone cannot tell a drafter batch from the target batch
+                # that staged it.
+                and not any(request.py_is_draft for request in live_requests)
+                and [request.py_request_id for request in live_requests]
+                == self._in_graph_request_ids
+            )
+            if staged_matches_batch:
+                # The staged destinations span the padded batch the graph runs
+                # at; only the leading live rows are reported back, the padded
+                # ones scattered into the scratch row and are dropped here.
+                assert self._in_graph_dest_indices is not None
+                seq_slots_cuda = self._in_graph_dest_indices[: self._in_graph_live_rows]
+                seq_slots_host = torch.tensor(
+                    [cast(int, request.py_seq_slot) for request in live_requests],
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned(),
+                )
+                # Stopping still has to be decided after the forward. It reduces
+                # to the per-token EOS and length checks
+                # _update_requests_single_beam_single_step runs on the host only
+                # when no request needs the finish-reason kernel; otherwise the
+                # caller must take the regular path and compute finish reasons,
+                # or a stop word would never be detected.
+                single_step_greedy = not any(
+                    self._request_needs_finish_reason_kernel(request) for request in live_requests
+                )
+                if not single_step_greedy:
+                    # write_finish_reasons shifts stop-word history by the
+                    # accepted-draft count, which update_requests only refreshes
+                    # after this step. Nothing was speculated here -- the tier
+                    # requires zero draft tokens -- so a count left over from an
+                    # earlier speculative step would shift the comparison and
+                    # could miss the stop word.
+                    accepted = self._finish_reasons_handler.store.num_accepted_draft_tokens_host
+                    for request in live_requests:
+                        if request.py_stop_words_list:
+                            accepted[request.py_seq_slot] = 0
+                seq_lens_host: torch.Tensor | None = None
+                seq_lens_cuda: torch.Tensor | None = None
+                if not single_step_greedy:
+                    # write_finish_reasons needs the per-request lengths the
+                    # regular path would have built for it.
+                    seq_lens_host = torch.tensor(
+                        [request.max_beam_num_tokens for request in live_requests],
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned(),
+                    )
+                    seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
+                # The two consumers want different layouts:
+                # _update_requests_single_beam_single_step zips a flat
+                # per-request tensor against the requests, while the regular
+                # path indexes the whole (steps, slots, beams) store by slot.
+                new_tokens_host = self._copy_to_host(
+                    new_tokens_cuda[DEFAULT_STEP_IDX, seq_slots_cuda, DEFAULT_BEAM_IDX]
+                    if single_step_greedy
+                    else new_tokens_cuda
+                )
+                # Consumption is one-shot. The id list is not a unique key for a
+                # batch -- a draft request reuses its target's py_request_id and
+                # the drafter shares this sampler -- so leaving the state staged
+                # would let a later drafter step with the same ids be served
+                # these tokens as draft tokens. The next forward restages.
+                self._consume_in_graph_staging()
+                return (
+                    live_requests,
+                    seq_slots_host,
+                    seq_lens_host,
+                    seq_slots_cuda,
+                    seq_lens_cuda,
+                    new_tokens_host,
+                    single_step_greedy,
+                )
+            # Staged for a different batch: fall through and sample eagerly.
+            self.invalidate_in_graph_sampling()
+
         if can_use_stable_greedy_path:
             if has_stable_greedy_batch:
                 assert self._stable_greedy_seq_slots_host is not None
@@ -2290,7 +2853,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._log_probs._process_logprobs(
                 batched_sampling_result,
                 logits_cuda=logits_cuda,
-                new_tokens_cuda=new_tokens_cuda,
+                # Drop the trailing scratch slot row (see dummy_slot_row): it
+                # belongs to no request, and the logprobs stores are sized by
+                # max_num_sequences, which also sets the flat gather stride
+                # there. contiguous() because slicing the slot dimension leaves
+                # a strided view and _process_logprobs calls view() on it.
+                new_tokens_cuda=new_tokens_cuda[:, : self.max_num_sequences].contiguous(),
                 seq_slots=seq_slots_host,
                 requests=sampling_requests,
                 req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens_output,
@@ -2323,569 +2891,3 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             use_beam_search=self._use_beam_search,
             min_p=min_p,
         )
-
-
-class Algorithms:
-    def defined_algorithms(self) -> list[str]:
-        return [attr for attr in dir(self) if not attr.startswith("__")]
-
-    def __repr__(self) -> str:
-        algs = self.defined_algorithms()
-        return f"Algs({', '.join(algs)})"
-
-
-@dataclass(kw_only=True)
-class SampleStateTensorsHostTRTLLM(SampleStateTensors):
-    finished_sum: torch.Tensor
-    finish_reasons: torch.Tensor
-    sequence_lengths: torch.Tensor
-    cum_log_probs: torch.Tensor | None = None
-    gathered_ids: torch.Tensor | None = None
-
-
-@dataclass(kw_only=True)
-class SampleStateTRTLLM(SampleState[SampleStateTensorsHostTRTLLM, SampleStateTensors]):
-    finalize_events: dict[int, CudaEvent] | None = None
-    """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
-
-
-class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
-    MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
-    SampleState = SampleStateTRTLLM
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
-
-    def __init__(
-        self,
-        model: "DecoderModelForCausalLM[_ModelType, _ConfigType]",
-        model_dtype: torch.dtype,
-        mapping: Mapping,
-        decoding_mode: DecodingMode,
-        disable_overlap_scheduler: bool,
-        max_seq_len: int,
-        max_batch_size: int,
-        max_beam_width: int,
-        decoding_config: Optional[DecodingConfig] = None,
-        kv_cache_config: Optional[KvCacheConfig] = None,
-        enable_async_worker: bool = False,
-        max_num_sequences: Optional[int] = None,
-    ):
-        assert model.config is not None
-        vocab_size = model.config.vocab_size
-        num_hidden_layers = model.config.num_hidden_layers
-        hidden_size = model.config.hidden_size
-        num_heads = model.config.num_attention_heads
-
-        self.model_datatype = torch_dtype_to_binding(model_dtype)
-        self.logits_datatype = DataType.FLOAT
-        self.decoding_mode = decoding_mode
-        self.decoding_config = decoding_config if decoding_config else DecodingConfig(decoding_mode)
-        max_attn_window = kv_cache_config.max_attention_window  # type: ignore
-        self.max_seq_len = max_seq_len
-        self.max_attention_window = (
-            max(max_attn_window) if max_attn_window is not None else max_seq_len
-        )
-        self.max_batch_size = max_batch_size
-        self.max_beam_width = max_beam_width
-        self.max_seq_idle_microseconds = 180 * 1000 * 1000
-        self.is_trt_overlap = not disable_overlap_scheduler
-        self.num_micro_batches = (
-            mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
-        )
-        # Decoder state is indexed by sequence slot and must match the
-        # executor's SeqSlotManager. The fallback preserves the established
-        # sizing for direct callers outside the PyExecutor creator.
-        self.max_num_sequences = (
-            max_num_sequences if max_num_sequences is not None else mapping.pp_size * max_batch_size
-        )
-        self.micro_batch_idx = 0
-
-        if mpi_disabled():
-            self.world_config = WorldConfig(
-                mapping.tp_size,
-                mapping.pp_size,
-                mapping.cp_size,
-                rank=mapping.rank,
-                gpus_per_node=mapping.gpus_per_node,
-            )
-        else:
-            self.world_config = WorldConfig.mpi(
-                mapping.gpus_per_node, mapping.tp_size, mapping.pp_size
-            )
-        self.model_config = ModelConfig(
-            vocab_size,
-            num_hidden_layers,
-            num_hidden_layers,
-            0,
-            num_heads,
-            hidden_size,
-            self.model_datatype,
-        )
-
-        self._initialize_store()
-        self._instantiate_algorithms()
-
-        self._async_worker_init(enable_async_worker)
-
-    def _initialize_store(self) -> None:
-        torch_stream = torch.cuda.current_stream().cuda_stream
-        cuda_stream = CudaStream(torch_stream)
-        buffer_manager = BufferManager(stream=torch_stream)
-
-        self.store = {
-            "torch_stream": torch_stream,
-            "cuda_stream": cuda_stream,
-            "buffer_manager": buffer_manager,
-            "decoder_input_buffers": [
-                DecoderInputBuffers(self.max_batch_size, self.MAX_DECODING_TOKENS, buffer_manager)
-                for _ in range(self.num_micro_batches)
-            ],
-            "sequence_lengths_host": torch.empty(
-                (
-                    self.max_num_sequences,
-                    self.max_beam_width,
-                ),
-                dtype=torch.int,
-            ),
-            "decoder_state": DecoderState(),
-        }
-
-        cast(DecoderState, self.store["decoder_state"]).setup(
-            max_num_sequences=self.max_num_sequences,
-            max_beam_width=self.max_beam_width,
-            max_attention_window=self.max_attention_window,
-            sink_token_length=0,
-            max_sequence_length=self.max_seq_len,
-            dtype=self.logits_datatype,
-            model_config=self.model_config,
-            world_config=self.world_config,
-            buffer_manager=buffer_manager,
-        )
-
-    def _instantiate_algorithms(self) -> None:
-        self.algs = Algorithms()
-        self.algs.decoder = GptDecoderBatched(stream=self.store["torch_stream"])  # type: ignore
-        self.algs.decoder.setup(  # type: ignore
-            mode=self.decoding_mode,
-            max_num_sequences=self.max_num_sequences,
-            max_beam_width=self.max_beam_width,
-            dtype=self.logits_datatype,
-            model_config=self.model_config,
-            world_config=self.world_config,
-        )
-        self.algs.create_new_decoder_requests = CreateNewDecoderRequests(  # type: ignore
-            speculative_decoding_fast_logits=False,
-            is_leader_in_orch_mode=False,
-            is_normalize_log_probs=False,
-        )
-        self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput()  # type: ignore
-
-    @torch.inference_mode()
-    @nvtx_range("setup_sampler_step")
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
-        batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = (
-            self.algs.create_new_decoder_requests(  # type: ignore
-                self.model_config,
-                self.world_config,
-                self.decoding_config,
-                scheduled_requests.context_requests,
-                self.logits_datatype,
-                self.store["decoder_input_buffers"][self.micro_batch_idx],  # type: ignore
-                self.store["decoder_state"],
-                self.store["cuda_stream"],
-                self.algs.decoder.decoder_stream,  # type: ignore
-                self.max_seq_len,
-                self.beam_width(scheduled_requests.context_requests),
-            )
-        )
-
-        local_batch_size = len(batch_slots)
-        if local_batch_size > 0:
-            sampling_config = make_sampling_config(sampling_configs)
-            self.algs.decoder.underlying_decoder().setup(  # type: ignore
-                sampling_config,
-                local_batch_size,
-                batch_slots,
-                self.store["decoder_state"].joint_decoding_output,  # type: ignore
-                self.model_config.data_type,
-                lookahead_prompt,
-                lookahead_algo_configs,
-            )
-
-        adp = [r for r in scheduled_requests.generation_requests if r.is_attention_dp_dummy]
-        batch_size = len(adp)
-        if batch_size == 0:
-            return
-        config = make_sampling_config(cast(SamplingConfigVector, [r.sampling_config for r in adp]))
-        slots = torch.tensor([r.py_seq_slot for r in adp], dtype=torch.int32)
-        self.algs.decoder.underlying_decoder().setup(config, batch_size, slots)  # type: ignore
-
-    def get_cache_indirection(self) -> torch.Tensor | None:
-        return self.store["decoder_state"].cache_indirection_output  # type: ignore
-
-    def _update_cache_indirection_buffer(self, scheduled_requests: ScheduledRequests) -> None:
-        # Copy cache indirection output to input
-        for request in scheduled_requests.generation_requests:
-            self.store["decoder_state"].cache_indirection_input[request.py_seq_slot].copy_(  # type: ignore
-                self.store["decoder_state"].cache_indirection_output[request.py_seq_slot],  # type: ignore
-                non_blocking=True,
-            )
-
-    @override
-    def validate_request(self, request: LlmRequest) -> None:
-        if (
-            self.max_batch_size > 1
-            and self.beam_width([request]) > 1
-            and request.py_return_log_probs
-        ):
-            raise ValueError("Beam search only supports logprobs when batch size is 1")
-
-    @torch.inference_mode()
-    @nvtx_range("sample_async")
-    @override
-    def sample_async(
-        self,
-        scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, Any],
-        num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> SampleStateTRTLLM:
-        batch_size = scheduled_requests.batch_size
-        beam_width = self.beam_width(scheduled_requests.all_requests())
-        assert not (
-            batch_size > 1
-            and beam_width > 1
-            and any(request.py_return_log_probs for request in scheduled_requests.all_requests())
-        ), "Beam search only supports logprobs when batch size is 1"
-
-        self.setup_sampler_step(scheduled_requests)
-
-        # For beam search, cache indirection needs to be updated
-        if beam_width > 1:
-            self._update_cache_indirection_buffer(scheduled_requests)
-
-        decoder_input_buffers = self.store["decoder_input_buffers"][self.micro_batch_idx]  # type: ignore
-        decoder_state = self.store["decoder_state"]
-
-        make_decoding_batch_input(
-            decoder_input_buffers,
-            decoder_state,
-            scheduled_requests.context_requests,
-            scheduled_requests.generation_requests,
-            model_outputs["logits"],
-            beam_width,
-            num_context_logits_prefix_sum,
-            self.store["buffer_manager"],
-        )
-
-        self.algs.decoder.forward_async(  # type: ignore
-            decoder_state,
-            self.store["decoder_input_buffers"][self.micro_batch_idx],  # type: ignore
-        )
-
-        sampling_requests = (
-            scheduled_requests.context_requests_last_chunk + scheduled_requests.generation_requests
-        )
-
-        finalize_events = {}
-        gathered_ids = None
-        if beam_width > 1:
-            finished_sum_device = decoder_state.finished_sum  # type: ignore[attr-defined]
-
-            for request in sampling_requests:
-                if request.is_context_init_state:
-                    continue
-                if finished_sum_device[request.seq_slot] == beam_width:
-                    finalize_events[request.request_id] = self._finalize_request(request, False)
-                elif request.streaming:
-                    finalize_events[request.request_id] = self._finalize_request(request, True)
-            gathered_ids = self._copy_to_host(decoder_state.gathered_ids)  # type: ignore[attr-defined]
-        new_output_tokens = self._copy_to_host(decoder_state.all_new_tokens)  # type: ignore[attr-defined]
-        finished_sum = self._copy_to_host(decoder_state.finished_sum)  # type: ignore[attr-defined]
-        finish_reasons = self._copy_to_host(decoder_state.finish_reasons)  # type: ignore[attr-defined]
-        sequence_lengths = self._copy_to_host(decoder_state.sequence_lengths)  # type: ignore[attr-defined]
-
-        log_probs = None
-        cum_log_probs = None
-        if any(request.py_return_log_probs for request in sampling_requests):
-            log_probs = self._copy_to_host(decoder_state.log_probs)  # type: ignore[attr-defined]
-            cum_log_probs = self._copy_to_host(decoder_state.cum_log_probs)  # type: ignore[attr-defined]
-
-        device = SampleStateTensors(new_tokens=decoder_state.all_new_tokens)  # type: ignore[attr-defined]
-
-        host = SampleStateTensorsHostTRTLLM(
-            new_tokens=new_output_tokens,
-            finished_sum=finished_sum,
-            finish_reasons=finish_reasons,
-            sequence_lengths=sequence_lengths,
-            log_probs=log_probs,
-            cum_log_probs=cum_log_probs,
-            gathered_ids=gathered_ids,
-        )
-
-        sampler_event = self._record_sampler_event()
-
-        self.micro_batch_idx = (self.micro_batch_idx + 1) % self.num_micro_batches
-
-        return SampleStateTRTLLM(
-            requests=sampling_requests,
-            device=device,
-            host=host,
-            sampler_event=sampler_event,
-            finalize_events=finalize_events,
-        )
-
-    @torch.inference_mode()
-    @override
-    def update_requests(
-        self,
-        state: SampleStateTRTLLM,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
-        # resource_manager will not be used in this function, just for interface consistency.
-        assert isinstance(state, SampleStateTRTLLM)
-
-        if state.sampler_event:
-            state.sampler_event.synchronize()
-
-        if not state.requests:
-            return
-
-        beam_width = self.beam_width(state.requests)
-
-        if beam_width == 1 and self.MAX_DECODING_TOKENS == 1:
-            self.update_requests_single_beam_single_step(state)
-        else:
-            self.update_requests_multiple_beams_or_drafting(state, beam_width)
-
-    @torch.inference_mode()
-    @nvtx_range("update_requests_single_beam_single_step")
-    def update_requests_single_beam_single_step(self, state: SampleStateTRTLLM) -> None:
-        """Specialization of update_requests for single beam and single step"""
-        assert state.host is not None
-        sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
-        finish_reasons = state.host.finish_reasons.flatten().tolist()
-
-        reqs = [r for r in state.requests if not r.is_generation_complete_state]
-
-        # NB: To ensure good performance, we must
-        #  1. Avoid accessing torch.Tensor object inside the for-each-request loops
-        #  2. Convert only necessary data to Python list
-
-        # Add new tokens
-        reqs_with_new_tokens = []
-        seq_slots = []
-        seq_slots_need_log_probs = []
-        for request in reqs:
-            assert request.py_seq_slot is not None
-            if sequence_lengths_host_data[request.py_seq_slot] <= request.get_num_tokens(0):
-                continue
-
-            reqs_with_new_tokens.append(request)
-            seq_slots.append(request.py_seq_slot)
-
-            if request.py_return_log_probs:
-                seq_slots_need_log_probs.append(request.py_seq_slot)
-
-        # [maxTokensPerStep, batchSize, maxBeamWidth]
-        new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
-        add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
-
-        # Log probs
-        assert state.host is not None
-        if state.host.log_probs is not None:
-            # [batchSize, maxBeamWidth]
-            seq_last_idx = state.host.sequence_lengths[seq_slots_need_log_probs, 0] - 1
-            # [batchSize, maxBeamWidth, maxSequenceLength]
-            log_probs_host = state.host.log_probs[
-                seq_slots_need_log_probs, 0, seq_last_idx
-            ].tolist()
-            # [batchSize, maxBeamWidth]
-            assert state.host.cum_log_probs is not None
-            cum_log_probs_host = state.host.cum_log_probs[seq_slots_need_log_probs, 0].tolist()
-
-            log_probs_idx = 0
-            for request, new_token in zip(reqs_with_new_tokens, new_tokens):
-                if request.py_return_log_probs:
-                    log_probs = [
-                        {
-                            new_token: Logprob(
-                                logprob=log_probs_host[log_probs_idx],
-                                rank=1,
-                            )
-                        }
-                    ]
-                    cum_log_probs = [cum_log_probs_host[log_probs_idx]]
-                    request.py_result.append_log_probs([log_probs], cum_log_probs)
-                    log_probs_idx += 1
-
-        for request in reqs:
-            request.py_decoding_iter += 1
-            assert request.py_seq_slot is not None
-            finished_state = FinishedState(finish_reasons[request.py_seq_slot])
-            if finished_state.is_finished:
-                request.state = LlmRequestState.GENERATION_COMPLETE
-                finish_reason = finished_state.to_finish_reason()
-                request.set_finished_reason(finish_reason, 0)
-
-    @torch.inference_mode()
-    @nvtx_range("update_requests_multiple_beams_or_drafting")
-    def update_requests_multiple_beams_or_drafting(
-        self,
-        state: SampleStateTRTLLM,
-        beam_width: int,
-    ) -> None:
-        assert state.host is not None
-        new_tokens_host = state.host.new_tokens.tolist()
-        finished_sum_host = state.host.finished_sum.tolist()
-        finish_reasons = state.host.finish_reasons.flatten().tolist()
-        sequence_lengths_host_data = state.host.sequence_lengths.flatten().tolist()
-        cum_log_probs_host = (
-            state.host.cum_log_probs.tolist() if state.host.cum_log_probs is not None else None
-        )
-        log_probs_host = state.host.log_probs.tolist() if state.host.log_probs is not None else None
-        finalize_events = state.finalize_events
-
-        reqs = [r for r in state.requests if not r.is_generation_complete_state]
-
-        for request in reqs:
-            seq_slot = request.py_seq_slot
-            assert seq_slot is not None
-            num_generated_tokens = request.num_draft_tokens + 1
-            current_num_of_tokens = request.max_beam_num_tokens
-            num_new_tokens = [0] * beam_width
-
-            log_probs: list[list[dict[int, Logprob]]] = [[] for _ in range(beam_width)]
-            cum_log_probs = []
-
-            for beam_idx in range(beam_width):
-                seq_len = sequence_lengths_host_data[seq_slot * beam_width + beam_idx]
-                num_new_tokens[beam_idx] = min(
-                    num_generated_tokens, seq_len - request.get_num_tokens(beam_idx)
-                )
-
-                for step in range(num_new_tokens[beam_idx]):
-                    new_token = add_token(request, new_tokens_host, beam_idx=beam_idx, step=step)
-
-                    if request.py_return_log_probs:
-                        assert state.host.log_probs is not None
-                        assert log_probs_host is not None
-                        # NOTE: Log probs with drafting has not been tested yet.
-                        begin_log_probs_offset = (
-                            request.prompt_len if request.py_beam_width == 1 else 0
-                        )
-                        current_token = (
-                            seq_len - request.prompt_len - num_new_tokens[beam_idx] + step
-                        )
-                        log_probs[beam_idx].append(
-                            {
-                                new_token: Logprob(
-                                    logprob=log_probs_host[seq_slot][beam_idx][
-                                        begin_log_probs_offset + current_token
-                                    ],
-                                    rank=1,
-                                )
-                            }
-                        )
-
-                if request.py_return_log_probs:
-                    assert cum_log_probs_host is not None
-                    cum_log_probs.append(cum_log_probs_host[seq_slot][beam_idx])
-
-                finished_state = FinishedState(finish_reasons[seq_slot * beam_width + beam_idx])
-                if finished_state.is_finished:
-                    finish_reason = finished_state.to_finish_reason()
-                    request.set_finished_reason(finish_reason, beam_idx)
-
-            if request.py_return_log_probs:
-                request.py_result.append_log_probs(log_probs, cum_log_probs)
-
-            # Set number of tokens predicted per runtime iteration. Will be > 1 for speculative decoding.
-            request.update_num_tokens_per_iteration(
-                request.max_beam_num_tokens - current_num_of_tokens, self.model_config
-            )
-
-            # Increment the decoding iteration counter
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                request.py_decoding_iter += 1
-
-            if finished_sum_host[seq_slot] == beam_width:
-                request.state = LlmRequestState.GENERATION_COMPLETE
-        for request in reqs:
-            if finalize_events is not None and request.request_id in finalize_events:
-                self._post_process_request(request, state)
-
-    def _finalize_request(
-        self,
-        request: LlmRequest,
-        streaming: bool,
-    ) -> CudaEvent:
-        """Finalizes the request. This is necessary for beam search."""
-        seq_slot = request.py_seq_slot
-        event = cast(
-            CudaEvent,
-            self.algs.decoder.finalize(  # type: ignore
-                self.store["decoder_state"], seq_slot, request.sampling_config, streaming
-            ),
-        )
-        return event
-
-    def _post_process_request(self, request: LlmRequest, state: SampleStateTRTLLM) -> None:
-        """Post Process the request. Updates the sequence according to the beam search results.
-        request: LlmRequest which shall be post processed
-        finalize_event: CudaEvent to wait for the finalize step to finish
-        """
-        assert state.host is not None
-        seq_slot = request.py_seq_slot
-        beam_width = request.py_beam_width
-        # synchronize on the finalize event before continuing the post processing.
-        # should be unnecessary, as already wait for the sampler event in update_requests
-        assert state.finalize_events is not None
-        state.finalize_events[request.request_id].synchronize()
-
-        # Get these values again, as they might have changed during the finalize step
-        output_ids_host = state.host.gathered_ids
-        assert output_ids_host is not None
-        sequence_lengths_host = state.host.sequence_lengths
-
-        if request.py_return_log_probs:
-            log_probs_host = state.host.log_probs
-            cum_log_probs_host = state.host.cum_log_probs
-        else:
-            log_probs_host = None
-            cum_log_probs_host = None
-
-        generated_tokens = [[0]] * beam_width
-        log_probs: list[list[dict[int, Logprob]]] = [[] for _ in range(beam_width)]
-        cum_log_probs = []
-
-        for beam_idx in range(beam_width):
-            # get the correct generated tokens for beam search
-            begin = request.py_prompt_len
-            end = cast(int, sequence_lengths_host[seq_slot, beam_idx].item())
-            generated_tokens[beam_idx] = output_ids_host[seq_slot, beam_idx][begin:end].tolist()
-
-            # get the correct log probs for beam search
-            if request.py_return_log_probs:
-                assert log_probs_host is not None
-                assert cum_log_probs_host is not None
-                cum_log_probs.append(cum_log_probs_host[seq_slot, beam_idx].item())
-
-                begin_log_probs_offset = request.prompt_len if request.py_beam_width == 1 else 0
-                for current_token, token in enumerate(generated_tokens[beam_idx]):
-                    log_probs[beam_idx].append(
-                        {
-                            token: Logprob(
-                                logprob=log_probs_host[seq_slot, beam_idx][
-                                    begin_log_probs_offset + current_token
-                                ].item(),
-                                rank=1,
-                            )
-                        }
-                    )
-        if request.py_return_log_probs:
-            request.py_result.set_log_probs(log_probs, cum_log_probs)
-
-        request.set_generated_tokens(generated_tokens)

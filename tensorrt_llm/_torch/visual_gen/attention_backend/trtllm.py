@@ -27,10 +27,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
-from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
-from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
-from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ...attention.backends.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
+from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
+from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
 
 

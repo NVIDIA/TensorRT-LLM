@@ -28,7 +28,7 @@ from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...attention_backend import AttentionMetadata
+from ...attention.backends import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph

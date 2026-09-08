@@ -197,15 +197,24 @@ class ReuseScope(NamedTuple):
 
 
 class ReuseMatch(NamedTuple):
-    """Volatile result of a KV cache prefix match."""
+    """Volatile result of a KV cache prefix match.
+
+    ``num_reusable_tokens_before_hybrid_pruning`` is retained for internal
+    diagnostics. It is the prefix the attention pages alone would support,
+    before recurrent snapshot availability shortens it.
+
+    ``num_reusable_tokens_before_pruning`` is the raw token-path walk depth,
+    before any pruning at all. It locates where this request's content diverges
+    from the tree, independent of which pages happen to still be resident, so
+    ``num_reusable_tokens_before_pruning == num_lookup_tokens`` means the whole
+    lookup range matched and there is no fork here.
+    """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
-    # Internal diagnostic: the prefix the attention pages alone would support,
-    # i.e. before recurrent-state (SSM) snapshot availability shortened it.
-    # Equal to num_tokens when the model has no SSM life cycle.
-    num_tokens_before_hybrid_pruning: int = 0
+    num_reusable_tokens_before_hybrid_pruning: int
+    num_reusable_tokens_before_pruning: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -721,7 +730,8 @@ class BlockRadixTree:
         """Shorten `matched` to the prefix that is actually reusable.
 
         Passing ssm_lc_id=None skips the recurrent-snapshot constraint and yields
-        the attention-only prefix (used for num_tokens_before_hybrid_pruning).
+        the attention-only prefix (used for
+        num_reusable_tokens_before_hybrid_pruning).
         """
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
@@ -776,24 +786,51 @@ class BlockRadixTree:
                 break
         return matched
 
+    @staticmethod
+    def _back_off_match(
+        matched: list[tuple["Block", int]], backoff: int
+    ) -> list[tuple["Block", int]]:
+        """Drop `backoff` tokens from the tail of a match.
+
+        Shortens the last entry, dropping whole blocks while the backoff outruns
+        them. Leading entries stay full blocks, so _prune_match's invariant holds.
+        """
+        while backoff > 0 and matched:
+            block, num_matched = matched[-1]
+            if num_matched > backoff:
+                matched[-1] = (block, num_matched - backoff)
+                break
+            backoff -= num_matched
+            matched.pop()
+        return matched
+
     def match(
         self,
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        backoff: int = 0,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
 
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
+
+        `backoff` trims that many tokens off the tail (see
+        KVCacheManagerConfig.reuse_match_backoff).
         """
         raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        num_reusable_tokens_before_pruning = self._num_matched_tokens(raw_matched)
         ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        # Page requirements depend on the final endpoint. Back off before pruning
+        # so SWA coverage and recurrent snapshots are validated at that endpoint.
+        if backoff > 0:
+            raw_matched = self._back_off_match(raw_matched, backoff)
         # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
         # the prefix the attention pages alone support. Only hybrid models pay for
         # the second pass; without an SSM life cycle the two results are identical.
-        attn_only_tokens = (
+        num_reusable_tokens_before_hybrid_pruning = (
             self._num_matched_tokens(self._prune_match(list(raw_matched), None))
             if ssm_lc_id is not None
             else None
@@ -804,7 +841,12 @@ class BlockRadixTree:
             [block for block, _ in matched],
             num_tokens,
             len(tokens),
-            num_tokens if attn_only_tokens is None else attn_only_tokens,
+            (
+                num_tokens
+                if num_reusable_tokens_before_hybrid_pruning is None
+                else num_reusable_tokens_before_hybrid_pruning
+            ),
+            num_reusable_tokens_before_pruning,
         )
 
     def _check_sanity(self) -> bool:

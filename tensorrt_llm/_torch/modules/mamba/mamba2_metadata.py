@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
@@ -338,9 +338,15 @@ class Mamba2Metadata:
         finally:
             cls._warmup_force_initial_states = prev
 
-    def __init__(self, max_batch_size: int, chunk_size: int):
+    def __init__(
+        self,
+        max_batch_size: int,
+        chunk_size: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
+        self.max_num_tokens = max_num_tokens
 
         # cumulative sequence lengths for prefill requests [batch_size+1]
         self.cu_seqlens = torch.zeros(max_batch_size + 1,
