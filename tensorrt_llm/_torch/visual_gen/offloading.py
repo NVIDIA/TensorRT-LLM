@@ -144,7 +144,7 @@ class ModuleOffloadManager:
 
     @staticmethod
     def _is_non_overlapping_and_dense(tensor: torch.Tensor) -> bool:
-        """Return whether ``tensor`` densely covers its storage in any dimension order."""
+        """Return whether ``tensor`` densely covers a contiguous span from its storage offset."""
         expected_stride = 1
         for stride, size in sorted(zip(tensor.stride(), tensor.shape, strict=True)):
             if size <= 1:
