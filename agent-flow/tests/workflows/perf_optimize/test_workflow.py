@@ -13,8 +13,13 @@ import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
+from agent_flow.workflows.perf_optimize import (
+    kernel_ledger,
+    nsys_items,
+    roadmap_schema,
+    task_schema,
+)
 from agent_flow.workflows.perf_optimize import progress as progress_module
-from agent_flow.workflows.perf_optimize import roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
 
@@ -72,15 +77,6 @@ class FakeGitOps:
     def __init__(self, is_repo: bool = True):
         self.calls: list[tuple] = []
         self.is_repo_flag = is_repo
-        # Which host the workflow routed git to, or "" for local. Recorded rather
-        # than swallowed so a test can assert the choice was made — the failure it
-        # guards is a resumed run silently issuing git against a local path that
-        # does not exist.
-        self.cluster: str | None = None
-
-    def use_cluster(self, ssh_alias: str) -> None:
-        self.calls.append(("use_cluster", ssh_alias))
-        self.cluster = ssh_alias
 
     def is_git_repo(self, repo):
         self.calls.append(("is_git_repo", str(repo)))
@@ -553,19 +549,7 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") == "# SOL Projection\n"
 
 
-def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
-    """The routing is chosen before the first git command, on BOTH paths.
-
-    A run whose ``slurm-environment`` carries ``cluster_ssh`` is running off-cluster:
-    the checkout exists only on the cluster, so every git command has to travel over
-    ssh. Absent, nothing changes — which is what every other test here relies on.
-
-    The resume case is the one that decides where this call belongs. ``_init_state``
-    returns early when resuming, so setting the route there would leave every resumed
-    run issuing git against a local path that does not exist — and `is_git_repo`
-    swallows its error, so the run would report "not a git repository" and point at
-    the wrong machine.
-    """
+def test_git_stays_local_when_slurm_is_remote(tmp_path, fake_git):
     slurm = {
         "slurm-environment": {
             "slurm_partition": "batch",
@@ -579,35 +563,8 @@ def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
     workflow.run(str(task))
-    assert fake_git.cluster == "me@login-01"
-
-    # RESUME: an UNFINISHED run reads the checkpointed task.yaml rather than the
-    # input file, and must still route remotely. Rewinding `done` is what makes this
-    # a resume — a completed workspace returns from `_init_state` as None and never
-    # reaches any git command, which is correct and would make this vacuous.
-    state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    state.done = False
-    state.stage = state_module.STAGE_REPORTER
-    state_module.save_state(ws / state_module.STATE_FILENAME, state)
-
-    fake_git.cluster = None
-    resumed = Workflow(workspace=ws)
-    _stub_agents(resumed)
-    resumed.run(str(task))
-    assert fake_git.cluster == "me@login-01", (
-        "a resumed run must route to the cluster too; `_init_state` returns early on "
-        "resume, so a route set only on the fresh path would be lost here — and "
-        "`is_git_repo` swallows its error, so the run would blame the wrong machine"
-    )
-
-
-def test_git_stays_local_without_a_cluster_ssh(tmp_path, fake_git):
-    """No `cluster_ssh` means the historical behaviour, explicitly asserted."""
-    task = _write_task(tmp_path)
-    workflow = Workflow(workspace=tmp_path / "ws")
-    _stub_agents(workflow)
-    workflow.run(str(task))
-    assert fake_git.cluster == "", "an ordinary run must not reach for an ssh host"
+    assert fake_git.count("is_git_repo") == 1
+    assert fake_git.count("create_branch") == 1
 
 
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):
@@ -2306,7 +2263,7 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
             encoding="utf-8",
         )
         state = _evaluator_state(ws)
@@ -2329,6 +2286,31 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
         workflow.close()
 
 
+def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
+    """The accept-evidence trace is decomposed, not just kernel-summed."""
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    recorder = _RecordingAgent()
+    workflow.evaluator = recorder
+    try:
+        (ws / "task.yaml").write_text(
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
+            encoding="utf-8",
+        )
+        state = _evaluator_state(ws)
+        workflow._run_evaluator(state)
+        prompt = recorder.messages[0]
+        profile_dir = workflow._attempt_dir(state) / "profile"
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{profile_dir}/nsys_analysis" in prompt
+        # The point of it: the mechanism check rests on a measured budget.
+        assert "rather than an eyeballed one" in prompt
+    finally:
+        workflow.close()
+
+
 def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -2336,7 +2318,7 @@ def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         workflow._run_evaluator(_evaluator_state(ws))
         assert "Accept-evidence duty" not in recorder.messages[0]
@@ -2351,7 +2333,7 @@ def test_run_evaluator_marks_the_final_attempt(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         state = _evaluator_state(ws)
         workflow._run_evaluator(state)
@@ -2404,7 +2386,7 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
-        assert "do **not** run nsys / ncu / the torch profiler" in message
+        assert "do **not** run nsys / ncu" in message
         assert "do **not** run the benchmark" in message
         # …and the evidence it plans from instead.
         assert str(ws / "rounds" / "round_1" / "analysis") in message
@@ -3258,6 +3240,22 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "sol_projection.md" not in with_sol["qa"]
 
 
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
+    with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
+    # Not SOL-gated: every profiling round decomposes the timeline it just
+    # captured, into the round's own analysis directory.
+    for prompt in (without, with_sol):
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert "analysis/nsys_analysis" in prompt
+        assert "nsys_analysis/` directory" in prompt
+        # Ranking a host-exposure item and a slow-kernel item needs the
+        # split, not the kernel-sum table alone.
+        assert "not from the `nsys stats` table alone" in prompt
+
+
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
     with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
@@ -3334,12 +3332,13 @@ _KC_EXTRA = {"profile": {"kernel_coverage": {}}}
 def _ledger_yaml(faster_ref: str = "opt-001") -> str:
     return yaml.safe_dump(
         {
-            "version": 1,
+            "version": kernel_ledger.LEDGER_VERSION,
             "source": "rounds/round_1/analysis/nsys_stats.txt",
             "coverage": {
                 "enumerated_share_pct": 96.0,
                 "other_share_pct": 4.0,
                 "min_share_pct": 0.5,
+                "gpu_busy_pct": 82.4,
             },
             "kernels": [
                 {
@@ -3353,11 +3352,21 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                         "occupancy_pct": 62.0,
                         "bound": "memory",
                     },
+                    "elimination": {
+                        "disposition": "dismissed",
+                        "why_it_runs": "read by the next layer (NVTX + source)",
+                        "ref": "mandatory-math: per-step recurrence",
+                    },
                     "faster": {"disposition": "item", "ref": faster_ref},
                     "fusion": {
                         "disposition": "dismissed",
                         "neighbors": "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace)",
                         "ref": "already-fused: neighbors are inside this kernel",
+                    },
+                    "overlap": {
+                        "disposition": "dismissed",
+                        "concurrent_with": "moe_gemm (cuda_gpu_trace, stream 7)",
+                        "ref": "graph-disabled: cuda_graph_config unset in the live tuning config",
                     },
                 }
             ],
@@ -3492,6 +3501,65 @@ def test_kernel_coverage_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
     assert state.stage == state_module.STAGE_ANALYZER
 
 
+@pytest.mark.parametrize("dropped", ["elimination", "faster", "fusion", "overlap"])
+def test_kernel_coverage_unanswered_question_blocks_advance(tmp_path, fake_git, dropped):
+    """A row that skips any question aborts the stage.
+
+    The exhaustiveness guarantee is only worth the weakest question it
+    enforces — a ledger silently dropping one would let a campaign
+    conclude with a kernel nobody asked whether it had to exist, run
+    alone, or run at all.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_incomplete_ledger(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["kernels"][0][dropped]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_with_incomplete_ledger
+    try:
+        with pytest.raises(RuntimeError, match="answers all four questions"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_kernel_coverage_missing_gpu_busy_blocks_advance(tmp_path, fake_git):
+    """Materiality is denominated in wall clock, so the busy share is owed."""
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_without_busy_share(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["coverage"]["gpu_busy_pct"]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_without_busy_share
+    try:
+        with pytest.raises(RuntimeError, match="gpu_busy_pct"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
 def test_kernel_coverage_below_target_blocks_advance(tmp_path, fake_git):
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
@@ -3538,7 +3606,10 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     assert "kernel_ledger.yaml" in analyzer
     assert "per-kernel coverage contract" in analyzer
     assert "0.5%" in analyzer and "95.0%" in analyzer
-    assert "faster? fusible?" in analyzer
+    assert "eliminable? faster? fusible? overlappable?" in analyzer
+    # The busy share is asked for by name — it is what converts a share of
+    # GPU time into the share of wall clock the noise floor judges.
+    assert "coverage.gpu_busy_pct" in analyzer
     # The default bounded top-kernel wording is superseded, not repeated.
     assert "on the top nsys kernels: keep the canonical ncu flags" not in analyzer
     reporter = captured["reporter"]
@@ -3949,19 +4020,76 @@ def test_reused_round_without_a_ledger_does_not_enforce_the_coverage_gate(tmp_pa
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
 
 
-def test_reused_source_ledger_is_still_validated(tmp_path, fake_git):
-    """An imported ledger that fails the contract blocks the stage."""
+def _run_reuse_campaign_with_source_ledger(tmp_path, ledger_yaml: str):
+    """Run a one-round reuse campaign whose source carries ``ledger_yaml``."""
     source = _analyze_workspace(tmp_path / "prior")
-    (source / "kernel_ledger.yaml").write_text(_ledger_yaml("opt-does-not-exist"), encoding="utf-8")
-    task = _write_task(tmp_path, _KC_EXTRA)
+    (source / "kernel_ledger.yaml").write_text(ledger_yaml, encoding="utf-8")
+    extra = dict(_KC_EXTRA)
+    extra["optimize"] = {"max_rounds": 1}
+    task = _write_task(tmp_path, extra)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws, reuse_analysis=source)
-    _stub_agents(workflow)
+    trace = _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    return ws, trace
+
+
+def test_reused_source_ledger_that_fails_the_contract_is_waived(tmp_path, fake_git):
+    """An unsatisfiable imported ledger degrades; it never wedges the run.
+
+    The reused round is plan-only and never writes a ledger, so nothing a
+    retry does can repair the copy ``--reuse-analysis`` seeded — here one
+    whose ``item`` refs name the *source* campaign's roadmap ids. Aborting
+    on it would leave the campaign stuck on a failure no operator action
+    clears, so it takes the same warn-and-waive as a source with no ledger.
+    """
+    ws, trace = _run_reuse_campaign_with_source_ledger(tmp_path, _ledger_yaml("opt-does-not-exist"))
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_reused_source_ledger_predating_the_contract_is_waived(tmp_path, fake_git):
+    """The real trap: a source ledger written before the questions grew.
+
+    Every workspace produced before ``elimination`` / ``overlap`` /
+    ``gpu_busy_pct`` became required carries a ledger that can never
+    satisfy today's schema, and ``--reuse-analysis`` documents an earlier
+    campaign as a supported source.
+    """
+    stale = yaml.safe_load(_ledger_yaml())
+    stale["coverage"].pop("gpu_busy_pct")
+    for row in stale["kernels"]:
+        row.pop("elimination")
+        row.pop("overlap")
+    ws, trace = _run_reuse_campaign_with_source_ledger(
+        tmp_path, yaml.safe_dump(stale, sort_keys=False)
+    )
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_a_self_authored_ledger_is_never_waived(tmp_path, fake_git):
+    """The waive is scoped to the imported copy, not to every failure.
+
+    A round that profiled authored its own ledger, so a failing one is a
+    retryable defect and must still park the checkpoint.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(workflow, faster_ref="opt-does-not-exist")
     try:
         with pytest.raises(RuntimeError, match="coverage contract"):
             workflow.run(str(task))
     finally:
         workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
 
 
 def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path):
@@ -4159,3 +4287,180 @@ def test_baseline_gate_ignores_unreadable_json(tmp_path):
     wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
+
+
+# --------------------------------------------------------------------------- #
+# The nsys opportunity-coverage gate: the timeline analysis writes items.json,
+# and the roadmap must account for every id in it. Self-gating on the file, so
+# a round that could not decompose a trace owes nothing.
+# --------------------------------------------------------------------------- #
+
+
+def _stub_agents_with_nsys_items(workflow, rows, item_ids=("nsys-01",), **kwargs):
+    """`_stub_agents` plus an analyzer that writes items.json + the block.
+
+    ``rows`` is the ``nsys_items`` coverage block the analyzer writes into
+    ``roadmap.yaml``; ``item_ids`` are the opportunities ``items.json``
+    carries. Passing mismatched pairs is how the negative cases are built.
+    """
+    trace = _stub_agents(workflow, **kwargs)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_items(state):
+        original_analyzer(state)
+        analysis_dir = workflow._analysis_dir(state)
+        items_file = nsys_items.items_path(analysis_dir)
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text(
+            json.dumps({"items": [{"id": i, "title": i, "claim": "c"} for i in item_ids]}),
+            encoding="utf-8",
+        )
+        data = roadmap_schema.load_roadmap(workflow.roadmap_path)
+        data[nsys_items.ROADMAP_KEY] = [dict(row) for row in rows]
+        roadmap_schema.save_roadmap(workflow.roadmap_path, data)
+
+    workflow._run_analyzer = analyzer_with_items
+    return trace
+
+
+def test_nsys_items_covered_roadmap_completes(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}]
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unaccounted_opportunity_blocks_advance(tmp_path, fake_git):
+    """An opportunity neither planned nor dismissed stops the round."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unaccounted for"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    # Parked at the analyzer, so re-running retries the stage.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_dismissal_with_evidence_is_enough(tmp_path, fake_git):
+    """Dismissing beats padding the roadmap with an item to disprove."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [
+            {"id": "nsys-01", "disposition": "item", "ref": "opt-001"},
+            {"id": "nsys-02", "disposition": "dismissed", "ref": "below the noise floor"},
+        ],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-999"}]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="does not match any roadmap item id"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_malformed_file_blocks_advance(tmp_path, fake_git):
+    """The analyzer's own artifact being unreadable is worth stopping for."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_broken_items(state):
+        original_analyzer(state)
+        items_file = nsys_items.items_path(workflow._analysis_dir(state))
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text("{not json", encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_broken_items
+    try:
+        with pytest.raises(RuntimeError, match="could not be read as JSON"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
+def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
+    """A round whose pipeline could not run degrades, it does not fail.
+
+    The skill may be absent, the export may fail, or nsys may not be in
+    `profile.methods` at all — every such round writes no items.json and
+    records the reason under *Caveats* instead.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)  # never writes items.json
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+    assert not list((ws / "rounds").glob("*/analysis/nsys_analysis/items.json"))
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks reaches the analyzer's driving instruction: the
+# stateless agent should not have to re-derive which ranks to capture, and the
+# multi-rank case has to arrive as a duty rather than an option.
+# --------------------------------------------------------------------------- #
+
+
+def test_default_driving_prompt_asks_for_rank_zero_only(tmp_path):
+    analyzer = _capture_driving_prompts(tmp_path)["analyzer"]
+    assert "rank 0 only" in analyzer
+    # And says plainly that the imbalance step does not apply, rather than
+    # leaving the agent to report a spread it could not measure.
+    assert "rank-jitter step does not apply" in analyzer
+
+
+def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
+    analyzer = _capture_driving_prompts(
+        tmp_path, {"profile": {"methods": ["nsys", "ncu"], "profile_ranks": [0, 4]}}
+    )["analyzer"]
+    assert "ranks 0, 4" in analyzer
+    assert "one trace per rank" in analyzer
+    # Only the listed ranks are wrapped — a profiler-slowed rank would
+    # otherwise register as jitter the others wait on.
+    assert "only these ranks are wrapped" in analyzer
+    assert "Step 0 survey" in analyzer
+    assert "straggler verdict" in analyzer

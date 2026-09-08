@@ -712,6 +712,13 @@ def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
     ])
 
 
+def test_anthropic_messages(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_anthropic_messages.py")])
+
+
 def test_openai_responses(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
