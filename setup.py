@@ -346,6 +346,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             "TRTLLM_PRECOMPILED_LINK=1 requires TRTLLM_PRECOMPILED_LOCATION to "
             "be a local directory in git-clone layout, but got "
             f"{precompiled_location}.")
+    # Linking a checkout onto itself would unlink the real artifacts and
+    # replace them with symlinks that point to themselves, destroying the
+    # build tree this mode is meant to share.
+    if link_artifacts and os.path.realpath(
+            precompiled_location) == os.path.realpath("."):
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_LINK=1 needs a source checkout separate from "
+            "this one, but TRTLLM_PRECOMPILED_LOCATION resolves to the current "
+            "directory.")
 
     # Handle local directory (assuming repo structure)
     if os.path.isdir(precompiled_location):
@@ -420,12 +429,17 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                 "precompiled source built with MSA packaging support.")
         dst_fmha = os.path.join("3rdparty", "fmha_sm100")
         if link_artifacts:
-            if os.path.islink(dst_fmha):
-                # The checkout already shares a build tree; replacing the link
-                # would undo that.
+            if os.path.islink(dst_fmha) and os.path.realpath(
+                    dst_fmha) == os.path.realpath(source_fmha):
+                # Already points at this source; leave the shared link alone.
                 print(f"Keeping existing fmha_sm100 symlink: {dst_fmha}")
             else:
-                if os.path.isdir(dst_fmha):
+                # A stale link (pointing at a different source) or a real
+                # directory: replace it so fmha_sm100 tracks the same source
+                # as the other linked artifacts.
+                if os.path.islink(dst_fmha):
+                    os.unlink(dst_fmha)
+                elif os.path.isdir(dst_fmha):
                     shutil.rmtree(dst_fmha)
                 # copytree() creates the parent below; os.symlink() does not.
                 os.makedirs(os.path.dirname(dst_fmha), exist_ok=True)

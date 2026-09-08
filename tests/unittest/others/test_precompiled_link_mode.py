@@ -86,7 +86,19 @@ def test_link_mode_symlinks_the_artifacts(extract_from_precompiled, build_tree, 
 
 
 def test_link_mode_keeps_an_existing_fmha_symlink(extract_from_precompiled, build_tree, tmp_path):
-    """A checkout already sharing a build tree keeps the link it has."""
+    """A link already pointing at this source is left untouched."""
+    Path("3rdparty").mkdir()
+    os.symlink(build_tree / "3rdparty" / "fmha_sm100", "3rdparty/fmha_sm100")
+
+    _run(extract_from_precompiled, build_tree, tmp_path, link=True)
+
+    assert Path(os.readlink("3rdparty/fmha_sm100")) == build_tree / "3rdparty" / "fmha_sm100"
+
+
+def test_link_mode_relinks_fmha_when_the_source_changed(
+    extract_from_precompiled, build_tree, tmp_path
+):
+    """A link to a different source is repointed, not kept stale."""
     other = tmp_path / "other-fmha"
     other.mkdir()
     Path("3rdparty").mkdir()
@@ -94,7 +106,15 @@ def test_link_mode_keeps_an_existing_fmha_symlink(extract_from_precompiled, buil
 
     _run(extract_from_precompiled, build_tree, tmp_path, link=True)
 
-    assert Path(os.readlink("3rdparty/fmha_sm100")) == other
+    assert Path(os.readlink("3rdparty/fmha_sm100")) == build_tree / "3rdparty" / "fmha_sm100"
+
+
+def test_link_mode_rejects_the_current_checkout(extract_from_precompiled, build_tree, tmp_path):
+    """Linking a checkout onto itself would destroy its own artifacts."""
+    from setuptools.errors import SetupError
+
+    with pytest.raises(SetupError, match="current directory"):
+        _run(extract_from_precompiled, Path.cwd(), tmp_path, link=True)
 
 
 def test_link_mode_replaces_a_stale_artifact(extract_from_precompiled, build_tree, tmp_path):
