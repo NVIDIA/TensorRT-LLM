@@ -22,7 +22,7 @@ import warnings
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar, NewType, final
+from typing import ClassVar, NewType
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -38,11 +38,10 @@ from .._common import (
     FileDescriptor,
     MemAddress,
 )
-from .._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from .._cuda_virt_mem import LOCALIZATION_OFFSET, PooledPhysMemAllocator, VirtMem
 from .._exceptions import LogicError, OutOfPagesError
 from .._utils import (
     CachedCudaEvent,
-    DynamicBitset,
     HomoTuple,
     HostMem,
     TypedIndexList,
@@ -103,48 +102,97 @@ class SlotPoolBase(abc.ABC):
         self.destroy()
 
 
-@final
-class GpuSlotPool(SlotPoolBase):
-    __slots__ = ("_vm",)
+class GpuSlotPool:
+    """GPU slot pool supporting 1 or N locality domains within a single VirtMem reservation.
+
+    For a single locality domain (the default), construction accepts scalar ``vm_size``
+    and ``num_slots`` arguments — identical to the original non-localized API.
+    For multiple locality domains, pass lists of per-locality domain values instead.
+
+    All operations that touch physical memory or VA addressing accept an
+    optional ``locality_domain_id`` (default 0) so that single-locality domain call sites remain
+    unchanged.
+
+    ``slot_address`` expects a local 0-based slot index for the selected
+    locality domain and converts it into a byte address::
+
+        address = locality_domain_address(locality_domain_id) + slot_size * slot
+
+    For ``locality_domain_id == 0`` this reduces to ``base + slot_size * slot``.
+    """
+
+    __slots__ = ("_slot_size", "_vm")
+    _slot_size: int
     _vm: VirtMem
 
     def __init__(
         self,
         slot_size: int,
-        vm_size: int,
+        vm_sizes: int | list[int],
         shared_phys_mem_pool: PooledPhysMemAllocator,
-        num_slots: int,
-    ):
-        super().__init__(slot_size)
-        assert vm_size % shared_phys_mem_pool.phys_mem_size == 0
-        self._vm = VirtMem(vm_size, shared_phys_mem_pool)
-        self.resize(num_slots)
+        num_slots: int | list[int],
+    ) -> None:
+        num_locality_domains = shared_phys_mem_pool.num_locality_domains
+        # Normalise scalar args to per-locality domain lists.
+        if isinstance(vm_sizes, int):
+            vm_sizes = [vm_sizes]
+        if isinstance(num_slots, int):
+            num_slots = [num_slots] * num_locality_domains
+        assert len(vm_sizes) == num_locality_domains and len(num_slots) == num_locality_domains, (
+            f"Expected {num_locality_domains} elements (num_locality_domains={num_locality_domains}), "
+            f"got vm_sizes={len(vm_sizes)}, num_slots={len(num_slots)}"
+        )
 
-    @override
+        phys_mem_size = shared_phys_mem_pool.phys_mem_size
+        for vs in vm_sizes:
+            assert vs % phys_mem_size == 0
+
+        self._slot_size = slot_size
+        self._vm = VirtMem(vm_sizes, shared_phys_mem_pool)
+        for uid, ns in enumerate(num_slots):
+            self.resize(ns, locality_domain_id=uid)
+
+    @property
+    def slot_size(self) -> int:
+        return self._slot_size
+
+    @property
+    def phys_mem_size(self) -> int:
+        return self._vm.phys_mem_size
+
+    @property
+    def num_locality_domains(self) -> int:
+        return self._vm.num_locality_domains
+
     def destroy(self) -> None:
         self._vm.destroy()
 
-    @override
-    def resize(self, new_num_slots: int) -> None:
+    def __del__(self) -> None:
+        self.destroy()
+
+    def resize(self, new_num_slots: int, locality_domain_id: int = 0) -> None:
         new_num_phys_mem = self._compute_num_phys_mem(
             self.slot_size, new_num_slots, self._vm.phys_mem_size
         )
-        self._vm.realloc(self._vm.phys_mem_size * new_num_phys_mem)
+        self._vm.realloc(self._vm.phys_mem_size * new_num_phys_mem, locality_domain_id)
 
-    def extend_by_one_phys_mem(self) -> int:
-        self._vm.extend(1)
-        return self.num_slots
+    def extend_by_one_phys_mem(self, locality_domain_id: int = 0) -> int:
+        self._vm.extend(1, locality_domain_id)
+        return self.num_slots(locality_domain_id)
 
-    @override
-    def slot_address(self, slot: SlotId) -> MemAddress:
-        return MemAddress(int(self._vm.address) + self.slot_size * int(slot))
-
-    @property
-    @override
-    def num_slots(self) -> int:
-        return self._compute_num_slots(
-            self.slot_size, self._vm.num_phys_mem, self._vm.phys_mem_size
+    def slot_address(self, slot: SlotId, locality_domain_id: int = 0) -> MemAddress:
+        """Return the memory address for local slot index ``slot`` in ``locality_domain_id``'s VA region."""
+        return MemAddress(
+            self._vm.locality_domain_address(locality_domain_id) + self._slot_size * slot
         )
+
+    def num_slots(self, locality_domain_id: int = 0) -> int:
+        return self._compute_num_slots(
+            self.slot_size, self._vm.num_phys_mem(locality_domain_id), self._vm.phys_mem_size
+        )
+
+    def num_bytes(self, locality_domain_id: int = 0) -> int:
+        return self.slot_size * self.num_slots(locality_domain_id)
 
     @staticmethod
     def _compute_num_phys_mem(slot_size: int, num_slots: int, phys_mem_size: int) -> int:
@@ -251,6 +299,12 @@ class Slot:
     #  When passed to release(), it indicates finish of usage by the current owners of the slot.
     _slot_id: SlotId | None
     ready_event: CachedCudaEvent
+    # locality_domain_id is None for non-localized (regular GPU) slots.
+    # For localized locality domain slots it must be 0 or 1, identifying which locality domain pool owns this slot.
+    # In localized mode slot_id carries a canonical per-locality domain slot-space stride
+    # rather than the raw byte-space LOCALIZATION_OFFSET. The VA address is
+    # reconstructed later from (slot_id, locality_domain_id) using the pool's slot size.
+    locality_domain_id: int | None
 
     @property
     def slot_id(self) -> SlotId:
@@ -271,7 +325,7 @@ class Slot:
         return self._slot_id is not None
 
     def move_to_new_slot(self) -> "Slot":
-        ret = Slot(None, CachedCudaEvent.NULL)
+        ret = Slot(None, CachedCudaEvent.NULL, None)
         ret.set_slot(self)
         return ret
 
@@ -279,8 +333,10 @@ class Slot:
         if self.has_valid_slot:
             raise LogicError("Slot is already set.")
         self._slot_id = slot.slot_id
+        self.locality_domain_id = slot.locality_domain_id
         self.ready_event = slot.ready_event
         slot._slot_id = None
+        slot.locality_domain_id = None
         slot.ready_event = CachedCudaEvent.NULL
 
     def __del__(self) -> None:
@@ -294,7 +350,8 @@ class SlotAllocator:
         "_num_active_slots",
         "_recycled_slots",
         "_num_ready_recycled_slots",
-        "_occupied_mask",
+        "_occupied_slot_ids",
+        "_slot_id_offset",
         "_target_capacity",
         "_overflow_slots",
     )
@@ -305,7 +362,15 @@ class SlotAllocator:
     ]  # only store recycled slots to avoid excessive memory usage on program start
     _num_ready_recycled_slots: int  # number of recycled slots that are ready to be used immediately
     # (no need for sync or wait in stream), i.e. their ready events are triggered.
-    _occupied_mask: DynamicBitset
+    # Set of slot_ids currently handed out to callers.  A set (vs. DynamicBitset) is used so that
+    # localized slot_ids with canonical per-locality domain offsets can be tracked
+    # without allocating a multi-terabyte bitset.
+    _occupied_slot_ids: set[SlotId]
+    # Additive offset applied to every slot_id this allocator creates.
+    # In localized mode this is a canonical slot-id stride derived from the
+    # pool-group's largest slot size, so slot_ids remain unique across locality domains
+    # while LOCALIZATION_OFFSET itself stays byte-based.
+    _slot_id_offset: int
 
     # for scheduled shrinking resize
     _target_capacity: (
@@ -315,12 +380,13 @@ class SlotAllocator:
         Slot
     ]  # slots that will be out-of-range after a in-progress resize. scheduled for removal.
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, slot_id_offset: int = 0) -> None:
         self._capacity = capacity
         self._num_active_slots = 0
         self._recycled_slots = deque[Slot]()
         self._num_ready_recycled_slots = 0
-        self._occupied_mask = DynamicBitset(capacity)
+        self._occupied_slot_ids = set()
+        self._slot_id_offset = slot_id_offset
         self._target_capacity = capacity
         self._overflow_slots = []
 
@@ -333,7 +399,7 @@ class SlotAllocator:
             self._target_capacity == self._capacity and not self._overflow_slots,
             "resize is in progress",
         )
-        assert_critical(self._occupied_mask.num_set_bits == 0, "some slots are still in use")
+        assert_critical(len(self._occupied_slot_ids) == 0, "some slots are still in use")
         assert_critical(
             len(self._recycled_slots) == self._num_active_slots, "some slots are not free"
         )
@@ -344,7 +410,11 @@ class SlotAllocator:
 
     @property
     def num_occupied_slots(self) -> int:
-        return self._occupied_mask.num_set_bits
+        return len(self._occupied_slot_ids)
+
+    def _local_idx(self, slot_id: SlotId) -> int:
+        """Convert a slot_id (which may carry an offset) back to the local 0-based index."""
+        return int(slot_id) - self._slot_id_offset
 
     def allocate(self) -> Slot:
         if self.num_free_slots == 0:
@@ -358,12 +428,14 @@ class SlotAllocator:
             self._num_ready_recycled_slots -= 1
             assert slot.ready_event is CachedCudaEvent.NULL
         elif self._num_active_slots < min(self.num_slots, self._target_capacity):
-            slot = Slot(SlotId(self._num_active_slots), CachedCudaEvent.NULL)
+            slot = Slot(
+                SlotId(self._num_active_slots + self._slot_id_offset), CachedCudaEvent.NULL, None
+            )
             self._num_active_slots += 1
         else:
             slot = self._recycled_slots.popleft()
             assert slot.has_valid_slot
-        self._occupied_mask.set(slot.slot_id)
+        self._occupied_slot_ids.add(slot.slot_id)
         return slot
 
     # The reason why we don't use allocate() multiple times is that if what user need is all or none,
@@ -379,14 +451,17 @@ class SlotAllocator:
     def release(self, slot: Slot) -> None:
         assert slot.has_valid_slot
         slot = slot.move_to_new_slot()
-        if slot.slot_id >= self._capacity or not self._occupied_mask.get(slot.slot_id):
+        if (
+            self._local_idx(slot.slot_id) >= self._capacity
+            or slot.slot_id not in self._occupied_slot_ids
+        ):
             raise LogicError(f"Slot {slot.slot_id} is not occupied")
         assert type(slot) is Slot and slot.has_valid_slot
-        if slot.slot_id < self._target_capacity:
+        if self._local_idx(slot.slot_id) < self._target_capacity:
             self._recycled_slots.append(slot)
         else:
             self._overflow_slots.append(slot)
-        self._occupied_mask.clear(slot.slot_id)
+        self._occupied_slot_ids.discard(slot.slot_id)
         self._scrub_events()
         assert NDEBUG or self._check()
 
@@ -397,8 +472,8 @@ class SlotAllocator:
     def expand(self, new_num_slots: int) -> None:
         assert NDEBUG or self._check()
         assert self._target_capacity == self._capacity
-        assert new_num_slots > self._capacity
-        self._occupied_mask.resize(new_num_slots)
+        old_num_slots = self._capacity
+        assert new_num_slots > old_num_slots
         self._capacity = new_num_slots
         self._target_capacity = self._capacity
         assert NDEBUG or self._check()
@@ -411,7 +486,7 @@ class SlotAllocator:
         new_num_ready_recycled_slots = 0
         old_num_ready_recycled_slots = self._num_ready_recycled_slots
         for i, slot in enumerate(self._recycled_slots):
-            if slot.slot_id < new_num_slots:
+            if self._local_idx(slot.slot_id) < new_num_slots:
                 new_recycled_slots.append(slot)
                 if i < old_num_ready_recycled_slots:
                     new_num_ready_recycled_slots += 1
@@ -454,8 +529,11 @@ class SlotAllocator:
     def get_slots_blocking_shrink(self) -> HomoTuple[SlotId]:
         return tuple(
             SlotId(id)
-            for id in range(self._target_capacity, self._capacity)
-            if self._occupied_mask.get(id)
+            for id in range(
+                self._slot_id_offset + self._target_capacity,
+                self._slot_id_offset + self._capacity,
+            )
+            if SlotId(id) in self._occupied_slot_ids
         )
 
     def _scrub_events(self) -> None:
@@ -469,7 +547,7 @@ class SlotAllocator:
             and self._target_capacity <= self._capacity
             and (self.shrink_in_progress or len(self._overflow_slots) == 0)
             and all(
-                self._target_capacity <= slot.slot_id < self._capacity
+                self._target_capacity <= self._local_idx(slot.slot_id) < self._capacity
                 for slot in self._overflow_slots
             )
             and len(self._recycled_slots) + len(self._overflow_slots) + self.num_occupied_slots
@@ -588,30 +666,226 @@ class PoolGroupBase:
         )
 
 
-class GpuPoolGroup(PoolGroupBase):
-    __slots__ = ()
+class GpuPoolGroup:
+    """GPU pool group supporting 1 or N locality domains.
+
+    Manages a list of ``SlotAllocator`` instances (one per locality domain) over shared
+    ``GpuSlotPool`` instances.  For a single locality domain (the default) the allocator
+    list has one entry with offset 0.  For N locality domains, allocator k has a
+    canonical slot-id stride derived from ``max(slot_size_list)`` so that the
+    byte-space ``LOCALIZATION_OFFSET`` remains 1 TiB while slot_ids stay in a
+    compact int32-friendly range.
+
+    All slot operations accept an optional ``locality_domain_id`` (default 0) so that
+    single-locality domain call sites remain unchanged.
+    """
+
+    __slots__ = ("_slot_allocators", "_pools", "_destroyed", "_slot_id_offset")
+
+    _slot_allocators: list[SlotAllocator]
+    _pools: TypedIndexList[PoolIndex, GpuSlotPool]
+    _destroyed: bool
+    _slot_id_offset: int
+
+    @staticmethod
+    def _query_localized_gpu_memory(locality_domain_id: int) -> int:
+        # Placeholder — will be replaced with a real per-locality domain capacity API.
+        # Assuming there are only 2 locality domains for now.
+        assert locality_domain_id in (0, 1)
+        return query_total_gpu_memory() // 2
 
     def __init__(
         self,
-        num_slots: int,
+        num_slots: int | list[int],
         slot_size_list: TypedIndexList[PoolIndex, int],
         shared_phys_mem_pool: PooledPhysMemAllocator,
-    ):
-        super().__init__(num_slots)
-        total_gpu_memory = query_total_gpu_memory()
+    ) -> None:
+        num_locality_domains = shared_phys_mem_pool.num_locality_domains
+        # Normalise scalar to per-locality domain list.
+        if isinstance(num_slots, int):
+            num_slots = [num_slots] * num_locality_domains
+        assert len(num_slots) == num_locality_domains
+
         max_slot_size = max(slot_size_list)
+        self._slot_id_offset = (
+            div_up(LOCALIZATION_OFFSET, max_slot_size) if num_locality_domains > 1 else 0
+        )
+
+        # One SlotAllocator per locality domain; slot ids use a canonical per-locality domain stride
+        # derived from the largest pool slot size in the group.
+        self._slot_allocators = [
+            SlotAllocator(num_slots[k], slot_id_offset=k * self._slot_id_offset)
+            for k in range(num_locality_domains)
+        ]
+        self._destroyed = False
+
         phys_mem_size = shared_phys_mem_pool.phys_mem_size
+
+        # Compute per-locality domain VM sizes.
+        if num_locality_domains == 1:
+            gpu_memory = [query_total_gpu_memory()]
+        else:
+            gpu_memory = [self._query_localized_gpu_memory(k) for k in range(num_locality_domains)]
+
         self._pools = typed_map(
             slot_size_list,
             lambda slot_size: GpuSlotPool(
                 slot_size,
-                max(
-                    round_down(int(total_gpu_memory * slot_size / max_slot_size), phys_mem_size),
-                    round_up(num_slots * slot_size, phys_mem_size),
-                ),
+                [
+                    round_down(int(gpu_memory[k] * slot_size / max_slot_size), phys_mem_size)
+                    for k in range(num_locality_domains)
+                ],
                 shared_phys_mem_pool,
                 num_slots,
             ),
+        )
+
+    def __del__(self) -> None:
+        self.destroy()
+
+    def destroy(self) -> None:
+        if self._destroyed:
+            return
+        for allocator in self._slot_allocators:
+            if allocator._capacity != 0:
+                # Best-effort teardown: when destroy() runs during an error
+                # unwind, slots may still be occupied by never-freed requests
+                # (or a shrink may already be in flight), so the shrink cannot
+                # complete. Raising here aborts shutdown mid-way and turns a
+                # per-rank error into a whole-instance hang (peer ranks block
+                # until the 300s watchdog); warn and release the pools instead.
+                try:
+                    allocator._synchronize()
+                    if not allocator.shrink_in_progress:
+                        allocator.prepare_for_shrink(0)
+                    allocator.finish_shrink()
+                except (RuntimeError, LogicError, AssertionError) as e:
+                    warnings.warn(
+                        f"KV cache slot allocator teardown incomplete ({e}); "
+                        "releasing pools anyway."
+                    )
+        for pool in self._pools:
+            pool.destroy()
+        self._destroyed = True
+
+    # ------------------------------------------------------------------
+    # Properties (locality_domain-agnostic)
+    # ------------------------------------------------------------------
+
+    @property
+    def num_locality_domains(self) -> int:
+        return len(self._slot_allocators)
+
+    @property
+    def num_pools(self) -> PoolIndex:
+        return PoolIndex(len(self._pools))
+
+    @property
+    def slot_size(self) -> TypedIndexList[PoolIndex, int]:
+        return typed_map(self._pools, lambda p: p.slot_size)
+
+    # ------------------------------------------------------------------
+    # Slot allocator + pool operations (all take locality_domain_id, defaulting to 0)
+    # ------------------------------------------------------------------
+
+    def num_slots(self, locality_domain_id: int = 0) -> int:
+        num_slots = self._slot_allocators[locality_domain_id]._capacity
+        assert num_slots <= self._get_num_slots_from_pools(locality_domain_id)
+        return num_slots
+
+    def num_free_slots(self, locality_domain_id: int = 0) -> int:
+        return self._slot_allocators[locality_domain_id].num_free_slots
+
+    def allocate(self, locality_domain_id: int = 0) -> Slot:
+        slot = self._slot_allocators[locality_domain_id].allocate()
+        # Stamp locality_domain_id onto the slot so that any holder can release it to the
+        # correct locality domain allocator without needing to track locality_domain_id separately.
+        slot.locality_domain_id = locality_domain_id
+        return slot
+
+    def allocate_multiple(self, num_slots: int, locality_domain_id: int = 0) -> list[Slot]:
+        slots = self._slot_allocators[locality_domain_id].allocate_multiple(num_slots)
+        for slot in slots:
+            slot.locality_domain_id = locality_domain_id
+        return slots
+
+    def release(self, slot: Slot, locality_domain_id: int = 0) -> None:
+        self._slot_allocators[locality_domain_id].release(slot)
+
+    def num_bytes(self, locality_domain_id: int = 0) -> int:
+        return sum(pool.num_bytes(locality_domain_id) for pool in self._pools)
+
+    def resize_pools(self, new_num_slots: int | None, locality_domain_id: int = 0) -> None:
+        """Resize all pools for the given locality domain, but not its slot allocator.
+
+        If new_num_slots is None, resize to match that locality domain's slot allocator
+        capacity.  If an exception is raised, pool sizes may be imbalanced;
+        call resize_pools() again with None to recover.
+        """
+        if new_num_slots is None:
+            new_num_slots = self._slot_allocators[locality_domain_id].num_slots
+        for pool in self._pools:
+            pool.resize(new_num_slots, locality_domain_id)
+        assert NDEBUG or self._check(locality_domain_id, allow_mismatch=True)
+
+    def slot_address(self, slot_id: SlotId, locality_domain_id: int = 0) -> HomoTuple[Address]:
+        """Return addresses across all pools for ``slot_id`` in ``locality_domain_id``'s VA region."""
+        if (
+            self.num_locality_domains > 1
+            and self._slot_id_offset > 0
+            and int(slot_id) >= self._slot_id_offset
+        ):
+            locality_domain_id = self.get_locality_domain_id(slot_id)
+        local_idx = self.get_local_slot_index(slot_id, locality_domain_id)
+        return tuple(pool.slot_address(local_idx, locality_domain_id) for pool in self._pools)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def get_locality_domain_id(self, slot_id: SlotId) -> int:
+        if self.num_locality_domains == 1 or self._slot_id_offset == 0:
+            return 0
+        locality_domain_id = int(slot_id) // self._slot_id_offset
+        if not (0 <= locality_domain_id < self.num_locality_domains):
+            raise LogicError(
+                f"Slot {slot_id} is out of range for {self.num_locality_domains} locality domains"
+            )
+        return locality_domain_id
+
+    def get_local_slot_index(self, slot_id: SlotId, locality_domain_id: int | None = None) -> int:
+        if locality_domain_id is None:
+            locality_domain_id = self.get_locality_domain_id(slot_id)
+        if self.num_locality_domains == 1 or self._slot_id_offset == 0:
+            return int(slot_id)
+        raw_slot_id = int(slot_id)
+        lower = locality_domain_id * self._slot_id_offset
+        upper = lower + self._slot_id_offset
+        if lower <= raw_slot_id < upper:
+            return raw_slot_id - lower
+        # Callers that already know the target locality domain may pass a local slot id
+        # (for example SlotId(0) when querying that locality domain's base address).
+        return raw_slot_id
+
+    def _get_num_slots_from_pools(self, locality_domain_id: int = 0) -> int:
+        return min(p.num_slots(locality_domain_id) for p in self._pools)
+
+    def _check(self, locality_domain_id: int = 0, allow_mismatch: bool = False) -> bool:
+        pool_num_slots = self._get_num_slots_from_pools(locality_domain_id)
+        allocator_num_slots = self._slot_allocators[locality_domain_id].num_slots
+        return (
+            allocator_num_slots <= pool_num_slots
+            if allow_mismatch
+            else allocator_num_slots == pool_num_slots
+        )
+
+    @staticmethod
+    def _compute_num_phys_mem(
+        slot_size_list: Sequence[int], num_slots: int, phys_mem_size: int
+    ) -> HomoTuple[int]:
+        return tuple(
+            GpuSlotPool._compute_num_phys_mem(slot_size, num_slots, phys_mem_size)
+            for slot_size in slot_size_list
         )
 
 
@@ -905,37 +1179,173 @@ class CacheLevelStorage:
 
 
 class GpuCacheLevelStorage(CacheLevelStorage):
+    """GPU cache storage tier supporting 1 or N locality domains.
+
+    The number of locality domains is determined by whether locality domain is enabled in the GPU
+    tier config and localization is supported on the current device.  For
+    N > 1, total_quota is split evenly across locality domains and the allocator is
+    created via ``PooledPhysMemAllocator.create_localized``.
+
+    All slot operations accept an optional ``locality_domain_id`` (default 0) so that
+    single-locality domain call sites remain unchanged.
+    """
+
     TIER: ClassVar[CacheTier] = CacheTier.GPU_MEM
     __slots__ = ("shared_phys_mem_pool",)
     shared_phys_mem_pool: PooledPhysMemAllocator
+
+    _pool_groups: TypedIndexList[PoolGroupIndex, GpuPoolGroup]
+
+    @staticmethod
+    def _quota_per_locality_domain(
+        total_quota: int,
+        slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
+        phys_mem_size: int,
+        num_locality_domains: int,
+    ) -> int:
+        if num_locality_domains == 1:
+            return total_quota
+
+        total_num_pools = sum(len(slot_sizes) for slot_sizes in slot_size_lists)
+        min_total_quota = phys_mem_size * total_num_pools * num_locality_domains
+        adjusted_total_quota = max(
+            min_total_quota, round_up(total_quota, phys_mem_size * num_locality_domains)
+        )
+        return adjusted_total_quota // num_locality_domains
 
     def __init__(
         self,
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         slot_count_list: TypedIndexList[PoolGroupIndex, int],
         phys_mem_size: int,
+        localized: bool = False,
     ):
         num_pool_groups = typed_len(slot_size_lists)
         assert num_pool_groups == typed_len(slot_count_list), (
             "slot_size_lists and slot_count_list must have the same length"
         )
         super().__init__()
-        self.shared_phys_mem_pool = PooledPhysMemAllocator(phys_mem_size)
+        if localized:
+            self.shared_phys_mem_pool = PooledPhysMemAllocator.create_localized(phys_mem_size)
+        else:
+            self.shared_phys_mem_pool = PooledPhysMemAllocator(phys_mem_size)
+
+        num_locality_domains = self.shared_phys_mem_pool.num_locality_domains
+        if num_locality_domains > 1:
+            slot_count_list = typed_map(
+                slot_count_list, lambda count: max(1, count // num_locality_domains)
+            )
         self._pool_groups = make_typed(
             lambda pg_idx: GpuPoolGroup(
-                slot_count_list[pg_idx], slot_size_lists[pg_idx], self.shared_phys_mem_pool
+                [slot_count_list[pg_idx]] * num_locality_domains,
+                slot_size_lists[pg_idx],
+                self.shared_phys_mem_pool,
             ),
             num_pool_groups,
         )
 
+    # ------------------------------------------------------------------
+    # locality domain info
+    # ------------------------------------------------------------------
+
+    @property
+    def num_locality_domains(self) -> int:
+        return self.shared_phys_mem_pool.num_locality_domains
+
+    # ------------------------------------------------------------------
+    # Slot operations — all accept locality_domain_id (default 0)
+    # ------------------------------------------------------------------
+
     @override
-    def post_resize(self) -> None:
-        super().post_resize()
-        self.shared_phys_mem_pool.clear()  # clear cached unused phys mem
+    def allocate(self, pool_group_index: PoolGroupIndex, locality_domain_id: int = 0) -> Slot:
+        return self._pool_groups[pool_group_index].allocate(locality_domain_id)
+
+    @override
+    def allocate_multiple(
+        self, pool_group_index: PoolGroupIndex, num_slots: int, locality_domain_id: int = 0
+    ) -> list[Slot]:
+        return self._pool_groups[pool_group_index].allocate_multiple(num_slots, locality_domain_id)
+
+    @override
+    def release(
+        self, pool_group_index: PoolGroupIndex, slot: Slot, locality_domain_id: int = 0
+    ) -> None:
+        self._pool_groups[pool_group_index].release(slot, locality_domain_id)
+
+    @override
+    def num_slots(self, pool_group_index: PoolGroupIndex, locality_domain_id: int = 0) -> int:
+        return self._pool_groups[pool_group_index].num_slots(locality_domain_id)
+
+    @override
+    def get_num_free_slots(
+        self, pool_group_index: PoolGroupIndex, locality_domain_id: int = 0
+    ) -> int:
+        return self._pool_groups[pool_group_index].num_free_slots(locality_domain_id)
+
+    @override
+    def slot_address(
+        self,
+        pool_group_index: PoolGroupIndex,
+        pool_index: PoolIndex,
+        slot_id: SlotId,
+        locality_domain_id: int = 0,
+    ) -> Address:
+        pool_group = self._pool_groups[pool_group_index]
+        local_idx = int(slot_id)
+        if pool_group.num_locality_domains > 1 and pool_group._slot_id_offset > 0:
+            if int(slot_id) >= pool_group._slot_id_offset:
+                locality_domain_id = pool_group.get_locality_domain_id(slot_id)
+            local_idx = pool_group.get_local_slot_index(slot_id, locality_domain_id)
+        return pool_group._pools[pool_index].slot_address(local_idx, locality_domain_id)
+
+    # ------------------------------------------------------------------
+    # Aggregated quota / ratio across all locality domains
+    # ------------------------------------------------------------------
+
+    @property
+    @override
+    def total_quota(self) -> int:
+        granularity = self.pool_size_granularity
+        quota = 0
+        for pg in self._pool_groups:
+            for p in pg._pools:
+                for uid in range(self.num_locality_domains):
+                    quota += round_up(p.num_bytes(uid), granularity)
+        return quota
+
+    @property
+    @override
+    def ratio_list(self) -> TypedIndexList[PoolGroupIndex, float]:
+        num_pool_groups = self.num_pool_groups
+        ret = filled_list(0.0, num_pool_groups)
+        total = 0
+        for i, pg in typed_enumerate(self._pool_groups):
+            size = sum(pg.num_bytes(uid) for uid in range(self.num_locality_domains))
+            total += size
+            ret[i] = size
+        assert total > 0
+        for i in typed_range(num_pool_groups):
+            ret[i] /= total
+        return ret
+
+    @property
+    @override
+    def slot_count_list(self) -> TypedIndexList[PoolGroupIndex, int]:
+        """Per-locality domain slot count (symmetric allocation: same for all locality domains)."""
+        return typed_map(self._pool_groups, lambda pg: pg.num_slots(0))
+
+    # ------------------------------------------------------------------
+    # Granularity, post_resize, destroy
+    # ------------------------------------------------------------------
 
     @property
     def pool_size_granularity(self) -> int:
         return self.shared_phys_mem_pool.phys_mem_size
+
+    @override
+    def post_resize(self) -> None:
+        super().post_resize()
+        self.shared_phys_mem_pool.clear()
 
     @override
     def destroy(self) -> None:
