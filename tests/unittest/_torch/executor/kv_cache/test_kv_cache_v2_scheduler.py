@@ -1242,6 +1242,108 @@ class TestEviction:
 
 
 # ===========================================================================
+# Disaggregated transfer ownership
+# ===========================================================================
+
+
+class TestInTransmissionVictims:
+    """A request whose KV the disagg fabric may still touch is not a victim.
+
+    Both victims below are context requests past their first chunk, which is
+    the pipelined-transfer shape: a chunk is on the wire while the request is
+    still prefilling, and that state is what _is_started_request accepts.
+    """
+
+    def test_eviction_skips_in_transmission_victim(self):
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1  # first fails, retry after eviction succeeds
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        sched.set_in_transmission_predicate(lambda req: req.py_request_id == 99)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_gen_request(0), victim], set())
+
+        assert 99 not in ids(out.paused_requests)
+        # Suspension is what would unlock the pages; the cache stays active.
+        assert mgr.is_request_active(99)
+        # gen0 self-evicts instead, so the pressure is real and unrelieved.
+        assert ids(out.paused_requests) == [0]
+
+    def test_eviction_takes_the_same_victim_when_not_in_transmission(self):
+        """Control for the test above: only the predicate spares the victim."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] != 1
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_gen_request(0), victim], set())
+
+        assert ids(out.paused_requests) == [99]
+        assert not mgr.is_request_active(99)
+
+    def test_recompute_pause_skips_in_transmission_victim(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        sched.set_in_transmission_predicate(lambda req: req.py_request_id == 99)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
+        # Already suspended, so ordinary eviction has nothing to free and the
+        # destructive recompute path is the only one left.
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([make_gen_request(0), victim], set())
+
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+        assert ids(out.paused_requests) == [0]
+
+    def test_recompute_pause_takes_the_same_victim_when_not_in_transmission(self):
+        """Control for the test above: only the predicate spares the victim."""
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.py_request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([make_gen_request(0), victim], set())
+
+        assert ids(out.recompute_paused_requests) == [99]
+        assert ids(out.generation_requests) == [0]
+
+    def test_predicate_is_not_consulted_for_scheduling(self):
+        """The predicate gates victim selection only, never admission."""
+        seen = []
+
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1024)
+
+        def predicate(req):
+            seen.append(req.py_request_id)
+            return True
+
+        sched.set_in_transmission_predicate(predicate)
+        out = sched.schedule_request([make_gen_request(0), make_ctx_request(1, 50)], set())
+
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.context_requests) == [1]
+        assert seen == []
+
+
+# ===========================================================================
 # PEFT / LoRA
 # ===========================================================================
 

@@ -158,6 +158,19 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # cache_level==GPU), so the slot_ids yielded here are already the right
         # offsets for primary-pool pointer arithmetic. No translation is needed,
         # unlike V1 (see _CacheReuseAdapterV1.get_block_ids).
+        #
+        # That only holds while the cache is active. A suspended cache keeps its
+        # pages as plain holders, which are free to migrate to a secondary tier,
+        # and get_aggregated_page_indices carries no cache level — a host-tier
+        # slot id would be multiplied by the GPU pool stride.
+        #
+        # Raised rather than asserted so the check survives optimized Python,
+        # matching the TLLM_CHECK the V1 path enforces this same invariant with.
+        if not self._mgr.is_request_active(req.py_request_id):
+            raise AssertionError(
+                f"Request {req.py_request_id} has no active KV cache; its slot ids are not "
+                "valid offsets into the GPU pool and must not be used for transfer pointers."
+            )
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
