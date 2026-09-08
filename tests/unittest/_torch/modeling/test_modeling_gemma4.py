@@ -2415,6 +2415,90 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertTrue(chunk_mask[-1, 32].item())
 
     @torch.no_grad()
+    def test_variable_window_matches_dense_bidirectional_mask(self) -> None:
+        """Per-token bounds encode the existing Gemma4 mask exactly."""
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        window = 8
+        prefix_len = 5
+        token_type_ids = torch.tensor(
+            [0, 1, 1, 1, 0, 2, 2, 3, 0, 1, 1], dtype=torch.long, device="cuda"
+        )
+        expected = model.get_context_mask(
+            token_type_ids,
+            effective_sliding_window=window,
+            prefix_len=prefix_len,
+        )
+        starts, ends = model.get_context_variable_window(
+            token_type_ids,
+            effective_sliding_window=window,
+            prefix_len=prefix_len,
+        )
+        kv_positions = torch.arange(expected.shape[1], device="cuda")
+        actual = (kv_positions.unsqueeze(0) >= starts.unsqueeze(1)) & (
+            kv_positions.unsqueeze(0) <= ends.unsqueeze(1)
+        )
+
+        self.assertEqual(starts.dtype, torch.int32)
+        self.assertEqual(ends.dtype, torch.int32)
+        self.assertTrue(starts.is_contiguous())
+        self.assertTrue(ends.is_contiguous())
+        torch.testing.assert_close(actual, expected)
+
+    @torch.no_grad()
+    def test_blackwell_routes_bidirectional_mask_to_variable_window(self) -> None:
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        token_type_ids = torch.tensor([0, 1, 1, 0], dtype=torch.long, device="cuda")
+        starts = torch.tensor([0, 0, 0, 0], dtype=torch.int32, device="cuda")
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
+        output = torch.zeros(4, config.hidden_size, dtype=config.torch_dtype, device="cuda")
+        fake_metadata_type = type("FakeTrtllmAttentionMetadata", (), {})
+        attn_metadata = fake_metadata_type()
+        attn_metadata.padded_num_tokens = None
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
+                fake_metadata_type,
+            ),
+            unittest.mock.patch.object(
+                model,
+                "get_attention_variable_window",
+                return_value=(starts, ends),
+            ) as get_variable_window,
+            unittest.mock.patch.object(model.model, "forward", return_value=output) as text_forward,
+            unittest.mock.patch.object(model.logits_processor, "forward", return_value=output),
+        ):
+            actual = model(
+                attn_metadata=attn_metadata,
+                inputs_embeds=output,
+                mm_token_type_ids=token_type_ids,
+            )
+
+        self.assertIs(actual, output)
+        get_variable_window.assert_called_once_with(
+            mm_token_type_ids=token_type_ids,
+            attn_metadata=attn_metadata,
+            effective_sliding_window=config.sliding_window,
+        )
+        self.assertIsNone(text_forward.call_args.kwargs["local_attention_mask_data"])
+        self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_starts"], starts)
+        self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_ends"], ends)
+
+    @torch.no_grad()
     def test_bidirectional_mask_only_applies_to_sliding_layers(self):
         """Full-attention layers retain the standard causal mask."""
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2446,6 +2530,29 @@ class TestGemma4HFComparison(unittest.TestCase):
                 self.assertIs(actual_mask, local_mask)
             else:
                 self.assertIsNone(actual_mask)
+
+        for layer_forward in layer_forwards:
+            layer_forward.reset_mock()
+        starts = torch.arange(4, dtype=torch.int32, device="cuda")
+        ends = starts.clone()
+        model.model(
+            attn_metadata=unittest.mock.MagicMock(),
+            inputs_embeds=torch.zeros(
+                4, config.hidden_size, dtype=config.torch_dtype, device="cuda"
+            ),
+            local_variable_window_token_starts=starts,
+            local_variable_window_token_ends=ends,
+        )
+
+        for layer, layer_forward in zip(model.model.layers, layer_forwards, strict=True):
+            actual_starts = layer_forward.call_args.kwargs["variable_window_token_starts"]
+            actual_ends = layer_forward.call_args.kwargs["variable_window_token_ends"]
+            if layer.is_sliding:
+                self.assertIs(actual_starts, starts)
+                self.assertIs(actual_ends, ends)
+            else:
+                self.assertIsNone(actual_starts)
+                self.assertIsNone(actual_ends)
 
     @torch.no_grad()
     def test_gemma4_routing_matches_hf_reference(self):

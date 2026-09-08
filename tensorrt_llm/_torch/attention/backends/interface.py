@@ -916,6 +916,8 @@ class AttentionForwardArgs:
     attention_input_type: AttentionInputType = AttentionInputType.mixed
     attention_window_size: Optional[int] = None
     attention_mask_data: Optional[torch.Tensor] = None
+    variable_window_token_starts: Optional[torch.Tensor] = None
+    variable_window_token_ends: Optional[torch.Tensor] = None
     attention_sinks: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
     relative_attention_max_distance: int = 0

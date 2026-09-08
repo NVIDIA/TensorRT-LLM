@@ -584,6 +584,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         else:
             return False, f"invalid FMHA phase: {phase}."
 
+        has_variable_window_starts = fwd.variable_window_token_starts is not None
+        has_variable_window_ends = fwd.variable_window_token_ends is not None
+        if has_variable_window_starts != has_variable_window_ends:
+            return False, "variable-window token starts and ends must be provided together."
+        if (
+            has_variable_window_starts
+            and fwd.attention_input_type == AttentionInputType.generation_only
+        ):
+            return False, "variable-window bounds are supported only for context attention."
+        if has_variable_window_starts and has_context_phase:
+            return False, (
+                "variable-window context attention requires the native TRTLLM-Gen fallback; "
+                "the pinned FlashInfer API does not expose variable-window bounds."
+            )
+
         has_fused_qkv = False
         has_q_only = False
         if not is_mla_enable and not meta.is_cross:

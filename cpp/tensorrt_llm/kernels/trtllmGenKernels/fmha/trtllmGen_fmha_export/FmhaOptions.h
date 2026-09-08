@@ -36,14 +36,13 @@ namespace fmha {
 struct FmhaOptions : public KernelConfigBase {
   // Relative error tolerance.
   float mAtol{1e-2f};
-  // Attention windows size of sliding window attention. Disabled by default.
-  int mAttentionWindowSize{0};
   // Batch size.
   int mBatchSize{2};
   // Whether to verify the correctness. 0: No check, 1: partial, 2: full.
   int mChecksResults{2};
-  // The chunked attention size (default 0 means no chunking).
-  int mChunkedAttentionSize{0};
+  // The chunked attention size. A value > 0 enables chunked attention under the shared
+  // SlidingOrChunkedCausal mask type.
+  int32_t mChunkedAttentionSize{0};
   // Dry-run: print a log but does not actually generate anything
   bool mDryRun{false};
   // Token dimension reserved by the DSv4 FP32 or packed UE8M0 scale tensor. May be padded.
@@ -56,29 +55,35 @@ struct FmhaOptions : public KernelConfigBase {
   bool mEnablesBf16QFp8KvKOnlyTransform{false};
   // Whether is exporting cubin.
   bool mIsExportingCubin{false};
-
-  // Whether running inside TRTLLM (affects KV stride computation for MLA).
-  bool mIsTrtllmLayout{false};
   // Whether the kernel is under tracing
   bool mIsTracing{false};
+  // Whether running inside TRTLLM (affects KV stride computation for MLA).
+  bool mIsTrtllmLayout{false};
+  // Sliding-window left bound. -1 means unbounded left; otherwise each Q row can attend to K
+  // positions no earlier than q - mLeftSlidingWindow, clamped to the sequence length.
+  int32_t mLeftSlidingWindow{-1};
+  // The maximum number of CTAs for K/V.
+  int mMaxNumCtasKv{1};
   // The maximum number of CTAs per sequenceKv (multiCtasKvMode).
   // This is used to limit the number of CTAs per sequenceKv for the multiCtasKvMode.
   int mMaxNumCtasPerSeqKv{INT_MAX};
   // The maximum number of CTAs for Q.
   int mMaxNumCtasQ{1};
-  // The maximum number of CTAs for K/V.
-  int mMaxNumCtasKv{1};
   // The maximum number of pages per sequence in the paged-kv buffer.
   int mMaxNumPagesPerSeqKv{512 / 32};
-  // Sequence length for Q and K/V.
-  int mMaxSeqLenQ{512}, mMaxSeqLenKv{512};
+  // The maximum number of waves for the multiCtasKvMode.
+  int mMaxNumWavesForCtasKvMode{1};
+  // Sequence length for K/V.
+  int mMaxSeqLenKv{512};
+  // Sequence length for Q.
+  int mMaxSeqLenQ{512};
   // The minimum first sparseMask offset in the Kv sequence dimension.
   // Default 0 means that all tokensKv need custom masking.
   int mMinFirstSparseMaskOffsetKv{0};
-  // The minimum sequence length (used to generate variable Q sequence length).
-  int mMinSeqLenQ{INT_MAX};
   // The minimum sequence length (used to generate variable Kv sequence length).
   int mMinSeqLenKv{INT_MAX};
+  // The minimum sequence length (used to generate variable Q sequence length).
+  int mMinSeqLenQ{INT_MAX};
   // The minimum sparse MLA topK length.
   int mMinSparseMlaTopK{1};
   // Benchmark steps.
@@ -92,16 +97,13 @@ struct FmhaOptions : public KernelConfigBase {
   int mNumPagesInMemPool{0};
   // The number of causal-mask spec-decoding tokens (it is fixed in the batch).
   int mNumSpecDecodingTokens{0};
-  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
-  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
-  // uses it as a deterministic upper bound for kernel selection.
-  int mSpecDecodingTargetMaxGenLen{0};
   // Warmup steps.
   int mNumWarmUpSteps{0};
-  // The maximum number of waves for the multiCtasKvMode.
-  int mMaxNumWavesForCtasKvMode{1};
   // The attention output scale.
   float mOutputScale{1.f};
+  // Sliding-window right bound. -1 means unbounded right before option validation; otherwise each Q
+  // row can attend to K positions no later than q + mRightSlidingWindow, clamped to the sequence.
+  int32_t mRightSlidingWindow{-1};
   // Relative error tolerance.
   float mRtol{1e-1f};
   // Whether to skip kernel generation (for debug purpose).
@@ -110,8 +112,14 @@ struct FmhaOptions : public KernelConfigBase {
   float mSkipSoftmaxThresholdScaleFactor{0};
   // The topK value for sparse attention kernels.
   int mSparseAttnTopK{2048};
-  // The sum of sequence lengths for Q and K/V.
-  int mSumOfSeqLensQ{512 * 2}, mSumOfSeqLensKv{512 * 2};
+  // For tree-based custom spec-decoding only: equals max_total_draft_tokens + 1,
+  // fixed at config time. When set with mIsCustomSpecDecodingGen, FmhaAutoTuner
+  // uses it as a deterministic upper bound for kernel selection.
+  int mSpecDecodingTargetMaxGenLen{0};
+  // The sum of sequence lengths for K/V.
+  int mSumOfSeqLensKv{512 * 2};
+  // The sum of sequence lengths for Q.
+  int mSumOfSeqLensQ{512 * 2};
   // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
   bool mUsesSharedPagedKvIdx{false};
   // Select the 2Qx1KV grouped-token schedule for GQA generation (decode) kernels. A fully
@@ -133,7 +141,6 @@ struct FmhaOptions : public KernelConfigBase {
 
     // Then, serialize the FmhaOptions-specific members.
     TO_JSON(mAtol);
-    TO_JSON(mAttentionWindowSize);
     TO_JSON(mBatchSize);
     TO_JSON(mChecksResults);
     TO_JSON(mChunkedAttentionSize);
@@ -144,31 +151,33 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
     TO_JSON(mIsTracing);
+    TO_JSON(mLeftSlidingWindow);
+    TO_JSON(mMaxNumCtasKv);
     TO_JSON(mMaxNumCtasPerSeqKv);
     TO_JSON(mMaxNumCtasQ);
-    TO_JSON(mMaxNumCtasKv);
     TO_JSON(mMaxNumPagesPerSeqKv);
-    TO_JSON(mMaxSeqLenQ);
+    TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mMaxSeqLenKv);
+    TO_JSON(mMaxSeqLenQ);
     TO_JSON(mMinFirstSparseMaskOffsetKv);
-    TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSeqLenKv);
+    TO_JSON(mMinSeqLenQ);
     TO_JSON(mMinSparseMlaTopK);
     TO_JSON(mNumBenchmarkSteps);
     TO_JSON(mNumCtasPerSeqKv);
     TO_JSON(mNumLoopItersForPrint);
     TO_JSON(mNumPagesInMemPool);
     TO_JSON(mNumSpecDecodingTokens);
-    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mNumWarmUpSteps);
-    TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
+    TO_JSON(mRightSlidingWindow);
     TO_JSON(mRtol);
     TO_JSON(mSkipsKernelGen);
     TO_JSON(mSkipSoftmaxThresholdScaleFactor);
     TO_JSON(mSparseAttnTopK);
-    TO_JSON(mSumOfSeqLensQ);
+    TO_JSON(mSpecDecodingTargetMaxGenLen);
     TO_JSON(mSumOfSeqLensKv);
+    TO_JSON(mSumOfSeqLensQ);
     TO_JSON(mUsesSharedPagedKvIdx);
     TO_JSON(mUses2InstsQDecodeKernels);
     TO_JSON(mVerbosity);
@@ -179,8 +188,6 @@ struct FmhaOptions : public KernelConfigBase {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct FmhaOptionsFromArgs {
-  // Attention window size.
-  bool mIsAttentionWindowSizeSet{false};
   // Relative error tolerance.
   bool mIsAtolSet{false};
   // The head dimension per stage for Kv.
@@ -254,6 +261,15 @@ inline bool hasOutputSfs(tg::Dtype dtype) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether token-sparse attention was requested together with window parameters it cannot support
+// (sliding-window mask, chunked attention, or VariableWindow).
+inline bool hasTokenSparseUnsupportedWindowParams(FmhaOptions const& options) {
+  return isAnySlidingWindowMask(options.mMaskType) || options.mLeftSlidingWindow != -1 ||
+         options.mRightSlidingWindow != -1 || options.mChunkedAttentionSize > 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Check whether the runtime skip-correction threshold is valid for the selected kernel.
 inline void checkSkipCorrThreshold(FmhaOptions const& options, float skipCorrThreshold) {
   TLLM_CHECK_ERROR(skipCorrThreshold >= 0.f, "skipCorrThreshold must be non-negative.");
@@ -275,9 +291,118 @@ inline void checkSkipCorrThreshold(FmhaOptions const& options, float skipCorrThr
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Check if the options are valid or not.
+// Check if the options are valid or not. Pure validation, does not mutate options.
 inline void checkFmhaOptions(FmhaOptions const& options,
                              FmhaOptionsFromArgs const& optionsFromArgs) {
+
+  bool const isSlidingOrChunked{isSlidingOrChunkedCausalMask(options.mMaskType)};
+  bool const isSlidingWindowCustom{isSlidingWindowCustomMask(options.mMaskType)};
+  bool const isChunkedAttention{options.mChunkedAttentionSize > 0};
+  bool const hasSlidingOrChunkedParams{options.mLeftSlidingWindow != -1 ||
+                                       options.mRightSlidingWindow != -1 ||
+                                       isChunkedAttention};
+  if (isTokenSparse(options.mSparseType)) {
+    TLLM_CHECK_ERROR(!hasTokenSparseUnsupportedWindowParams(options),
+                     "Token-sparse attention does not support sliding-window, chunked, or "
+                     "VariableWindow mask parameters.");
+  }
+
+  bool const hasValidSlidingOrChunkedMaskType{
+    !hasSlidingOrChunkedParams || isSlidingOrChunked || isSlidingWindowCustom};
+  TLLM_CHECK_ERROR(hasValidSlidingOrChunkedMaskType,
+                   "Sliding window or chunked attention parameters are only supported with "
+                   "SlidingOrChunkedCausal or SlidingWindowCustom mask type.");
+  TLLM_CHECK_ERROR(options.mChunkedAttentionSize >= 0,
+                   "chunkedAttentionSize must be >= 0.");
+
+  // Validate chunked attention. In this mode, mChunkedAttentionSize is the exact chunk size
+  // including the current token. Do not also pass left/right sliding-window bounds.
+  if (isChunkedAttention) {
+    bool const hasSlidingWindowBounds{options.mLeftSlidingWindow != -1 ||
+                                      options.mRightSlidingWindow != -1};
+    TLLM_CHECK_ERROR(!hasSlidingWindowBounds,
+                     "Chunked attention uses mChunkedAttentionSize; do not also set "
+                     "leftSlidingWindow or rightSlidingWindow.");
+
+    bool const isChunkedAttentionActuallyCausal{
+      options.mMaxSeqLenKv > 0 && options.mChunkedAttentionSize >= options.mMaxSeqLenKv};
+    TLLM_CHECK_ERROR(!isChunkedAttentionActuallyCausal,
+                     "Chunked attention with mChunkedAttentionSize >= mMaxSeqLenKv is Causal; "
+                     "use -maskType Causal.");
+  }
+
+  // Validate non-chunked SlidingOrChunkedCausal. In this mode, mLeftSlidingWindow and
+  // mRightSlidingWindow are sliding reaches that exclude the current token, so the attended K
+  // range is [q - leftSlidingWindow, q + rightSlidingWindow].
+  if (isSlidingOrChunked && !isChunkedAttention) {
+    bool const isSlidingOrChunkedActuallyDense{
+      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == -1};
+    TLLM_CHECK_ERROR(!isSlidingOrChunkedActuallyDense,
+                     "SlidingOrChunkedCausal with unbounded left and right sides is Dense; "
+                     "use -maskType Dense.");
+
+    bool const isSlidingOrChunkedActuallyCausal{
+      options.mLeftSlidingWindow == -1 && options.mRightSlidingWindow == 0};
+    TLLM_CHECK_ERROR(!isSlidingOrChunkedActuallyCausal,
+                     "SlidingOrChunkedCausal with unbounded left and rightSlidingWindow = 0 is "
+                     "Causal; use -maskType Causal.");
+
+    bool const isSlidingOrChunkedEffectivelyCausal{
+      options.mMaxSeqLenKv > 0 && options.mLeftSlidingWindow >= options.mMaxSeqLenKv - 1 &&
+      options.mRightSlidingWindow == 0};
+    TLLM_CHECK_ERROR(!isSlidingOrChunkedEffectivelyCausal,
+                     "SlidingOrChunkedCausal with leftSlidingWindow >= mMaxSeqLenKv - 1 and "
+                     "rightSlidingWindow = 0 is Causal; use -maskType Causal.");
+
+    bool const isSlidingOrChunkedEffectivelyDense{
+      options.mMaxSeqLenKv > 0 && options.mLeftSlidingWindow >= options.mMaxSeqLenKv - 1 &&
+      options.mRightSlidingWindow > 0 && options.mRightSlidingWindow >= options.mMaxSeqLenKv - 1};
+    TLLM_CHECK_ERROR(!isSlidingOrChunkedEffectivelyDense,
+                     "SlidingOrChunkedCausal with leftSlidingWindow and rightSlidingWindow both "
+                     ">= mMaxSeqLenKv - 1 is Dense; use -maskType Dense.");
+
+    bool const hasInvalidLeftSlidingWindow{options.mLeftSlidingWindow < -1};
+    TLLM_CHECK_ERROR(!hasInvalidLeftSlidingWindow,
+                     "leftSlidingWindow must be >= -1 for SlidingOrChunkedCausal.");
+
+    bool const hasOversizedLeftSlidingWindow{options.mLeftSlidingWindow > options.mMaxSeqLenKv};
+    TLLM_CHECK_ERROR(!hasOversizedLeftSlidingWindow,
+                     "leftSlidingWindow must be <= mMaxSeqLenKv for SlidingOrChunkedCausal.");
+
+    bool const hasInvalidRightSlidingWindow{options.mRightSlidingWindow < 0};
+    TLLM_CHECK_ERROR(!hasInvalidRightSlidingWindow,
+                     "rightSlidingWindow must be >= 0 for SlidingOrChunkedCausal.");
+
+    bool const isGenerationSlidingOrChunked{!isContextKernel(options.mFmhaKernelType)};
+    TLLM_CHECK_ERROR(!isGenerationSlidingOrChunked || options.mRightSlidingWindow == 0,
+                     "SlidingOrChunkedCausal generation kernels require rightSlidingWindow = 0.");
+
+    bool const hasOversizedRightSlidingWindow{
+      options.mRightSlidingWindow > options.mMaxSeqLenKv};
+    TLLM_CHECK_ERROR(!hasOversizedRightSlidingWindow,
+                     "rightSlidingWindow must be <= mMaxSeqLenKv for SlidingOrChunkedCausal.");
+  }
+
+  // SlidingWindowCustom is the generation custom-mask mode with an analytic left sliding-window
+  // bound. The right/tree visibility still comes from the packed custom mask.
+  if (isSlidingWindowCustom) {
+    TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
+                     "SlidingWindowCustom is only supported with generation kernels.");
+    TLLM_CHECK_ERROR(!isChunkedAttention,
+                     "SlidingWindowCustom requires sliding-window bounds without chunked attention.");
+    TLLM_CHECK_ERROR(options.mLeftSlidingWindow >= 0 && options.mRightSlidingWindow == 0,
+                     "SlidingWindowCustom requires leftSlidingWindow >= 0 and "
+                     "rightSlidingWindow = 0.");
+  }
+
+  // VariableWindow extra constraints.
+  if (isVariableWindowMask(options.mMaskType)) {
+    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType),
+                     "VariableWindow is only supported with context (prefill) kernels.");
+    TLLM_CHECK_ERROR(!options.mGroupsTokensHeadsQ,
+                     "VariableWindow does not support groupsTokensHeadsQ because "
+                     "mGroupsTokensHeadsQ is only supported by generation kernels.");
+  }
 
   TLLM_CHECK_ERROR(!(options.mGroupsHeadsQ && isPackedQkv(options.mQkvLayout)),
                    "Grouping Q heads doesn't work with the packedQkv layout");
@@ -435,20 +560,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
                    "PackedQkv layout does not support supportsDiffSeqLensForQAndKv");
   // Q does not support E2m1 dtype.
   TLLM_CHECK_ERROR(options.mDtypeQ != tg::Dtype::E2m1, "Q does not suppot E2m1 dtype");
-  // Make sure correct attention window size is set.
-  TLLM_CHECK_ERROR(!usesSlidingWindowMask(options.mMaskType) || options.mAttentionWindowSize > 0 ||
-                     options.mChunkedAttentionSize > 0,
-                   "Please set correct sliding attention window size or chunked attention size");
-  TLLM_CHECK_ERROR(!isSlidingWindowCustomMask(options.mMaskType) ||
-                     (options.mAttentionWindowSize > 0 && options.mChunkedAttentionSize == 0),
-                   "SlidingWindowCustom requires attentionWindowSize without chunked attention");
-  if (options.mChunkedAttentionSize > 0) {
-    TLLM_CHECK_ERROR(options.mAttentionWindowSize >= options.mMaxSeqLenKv,
-                     "sliding attention window size must be greater than or equal to maxSeqLenKv");
-    TLLM_CHECK_ERROR(options.mChunkedAttentionSize % (options.mTileSizeKv * options.mNumInstsKv) ==
-                       0,
+  if (isChunkedAttention) {
+    int32_t const chunkSize = options.mChunkedAttentionSize;
+    TLLM_CHECK_ERROR(chunkSize % (options.mTileSizeKv * options.mNumInstsKv) == 0,
                      "Chunked attention size must be a multiple of the tileSizePerCtaKv");
-    TLLM_CHECK_ERROR((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
+    TLLM_CHECK_ERROR((chunkSize & (chunkSize - 1)) == 0,
                      "Chunked attention size must be power of 2");
   }
 
@@ -537,9 +653,6 @@ inline void checkFmhaOptions(FmhaOptions const& options,
       "The sliding-window KV pool is only supported by dynamic-token sparse MLA kernels.");
     TLLM_CHECK_ERROR(options.mSingleTokenQPerCta,
                      "mSingleTokenQPerCta must be true when sliding-window KV pool is enabled.");
-    TLLM_CHECK_ERROR(options.mAttentionWindowSize == options.mTileSizeKv,
-                     "attentionWindowSize must equal tileSizeKv when sliding-window KV pool is "
-                     "enabled.");
   }
 
   // Always enable skipsSoftmaxWhenPossible for outputSkipSoftmaxStats.
@@ -566,8 +679,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(!options.mIsMlaGen
-                       || options.mSelectsGroupedMla,
+    TLLM_CHECK_ERROR(!options.mIsMlaGen || options.mSelectsGroupedMla,
                      "MLA generation with mGroupsTokensHeadsQ requires mSelectsGroupedMla.");
   }
 
@@ -594,7 +706,8 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     // TODO Are there more features that are not compatible?
   }
   if (options.mFineGrainedProducer) {
-    TLLM_CHECK_ERROR(options.mFineGrainedForceValid, "fineGrainedProducer requires fineGrainedForceValid");
+    TLLM_CHECK_ERROR(options.mFineGrainedForceValid,
+                     "fineGrainedProducer requires fineGrainedForceValid");
   }
 #endif // TLLM_RUBIN_FEATURES
 
@@ -614,9 +727,17 @@ inline void checkFmhaOptions(FmhaOptions const& options,
 #endif // TLLM_RUBIN_FEATURES
 
   // For transformed K/V, MmaOrder must be Pv0_Qk0_Pv1_Qk1.
-  if (options.mDtypeQ != options.mDtypeKv) {
+  if (options.mDtypeQ != options.mDtypeK || getDtypeBmm2(options) != options.mDtypeV) {
     TLLM_CHECK_ERROR(options.mMmaOrder == MmaOrder::Pv0_Qk0_Pv1_Qk1,
                      "Only MMA order Pv0_Qk0_Pv1_Qk1 is supported for transformed K/V.");
+  }
+  if (isFp8KNvFp4V(options)) {
+    TLLM_CHECK_ERROR(isFp8QFp8KNvFp4V(options),
+                     "FP8-K/NVFP4-V is supported only with FP8 Q on Blackwell.");
+    TLLM_CHECK_ERROR(options.mDtypeOut == tg::Dtype::Bfloat16,
+                     "FP8-K/NVFP4-V requires BF16 output.");
+    TLLM_CHECK_ERROR(isContextKernel(options.mFmhaKernelType) || !options.mGroupsTokensHeadsQ,
+                     "FP8-K/NVFP4-V generation does not support groupsTokensHeadsQ.");
   }
   if (options.mEnablesBf16QFp8KvKOnlyTransform) {
     TLLM_CHECK_ERROR(usesKOnlyTransformPipeline(options),
@@ -628,10 +749,11 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   if (options.mSeparateTransformedKv) {
     TLLM_CHECK_ERROR(!usesKOnlyTransformPipeline(options),
                      "BF16Q+FP8KV K-only transform cannot be combined with separateTransformedKv.");
-    TLLM_CHECK_ERROR(supportsSeparateTransformedKv(options),
-                     "separateTransformedKv is only supported by BF16Q+E4M3KV full-transform "
-                     "generation kernels on Blackwell with numInstsQ=1, numInstsKv=1, and equal "
-                     "H64/H128/H256 K/V heads.");
+    TLLM_CHECK_ERROR(
+      supportsSeparateTransformedKv(options),
+      "separateTransformedKv is only supported by BF16-Q full-transform generation kernels "
+      "with E4M3 K/V on Blackwell, numInstsQ=1, numInstsKv=1, and equal "
+      "H64/H128/H256 K/V heads.");
   }
 
   if (options.mMmaOrder == MmaOrder::Qk0_Qk1_Pv0_Pv1) {
@@ -653,7 +775,14 @@ inline void checkFmhaOptions(FmhaOptions const& options,
 // Update the fmha options if needed.
 inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& optionsFromArgs) {
   // Set default absolute/relative tolerance for different data types.
-  if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
+  if (options.mDtypeK == tg::Dtype::E2m1 || options.mDtypeV == tg::Dtype::E2m1) {
+    if (!optionsFromArgs.mIsAtolSet) {
+      options.mAtol = 0.3f;
+    }
+    if (!optionsFromArgs.mIsRtolSet) {
+      options.mRtol = 0.1f;
+    }
+  } else if ((options.mDtypeQ == tg::Dtype::Fp16) || (options.mDtypeQ == tg::Dtype::Bfloat16)) {
     // Use smaller tolerance for float16/bfloat16 if it is not set.
     if (options.mDtypeOut == tg::Dtype::E4m3) {
       if (!optionsFromArgs.mIsAtolSet) {
@@ -676,13 +805,6 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
       if (!optionsFromArgs.mIsRtolSet) {
         options.mRtol = 1e-3f;
       }
-    }
-  } else if (options.mDtypeKv == tg::Dtype::E2m1) {
-    if (!optionsFromArgs.mIsAtolSet) {
-      options.mAtol = 0.3f;
-    }
-    if (!optionsFromArgs.mIsRtolSet) {
-      options.mRtol = 0.1f;
     }
   } else if (options.mDtypeOut == tg::Dtype::E2m1) {
     if (!optionsFromArgs.mIsAtolSet) {

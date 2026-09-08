@@ -1203,10 +1203,9 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        // The attention window size.
-        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
-        // The chunked attention size.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = 0;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
@@ -2114,6 +2113,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
         fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
         fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
+        fmhaParams.variableWindowTokenStartsPtr = params.variable_window_token_starts;
+        fmhaParams.variableWindowTokenEndsPtr = params.variable_window_token_ends;
         fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
         fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
         fmhaParams.scaleBmm2Ptr = workspaceViews.fmhaBmm2Scale;
@@ -3060,8 +3061,16 @@ int AttentionOp::initialize() noexcept
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
 
-        // setting attention mask type based on the mask type
-        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+        // Variable-window bounds are a context-only runtime feature. Generation
+        // continues to use the model's regular causal mask.
+        if (mUseVariableWindow)
+        {
+            fmhaParams.attentionMaskType = ContextAttentionMaskType::VARIABLE_WINDOW;
+        }
+        else
+        {
+            fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mMaskType));
+        }
 
         if (isCrossAttention())
         {

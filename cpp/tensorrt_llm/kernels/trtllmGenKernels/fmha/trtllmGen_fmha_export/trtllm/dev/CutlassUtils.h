@@ -1147,6 +1147,25 @@ __forceinline__ __device__ float scale_rcp_exp_only(float val) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Returns the exact FP32 reciprocal of a finite UE8m0 scaling factor.
+__forceinline__ __device__ float scale_rcp_ue8m0(cutlass::float_ue8m0_t val) {
+  uint32_t const exponent = static_cast<uint32_t>(val.storage);
+  float result;
+  asm volatile("{\n"
+               ".reg .b32 reciprocal, bf16x2;\n"
+               ".reg .b16 lo, hi;\n"
+               "sub.u32 reciprocal, 254, %1;\n"
+               "mov.b32 {lo, hi}, reciprocal;\n"
+               "cvt.rn.bf16x2.ue8m0x2 bf16x2, lo;\n"
+               "prmt.b32 %0, 0, bf16x2, 0x5410;\n"
+               "}\n"
+               : "=f"(result)
+               : "r"(exponent));
+  return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ cutlass::Array<float, 2> sigmoid2_base2(cutlass::Array<float, 2> x) {
   cutlass::Array<float, 2> result;
   // Vector of ones.
