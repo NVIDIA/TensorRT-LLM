@@ -151,7 +151,8 @@ def build_perf_optimize_prompts(
     When ``kernel_coverage`` is set (the validated
     ``profile.kernel_coverage`` block — the per-kernel coverage
     contract), the analyzer gets the coverage-driven ncu targeting, the
-    two per-kernel questions (faster? fusible?), and the
+    four per-kernel questions (eliminable? faster? fusible?
+    overlappable?), and the
     ``kernel_ledger.yaml`` contract with the task's bars interpolated;
     the reporter gets the "Kernel Coverage" accountability section. The
     other roles are unchanged — the ledger is authored by the analyzer

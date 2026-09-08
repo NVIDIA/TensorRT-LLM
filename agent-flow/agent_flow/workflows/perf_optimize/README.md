@@ -354,7 +354,11 @@ Fresh runs only: on resume the checkpoint wins and the flag is ignored
 with a warning. Note that a run whose `profile.kernel_coverage` contract
 is on does **not** enforce the per-kernel ledger for a reused round that
 carries none, nor for a replan-only round (neither ran ncu); every round
-the analyzer actually profiles is still bound by it.
+the analyzer actually profiles is still bound by it. A reused round that
+*did* import a ledger is held to the contract, but one this campaign
+cannot satisfy — an older schema, or `item` refs naming the source
+campaign's roadmap ids — is waived with a warning rather than aborted,
+since the plan-only round never writes a ledger a retry could repair.
 
 ## Usage
 
@@ -549,25 +553,56 @@ running the CLI.
   coverage target is reached, captured over up to 3 bounded ncu passes
   that re-filter on still-missing stems so once-per-step kernels are
   not starved by per-layer hot ones). Each round the analyzer must then
-  answer two questions per enumerated kernel — *can it be made faster?*
-  *can it be fused with its neighbors?* — in
+  answer four questions per enumerated kernel — *can it be eliminated?*
+  *can it be made faster?* *can it be fused with its neighbors?* *can it
+  be overlapped with independent work on another stream?* — in
   `rounds/round_<n>/analysis/kernel_ledger.yaml`: every row carries the
-  kernel's ncu SOL metrics/bound class plus a `faster` and a `fusion`
-  disposition, each either a roadmap item id or an evidence-backed
-  dismissal (`at-sol-floor`, `below-materiality` with arithmetic,
-  `multi-consumer-pinned`, `already-fused`, `phase-boundary`,
-  `needs-rebuild`, ...); `needs-rebuild` is valid only when a
-  written-from-scratch replacement kernel routed from the Python call
-  site is also ruled out, not merely because the incumbent ships
-  compiled; fusion rows record the observed neighbors from the trace. The orchestrator schema-validates the ledger after every
-  analyzer turn (both dispositions per row, `item` refs resolving to
-  real roadmap ids, coverage ≥ target) and **aborts the stage on an
-  incomplete ledger**, so the campaign cannot conclude while a hot
-  kernel's optimization or fusion possibility was never considered; the
-  reporter's *Kernel Coverage* section resolves the final ledger's
-  dispositions to campaign outcomes and itemizes the untried tail.
-  Requires `nsys` + `ncu` in `profile.methods`; costs extra profiling
-  wall-clock per round.
+  kernel's ncu SOL metrics/bound class plus an `elimination`, a
+  `faster`, a `fusion` and an `overlap` disposition, each either a
+  roadmap item id or an evidence-backed dismissal (`mandatory-math`,
+  `padding-minimal`, `already-hoisted`, `fast-path-active`,
+  `fast-path-blocked`, `at-sol-floor`, `below-materiality` with
+  arithmetic, `multi-consumer-pinned`, `already-fused`,
+  `phase-boundary`, `needs-rebuild`, `graph-disabled`,
+  `no-independent-partner`, `resource-saturated`, ...);
+  `needs-rebuild` is valid only when a written-from-scratch replacement
+  kernel routed from the Python call site is also ruled out, not merely
+  because the incumbent ships compiled; elimination rows record what
+  consumes the output (or the guard that selected this path), fusion
+  rows the observed neighbors from the trace, and overlap rows the
+  candidate partner plus the evidence the two are serialized today.
+
+  The four are ordered by how much they presuppose, each asking less
+  than the last. **Elimination** presupposes only that the kernel runs
+  today, and is first because a `yes` moots the rest and recovers the
+  row's *whole* share rather than a fraction — it covers redundant work,
+  work over padded/masked data, per-step recompute of something
+  invariant, and the accidental slow path (an `is_fused=False` fallback
+  firing because a gated fast path did not), which is the per-kernel
+  per-round teeth on round 1's dormant-capability sweep. **Faster** and
+  **fusion** presuppose the work is necessary *and* that the kernel must
+  run alone. **Overlap** drops the alone assumption: a kernel at its
+  bound-class ceiling (`at-sol-floor`) whose neighbors move only
+  mandatory bytes (`neighbors-at-bandwidth-floor`) is legitimately
+  closed on both and can still give back most of its share by running
+  concurrently with independent work — realized through the checkout's
+  own `maybe_execute_in_parallel` / `AuxStreamType` idiom, and gated on
+  CUDA graphs being enabled (multi-stream no-ops without them). The
+  ledger also carries `coverage.gpu_busy_pct`, the busy share of the
+  profiled window: `share_pct` is a share of *GPU time* while
+  `noise_floor_pct` and `expected_gain_pct` are shares of *wall clock*,
+  so every materiality claim converts through it rather than
+  overstating candidates by `1/busy` on a host-bound deployment.
+
+  The orchestrator schema-validates the ledger after every analyzer
+  turn (all four dispositions per row, `item` refs resolving to real
+  roadmap ids, coverage ≥ target, `gpu_busy_pct` present) and **aborts
+  the stage on an incomplete ledger**, so the campaign cannot conclude
+  while a hot kernel's elimination, optimization, fusion, or overlap
+  possibility was never considered; the reporter's *Kernel Coverage* section resolves
+  the final ledger's dispositions to campaign outcomes and itemizes the
+  untried tail. Requires `nsys` + `ncu` in `profile.methods`; costs
+  extra profiling wall-clock per round.
 - **Optimization casebook.** The benchmarker/analyzer load the
   `trtllm-agent-toolkit:perf-optimization-casebook` skill as read-only
   reference; the optimizer uses it *actionably* (how-to-apply /
