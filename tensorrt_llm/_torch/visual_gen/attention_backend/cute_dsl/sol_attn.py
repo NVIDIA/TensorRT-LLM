@@ -97,10 +97,10 @@ def sol_attn_graph_phase(
 def _cute_dense_available() -> bool:
     """Whether `cute_dsl_fmha_fwd` can run on the current device.
 
-    Checked once at construction. Sol-Attn is sm100-only and the dense CuTe DSL
-    kernel covers sm_100a/sm_103a, so in practice this is always true wherever
-    Sol-Attn runs; the negative branch exists so an unsupported device degrades
-    to SDPA instead of raising.
+    Checked once at construction. Sol-Attn and the dense CuTe DSL kernel now
+    cover the same set (sm_100a/sm_103a), so in practice this is always true
+    wherever Sol-Attn runs; the negative branch exists so an unsupported device
+    degrades to SDPA instead of raising.
     """
     try:
         from .fmha import _check_cute_runtime_available, _get_gpu_arch
@@ -127,7 +127,7 @@ def _parse_dense_layers(spec: Optional[str]) -> frozenset[int]:
 
 
 class SolAttention(AttentionBackend):
-    """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100).
+    """Sol-Attn dynamic block-routing sparse attention (CuTeDSL, sm100/sm103).
 
     The kernel wrapper already falls back to dense attention on any unsupported
     shape/dtype/arch (see ``_run_sol_attn_bthd``); this class only adds the

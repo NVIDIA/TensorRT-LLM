@@ -95,7 +95,25 @@ remain subject to their respective licenses.
 SM120 (RTX Blackwell) was carried in an earlier revision of this port and has
 been dropped: it had kernel-level evidence only, no end-to-end validation, and
 no `cute_dsl_fmha_fwd` exists for that architecture, so Sol-Attn's dense
-fallback could not match its own backend there. With SM100 alone, Sol-Attn's
-architecture set is a subset of the dense CuTe DSL FMHA kernel's. The
-cuDNN-frontend attribution that covered the SM120 execution skeleton was
-removed with it.
+fallback could not match its own backend there. The cuDNN-frontend attribution
+that covered the SM120 execution skeleton was removed with it.
+
+SM103 (B300/GB300) is served by the same vendored `sm100/` kernel. Upstream
+ships it as SM100-only, so treating one kernel as covering both steppings is a
+divergence and is recorded here. Two things make it safe. The CuTe DSL JIT
+targets whatever device it compiles on -- `cute.compile()` takes no
+architecture argument -- and the kernel body uses no SM100-exclusive
+construct; the dense `cute_dsl_fmha_fwd` in this repository already serves
+`sm_100a` and `sm_103a` from one class for the same reason, differing only by
+an exp2-emulation flag that Sol-Attn does not use. So Sol-Attn's architecture
+set remains a subset of the dense CuTe DSL FMHA kernel's, which is the
+invariant SM120 failed.
+
+Evidence: the vendored package was run directly (not through the TensorRT-LLM
+wrapper, whose ineligibility path would mask a failure as a dense fallback) on
+a B300 SXM6 AC, and on a B200 as a control, with identical seed, shape and
+pinned toolchain. Both produced finite output with matching error against a
+dense SDPA reference at tau 0.0/1.0/2.0: cosine 0.826578/0.686830/0.629194 on
+SM103 versus 0.826579/0.686839/0.629211 on SM100, with mean absolute error
+equal to printed precision. The residual difference appears only in the maximum
+element and is consistent with reduction order across a different SM count.

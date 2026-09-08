@@ -226,8 +226,9 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
     """Sol-Attn sparse attention configuration for visual generation.
 
     Dynamic block routing + sparse computation + approximation correction in
-    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL, sm100
-    (B200/GB200) only, head_dim=128, bf16, MHA.
+    one online-softmax pass (arXiv:2607.24027). Kernel is CuTeDSL on
+    datacenter Blackwell -- sm100 (B200/GB200) and sm103 (B300/GB300) --
+    head_dim=128, bf16, MHA.
 
     On an unsupported *shape, dtype, or architecture* the kernel falls back to
     dense attention -- the configured backend's dense kernel where available,

@@ -22,14 +22,15 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
 | VSA | TBD | TODO |
-| `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100) |
+| `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100/sm103) |
 
 ### Sol-Attn
 
 Sol-Attn ([arXiv:2607.24027](https://arxiv.org/abs/2607.24027)) folds dynamic block
 routing, sparse computation, and an approximation-correction term into one
-online-softmax pass. It runs on the **CUTEDSL** backend only, on sm100
-(B200/GB200), and requires `head_dim=128`, bfloat16, and MHA
+online-softmax pass. It runs on the **CUTEDSL** backend only, on datacenter
+Blackwell -- sm100 (B200/GB200) and sm103 (B300/GB300) -- and requires
+`head_dim=128`, bfloat16, and MHA
 (`num_kv_heads == num_heads`).
 
 ```yaml
