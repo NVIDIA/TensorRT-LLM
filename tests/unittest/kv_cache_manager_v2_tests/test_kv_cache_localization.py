@@ -88,6 +88,13 @@ _TOKENS_PER_BLOCK = 32
 _KV_BUF_SIZE = 8192  # 8 KB per KV buffer
 
 
+def setUpModule() -> None:
+    # Locality domains only exist in the Python backend; the C++ one reports a
+    # single domain, so every assertion here would be meaningless.
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python":
+        raise unittest.SkipTest("locality domains require the Python KVCacheManagerV2 backend")
+
+
 @contextmanager
 def _override_localization_mode(mode: str):
     env_backup = os.environ.get("TRT_LLM_MOCK_LOCALIZATION_SUPPORT")

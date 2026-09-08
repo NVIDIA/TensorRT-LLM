@@ -517,6 +517,11 @@ class TestSlotAllocatorOffset(unittest.TestCase):
         alloc.release(recycled)
 
 
+# Locality domains only exist in the Python backend.
+@unittest.skipIf(
+    os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "python",
+    "locality domains require the Python KVCacheManagerV2 backend",
+)
 class TestStorageManagerLocalized(unittest.TestCase):
     """Tests for StorageManager when GpuCacheLevelStorage has num_locality_domains > 1.
 
