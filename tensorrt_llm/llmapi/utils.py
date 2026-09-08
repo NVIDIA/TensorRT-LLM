@@ -691,6 +691,25 @@ def _set_affinity_all_threads(cpus: list[int]) -> tuple[int, int]:
     return bound, attempted
 
 
+def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
+    """Rebind existing threads to the calling thread's current CPU mask.
+
+    This refreshes the snapshot taken by configure_cpu_affinity after
+    model and KV-cache initialization may have created more threads. It does
+    not choose or change the affinity policy.
+    """
+    if not hasattr(os, "sched_getaffinity"):
+        return 0, 0
+    try:
+        cpus = list(os.sched_getaffinity(0))
+    except OSError as e:
+        logger.warning(
+            f"Could not read the calling thread's CPU affinity before "
+            f"starting executor threads: {e}.")
+        return 0, 0
+    return _set_affinity_all_threads(cpus)
+
+
 def configure_cpu_affinity(device_id: int) -> None:
     """Probe and configure the CPU affinity of the calling process based on NUMA topology.
 

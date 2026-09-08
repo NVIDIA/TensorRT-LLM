@@ -219,6 +219,18 @@ assert bound == attempted, (bound, attempted)
 assert bound >= 2, (bound, attempted)
 assert seen == [subset], seen
 assert sorted(os.sched_getaffinity(0)) == subset
+
+later_seen = []
+
+
+def later_worker():
+    later_seen.append(sorted(os.sched_getaffinity(0)))
+
+
+later_thread = threading.Thread(target=later_worker, daemon=True)
+later_thread.start()
+later_thread.join(60)
+assert later_seen == [subset], later_seen
 print("OK")
 """
 

@@ -45,6 +45,8 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
                                           WaitingQueuePolicy)
+from tensorrt_llm.llmapi.utils import \
+    _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -1280,6 +1282,13 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                # Model/KV-cache/transceiver construction can create threads
+                # after configure_cpu_affinity(). Refresh the existing-thread
+                # snapshot immediately before launching executor threads.
+                # Explicit affinity opt-out must remain a true opt-out.
+                if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None,
+                                                                         "1"):
+                    _reapply_current_thread_affinity_to_all_threads()
                 if self.dist.pp_size > 1:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
                         maxsize=self.num_micro_batches)

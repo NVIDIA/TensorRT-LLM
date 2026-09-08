@@ -31,8 +31,9 @@ environment variable as follows:
 The mask is applied to each TID from a single `/proc/self/task` enumeration,
 not to the main thread alone, so threads created earlier (for example by MPI
 or communication libraries) are covered too. This is best effort: threads
-created concurrently may be missed, and later threads inherit their creator's
-mask.
+created concurrently may be missed. A final existing-thread refresh is done
+immediately before the executor worker threads start; later threads inherit
+their creator's mask.
 
 Where the worker shares a process with caller code, non-worker threads in that
 process are rebound too, and the mask is not restored at shutdown. This covers
