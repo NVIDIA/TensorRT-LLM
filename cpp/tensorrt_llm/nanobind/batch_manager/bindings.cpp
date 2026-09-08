@@ -398,10 +398,8 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens, bool return_encoder_output,
                 std::optional<tb::LlmRequest::RequestIdType> client_id, executor::PriorityType priority,
                 std::optional<at::Tensor> encoder_input_features,
-                std::optional<tb::LlmRequest::SizeType32> encoder_output_length,
-                std::optional<at::Tensor> cross_attention_mask, tb::LlmRequestType llm_request_type,
-                std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids,
-                std::optional<at::Tensor> skip_cross_attn_blocks, bool return_perf_metrics,
+                std::optional<tb::LlmRequest::SizeType32> encoder_output_length, tb::LlmRequestType llm_request_type,
+                std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids, bool return_perf_metrics,
                 std::optional<executor::GuidedDecodingParams> guided_decoding_params,
                 std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
@@ -429,8 +427,6 @@ void initBindings(nb::module_& m)
                 auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
-                auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
-                auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
@@ -439,9 +435,8 @@ void initBindings(nb::module_& m)
                     lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
                     return_generation_logits, draft_tokens, exclude_input_from_output, encoder_input_tokens,
                     return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
-                    encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
-                    skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                    language_adapter_uid, allotted_time_ms, context_phase_params, arrival_time,
+                    encoder_output_length, llm_request_type, input_token_extra_ids, return_perf_metrics,
+                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, arrival_time,
                     std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
                     multimodal_run_lengths, std::move(cache_salt)};
             },
@@ -459,13 +454,12 @@ void initBindings(nb::module_& m)
             nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
             nb::arg("client_id") = std::nullopt, nb::arg("priority") = executor::Request::kDefaultPriority,
             nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
-            nb::arg("cross_attention_mask") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-            nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
-            nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
-            nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
-            nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,
-            nb::arg("agent_hierarchy") = std::nullopt, nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
+            nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("return_perf_metrics") = false,
+            nb::arg("guided_decoding_params") = std::nullopt, nb::arg("language_adapter_uid") = std::nullopt,
+            nb::arg("allotted_time_ms") = std::nullopt, nb::arg("context_phase_params") = std::nullopt,
+            nb::arg("arrival_time") = std::nullopt, nb::arg("agent_hierarchy") = std::nullopt,
+            nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
             nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt,
             nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
