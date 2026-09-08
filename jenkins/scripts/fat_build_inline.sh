@@ -60,7 +60,10 @@ LLM_TARFILE_URL="$1"
 TAR_NAME="$2"
 cd /tmp
 echo "[fat_build] Downloading $TAR_NAME..."
-wget -nv --tries=5 --retry-connrefused --waitretry=30 --timeout=300 "$LLM_TARFILE_URL"
+# -O for the same reason the callers in L0_Test.groovy use it: a second wget
+# process (a retried builder job) would otherwise save to $TAR_NAME.1 and leave
+# the tar below unpacking whatever the first attempt got.
+wget -nv --tries=5 --retry-connrefused --waitretry=30 --timeout=300 -O "$TAR_NAME" "$LLM_TARFILE_URL"
 tar -zxf "$TAR_NAME"
 rm -f "$TAR_NAME"
 echo "[fat_build] Python/pip versions:"
