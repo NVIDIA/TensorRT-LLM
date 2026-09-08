@@ -98,8 +98,26 @@ jobs:
               query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
+                    baseRefName
                     reviewDecision
                     state
+                    latestOpinionatedReviews(first: 100, writersOnly: true) {
+                      nodes {
+                        state
+                      }
+                      pageInfo {
+                        hasNextPage
+                      }
+                    }
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        isOutdated
+                      }
+                      pageInfo {
+                        hasNextPage
+                      }
+                    }
                   }
                 }
               }
@@ -115,7 +133,56 @@ jobs:
                 console.log(`PR #${pullNumber} is not open; skipping auto-labeling.`);
                 return;
               }
-              if (pullRequest.reviewDecision !== 'APPROVED') {
+              const latestOpinions = pullRequest.latestOpinionatedReviews?.nodes ?? [];
+              const hasApproval = latestOpinions.some(
+                (review) => review.state === 'APPROVED'
+              );
+              const hasChangesRequested = latestOpinions.some(
+                (review) => review.state === 'CHANGES_REQUESTED'
+              );
+              const hasUnresolvedConversation =
+                (pullRequest.reviewThreads?.nodes ?? []).some(
+                  (thread) => !thread.isResolved && !thread.isOutdated
+                );
+              const opinionsComplete =
+                pullRequest.latestOpinionatedReviews?.pageInfo?.hasNextPage === false;
+              let requiredApprovalCountSatisfied = false;
+              if (pullRequest.reviewDecision === null &&
+                  opinionsComplete &&
+                  hasApproval &&
+                  !hasChangesRequested &&
+                  hasUnresolvedConversation) {
+                try {
+                  const response = await github.request(
+                    'GET /repos/{owner}/{repo}/rules/branches/{branch}',
+                    { ...context.repo, branch: pullRequest.baseRefName }
+                  );
+                  const approvalCounts = response.data
+                    .filter((rule) => rule.type === 'pull_request')
+                    .map((rule) => rule.parameters?.required_approving_review_count)
+                    .filter((count) => Number.isSafeInteger(count));
+                  if (approvalCounts.length === 0) {
+                    core.warning('Could not determine the required approval count.');
+                  } else {
+                    const approvalCount = latestOpinions.filter(
+                      (review) => review.state === 'APPROVED'
+                    ).length;
+                    requiredApprovalCountSatisfied =
+                      approvalCount >= Math.max(...approvalCounts);
+                  }
+                } catch (error) {
+                  core.warning(`Could not read branch approval rules: ${error.message}`);
+                }
+              }
+              const fullyApproved =
+                pullRequest.reviewDecision === 'APPROVED' ||
+                (pullRequest.reviewDecision === null &&
+                 opinionsComplete &&
+                 hasApproval &&
+                 !hasChangesRequested &&
+                 hasUnresolvedConversation &&
+                 requiredApprovalCountSatisfied);
+              if (!fullyApproved) {
                 console.log(`PR #${pullNumber} is not fully approved; skipping auto-labeling.`);
                 return;
               }
@@ -216,6 +283,23 @@ jobs:
               }
               return 'false';
             }
+
+      - name: Explain automatic full pre-merge approval
+        if: >-
+          steps.validate.outputs.result == 'true' &&
+          steps.validate.outputs.validated_actor == 'trtllm-agent'
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body:
+                'Automatically added "ci: full pre-merge approved" because this PR has ' +
+                'satisfied the required GitHub review approvals. Unresolved review ' +
+                'conversations and other required checks remain independent merge requirements.',
+            });
 
       - name: Clear unauthorized full pre-merge approval
         # Let a started job attempt fail-closed cleanup after normal cancellation.
