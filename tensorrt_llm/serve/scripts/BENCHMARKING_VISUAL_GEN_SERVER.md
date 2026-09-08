@@ -29,10 +29,9 @@ This page repeats no field description. Each lives with its definition:
 * **Execution** — how the client drives the run, and how the media comes back.
 * **Results** — what the run writes down.
 
-The rest of this page is what none of the definitions above can state on its own: the
-document's shape, which route carries which field, and how the latency series relate.
+Four of them are their flags and nothing more. Workload is the one with a shape of its own.
 
-## The workload document
+### Workload
 
 A YAML or JSON file, the same document inline (starting with `{` or `[`), or a bare list of
 requests, named by `--workload`.
@@ -58,7 +57,7 @@ requests:
 `backend` sits at the top level and selects the route, and so what the run measures.
 Everything else is a `VisualGenParams` field, `prompt`, `prompt_file`, or `extra_params`.
 
-### Which route carries which field
+#### Route matrix
 
 Derived at load from the request model the route validates against, so naming a field the
 route cannot carry is an error rather than a request the server ignores.
@@ -76,7 +75,7 @@ route cannot carry is an error rather than a request the server ignores.
 Each reference conditions one generation, so it goes in a request and `common_params`
 rejects it.
 
-### Resolution order
+#### Resolution order
 
 Each request is `common_params`, then the request's own keys. `extra_params` merges per key
 rather than being replaced whole.
@@ -85,7 +84,7 @@ rather than being replaced whole.
   run.
 * `--num-requests` cycles or truncates the resulting list.
 
-### References and prompt files
+#### References and prompt files
 
 A path is read and encoded when the document loads, so a missing file fails before the run
 starts. Relative paths resolve from the document, and `~` expands; there is no variable
@@ -96,14 +95,14 @@ format}` — which is passed through untouched.
 `extra_params.action` and dropped; setting both is an error. `_resolve_prompt_file` documents
 the shapes a prompt file is read in.
 
-## Reading the result
+## Result
 
 `--save-result` writes the JSON, `--save-detailed` adds the server-side series and the
 per-request records, and the run prints the summary scalars with a table of `e2e_latency` and
 `gen_latency`. Every series is `{mean, median, std, min, max, percentiles}` over the run's
 requests — **one sample per request**.
 
-### How the series relate
+### Series relationships
 
 ```
 gen_latency = server_gen  + network + client_poll_interval
@@ -127,7 +126,7 @@ that follows it, and `gen_latency` stops where the second begins. The encode's c
 `--format` and to whether ffmpeg is installed, so folding it into `server_gen` would move the
 engine's number when only the output container changed.
 
-### Before trusting a run
+### Validity checks
 
 The run exits non-zero when `completed` differs from `total_requests`, after writing the
 result.
