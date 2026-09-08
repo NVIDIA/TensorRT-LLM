@@ -77,6 +77,10 @@ reviews:
     drafts: false
     base_branches: ["main", "release/.+"]
 
+  path_filters:
+    # Vendored/adapted FlashInfer kernels; excluded from review.
+    - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
+
   path_instructions:
     # Production-code coverage review. This is required because tests/** rules
     # do not run when a PR changes source code without changing a test file.
