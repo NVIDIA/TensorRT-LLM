@@ -113,7 +113,7 @@ def test_apply_routes_correct_shapes(monkeypatch) -> None:
     splitk_module.run_splitk_dense = fake_run_splitk_dense
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 
@@ -196,7 +196,7 @@ def test_apply_force_active_bypasses_low_m_gemm_active(monkeypatch) -> None:
     splitk_module.run_splitk_dense = fake_run
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 
@@ -246,7 +246,7 @@ def test_direct_runner_no_tactics_when_bias_present(monkeypatch) -> None:
     direct_module.autotune_tactics = MagicMock(return_value=[])
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_direct",
         direct_module,
     )
 
@@ -280,7 +280,7 @@ def test_direct_runner_tactics_serialisable(monkeypatch) -> None:
     direct_module.default_tactic = lambda m, n, k: FakeTactic()
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_direct",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_direct",
         direct_module,
     )
 
@@ -397,7 +397,7 @@ def test_runner_get_valid_tactics_returns_serialisable_tuples(monkeypatch) -> No
     splitk_module.autotune_tactics = lambda m, n, k: []
     monkeypatch.setitem(
         sys.modules,
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.low_m_bf16_splitk",
+        "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk",
         splitk_module,
     )
 
