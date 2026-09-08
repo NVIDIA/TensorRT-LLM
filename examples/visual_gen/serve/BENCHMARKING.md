@@ -239,9 +239,12 @@ finished within one `--poll-interval`.
 
 ### Result JSON
 
-`--save-result` writes the metrics above plus `date`, `duration`, and `config` — the run's
-`num_requests`, `num_gpus`, `max_concurrency`, `request_rate`, `burstiness`, `response_format`,
-`format`, `output_media_dir` and, for video, `poll_interval`.
+`--save-result` writes the metrics above plus `schema_version`, `date`, `duration`, and
+`config` — the run's `num_requests`, `num_gpus`, `max_concurrency`, `request_rate`,
+`burstiness`, `response_format`, `format`, `output_media_dir` and, for video, `poll_interval`.
+
+`schema_version` is `2`, the shape this page describes. A file without the key predates it:
+its generation config lived in flags and its latency keys carried other names.
 
 `--save-detailed` adds `timings.server_*` and a `requests[]` record per request:
 

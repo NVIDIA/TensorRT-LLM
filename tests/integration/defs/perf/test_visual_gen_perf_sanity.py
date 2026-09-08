@@ -470,6 +470,8 @@ class VisualGenPerfSanityTestConfig:
         optional_arg_map = {
             "num_prompts": "--num-requests",
             "max_concurrency": "--max-concurrency",
+            "request_rate": "--request-rate",
+            "burstiness": "--burstiness",
             "request_timeout": "--request-timeout",
             "poll_interval": "--poll-interval",
             "metric_percentiles": "--metric-percentiles",

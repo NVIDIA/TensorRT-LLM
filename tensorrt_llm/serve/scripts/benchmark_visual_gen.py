@@ -68,6 +68,10 @@ from tensorrt_llm.serve.visual_gen_metrics import (
 )
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
+# 2 is the workload-document shape. The shape before it carried no version, so a
+# result without the key reads as 1.
+RESULT_SCHEMA_VERSION = 2
+
 VIDEO_BACKEND = "openai-videos"
 BACKEND_ENDPOINTS = {
     "openai-images": "/v1/images/generations",
@@ -1256,6 +1260,9 @@ def build_visual_gen_result(
     rate_key, rate = _output_rate(records, backend, duration)
 
     result: dict[str, Any] = {
+        # A file without this key is the pre-workload shape, whose generation config
+        # lived in flags and whose latency keys were named differently.
+        "schema_version": RESULT_SCHEMA_VERSION,
         "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
         "backend": backend,
         "model": model,

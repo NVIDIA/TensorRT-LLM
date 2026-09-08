@@ -22,6 +22,7 @@ import pytest
 
 from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     REFERENCE_KEYS,
+    RESULT_SCHEMA_VERSION,
     SCALAR_PARAM_FIELDS,
     SERVER_TIMING_FIELDS,
     VisualGenRequestRecord,
@@ -399,6 +400,23 @@ def test_an_unreported_optional_timing_is_null_not_zero():
     assert result["timings"]["server_e2e"] is None
     assert result["timings"]["server_gen"]["mean"] == pytest.approx(0.8)
     assert result["e2e_latency"]["mean"] == pytest.approx(1.0)
+
+
+def test_the_result_states_which_shape_it_is():
+    """A stored result is read long after the run, by a reader holding both shapes."""
+    result = build_visual_gen_result(
+        backend="openai-images",
+        model="m",
+        duration=1.0,
+        records=[
+            VisualGenRequestRecord(index=0, prompt="p", params={}, success=True, client_e2e=1.0)
+        ],
+        selected_percentiles=[50.0],
+        config={},
+        save_detailed=False,
+    )
+
+    assert result["schema_version"] == RESULT_SCHEMA_VERSION
 
 
 def test_pacing_is_off_at_the_default_rate():
