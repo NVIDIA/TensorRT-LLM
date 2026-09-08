@@ -2030,13 +2030,7 @@ public:
     bool mApplyLogitsPostProcessorBatched{false};
     std::optional<RequestIdType> mClientId{std::nullopt};
 
-    // Position of mask token in GLM model inputs
-    SizeType32 mMaskPosition{0};
-
     LlmRequestState mState{LlmRequestState::kCONTEXT_INIT};
-
-    // current position of the prompt tuning table (only used in chunked prefill mode)
-    SizeType32 mPtableCurrentPosition{0};
 
 protected:
     bool mIsStreaming;
