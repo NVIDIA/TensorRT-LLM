@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 set -ex
 
 GITHUB_URL="https://github.com"
@@ -202,6 +204,10 @@ case "$ID" in
     exit 1
     ;;
 esac
+
+# HPC-X 2.26's OpenMPI 4 runtime lacks the ARM64 wait-sync publication
+# barriers. Apply the upstream fix before mpi4py is installed.
+bash "$(dirname "${BASH_SOURCE[0]}")/install_openmpi_wait_sync.sh"
 
 # Final cleanup
 cleanup
