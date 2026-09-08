@@ -45,33 +45,45 @@ KdaDecodeKernel selectLegacyKdaDecodeKernel(KdaDecodeParams const& params)
     return useCompactHeads ? KdaDecodeKernel::kLegacyCompactHeads : KdaDecodeKernel::kLegacyManyHeads;
 }
 
-KdaDecodeKernel selectOptimizedKdaDecodeKernel(int smVersion, int64_t workload)
+KdaDecodeKernel selectOptimizedKdaDecodeKernel(int smVersion, KdaDecodeParams const& params)
 {
+    int64_t const workload = static_cast<int64_t>(params.batchSize) * params.numHeads;
+    if (workload <= 32)
+    {
+        return KdaDecodeKernel::kOptimizedFourCtaCluster;
+    }
+    if (workload <= 144)
+    {
+        return KdaDecodeKernel::kLegacyCompactHeads;
+    }
+
     if (smVersion == 100)
     {
-        if (workload <= 48)
+        if (workload >= 672 && workload <= 720)
         {
-            return KdaDecodeKernel::kOptimizedFourCtaCluster;
+            return KdaDecodeKernel::kLegacyManyHeads;
         }
-        if ((workload >= 320 && workload <= 864) || (workload >= 960 && workload <= 1152)
-            || (workload >= 1440 && workload <= 3072))
+        if ((workload >= 624 && workload <= 865) || (workload >= 1368 && workload <= 2496))
         {
             return KdaDecodeKernel::kOptimizedSingleCta;
         }
         return KdaDecodeKernel::kOptimizedTwoStageBulk;
     }
-    else
+
+    if (smVersion == 103)
     {
-        if (workload <= 48)
+        if ((params.numHeads % 6 == 0 && params.batchSize >= 512) || (workload >= 672 && workload <= 720))
         {
-            return KdaDecodeKernel::kOptimizedFourCtaCluster;
+            return KdaDecodeKernel::kLegacyManyHeads;
         }
-        if ((workload >= 512 && workload <= 864) || (workload >= 1440 && workload <= 6144))
+        if ((workload >= 624 && workload < 672) || (workload >= 816 && workload <= 867))
         {
             return KdaDecodeKernel::kOptimizedSingleCta;
         }
         return KdaDecodeKernel::kOptimizedTwoStageBulk;
     }
+
+    TLLM_THROW("Optimized KDA decode selector requires SM100 or SM103");
 }
 
 KdaDecodeKernel selectKdaDecodeKernel(KdaDecodeParams const& params)
@@ -79,8 +91,7 @@ KdaDecodeKernel selectKdaDecodeKernel(KdaDecodeParams const& params)
     static int const smVersion = tensorrt_llm::common::getSMVersion();
     if (smVersion == 100 || smVersion == 103)
     {
-        int64_t const workload = static_cast<int64_t>(params.batchSize) * params.numHeads;
-        return selectOptimizedKdaDecodeKernel(smVersion, workload);
+        return selectOptimizedKdaDecodeKernel(smVersion, params);
     }
     return selectLegacyKdaDecodeKernel(params);
 }
