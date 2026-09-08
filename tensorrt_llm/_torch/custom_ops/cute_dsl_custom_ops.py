@@ -13836,7 +13836,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cluster_shape_mn,
                         True,  # vectorized_f32
                         topk=self.top_k,
-                        use_pdl=False,
+                        use_pdl=True,
                         swiglu_limit=self.swiglu_limit,
                         scheduler="l2_atomic",
                     )
