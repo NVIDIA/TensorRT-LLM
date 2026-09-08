@@ -11,7 +11,6 @@ set(SRCS
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/kvCacheManagerV2.cpp
-    batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executorConfig.cpp
