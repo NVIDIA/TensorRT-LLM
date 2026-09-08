@@ -123,6 +123,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_locality_domains: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...
