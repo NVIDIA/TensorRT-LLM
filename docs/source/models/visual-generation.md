@@ -183,6 +183,70 @@ args = VisualGenArgs(model="/path/to/model", quant_config={"quant_algo": "FP8", 
 
 Omit `quant_config` for BF16/FP16 baseline.
 
+#### Wan VAE NVFP4
+
+The VAE can represent a substantial fraction of end-to-end latency in distilled
+video-generation pipelines with few denoising steps. Blackwell Tensor Cores offer
+up to four times the peak NVFP4 compute throughput of BF16, making VAE Conv3d
+operators an important optimization target. FP4 VAE replaces eligible native VAE
+Conv3d operators with NVFP4 weight-and-activation kernels while retaining BF16
+outputs.
+
+Linear-layer, attention, and VAE quantization are selected independently. Use
+`quant_config` for transformer linear layers,
+`attention_config.quant_attention_config` for attention, and
+`vae_config.quant_conv_config` for VAE convolutions.
+NVFP4 VAE execution currently supports native Wan-family VAEs on SM100 and
+SM103 GPUs. Unsupported pipelines and algorithms fail before
+pipeline construction. On an unsupported device, an explicit NVFP4 request
+fails; checkpoint-driven NVFP4 instead uses dequantized BF16 operators.
+
+By default, `vae_config.quant_conv_config` is unset (`None`) and VAE
+convolutions follow the checkpoint metadata. A high-precision checkpoint
+remains high precision. A packed NVFP4 checkpoint selects NVFP4 execution
+automatically and reuses any valid calibrated activation scales; layers without
+one derive it dynamically.
+
+To quantize eligible Wan Conv3d layers from a high-precision checkpoint and
+derive activation scales dynamically, use the shorthand configuration:
+
+```yaml
+vae_config:
+  quant_conv_config:
+    quant_algo: NVFP4
+    dynamic: true
+```
+
+The `quant_conv_config.dynamic` shorthand sets both weight and activation
+modes. Configure them independently when their sources differ. For example,
+packed NVFP4 weights with rank-local dynamic activation scales use:
+
+```yaml
+vae_config:
+  quant_conv_config:
+    quant_algo: NVFP4
+    config_groups:
+      default:
+        weights:
+          dynamic: false
+        input_activations:
+          dynamic: true
+```
+
+`weights.dynamic: true` requires high-precision checkpoint weights, while
+`false` requires packed NVFP4 weights. `input_activations.dynamic: false`
+requires a valid calibrated checkpoint scale for every selected convolution;
+`true` derives rank-local activation scales at runtime. Do not specify both the
+top-level shorthand and `config_groups`.
+
+The optional `ignore` list excludes matching VAE modules. With a
+high-precision checkpoint, excluded convolutions remain in BF16. With a packed
+NVFP4 checkpoint, their weights can only be dequantized back to BF16; the
+original high-precision weights cannot be recovered.
+
+See the [Model Optimizer diffusion example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers#wan-22-vae-nvfp4-conv3d-implicit-gemm)
+for a Wan 2.2 VAE NVFP4 calibration and checkpoint-generation recipe.
+
 ### Runtime LoRA
 
 VisualGen can preload a local LoRA adapter at startup and fuse its deltas into transformer weights before warmup, CUDA graph capture, and cache acceleration setup. Configure this through `VisualGenArgs.runtime_lora_config` in Python or YAML:

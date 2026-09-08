@@ -24,12 +24,13 @@ Shape::
       - kernel: gdn_bf16_state              # distinctive stem / group label (unique)
         full_name: "void tensorrt_llm::..." # representative full name(s)
         share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
-        ncu:                                # per-kernel deep-dive metrics, or the
-          duration_us: 41.2                 # string degrade "unavailable: <reason>"
+        ncu:                                # metrics mapping (or the string below)
+          duration_us: 41.2
           sm_sol_pct: 12.1
           mem_sol_pct: 78.5
-          occupancy_pct: 62.0
-          bound: memory                     # compute | memory | latency | balanced
+          occupancy_pct: null               # a metric the capture did not yield
+          bound: memory                     # compute | memory | latency | balanced | comm
+          note: "occupancy section empty: replay stalled"   # required by the null
         faster:                             # question 1 — make this kernel faster
           disposition: item                 # item | dismissed
           ref: opt-003                      # item id, or the dismissal evidence
@@ -37,6 +38,18 @@ Shape::
           disposition: dismissed
           neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace step 120)"
           ref: "multi-consumer-pinned: intermediate feeds residual + norm (torch_trace)"
+      - kernel: allreduce_fusion            # a collective: never goes under ncu
+        full_name: "void tensorrt_llm::kernels::ar_fusion::..."
+        share_pct: 9.2
+        ncu: "unavailable: collective — kernel replay deadlocks the ranks"
+        bound: comm                         # with the string form, `bound` sits here
+        faster:
+          disposition: dismissed
+          ref: "approach-restricted: strategy A/B falsified in a prior round; no NVLS here"
+        fusion:
+          disposition: dismissed
+          neighbors: "sigmoid_gate_mul_add -> THIS -> scaleMatrixPerTensorVec (step 120)"
+          ref: "already-fused: this IS the AR + residual/norm/quant fused epilogue"
 
 Ownership mirrors ``roadmap.yaml``: only the analyzer writes the ledger
 (a fresh file each round, carrying forward still-valid dismissals); the
@@ -58,7 +71,7 @@ LEDGER_FILENAME = "kernel_ledger.yaml"
 DISPOSITIONS = ("item", "dismissed")
 
 # ncu bound classes per the perf-nsight-compute-analysis skill.
-BOUND_CLASSES = ("compute", "memory", "latency", "balanced")
+BOUND_CLASSES = ("compute", "memory", "latency", "balanced", "comm")
 
 # Shorthand analyzers have written (or plausibly will) for the bound
 # enum, mapped to the canonical value. Normalized on load — an alias here
@@ -75,6 +88,10 @@ _BOUND_ALIASES = {
     "launch": "latency",
     "launch-latency": "latency",
     "mixed": "balanced",
+    "communication": "comm",
+    "comm-bound": "comm",
+    "nccl": "comm",
+    "collective": "comm",
 }
 
 _NCU_METRIC_FIELDS = ("duration_us", "sm_sol_pct", "mem_sol_pct", "occupancy_pct")
@@ -122,13 +139,41 @@ def _validate_coverage(data: Mapping[str, Any], errors: list[str]) -> None:
             )
 
 
-def _validate_ncu(entry: Any, where: str, errors: list[str]) -> None:
-    """Validate a row's ``ncu`` block: the metrics mapping or the degrade string."""
+def _validate_bound(holder: dict[str, Any], where: str, errors: list[str], hint: str = "") -> None:
+    """Validate — and normalize in place — the ``bound`` class in ``holder``."""
+    bound = holder.get("bound")
+    if isinstance(bound, str) and bound not in BOUND_CLASSES:
+        canonical = _BOUND_ALIASES.get(bound.strip().lower(), bound.strip().lower())
+        if canonical in BOUND_CLASSES:
+            holder["bound"] = canonical
+            bound = canonical
+    if bound not in BOUND_CLASSES:
+        errors.append(f"'{where}' must be one of {list(BOUND_CLASSES)}, got {bound!r}{hint}")
+
+
+def _validate_ncu(row: dict[str, Any], where: str, errors: list[str]) -> None:
+    """Validate a row's ``ncu`` block and the ``bound`` class it owes.
+
+    ``ncu`` is either the metrics mapping or the ``unavailable: <reason>``
+    degrade string; ``bound`` lives inside ``ncu`` in the first shape and on
+    the row in the second, since the dispositions rest on it.
+    """
+    entry = row.get("ncu")
     if isinstance(entry, str):
         # The honest degrade for a kernel no capture pass reached — the
-        # dispositions are still owed (from nsys shares + the source).
+        # dispositions and their bound class are still owed (from nsys
+        # shares + the source).
         if not entry.strip():
             errors.append(f"'{where}.ncu' string form must be non-empty (the reason)")
+        _validate_bound(
+            row,
+            f"{where}.bound",
+            errors,
+            hint=(
+                " — with the whole-block 'unavailable: <reason>' degrade the bound "
+                "class lives on the row, beside 'ncu' (a collective records 'comm')"
+            ),
+        )
         return
     if not isinstance(entry, dict):
         errors.append(
@@ -136,18 +181,27 @@ def _validate_ncu(entry: Any, where: str, errors: list[str]) -> None:
             f"'unavailable: <reason>' string, got {entry!r}"
         )
         return
+    # ncu often times a kernel while its SOL / occupancy sections come back
+    # empty (replay stalls, LaunchFailed, the hang-detector budget). Those
+    # metrics may be null, but only with a non-empty `note` saying why.
+    note = entry.get("note")
+    has_note = isinstance(note, str) and bool(note.strip())
+    missing: list[str] = []
     for field in _NCU_METRIC_FIELDS:
         value = entry.get(field)
+        if value is None:
+            missing.append(field)
+            continue
         if not _is_number(value) or value < 0:
             errors.append(f"'{where}.ncu.{field}' must be a number >= 0, got {value!r}")
-    bound = entry.get("bound")
-    if isinstance(bound, str) and bound not in BOUND_CLASSES:
-        canonical = _BOUND_ALIASES.get(bound.strip().lower(), bound.strip().lower())
-        if canonical in BOUND_CLASSES:
-            entry["bound"] = canonical
-            bound = canonical
-    if bound not in BOUND_CLASSES:
-        errors.append(f"'{where}.ncu.bound' must be one of {list(BOUND_CLASSES)}, got {bound!r}")
+    if missing and not has_note:
+        errors.append(
+            f"'{where}.ncu' leaves {missing} null without a 'note' — a null "
+            f"metric must be accompanied by a non-empty 'note' explaining why "
+            f"the capture did not yield it (or use the whole-block "
+            f"'unavailable: <reason>' string form)"
+        )
+    _validate_bound(entry, f"{where}.ncu.bound", errors)
 
 
 def _validate_disposition(
@@ -172,12 +226,15 @@ def _validate_disposition(
             f"'{where}.{question}.ref' must be a non-empty string (a roadmap "
             f"item id, or the evidence-backed dismissal), got {ref!r}"
         )
-    if question == "fusion":
+    if question == "fusion" and disposition == "dismissed":
+        # `neighbors` is the evidence a dismissal rests on; a promoted
+        # `item` carries its adjacency in the roadmap entry `ref` names.
         neighbors = block.get("neighbors")
         if not isinstance(neighbors, str) or not neighbors.strip():
             errors.append(
-                f"'{where}.fusion.neighbors' must be a non-empty string — the "
-                f"observed adjacency a fusion verdict rests on; got {neighbors!r}"
+                f"'{where}.fusion.neighbors' must be a non-empty string when the "
+                f"disposition is 'dismissed' — the observed adjacency the "
+                f"dismissal rests on; got {neighbors!r}"
             )
 
 
@@ -199,7 +256,7 @@ def _validate_row(row: Any, index: int, seen: set[str], errors: list[str]) -> No
     share = row.get("share_pct")
     if not _is_number(share) or share < 0:
         errors.append(f"'{where}.share_pct' must be a number >= 0, got {share!r}")
-    _validate_ncu(row.get("ncu"), where, errors)
+    _validate_ncu(row, where, errors)
     _validate_disposition(row, "faster", where, errors)
     _validate_disposition(row, "fusion", where, errors)
 

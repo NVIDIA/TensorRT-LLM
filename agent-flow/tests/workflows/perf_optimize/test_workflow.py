@@ -72,15 +72,6 @@ class FakeGitOps:
     def __init__(self, is_repo: bool = True):
         self.calls: list[tuple] = []
         self.is_repo_flag = is_repo
-        # Which host the workflow routed git to, or "" for local. Recorded rather
-        # than swallowed so a test can assert the choice was made — the failure it
-        # guards is a resumed run silently issuing git against a local path that
-        # does not exist.
-        self.cluster: str | None = None
-
-    def use_cluster(self, ssh_alias: str) -> None:
-        self.calls.append(("use_cluster", ssh_alias))
-        self.cluster = ssh_alias
 
     def is_git_repo(self, repo):
         self.calls.append(("is_git_repo", str(repo)))
@@ -553,19 +544,7 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") == "# SOL Projection\n"
 
 
-def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
-    """The routing is chosen before the first git command, on BOTH paths.
-
-    A run whose ``slurm-environment`` carries ``cluster_ssh`` is running off-cluster:
-    the checkout exists only on the cluster, so every git command has to travel over
-    ssh. Absent, nothing changes — which is what every other test here relies on.
-
-    The resume case is the one that decides where this call belongs. ``_init_state``
-    returns early when resuming, so setting the route there would leave every resumed
-    run issuing git against a local path that does not exist — and `is_git_repo`
-    swallows its error, so the run would report "not a git repository" and point at
-    the wrong machine.
-    """
+def test_git_stays_local_when_slurm_is_remote(tmp_path, fake_git):
     slurm = {
         "slurm-environment": {
             "slurm_partition": "batch",
@@ -579,35 +558,8 @@ def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
     workflow.run(str(task))
-    assert fake_git.cluster == "me@login-01"
-
-    # RESUME: an UNFINISHED run reads the checkpointed task.yaml rather than the
-    # input file, and must still route remotely. Rewinding `done` is what makes this
-    # a resume — a completed workspace returns from `_init_state` as None and never
-    # reaches any git command, which is correct and would make this vacuous.
-    state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    state.done = False
-    state.stage = state_module.STAGE_REPORTER
-    state_module.save_state(ws / state_module.STATE_FILENAME, state)
-
-    fake_git.cluster = None
-    resumed = Workflow(workspace=ws)
-    _stub_agents(resumed)
-    resumed.run(str(task))
-    assert fake_git.cluster == "me@login-01", (
-        "a resumed run must route to the cluster too; `_init_state` returns early on "
-        "resume, so a route set only on the fresh path would be lost here — and "
-        "`is_git_repo` swallows its error, so the run would blame the wrong machine"
-    )
-
-
-def test_git_stays_local_without_a_cluster_ssh(tmp_path, fake_git):
-    """No `cluster_ssh` means the historical behaviour, explicitly asserted."""
-    task = _write_task(tmp_path)
-    workflow = Workflow(workspace=tmp_path / "ws")
-    _stub_agents(workflow)
-    workflow.run(str(task))
-    assert fake_git.cluster == "", "an ordinary run must not reach for an ssh host"
+    assert fake_git.count("is_git_repo") == 1
+    assert fake_git.count("create_branch") == 1
 
 
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):

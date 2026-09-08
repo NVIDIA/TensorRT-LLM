@@ -103,6 +103,7 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
     ],
     doc="Wan 2.1 & 2.2 image-to-video family.",
+    supports_nvfp4_vae=True,
 )
 class WanImageToVideoPipeline(BasePipeline):
     def __init__(self, pipeline_config):
@@ -253,6 +254,9 @@ class WanImageToVideoPipeline(BasePipeline):
                 checkpoint_dir,
                 device,
                 dtype=self.pipeline_config.torch_dtype,
+                quant_config=self.pipeline_config.vae_conv_quant_config,
+                dynamic_weight_quant=self.pipeline_config.vae_conv_dynamic_weight_quant,
+                dynamic_activation_quant=self.pipeline_config.vae_conv_dynamic_activation_quant,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)

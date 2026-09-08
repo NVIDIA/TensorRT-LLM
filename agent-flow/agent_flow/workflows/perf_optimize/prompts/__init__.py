@@ -2,10 +2,13 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from agent_flow.workflows.perf_analyze.prompts import build_remote_execution_context
+
 from ._common import (
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
+    REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
@@ -91,6 +94,8 @@ DEFAULT_PROMPTS = PromptBundle(
 
 def build_perf_optimize_prompts(
     include_slurm_environment: bool = False,
+    remote_execution: Mapping[str, Any] | None = None,
+    campaign_name: str = "perf-optimize",
     approaches: Sequence[str] | None = None,
     include_sol: bool = False,
     kernel_coverage: Mapping[str, Any] | None = None,
@@ -106,6 +111,10 @@ def build_perf_optimize_prompts(
     projector, which launches no servers either (under Slurm it runs on
     the login node and records the latency constants as unmeasured, per
     its own prompt).
+
+    ``remote_execution`` is the resolved task spec. When it names an SSH
+    target, a short remote boundary plus its task-specific connection and
+    Slurm values is appended to every role that may touch runtime data.
 
     When ``approaches`` (``optimize.approaches`` from the task spec)
     restricts the run to a subset of the roadmap's approach values, the
@@ -207,6 +216,16 @@ def build_perf_optimize_prompts(
             ),
             reporter=KERNEL_COVERAGE_REPORTER_GUIDANCE,
         )
+    context = build_remote_execution_context(remote_execution, campaign_name)
+    if context:
+        bundle = bundle.with_extensions(
+            benchmarker=context,
+            projector=context,
+            analyzer=context,
+            optimizer=context,
+            evaluator=context,
+            qa=context,
+        )
     return bundle
 
 
@@ -218,6 +237,7 @@ __all__ = [
     "INTEGRATOR_SYSTEM_PROMPT",
     "OPTIMIZER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
+    "REMOTE_SLURM_EXECUTION",
     "PromptBundle",
     "QA_SYSTEM_PROMPT",
     "REPORTER_SYSTEM_PROMPT",
