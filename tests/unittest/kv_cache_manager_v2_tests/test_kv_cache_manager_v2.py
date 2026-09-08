@@ -173,15 +173,15 @@ def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
         try:
-            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import _introspection
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
         except ImportError:
             from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
-                CachedCudaEvent,
+                _introspection,
             )
 
-            return CachedCudaEvent
+            return _introspection.CachedCudaEvent
 
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent

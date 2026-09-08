@@ -1336,20 +1336,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
         .def("__eq__", &kv::SsmLifeCycle::operator==);
 
-    // ---- CUDA event --------------------------------------------------------
-    auto cachedCudaEvent
-        = nb::class_<kv::CachedCudaEvent>(m, "CachedCudaEvent")
-              .def(nb::init<kv::CudaStream>(), nb::arg("stream"))
-              .def("query_complete", &kv::CachedCudaEvent::queryComplete, nb::call_guard<nb::gil_scoped_release>())
-              .def("synchronize", &kv::CachedCudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>())
-              .def(
-                  "wait_in_stream",
-                  [](kv::CachedCudaEvent const& self, kv::CudaStream stream) { self.waitInStream(stream); },
-                  nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
-              .def("close", &kv::CachedCudaEvent::close)
-              .def("is_closed", &kv::CachedCudaEvent::isClosed);
-    cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
-
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
         .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>>(),
@@ -1787,20 +1773,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("supports_index_mode", &kv::KvCache::supportsIndexMode, nb::arg("mode"))
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
-        .def_prop_ro("finish_event",
-            [](kv::KvCache const& self)
-            {
-                try
-                {
-                    return self.finishEvent();
-                }
-                catch (std::bad_optional_access const&)
-                {
-                    // Python unwrap_optional(None) raises ValueError with this message.
-                    PyErr_SetString(PyExc_ValueError, "Expected non-None value");
-                    throw nb::python_error();
-                }
-            })
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
@@ -1886,6 +1858,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("cold_page_bytes_by_layer"));
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
+
+    // CachedCudaEvent is internal: the retirement rules in kv_cache_manager_v2/AGENTS.md are not
+    // something a Python caller can honour, and handing one out would let a copy outlive the
+    // KvCache that recorded it. Exposed here for tests only.
+    auto cachedCudaEvent
+        = nb::class_<kv::CachedCudaEvent>(mIntrospection, "CachedCudaEvent")
+              .def(nb::init<kv::CudaStream>(), nb::arg("stream"))
+              .def("query_complete", &kv::CachedCudaEvent::queryComplete, nb::call_guard<nb::gil_scoped_release>())
+              .def("synchronize", &kv::CachedCudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>())
+              .def(
+                  "wait_in_stream",
+                  [](kv::CachedCudaEvent const& self, kv::CudaStream stream) { self.waitInStream(stream); },
+                  nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+              .def("close", &kv::CachedCudaEvent::close)
+              .def("is_closed", &kv::CachedCudaEvent::isClosed);
+    cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
     mIntrospection.def(
         "make_test_block",
         [](kv::KvCacheManager& manager, nb::object tokenObject, std::vector<int> coveragePerLc, nb::object parentObject,
