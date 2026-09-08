@@ -6,7 +6,21 @@
 The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
 ```
 
-This document describes the different quantization recipes implemented in TensorRT-LLM and contains a support matrix
+> [!WARNING]
+> Per-model TensorRT example trees cited below
+> (`examples/models/core/gpt`, `examples/models/core/llama`,
+> `examples/models/contrib/gptj`, and the deleted
+> `examples/quantization/quantize.py` / `convert_checkpoint.py` flows) are **gone**
+> with the TensorRT backend. Do not follow those paths.
+> For current quantization on the PyTorch backend, see
+> [features/quantization.md](../../features/quantization.md),
+> [torch/features/quantization.md](../../torch/features/quantization.md),
+> and [examples/quantization/README.md](../../../examples/quantization/README.md)
+> (Model Optimizer / pre-quantized HF checkpoints). Also see
+> [TensorRT Backend Removed](../tensorrt-backend-removal.md).
+
+This document describes the different quantization recipes that were implemented
+for the **legacy** TensorRT backend and contains a historical support matrix
 for the different models.
 
 ## FP32, FP16 and BF16
@@ -77,8 +91,9 @@ As explained in the research paper, preprocessing must be applied to the
 weights of the model. TensorRT-LLM includes scripts to prepare the model to
 run using the SmoothQuant method.
 
-Examples of how to enable SmoothQuant for GPT, GPT-J and LLaMA can be found in
-the [examples/quantization](source:examples/quantization) folder of that release.
+Historically, SmoothQuant enablement examples for GPT, GPT-J and LLaMA lived under
+the removed TensorRT `examples/quantization/quantize.py` / per-model convert flows.
+Those scripts are gone; use the current quantization guides linked in the warning above.
 
 ## INT4 and INT8 Weight-Only (W4A16 and W8A16)
 
@@ -89,8 +104,9 @@ The activations are encoded using floating-point values (FP16 or BF16).
 To use INT4/INT8 Weight-Only methods, the user must determine the scaling
 factors to use to quantize and dequantize the weights of the model.
 
-This release includes examples for [GPT](source:examples/models/core/gpt) and
-[LLaMA](source:examples/models/core/llama).
+The legacy TensorRT release shipped Weight-Only examples under the deleted
+`examples/models/core/gpt` and `examples/models/core/llama` trees. Those directories
+are no longer in the repository.
 
 ## GPTQ and AWQ (W4A16)
 
@@ -98,30 +114,33 @@ The GPTQ and AWQ techniques are presented in
 [https://arxiv.org/abs/2210.17323](https://arxiv.org/abs/2210.17323)
 and
 [https://arxiv.org/abs/2306.00978](https://arxiv.org/abs/2306.00978),
-respectively. TensorRT-LLM supports per-group scaling factors and
-zero-offsetting in linear layers to implement GPTQ and AWQ methods. See the
-[WeightOnlyGroupwiseQuantMatmulPlugin](source:cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin)
-plugin and the corresponding
-[`weight_only_groupwise_quant_matmul`](source:tensorrt_llm/quantization/functional.py)
-Python function, for details.
+respectively. The legacy TensorRT backend supported per-group scaling factors and
+zero-offsetting in linear layers to implement GPTQ and AWQ methods via the
+removed `WeightOnlyGroupwiseQuantMatmulPlugin`
+(`cpp/tensorrt_llm/plugins/weightOnlyGroupwiseQuantMatmulPlugin`) and related
+Python helpers. Those plugin sources are no longer in the tree.
 
-This release includes examples of applying GPTQ to [GPT-NeoX](source:examples/models/core/gpt)
-and [LLaMA-v2](source:examples/models/core/llama), as well as an example of using AWQ with
-[GPT-J](source:examples/models/contrib/gptj).
+Legacy GPTQ/AWQ examples for GPT-NeoX, LLaMA-v2, and GPT-J lived under the deleted
+`examples/models/core/gpt`, `examples/models/core/llama`, and
+`examples/models/contrib/gptj` directories.
 
 ## FP8 (Hopper)
 
-This release of TensorRT-LLM contains implementations of FP8 for GPT-NeMo,
-GPT-J and LLaMA. Those examples can be found in
-[examples/quantization](source:examples/quantization).
+The legacy TensorRT release contained FP8 implementations for GPT-NeMo,
+GPT-J and LLaMA under the removed `examples/quantization/quantize.py` convert flow.
+For FP8 today, load a pre-quantized Hugging Face checkpoint or use Model Optimizer
+(see the warning above).
 
 ## NVFP4 (Blackwell)
 
-LLama and Mixtral can run in NVFP4 datatype. Those examples can be found in Llama examples.
+Llama and Mixtral historically ran in NVFP4 via the deleted Llama TensorRT example tree.
+Use a pre-quantized NVFP4 Hugging Face checkpoint with the PyTorch backend instead.
 
 ## Support matrix
 
-This release of TensorRT-LLM contains the following examples:
+The following matrix records which precision recipes the **legacy** TensorRT
+backend historically advertised for each model (not a guarantee of current
+PyTorch-backend support):
 
 | Model          | FP32  | FP16  | BF16  |  FP8  | NVFP4 | W8A8 SQ | W8A16 | W4A16 | W4A16 AWQ | W4A16 GPTQ |
 | :------------- | :---: | :---: | :---: | :---: | :---: | :-----: | :---: | :---: | :-------: | :--------: |
@@ -168,11 +187,11 @@ This release of TensorRT-LLM contains the following examples:
 Note: The vision component of multi-modal models(BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
 The language component decides which quantization methods are supported by a given multi-modal model.
 
-## Technical Detail: The `QuantMode` Flags
+## Technical Detail: The `QuantMode` Flags (legacy)
 
-The quantization method is controlled by the
-[`QuantMode`](source:tensorrt_llm/quantization/mode.py) flags. The different fields
-are:
+The legacy TensorRT quantization method was controlled by the
+[`QuantMode`](source:tensorrt_llm/quantization/mode.py) flags (still present in-tree
+for compatibility). The different fields are:
 
  * `INT4_WEIGHTS`, the weights are quantized to 4 bits (W4A\*),
  * `INT8_WEIGHTS`, the weights are quantized to 8 bits (W8A\*),
@@ -181,7 +200,7 @@ are:
  * `PER_TOKEN`, the scaling factors are defined per token,
  * `PER_GROUP`, the scaling factors are defined per group.
 
-There are three additional flags to control TensorRT-LLM:
+There are three additional flags that historically controlled TensorRT-LLM engine builds:
 
  * `INT8_KV_CACHE`, the K/V cache stores K and V using 8-bit integers,
  * `FP8_KV_CACHE`, the K/V cache stores K and V using 8-bit floating-point numbers,
