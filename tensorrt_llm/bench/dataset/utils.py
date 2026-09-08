@@ -54,6 +54,10 @@ def get_list_of_delays(delay_dist, mean_time_bet_reqs, num_reqs, random_seed):
         delays = [mean_time_bet_reqs] * num_reqs
     elif delay_dist == "exponential_dist":
         delays = get_exponential_dist_delays(mean_time_bet_reqs, num_reqs, random_seed)
+    else:
+        raise ValueError(
+            f"Unknown delay_dist '{delay_dist}'; expected 'constant' or 'exponential_dist'."
+        )
 
     return delays
 
