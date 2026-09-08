@@ -1023,6 +1023,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         manager_layer_id_to_layer_attn: Dict[
             Tuple[LayerId, DataRole], Tuple[int, DeepseekV4AttentionType]
         ] = {}
+        disagg_ignored_roles: set[DataRole] = set()
         nvfp4_padding_pages: Dict[int, int] = {}
         if self._use_nvfp4_compress:
             compress_layers_by_scale_page_size: Dict[int, List[int]] = defaultdict(list)
@@ -1081,20 +1082,23 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                     DeepseekV4AttentionType.COMPRESS, layer_idx
                 )
                 for padding_idx in range(nvfp4_padding_pages.get(layer_idx, 0)):
+                    data_padding_role = DataRole(f"deepseek_v4_compress_padding_{padding_idx}")
+                    scale_padding_role = DataRole(
+                        f"deepseek_v4_compress_block_scale_padding_{padding_idx}"
+                    )
                     buffers.extend(
                         [
                             BufferConfig(
-                                role=DataRole(f"deepseek_v4_compress_padding_{padding_idx}"),
+                                role=data_padding_role,
                                 size=data_page_size,
                             ),
                             BufferConfig(
-                                role=DataRole(
-                                    f"deepseek_v4_compress_block_scale_padding_{padding_idx}"
-                                ),
+                                role=scale_padding_role,
                                 size=scale_page_size,
                             ),
                         ]
                     )
+                    disagg_ignored_roles.update((data_padding_role, scale_padding_role))
             layer_config = AttentionLayerConfig(
                 layer_id=layer_id,
                 buffers=buffers,
@@ -1153,6 +1157,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # the mapping from layer index and attention type to layer id
         self._layer_attn_to_layer_id = layer_attn_to_layer_id
         self._manager_layer_id_to_layer_attn = manager_layer_id_to_layer_attn
+        self._disagg_ignored_roles = frozenset(disagg_ignored_roles)
         # number of layers in the KVCacheManagerPy
         self._num_manager_layers = len(layers)
 
@@ -1386,6 +1391,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # The generic layers in the base config are replaced by
         # _build_cache_config, so their buffer sizes are only placeholders.
         return 1
+
+    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
+        """Exclude storage-only NVFP4 alignment pages from KV transfer."""
+        return self._disagg_ignored_roles
 
     def get_indexer_k_cache_buffers(self, layer_idx: int) -> torch.Tensor:
         """
