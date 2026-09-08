@@ -297,6 +297,77 @@ and the *non-atomic* refcounts in `utils/sharedPtr.h`, neither of which a
 per-node lock protects. Eviction is global (LRU across the whole tree), so a
 writer cannot be scoped to a subtree.
 
+**Event retirement sits outside the lock.** `CachedCudaEvent` returns its
+`CUevent` to the process-wide `CudaEventPool` from places that hold different
+locks or none: `scrubEvents()` under the exclusive lock, and the destructor on
+whichever thread drops the last copy. The pool is shared by every
+`KvCacheManager`, so no manager's lock could cover it anyway.
+
+Three properties make that sound, and a change that breaks any one of them
+reintroduces a hazard the type system will not catch:
+
+- `PooledEvent` holds the handle in an atomic and retires with an exchange, so
+  concurrent retirers race and exactly one returns the handle. A plain reset
+  would let two callers put the same `CUevent`, and the pool would hand one
+  event to two owners.
+- *While you hold a copy*, any retirement you can observe came from
+  `queryComplete()`, `synchronize()` or `close()`, and each of those runs only
+  after the work has completed -- so a copy that finds the handle gone skips a
+  dependency that was already satisfied, never a live one. Holding the copy is
+  what rules out the destructor, which retires unconditionally: the last drop
+  returns the handle even with work still in flight. That is why a raw `CUevent`
+  must not outlive the `CachedCudaEvent` it came from. Once the handle is back
+  in the pool another owner can re-record it, and a stale waiter would then wait
+  on that owner's work, which can finish earlier -- a missed wait, not a
+  spurious one.
+- `CudaEventPool` is unbounded and FIFO (see its declaration). Unbounded so a
+  handle already copied out of a `CachedCudaEvent` is never destroyed under its
+  user; FIFO so the reuse distance keeps a copied-out handle from being
+  re-recorded by another owner mid-call.
+
+Two rules follow for code that touches events:
+
+- Load the handle once per call and operate on the loaded value. Testing the
+  handle and then re-reading it can observe a concurrent retirement in between
+  and pass `nullptr` to the driver.
+- A raw `CUevent` that has left a `CachedCudaEvent` -- `handle()`,
+  `streamWaitEvents()`, `synchronizeAll()`, `mergeEvents()` -- is valid only
+  while the caller holds the **exclusive** lock, which excludes the shared-lock
+  lookups that would otherwise retire it. Do not copy handles out on a
+  shared-lock path.
+- Copies may be used concurrently; a single `CachedCudaEvent` **object** may
+  not. Two mechanisms cover two pieces of state, and confusing them is the easy
+  mistake here: **the atomic protects the payload, the lock protects the
+  object.** `PooledEvent`'s handle is an atomic, safe for any number of
+  concurrent callers; the `shared_ptr` that names it -- and the `std::optional`
+  that may wrap it, as in `KvCache::mFinishEvent` -- is ordinary memory and
+  needs the API lock.
+
+  So for a `CachedCudaEvent` held as a member:
+
+  | Operation on the member | Lock |
+  |---|---|
+  | assign, move-assign, `emplace`, `reset`, destroy | **exclusive** |
+  | copy it out, `handle()`, `isClosed()` | **shared** |
+  | `queryComplete()`, `synchronize()`, `close()`, `waitInStream()` | **shared** |
+
+  The third row is the counter-intuitive one. Those methods retire the handle,
+  which looks like a write, but they mutate only the atomic payload and never
+  `mEvent` -- which is why they are `const`. For locking purposes they are
+  readers.
+
+  `Slot::readyEvent` and `Page::readyEvent` are assigned in about ten places;
+  each is a first-row operation. An *unlocked* reader races those writers no
+  matter how carefully the writers lock: that is why `finish_event` is no longer
+  bound, since the binding copied out of a live `KvCache` with no lock at all.
+
+  Two riders. Once a copy exists it is independent and needs no lock -- that is
+  the point of the shared payload, and what makes handing a copy to another
+  thread viable. But a raw `CUevent` taken from it is not a copy: because
+  `queryComplete()` is a shared-lock operation that can retire, a handle read
+  under the shared lock can be reissued by a concurrent reader, so handles stay
+  exclusive-only as above.
+
 **Introspection is out of scope.** The `_introspection` submodule (`StorageStatistics`,
 `set_target_ratio_list_gpu`, `reuse_match_pages`, test block/codec helpers, ...)
 reaches private members directly, by design, and takes no locks. It is
