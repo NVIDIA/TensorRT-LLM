@@ -13602,6 +13602,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.local_expert_offset,
                     self.tile_size,
                     self.scaling_vector_size,
+                    self.swiglu_limit,
                 )
 
             def get_valid_tactics(
@@ -13897,7 +13898,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 top_k_cx = self.top_k
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, max_active_clusters)
+                             cluster_shape_mn, max_active_clusters,
+                             self.swiglu_limit)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         self.scaling_vector_size,
