@@ -7,6 +7,7 @@ flags per run, so these tests pin the flags that template guarantees.
 
 from __future__ import annotations
 
+import json
 import re
 
 from agent_flow.workflows.perf_analyze.prompts import (
@@ -27,6 +28,8 @@ from agent_flow.workflows.perf_analyze.prompts._common import (
     SOL_CORRELATION_METHOD,
     SOL_METHODOLOGY_FALLBACK,
     SOL_REPORTER_GUIDANCE,
+    TRTLLM_TAXONOMY_PATH,
+    profile_ranks_note,
 )
 
 
@@ -69,7 +72,21 @@ _NSYS_CANONICAL_FLAGS = (
     "--trace-fork-before-exec=true",
 )
 
-# Canonical ``ncu`` flags the analyzer's Run C must carry.
+# Canonical Run A2 flags: the utilization pass (``--gpu-metrics-*``) and the
+# call-stack pass (backtraces). Both are separate captures from the timing
+# pass, so a prompt that carries the flags but folds them into Run A would
+# silently perturb every timing number the findings rest on.
+_NSYS_UTILIZATION_FLAGS = (
+    "--gpu-metrics-devices=all",
+    "--gpu-metrics-frequency=100000",
+)
+_NSYS_CALL_STACK_FLAGS = (
+    "--python-backtrace",
+    "--python-sampling=true",
+    "--cudabacktrace=kernel:5000,sync:10000",
+)
+
+# Canonical ``ncu`` flags the analyzer's Run B must carry.
 _NCU_CANONICAL_FLAGS = (
     "--target-processes all",
     "--profile-from-start off",
@@ -94,6 +111,53 @@ def test_analyzer_prompt_has_canonical_nsys_flags():
         assert flag in ANALYZER_SYSTEM_PROMPT, flag
 
 
+def test_analyzer_prompt_has_run_a2_utilization_and_call_stack_flags():
+    # Without ``--gpu-metrics-*`` a trace ranks kernels by cost and calls it
+    # headroom; without backtraces every kernel is a mangled name with no
+    # owner. Both passes are pinned so they cannot quietly fall out.
+    for flag in _NSYS_UTILIZATION_FLAGS + _NSYS_CALL_STACK_FLAGS:
+        assert flag in ANALYZER_SYSTEM_PROMPT, flag
+    assert "## Run A2" in ANALYZER_SYSTEM_PROMPT
+
+
+def test_run_a2_passes_are_separate_captures_from_the_timing_pass():
+    # Metric sampling and backtraces perturb the timeline, so they must land
+    # in their own captures — the timing numbers stay Run A's.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "server_nsys_metrics" in prompt
+    assert "server_nsys_stacks" in prompt
+    assert "additional** captures" in prompt
+
+
+def test_run_a2_degrades_gracefully_instead_of_fabricating():
+    # ERR_NVGPUCTRPERM is the expected portability failure of the metrics
+    # pass; the prompt must send the agent on rather than into a permission
+    # fight, and must never let it invent the numbers.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "ERR_NVGPUCTRPERM" in prompt
+    assert "NVreg_RestrictProfilingToAdminUsers" in prompt
+    assert "additive, never blocking" in prompt
+
+
+def test_run_a2_call_stack_pass_states_the_cuda_graph_limit():
+    # One cudaGraphLaunch covers thousands of kernels, so a backtrace on it
+    # names the launch site and not the operator inside the graph. A prompt
+    # that omits this invites graph-launch stacks reported as call sites.
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "cudaGraphLaunch" in prompt
+    assert "graphId IS NOT NULL" in prompt
+
+
+def test_findings_contract_carries_the_run_a2_evidence():
+    # The evidence lands inside the existing ``nsys timeline`` section, so
+    # every "Profiling setup / nsys timeline / ..." enumeration elsewhere
+    # stays valid.
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "gpu metrics unavailable" in contract
+    assert "call stacks unavailable" in contract
+    assert "bounding resource" in contract
+
+
 def test_analyzer_keeps_capture_range_end_stop_safety_flag():
     # The template omits it, but the automated run must keep it so nsys
     # does not SIGTERM the server at the window's end (default
@@ -102,7 +166,60 @@ def test_analyzer_keeps_capture_range_end_stop_safety_flag():
 
 
 # --------------------------------------------------------------------------- #
-# ncu deep dive (Run C): a bounded per-kernel profile of the top nsys kernels
+# nsys timeline decomposition (Run A step 5): the analyzer does not read the
+# trace by hand — it exports a .sqlite and runs the internal-perf-nsight-system-analysis
+# skill's pipeline, whose vocabulary the findings must then use.
+# --------------------------------------------------------------------------- #
+
+
+def test_analyzer_loads_nsys_analysis_skill_and_degrades():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Named with the fully-qualified fallback for plugin-namespaced installs,
+    # exactly as the ncu methodology skill is.
+    assert "internal-perf-nsight-system-analysis" in prompt
+    assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+    # It is proactive: the trace is already captured, so the pipeline costs
+    # no extra server launch and runs whenever nsys runs.
+    assert "costs no extra server launch" in prompt
+    assert "without waiting to be asked" in prompt
+    # A missing skill or a failed pipeline never blocks the run and never
+    # yields a fabricated split — the section degrades to a one-liner.
+    assert "timeline analysis unavailable" in prompt
+
+
+def test_nsys_analysis_pipeline_is_driven_from_the_sqlite_export():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The pipeline reads a .sqlite, not the .nsys-rep next to it.
+    assert "nsys export --type sqlite" in prompt
+    assert "scripts/run_all.py" in prompt
+    assert "--taxonomy" in prompt
+    assert "--out <workspace>/nsys_analysis" in prompt
+
+
+def test_nsys_analysis_resolves_the_skills_ask_the_user_steps_autonomously():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill tells a human operator to pick representatives and anchors;
+    # a campaign has nobody to ask, so the prompt resolves both itself.
+    assert "no user to ask" in prompt
+    assert "--representative" in prompt
+    assert "--anchor" in prompt
+
+
+def test_findings_contract_carries_the_timeline_decomposition():
+    block = _norm(PROFILE_FINDINGS_CONTRACT)
+    # The skill's vocabulary, verbatim — "compute-absent", never
+    # "compute idle", and the three causes it splits into.
+    assert "compute-absent" in block
+    assert 'never "compute idle"' in block
+    for bucket in ("launch-starved", "blocking", "dependency-stalled"):
+        assert bucket in block, bucket
+    # Iteration counts back every table, and the section degrades honestly.
+    assert "`n=` iterations" in block
+    assert "timeline analysis unavailable" in block
+
+
+# --------------------------------------------------------------------------- #
+# ncu deep dive (Run B): a bounded per-kernel profile of the top nsys kernels
 # over the same iteration window, interpreted with the
 # perf-nsight-compute-analysis skill; the findings carry a dedicated section
 # and the ranked hypotheses synthesize nsys + ncu + SOL correlation.
@@ -779,3 +896,209 @@ def test_lifecycle_verifies_the_listener_belongs_to_our_process_group():
 def test_lifecycle_confirms_the_port_freed_after_teardown():
     block = _norm(SERVER_LIFECYCLE)
     assert "that :8000 is free again" in block
+
+
+# --------------------------------------------------------------------------- #
+# The nsys-timeline pipeline's own artifacts: the taxonomy it classifies with,
+# and the products the findings (and, downstream, the roadmap) are built from.
+# Running `run_all.py` is not the same as consuming what it wrote.
+# --------------------------------------------------------------------------- #
+
+
+def test_timeline_pipeline_uses_the_trtllm_taxonomy_not_the_skill_template():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill's template is shaped for training frameworks and matches
+    # almost nothing in a decode step; copying it verbatim leaves the hot
+    # kernels uncategorized and the Step 5 mode decision meaningless.
+    assert f"cp {TRTLLM_TAXONOMY_PATH}" in prompt
+    # Named only to be ruled out as the source, never as the thing to copy.
+    assert "not the skill's `references/taxonomy_template.json`" in prompt
+    assert "shaped for training frameworks" in prompt
+
+
+def test_trtllm_taxonomy_asset_is_loadable_and_keeps_the_reserved_categories():
+    data = json.loads(TRTLLM_TAXONOMY_PATH.read_text(encoding="utf-8"))
+    overall = data["Overall"]
+    # `gemm` / `mha` are the pipeline's hard-coded Step 4 anchors and
+    # `nccl` its collective class; renaming one silently empties a view.
+    assert {"gemm", "mha", "nccl"} <= set(overall)
+    # The exact-name overlay the correlation would merge into.
+    assert data["ExactNames"] == {}
+    for category, pattern in overall.items():
+        re.compile(pattern)  # a broken regex fails the whole pipeline
+        assert pattern.strip(), category
+
+
+def test_trtllm_taxonomy_classifies_real_trtllm_kernel_names():
+    overall = json.loads(TRTLLM_TAXONOMY_PATH.read_text(encoding="utf-8"))["Overall"]
+    compiled = [(name, re.compile(rx)) for name, rx in overall.items()]
+
+    def classify(kernel: str) -> str:
+        return next((name for name, rx in compiled if rx.search(kernel)), "uncategorized")
+
+    # First-match-wins ordering has to survive edits: a collective that
+    # carries `moe` in its name is comm, and a grouped MoE matmul is a
+    # GEMM rather than MoE plumbing.
+    assert classify("ncclDevKernel_AllReduce_Sum_bf16_RING_LL") == "nccl"
+    assert classify("moeA2ADispatchKernel") == "nccl"
+    assert classify("nvjet_tst_128x128_64x6_1x1_h_bz_coopA") == "gemm"
+    assert classify("void tensorrt_llm::kernels::moe_gemm::moeGemmKernel") == "gemm"
+    assert classify("fmha_v2_flash_attention_fp16_128_64_sm90_kernel") == "mha"
+    assert classify("xqa_kernel_dt_fp16_d128") == "mha"
+    assert classify("flashinfer::BatchDecodeWithPagedKVCacheKernel") == "mha"
+    assert classify("void tensorrt_llm::kernels::generalRmsNorm") == "norm"
+    assert classify("finalizeMoeRoutingKernel") == "moe"
+    assert classify("applyBiasRopeUpdateKVCache") == "rope"
+    assert classify("triton_poi_fused_add_mul_0") == "triton"
+
+
+def test_analyzer_verifies_the_taxonomy_before_quoting_a_category():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "Verify the taxonomy before quoting a single category number" in prompt
+    # The three buckets that say how much of the classification is real.
+    assert "classified_by" in prompt
+    assert "uncategorized_above_threshold" in prompt
+    # Iterating is free — the pipeline re-reads files, it does not re-profile.
+    assert "re-reads files only, no server, no GPU" in prompt
+    # The reserved names are load-bearing, not stylistic.
+    assert "hard-codes them as the Step 4 anchors" in prompt
+
+
+def test_analyzer_reads_the_per_op_breakdown_and_its_mode():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # Step 5 decides between two shapes and writes a different file each
+    # way; the busy rungs size the prize, this names the target.
+    assert "fused_share_of_residual_pct" in prompt
+    assert "module_slicing_recommended" in prompt
+    assert "opgroup.json" in prompt
+    assert "module_slice.json" in prompt
+    assert "window_labels" in prompt
+    assert "names *what to optimize*" in prompt
+
+
+def test_analyzer_authors_the_skills_items_json_handoff():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill's machine-readable opportunity list, authored from its own
+    # numbers — the artifact downstream stages key coverage on.
+    assert "items.json" in prompt
+    assert "magnitudeMs" in prompt
+    assert "boundingResource" in prompt
+    assert 'Write `{"items": []}` when the analysis genuinely found nothing' in prompt
+    # An opportunity omitted reads as one that does not exist.
+    assert "reads as one that does not exist" in prompt
+
+
+def test_analyzer_reconciles_the_pipelines_own_invariants():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "iter_ms ≈ device_busy_ms + device_idle_ms" in prompt
+    assert "launch_starved + blocking + dependency_stalled ≈ compute_absent" in prompt
+    # The usual cause, named so it can be found rather than rounded away.
+    assert "a sum was used where a union belongs" in prompt
+
+
+def test_ncu_targets_come_from_the_decomposition_not_the_kernel_sum():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # ~40 launches per server relaunch makes this the round's most
+    # expensive choice; kern_sum sums overlapping streams over the whole
+    # capture, the decomposition is a union clipped to the iteration.
+    assert "Pick the targets from the timeline decomposition, not the kernel sum" in prompt
+    assert "matched_kernels" in prompt
+    assert "sum across overlapping streams over the whole capture" in prompt
+    # Still the honest fallback when the pipeline could not run.
+    assert "if nsys ran but the skill's pipeline did not, rank on `kern_sum`" in prompt
+
+
+def test_findings_contract_owes_the_classification_and_the_step5_mode():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "a category number whose taxonomy was not verified is not a finding" in contract
+    assert "which Step 5 mode ran" in contract
+    # Both reconciliations are reported as pass/fail, not assumed.
+    assert "stated as pass/fail" in contract
+
+
+# --------------------------------------------------------------------------- #
+# Multi-rank capture and the rank-jitter step. Where the nsys wrap goes decides
+# whether a multi-GPU run yields any model kernels at all, and several ranks
+# are what buy the straggler verdict.
+# --------------------------------------------------------------------------- #
+
+
+def test_multi_gpu_names_the_spawn_limit_rather_than_the_wrong_env_var():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The real constraint: a bare trtllm-serve spawns its workers, and nsys
+    # does not follow spawned processes.
+    assert "MPI.COMM_SELF.Spawn" in prompt
+    assert "does not follow them" in prompt
+    # TLLM_PROFILE_LOG_RANKS selects which ranks print the step log; it is
+    # not a capture knob, and treating it as one wastes an allocation.
+    assert "selects which ranks print the step log line" in prompt
+    # The window needs no per-rank handling — every rank arms on the same
+    # iteration counter.
+    assert "arms `cudaProfilerStart/Stop` on the same iteration" in prompt
+
+
+def test_per_rank_wrap_goes_inside_the_launcher_and_only_on_listed_ranks():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "the wrap goes **inside** the step, once per task" in prompt
+    assert "SLURM_PROCID" in prompt
+    assert "trtllm-llmapi-launch" in prompt
+    # Wrapping every rank makes the straggler verdict describe nsys.
+    assert "makes the straggler verdict describe nsys rather than the model" in prompt
+
+
+def test_several_ranks_take_a_survey_pass_then_a_representative_pass():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    # The skill refuses to pick representatives; exit 2 on the first pass is
+    # the expected outcome, not a failure to retry around.
+    assert "no `--representative`" in prompt
+    assert "stops with exit 2, which is the expected outcome" in prompt
+    assert "--representative 0 --representative 4" in prompt
+    assert "--part stage-0=0,1,2,3" in prompt
+    # Parts come from measured fingerprint groups, not an assumed layout.
+    assert "group index shared by ranks with identical kernel fingerprints" in prompt
+    assert "rather than from a rank-layout convention you assumed" in prompt
+    # Rank ids are the pairing key.
+    assert "never renumbered" in prompt
+
+
+def test_jitter_step_is_read_with_its_verdict():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "part-<name>/jitter.json" in prompt
+    assert "mean_jitter_wait_ms_per_iter" in prompt
+    assert "imbalance_operator" in prompt
+    # The spread alone is not actionable — pinned and rotating need
+    # opposite fixes.
+    assert "always with `straggler.verdict` beside the spread, never without" in prompt
+    assert "need opposite fixes" in prompt
+    # Lateness needs a shared clock; a one-rank part has no jitter at all.
+    assert "only with its `floor_ms` beside it" in prompt
+    assert "A part holding one rank has a `null` `jitter_cost`" in prompt
+
+
+def test_jitter_wait_dominant_comm_is_read_as_imbalance():
+    prompt = _norm(ANALYZER_SYSTEM_PROMPT)
+    assert "is imbalance, not the network" in prompt
+    assert "where the cost *appears*, not where it is *caused*" in prompt
+
+
+def test_findings_contract_owes_the_straggler_verdict():
+    contract = _norm(PROFILE_FINDINGS_CONTRACT)
+    assert "Rank jitter" in contract
+    assert "straggler verdict" in contract
+    assert "the spread is never reported without it" in contract
+    # One captured rank makes no imbalance claim at all.
+    assert "make no imbalance claim" in contract
+
+
+def test_profile_ranks_note_states_the_duty_for_each_shape():
+    single = _norm(profile_ranks_note([0]))
+    assert "rank 0 only" in single
+    assert "rank-jitter step does not apply" in single
+
+    several = _norm(profile_ranks_note([0, 4]))
+    assert "ranks 0, 4" in several
+    assert "one trace per rank" in several
+    assert "only these ranks are wrapped" in several
+    # Degrades where the topology cannot deliver per-rank traces.
+    assert "spawn-launched `trtllm-serve` cannot" in several
+    assert "make no imbalance claim" in several

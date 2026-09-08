@@ -15,6 +15,7 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     is_curve_mode,
     load_and_validate_task_yaml,
     num_prompts_per_point,
+    profile_ranks,
     remote_run_root,
     sol_enabled,
 )
@@ -51,8 +52,11 @@ def test_valid_minimal_applies_defaults(tmp_path):
     assert data["benchmark"]["num_prompts"] == 200
     assert data["benchmark"]["concurrency"] == 64
     assert data["profile"] == {
-        "methods": ["nsys", "torch", "ncu"],
+        "methods": ["nsys", "ncu"],
         "nsys_iter_range": "100-150",
+        # Rank 0 only: the historical single-wrap behaviour, and all a
+        # spawn-launched server can give.
+        "profile_ranks": [0],
     }
     assert has_slurm_environment(data) is False
     # The projector is on by default, and the block is materialized so
@@ -742,7 +746,7 @@ def test_dump_task_yaml_round_trip(tmp_path):
     reloaded = yaml.safe_load(dump_task_yaml(data))
     assert reloaded["checkpoint_path"] == ckpt
     assert "serve" not in reloaded
-    assert reloaded["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert reloaded["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_dump_task_yaml_normalizes_float_inf():
@@ -910,3 +914,73 @@ def test_a_malformed_slurm_block_does_not_decide_the_question(tmp_path):
     assert paths_are_local({"slurm-environment": "not-a-mapping"}) is True
     assert paths_are_local({"slurm-environment": {"cluster_ssh": "   "}}) is True
     assert paths_are_local({}) is True
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks — which ranks nsys captures. Several ranks is what
+# buys the skill's rank-jitter step its straggler verdict; the knob is inert
+# without nsys, and inert config is what this schema exists to catch.
+# --------------------------------------------------------------------------- #
+
+
+def test_profile_ranks_accepts_several_ranks_and_sorts_them(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"profile_ranks": [4, 0]},
+        },
+    )
+    data = load_and_validate_task_yaml(path)
+    # Sorted for a deterministic resolved spec; the ids themselves are the
+    # skill's pairing key and are never renumbered.
+    assert data["profile"]["profile_ranks"] == [0, 4]
+    assert profile_ranks(data) == (0, 4)
+
+
+def test_profile_ranks_defaults_to_rank_zero():
+    assert profile_ranks({}) == (0,)
+    assert profile_ranks({"profile": {}}) == (0,)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ([], "non-empty list"),
+        ("all", "non-empty list"),
+        ([0, -1], "non-negative integers"),
+        ([0, "1"], "non-negative integers"),
+        ([True], "non-negative integers"),
+        ([0, 0], "duplicate rank ids"),
+    ],
+)
+def test_profile_ranks_rejects_malformed_values(tmp_path, value, expected):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"profile_ranks": value},
+        },
+    )
+    with pytest.raises(TaskSchemaError, match=expected):
+        load_and_validate_task_yaml(path)
+
+
+def test_profile_ranks_requires_nsys_in_methods(tmp_path):
+    # A rank is captured by wrapping it in nsys; without nsys the knob is
+    # inert, and silently inert config is the failure mode to avoid.
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"methods": ["ncu"], "profile_ranks": [0, 1]},
+        },
+    )
+    with pytest.raises(TaskSchemaError, match="requires 'nsys' in 'profile.methods'"):
+        load_and_validate_task_yaml(path)

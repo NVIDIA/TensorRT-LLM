@@ -13,8 +13,8 @@ import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
+from agent_flow.workflows.perf_optimize import nsys_items, roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import progress as progress_module
-from agent_flow.workflows.perf_optimize import roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
 
@@ -2258,7 +2258,7 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
             encoding="utf-8",
         )
         state = _evaluator_state(ws)
@@ -2281,6 +2281,31 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
         workflow.close()
 
 
+def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
+    """The accept-evidence trace is decomposed, not just kernel-summed."""
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    recorder = _RecordingAgent()
+    workflow.evaluator = recorder
+    try:
+        (ws / "task.yaml").write_text(
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
+            encoding="utf-8",
+        )
+        state = _evaluator_state(ws)
+        workflow._run_evaluator(state)
+        prompt = recorder.messages[0]
+        profile_dir = workflow._attempt_dir(state) / "profile"
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{profile_dir}/nsys_analysis" in prompt
+        # The point of it: the mechanism check rests on a measured budget.
+        assert "rather than an eyeballed one" in prompt
+    finally:
+        workflow.close()
+
+
 def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -2288,7 +2313,7 @@ def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         workflow._run_evaluator(_evaluator_state(ws))
         assert "Accept-evidence duty" not in recorder.messages[0]
@@ -2303,7 +2328,7 @@ def test_run_evaluator_marks_the_final_attempt(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         state = _evaluator_state(ws)
         workflow._run_evaluator(state)
@@ -2356,7 +2381,7 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
-        assert "do **not** run nsys / ncu / the torch profiler" in message
+        assert "do **not** run nsys / ncu" in message
         assert "do **not** run the benchmark" in message
         # …and the evidence it plans from instead.
         assert str(ws / "rounds" / "round_1" / "analysis") in message
@@ -3208,6 +3233,22 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     # pointer even when the sol block is set.
     assert "sol_projection.md" not in with_sol["evaluator"]
     assert "sol_projection.md" not in with_sol["qa"]
+
+
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
+    with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
+    # Not SOL-gated: every profiling round decomposes the timeline it just
+    # captured, into the round's own analysis directory.
+    for prompt in (without, with_sol):
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert "analysis/nsys_analysis" in prompt
+        assert "nsys_analysis/` directory" in prompt
+        # Ranking a host-exposure item and a slow-kernel item needs the
+        # split, not the kernel-sum table alone.
+        assert "not from the `nsys stats` table alone" in prompt
 
 
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
@@ -4111,3 +4152,180 @@ def test_baseline_gate_ignores_unreadable_json(tmp_path):
     wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
+
+
+# --------------------------------------------------------------------------- #
+# The nsys opportunity-coverage gate: the timeline analysis writes items.json,
+# and the roadmap must account for every id in it. Self-gating on the file, so
+# a round that could not decompose a trace owes nothing.
+# --------------------------------------------------------------------------- #
+
+
+def _stub_agents_with_nsys_items(workflow, rows, item_ids=("nsys-01",), **kwargs):
+    """`_stub_agents` plus an analyzer that writes items.json + the block.
+
+    ``rows`` is the ``nsys_items`` coverage block the analyzer writes into
+    ``roadmap.yaml``; ``item_ids`` are the opportunities ``items.json``
+    carries. Passing mismatched pairs is how the negative cases are built.
+    """
+    trace = _stub_agents(workflow, **kwargs)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_items(state):
+        original_analyzer(state)
+        analysis_dir = workflow._analysis_dir(state)
+        items_file = nsys_items.items_path(analysis_dir)
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text(
+            json.dumps({"items": [{"id": i, "title": i, "claim": "c"} for i in item_ids]}),
+            encoding="utf-8",
+        )
+        data = roadmap_schema.load_roadmap(workflow.roadmap_path)
+        data[nsys_items.ROADMAP_KEY] = [dict(row) for row in rows]
+        roadmap_schema.save_roadmap(workflow.roadmap_path, data)
+
+    workflow._run_analyzer = analyzer_with_items
+    return trace
+
+
+def test_nsys_items_covered_roadmap_completes(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}]
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unaccounted_opportunity_blocks_advance(tmp_path, fake_git):
+    """An opportunity neither planned nor dismissed stops the round."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unaccounted for"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    # Parked at the analyzer, so re-running retries the stage.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_dismissal_with_evidence_is_enough(tmp_path, fake_git):
+    """Dismissing beats padding the roadmap with an item to disprove."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [
+            {"id": "nsys-01", "disposition": "item", "ref": "opt-001"},
+            {"id": "nsys-02", "disposition": "dismissed", "ref": "below the noise floor"},
+        ],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-999"}]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="does not match any roadmap item id"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_malformed_file_blocks_advance(tmp_path, fake_git):
+    """The analyzer's own artifact being unreadable is worth stopping for."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_broken_items(state):
+        original_analyzer(state)
+        items_file = nsys_items.items_path(workflow._analysis_dir(state))
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text("{not json", encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_broken_items
+    try:
+        with pytest.raises(RuntimeError, match="could not be read as JSON"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
+def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
+    """A round whose pipeline could not run degrades, it does not fail.
+
+    The skill may be absent, the export may fail, or nsys may not be in
+    `profile.methods` at all — every such round writes no items.json and
+    records the reason under *Caveats* instead.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)  # never writes items.json
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+    assert not list((ws / "rounds").glob("*/analysis/nsys_analysis/items.json"))
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks reaches the analyzer's driving instruction: the
+# stateless agent should not have to re-derive which ranks to capture, and the
+# multi-rank case has to arrive as a duty rather than an option.
+# --------------------------------------------------------------------------- #
+
+
+def test_default_driving_prompt_asks_for_rank_zero_only(tmp_path):
+    analyzer = _capture_driving_prompts(tmp_path)["analyzer"]
+    assert "rank 0 only" in analyzer
+    # And says plainly that the imbalance step does not apply, rather than
+    # leaving the agent to report a spread it could not measure.
+    assert "rank-jitter step does not apply" in analyzer
+
+
+def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
+    analyzer = _capture_driving_prompts(
+        tmp_path, {"profile": {"methods": ["nsys", "ncu"], "profile_ranks": [0, 4]}}
+    )["analyzer"]
+    assert "ranks 0, 4" in analyzer
+    assert "one trace per rank" in analyzer
+    # Only the listed ranks are wrapped — a profiler-slowed rank would
+    # otherwise register as jitter the others wait on.
+    assert "only these ranks are wrapped" in analyzer
+    assert "Step 0 survey" in analyzer
+    assert "straggler verdict" in analyzer

@@ -114,6 +114,13 @@ items:                                # pending items ordered by expected benefi
     status: pending                   # pending | in_progress | accepted | failed | obsolete
     attempts: 0
     measured_gain_pct: null           # filled from the evaluator's measurement
+nsys_items:                           # coverage of nsys_analysis/items.json; one row per id there
+  - id: nsys-01                       # the id verbatim from items.json
+    disposition: item                 # item | dismissed
+    ref: opt-001                      # the roadmap item id, or the evidence for dismissing it
+  - id: nsys-02
+    disposition: dismissed
+    ref: "0.2 ms/iter is below the noise floor at this operating point"
 ```
 
 Rules that keep the loop deterministic:
@@ -130,6 +137,22 @@ Rules that keep the loop deterministic:
 - **Expected gains are grounded, not vibes.** Every item cites the
   profiling evidence (trace file + numbers) and, when one matches, the
   casebook precedent its estimate leans on.
+- **`nsys_items` accounts for the timeline analysis, one row per id.**
+  Required whenever that round's `nsys_analysis/items.json` exists;
+  omitted entirely when it does not (nsys not in `profile.methods`, or
+  the pipeline could not run — the *Caveats* line covers that case). A
+  `disposition: item` `ref` must name a real roadmap item id, any
+  status: an opportunity whose fix was already tried *was* considered.
+  A `dismissed` `ref` is the evidence for dismissing it, never a bare
+  restatement. **Round N > 1**: author the block fresh from *this*
+  round's `items.json`. An `nsys-NN` id is local to the analysis that
+  wrote it — a re-profile renumbers from `nsys-01` — so unlike a roadmap
+  item id it is never carried forward, and a previous round's row never
+  covers this round's same-numbered opportunity. Re-state a judgement
+  that still holds against the id this round's file gives it, citing the
+  earlier round in `ref` when that saves re-deriving the evidence. A row
+  naming an id absent from the current file fails validation exactly as
+  an unaccounted id does.
 - **Ownership.** Only the **analyzer** writes item content (ids, titles,
   categories, evidence, gains, ordering) and may mark still-pending items
   `obsolete` when fresh evidence — a re-profile, or the verdicts a
@@ -596,7 +619,7 @@ profiling:
 - Choose each window from the operating point — the roles count
   iterations on different clocks and `profile.nsys_iter_range` is only a
   default. State the windows you used.
-- torch profiler and ncu have **no path through this harness**: record
+- ncu has **no path through this harness**: record
   `not available in a disagg campaign` and plan from nsys — never
   fabricate a trace.
 - KV-cache transfer (ctx to gen) is a first-class cost here that an
@@ -927,7 +950,7 @@ def kernel_coverage_analyzer_note(min_share_pct: float, coverage_target_pct: flo
     """The analyzer's per-kernel coverage contract, with the task's bars.
 
     Appended only when ``task.yaml`` declares ``profile.kernel_coverage``.
-    It supersedes Run C's top-kernel target selection with coverage-driven
+    It supersedes Run B's top-kernel target selection with coverage-driven
     enumeration, poses the two per-kernel questions (faster? fusible?),
     and defines ``kernel_ledger.yaml`` — the machine-readable proof,
     validated by the orchestrator each round, that every enumerated
@@ -955,17 +978,25 @@ orchestrator waives the contract for it rather than aborting over an
 artifact the round was told not to produce. The standing ledger still
 describes that build — the round changed nothing about it.
 
-### Coverage-driven ncu targeting (supersedes Run C's target selection)
+### Coverage-driven ncu targeting (supersedes Run B's target selection)
 
-Run C's "top 3–6 stems, never profile every kernel blindly" rule is
+Run B's "top 3–6 stems, never profile every kernel blindly" rule is
 superseded — this task pays for breadth:
 
-- **Enumerate from the fresh nsys `cuda_gpu_kern_sum`**: every kernel at
-  or above **{min_share_pct}%** of profiled GPU time gets a ledger row;
-  when those rows sum below **{coverage_target_pct}%**, keep taking the
-  next-largest kernels until the target is covered. Roll everything
-  below the cut into a single explicit `other` share — recorded, never
-  silently dropped.
+- **Enumerate from the fresh nsys timeline decomposition**: every
+  kernel at or above **{min_share_pct}%** of in-window GPU time gets a
+  ledger row; when those rows sum below **{coverage_target_pct}%**, keep
+  taking the next-largest kernels until the target is covered. Roll
+  everything below the cut into a single explicit `other` share —
+  recorded, never silently dropped. What this supersedes is Run B's
+  *breadth* (3–6 stems), never its *source*: rank from `nsys_analysis/`
+  — `cat_full.json`'s `per_category` and `matched_kernels`, plus
+  `opgroup.json` / `module_slice.json` for the residual — because
+  `cuda_gpu_kern_sum` sums overlapping streams over the whole capture
+  while the decomposition is a union clipped to the iteration window,
+  and the two rank kernels differently. Where the pipeline could not
+  run, `kern_sum` is the honest fallback — say so in the ledger's
+  `source`.
 - **Group where the disposition is genuinely shared**: closely related
   kernels (e.g. a family of small elementwise/cast variants between the
   same producers and consumers) may share one row, with the members
@@ -975,8 +1006,8 @@ superseded — this task pays for breadth:
 - **Capture ncu in bounded passes, not one blind sweep.** One pass's
   `--launch-count` is consumed in launch order, so per-layer hot kernels
   exhaust it before once-per-step kernels (final norm, logits GEMM,
-  sampler) ever match. Run Run C's canonical command up to **3 passes**:
-  pass 1 filters on the hottest stems exactly as Run C describes; then
+  sampler) ever match. Run Run B's canonical command up to **3 passes**:
+  pass 1 filters on the hottest stems exactly as Run B describes; then
   check which enumerated stems the report actually captured (`ncu
   --import ... --page raw --csv`), and each further pass filters on
   **only the still-missing stems** (so its budget is spent on them),
@@ -987,7 +1018,7 @@ superseded — this task pays for breadth:
 - **Degrade honestly, never fabricate**: a kernel no pass captured (or
   ncu itself unavailable) keeps its ledger row with
   `ncu: "unavailable: <reason>"` — both questions are still owed,
-  answered from the nsys timeline, the torch trace, and the source.
+  answered from the nsys timeline and the source.
 
 ### Question 1 per kernel — can it be made faster?
 
@@ -1040,9 +1071,9 @@ Fusion verdicts rest on **observed adjacency, not guesses**. Derive each
 kernel's neighborhood from the traces: the launch sequence inside one
 steady-state step (`nsys stats --report cuda_gpu_trace`, or the
 timeline around the kernel's instances) gives the predecessor/successor
-kernels; the torch trace's op attribution gives the producer/consumer
-tensors between them. Record it in the row's `fusion.neighbors`. Then
-test the candidate patterns:
+kernels; the NVTX ranges around them, read against the source, give the
+producer/consumer tensors. Record it in the row's `fusion.neighbors`.
+Then test the candidate patterns:
 
 - elementwise/cast/activation chains between two anchors → one fused
   kernel or the producer's epilogue;
@@ -1058,7 +1089,7 @@ opportunity. The recurring legitimate dismissals:
 
 - `multi-consumer-pinned` — the intermediate feeds >1 consumer, so
   fusion cannot remove the round trip (cite the consumers from the
-  torch trace / source).
+  timeline / source).
 - `already-fused` — the kernel is itself the fused form of its
   neighborhood; nothing adjacent left to absorb.
 - `phase-boundary` — the neighbors sit across a CUDA-graph capture,
@@ -1080,7 +1111,7 @@ exact shape:
 
 ```yaml
 version: 1
-source: rounds/round_<n>/analysis/nsys_stats.txt   # the kern_sum you enumerated
+source: rounds/round_<n>/analysis/nsys_analysis   # the decomposition you enumerated
 coverage:
   enumerated_share_pct: 96.8    # sum of kernels[].share_pct
   other_share_pct: 3.2          # the explicit below-bar tail (they must total ~100)
@@ -1088,7 +1119,7 @@ coverage:
 kernels:                        # descending share_pct; one row per kernel/group
   - kernel: gdn_bf16_state              # distinctive stem or group label (unique)
     full_name: "void tensorrt_llm::..." # representative full name(s); group members
-    share_pct: 18.4                     # % of profiled GPU time (nsys kern_sum)
+    share_pct: 18.4                     # % of in-window GPU time (nsys_analysis)
     ncu:                                # metrics mapping (or the string below)
       duration_us: 41.2
       sm_sol_pct: 12.1
@@ -1102,7 +1133,7 @@ kernels:                        # descending share_pct; one row per kernel/group
     fusion:
       disposition: dismissed
       neighbors: "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)"
-      ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (torch_trace)"
+      ref: "multi-consumer-pinned: intermediate feeds residual add + next norm (cuda_gpu_trace)"
   - kernel: allreduce_fusion            # a collective: never goes under ncu at all
     full_name: "void tensorrt_llm::kernels::ar_fusion::..."
     share_pct: 9.2
@@ -1125,7 +1156,7 @@ Rules:
   the referenced item may already be `accepted`/`failed` (the
   possibility *was* considered — that is the point). `disposition:
   dismissed` carries the evidence in `ref`, tagged per the vocabularies
-  above, citing the artifact (an ncu row, the torch trace, a source
+  above, citing the artifact (an ncu row, the nsys timeline, a source
   file, a failed item's `evaluation.md`).
 - **Say "not measured", never guess it.** A collective never goes under
   `ncu` — kernel replay deadlocks it — so disposition an allreduce from

@@ -105,7 +105,10 @@ SOL_DEFAULTS: dict[str, Any] = {SOL_ENABLED_FIELD: True}
 # silently ignored.
 _RENAMED_SOL_FIELD = "dlsim"
 
-VALID_PROFILE_METHODS: tuple[str, ...] = ("nsys", "torch", "ncu")
+VALID_PROFILE_METHODS: tuple[str, ...] = ("nsys", "ncu")
+
+# ``profile.profile_ranks`` — the rank ids nsys captures a trace for.
+PROFILE_RANKS_FIELD = "profile_ranks"
 
 # Defaults merged under the user's values for the always-present knobs.
 # Keys deliberately absent here (e.g. ``benchmark.request_rate``) stay
@@ -124,6 +127,14 @@ BENCHMARK_DEFAULTS: dict[str, Any] = {
 PROFILE_DEFAULTS: dict[str, Any] = {
     "methods": list(VALID_PROFILE_METHODS),
     "nsys_iter_range": "100-150",
+    # Which ranks nsys captures. Rank 0 alone is the historical
+    # behaviour and the only shape a spawn-launched server can give:
+    # a bare `trtllm-serve` at world size > 1 creates its workers with
+    # `MPI.COMM_SELF.Spawn`, and nsys does not follow spawned
+    # processes. Several ranks need one wrap per rank inside the
+    # launcher (the Slurm `trtllm-llmapi-launch` shape), which is what
+    # buys the skill's rank-jitter step its straggler verdict.
+    PROFILE_RANKS_FIELD: [0],
 }
 
 # Type expectations for known keys inside the optional ``benchmark``
@@ -164,7 +175,7 @@ _BENCHMARK_STR_FIELDS = ("dataset_name", "dataset_path")
 KNOWN_BENCHMARK_KEYS: frozenset[str] = frozenset(
     _BENCHMARK_INT_FIELDS + _BENCHMARK_STR_FIELDS + ("concurrency", "num_prompts", "request_rate")
 )
-KNOWN_PROFILE_KEYS: frozenset[str] = frozenset({"methods", "nsys_iter_range"})
+KNOWN_PROFILE_KEYS: frozenset[str] = frozenset({"methods", "nsys_iter_range", PROFILE_RANKS_FIELD})
 KNOWN_SLURM_KEYS: frozenset[str] = frozenset(
     SLURM_REQUIRED_FIELDS + (SLURM_CLUSTER_SSH_FIELD, REMOTE_RUN_ROOT_FIELD)
 )
@@ -368,6 +379,47 @@ def _validate_mapping_block(data: Mapping[str, Any], key: str, errors: list[str]
     return dict(value)
 
 
+def _validate_profile_ranks(profile: dict[str, Any], methods: Any, errors: list[str]) -> None:
+    """Validate — and sort in place — ``profile.profile_ranks``.
+
+    Rank ids are the skill's pairing key across variants and parts, so
+    they are read verbatim and never renumbered. Sorting only makes the
+    resolved spec deterministic; duplicates are rejected because a
+    repeated ``--profile <rank>=`` would silently drop one capture.
+    """
+    if PROFILE_RANKS_FIELD not in profile or profile[PROFILE_RANKS_FIELD] is None:
+        return
+    where = f"profile.{PROFILE_RANKS_FIELD}"
+    ranks = profile[PROFILE_RANKS_FIELD]
+    if not isinstance(ranks, list) or not ranks:
+        errors.append(f"'{where}' must be a non-empty list of rank ids, e.g. [0] or [0, 4]")
+        return
+    bad = [r for r in ranks if not isinstance(r, int) or isinstance(r, bool) or r < 0]
+    if bad:
+        errors.append(f"'{where}' must contain non-negative integers, got {bad}")
+        return
+    if len(set(ranks)) != len(ranks):
+        errors.append(f"'{where}' contains duplicate rank ids: {sorted(ranks)}")
+        return
+    # Capturing a rank is an nsys act; without nsys the knob is inert, and
+    # silently inert config is exactly what this schema exists to prevent.
+    if isinstance(methods, list) and "nsys" not in methods:
+        errors.append(
+            f"'{where}' requires 'nsys' in 'profile.methods' — a rank is captured "
+            f"by wrapping it in nsys, so the knob does nothing without it"
+        )
+    profile[PROFILE_RANKS_FIELD] = sorted(ranks)
+
+
+def profile_ranks(data: Mapping[str, Any]) -> tuple[int, ...]:
+    """The rank ids nsys captures, from a resolved spec. Defaults to ``(0,)``."""
+    profile = data.get("profile")
+    ranks = profile.get(PROFILE_RANKS_FIELD) if isinstance(profile, Mapping) else None
+    if isinstance(ranks, list) and ranks:
+        return tuple(int(rank) for rank in ranks)
+    return (0,)
+
+
 def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
     """Parse ``path`` as YAML and validate the perf-analyze schema.
 
@@ -495,6 +547,7 @@ def load_and_validate_task_yaml(path: str | Path) -> dict[str, Any]:
             or not profile["nsys_iter_range"].strip()
         ):
             errors.append("'profile.nsys_iter_range' must be a non-empty string (e.g. \"100-150\")")
+    _validate_profile_ranks(profile, methods, errors)
 
     if SLURM_ENVIRONMENT_FIELD in data and data[SLURM_ENVIRONMENT_FIELD] is not None:
         slurm_environment = data[SLURM_ENVIRONMENT_FIELD]
@@ -772,6 +825,7 @@ __all__ = [
     "BENCHMARK_DEFAULTS",
     "EXTRA_LLM_API_OPTIONS_FIELD",
     "PROFILE_DEFAULTS",
+    "PROFILE_RANKS_FIELD",
     "REMOTE_RUN_ROOT_FIELD",
     "REQUIRED_PATH_FIELDS",
     "SERVE_BACKEND",
@@ -794,6 +848,7 @@ __all__ = [
     "is_curve_mode",
     "load_and_validate_task_yaml",
     "num_prompts_per_point",
+    "profile_ranks",
     "remote_run_root",
     "sol_enabled",
 ]

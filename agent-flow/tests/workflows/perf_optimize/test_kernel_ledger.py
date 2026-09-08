@@ -33,7 +33,7 @@ def _row(kernel: str = "gdn_bf16_state", share: float = 60.0, **overrides) -> di
         "fusion": {
             "disposition": "dismissed",
             "neighbors": "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace, step 120)",
-            "ref": "multi-consumer-pinned: intermediate feeds residual + norm (torch_trace)",
+            "ref": "multi-consumer-pinned: intermediate feeds residual + norm (cuda_gpu_trace)",
         },
     }
     row.update(overrides)
