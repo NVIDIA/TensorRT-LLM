@@ -7,7 +7,8 @@ set -Eeo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 OPENMPI_SOURCE_ARCHIVE=/opt/hpcx/sources/openmpi4-gitclone.tar.gz
 OPENMPI_PREFIX=/opt/hpcx/ompi4
-# OpenMPI upstream commit 0c86834a68c8691088570925e33b854758e1e400.
+# Backport of OpenMPI upstream commit 0c86834a68c8691088570925e33b854758e1e400
+# against HPC-X 2.26's OpenMPI v4.1.5-241-g81d402c97a source archive.
 OPENMPI_PATCH="${SCRIPT_DIR}/patches/openmpi/0c86834a-request-add-wait-sync-memory-barriers.diff"
 
 if [[ "$(uname -m)" != "aarch64" || ! -d "${OPENMPI_PREFIX}" ]]; then
