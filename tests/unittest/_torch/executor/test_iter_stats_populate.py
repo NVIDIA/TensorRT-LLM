@@ -43,11 +43,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
-    _ITERATION_STATS_OPTIONAL_FIELDS,
-    _ITERATION_STATS_SCALAR_FIELDS,
-    ADPIterStatsBuffer,
-)
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
 
@@ -809,22 +805,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert len(records) == 2
 
     rank0_record = records[0]
-    rank0_row = rank0_record.stats
-    rank0_ifb = rank0_row.inflight_batching_stats
     assert rank0_record.attention_dp_rank == 0
-    assert rank0_row.iter_latency_ms == 12.5
-    assert rank0_ifb.num_context_requests == 1
-    assert rank0_ifb.num_ctx_tokens == 100
-    assert rank0_ifb.num_ctx_kv_tokens == 10
-    assert rank0_ifb.num_gen_requests == 2
-    assert rank0_ifb.num_gen_kv_tokens == 20
-    assert rank0_ifb.num_paused_requests == 1
-    assert rank0_ifb.num_paused_kv_tokens == 5
-    assert rank0_ifb.num_scheduled_requests == 3
-    assert rank0_ifb.num_queued_context_requests == 7
-    assert rank0_ifb.num_queued_ctx_tokens == 700
-    assert rank0_ifb.num_queued_gen_requests == 8
-    assert rank0_ifb.num_queued_gen_kv_tokens == 800
+    assert rank0_record.stats is rank0_stats
+    assert rank0_record.rank_iter_stats is rank0_state.iter_stats
     assert rank0_record.req_stats == ["req-stats"]
     assert rank0_record.kv_iter_stats == {0: "pending-kv"}
     assert rank0_record.host_step_time_ms == 11.0
@@ -832,24 +815,16 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_record.gpu_forward_time_ms == 7.0
 
     rank1_record = records[1]
-    rank1_row = rank1_record.stats
-    rank1_ifb = rank1_row.inflight_batching_stats
     assert rank1_record.attention_dp_rank == 1
-    assert rank1_row.iter_latency_ms == 12.5
-    assert rank1_ifb.num_context_requests == 3
-    assert rank1_ifb.num_ctx_tokens == 300
-    assert rank1_ifb.num_ctx_kv_tokens == 30
-    assert rank1_ifb.num_gen_requests == 4
-    assert rank1_ifb.num_gen_kv_tokens == 40
-    assert rank1_ifb.num_paused_requests == 2
-    assert rank1_ifb.num_paused_kv_tokens == 25
-    assert rank1_ifb.num_scheduled_requests == 7
-    # Expected to be zero/None because queued/request/KV stats are reported
-    # only on rank 0.
-    assert rank1_ifb.num_queued_context_requests == 0
-    assert rank1_ifb.num_queued_ctx_tokens == 0
-    assert rank1_ifb.num_queued_gen_requests == 0
-    assert rank1_ifb.num_queued_gen_kv_tokens == 0
+    assert rank1_record.stats is rank0_stats
+    assert rank1_record.rank_iter_stats is rank1_state.iter_stats
+    assert rank1_record.rank_iter_stats.num_context_requests == 3
+    assert rank1_record.rank_iter_stats.num_ctx_tokens == 300
+    assert rank1_record.rank_iter_stats.num_ctx_kv_tokens == 30
+    assert rank1_record.rank_iter_stats.num_gen_requests == 4
+    assert rank1_record.rank_iter_stats.num_gen_kv_tokens == 40
+    assert rank1_record.rank_iter_stats.num_paused_requests == 2
+    assert rank1_record.rank_iter_stats.num_paused_kv_tokens == 25
     assert rank1_record.req_stats is None
     assert rank1_record.kv_iter_stats is None
     assert rank1_record.host_step_time_ms == 11.0
@@ -950,22 +925,6 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     assert next_payload.num_context_requests == 0
     assert 9 in buffer._synthetic_iters
     assert 10 in buffer._payloads
-
-
-def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
-    """Guard the hardcoded field lists used when cloning rank-0 stats."""
-    actual_fields = {
-        field
-        for field in dir(IterationStats())
-        if not field.startswith("_") and field != "to_json_str"
-    }
-    copied_fields = (
-        set(_ITERATION_STATS_SCALAR_FIELDS)
-        | set(_ITERATION_STATS_OPTIONAL_FIELDS)
-        | {"inflight_batching_stats"}
-    )
-
-    assert copied_fields == actual_fields
 
 
 # ---------------------------------------------------------------------------

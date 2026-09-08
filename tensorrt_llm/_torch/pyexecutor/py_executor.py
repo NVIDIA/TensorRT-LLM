@@ -108,7 +108,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter
+from .scheduler.adp_router import ADPRouter, RankIterStatsPayload
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -2348,14 +2348,16 @@ class PyExecutor:
             self.speculation_permanently_disabled = True
         return disabled_now, avg
 
-    def _append_iter_stats(self,
-                           stats: IterationStats,
-                           req_stats: Optional[List[RequestStats]] = None,
-                           kv_iter_stats: Optional[Dict[int, object]] = None,
-                           attention_dp_rank: Optional[int] = None,
-                           host_step_time_ms: Optional[float] = None,
-                           prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+    def _append_iter_stats(
+            self,
+            stats: IterationStats,
+            req_stats: Optional[List[RequestStats]] = None,
+            kv_iter_stats: Optional[Dict[int, object]] = None,
+            attention_dp_rank: Optional[int] = None,
+            host_step_time_ms: Optional[float] = None,
+            prev_device_step_time_ms: Optional[float] = None,
+            gpu_forward_time_ms: Optional[float] = None,
+            attention_dp_payload: Optional[RankIterStatsPayload] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -2381,6 +2383,8 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            attention_dp_payload: Compact rank-local scheduler counters. The
+                serializer applies these to the shared rank-0 snapshot.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -2442,11 +2446,12 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] attention_dp_payload: Optional[RankIterStatsPayload]
         with self.stats_lock:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, attention_dp_payload))
             if not _stats_buffer_is_unbounded(self.max_stats_len):
                 while len(self.stats) > self.max_stats_len:
                     self.stats.popleft()
@@ -6021,7 +6026,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        attention_dp_payload=record.rank_iter_stats)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]

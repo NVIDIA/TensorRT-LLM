@@ -7,39 +7,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set
 
-from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, RequestStats
+from tensorrt_llm.bindings.executor import IterationStats, RequestStats
 from tensorrt_llm.logger import logger
 
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 
-_ITERATION_STATS_SCALAR_FIELDS = (
-    "timestamp",
-    "iter",
-    "iter_latency_ms",
-    "new_active_requests_queue_latency_ms",
-    "num_new_active_requests",
-    "num_active_requests",
-    "num_queued_requests",
-    "num_completed_requests",
-    "max_num_active_requests",
-    "gpu_mem_usage",
-    "cpu_mem_usage",
-    "pinned_mem_usage",
-)
-
-_ITERATION_STATS_OPTIONAL_FIELDS = (
-    "kv_cache_stats",
-    "cross_kv_cache_stats",
-    "static_batching_stats",
-    "specdec_stats",
-)
-
 
 @dataclass
 class ADPIterStatsRecord:
-    """Append-ready stats row produced by Attention-DP fanout."""
+    """Append-ready stats row produced by Attention-DP fanout.
+
+    All rank rows share the rank-0 ``IterationStats`` object. The compact
+    rank payload is applied only when the row is serialized, keeping the
+    executor loop from cloning nested nanobind stats objects per ADP rank.
+    """
 
     stats: IterationStats
+    rank_iter_stats: RankIterStatsPayload
     req_stats: Optional[List[RequestStats]]
     kv_iter_stats: Optional[Dict[int, object]]
     attention_dp_rank: int
@@ -186,62 +170,6 @@ class ADPIterStatsBuffer:
         if changed:
             self._recompute_oldest_iter()
 
-    @staticmethod
-    def _make_rank_iter_stats(
-        rank0_stats: IterationStats,
-        rank_state: RankState,
-    ) -> IterationStats:
-        """Build one IterationStats row for an ADP rank.
-
-        Attention-DP emits one stats row per rank so downstream FPM consumers
-        can see scheduling distribution and diagnose load imbalance. Scheduled
-        fields are rank-local. Queued fields remain rank-0/global because the
-        executor request queue lives on rank 0.
-        """
-        rank = rank_state.rank
-        payload = rank_state.iter_stats
-        source_ifb = rank0_stats.inflight_batching_stats
-
-        stats = IterationStats()
-        for attr in _ITERATION_STATS_SCALAR_FIELDS:
-            setattr(stats, attr, getattr(rank0_stats, attr))
-
-        # Optional nested stats are copied when present. KV iteration deltas
-        # are attached separately and remain rank-0-only to avoid double-logging
-        # global KV-cache deltas.
-        for attr in _ITERATION_STATS_OPTIONAL_FIELDS:
-            nested_stats = getattr(rank0_stats, attr)
-            if nested_stats is not None:
-                setattr(stats, attr, nested_stats)
-
-        ifb = InflightBatchingStats()
-        ifb.num_context_requests = payload.num_context_requests
-        ifb.num_ctx_tokens = payload.num_ctx_tokens
-        ifb.num_ctx_kv_tokens = payload.num_ctx_kv_tokens
-        ifb.num_gen_requests = payload.num_gen_requests
-        ifb.num_gen_kv_tokens = payload.num_gen_kv_tokens
-        ifb.num_paused_requests = payload.num_paused_requests
-        ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
-        ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
-
-        if source_ifb is not None:
-            ifb.micro_batch_id = source_ifb.micro_batch_id
-            ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
-            if rank == 0:
-                ifb.num_queued_context_requests = source_ifb.num_queued_context_requests
-                ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = source_ifb.num_queued_gen_requests
-                ifb.num_queued_gen_kv_tokens = source_ifb.num_queued_gen_kv_tokens
-
-        if rank != 0:
-            stats.num_queued_requests = 0
-            stats.num_completed_requests = 0
-            stats.num_new_active_requests = 0
-            stats.new_active_requests_queue_latency_ms = 0.0
-
-        stats.inflight_batching_stats = ifb
-        return stats
-
     def finalize(
         self, all_rank_states: List[RankState], *, is_rank0: bool
     ) -> List[ADPIterStatsRecord]:
@@ -299,7 +227,8 @@ class ADPIterStatsBuffer:
                 rank = rank_state.rank
                 records.append(
                     ADPIterStatsRecord(
-                        stats=self._make_rank_iter_stats(rank0_stats, rank_state),
+                        stats=rank0_stats,
+                        rank_iter_stats=rank_state.iter_stats,
                         req_stats=req_stats if rank == 0 else None,
                         kv_iter_stats=kv_iter_stats if rank == 0 else None,
                         attention_dp_rank=rank,

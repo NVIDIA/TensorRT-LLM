@@ -54,6 +54,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -82,6 +83,32 @@ def _init_hf_modules():
 
 
 _init_hf_modules()
+
+
+def _apply_attention_dp_payload(stats_dict: dict,
+                                payload: "RankIterStatsPayload",
+                                rank: int) -> None:
+    """Overlay compact rank-local counters on a shared IterationStats JSON dict."""
+    ifb = stats_dict["inflightBatchingStats"]
+    ifb["numContextRequests"] = payload.num_context_requests
+    ifb["numCtxTokens"] = payload.num_ctx_tokens
+    ifb["numCtxKvTokens"] = payload.num_ctx_kv_tokens
+    ifb["numGenRequests"] = payload.num_gen_requests
+    ifb["numGenKvTokens"] = payload.num_gen_kv_tokens
+    ifb["numPausedRequests"] = payload.num_paused_requests
+    ifb["numPausedKvTokens"] = payload.num_paused_kv_tokens
+    ifb["numScheduledRequests"] = (payload.num_context_requests +
+                                   payload.num_gen_requests)
+
+    if rank != 0:
+        stats_dict["numQueuedRequests"] = 0
+        stats_dict["numCompletedRequests"] = 0
+        stats_dict["numNewActiveRequests"] = 0
+        stats_dict["newActiveRequestsQueueLatencyMS"] = 0.0
+        ifb["numQueuedContextRequests"] = 0
+        ifb["numQueuedCtxTokens"] = 0
+        ifb["numQueuedGenRequests"] = 0
+        ifb["numQueuedGenKvTokens"] = 0
 
 
 class BaseWorker(GenerationExecutor):
@@ -1081,6 +1108,7 @@ class BaseWorker(GenerationExecutor):
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        attention_dp_payload = stats[8] if len(stats) > 8 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -1088,6 +1116,9 @@ class BaseWorker(GenerationExecutor):
         # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
         stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
                                          attention_dp_rank)
+        if attention_dp_payload is not None:
+            _apply_attention_dp_payload(stats_dict, attention_dp_payload,
+                                        stats_dict["attentionDpRank"])
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []

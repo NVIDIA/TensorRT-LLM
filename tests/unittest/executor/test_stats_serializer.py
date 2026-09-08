@@ -286,6 +286,60 @@ class TestStatsSerializer:
         d = json.loads(result)
         assert d["attentionDpRank"] == 3
 
+    def test_serializer_applies_compact_attention_dp_payload(self):
+        """Rank-local counters overlay the shared rank-0 snapshot at export."""
+        iter_stats = MagicMock()
+        iter_stats.to_json_str.return_value = json.dumps(
+            {
+                "numQueuedRequests": 9,
+                "numCompletedRequests": 2,
+                "numNewActiveRequests": 3,
+                "newActiveRequestsQueueLatencyMS": 4.0,
+                "inflightBatchingStats": {
+                    "numQueuedContextRequests": 5,
+                    "numQueuedCtxTokens": 500,
+                    "numQueuedGenRequests": 6,
+                    "numQueuedGenKvTokens": 600,
+                    "microBatchId": 7,
+                },
+            }
+        )
+        payload = SimpleNamespace(
+            num_context_requests=10,
+            num_ctx_tokens=1000,
+            num_ctx_kv_tokens=100,
+            num_gen_requests=20,
+            num_gen_kv_tokens=2000,
+            num_paused_requests=4,
+            num_paused_kv_tokens=400,
+        )
+
+        result = BaseWorker._stats_serializer(
+            (iter_stats, None, None, 1, None, None, None, None, payload)
+        )
+        d = json.loads(result)
+
+        assert d["attentionDpRank"] == 1
+        assert d["numQueuedRequests"] == 0
+        assert d["numCompletedRequests"] == 0
+        assert d["numNewActiveRequests"] == 0
+        assert d["newActiveRequestsQueueLatencyMS"] == 0.0
+        assert d["inflightBatchingStats"] == {
+            "numQueuedContextRequests": 0,
+            "numQueuedCtxTokens": 0,
+            "numQueuedGenRequests": 0,
+            "numQueuedGenKvTokens": 0,
+            "microBatchId": 7,
+            "numContextRequests": 10,
+            "numCtxTokens": 1000,
+            "numCtxKvTokens": 100,
+            "numGenRequests": 20,
+            "numGenKvTokens": 2000,
+            "numPausedRequests": 4,
+            "numPausedKvTokens": 400,
+            "numScheduledRequests": 30,
+        }
+
     def test_serializer_none_attention_dp_rank_defaults_zero(self):
         """Fixed-shape 4-tuples use None for non-ADP and serialize as rank 0."""
         iter_stats = _make_mock_iteration_stats()
