@@ -1548,7 +1548,6 @@ def executor_request_to_llm_request(
         sampling_config=sampling_config,
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
-        pad_id=executor_request.pad_id,
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
