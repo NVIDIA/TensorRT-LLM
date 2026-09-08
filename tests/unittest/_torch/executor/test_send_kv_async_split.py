@@ -8,7 +8,9 @@ register its transfer before the connector does, and the ctx reap must run
 last so a quickly-completed send cannot terminate a request whose connector
 transfer is not registered yet. These tests pin that structure, and pin the
 property this split exists for: the connector leg keeps running when the
-transceiver is disabled.
+transceiver is disabled. After the coordinator extraction, that property comes
+from the lazily built no-op coordinator, so the transceiver-off test goes
+through the real builder rather than an injected coordinator.
 """
 
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
@@ -45,6 +48,21 @@ def test_wrapper_order_disagg_then_connector_then_reap() -> None:
     PyExecutor._send_kv_async(executor, [])
 
     assert calls == ["disagg_send", "connector_save", "ctx_reap:0"]
+
+
+def test_wrapper_keeps_connector_leg_without_transceiver() -> None:
+    """Connector-only configs: with no transceiver the executor lazily builds
+    the no-op coordinator, which turns both disagg legs into no-ops around the
+    connector save. No coordinator is injected so the builder is exercised."""
+    executor = _stub_executor()
+    executor.kv_cache_transceiver = None
+    calls = []
+    executor._save_kv_to_connector_async = lambda reqs: calls.append("connector_save")
+
+    PyExecutor._send_kv_async(executor, [])
+
+    assert isinstance(executor.disagg, NoopDisaggCoordinator)
+    assert calls == ["connector_save"]
 
 
 def test_connector_save_leg_is_noop_without_connector() -> None:

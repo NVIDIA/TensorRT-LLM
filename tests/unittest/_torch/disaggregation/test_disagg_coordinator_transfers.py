@@ -54,6 +54,7 @@ class _Request(SimpleNamespace):
         self.state_at_response_creation = self.state
         return self.response
 
+    @property
     def is_generation_only_request(self) -> bool:
         return not self.is_context_only_request
 

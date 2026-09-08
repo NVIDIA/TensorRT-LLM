@@ -485,7 +485,7 @@ class DisaggTransferCoordinator:
     def _check_gen_transfer_errors_consensus(self) -> None:
         """Flush generation transfer errors through a TP-uniform path."""
         error_requests = [
-            req for req in self._d.requests_in_error_state() if req.is_generation_only_request()
+            req for req in self._d.requests_in_error_state() if req.is_generation_only_request
         ]
         local_needs_flush = bool(error_requests)
         if self._dist.tp_size > 1:
