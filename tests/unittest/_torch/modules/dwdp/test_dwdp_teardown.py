@@ -91,6 +91,23 @@ def test_teardown_releases_every_manager_when_one_fails():
     second.release.assert_called_once_with()
 
 
+def test_teardown_releases_every_manager_after_a_keyboard_interrupt():
+    """Ctrl-C is not an ``Exception``; later managers must still be released."""
+    first = MagicMock()
+    first.release.side_effect = KeyboardInterrupt()
+    second = MagicMock()
+
+    model = _model()
+    model.dwdp_weight_manager = first
+    model.model.dwdp_weight_manager = second
+
+    with pytest.raises(KeyboardInterrupt):
+        teardown_dwdp(model)
+
+    first.release.assert_called_once_with()
+    second.release.assert_called_once_with()
+
+
 def test_teardown_detaches_both_model_references_and_releases_once():
     model = _model()
     manager = MagicMock()
