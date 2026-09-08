@@ -13,18 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
 import unittest
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, DraftTargetDecodingConfig, KvCacheConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
 
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])

@@ -90,6 +90,9 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  # Exercise VisualGen worker-failure containment with live CUDA allocations
+  # spread across four local processes.
+  - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
   # ------------- Model specific tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=True]

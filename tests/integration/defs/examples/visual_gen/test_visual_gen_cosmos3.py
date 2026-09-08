@@ -16,6 +16,7 @@
 """Single-GPU integration and accuracy tests for Cosmos3."""
 
 import contextlib
+import json
 import os
 from dataclasses import dataclass
 
@@ -648,7 +649,10 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
                     # so pin it rather than inheriting the video-mode default.
                     negative_prompt="",
                     seed=COSMOS3_LPIPS_SEED,
-                    image=image_path,
+                    # forward() takes an encoded reference, not a path: the serve
+                    # path resolves MediaRef to bytes on the coordinator, so
+                    # direct callers read the file themselves.
+                    image=image_path.read_bytes(),
                     height=COSMOS3_LPIPS_HEIGHT,
                     width=COSMOS3_LPIPS_WIDTH,
                     num_frames=COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES,
@@ -688,7 +692,7 @@ def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_p
     regression against a past TRT-LLM run. Full provenance:
     ``golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json``.
     """
-    image_path = str(tmp_path / "cosmos3_i2v_4step_conditioning.png")
+    image_path = tmp_path / "cosmos3_i2v_4step_conditioning.png"
     _write_cosmos3_i2v_conditioning_image(image_path)
     generated_path = tmp_path / "cosmos3_i2v_4step_generated.mp4"
     golden_path = _golden_media_path(
@@ -776,6 +780,85 @@ def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
     assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
+
+
+def _write_cosmos3_edge_policy_observation(path):
+    """Deterministic 736x544 three-view observation in the DROID layout."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (736, 544), (24, 24, 24))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, 735, 271], fill=(75, 115, 170))
+    draw.rectangle([0, 272, 367, 543], fill=(150, 90, 55))
+    draw.rectangle([368, 272, 735, 543], fill=(55, 140, 90))
+    draw.ellipse([305, 180, 430, 305], fill=(230, 190, 45))
+    image.save(path)
+
+
+def test_cosmos3_edge_policy_droid_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the released Policy-DROID checkpoint through its documented API."""
+    from safetensors.torch import load_file
+
+    model_path = _lpips_model_path("Cosmos3-Edge-Policy-DROID")
+    _skip_if_missing(model_path, "Cosmos3-Edge-Policy-DROID checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(),
+        "visual_gen_output",
+        "cosmos3_edge_policy_droid_example",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    image_path = os.path.join(out_dir, "droid_observation.png")
+    state_path = os.path.join(out_dir, "current_state.json")
+    output_path = os.path.join(out_dir, "droid_policy.safetensors")
+    action_output_path = os.path.join(out_dir, "droid_policy.action.json")
+    _write_cosmos3_edge_policy_observation(image_path)
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump([0.0] * 8, state_file)
+    for stale_path in (output_path, action_output_path):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    prompt_path = os.path.join(
+        llm_root,
+        "examples",
+        "visual_gen",
+        "models",
+        "cosmos3",
+        "prompts",
+        "action_edge_policy_droid.json",
+    )
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--prompt_file",
+            prompt_path,
+            "--image_path",
+            image_path,
+            "--action_json",
+            state_path,
+            "--output_path",
+            output_path,
+            "--action_output_path",
+            action_output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+
+    payload = load_file(output_path)
+    assert payload["video"].shape == (33, 544, 736, 3)
+    assert payload["action"].shape == (32, 8)
+    assert payload["frame_rate"].item() == pytest.approx(15.0)
+    with open(action_output_path, encoding="utf-8") as action_file:
+        action_output = json.load(action_file)
+    assert action_output["action_mode"] == "policy"
+    assert action_output["shape"] == [32, 8]
 
 
 # Edge LPIPS gates compare against TRT-LLM self-goldens (originally cut from
@@ -897,10 +980,13 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
         tmp_path, "cosmos3_edge_i2v_lpips_golden_video.mp4", "Cosmos3-Edge I2V LPIPS golden video"
     )
     image_path = tmp_path / "cosmos3_edge_i2v_conditioning.png"
-    _write_cosmos3_edge_conditioning_image(str(image_path))
+    _write_cosmos3_edge_conditioning_image(image_path)
     result = _run_cosmos3_edge_lpips_pipeline(
         prompt=COSMOS3_EDGE_I2V_LPIPS_PROMPT,
-        image=str(image_path),
+        # forward() takes an encoded reference, not a path: the serve path
+        # resolves MediaRef to bytes on the coordinator, so direct callers
+        # read the file themselves.
+        image=image_path.read_bytes(),
         height=480,
         width=832,
         num_frames=COSMOS3_EDGE_LPIPS_NUM_FRAMES,
