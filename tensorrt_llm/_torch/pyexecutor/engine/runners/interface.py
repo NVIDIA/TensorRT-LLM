@@ -70,20 +70,22 @@ class ModelRunner(Protocol):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
     ) -> PreparedInputs: ...
 
-    def warmup(self, resource_manager: ResourceManager) -> None: ...
+    def warmup(self, resource_manager: ResourceManager | None) -> None: ...
 
-    def capture_graphs(self, resource_manager: ResourceManager) -> None: ...
+    def capture_graphs(self, resource_manager: ResourceManager | None) -> None: ...
+
+    def release_graph(self) -> None: ...
 
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
         moe_load_balancer: MoeLoadBalancer | None,

@@ -18,13 +18,16 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .llm_request import LlmRequest, SamplingConfig
+from .scheduler import ScheduledRequests
+
 
 class EncoderExecutor:
     """Executor for models using the encode-only path.
 
     Primary path: batch_forward(inputs) — synchronous batch execution.
-    Delegates to model_engine.encoder_forward() for all heavy lifting
-    (pre-allocated buffers, attention metadata, torch.compile).
+    Converts the direct Encode API batch to the engine's scheduled-request
+    contract before dispatching model execution.
 
     This executor has no background thread, no scheduler, no sampler,
     and no request queue. It runs entirely on the calling thread.
@@ -41,7 +44,7 @@ class EncoderExecutor:
             "are bypassed. Use llm.encode() for inference."
         )
 
-        self.model_engine.warmup_encoder()
+        self.model_engine.warmup(None)
 
     def batch_forward(self, inputs: Dict[str, Any], **kwargs) -> Dict[str, torch.Tensor]:
         """Execute a pre-formed batch in one forward pass.
@@ -54,7 +57,52 @@ class EncoderExecutor:
         Returns:
             Dict with 'logits' tensor and any other model outputs.
         """
-        return self.model_engine.encoder_forward(inputs, **kwargs)
+        scheduled_requests, model_inputs = self._build_scheduled_requests(inputs)
+        return self.model_engine.forward(
+            scheduled_requests,
+            resource_manager=None,
+            **model_inputs,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _build_scheduled_requests(
+        inputs: Dict[str, Any],
+    ) -> tuple[ScheduledRequests, Dict[str, Any]]:
+        model_inputs = dict(inputs)
+        input_ids = model_inputs.pop("input_ids")
+        sequence_lengths = [int(length) for length in model_inputs.pop("seq_lens")]
+        multi_item_part_lens = model_inputs.pop("multi_item_part_lens", None)
+
+        if sum(sequence_lengths) != len(input_ids):
+            raise ValueError("The sum of seq_lens must equal the number of input_ids.")
+        if multi_item_part_lens is not None and len(multi_item_part_lens) != len(sequence_lengths):
+            raise ValueError(
+                '"multi_item_part_lens" must either be provided for all requests or for none.'
+            )
+
+        requests = []
+        offset = 0
+        for request_id, sequence_length in enumerate(sequence_lengths):
+            tokens = input_ids[offset : offset + sequence_length]
+            offset += sequence_length
+            if isinstance(tokens, torch.Tensor):
+                tokens = tokens.tolist()
+            request = LlmRequest(
+                request_id=request_id,
+                max_new_tokens=1,
+                input_tokens=tokens,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            )
+            request.py_multi_item_part_lens = (
+                multi_item_part_lens[request_id] if multi_item_part_lens is not None else None
+            )
+            requests.append(request)
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.reset_context_requests(requests)
+        return scheduled_requests, model_inputs
 
     def shutdown(self):
         """No background thread to stop — just release model engine resources."""

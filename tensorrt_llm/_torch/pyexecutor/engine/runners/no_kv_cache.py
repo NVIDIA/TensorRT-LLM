@@ -136,10 +136,12 @@ class NoKVCacheRunner(ABC):
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
     ) -> PreparedInputs:
+        if resource_manager is None:
+            raise ValueError("NoKVCacheRunner requires a resource manager.")
         runner_config = self._config
         attn_metadata = self.setup_attn_metadata()
         spec_metadata = self.setup_spec_metadata(
@@ -368,17 +370,20 @@ class NoKVCacheRunner(ABC):
 
         return PreparedInputs(inputs)
 
-    def warmup(self, resource_manager: ResourceManager) -> None:
+    def warmup(self, resource_manager: ResourceManager | None) -> None:
         return
 
-    def capture_graphs(self, resource_manager: ResourceManager) -> None:
+    def capture_graphs(self, resource_manager: ResourceManager | None) -> None:
+        return
+
+    def release_graph(self) -> None:
         return
 
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager,
+        resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
         moe_load_balancer: MoeLoadBalancer | None,

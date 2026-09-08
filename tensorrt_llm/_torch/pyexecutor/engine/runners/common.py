@@ -19,6 +19,38 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
+def filter_cuda_graph_batch_sizes(
+    cuda_graph_batch_sizes: list[int],
+    max_batch_size: int,
+    max_num_tokens: int,
+    tokens_per_request: int,
+    enable_padding: bool,
+) -> list[int]:
+    """Drop graph batch sizes that exceed the request or token budget."""
+    max_cuda_graph_batch_size = min(
+        max_batch_size,
+        max_num_tokens // tokens_per_request,
+    )
+    if max_cuda_graph_batch_size < 1:
+        return []
+
+    result: list[int] = []
+    for index, batch_size in enumerate(cuda_graph_batch_sizes):
+        if batch_size <= max_cuda_graph_batch_size:
+            result.append(batch_size)
+            continue
+        if enable_padding and (index == 0 or result[index - 1] != max_cuda_graph_batch_size):
+            logger.warning(
+                "CUDA graph padding is enabled, but one of the given CUDA "
+                f"graph batch sizes ({batch_size}) is larger than the "
+                f"executor's max batch size ({max_cuda_graph_batch_size}). "
+                f"We will pad batches to {max_cuda_graph_batch_size}."
+            )
+            result.append(max_cuda_graph_batch_size)
+        break
+    return result
+
+
 def get_all_rank_num_tokens(
     attn_metadata: AttentionMetadata,
     *,
