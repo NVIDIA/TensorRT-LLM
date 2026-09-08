@@ -71,6 +71,15 @@ class KVCacheLayerSpec:
     attention_window: Optional[int] = None
 
 
+def _get_kv_cache_layer_specs(
+    model_config: object, ) -> Optional[Sequence[KVCacheLayerSpec]]:
+    """Return concrete per-layer geometry from full or lightweight configs."""
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    if not isinstance(layer_specs, Sequence):
+        return None
+    return layer_specs
+
+
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 

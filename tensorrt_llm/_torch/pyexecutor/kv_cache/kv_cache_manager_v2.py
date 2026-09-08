@@ -27,6 +27,7 @@ from strenum import StrEnum
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.model_config import _get_kv_cache_layer_specs
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -434,7 +435,7 @@ def _get_static_cache_size_layer_components(
     kv_cache_config: Optional[KvCacheConfig] = None,
 ) -> tuple[List[int], List[Optional[int]]]:
     config = model_config.pretrained_config
-    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    layer_specs = _get_kv_cache_layer_specs(model_config)
 
     mla = hasattr(config, "kv_lora_rank") and config.kv_lora_rank is not None
     if mla:

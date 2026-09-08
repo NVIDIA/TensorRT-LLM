@@ -46,7 +46,7 @@ from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
 from ..hostfunc import set_low_latency_dispatch
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
@@ -98,7 +98,7 @@ def _get_initial_lora_data_type(
 
 
 def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
-    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    layer_specs = _get_kv_cache_layer_specs(model_config)
     return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
                                       for spec in layer_specs}) > 1
 
@@ -2415,7 +2415,7 @@ def _create_kv_cache_manager(
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
 
-    layer_specs = getattr(_model_config, "kv_cache_layer_specs", None)
+    layer_specs = _get_kv_cache_layer_specs(_model_config)
     if layer_specs:
         head_dim = [spec.head_dim for spec in layer_specs]
         num_key_value_heads = [spec.num_kv_heads for spec in layer_specs]

@@ -18,7 +18,11 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
+from tensorrt_llm._torch.model_config import (
+    KVCacheLayerSpec,
+    ModelConfig,
+    _get_kv_cache_layer_specs,
+)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
@@ -42,6 +46,11 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_unconfigured_mock_has_no_kv_cache_layer_specs() -> None:
+    """A lightweight mock must not fabricate iterable per-layer geometry."""
+    assert _get_kv_cache_layer_specs(Mock()) is None
 
 
 def _make_mock_request(num_input_tokens, beam_width=1):
