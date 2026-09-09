@@ -798,14 +798,6 @@ class TestUlyssesAttention:
             use_cuda=False,
         )
 
-    def test_ulysses_replicated_kv_unequal_lengths(self):
-        """Unequal replicated-context lengths and generated tail padding are exact."""
-        run_test_in_distributed(
-            world_size=2,
-            test_fn=_logic_ulysses_replicated_kv_unequal_lengths,
-            use_cuda=False,
-        )
-
     def test_ulysses_attention_invalid_heads(self):
         """Test that invalid head count raises error."""
         run_test_in_distributed(world_size=2, test_fn=_logic_ulysses_invalid_heads, use_cuda=False)

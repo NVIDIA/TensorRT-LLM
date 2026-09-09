@@ -198,14 +198,13 @@ def test_cosmos3_cross_attention_backend_resolution(backend, mapping, expected):
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 @pytest.mark.parametrize("ulysses_size", [1, 2])
-def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size):
+def test_cosmos3_cross_attention_falls_back_from_cute_dsl_with_attention2d(ulysses_size):
     mapping = SimpleNamespace(
         ulysses_size=ulysses_size,
         attn2d_row_size=2,
         attn2d_col_size=2,
     )
-    with pytest.raises(ValueError, match="Use attention backend FA4"):
-        _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping)
+    assert _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping) == "FA4"
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
