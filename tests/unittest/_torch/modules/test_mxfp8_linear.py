@@ -25,7 +25,9 @@ import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    FlashInferMXFP8GemmRunner,
     MXFP8GemmRunner,
+    MXFP8QuantizeRunner,
     _get_mxfp8_large_m_tuning_buckets,
     _map_to_mxfp8_large_m_bucket,
 )
@@ -591,6 +593,15 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
 
     monkeypatch.setattr(custom_ops_module, "_choose_mxfp8_tactic", record_tactic)
 
+    # Both CuTeDSL candidates must run and match, independent of which
+    # backend wins the profiling below.
+    act, act_scale = MXFP8QuantizeRunner(x.dtype)([x], tactic=MXFP8QuantizeRunner.CUTE_DSL)
+    cute_dsl_output = FlashInferMXFP8GemmRunner(tuned.dtype)(
+        [act, act_scale, tuned.weight, tuned.weight_scale],
+        tactic=FlashInferMXFP8GemmRunner.CUTE_DSL,
+    )
+    torch.testing.assert_close(cute_dsl_output, native_output, rtol=2e-2, atol=2e-2)
+
     # Warmup-only pass: profile both backends of each stage for this bucket.
     with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
         warmup_output = tuned(x)
@@ -607,5 +618,9 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
         with flashinfer_mxfp8_decode_graph_capture():
             graph_output = tuned(static_x)
     assert tuple(chosen_tactics) == warmup_tactics
+
+    # Replay on a fresh input so the check cannot pass on the captured result.
+    replay_x = torch.randn_like(x)
+    static_x.copy_(replay_x)
     graph.replay()
-    torch.testing.assert_close(graph_output, native_output, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
