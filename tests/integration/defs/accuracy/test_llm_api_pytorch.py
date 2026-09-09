@@ -1223,359 +1223,6 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
-@skip_post_blackwell
-@skip_pre_hopper
-class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            free_gpu_memory_fraction=0.5,
-        )
-        # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
-        # So, testing with it here.
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_fp8_prequantized(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        dtype="fp8")
-        # Note: This has only the LLM part quantized. Vision part is in bfloat16.
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None,
-                 max_seq_len=4096) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-@skip_pre_hopper
-class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-1b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
-
-    # NOTE: Disable block reuse for SWA window model.
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-        )
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp8_prequantized(self, torch_compile):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        dtype="fp8")
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_fp8_vswa_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.parametrize("backend", ["xgrammar"])
-    def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-        cuda_graph_config = CudaGraphConfig(enable_padding=True)
-        llm = LLM(prequantized_model_path,
-                  guided_decoding_backend=backend,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config)
-        with llm:
-            task = JsonModeEval(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 disable_overlap_scheduler=True) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 disable_overlap_scheduler=True) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_kv_cache_stats(self):
-        """Mirror of test_auto_dtype_vswa_reuse that collects per-iteration stats.
-
-        Collects per-iteration KV cache statistics and writes them to a JSON
-        file for offline visualization with
-        ``scripts/visualize_kv_cache_stats.py``.
-        """
-        import json
-        import time
-        from pathlib import Path
-
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            iteration_stats_interval=1,
-        )
-
-        all_stats = []
-
-        def drain_stats(llm, phase_label):
-            """Drain the stats queue and tag each entry.
-
-            Tags each entry with wall-clock time and a human-readable phase
-            label.
-            """
-            stats = llm.get_stats(timeout=2)
-            ts = time.time()
-            for entry in stats:
-                entry["_collectedAt"] = ts
-                entry["_phase"] = phase_label
-            all_stats.extend(stats)
-
-        with LLM(
-                self.MODEL_PATH,
-                kv_cache_config=kv_cache_config,
-                max_stats_len=-1,
-                enable_iter_perf_stats=True,
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            drain_stats(llm, "GSM8K")
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            drain_stats(llm, "MMLU")
-
-        # Write collected stats to JSON
-        out_dir = Path(
-            os.environ.get(
-                "KV_CACHE_STATS_OUTPUT_DIR",
-                "kv_cache_stats_output",
-            ))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"kv_cache_stats_{timestamp}.json"
-
-        payload = {
-            "model": self.MODEL_NAME,
-            "kv_cache_config": {
-                "enable_block_reuse":
-                kv_cache_config.enable_block_reuse,
-                "max_attention_window":
-                kv_cache_config.max_attention_window,
-                "iteration_stats_interval":
-                kv_cache_config.iteration_stats_interval,
-            },
-            "num_entries": len(all_stats),
-            "stats": all_stats,
-        }
-        out_path.write_text(json.dumps(payload, indent=2))
-        print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
-              f"{out_path}")
-
-    def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        # chunked prefill case or more features
-        extra_llm_config = dict(
-            enable_chunked_prefill=True,
-            max_num_tokens=1024,
-        )
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 **extra_llm_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_chunked_prefill_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        # chunked prefill case or more features
-        extra_llm_config = dict(
-            enable_chunked_prefill=True,
-            max_num_tokens=1024,
-        )
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 **extra_llm_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
@@ -7634,9 +7281,14 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    def _build_llm(self, model_path: str, tensor_parallel_size: int,
-                   moe_backend: str, max_draft_len: Optional[int],
-                   cover_guided_decoding: bool) -> LLM:
+    def _build_llm(self,
+                   model_path: str,
+                   tensor_parallel_size: int,
+                   moe_backend: str,
+                   max_draft_len: Optional[int],
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False,
+                   cover_guided_decoding: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False,
@@ -7651,7 +7303,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         return LLM(model_path,
                    trust_remote_code=True,
                    tensor_parallel_size=tensor_parallel_size,
-                   moe_expert_parallel_size=1,
+                   moe_expert_parallel_size=moe_expert_parallel_size,
+                   enable_attention_dp=enable_attention_dp,
                    max_num_tokens=self.MAX_NUM_TOKENS,
                    enable_chunked_prefill=True,
                    max_batch_size=self.MAX_BATCH_SIZE,
@@ -7669,14 +7322,22 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    expected_quant_algo: Optional[QuantAlgo],
                    monkeypatch: pytest.MonkeyPatch,
                    mocker,
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False,
                    cover_guided_decoding: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
-        with self._build_llm(model_path, tensor_parallel_size, moe_backend,
-                             max_draft_len, cover_guided_decoding) as llm:
+        with self._build_llm(
+                model_path,
+                tensor_parallel_size,
+                moe_backend,
+                max_draft_len,
+                moe_expert_parallel_size=moe_expert_parallel_size,
+                enable_attention_dp=enable_attention_dp,
+                cover_guided_decoding=cover_guided_decoding) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             if cover_guided_decoding:
                 assert_guided_decoding_regex(llm)
@@ -7690,50 +7351,76 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
 
     @skip_pre_hopper
-    @pytest.mark.skip_less_device(2)
-    @pytest.mark.skip_less_device_memory(142000)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_bf16_tp2_cutlass(self, monkeypatch: pytest.MonkeyPatch,
-                              mocker) -> None:
-        """BF16 TP2, no MTP, PLE offloaded to pinned host memory."""
+    def test_bf16_tep4_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                               mocker) -> None:
+        """BF16 TEP4, no MTP, PLE offloaded to pinned host memory."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
-                        tensor_parallel_size=2,
+                        tensor_parallel_size=4,
                         moe_backend="CUTLASS",
                         max_draft_len=None,
                         expected_quant_algo=None,
                         monkeypatch=monkeypatch,
                         mocker=mocker,
+                        moe_expert_parallel_size=4,
                         cover_guided_decoding=True)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
     @pytest.mark.skip_less_host_memory(98304)
-    def test_fp8_1gpu_mtp3_trtllm_ple_offload(self,
+    def test_fp8_adp4_mtp3_trtllm_ple_offload(self,
                                               monkeypatch: pytest.MonkeyPatch,
                                               mocker) -> None:
-        """Block-FP8 on one GPU with MTP3 and the PLE table offloaded to host."""
+        """Block-FP8 on four GPUs with attention DP, MTP3 and PLE offload."""
         self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
-                        tensor_parallel_size=1,
+                        tensor_parallel_size=4,
                         moe_backend="TRTLLM",
                         max_draft_len=3,
                         expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
                         monkeypatch=monkeypatch,
-                        mocker=mocker)
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_mtp3_trtllm_ple_offload(self,
+                                                monkeypatch: pytest.MonkeyPatch,
+                                                mocker) -> None:
+        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
-    def test_nvfp4_1gpu_mtp3_cutedsl_ple_offload(
-            self, monkeypatch: pytest.MonkeyPatch, mocker) -> None:
-        """NVFP4 on one GPU with MTP3 and the PLE table offloaded to host."""
-        self._run_evals(
-            f"{llm_models_root()}/Inferact-Qwen3.8-Flash-Next-NVFP4",
-            tensor_parallel_size=1,
-            moe_backend="CUTEDSL",
-            max_draft_len=3,
-            expected_quant_algo=QuantAlgo.NVFP4,
-            monkeypatch=monkeypatch,
-            mocker=mocker)
+    def test_nvfp4_1gpu_cutedsl_ple_offload(self,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            mocker) -> None:
+        """NVFP4 on one GPU without MTP and the PLE table offloaded to host.
+
+        CuteDSL serves NVFP4 but not the FP8 block scales of the MTP layer's
+        experts, so this checkpoint only fits the backend without MTP.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=1,
+                        moe_backend="CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker)
 
 
 class TestSeedOss_36B(LlmapiAccuracyTestHarness):
