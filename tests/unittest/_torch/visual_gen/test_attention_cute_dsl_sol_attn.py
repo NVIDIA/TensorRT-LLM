@@ -426,8 +426,12 @@ def test_datacenter_blackwell_archs_are_supported():
     """
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
 
-    assert (10, 0) in interface._CUTE_BACKENDS
-    assert (10, 3) in interface._CUTE_BACKENDS
+    # Resolve, don't just look up: a malformed value would satisfy a key check
+    # and then fail at dispatch.
+    for arch in ((10, 0), (10, 3)):
+        backend = interface._backend_for_arch(arch, cute_available=True)
+        assert backend in interface._CUTE_BACKENDS.values()
+        assert isinstance(backend, str) and backend
 
 
 def test_no_arch_literal_outside_the_dispatch_map():
@@ -439,16 +443,35 @@ def test_no_arch_literal_outside_the_dispatch_map():
     hardcoded literal here as the only thing still rejecting the new arch --
     with every test green. Assert on the source so the coupling cannot regress.
     """
+    import ast
     import inspect
+    import textwrap
 
     from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.sol_attn import interface
 
-    src = inspect.getsource(interface._sol_attn_cute)
+    src = textwrap.dedent(inspect.getsource(interface._sol_attn_cute))
     assert "arch not in _CUTE_BACKENDS" in src, (
         "the guard in _sol_attn_cute must be keyed off _CUTE_BACKENDS"
     )
-    assert "arch != (10, 0)" not in src, (
-        "hardcoded architecture literal in _sol_attn_cute; key it off _CUTE_BACKENDS"
+
+    # Reject *any* architecture tuple literal, not just (10, 0): pinning one
+    # value would let a future `arch != (10, 3)` reintroduce the same trap.
+    offenders = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left, *node.comparators]
+        names = {n.id for n in operands if isinstance(n, ast.Name)}
+        if "arch" not in names:
+            continue
+        for operand in operands:
+            if isinstance(operand, ast.Tuple) and all(
+                isinstance(e, ast.Constant) and isinstance(e.value, int) for e in operand.elts
+            ):
+                offenders.append(ast.unparse(node))
+    assert not offenders, (
+        "hardcoded architecture literal(s) compared against `arch` in "
+        f"_sol_attn_cute: {offenders}; key the guard off _CUTE_BACKENDS instead"
     )
 
 
@@ -480,8 +503,19 @@ def test_zero_cutoff_rejected():
         ("abc", "not a layer index"),
         ("0,x", "not a layer index"),
         ("-1", "not a layer index"),
+        (",", "empty entry"),
+        ("0,,2", "empty entry"),
+        (" ", "empty entry"),
     ],
-    ids=["descending_range", "non_numeric", "non_numeric_in_list", "negative"],
+    ids=[
+        "descending_range",
+        "non_numeric",
+        "non_numeric_in_list",
+        "negative",
+        "only_separator",
+        "empty_in_list",
+        "whitespace_only",
+    ],
 )
 def test_dense_layers_rejects_malformed_spec(spec, reason):
     """Malformed dense_layers must fail at config time, not silently or late.
@@ -499,20 +533,45 @@ def test_dense_layers_accepts_valid_spec(spec):
     assert SolAttentionConfig(tau=2.0, dense_layers=spec).dense_layers == spec
 
 
-@pytest.mark.skip(
-    reason=(
-        "TODO(sol-attn): numerical equivalence vs dense SDPA at zero/near-zero routing "
-        "(the analogue of VSA's test_cute_kernel_matches_dense_at_full_topk) needs the "
-        "exact tau/thresh_type combination that guarantees full (non-sparse) block "
-        "routing, which is not simply tau=0 because Sol-Attn's routing is score-derived "
-        "rather than a plain top-k like VSA's. Deriving it requires reading "
-        "cute_dsl_kernels/blackwell/sol_attn/interface.py's routing math and calibrating "
-        "rtol/atol on real sm100 hardware. This would be a unit-level complement to the "
-        "end-to-end accuracy evidence recorded in the pull request, not a replacement."
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Sol-Attn needs CUDA")
+def test_cute_kernel_matches_dense_on_a_single_block():
+    """Kernel-level numerical check against dense attention.
+
+    The obvious form of this test -- the analogue of VSA's
+    `test_cute_kernel_matches_dense_at_full_topk` -- needs a tau that provably
+    forces full non-sparse routing. Sol-Attn has no such value: its routing is
+    score-derived rather than a plain top-k, so tau=0 is not the dense limit.
+
+    A single KV block sidesteps that entirely. With `tokens <= BLOCK_SIZE`
+    there is exactly one block, so there is nothing to route away and sparsity
+    is structurally impossible whatever tau says. The kernel must therefore
+    reproduce dense attention here, which makes this a genuine numerical test
+    of the kernel rather than of the routing policy.
+
+    `kernel_calls` is asserted to have advanced: without that, a fallback to
+    dense would make this pass by comparing dense against itself.
+    """
+    sab = _backend_mod()
+    if not sab.sol_attn_supported(torch.empty(1, 8, 8, 128, device="cuda", dtype=torch.bfloat16)):
+        pytest.skip("no Sol-Attn kernel for this device")
+
+    tokens = 64  # == BLOCK_SIZE: exactly one KV block
+    torch.manual_seed(0)
+    shape = (1, tokens, 4, 128)
+    q, k, v = (torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2).float(), k.transpose(1, 2).float(), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+
+    before = sab._SOL_STATS["kernel_calls"]
+    out = sab._run_sol_attn_bthd(q, k, v, tau=2.0, thresh_type="diag", kv_splits=1)
+    torch.cuda.synchronize()
+    assert sab._SOL_STATS["kernel_calls"] == before + 1, (
+        "the kernel did not run; this comparison would be dense against dense"
     )
-)
-def test_cute_kernel_matches_dense_placeholder():
-    pass
+
+    torch.testing.assert_close(out.float(), reference, rtol=2e-2, atol=2e-2)
 
 
 def test_kv_splits_rejects_unsupported_value():

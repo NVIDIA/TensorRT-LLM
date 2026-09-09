@@ -15,9 +15,27 @@
 """Shape/dtype guard and dense-fallback wrapper around the Sol-Attn kernel.
 
 Adapted from upstream's ``techniques/sparse_backends/sol_attn_backend.py`` at
-the pin in ``sol_attn/THIRD_PARTY_NOTICES.md``, which records exactly which
-subset is carried and how this version deliberately diverges. Check that file
-before re-syncing against upstream.
+the pin in ``sol_attn/THIRD_PARTY_NOTICES.md``, which records which subset is
+carried. Check that file before re-syncing against upstream.
+
+Deliberate divergences from upstream, which a re-sync must preserve rather
+than overwrite:
+
+* ``logger.warning_once`` replaces ``print()``, so fallbacks are suppressible
+  and routed through this repository's logger.
+* ``_SOL_STATS["dense_fallback_calls"]`` makes a silently-degraded run
+  countable rather than only visible on stderr.
+* ``sol_attn_ineligible_reason()`` names the specific reason (architecture,
+  head_dim, dtype) instead of returning one boolean.
+* ``SOL_ATTN_STRICT=1`` also covers the eligibility path; upstream raises only
+  on kernel exceptions, so an ineligible run stayed silent.
+* Dense paths route to ``cute_dsl_fmha_fwd`` through ``dense_fn``. Upstream
+  falls back to torch SDPA; staying inside the configured backend is what lets
+  a ``backend: CUTEDSL`` A/B isolate sparsity rather than also swapping the
+  dense kernel.
+* ``@torch.compiler.disable`` guards the launch boundary; see the comment on
+  ``_run_sol_attn_bthd`` for why, and for the ``torch.library.custom_op``
+  alternative upstream uses.
 
 The kernel-facing API accepts contiguous BF16
 ``[batch, tokens, heads, 128]`` Q/K/V, ``tau``, ``thresh_type``,
@@ -145,11 +163,49 @@ def _dense_bthd(q, k, v):
     ).transpose(1, 2)
 
 
+def _degradable_kernel_errors() -> tuple[type[BaseException], ...]:
+    """Exception types whose failure is safe to answer with dense attention.
+
+    `CODING_GUIDELINES.md` asks for the smallest exception set. A bare
+    ``except Exception`` also swallowed ordinary programming and integration
+    errors -- ``TypeError``, ``NameError``, ``AttributeError`` -- turning a bug
+    into "Sol-Attn just didn't speed anything up". Those now propagate.
+
+    ``DSLBaseError`` has to be named explicitly because CuTe DSL derives it
+    from ``Exception``, not ``RuntimeError``, so a narrower tuple would stop
+    catching real JIT and codegen failures that were previously degraded. It
+    is resolved lazily and cached: this module defers every CuTe DSL import to
+    first use, and the tuple is only needed once something has already raised.
+    """
+    global _DEGRADABLE_KERNEL_ERRORS
+    if _DEGRADABLE_KERNEL_ERRORS is None:
+        types: list[type[BaseException]] = [ImportError, OSError, RuntimeError]
+        try:
+            from cutlass.base_dsl.common import DSLBaseError
+        except ImportError:
+            pass
+        else:
+            types.append(DSLBaseError)
+        _DEGRADABLE_KERNEL_ERRORS = tuple(types)
+    return _DEGRADABLE_KERNEL_ERRORS
+
+
+_DEGRADABLE_KERNEL_ERRORS: tuple[type[BaseException], ...] | None = None
+
+
 # Opaque to Dynamo, like every other CuTe DSL launch boundary here (see
 # cute_dsl/fmha.py, video_sparse_attention/interface.py). Otherwise Dynamo
 # traces into the CuTe DSL JIT builder and retraces on every call: near two
 # orders of magnitude slower on B200 (2496.9 s mean denoise without it), and
 # silently, as if compile just didn't help.
+#
+# Upstream instead wraps the same call in a `torch.library.custom_op` with a
+# `register_fake`, which keeps the kernel in the compiled graph as an opaque
+# node rather than breaking the graph at it. That is the better end state --
+# it removes the per-layer graph break -- and is tracked as a follow-up. It is
+# not done here because `torch.compiler.disable` is the convention every other
+# CuTe DSL entry point in this repository already follows, and is what the
+# reported measurements were taken with.
 @torch.compiler.disable
 def _run_sol_attn_bthd(
     q,
@@ -191,6 +247,10 @@ def _run_sol_attn_bthd(
         )
         return dense()
 
+    # Resolved outside the try: a bad kv_splits is a configuration error and
+    # must surface, not silently become a dense run.
+    resolved_kv_splits = _resolve_kv_splits(q0, kv_splits)
+
     try:
         kernel = _load_sol_attn()
         out = kernel(
@@ -199,13 +259,11 @@ def _run_sol_attn_bthd(
             v0,
             tau=float(tau),
             thresh_type=str(thresh_type),
-            kv_splits=_resolve_kv_splits(q0, kv_splits),
+            kv_splits=resolved_kv_splits,
             sink_start=sink_start,
             sink_tokens=int(sink_tokens),
         )
-        _SOL_STATS["kernel_calls"] += 1
-        return out
-    except Exception as exc:
+    except _degradable_kernel_errors() as exc:
         if _strict():
             raise
         logger.warning_once(
@@ -215,6 +273,9 @@ def _run_sol_attn_bthd(
             key=(type(exc).__name__, str(exc)),
         )
         return dense()
+
+    _SOL_STATS["kernel_calls"] += 1
+    return out
 
 
 # Lightweight run-validation counters. `kernel_calls` is the census used to

@@ -298,7 +298,12 @@ class SolAttentionConfig(BaseSparseAttentionConfig):
         for item in spec.split(","):
             item = item.strip()
             if not item:
-                continue
+                # Not skipped: "," / "0,,2" / " " would otherwise be accepted
+                # and quietly force fewer layers dense than the user wrote.
+                raise ValueError(
+                    f"dense_layers {spec!r} has an empty entry; expected a "
+                    "comma-separated list such as '0,2-4'"
+                )
             try:
                 if "-" in item:
                     # A negative index cannot reach here: it also contains '-',

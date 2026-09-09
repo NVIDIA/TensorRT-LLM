@@ -102,14 +102,7 @@ class Attention(nn.Module):
         _is_sol_attn = base_backend == "CUTEDSL" and _sa_algo == "sol_attn"
 
         # SEPARATE_QKV fallback: TRTLLM and CUTEDSL VSA cannot serve it.
-        #
-        # Sol-Attn is deliberately absent: it decides per call (`_can_serve`) and
-        # delegates what it cannot serve to the dense backend of its own family.
-        # A rule here would have to guess from `qkv_mode`, which describes how
-        # Q/K/V are *projected* rather than whether K/V come from another
-        # sequence -- and that guess is wrong wherever SEPARATE_QKV is chosen for
-        # other reasons (Qwen-Image always; WAN's attn1 under async Ulysses),
-        # silently costing those modules their configured backend.
+        # Sol-Attn is absent by design; see SolAttention._can_serve.
         if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
             backend_name = "VANILLA"
             requested = f"{base_backend} (VSA)" if _is_vsa else base_backend
@@ -123,15 +116,12 @@ class Attention(nn.Module):
         else:
             backend_name = base_backend
 
-        if _is_vsa and cp_size > 1:
+        # Every sparse algorithm here routes over the whole token sequence, so
+        # none of them can be split across context-parallel ranks.
+        if (_is_vsa or _is_sol_attn) and cp_size > 1:
+            _algo_name = "VSA" if _is_vsa else "Sol-Attn"
             raise ValueError(
-                f"VSA needs the full token sequence per rank, so it is incompatible "
-                f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
-                f"ulysses or cfg parallelism instead."
-            )
-        if _is_sol_attn and cp_size > 1:
-            raise ValueError(
-                f"Sol-Attn needs the full token sequence per rank, so it is incompatible "
+                f"{_algo_name} needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
             )
