@@ -300,7 +300,7 @@ trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gp
 # instead of the omni video shape
 trtllm-serve nvidia/Cosmos3-Super-Text2Image-4Step --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
 
-# 4 GPU distilled image-to-video deployment
+# 4 H200 GPUs on one node for distilled image-to-video
 trtllm-serve nvidia/Cosmos3-Super-Image2Video-4Step --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
 
 # 1 GPU Edge generator: no YAML is needed, but select the VisualGen runtime
@@ -311,9 +311,12 @@ trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID --enable_visual_gen
 ```
 
 The distilled image-to-video checkpoint reads its fixed four-step schedule from
-the checkpoint; the Super multi-GPU config supplies the parallel deployment for
-its 720p x 189-frame shape. Edge and DROID need no YAML because their checkpoint
-defaults already are the deployed shape, but they do need
+the checkpoint. Its default 720p x 189-frame workload needs more device memory
+than one H200 provides: validation on an H200 with 139.8 GiB usable memory
+reached 138.21 GiB in use before VAE decode requested another 1.76 GiB. Use a
+higher-memory GPU, such as Blackwell, or the single-node 4-GPU config shown
+above on Hopper. Edge and DROID need no YAML because their checkpoint defaults
+already are the deployed shape, but they do need
 `--enable_visual_gen` to select the generator rather than the Reasoner. The
 DROID checkpoint metadata then selects Policy mode and supplies its deployment
 defaults. A local checkpoint directory works in place of any Hub ID.

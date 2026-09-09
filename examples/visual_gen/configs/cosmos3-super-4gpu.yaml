@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # 4-GPU Cosmos3-Super with (tensor parallel + Ulysses + parallel VAE).
-# Model: nvidia/Cosmos3-Super
+# Models: nvidia/Cosmos3-Super and nvidia/Cosmos3-Super-Image2Video-4Step
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
 # trtllm-serve spawns the 4 workers itself — do not wrap it in torchrun/mpirun.
