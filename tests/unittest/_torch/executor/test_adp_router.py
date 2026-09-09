@@ -445,15 +445,10 @@ class TestDefaultADPRouter:
         assert states[0].num_active_tokens == 600
 
     def test_exclude_retiring_requests_follows_the_seat_pool_headroom(self):
-        # The flag is the single gate; _pad_attention_dp_dummy_request reads it
-        # rather than re-deriving the predicate, so the two cannot drift.
-        #
-        # It tracks the *engine's* headroom flag and nothing else. It used to be
-        # `not dist.mapping.has_pp()`, which was a second derivation of the same
-        # fact: correct only as long as the sizing gate happened to exclude
-        # exactly PP. Once the sizing gate also excluded hybrid architectures the
-        # two disagreed, and the router credited a rank with seats that were
-        # never allocated. Pipeline parallelism is now in scope on both sides.
+        # The flag tracks the *engine's* headroom flag and nothing else, so the
+        # correction can only ever spend seats that were actually allocated. It
+        # used to re-derive the predicate as `not dist.mapping.has_pp()`, which
+        # is a second copy of a fact the sizing gate already owns.
         for has_pp in (False, True):
             dist = _mock_dist(has_pp=has_pp)
             assert (

@@ -1158,11 +1158,10 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator._is_disagg = False
     creator._mapping = Mock()
     creator._speculative_config = Mock()
-    # The draft manager is now sized from the *target* engine's published seat
-    # pool, so this hand-built creator has to carry the attribute the real one
-    # sets in __init__. None means "no pool published", which is the pre-existing
-    # behaviour this test asserts.
-    creator._model_engine = None
+    # Every manager is now told whether the overlap scheduler is on, so this
+    # hand-built creator has to carry the attribute the real one sets in
+    # __init__. False is the pre-existing sizing this test asserts.
+    creator._enable_overlap_scheduler = False
 
     effective_draft_config = Mock()
     effective_draft_config.pretrained_config.torch_dtype = "bfloat16"

@@ -583,11 +583,9 @@ def seat_pool_or_none(model_engine) -> Optional[int]:
     micro-batch scheduler caps every forward at max_batch_size.
 
     Gated on the same flag ``_set_up_spec_metadata`` reads, so every spec-decoding
-    pool agrees with the metadata about which number it is indexed by. Returning
-    None (headroom off) preserves the established max_batch_size sizing.
+    pool agrees with the metadata about which number it is indexed by.
     """
-    if not getattr(model_engine, "_enable_adp_overlap_seq_slot_headroom",
-                   False):
+    if not getattr(model_engine, "_enable_disagg_adp_overlap_headroom", False):
         return None
     return getattr(model_engine, "max_num_seq_slots", None)
 
@@ -769,14 +767,12 @@ def get_spec_drafter(model_engine,
 
     max_num_requests = model_engine.batch_size
     # The draft loop runs its own slot pool, but the indices it hands out address
-    # buffers sized by the *target* engine's seat pool: the shared sampler
-    # (instantiate_sampler), the draft KV cache manager's IndexMapper
-    # (KvCacheCreator._target_max_num_seq_slots) and spec_resource_manager above.
-    # It must therefore be sized from the same number. It is also load-bearing,
-    # not merely tidy: the previous draft batch's slots are released by
-    # cleanup_previous_draft_resources a full iteration later
-    # (py_executor.py:5347), so a pool of max_batch_size raises NoFreeSlotsError
-    # precisely when the overlap headroom is doing its job.
+    # buffers sized by the *target* engine's seat pool (the shared sampler and
+    # spec_resource_manager above), so it must be sized from the same number. The
+    # previous draft batch's slots are also released by
+    # cleanup_previous_draft_resources a full iteration later, so a pool of
+    # max_batch_size raises NoFreeSlotsError precisely when the overlap headroom
+    # is doing its job.
     draft_slots = seat_pool_or_none(model_engine) or max_num_requests
     if spec_config.spec_dec_mode.is_draft_target(
     ) or spec_config.spec_dec_mode.is_eagle3(

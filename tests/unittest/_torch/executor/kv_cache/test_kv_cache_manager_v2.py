@@ -1550,22 +1550,14 @@ def _index_mapper_capacity_for(
     pp_size: int = 1,
     is_disagg: bool = False,
     num_reserved_index_slots: int = 1,
-    max_num_seq_slots: int | None = None,
-) -> tuple[int, int, int | None]:
-    """Construct a manager and return (IndexMapper capacity, page-table capacity,
-    published ``max_admissible_sequences``).
+    enable_attention_dp: bool = False,
+    enable_overlap_scheduler: bool = False,
+) -> tuple[int, int]:
+    """Construct a manager and return (IndexMapper capacity, page-table capacity).
 
-    The first two must agree: ``host_kv_cache_block_offsets`` is indexed by the
-    index the mapper hands out, so a page table sized below the mapper's capacity
-    would be an out-of-bounds write. The third is the same number net of the
-    reserved slots, published for the startup validator so that the seat pool and
-    the index pool can be compared without either being re-derived.
-
-    The third is read with ``getattr(..., None)`` rather than as an attribute so
-    that a manager which does not publish it at all fails only the test that is
-    *about* publishing it. Asserting it here would make every capacity row fail
-    for one and the same trivial reason, which would destroy the negative
-    control's ability to say *which* topologies the coefficient actually moved.
+    The two must agree: ``host_kv_cache_block_offsets`` is indexed by the index the
+    mapper hands out, so a page table sized below the mapper's capacity would be an
+    out-of-bounds write.
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
@@ -1592,12 +1584,13 @@ def _index_mapper_capacity_for(
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor") as page_table,
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
     ):
-        manager = KVCacheManagerV2(
+        KVCacheManagerV2(
             # A quota must be set or __init__ asserts before it sizes anything
             # ("Quota not set. Check kv_cache_config.max_tokens or
             # kv_cache_config.max_gpu_total_bytes"). The value is irrelevant to the
             # index-mapper arithmetic, which reads only max_batch_size, pp_size,
-            # is_disagg, num_reserved_index_slots and max_num_seq_slots.
+            # enable_attention_dp, is_disagg, enable_overlap_scheduler and
+            # num_reserved_index_slots.
             KvCacheConfig(max_gpu_total_bytes=16 << 20),
             CacheType.SELFKONLY,
             num_layers=1,
@@ -1606,129 +1599,78 @@ def _index_mapper_capacity_for(
             tokens_per_block=TOKENS_PER_BLOCK,
             max_seq_len=MAX_SEQ_LEN,
             max_batch_size=max_batch_size,
-            mapping=Mapping(world_size=pp_size, rank=0, tp_size=1, pp_size=pp_size),
+            mapping=Mapping(
+                world_size=pp_size,
+                rank=0,
+                tp_size=1,
+                pp_size=pp_size,
+                enable_attention_dp=enable_attention_dp,
+            ),
             dtype=DataType.HALF,
             vocab_size=16,
             execution_stream=Mock(),
             is_disagg=is_disagg,
             num_reserved_index_slots=num_reserved_index_slots,
-            max_num_seq_slots=max_num_seq_slots,
+            enable_overlap_scheduler=enable_overlap_scheduler,
         )
     index_mapper_cls.assert_called_once()
     page_table.assert_called_once()
     return (
         index_mapper_cls.call_args.args[0],
         page_table.call_args.args[0],
-        getattr(manager, "max_admissible_sequences", None),
     )
 
 
-# (max_batch_size, pp_size, is_disagg, reserved, max_num_seq_slots, expected capacity)
+# (max_batch_size, pp_size, adp, is_disagg, overlap, reserved, expected capacity)
 #
-# The seat pool (`PyTorchModelEngine.max_num_seq_slots`) and the index mapper are
-# both per-request leases, so the mapper must cover whatever the executor can
-# admit. Rows 1-2 are the nvbug 6627795 case: aggregated attention DP under the
-# overlap scheduler doubles the seat pool, and before the fix the mapper stayed
-# at B+1 and silently deferred requests.
+# capacity == max_batch_size * pp_size * (2 if is_disagg or (adp and overlap and
+# not pp) else 1) + reserved. Rows 1-2 are the nvbug 6627795 case: under
+# attention DP the overlap scheduler defers the retiring batch's teardown past
+# the point where its replacement is admitted, so both cohorts hold index slots
+# at once and a mapper sized at B+1 silently defers requests one at a time.
 _INDEX_MAPPER_CAPACITY_CASES = [
-    # aggregated + ADP + overlap: seats are 2B, so the mapper must be 2B too.
-    pytest.param(2, 1, False, 1, 4, 5, id="agg_adp_overlap"),
-    pytest.param(8, 1, False, 1, 16, 17, id="agg_adp_overlap_b8"),
-    # No seat headroom (no ADP, or overlap off): unchanged at B+1.
-    pytest.param(2, 1, False, 1, 2, 3, id="agg_no_headroom"),
-    # Negative control: callers that pass nothing keep the pre-fix allocation.
-    pytest.param(2, 1, False, 1, None, 3, id="seats_unset_is_unchanged"),
-    # Negative control: disagg does not compound with the seat headroom. The two
-    # coefficients cover the same extra cohort, so this is max(4, 4)+1, not 4B+1.
-    pytest.param(2, 1, True, 1, 4, 5, id="disagg_does_not_compound"),
-    # Disagg without seat headroom keeps its own 2x.
-    pytest.param(2, 1, True, 1, None, 5, id="disagg_only"),
-    # The same cell as it actually occurs once the seat pool is plumbed: disagg
-    # without ADP seats B*pp == 2, and the mapper still carries its own 2x. The
-    # surplus is deliberate and is the reason the 2x lives *here* and not in
-    # compute_max_num_sequences -- a request in KV transfer holds an index lease
-    # while SeqSlotManager.prepare_resources skips it, so it occupies no seat.
-    pytest.param(2, 1, True, 1, 2, 5, id="disagg_index_pool_exceeds_seat_pool"),
-    # PP without the headroom: seats are B*pp, which the mapper already matched.
-    pytest.param(2, 4, False, 1, 8, 9, id="pp4"),
-    # PP with the headroom: seats are (pp+1)*B == 10, additive rather than
-    # 2*B*pp == 16. The mapper follows the seat pool verbatim, so this row is what
-    # makes the extra generation of seats usable under pipeline parallelism.
-    pytest.param(2, 4, False, 1, 10, 11, id="pp4_adp_overlap"),
+    # ADP + overlap, no PP: both cohorts are resident, so the mapper needs 2B.
+    pytest.param(2, 1, True, False, True, 1, 5, id="adp_overlap"),
+    pytest.param(8, 1, True, False, True, 1, 17, id="adp_overlap_b8"),
+    # Either half of the conjunction missing leaves the pre-fix allocation.
+    pytest.param(2, 1, True, False, False, 1, 3, id="adp_no_overlap"),
+    pytest.param(2, 1, False, False, True, 1, 3, id="overlap_no_adp"),
+    # Disagg already carried its own 2x; the two coefficients cover the same
+    # extra cohort, so they do not compound.
+    pytest.param(2, 1, True, True, True, 1, 5, id="disagg_does_not_compound"),
+    pytest.param(2, 1, False, True, False, 1, 5, id="disagg_only"),
+    # Pipeline parallelism is out of scope: max_batch_size * pp_size already
+    # covers the in-flight micro-batches, so the ADP coefficient stays off.
+    pytest.param(2, 4, True, False, True, 1, 9, id="pp4_adp_overlap"),
+    pytest.param(2, 4, False, False, False, 1, 9, id="pp4_plain"),
+    # ... while the pre-existing disagg 2x under PP is left exactly as it was.
+    pytest.param(2, 4, False, True, False, 1, 17, id="pp4_disagg_unchanged"),
     # Reserved slots are still added on top of the widened pool.
-    pytest.param(2, 1, False, 5, 4, 9, id="reserved_slots_still_added"),
-    # A seat pool smaller than the mapper's own floor must never shrink it.
-    pytest.param(4, 1, False, 1, 1, 5, id="small_seat_pool_does_not_shrink"),
+    pytest.param(2, 1, True, False, True, 5, 9, id="reserved_slots_still_added"),
 ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "max_batch_size,pp_size,is_disagg,reserved,max_num_seq_slots,expected",
+    "max_batch_size,pp_size,adp,is_disagg,overlap,reserved,expected",
     _INDEX_MAPPER_CAPACITY_CASES,
 )
-def test_index_mapper_capacity_covers_seq_slot_pool(
+def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     max_batch_size: int,
     pp_size: int,
+    adp: bool,
     is_disagg: bool,
+    overlap: bool,
     reserved: int,
-    max_num_seq_slots: int | None,
     expected: int,
 ) -> None:
-    capacity, page_table_capacity, _ = _index_mapper_capacity_for(
+    capacity, page_table_capacity = _index_mapper_capacity_for(
         max_batch_size=max_batch_size,
         pp_size=pp_size,
         is_disagg=is_disagg,
         num_reserved_index_slots=reserved,
-        max_num_seq_slots=max_num_seq_slots,
+        enable_attention_dp=adp,
+        enable_overlap_scheduler=overlap,
     )
     assert capacity == expected
     assert page_table_capacity == expected
-
-
-# The rows where the *published* number is worth stating separately from the
-# capacity arithmetic: the aggregated cell nvbug 6627795 was filed for, the new
-# pipeline-parallel cell, and a caller that supplies no seat pool at all.
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "max_batch_size,pp_size,is_disagg,reserved,max_num_seq_slots,expected_admissible",
-    [
-        pytest.param(2, 1, False, 1, 4, 4, id="agg_adp_overlap"),
-        pytest.param(2, 4, False, 1, 10, 10, id="pp4_adp_overlap"),
-        pytest.param(2, 1, False, 5, None, 2, id="seats_unset_reserved_excluded"),
-        # Disagg is the one case where the published number legitimately exceeds
-        # the seat pool it is compared against.
-        pytest.param(2, 1, True, 1, 2, 4, id="disagg_exceeds_seat_pool"),
-    ],
-)
-def test_index_mapper_publishes_max_admissible_sequences(
-    max_batch_size: int,
-    pp_size: int,
-    is_disagg: bool,
-    reserved: int,
-    max_num_seq_slots: int | None,
-    expected_admissible: int,
-) -> None:
-    """The manager publishes what it can index, so nobody has to re-derive it.
-
-    ``_util.validate_seq_slot_pool_covers_admission`` compares this against the
-    executor's sequence-slot pool at startup. It is the pool *net of* the reserved
-    padding/dummy slots, which no real sequence can take. Aggregated, it equals
-    the seat pool exactly on every row where one was plumbed through, and the
-    validator enforces that in both directions. Under disaggregation it may
-    exceed the seat pool, because an index lease outlives the seat while the KV
-    transfer drains -- so there the validator enforces only ``>=``.
-    """
-    _, _, admissible = _index_mapper_capacity_for(
-        max_batch_size=max_batch_size,
-        pp_size=pp_size,
-        is_disagg=is_disagg,
-        num_reserved_index_slots=reserved,
-        max_num_seq_slots=max_num_seq_slots,
-    )
-    assert admissible == expected_admissible
-    if max_num_seq_slots is not None:
-        if is_disagg:
-            assert admissible >= max_num_seq_slots
-        else:
-            assert admissible == max_num_seq_slots

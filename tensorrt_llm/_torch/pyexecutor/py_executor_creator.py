@@ -758,14 +758,9 @@ def create_py_executor(
             if mapping.is_last_pp_rank():
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    # Unconditionally the seat pool. The guided decoder's state
-                    # is indexed by py_seq_slot (guided_decoder.py: grammar_matchers
-                    # [req.seq_slot], the bitmask rows), and py_seq_slot ranges over
-                    # the whole pool -- so sizing this at max_batch_size is an
-                    # IndexError under pipeline parallelism, where admission already
-                    # permits max_batch_size * pp_size live requests. The previous
-                    # conditional made the correct size depend on an unrelated
-                    # attention-DP flag.
+                    # The guided decoder's state is indexed by py_seq_slot
+                    # (guided_decoder.py: grammar_matchers[req.seq_slot], the
+                    # bitmask rows), so it must span the whole seat pool.
                     "max_num_sequences": max_num_seq_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
@@ -877,9 +872,6 @@ def create_py_executor(
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
-        # Same helper the model engine sizes its seat pool with: this predicate
-        # feeds KVCacheManagerV2's index-pool coefficient, so an independent copy
-        # here could disagree with the seat pool by a factor of 2.
         is_disagg = is_disagg_enabled(cache_transceiver_config)
         is_hybrid = is_hybrid_linear(
             model_engine.model.model_config.pretrained_config)

@@ -155,16 +155,17 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # Pool sizing: effective_pool_size returns max_slots when global pool is
         # off, or max(64, max_slots) / the explicit value when on. All slot-indexed
-        # sizing uses pool_size. An explicit global_pool_size is a user contract
-        # about memory, so it is honoured and validated rather than grown silently.
-        if sa_config.global_pool_size is not None:
-            self.pool_size = sa_config.global_pool_size
-        else:
-            self.pool_size = max(sa_config.effective_pool_size, self._num_seq_slots)
-        if self.pool_size < self._num_seq_slots:
-            raise ValueError(
-                f"global_pool_size ({self.pool_size}) must be >= the number of "
-                f"sequence slots ({self._num_seq_slots})"
+        # sizing uses pool_size, so the live-slot count is a floor on it. An
+        # explicit global_pool_size below that floor is grown rather than rejected:
+        # the same config is legal without the headroom, so failing here would turn
+        # enabling attention DP into a startup error for a value that
+        # TorchLlmArgs.validate_speculative_config already accepted.
+        self.pool_size = max(sa_config.effective_pool_size, self._num_seq_slots)
+        if sa_config.global_pool_size is not None and self.pool_size > sa_config.global_pool_size:
+            logger.warning(
+                f"Growing the SA pool from the configured global_pool_size "
+                f"({sa_config.global_pool_size}) to {self.pool_size} to cover the "
+                f"executor's sequence slots."
             )
 
         # Calculate per-state size based on max_seq_len

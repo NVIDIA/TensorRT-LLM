@@ -80,7 +80,7 @@ from ..utils import (get_model_extra_attrs,
                      set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from .config_utils import is_hybrid_linear, is_mla
+from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
                                 EncoderCUDAGraphRunner,
@@ -434,6 +434,24 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+        # Disaggregated attention-DP can backfill a batch before the overlap
+        # scheduler releases the previous batch's terminal sequence slots.
+        from ._util import (compute_max_num_sequences,
+                            should_enable_adp_dummy_fixes,
+                            should_enable_disagg_adp_overlap_headroom,
+                            should_enable_non_overlap_adp_forward_intent,
+                            should_enable_scheduler_aware_adp_dummy)
+        self._enable_disagg_adp_overlap_headroom = (
+            should_enable_disagg_adp_overlap_headroom(
+                mapping, llm_args.cache_transceiver_config,
+                llm_args.disable_overlap_scheduler))
+        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
+        )
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -511,30 +529,6 @@ class PyTorchModelEngine(ModelEngine):
         self._validate_breakable_cuda_graph_compatibility()
         pretrained_config = self.model.model_config.pretrained_config
         model_type = getattr(pretrained_config, "model_type", None)
-        # Attention-DP can backfill a batch before the overlap scheduler
-        # releases the previous batch's terminal sequence slots, so the seat
-        # pool needs one extra generation of slots. Both the gate and the
-        # sizing depend on the architecture -- hybrid/SSM cache managers size
-        # their state-slot pool from max_batch_size alone, so they cannot use
-        # the headroom -- which is why this runs after the model is loaded
-        # rather than next to `self.mapping`.
-        from ._util import (compute_max_num_sequences,
-                            should_enable_adp_dummy_fixes,
-                            should_enable_adp_overlap_seq_slot_headroom,
-                            should_enable_non_overlap_adp_forward_intent,
-                            should_enable_scheduler_aware_adp_dummy)
-        self._enable_adp_overlap_seq_slot_headroom = (
-            should_enable_adp_overlap_seq_slot_headroom(
-                mapping,
-                llm_args.disable_overlap_scheduler,
-                is_hybrid=is_hybrid_linear(pretrained_config)))
-        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
-        self.max_num_seq_slots = compute_max_num_sequences(
-            mapping,
-            self.batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_adp_overlap_seq_slot_headroom,
-        )
         self._enable_scheduler_aware_adp_dummy = (
             should_enable_scheduler_aware_adp_dummy(
                 model_type, mapping, llm_args.disable_overlap_scheduler))
@@ -3577,11 +3571,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # The attention-DP overlap path opts into larger metadata buffers.
-        # Passing None preserves the established max_num_requests fallback for
-        # other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots if
-                         self._enable_adp_overlap_seq_slot_headroom else None)
+        # The disaggregated attention-DP overlap path opts into larger metadata
+        # buffers. Passing None preserves the established max_num_requests
+        # fallback for other configurations, including PP.
+        num_seq_slots = (self.max_num_seq_slots
+                         if self._enable_disagg_adp_overlap_headroom else None)
         if no_cache:
             return get_spec_metadata(
                 spec_config,

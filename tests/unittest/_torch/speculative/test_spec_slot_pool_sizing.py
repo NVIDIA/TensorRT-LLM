@@ -252,7 +252,7 @@ def _drafter_engine(headroom: bool, seats: int = POOL):
         spec_config=spec_config,
         batch_size=R,
         max_num_seq_slots=seats,
-        _enable_adp_overlap_seq_slot_headroom=headroom,
+        _enable_disagg_adp_overlap_headroom=headroom,
     )
 
 
@@ -510,17 +510,19 @@ def test_sa_pool_survives_a_full_overlap_turnover():
 
 
 @pytest.mark.cpu_only
-def test_an_explicit_sa_pool_is_honoured_but_validated():
-    """``global_pool_size`` is a memory contract, so it is never grown silently.
+def test_an_explicit_sa_pool_is_a_floor_not_a_rejection():
+    """The seat count raises ``global_pool_size``; it never fails the run.
 
-    It is validated against the sequence-slot pool instead, turning what would be
-    a mid-run slot exhaustion into a startup error that names the real bound.
+    ``TorchLlmArgs.validate_speculative_config`` accepts any
+    ``global_pool_size >= max_batch_size``, so rejecting a value between
+    max_batch_size and the seat count would make merely enabling attention DP turn
+    an already-validated config into a startup error. The last assertion is the
+    negative control: without the headroom the configured value is used verbatim,
+    so this is a floor and not an unconditional bump.
     """
-    grown = _sa_manager(POOL, enable_global_pool=True, global_pool_size=64)
-    assert grown.pool_size == 64
-
-    with pytest.raises(ValueError, match="sequence slots"):
-        _sa_manager(POOL, enable_global_pool=True, global_pool_size=R)
+    assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=64).pool_size == 64
+    assert _sa_manager(POOL, enable_global_pool=True, global_pool_size=R).pool_size == POOL
+    assert _sa_manager(None, enable_global_pool=True, global_pool_size=R).pool_size == R
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dynamic-tree slot storage is on CUDA")

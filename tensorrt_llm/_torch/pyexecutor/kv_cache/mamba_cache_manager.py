@@ -3213,11 +3213,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
 
-        # Sized by *scheduled batch* position, not by live sequence:
-        # _setup_state_indices fills [0, len(requests)) for one iteration's
-        # requests. So this is deliberately max_batch_size and must NOT grow with
-        # pp_size or with the executor's sequence-slot pool -- unlike the SSM
-        # state slots checked below, which are per-live-sequence leases.
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
         self.cuda_state_indices = torch.zeros([state_index_capacity],
@@ -3238,22 +3233,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
             num_ssm_slots = ((num_ssm_pages + self._ssm_page_index_scale - 1) //
                              self._ssm_page_index_scale)
-            # Per-live-sequence leases, so this floor tracks the number of
-            # sequences that can be resident at once -- max_batch_size * pp_size.
-            # It is deliberately *not* raised to `max_admissible_sequences` (the
-            # index-mapper pool net of reserved slots): under disaggregation that
-            # pool carries a 2x for requests still draining their KV transfer,
-            # and whether such a request also retains its SSM state slot is
-            # unresolved. Requiring the larger number would turn a possibly
-            # adequate Mamba pool into a startup failure, so the count is rounded
-            # down here on purpose.
-            #
-            # This manager is also excluded from the attention-DP overlap seat
-            # headroom (`should_enable_adp_overlap_seq_slot_headroom` returns
-            # False for hybrid architectures, and `_create_kv_cache_manager`
-            # withholds `max_num_seq_slots`), so the seat pool it is sized against
-            # is exactly `_max_resident_sequences()` and cannot outgrow this
-            # floor.
             required_live_slots = (self._max_resident_sequences() +
                                    self._num_reserved_dummy_slots)
             if num_ssm_slots < required_live_slots:
