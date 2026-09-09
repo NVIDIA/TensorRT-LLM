@@ -2085,7 +2085,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             "moe_config": {
                 "backend": "MEGAMOE_CUTEDSL"
             },
-            "max_batch_size": 64,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
             "max_seq_len": 4096,
             "max_num_tokens": 4096,
             "enable_chunked_prefill": False,
@@ -2100,7 +2100,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         gen_server_config = {
             **common_server_config,
             "cuda_graph_config": {
-                "max_batch_size": 64
+                "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE
             },
             "speculative_config": {
                 "decoding_type": "DSpark",
