@@ -114,7 +114,7 @@ class _Mapper(BaseWeightMapper):
 
 def test_base_mapper_emits_valid_conservative_plan() -> None:
     catalog = _catalog()
-    model_config = ModelConfig(mapping=Mapping(world_size=2, rank=1))
+    model_config = ModelConfig(mapping=Mapping(world_size=2, rank=1, tp_size=2))
     model = SimpleNamespace(model_config=model_config, config=object())
     mapper = _Mapper()
     mapper.init_model_and_config(model, model_config)
