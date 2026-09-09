@@ -7,8 +7,8 @@ Covers two layers:
      ``flash_attn.cute`` kernel, packed ragged K/V vs. a per-sample SDPA
      reference. Requires CUDA + the FA4 CuTe kernel.
   2. ``Attention._attn_impl_varlen_kv`` -- the dispatch/reshape glue in
-     ``modules/attention.py`` that builds ``cu_seqlens_q`` and reshapes Q/K/V
-     around the backend call. Requires CUDA (delegates to layer 1).
+     ``modules/attention.py`` that keeps Q padded and reshapes K/V around
+     the backend call.
 
 This capability is not wired into any model yet; these tests exercise the
 backend and dispatch layer directly.

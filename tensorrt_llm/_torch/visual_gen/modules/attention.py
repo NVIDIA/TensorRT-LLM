@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -601,18 +601,22 @@ class Attention(nn.Module):
 
     @staticmethod
     def pack_ragged_kv(
-        k: torch.Tensor, v: torch.Tensor, kv_lens: torch.Tensor
+        k: torch.Tensor, v: torch.Tensor, kv_lens: List[int]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Slice each sample's true K/V rows out of padded [B, S, H*D] K/V
         into [total_kv_tokens, H*D], plus cu_seqlens_kv for _attn_impl_varlen_kv.
+        kv_lens is a plain host-side list; a CUDA tensor would force a sync
+        on .tolist().
         """
         k_parts, v_parts = [], []
-        for i, n in enumerate(kv_lens.tolist()):
+        for i, n in enumerate(kv_lens):
             k_parts.append(k[i, :n])
             v_parts.append(v[i, :n])
         k_ragged = torch.cat(k_parts, dim=0)
         v_ragged = torch.cat(v_parts, dim=0)
-        cu_seqlens_kv = F.pad(torch.cumsum(kv_lens, dim=0), (1, 0)).to(torch.int32)
+        cu_seqlens_kv = F.pad(
+            torch.tensor(kv_lens, dtype=torch.int32, device=k.device).cumsum(dim=0), (1, 0)
+        ).to(torch.int32)
         return k_ragged, v_ragged, cu_seqlens_kv
 
     def _attn_impl_varlen_kv(
