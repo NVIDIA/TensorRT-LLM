@@ -938,6 +938,29 @@ def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_attn2d_unequal_text_vs_single_gpu(rank, world_size):
+    """A real 1x2 mesh partitions unequal text prefixes across columns."""
+    try:
+        ref_model, attn2d_model, _, device = _build_ref_and_parallel(
+            attn2d_row_size=1,
+            attn2d_col_size=2,
+            backend="FA4",
+            pretrained_dict=_COSMOS3_FA4_CONFIG,
+        )
+    except ImportError:
+        pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=1)
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+    attn2d_out = _forward_with_unequal_text_lengths(attn2d_model, device, text_seed)
+
+    _assert_parity(
+        attn2d_out,
+        ref_out,
+        msg=f"Rank {rank}: Attention2D (1x2) unequal text differs from single-GPU reference",
+    )
+
+
 def _logic_cosmos3_attn2d_ulysses_vs_single_gpu(rank, world_size):
     # 2x1 attn2d mesh composed with Ulysses=2 (seq_size = attn2d * ulysses = 4).
     attn2d_row_size = 2
@@ -1040,6 +1063,15 @@ class TestCosmos3TransformerParallel:
         if not _ATTN2D_AVAILABLE:
             pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
         run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_attn2d_vs_single_gpu)
+
+    def test_attn2d_1x2_unequal_text_lengths_vs_single_gpu(self):
+        self._skip_if_unavailable()
+        if not _ATTN2D_AVAILABLE:
+            pytest.skip("FA4 / flash_attn_combine JIT kernels not available")
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_attn2d_unequal_text_vs_single_gpu,
+        )
 
     @pytest.mark.gpu4
     def test_attn2d_2x1_ulysses2_vs_single_gpu(self):
