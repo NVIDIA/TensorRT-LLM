@@ -1551,7 +1551,6 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
     executor._handle_control_request = Mock()
     executor.kv_cache_transceiver = Mock()
     executor._check_disagg_ctx_schedulable_status = Mock()
-    executor._check_disagg_gen_transfer_status = Mock()
     executor._pad_attention_dp_dummy_request = Mock()
     executor._pp_retry_until_can_schedule = Mock()
     executor._mm_encoder_item_scheduling_enabled = False
@@ -1574,6 +1573,10 @@ def test_nonzero_pp_rank_reconciles_local_only_disagg_allocations(
         fitting_disagg_gen_init_requests=[local_canonical, local_only]
     )
     executor._prepare_disagg_gen_init = Mock(side_effect=StopAfterReconciliation)
+    # Gen-transfer polling lives in the coordinator, so stub it there rather
+    # than on the executor. Touch ``executor.disagg`` only after the delegate
+    # targets above are stubbed: the coordinator binds them at construction.
+    executor.disagg.poll_gen_transfers = Mock()
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device",
