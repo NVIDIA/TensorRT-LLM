@@ -1642,10 +1642,15 @@ def test_coder_prompt_documents_ask_human():
     """Coder system prompt must mention ``ask_human`` and its surrounding contract.
 
     It must cover the strict last-resort framing, the build-stage opt-in
-    flag, and the no-reply contract.
+    flag, and the no-reply contract. ``ask_human`` is an MCP tool, so the
+    contract lives in the conditionally-appended MCP-tools block rather
+    than in the transport-neutral base prompt.
     """
     module = _load_module()
-    text = module.DEFAULT_PROMPTS.coder
+    from agent_flow.workflows.agent_team.prompts import MCP_TOOLS_EXTENSIONS
+
+    text = module.DEFAULT_PROMPTS.coder + MCP_TOOLS_EXTENSIONS["coder"]
+    assert "ask_human" not in module.DEFAULT_PROMPTS.coder
     assert "ask_human" in text
     assert "Asking the human as a last resort" in text
     assert "(no response from human)" in text
@@ -1654,6 +1659,51 @@ def test_coder_prompt_documents_ask_human():
     # behavior is to NOT ask. If a refactor softens this, the test
     # should flag it.
     assert "default: do not call it" in text.lower()
+
+
+def test_base_prompts_name_no_mcp_tool():
+    """Every base prompt must be transport-neutral.
+
+    A tool name in the base prompt is the bug this split exists to
+    prevent: under ``--no-mcp-tools`` the tool is not registered, so the
+    prompt would be instructing the role to call something it does not
+    have. Mechanism belongs in ``MCP_TOOLS_EXTENSIONS`` only.
+    """
+    module = _load_module()
+    tools = (
+        "append_",
+        "read_latest_progress",
+        "read_latest_build_progress",
+        "read_human_feedback",
+        "read_status",
+        "update_status",
+        "ask_human",
+    )
+    for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+        text = getattr(module.DEFAULT_PROMPTS, role)
+        for tool in tools:
+            assert tool not in text, f"base {role} prompt names the MCP tool {tool!r}"
+
+
+def test_every_registered_tool_is_documented_in_the_role_prompt(tmp_path):
+    """In MCP mode, each role's prompt must document every tool it was handed.
+
+    Guards the other direction of the split: moving a tool's instructions
+    into ``MCP_TOOLS_EXTENSIONS`` must not drop any of them on the floor.
+    """
+    module = _load_module()
+    workflow = _make_workflow(module, tmp_path)
+    try:
+        for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+            agent = getattr(workflow, role)
+            registered = [t.name for t in (agent.config.backend.tools or [])]
+            assert registered, f"{role} has no in-process tools to document"
+            for name in registered:
+                assert name in agent.config.system_prompt, (
+                    f"{role} is handed {name!r} but its prompt never mentions it"
+                )
+    finally:
+        workflow.close()
 
 
 def test_coder_and_reviewer_required_tools_include_status_update(tmp_path):
@@ -3445,7 +3495,7 @@ def test_invoke_agent_prepends_preamble_and_keeps_original_prompt(tmp_path):
     try:
         wf._invoke_agent("qa", wf.qa, "ORIGINAL-PROMPT-BODY", 1)
         assert "ORIGINAL-PROMPT-BODY" in stub.prompts[0]
-        assert "available in this run" in stub.prompts[0]
+        assert "no in-process MCP tools" in stub.prompts[0]
         assert str(mcpless.handoff_path(wf.turn_dir, "qa")) in stub.prompts[0]
     finally:
         wf.close()

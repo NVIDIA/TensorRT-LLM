@@ -219,6 +219,12 @@ each agent ends its turn by writing a small handoff file to
 `<workspace>/.turn/<role>.yaml` that the orchestrator validates and folds back
 into `progress.yaml`.
 
+The agents' system prompts follow the switch. Both the `agent_team` base
+prompts and the modeling-bringup `*_extra.py` overlays are transport-neutral —
+they say *record your progress entry*, not *call `append_coder_progress`*. The
+tool-level block is appended only when the tools are registered, so in this mode
+no prompt mentions a tool the agent does not have.
+
 Two things behave differently in this mode:
 
 - `ask_human` is unavailable, so `--no-mcp-tools` cannot be combined with

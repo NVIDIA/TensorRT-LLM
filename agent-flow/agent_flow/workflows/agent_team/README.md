@@ -204,7 +204,24 @@ ever created.
 Each role then runs with `tools=None`, no required-tool stop hooks, and
 no `ask_human`; only the backend's own built-in tools remain (reading,
 editing, and running commands are not MCP servers, so they are
-unaffected). The coordination the tools provided is re-plumbed in
+unaffected).
+
+**The system prompts change too.** The five base prompts in
+[`prompts/`](prompts) are *transport-neutral*: they describe what each
+role reads and records (the rolling status snapshot, the progress entry
+and its `summary` / `decision` / `weighted_score` fields) without naming
+a mechanism. The tool-level half — `read_latest_progress`,
+`read_human_feedback`, `read_status` / `update_status`,
+`append_*_progress`, `ask_human` — lives in
+[`prompts/mcp_tools.py`](prompts/mcp_tools.py) and is appended per role
+by `AgentTeamWorkflow` **only when the tools are actually registered**.
+Under `--no-mcp-tools` the block is simply not appended, so no prompt
+ever instructs a role to call something it does not have, and nothing at
+turn time has to argue it back out. The same seam applies to a custom
+bundle passed via `prompts=` (e.g. `modeling_bringup`), which is why
+domain extensions must stay transport-neutral as well.
+
+The coordination the tools provided is then re-plumbed in
 [`mcpless.py`](mcpless.py):
 
 - **Reads** — the orchestrator gathers the same slices the `read_*`
@@ -219,13 +236,13 @@ unaffected). The coordination the tools provided is re-plumbed in
   on claude-code. The orchestrator parses and validates that file, then
   records it into `progress.yaml` with the iteration, agent, and
   timestamp stamped server-side. Coder and Reviewer are additionally
-  told to overwrite `status.md` in place of `update_status`.
+  told to overwrite `status.md` themselves.
 
 A missing or invalid handoff gets one corrective retry before the turn
 raises `HandoffError`. Because `ask_human` is gone, `--plan-human-review`
 and `--build-human-review` are rejected at construction time rather than
-silently ignored, and `HUMAN_APPROVED` is dropped from the PlanDrafter's
-accepted decisions.
+silently ignored, and `HUMAN_APPROVED` — which the MCP block is what
+introduces — is absent from the PlanDrafter's accepted decisions.
 
 ### Injecting mid-run feedback
 

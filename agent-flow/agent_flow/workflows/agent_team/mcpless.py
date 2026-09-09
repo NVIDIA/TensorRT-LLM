@@ -23,9 +23,14 @@ MCP tools used to provide is re-plumbed here:
   which the orchestrator parses (:func:`parse_handoff`) and records into
   ``progress.yaml`` via the existing writers.
 
-:func:`build_recording_preamble` produces the authoritative instruction
-block the orchestrator prepends to each turn's prompt so the agent follows
-the file-based protocol instead of calling the (now unavailable) MCP tools.
+:func:`build_recording_preamble` produces the instruction block the
+orchestrator prepends to each turn's prompt. It does **not** have to argue
+the agent out of anything: the role system prompts are transport-neutral
+and ``AgentTeamWorkflow`` simply does not append
+``prompts.mcp_tools.MCP_TOOLS_EXTENSIONS`` in this mode, so no prompt names
+a tool the role does not have. The preamble supplies the mechanism for the
+reads and the recording the system prompt describes abstractly.
+
 It deliberately names no backend-specific tool as mandatory: the workflow
 mixes claude-code roles (which have ``Write``) with codex roles (which
 have ``apply_patch`` / shell), and both must be able to satisfy it.
@@ -64,8 +69,10 @@ class HandoffSchema:
     needs_score: bool
 
 
-# ``HUMAN_APPROVED`` is intentionally absent from plan_drafter's decisions:
-# it required ``ask_human``, which is disabled in no-MCP mode.
+# ``HUMAN_APPROVED`` is absent from plan_drafter's decisions because it
+# required ``ask_human``. The base prompt only offers the other three; the
+# fourth value is introduced by the MCP-tools block, which is not appended
+# in this mode — so the schema and the prompt agree without a special case.
 HANDOFF_SCHEMAS: dict[str, HandoffSchema] = {
     "plan_drafter": HandoffSchema(
         ("summary", "decision"), ("DRAFT_READY", "POLISHING", "DONE"), False
@@ -74,37 +81,6 @@ HANDOFF_SCHEMAS: dict[str, HandoffSchema] = {
     "coder": HandoffSchema(("summary",), None, False),
     "reviewer": HandoffSchema(("summary", "decision"), ("APPROVE", "REJECT"), False),
     "qa": HandoffSchema(("summary", "decision", "weighted_score"), ("APPROVE", "REJECT"), True),
-}
-
-# The MCP tools each role used to have, named in the preamble so the model
-# understands which later instructions the file-based protocol replaces.
-_OLD_TOOLS: dict[str, tuple[str, ...]] = {
-    "plan_drafter": (
-        "append_plan_drafter_progress",
-        "read_latest_progress",
-        "read_latest_build_progress",
-        "read_human_feedback",
-    ),
-    "plan_reviewer": (
-        "append_plan_reviewer_progress",
-        "read_latest_progress",
-        "read_human_feedback",
-    ),
-    "coder": (
-        "append_coder_progress",
-        "read_latest_progress",
-        "read_human_feedback",
-        "update_status",
-        "read_status",
-    ),
-    "reviewer": (
-        "append_reviewer_progress",
-        "read_latest_progress",
-        "read_human_feedback",
-        "update_status",
-        "read_status",
-    ),
-    "qa": ("append_qa_progress", "read_human_feedback"),
 }
 
 
@@ -222,6 +198,16 @@ def gather_context(
                 ),
             )
         )
+        # Four iterations, not one: the Reviewer's persistent-deviation rule
+        # ("same documented deviation re-cited for 3+ consecutive iterations
+        # => APPROVE") needs the current iteration plus the three before it.
+        sections.append(
+            (
+                "Recent build-stage progress (last 4 iterations — for the "
+                "persistent-deviation check)",
+                _entries(find_entries(progress_path, stage=BUILD_STAGE, last_iterations=4)),
+            )
+        )
         sections.append(("Human feedback (from --feedback)", _feedback()))
         sections.append(("Current status.md (rolling scratchpad)", _status()))
     elif role == "plan_reviewer":
@@ -276,11 +262,13 @@ def build_recording_preamble(
     status_path: Path,
     context: str,
 ) -> str:
-    """Build the authoritative protocol block prepended to a turn's prompt.
+    """Build the protocol block prepended to a turn's prompt.
 
-    Declares the role's MCP tools unavailable, gives the file-based
-    equivalent (writing ``handoff`` with the role's fixed YAML keys, plus a
-    ``status.md`` overwrite for coder/reviewer), and inlines ``context``.
+    Supplies the mechanism for the reads and the recording the role's
+    system prompt describes abstractly: the inlined ``context``, the
+    ``handoff`` file with the role's fixed YAML keys, plus a ``status.md``
+    overwrite for coder/reviewer. Nothing here contradicts the system
+    prompt — the MCP-tools block is simply not part of it in this mode.
     """
     schema = HANDOFF_SCHEMAS[role]
 
@@ -291,34 +279,23 @@ def build_recording_preamble(
         spec_lines.append("weighted_score: <a number from 0 to 10>")
     yaml_spec = textwrap.indent("\n".join(spec_lines), "       ")
 
-    tool_names = _OLD_TOOLS.get(role, ())
-    if tool_names:
-        tools_sentence = (
-            "The MCP tools this workflow normally provides ("
-            + ", ".join(f"`{t}`" for t in tool_names)
-            + ") are NOT available in this run."
-        )
-    else:
-        tools_sentence = "In-process MCP tools are NOT available in this run."
-
     status_clause = ""
     if role in ("coder", "reviewer"):
         status_clause = (
-            "\n3. To update the rolling status (replacing any `update_status` call), "
-            f"OVERWRITE `{status_path}` — with the same file-writing tool — with a "
-            "fresh, self-contained status snapshot (current status, execution path, "
-            "what was tried, what worked / didn't, pointers for the next step)."
+            "\n3. To UPDATE the rolling status, OVERWRITE "
+            f"`{status_path}` — with the same file-writing tool — with a "
+            "fresh, self-contained status snapshot, as your system prompt describes."
         )
 
     return (
-        "=== RUN MODE: MCP tools disabled (--no-mcp-tools) ===\n"
-        f"{tools_sentence} Wherever the instructions below tell you to CALL one of those "
-        "tools, follow this protocol instead:\n"
-        "1. Any prior progress / human-feedback / status you would have fetched with a "
-        "`read_*` tool is already provided inline under CONTEXT below — do not try to read "
-        "progress.yaml or status.md to get it.\n"
-        "2. To RECORD your progress entry (replacing any `append_*_progress` call), write "
-        f"the following file as the LAST action of your turn, {_WRITE_TOOL_HINT}:\n"
+        "=== RUN MODE: no in-process MCP tools (--no-mcp-tools) ===\n"
+        "This run registers no MCP tools. Your system prompt says WHAT you read and "
+        "record each turn; this block is HOW:\n"
+        "1. Everything you are given for this turn — prior progress, human feedback, "
+        "current status — is inlined under CONTEXT below. Do not read progress.yaml or "
+        "status.md to get it.\n"
+        "2. To RECORD your progress entry, write the following file as the LAST action "
+        f"of your turn, {_WRITE_TOOL_HINT}:\n"
         f"       {handoff}\n"
         "   containing exactly these YAML keys and nothing else:\n"
         f"{yaml_spec}"

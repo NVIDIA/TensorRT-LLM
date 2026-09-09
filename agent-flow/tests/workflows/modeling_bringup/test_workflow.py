@@ -79,13 +79,36 @@ def test_workflow_uses_default_prompts_when_arg_omitted(tmp_path):
     """
     module = _load_agent_team_workflow_module()
     prompts = importlib.import_module("agent_flow.workflows.agent_team.prompts")
+    # The default run has in-process MCP tools, so each role's prompt is the
+    # transport-neutral base plus the conditionally-appended MCP block.
+    expected = prompts.DEFAULT_PROMPTS.with_extensions(**prompts.MCP_TOOLS_EXTENSIONS)
     workflow = module.AgentTeamWorkflow(workspace=tmp_path)
     try:
-        assert workflow.plan_drafter.config.system_prompt == prompts.PLAN_DRAFTER_SYSTEM_PROMPT
-        assert workflow.plan_reviewer.config.system_prompt == prompts.PLAN_REVIEWER_SYSTEM_PROMPT
-        assert workflow.coder.config.system_prompt == prompts.CODER_SYSTEM_PROMPT
-        assert workflow.reviewer.config.system_prompt == prompts.REVIEWER_SYSTEM_PROMPT
-        assert workflow.qa.config.system_prompt == prompts.QA_SYSTEM_PROMPT
+        for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+            agent_prompt = getattr(workflow, role).config.system_prompt
+            base = getattr(prompts.DEFAULT_PROMPTS, role)
+            assert agent_prompt == getattr(expected, role)
+            assert agent_prompt.startswith(base.rstrip())
+    finally:
+        workflow.close()
+
+
+def test_workflow_omits_mcp_block_without_in_process_tools(tmp_path):
+    """``--no-mcp-tools`` must leave every role on the transport-neutral base prompt.
+
+    The block naming ``append_*_progress`` / ``update_status`` / ``ask_human``
+    is what makes a prompt describe tools the role does not have, so it must
+    be absent rather than overridden at turn time.
+    """
+    module = _load_agent_team_workflow_module()
+    prompts = importlib.import_module("agent_flow.workflows.agent_team.prompts")
+    workflow = module.AgentTeamWorkflow(workspace=tmp_path, use_in_process_tools=False)
+    try:
+        for role in ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa"):
+            agent_prompt = getattr(workflow, role).config.system_prompt
+            assert agent_prompt == getattr(prompts.DEFAULT_PROMPTS, role)
+            for tool in ("append_", "update_status", "read_status", "ask_human"):
+                assert tool not in agent_prompt, f"{role} prompt still names {tool!r}"
     finally:
         workflow.close()
 
@@ -104,19 +127,23 @@ def test_workflow_propagates_custom_prompt_bundle(tmp_path):
         reviewer="REVIEWER-SYS",
         qa="QA-SYS",
     )
+    # A custom bundle is transport-neutral too: the workflow appends the MCP
+    # block on top of it, so the bundle text stays a prefix.
+    expected = custom.with_extensions(**prompts.MCP_TOOLS_EXTENSIONS)
     workflow = module.AgentTeamWorkflow(workspace=tmp_path, prompts=custom)
     try:
-        assert workflow.plan_drafter.config.system_prompt == "PD-SYS"
-        assert workflow.plan_reviewer.config.system_prompt == "PR-SYS"
-        assert workflow.coder.config.system_prompt == "CODER-SYS"
-        assert workflow.reviewer.config.system_prompt == "REVIEWER-SYS"
-        assert workflow.qa.config.system_prompt == "QA-SYS"
+        assert workflow.plan_drafter.config.system_prompt == expected.plan_drafter
+        assert workflow.plan_reviewer.config.system_prompt == expected.plan_reviewer
+        assert workflow.coder.config.system_prompt == expected.coder
+        assert workflow.reviewer.config.system_prompt == expected.reviewer
+        assert workflow.qa.config.system_prompt == expected.qa
+        assert workflow.coder.config.system_prompt.startswith("CODER-SYS")
         # Reset paths must rebuild from the same bundle, not the module
         # defaults.
         workflow._reset_coder()
         workflow._reset_reviewer()
-        assert workflow.coder.config.system_prompt == "CODER-SYS"
-        assert workflow.reviewer.config.system_prompt == "REVIEWER-SYS"
+        assert workflow.coder.config.system_prompt == expected.coder
+        assert workflow.reviewer.config.system_prompt == expected.reviewer
     finally:
         workflow.close()
 
@@ -587,12 +614,13 @@ def test_qa_prompt_has_final_report_contract():
             f"QA prompt does not forbid {forbidden!r} as a non-measurement placeholder"
         )
 
-    # Ordering: the report write must happen before
-    # ``append_qa_progress`` so an interrupt between the two does not
-    # lose the closure artifact.
-    write_idx = qa_prompt.find("Write the file **before** you call `append_qa_progress`")
+    # Ordering: the report write must happen before the progress entry is
+    # recorded, so an interrupt between the two does not lose the closure
+    # artifact. Stated transport-neutrally — the recording mechanism differs
+    # between MCP and no-MCP runs, the ordering does not.
+    write_idx = qa_prompt.find("Write the file **before** you record your progress entry")
     assert write_idx != -1, (
-        "QA prompt must explicitly order the report write before append_qa_progress"
+        "QA prompt must explicitly order the report write before the progress entry"
     )
 
 
@@ -739,12 +767,17 @@ def test_modeling_bringup_workflow_uses_extended_bundle(tmp_path, monkeypatch):
         prompts=mb_prompts.MODELING_BRINGUP_PROMPTS,
     )
     try:
-        assert workflow.coder.config.system_prompt.endswith("\n\n## MB\nExtra coder guidance.\n")
+        # Base prompt, then the domain extension, then the MCP block last.
+        assert "\n\n## MB\nExtra coder guidance.\n" in workflow.coder.config.system_prompt
         assert workflow.coder.config.system_prompt.startswith(prompts.CODER_SYSTEM_PROMPT.rstrip())
+        assert workflow.coder.config.system_prompt.endswith(
+            prompts.MCP_TOOLS_EXTENSIONS["coder"].rstrip() + "\n"
+        )
         # Agents whose extras were not monkeypatched keep their normally-
-        # populated bundle prompts.
-        assert workflow.qa.config.system_prompt == baseline_bundle.qa
-        assert workflow.plan_drafter.config.system_prompt == baseline_bundle.plan_drafter
+        # populated bundle prompts (plus the same MCP block).
+        expected = baseline_bundle.with_extensions(**prompts.MCP_TOOLS_EXTENSIONS)
+        assert workflow.qa.config.system_prompt == expected.qa
+        assert workflow.plan_drafter.config.system_prompt == expected.plan_drafter
     finally:
         workflow.close()
         # Reset the override so subsequent tests see the populated bundle.

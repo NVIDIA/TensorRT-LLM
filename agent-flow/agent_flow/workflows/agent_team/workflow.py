@@ -27,7 +27,7 @@ from .progress import (
     latest_entry,
     record_progress_entry,
 )
-from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts import DEFAULT_PROMPTS, MCP_TOOLS_EXTENSIONS, PromptBundle
 from .state import (
     STAGE_CODER,
     STAGE_PLAN_DRAFTER,
@@ -112,7 +112,14 @@ class AgentTeamWorkflow:
         use_in_process_tools: bool = True,
     ) -> None:
         self.workspace = workspace
+        # Prompt bundles are transport-neutral. The MCP-tool protocol block
+        # is appended per role only when the run actually registers those
+        # tools; under ``--no-mcp-tools`` it is dropped and ``mcpless``
+        # supplies the file-based protocol instead, so no role is ever told
+        # to call a tool it does not have.
         self.prompts = prompts or DEFAULT_PROMPTS
+        if use_in_process_tools:
+            self.prompts = self.prompts.with_extensions(**MCP_TOOLS_EXTENSIONS)
         self.task_path = workspace / "task.yaml"
         self.plan_path = workspace / "plan.md"
         self.acceptance_criteria_path = workspace / "acceptance-criteria.md"

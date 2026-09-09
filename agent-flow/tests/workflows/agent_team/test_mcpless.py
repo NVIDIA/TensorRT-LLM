@@ -117,6 +117,35 @@ def test_gather_context_reviewer_uses_coder_entry(tmp_path):
     assert "state here" in ctx
 
 
+def test_gather_context_reviewer_spans_four_iterations(tmp_path):
+    """The Reviewer's persistent-deviation rule needs four iterations of history.
+
+    Its prompt says to look at the current iteration plus the three before
+    it before REJECTing; with only the latest entry inlined the rule is
+    unexecutable and the Reviewer loses an APPROVE exit.
+    """
+    prog = tmp_path / "progress.yaml"
+    P.write_progress(
+        prog,
+        {
+            "plan_stage": [],
+            "build_stage": [
+                {"iteration": n, "agent": "coder", "summary": f"deviation cited iter {n}"}
+                for n in range(1, 6)
+            ],
+            "human_feedback": [],
+        },
+    )
+    status = tmp_path / "status.md"
+    status.write_text("# current\n", encoding="utf-8")
+
+    ctx = mcpless.gather_context("reviewer", progress_path=prog, status_path=status)
+    for n in (2, 3, 4, 5):
+        assert f"deviation cited iter {n}" in ctx
+    # Four iterations, not the whole log.
+    assert "deviation cited iter 1" not in ctx
+
+
 def test_gather_context_qa_only_feedback(tmp_path):
     prog, status = _seed(tmp_path)
     ctx = mcpless.gather_context("qa", progress_path=prog, status_path=status)
@@ -160,8 +189,35 @@ def test_preamble_names_handoff_path_and_status_for_coder(tmp_path):
     assert str(hp) in pre
     assert str(tmp_path / "status.md") in pre
     assert "CTXBODY" in pre
-    assert "append_coder_progress" in pre  # explicitly reinterprets the old tool
-    assert "update_status" in pre
+    assert "OVERWRITE" in pre  # coder owns the status.md snapshot
+
+
+def test_preamble_never_names_an_mcp_tool(tmp_path):
+    """The preamble supplies a mechanism; it must not argue with the system prompt.
+
+    The role prompts are transport-neutral and the MCP-tools block is not
+    appended in this mode, so there is no tool instruction left to
+    reinterpret. Naming one here would reintroduce the contradiction the
+    conditional block exists to remove.
+    """
+    tools = (
+        "append_coder_progress",
+        "append_reviewer_progress",
+        "append_qa_progress",
+        "append_plan_drafter_progress",
+        "append_plan_reviewer_progress",
+        "read_latest_progress",
+        "read_latest_build_progress",
+        "read_human_feedback",
+        "read_status",
+        "update_status",
+        "ask_human",
+    )
+    for role in mcpless.HANDOFF_SCHEMAS:
+        hp = mcpless.handoff_path(tmp_path / ".turn", role)
+        pre = mcpless.build_recording_preamble(role, hp, tmp_path / "status.md", "CTX")
+        for tool in tools:
+            assert tool not in pre, f"{role} preamble names the MCP tool {tool!r}"
 
 
 def test_preamble_qa_has_score_and_no_status_duty(tmp_path):
