@@ -29,7 +29,7 @@ pip install -r requirements.txt
 After cloning, your directory structure should look like:
 
 ```text
-sparse_attention/
+longbench/
 ├── eval_longbench_v1.py          # LongBench v1 evaluation script
 ├── README.md                     # This file
 └── LongBench/                    # Cloned LongBench repository
