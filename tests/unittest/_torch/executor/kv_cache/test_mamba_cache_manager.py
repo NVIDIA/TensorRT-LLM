@@ -551,6 +551,12 @@ def _capture_qwen3_hybrid_manager_ctor(monkeypatch, manager_base, pretrained_con
 
     class RecordingManager(manager_base):
         def __init__(self, *args, **kwargs):
+            """Record the constructor kwargs without building a real manager.
+
+            The base constructor is deliberately not called: it would allocate
+            cache pools and need a GPU, and these tests only assert on what the
+            factory passes in.
+            """
             captured.update(kwargs)
 
     monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
