@@ -822,7 +822,7 @@ def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", fileP
             "GIT_DIFF_RENAME_PATH=${diffPaths.size() > 1 ? diffPaths[1] : diffPaths[0]}",
         ]) {
             rawDiff = pipeline.sh(
-                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \"\${GIT_DIFF_PATH}\" \"\${GIT_DIFF_RENAME_PATH}\"",
+                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \":(literal)\${GIT_DIFF_PATH}\" \":(literal)\${GIT_DIFF_RENAME_PATH}\"",
                 returnStdout: true
             )
         }
