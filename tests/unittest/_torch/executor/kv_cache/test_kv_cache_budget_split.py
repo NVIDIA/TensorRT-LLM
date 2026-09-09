@@ -14,9 +14,11 @@
 # limitations under the License.
 """Tests for KV cache budget splitting between target and draft managers."""
 
+import math
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
@@ -47,8 +49,8 @@ def _make_creator(
     """Minimal KvCacheCreator for budget-split helpers.
 
     ``*_intercept`` model the affine fixed cost (e.g. mamba SSM state) that a
-    manager pays per batch regardless of token count. The draft cost is derived
-    as ``total - target`` for both slope and intercept.
+    manager pays per batch regardless of token count. The draft mock receives
+    the component-wise ``total - target`` values directly.
     """
     c = object.__new__(KvCacheCreator)
 
@@ -78,6 +80,12 @@ def _make_creator(
         )
     )
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
+    c._get_draft_cache_cost = Mock(
+        return_value=CacheCost(
+            slope=total_kv_per_token - target_kv_per_token,
+            intercept=total_kv_intercept - target_kv_intercept,
+        )
+    )
 
     return c
 
@@ -136,7 +144,14 @@ class TestSplitGpuBudgetForDraft:
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [0]
         creator._mapping.is_last_pp_rank.return_value = True
-        creator._speculative_config = SimpleNamespace(spec_dec_mode=mode)
+        creator._speculative_config = SimpleNamespace(
+            spec_dec_mode=mode,
+            max_draft_len=1,
+            max_total_draft_tokens=0,
+            tokens_per_gen_step=1,
+            use_dynamic_tree=False,
+            _use_shared_kv_cache=False,
+        )
         creator._model_engine = SimpleNamespace(
             model=SimpleNamespace(model_config=target_model_config)
         )
@@ -153,9 +168,13 @@ class TestSplitGpuBudgetForDraft:
         )
 
         # The draft layer stores 64 bytes/token in a fixed 512-token window.
+        # Generation retains one additional 64-token boundary block and the
+        # 128-token context budget consumes two more blocks.
         # Leaking the target's 16K window would instead count it as 64 bytes/token.
         cost = creator._get_kv_size_per_token()
-        assert cost == CacheCost(slope=10, intercept=512 * 64)
+        usable_slots = 11
+        configured_slots = math.ceil(usable_slots / float(np.float32(0.95)))
+        assert cost == CacheCost(slope=10, intercept=configured_slots * 64 * 64)
         assert len(draft_kv_configs) == 1
         draft_kv_config = draft_kv_configs[0]
         assert draft_kv_config.max_attention_window == [512]
@@ -269,9 +288,7 @@ class TestSplitGpuBudgetForDraft:
 
     def test_fixed_only_draft_uses_manager_estimated_quota(self):
         total_gpu = 10 * GB
-        slot_bytes = 327_680
-        configured_slots = 2_561
-        configured_bytes = configured_slots * slot_bytes
+        configured_bytes = 2_561 * 327_680
         c = _make_creator(
             max_gpu_total_bytes=total_gpu,
             total_kv_per_token=80,

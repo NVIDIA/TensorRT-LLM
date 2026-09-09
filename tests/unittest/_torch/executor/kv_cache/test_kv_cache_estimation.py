@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -649,12 +650,21 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     )
 
     # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
-    expected = CacheCost(slope=64, intercept=3 * 2 * 2048 * 64)
+    expected = CacheCost(slope=64, intercept=3 * 2 * (2048 + 64) * 64)
     assert no_scratch_size_per_token == expected
     assert scratch_size_per_token == expected
 
 
-def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
+@pytest.mark.parametrize(
+    ("spec_dec_mode", "tokens_per_gen_step", "headroom", "generation_blocks"),
+    [
+        pytest.param(SpeculativeDecodingMode.DFLASH, 5, 8, 17, id="dflash"),
+        pytest.param(SpeculativeDecodingMode.PARD, 8, 11, 18, id="pard"),
+    ],
+)
+def test_v2_external_draft_cost_covers_context_and_generation_slots(
+    spec_dec_mode, tokens_per_gen_step, headroom, generation_blocks
+):
     class FakeDraftModelConfig:
         quant_config = None
         pretrained_config = SimpleNamespace(
@@ -667,9 +677,12 @@ def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
             return 1
 
     spec_config = SimpleNamespace(
-        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+        spec_dec_mode=spec_dec_mode,
         max_draft_len=4,
-        tokens_per_gen_step=5,
+        max_total_draft_tokens=4,
+        tokens_per_gen_step=tokens_per_gen_step,
+        use_dynamic_tree=False,
+        _use_shared_kv_cache=False,
     )
     mapping = Mock(enable_attention_dp=False, tp_size=1)
     mapping.pp_layers.return_value = [0]
@@ -685,7 +698,7 @@ def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
             max_seq_len=4096,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            kv_cache_config=KvCacheConfig(max_attention_window=[512]),
+            kv_cache_config=KvCacheConfig(max_attention_window=[504]),
             spec_config=spec_config,
             is_draft=True,
         )
@@ -693,16 +706,14 @@ def test_v2_dflash_draft_cost_covers_context_and_generation_slots():
 
     # One layer stores K+V * 2 KV heads * 8 head dim * BF16 = 64 B/token.
     slot_bytes = tokens_per_block * 64
-    # Runtime generation capacity can lead history by max_draft_len - 1
-    # (get_num_extra_kv_tokens) plus tokens_per_gen_step: 3 + 5 = 8.
-    generation_blocks_per_request = math.ceil((512 + 8 - 1) / tokens_per_block) + 1
-    assert generation_blocks_per_request == 18
+    # Runtime generation capacity leads history by max_draft_len - 1 plus
+    # tokens_per_gen_step. For PARD K=4 that is 3 + 2K = 11 tokens.
+    generation_blocks_per_request = math.ceil((504 + headroom - 2) / tokens_per_block) + 1
+    assert generation_blocks_per_request == generation_blocks
     context_slots = max_num_tokens // tokens_per_block
     expected_usable_slots = max_batch_size * generation_blocks_per_request + context_slots
-    assert expected_usable_slots == 2_432
-    # float32(0.95) requires 2561 configured slots for 2432 slots to remain
-    # resumable. The estimator owns this manager-specific quota normalization.
-    expected_configured_slots = 2_561
+    resume_util = float(np.float32(0.95))
+    expected_configured_slots = math.ceil(expected_usable_slots / resume_util)
     assert cost == CacheCost(slope=0, intercept=expected_configured_slots * slot_bytes)
 
 
@@ -759,7 +770,10 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
         tokens_per_block=64,
         max_seq_len=4096,
         max_batch_size=3,
-        kv_cache_config=KvCacheConfig(max_attention_window=[64]),
+        kv_cache_config=KvCacheConfig(
+            max_attention_window=[64],
+            max_util_for_resume=1.0,
+        ),
         spec_config=spec_config,
     )
 
@@ -797,18 +811,20 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
                     "kv_cache_config": KvCacheConfig(
                         enable_block_reuse=False,
                         max_attention_window=[64],
+                        max_util_for_resume=1.0,
                     )
                 }
             ),
         )
     )
 
-    # W=64 occupies one page; one-model draft reuse retains W+D=65 and
-    # therefore charges two pages in single and separate KVCM layouts.
-    assert no_draft == CacheCost(slope=0, intercept=3 * 64 * 64)
+    # W=64 plus the base generation token can retain two boundary pages.
+    # One-model draft reuse extends retention to W+D=65; its two-token
+    # generation step can therefore cross into a third page.
+    assert no_draft == CacheCost(slope=0, intercept=3 * 128 * 64)
     assert unsupported == no_draft
     assert block_reuse_disabled == no_draft
-    assert single_kvcm == target == draft == CacheCost(slope=0, intercept=3 * 128 * 64)
+    assert single_kvcm == target == draft == CacheCost(slope=0, intercept=3 * 192 * 64)
 
 
 def test_creator_uses_v2_affine_cache_cost():
@@ -839,6 +855,7 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager.tokens_per_block = 64
     manager.max_batch_size = 4
     manager.max_num_tokens = 1000
+    manager._generation_kv_capacity_headroom = 1
     manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: [10, 10, 20][
         local_layer_idx
     ]
@@ -847,12 +864,12 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch():
 
     manager.enable_swa_scratch_reuse = False
     no_scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
-    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 128 * 10)
+    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 192 * 10)
     assert manager._get_max_tokens_from_quota(no_scratch_quota) == max_tokens
 
     manager.enable_swa_scratch_reuse = True
     scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
-    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 128 * 10)
+    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 192 * 10)
     assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
 
 
