@@ -38,6 +38,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
     MiniMaxM3Model,
     MiniMaxM3MoE,
     _build_swiglu_oai_dense_mlp,
@@ -59,7 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
-from tensorrt_llm._torch.utils import EventType
+from tensorrt_llm._torch.utils import AuxStreamType, EventType
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -146,6 +147,66 @@ def test_minimax_m3_moe_reduces_only_local_terms(
         moe.allreduce.inputs[0], torch.full_like(hidden_states, reduced_input)
     )
     assert moe.allreduce.params == [None]
+
+
+@pytest.mark.parametrize(
+    "scheduler_kind, expected_post_fusion",
+    [
+        (MoESchedulerKind.EXTERNAL_COMM, True),
+        (MoESchedulerKind.FUSED_COMM, False),
+    ],
+)
+def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_kind: MoESchedulerKind,
+    expected_post_fusion: bool,
+) -> None:
+    """A fused-communication MoE must not schedule a second boundary reduction."""
+
+    class _DecoderComponent(nn.Module):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            super().__init__()
+
+    class _DecoderMoE(_DecoderComponent):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            self.backend = SimpleNamespace(scheduler_kind=scheduler_kind)
+            self.routed_output_is_global = _moe_routed_output_is_global(self)
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.MiniMaxM3Attention",
+        _DecoderComponent,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.MiniMaxM3MoE",
+        _DecoderMoE,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.RMSNorm",
+        _DecoderComponent,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_minimaxm3.AllReduce",
+        _DecoderComponent,
+    )
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        mapping=Mapping(world_size=2, rank=0, tp_size=2),
+    )
+
+    layer = MiniMaxM3DecoderLayer(
+        model_config=model_config,
+        layer_idx=3,
+        aux_stream_dict={
+            AuxStreamType.Attention: None,
+            AuxStreamType.MoeShared: None,
+        },
+    )
+
+    assert layer.enable_fusion
+    assert layer.pre_feed_forward_fusion
+    assert layer.post_feed_forward_fusion is expected_post_fusion
 
 
 @pytest.mark.parametrize(
