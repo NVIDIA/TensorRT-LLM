@@ -1471,18 +1471,6 @@ class PyTorchModelEngine(ModelEngine):
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
-        # Ahead of the early returns below, since it holds regardless of why
-        # warmup is skipped: only the advanced-sampling CUDA graph capture pass
-        # exercises the non-greedy sampler, so with cuda_graph_config=None
-        # flashinfer's sampling kernels would be JIT-built mid-serving.
-        warmup_sampling_module()
-        if self.enable_in_graph_sampling:
-            # The fast tier samples inside the captured graph via a
-            # torch.compile'd op; compile it now so capture does not.
-            warmup_sample_from_logits_op(self.model.config.vocab_size,
-                                         torch.device('cuda'), self.dtype,
-                                         self._cuda_graph_batch_sizes or [])
-
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         if self._runner is not None:
@@ -1493,6 +1481,18 @@ class PyTorchModelEngine(ModelEngine):
             self._runner.warmup(resource_manager)
             self._runner.capture_graphs(resource_manager)
             return
+
+        # Ahead of the legacy early returns below: only the advanced-sampling
+        # CUDA graph capture pass exercises the non-greedy sampler, so with
+        # cuda_graph_config=None flashinfer's sampling kernels would be
+        # JIT-built mid-serving.
+        warmup_sampling_module()
+        if self.enable_in_graph_sampling:
+            # The fast tier samples inside the captured graph via a
+            # torch.compile'd op; compile it now so capture does not.
+            warmup_sample_from_logits_op(self.model.config.vocab_size,
+                                         torch.device('cuda'), self.dtype,
+                                         self._cuda_graph_batch_sizes or [])
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")

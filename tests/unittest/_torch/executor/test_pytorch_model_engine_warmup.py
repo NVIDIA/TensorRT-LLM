@@ -210,6 +210,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
+        model_engine.enable_in_graph_sampling = False
         model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = None
         resource_manager = Mock()
