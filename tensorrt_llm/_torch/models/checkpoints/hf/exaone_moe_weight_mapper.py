@@ -5,7 +5,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 
 
-@register_mapper("HF", "ExaoneMoEForCausalLM")
+@register_mapper("HF", "ExaoneMoeForCausalLM")
 class ExaoneMoeWeightMapper(HfWeightMapper):
     def __init__(self):
         super().__init__()
@@ -30,12 +30,22 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
     def preprocess_weights(self, weights: dict):
         mtp_layer_offset = self.config.pretrained_config.num_hidden_layers
 
+        def rename(old_name: str, new_name: str) -> None:
+            # `weights` is a ConsumableWeightsDict, which deliberately exposes
+            # only __getitem__/__setitem__/__delitem__ (each lock-guarded) and
+            # has no `pop`. Reading does not consume, so get-then-delete is the
+            # exact equivalent of pop here.
+            weights[new_name] = weights[old_name]
+            del weights[old_name]
+
         for name in list(weights.keys()):
             if name.startswith("mtp.layers."):
                 # mtp.layers.{idx}.* -> model.layers.{offset + idx}.*
                 _, _, mtp_layer_idx, module_name = name.split(".", 3)
-                new_name = f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}"
-                weights[new_name] = weights.pop(name)
+                rename(
+                    name,
+                    f"model.layers.{mtp_layer_offset + int(mtp_layer_idx)}.{module_name}",
+                )
             elif name.startswith("mtp."):
                 # mtp.fc.* -> model.layers.{offset}.eh_proj.*
                 # mtp.norm.* -> model.layers.{offset}.shared_head.norm.*
@@ -43,12 +53,27 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                 for mtp_prefix, trtllm_name in self.mtp_mapping.items():
                     if name.startswith(mtp_prefix):
                         suffix = name[len(mtp_prefix) :]
-                        new_name = f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}"
-                        weights[new_name] = weights.pop(name)
+                        rename(
+                            name,
+                            f"model.layers.{mtp_layer_offset}.{trtllm_name}{suffix}",
+                        )
                         break
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return is_moe_weight_owner(module)
+
+    def _renames_scales_to_inv(self) -> bool:
+        """Whether this checkpoint's MoE scales must be exposed as ``weight_scale_inv``.
+
+        True for everything except NVFP4, whose loader
+        (:meth:`NVFP4FusedMoEMethod.load_quant_scales`) indexes ``weight_scale``
+        and ``weight_scale_2`` directly. Unknown/absent quant config keeps the
+        historical behaviour so non-quantised checkpoints are unaffected.
+        """
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        quant_config = getattr(self.config, "quant_config", None)
+        return getattr(quant_config, "quant_algo", None) != QuantAlgo.NVFP4
 
     def handle_special_instance_module(
         self,
@@ -81,8 +106,19 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
                         for i in range(weight_value.shape[0]):
                             updated_module_weights[f"{i}.w2.weight"] = weight_value[i]
                         continue
-                new_weight_name = weight_name.replace("weight_scale", "weight_scale_inv")
-                if new_weight_name.endswith(".weight_scale_inv"):
+                # Only the FP8-block-scale and W4A16-MXFP4 MoE loaders read
+                # `weight_scale_inv`. The NVFP4 loader reads `weight_scale` (the
+                # per-block scales) and `weight_scale_2` (the per-tensor global
+                # scale) verbatim, so renaming here hides both from it.
+                #
+                # The old unconditional `replace("weight_scale", ...)` also
+                # rewrote `weight_scale_2` into `weight_scale_inv_2`, which no
+                # loader has ever looked for -- wrong under any quantisation.
+                new_weight_name = weight_name
+                if self._renames_scales_to_inv() and (
+                    weight_name == "weight_scale" or weight_name.endswith(".weight_scale")
+                ):
+                    new_weight_name = weight_name[: -len("weight_scale")] + "weight_scale_inv"
                     weight_value = weight_value.squeeze()
                 updated_module_weights[new_weight_name] = weight_value
             module.load_weights(
