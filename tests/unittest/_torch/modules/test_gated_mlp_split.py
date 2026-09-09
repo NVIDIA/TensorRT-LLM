@@ -55,10 +55,13 @@ def _make(split, *, quant_algo=QuantAlgo.FP8, activation=F.silu, force_dynamic=F
 
 
 def _capture(fn):
-    """Capture fn() after warming up on a side stream.
+    """Capture fn() into a CUDA graph after warming up on a side stream.
 
-    Capture is sensitive to allocator state left by earlier tests, so the
-    documented warmup protocol is used rather than a single default-stream call.
+    The warmup is the documented capture protocol rather than a workaround for
+    anything a previous test left behind: the first execution allocates
+    workspaces, resolves lazy initialization and runs kernel autotuning, none of
+    which may happen inside the capture region. Running it on a side stream keeps
+    that work off the stream being captured.
     """
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
