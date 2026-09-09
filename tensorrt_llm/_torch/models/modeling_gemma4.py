@@ -1494,7 +1494,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         local_positions = torch.arange(
             extend_len, device=mm_token_type_ids.device, dtype=torch.int32
         )
-        start_candidates = torch.where(blob_starts, local_positions, 0)
+        start_candidates = torch.where(blob_starts, local_positions, -1)
         vision_starts = torch.cummax(start_candidates, dim=0).values + prefix_len
         end_candidates = torch.where(blob_ends, local_positions, extend_len)
         vision_ends = (
