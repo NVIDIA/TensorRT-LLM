@@ -47,7 +47,9 @@ common_params:                            # applies to every request
 requests:
   - prompt: A red fox trotting across a snowy field at dawn
   - prompt_file: prompts/aerial.json      # instead of prompt
-    image_reference: ../media/frame.png
+    image_reference:
+      - content: ../media/frame.png       # format defaults to path
+        role: first_frame
     width: 720                            # overrides common_params for this request
     height: 1280
 ```
@@ -67,7 +69,7 @@ cannot carry is an error rather than a request the server ignores.
 | `negative_prompt` | ✓ | ✓ | ✓ |
 | `num_frames` · `frame_rate` | ✓ | — | — |
 | `num_images_per_prompt` | — | ✓ | ✓ |
-| `image_reference` | ✓ | — | required |
+| `image_reference` | ✓ | — | required, base64 only |
 | `video_reference` · `audio_reference` | ✓ | — | — |
 
 #### Resolution order
@@ -81,18 +83,16 @@ rather than being replaced whole.
 
 #### File inputs
 
-Five keys read a file, and no others. A bare string in any of them is a local path, resolved
+`prompt_file` and `extra_params.action_file` are path strings. The three reference slots take
+the object `MediaReferenceItem` declares — `{content, format, role}`, `format` one of `path`
+(the default), `url` or `base64` — or a list of them. A relative path in any of these resolves
 from the document, with `~` expanded and no variable expansion.
 
-| key | what the file becomes |
+| key | what it becomes |
 |---|---|
-| `image_reference` · `video_reference` · `audio_reference` | base64 on the wire |
+| `image_reference` · `video_reference` · `audio_reference` | a `path` goes out as the path and the server reads the file; `url` and `base64` go out as written |
 | `prompt_file` | that request's `prompt`: a JSON object's `prompt` field, the whole object serialized when it has none, or the file's text when it is not JSON |
 | `extra_params.action_file` | `extra_params.action`, a JSON `[T, D]` trajectory |
-
-A URL or inline base64 goes in the object form `MediaRef` declares — `{content, format}` with
-`format` one of `path`, `url` or `base64` — which the three reference slots take and pass
-through untouched.
 
 ## Result
 

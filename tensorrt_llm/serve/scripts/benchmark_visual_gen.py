@@ -43,7 +43,7 @@ from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Optional, get_args
+from typing import Any, Literal, Optional, Union, get_args
 
 import aiohttp
 import numpy as np
@@ -55,6 +55,7 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
     ImageGenerationRequest,
+    MediaReferenceItem,
     VideoGenerationRequest,
 )
 from tensorrt_llm.serve.visual_gen_metrics import (
@@ -92,8 +93,8 @@ WIRE_MODEL = {
 # The document keeps the API's name; only the payload uses these.
 WIRE_ALIAS = {"num_images_per_prompt": "n", "image_reference": "image"}
 
-# Reference slots the loader resolves itself, so the document can name a local file
-# and the read happens once, before the run. VisualGenParams rejects a bare path.
+# Reference slots the loader resolves itself, so a document can name a local file
+# relative to itself and an unreadable one fails before the run.
 # Read off the params rather than listed, so a slot the API gains is addressable.
 REFERENCE_KEYS = tuple(name for name in VisualGenParams.model_fields if name.endswith("_reference"))
 # What one generation is given. common_params carries generation parameters, so
@@ -148,9 +149,8 @@ class VisualGenBenchRequest(StrictBaseModel):
     """One entry of ``requests``, in the fields its route accepts.
 
     Resolution replaces what the document named with what a request carries --
-    a reference path with its body, a prompt file with its text -- so the
-    locator worth recording is kept here. A result naming the bytes rather than
-    the file would be useless, and megabytes wide.
+    a prompt file with its text, a relative reference path with its absolute
+    one -- so the locator worth recording is kept here.
     """
 
     _original: dict[str, str] = PrivateAttr(default_factory=dict)
@@ -203,16 +203,25 @@ _REQUEST_INPUT_FIELDS: dict[str, Any] = {
 }
 
 
+class VisualGenBenchMediaRef(MediaReferenceItem):
+    """One media reference in a workload document; ``format`` defaults to ``path``."""
+
+    format: Literal["path", "url", "base64"] = "path"
+
+
 def _reference_fields(backend: str) -> dict[str, Any]:
     """The reference slots this route carries.
 
-    A local path, or the ``{content, format}`` object ``MediaReferenceItem``
-    declares; both are resolved after the merge. ``/v1/images/edits`` has a
-    required ``image``, so its slot is required here rather than checked later.
+    One reference or a list of them, in the wire form ``MediaReferenceItem``
+    declares. ``/v1/images/edits`` has a required ``image``, so its slot is
+    required here rather than checked later.
     """
+    one_or_more = Union[VisualGenBenchMediaRef, list[VisualGenBenchMediaRef]]
     required = backend == "openai-image-edits"
     return {
-        slot: (Any, ... if required else None) for slot in REFERENCE_KEYS if _carried(backend, slot)
+        slot: (one_or_more, ...) if required else (Optional[one_or_more], None)
+        for slot in REFERENCE_KEYS
+        if _carried(backend, slot)
     }
 
 
@@ -421,40 +430,34 @@ def _merge_request(
 
 
 def _resolve_reference(slot: str, reference: Any, base_dir: Path, index: int) -> tuple[str, Any]:
-    """Return ``(label, wire)`` for one reference slot.
+    """Return ``(label, resolved)`` for one reference slot.
 
-    A string is a local path: it is read and encoded here rather than at
-    dispatch so a missing file fails before the run starts. A ``{content,
-    format}`` object (or a list of them) is already in the wire form
-    ``MediaReferenceItem`` declares and passes through untouched.
+    A ``path`` is made absolute against the document's directory and opened
+    here, so an unreadable one fails before the run starts; the server does the
+    reading, so the file never crosses the wire. ``url`` and ``base64`` are
+    already what goes out.
     """
-    if isinstance(reference, (dict, list)):
-        items = reference if isinstance(reference, list) else [reference]
-        labels = []
-        for item in items:
-            if not isinstance(item, dict) or "content" not in item or "format" not in item:
-                raise ValueError(
-                    f"requests[{index}]: {slot} objects need 'content' and 'format' "
-                    f"(path/url/base64); got {item!r}."
-                )
-            labels.append(item["content"] if item["format"] != "base64" else "<base64>")
-        return ", ".join(labels), reference
-    if not isinstance(reference, str):
-        raise ValueError(
-            f"requests[{index}]: {slot} must be a local path string or a "
-            "{content, format} object."
-        )
-    path = Path(reference).expanduser()
-    if not path.is_absolute():
-        path = base_dir / path
-    try:
-        payload = path.read_bytes()
-    except OSError as e:
-        raise ValueError(f"requests[{index}]: cannot read {slot} {str(path)!r}: {e}") from e
-    if not payload:
-        raise ValueError(f"requests[{index}]: {slot} {str(path)!r} is empty.")
-    encoded = base64.b64encode(payload).decode("ascii")
-    return str(path.resolve()), {"content": encoded, "format": "base64"}
+    items = reference if isinstance(reference, list) else [reference]
+    labels: list[str] = []
+    resolved: list[VisualGenBenchMediaRef] = []
+    for item in items:
+        if item.format != "path":
+            labels.append("<base64>" if item.format == "base64" else item.content)
+            resolved.append(item)
+            continue
+        path = Path(item.content).expanduser()
+        if not path.is_absolute():
+            path = base_dir / path
+        try:
+            with path.open("rb") as handle:
+                empty = not handle.read(1)
+        except OSError as e:
+            raise ValueError(f"requests[{index}]: cannot read {slot} {str(path)!r}: {e}") from e
+        if empty:
+            raise ValueError(f"requests[{index}]: {slot} {str(path)!r} is empty.")
+        labels.append(str(path.resolve()))
+        resolved.append(item.model_copy(update={"content": str(path.resolve())}))
+    return ", ".join(labels), resolved if isinstance(reference, list) else resolved[0]
 
 
 def _resize_requests(
@@ -591,15 +594,18 @@ def _resolve_request(
                 )
             action_file, extra["action"] = _resolve_action_file(action_file, base_dir, index)
 
-    located: dict[str, str] = {}
-    for slot in REFERENCE_KEYS:
-        if merged.get(slot) is not None:
-            located[slot], merged[slot] = _resolve_reference(slot, merged[slot], base_dir, index)
-
     try:
         request = model(**merged)
     except ValidationError as e:
         raise ValueError(f"requests[{index}]: invalid request:\n{e}") from e
+
+    located: dict[str, str] = {}
+    for slot in REFERENCE_KEYS:
+        reference = getattr(request, slot, None)
+        if reference is not None:
+            located[slot], resolved = _resolve_reference(slot, reference, base_dir, index)
+            setattr(request, slot, resolved)
+
     if (request.width is None) != (request.height is None):
         raise ValueError(
             f"requests[{index}]: resolved width={request.width!r} height={request.height!r}; the "
@@ -707,19 +713,19 @@ def load_workload(args: argparse.Namespace) -> VisualGenBenchWorkload:
 def _validate_edit_reference(workload: VisualGenBenchWorkload) -> None:
     """Reject an image_reference /v1/images/edits cannot take.
 
-    Its ``image`` is one base64 string, while the video route's slot also takes
-    a URL, a path, or a list of them -- a shape difference the field type, which
-    is the same ``Any`` on both, does not express.
+    Its ``image`` follows OpenAI's schema: one string with nowhere to declare a
+    wire form, so the server reads it as base64 and refuses a path or a URL.
+    The video route's slot takes those, and a list of them.
     """
     if workload.backend != "openai-image-edits":
         return
     for index, request in enumerate(workload.requests):
-        wire = request.image_reference
-        if not (isinstance(wire, dict) and wire.get("format") == "base64"):
+        reference = request.image_reference
+        if isinstance(reference, list) or reference.format != "base64":
             raise ValueError(
                 f"requests[{index}]: 'openai-image-edits' takes a single base64 image, so "
-                "image_reference must be a local path or one {content, format: base64} "
-                "object; /v1/images/edits does not accept the video backend's list form."
+                "image_reference must be one {content, format: base64} object; "
+                "/v1/images/edits accepts neither a path nor the video backend's list form."
             )
 
 
@@ -786,12 +792,18 @@ def build_payload(
     if backend == VIDEO_BACKEND:
         # Typed fields, so the modality is named rather than sniffed.
         for slot in REFERENCE_KEYS:
-            if getattr(request, slot) is not None:
-                payload[slot] = getattr(request, slot)
+            reference = getattr(request, slot)
+            if reference is None:
+                continue
+            payload[slot] = (
+                [item.model_dump(exclude_none=True) for item in reference]
+                if isinstance(reference, list)
+                else reference.model_dump(exclude_none=True)
+            )
         if output_format is not None:
             payload["format"] = output_format
     elif backend == "openai-image-edits":
-        payload["image"] = request.image_reference["content"]
+        payload["image"] = request.image_reference.content
         if output_format is not None:
             # ImageEditRequest's canonical name; ``format`` is only an alias.
             payload["output_format"] = output_format

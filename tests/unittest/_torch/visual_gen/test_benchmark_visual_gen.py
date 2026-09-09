@@ -131,7 +131,7 @@ def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
         "negative_prompt": "blurry",
         "extra_params": {"output_type": "video"},
     }
-    request = {"prompt": "a red fox", "image_reference": str(reference_file)}
+    request = {"prompt": "a red fox", "image_reference": {"content": str(reference_file)}}
     argv = ["--backend", "openai-videos", "--requests", json.dumps([request])]
     for key, value in fields.items():
         argv += [
@@ -228,15 +228,17 @@ def reference_file(tmp_path):
 
 
 @pytest.mark.parametrize("slot", REFERENCE_KEYS)
-def test_local_path_is_encoded_before_the_run(slot, reference_file):
-    """A bare path is the document's ergonomics; VisualGenParams rejects one itself."""
-    request = _workload(**{slot: str(reference_file)}).requests[0]
+def test_a_path_reference_goes_out_as_a_path(slot, reference_file):
+    """Reading it here would fold the transfer into the measured request."""
+    resolved = str(reference_file.resolve())
+    request = _workload(**{slot: {"content": str(reference_file)}}).requests[0]
 
-    assert getattr(request, slot) == {
-        "content": base64.b64encode(PNG).decode("ascii"),
-        "format": "base64",
+    assert getattr(request, slot).model_dump() == {
+        "content": resolved,
+        "format": "path",
+        "role": None,
     }
-    assert request._original[slot] == str(reference_file)
+    assert request._original[slot] == resolved
 
 
 @pytest.mark.parametrize("slot", REFERENCE_KEYS)
@@ -245,21 +247,38 @@ def test_typed_object_passes_through(slot):
     typed = {"content": "aGk=", "format": "base64", "role": "first_frame"}
     request = _workload(**{slot: typed}).requests[0]
 
-    assert getattr(request, slot) == typed
+    assert getattr(request, slot).model_dump() == typed
     assert request._original[slot] == "<base64>"
+
+
+def test_a_list_of_references_stays_a_list(reference_file):
+    """Dropping one would condition the generation on less than the document said."""
+    workload = _workload(
+        image_reference=[
+            {"content": str(reference_file), "role": "first_frame"},
+            {"content": "aGk=", "format": "base64", "role": "last_frame"},
+        ]
+    )
+    payload = build_payload(workload.requests[0], workload.backend, "m", "path", None)
+
+    assert [item["role"] for item in payload["image_reference"]] == ["first_frame", "last_frame"]
+    assert [item["format"] for item in payload["image_reference"]] == ["path", "base64"]
+    assert (
+        workload.requests[0]._original["image_reference"] == f"{reference_file.resolve()}, <base64>"
+    )
 
 
 @pytest.mark.parametrize("slot", REFERENCE_KEYS)
 def test_record_holds_the_locator_not_the_bytes(slot, reference_file):
     """A reference video is tens of MB; copying it per record dwarfs the result."""
-    workload = _workload(**{slot: str(reference_file)})
+    workload = _workload(**{slot: {"content": str(reference_file)}})
     request = workload.requests[0]
     payload = build_payload(request, workload.backend, "m", "path", None)
     record = _make_record(0, request, payload)
 
     assert slot not in record.params
-    assert getattr(record, slot) == str(reference_file)
-    assert payload[slot]["format"] == "base64"
+    assert getattr(record, slot) == str(reference_file.resolve())
+    assert payload[slot]["content"] == str(reference_file.resolve())
 
 
 @pytest.mark.parametrize(
@@ -301,7 +320,7 @@ def test_image_edits_requires_its_reference():
 
 def test_missing_reference_fails_before_the_run(tmp_path):
     with pytest.raises(ValueError, match="cannot read video_reference"):
-        _workload(video_reference=str(tmp_path / "absent.mp4"))
+        _workload(video_reference={"content": str(tmp_path / "absent.mp4")})
 
 
 @pytest.mark.parametrize(
