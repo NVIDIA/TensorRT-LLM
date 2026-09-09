@@ -107,8 +107,9 @@ def test_default_topology_is_unchanged():
     assert mlp.split_gate_up is False
     assert isinstance(mlp.gate_up_proj, torch.nn.Module)
     assert mlp.gate_up_proj.out_features == INTERMEDIATE * 2
-    assert not hasattr(mlp, "gate_proj")
-    assert not hasattr(mlp, "up_proj")
+    # Same attribute set in both topologies; the unused projections are None.
+    assert mlp.gate_proj is None
+    assert mlp.up_proj is None
 
     names = set(mlp.state_dict())
     assert any(n.startswith("gate_up_proj.") for n in names)
