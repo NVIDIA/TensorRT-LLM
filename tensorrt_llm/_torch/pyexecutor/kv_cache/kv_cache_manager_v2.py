@@ -4307,16 +4307,69 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return get_size_in_bytes(cache_size // quant_vector_size, scaling_factor_dtype)
 
+    def _get_buffer_views_for_invalid_value_check(
+        self, layer_idx: int, kv_layout: str = "NHD"
+    ) -> list[torch.Tensor]:
+        """Return contiguous tensor views covering the mapped KV pages to scan."""
+        if self.num_locality_domains <= 1:
+            return [self.get_buffers(layer_idx, kv_layout=kv_layout).flatten(0, 1)]
+
+        layer_offset = self.layer_offsets[layer_idx]
+        storage = self.impl._storage
+        lc_id = storage._layer_to_life_cycle_ids[LayerId(layer_offset)]
+        attr = storage.get_buffer_attr(LayerId(layer_offset), Role.KEY)
+        pg_idx = storage.get_pool_group_index(lc_id)
+        gpu_storage = storage._levels[GPU_LEVEL].storage
+        pool_group = gpu_storage._pool_groups[pg_idx]
+        slot_size = pool_group.slot_size[attr.pool_index]
+        element_per_container = 1
+        dtype = self.dtype
+        if dtype == DataType.NVFP4:
+            element_per_container = 2
+            dtype = torch.int8
+
+        views: list[torch.Tensor] = []
+        for locality_domain_id in range(self.num_locality_domains):
+            local_page_upper_bound = (
+                exact_div(slot_size, attr.size) * pool_group.num_slots(locality_domain_id)
+                - exact_div(attr.offset, attr.size)
+            ) * attr.expansion
+            if kv_layout == "NHD":
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.tokens_per_block,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.head_dim // element_per_container,
+                ]
+            else:
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.tokens_per_block,
+                    self.head_dim // element_per_container,
+                ]
+            addr_key = (
+                int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, locality_domain_id))
+                + attr.offset
+            )
+            views.append(
+                convert_to_torch_tensor(TensorWrapper(addr_key, dtype, shape)).flatten(0, 1)
+            )
+        return views
+
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
         pool_handled = set()
         for layer_id, layer_offset in self.layer_offsets.items():
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]
             if pool_id in pool_handled:
                 continue
-            buffer = self.get_buffers(layer_id)
-            if buffer is None:
-                continue
-            yield buffer
+            buffers = self._get_buffer_views_for_invalid_value_check(layer_id)
+            for buffer in buffers:
+                if buffer is None:
+                    continue
+                yield buffer
             pool_handled.add(pool_id)
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
