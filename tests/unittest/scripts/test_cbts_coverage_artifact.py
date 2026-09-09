@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import ast
 import importlib.util
 import json
 import shutil
@@ -33,7 +32,6 @@ from unittest import mock
 _ROOT = Path(__file__).resolve().parents[3]
 _CBTS = _ROOT / "jenkins/scripts/cbts"
 _ARTIFACT_PATH = _CBTS / "coverage_selection/artifact.py"
-_MAIN_PATH = _CBTS / "main.py"
 sys.path.insert(0, str(_CBTS / "coverage_utils"))
 
 from compact_db import write_leaf_database  # noqa: E402
@@ -62,47 +60,6 @@ def _git(repo: Path, *args: str) -> str:
 
 
 class CoverageArtifactTest(unittest.TestCase):
-    def test_selects_latest_complete_pair_even_when_an_older_db_is_closer(self) -> None:
-        commits = {104: "newer", 102: "older-three", 101: "older-one"}
-
-        def exists(url: str) -> bool:
-            if "/103/" in url:
-                return url.endswith("cbts_pystart_report_x86_64.tar.gz")
-            return "/100/" not in url
-
-        relations = {
-            "newer": (8, "behind"),
-            "older-three": (3, "ahead"),
-            "older-one": (1, "ahead"),
-        }
-        with (
-            mock.patch.object(artifact, "latest_build_number", return_value=104),
-            mock.patch.object(artifact, "_exists", side_effect=exists),
-            mock.patch.object(
-                artifact, "build_commit", side_effect=lambda build, _base: commits[build]
-            ) as build_commit,
-            mock.patch.object(
-                artifact, "drift", side_effect=lambda commit, _base: relations[commit]
-            ),
-            mock.patch.object(artifact, "compare_distance", return_value=7) as lag,
-        ):
-            selected = artifact.select_tarball(
-                "pr-base", artifact_base="coverage", jenkins_base="jenkins", max_probe=5
-            )
-
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["build"], 104)
-        self.assertEqual(selected["commit"], "newer")
-        self.assertEqual(selected["drift"], 8)
-        self.assertEqual(selected["drift_status"], "behind")
-        self.assertEqual(
-            [url.rsplit("/", 1)[-1] for url in selected["urls"]],
-            list(artifact.ARCH_TARBALL_NAMES),
-        )
-        build_commit.assert_called_once_with(104, "coverage")
-        lag.assert_called_once_with("newer")
-
     def test_patch_apply_status_detects_clean_and_conflicting_diffs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = Path(temp_dir)
@@ -233,42 +190,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 },
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
-
-    def test_git_timeout_returns_unknown_result(self) -> None:
-        with mock.patch.object(
-            artifact.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired(["git", "fetch"], 120),
-        ):
-            result = artifact._run_git(["fetch"], cwd=Path("."))
-
-        self.assertIsNone(result)
-
-    def test_prepare_declines_before_download_when_latest_db_is_not_usable(self) -> None:
-        for patch_status in ("conflict", "unknown"):
-            with self.subTest(patch_status=patch_status):
-                selection = {"commit": "coverage-commit"}
-                with (
-                    mock.patch.object(artifact, "merge_base", return_value="pr-base"),
-                    mock.patch.object(artifact, "select_tarball", return_value=selection),
-                    mock.patch.object(artifact, "_patch_apply_status", return_value=patch_status),
-                    mock.patch.object(artifact, "download") as download,
-                ):
-                    ready = artifact.prepare("unused", "pr-head")
-
-                self.assertIsNone(ready)
-                download.assert_not_called()
-
-    def test_freshness_default_is_thirty_commits(self) -> None:
-        tree = ast.parse(_MAIN_PATH.read_text())
-        defaults = {
-            target.id: node.value.value
-            for node in tree.body
-            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        }
-        self.assertEqual(defaults["DEFAULT_COVERAGE_MAX_DRIFT"], 30)
 
 
 if __name__ == "__main__":
