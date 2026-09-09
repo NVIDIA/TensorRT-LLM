@@ -54,11 +54,15 @@ def evidence() -> ModuleType:
     return _load_module()
 
 
-def _good_log(rank: int, count: int = 12) -> str:
+def _completion(rank: int, tensors: int = 291, size_gb: float = 2.2) -> str:
     return (
-        f"INFO some upstream chatter\nMatched {count}/{count} params\n"
-        f"Rank {rank}: transferred {count} params\n"
+        f"[Worker {rank}] INFO modelexpress.engines.trtllm: "
+        f"RDMA transfer complete: {tensors} tensors, {size_gb} GB\n"
     )
+
+
+def _good_log(tp_size: int) -> str:
+    return "INFO some TRT-LLM chatter\n" + "".join(_completion(rank) for rank in range(tp_size))
 
 
 def test_module_is_standard_library_only() -> None:
@@ -68,77 +72,59 @@ def test_module_is_standard_library_only() -> None:
 
 
 def test_complete_evidence_has_no_problems(evidence: ModuleType) -> None:
-    logs = {0: _good_log(0), 1: _good_log(1)}
-    assert evidence.check_receiver_transfer_logs(logs, tp_size=2) == []
+    assert evidence.check_receiver_log(_good_log(2), tp_size=2) == []
 
 
 def test_missing_rank_is_reported(evidence: ModuleType) -> None:
-    problems = evidence.check_receiver_transfer_logs({0: _good_log(0)}, tp_size=2)
-    assert problems == ["Expected receiver transfer logs for ranks [0, 1], got [0]"]
+    problems = evidence.check_receiver_log(_good_log(1), tp_size=2)
+    assert problems == ["Expected RDMA transfer completion for ranks [0, 1], got [0]"]
 
 
-def test_failure_marker_in_rank_log_or_stdout_is_reported(evidence: ModuleType) -> None:
-    logs = {0: _good_log(0) + "MX P2P unavailable (no source); loading from disk\n"}
-    problems = evidence.check_receiver_transfer_logs(logs, tp_size=1)
-    assert problems == ["MX receiver logs contain failure marker 'mx p2p unavailable'"]
-
-    problems = evidence.check_receiver_transfer_logs(
-        {0: _good_log(0)}, tp_size=1, extra_text="... Falling back to DISK ..."
-    )
-    assert problems == ["MX receiver logs contain failure marker 'falling back to disk'"]
+def test_no_completion_at_all_is_reported(evidence: ModuleType) -> None:
+    problems = evidence.check_receiver_log("MX loading unavailable: missing model\n", tp_size=1)
+    assert problems == ["Expected RDMA transfer completion for ranks [0], got []"]
 
 
-def test_incomplete_match_is_reported(evidence: ModuleType) -> None:
-    logs = {0: "Matched 10/12 params\nRank 0: transferred 10 params\n"}
-    problems = evidence.check_receiver_transfer_logs(logs, tp_size=1)
-    assert problems == ["MX receiver rank 0 reported incomplete parameter match 10/12"]
+@pytest.mark.parametrize(
+    ("line", "marker"),
+    [
+        ("... Falling back to DISK ...", "falling back to disk"),
+        (
+            "MX loading unavailable: missing model_config; "
+            "falling back to native Hugging Face checkpoint loading.",
+            "falling back to native hugging face checkpoint loading",
+        ),
+        ("MX P2P unavailable (no source)", "mx p2p unavailable"),
+    ],
+)
+def test_failure_marker_is_reported(evidence: ModuleType, line: str, marker: str) -> None:
+    problems = evidence.check_receiver_log(_good_log(1) + line + "\n", tp_size=1)
+    assert problems == [f"MX receiver log contains failure marker {marker!r}"]
 
 
-def test_duplicate_summaries_are_reported(evidence: ModuleType) -> None:
-    logs = {0: _good_log(0) + _good_log(0)}
-    problems = evidence.check_receiver_transfer_logs(logs, tp_size=1)
-    assert len(problems) == 2
-    assert problems[0].startswith("Expected one matched-parameter summary for rank 0")
-    assert problems[1].startswith("Expected one transfer summary for rank 0")
+def test_duplicate_completion_is_reported(evidence: ModuleType) -> None:
+    problems = evidence.check_receiver_log(_good_log(1) + _completion(0), tp_size=1)
+    assert len(problems) == 1
+    assert problems[0].startswith("Expected one RDMA transfer completion for rank 0, got [")
 
 
-def test_transfer_summary_must_match_rank_and_count(evidence: ModuleType) -> None:
-    wrong_rank = {0: "Matched 12/12 params\nRank 1: transferred 12 params\n"}
-    assert evidence.check_receiver_transfer_logs(wrong_rank, tp_size=1) == [
-        "MX receiver rank 0 matched 12 params but reported transfer summary [1, 12]"
+@pytest.mark.parametrize(
+    ("tensors", "size_gb"), [(0, 2.2), (291, 0.0)], ids=["no-tensors", "no-bytes"]
+)
+def test_empty_transfer_is_reported(evidence: ModuleType, tensors: int, size_gb: float) -> None:
+    problems = evidence.check_receiver_log(_completion(0, tensors, size_gb), tp_size=1)
+    assert problems == [
+        f"MX receiver rank 0 reported an empty transfer: {tensors} tensors, {size_gb} GB"
     ]
-    wrong_count = {0: "Matched 12/12 params\nRank 0: transferred 11 params\n"}
-    assert evidence.check_receiver_transfer_logs(wrong_count, tp_size=1) == [
-        "MX receiver rank 0 matched 12 params but reported transfer summary [0, 11]"
+
+
+def test_completions_are_parsed_case_insensitively_and_json_friendly(
+    evidence: ModuleType,
+) -> None:
+    text = _completion(1, tensors=3, size_gb=0.75).upper() + _completion(0)
+    transfers = evidence.rdma_transfers_by_rank(text)
+    assert sorted(transfers) == [0, 1]
+    assert [record.to_dict() for record in transfers[1]] == [
+        {"rank": 1, "tensor_count": 3, "size_gb": 0.75}
     ]
-
-
-def test_summaries_are_json_friendly(evidence: ModuleType) -> None:
-    summary = evidence.summarize_rank_log(1, _good_log(1, count=3))
-    assert summary.to_dict() == {
-        "rank": 1,
-        "matched_summaries": [[3, 3]],
-        "transfer_summaries": [[1, 3]],
-        "failure_markers": [],
-    }
-
-
-def test_transfer_logs_by_rank_validates_directory(evidence: ModuleType, tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="no non-empty receiver transfer logs"):
-        evidence.transfer_logs_by_rank(tmp_path)
-
-    (tmp_path / "rank0.log").write_text(_good_log(0), encoding="utf-8")
-    (tmp_path / "rank1.log").write_text(_good_log(1), encoding="utf-8")
-    assert sorted(evidence.transfer_logs_by_rank(tmp_path)) == [0, 1]
-    assert sorted(evidence.summarize_transfer_logs(tmp_path)) == [0, 1]
-
-    (tmp_path / "manifest.final.receiver.rank0.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="Unexpected ModelExpress receiver transfer log"):
-        evidence.transfer_logs_by_rank(tmp_path)
-
-
-def test_duplicate_rank_files_are_rejected(evidence: ModuleType, tmp_path: Path) -> None:
-    (tmp_path / "rank0.log").write_text(_good_log(0), encoding="utf-8")
-    (tmp_path / "RANK0.log").write_text(_good_log(0), encoding="utf-8")
-    with pytest.raises(ValueError, match="multiple receiver transfer logs for rank 0"):
-        evidence.transfer_logs_by_rank(tmp_path)
+    assert evidence.find_failure_markers(text) == ()

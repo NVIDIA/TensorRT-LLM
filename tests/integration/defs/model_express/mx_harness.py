@@ -47,9 +47,7 @@ from packaging.version import InvalidVersion, Version
 from defs.model_express.mx_evidence import (
     DONOR_PROCESS_FAILURE_MARKERS,
     DONOR_PROCESS_FAILURE_OVERLAP,
-    check_receiver_transfer_logs,
-    summarize_transfer_logs,
-    transfer_logs_by_rank,
+    check_receiver_log,
 )
 from defs.trt_test_alternative import cleanup_process_tree, popen
 from tensorrt_llm._torch.weight_sharing import (
@@ -62,7 +60,7 @@ from tensorrt_llm._torch.weight_sharing import (
 
 WORKER_PATH = Path(__file__).with_name("mx_e2e_worker.py")
 WEIGHT_SUFFIXES = frozenset({".bin", ".ckpt", ".gguf", ".pt", ".pth", ".safetensors"})
-MINIMUM_MODELEXPRESS_VERSION = Version("0.4.1")
+MINIMUM_MODELEXPRESS_VERSION = Version("0.5.1")
 _MODELEXPRESS_VERSION_PREFIX = "MODELEXPRESS_VERSION="
 MX_PREFLIGHT_SCRIPT = """
 import importlib.metadata as metadata
@@ -76,9 +74,7 @@ def module_exists(name):
         return False
 
 
-assert module_exists("modelexpress.trtllm_live_transfer") or module_exists(
-    "modelexpress.engines.trtllm"
-), "no TRT-LLM adapter is available"
+assert module_exists("modelexpress.engines.trtllm"), "no TRT-LLM adapter is available"
 from modelexpress.nixl_transfer import is_nixl_available
 
 assert is_nixl_available(), "NIXL is unavailable"
@@ -87,6 +83,9 @@ print(f"MODELEXPRESS_VERSION={metadata.version('modelexpress')}")
 
 ROLES = ("baseline", "donor", "receiver")
 MX_ROLES = ("donor", "receiver")
+# NIXL binds `MX_METADATA_PORT + device_id` in every rank. The donor and the
+# receiver share one network namespace in CI, so each side gets its own range.
+DEFAULT_MX_METADATA_PORT = 5555
 # The behavioral probe: every role must generate at least this many prompts and
 # exactly this many greedy tokens per prompt (see `mx_e2e_worker.py`).
 MIN_PROBE_PROMPTS = 8
@@ -350,14 +349,30 @@ def worker_command(
     return command
 
 
+def mx_metadata_ports(tp_size: int) -> tuple[int, int]:
+    """Return non-overlapping `(donor_port, receiver_port)` NIXL metadata base ports.
+
+    `MX_METADATA_PORT` overrides the donor's base port; the receiver's range
+    starts `tp_size` ports later so the two TP groups never collide.
+    """
+    donor_port = int(os.environ.get("MX_METADATA_PORT", str(DEFAULT_MX_METADATA_PORT)))
+    return donor_port, donor_port + tp_size
+
+
 def worker_environment(
-    gpu_ids: tuple[str, ...], transfer_log_dir: Path, manifest_dir: Path | None = None
+    gpu_ids: tuple[str, ...],
+    transfer_log_dir: Path,
+    manifest_dir: Path | None = None,
+    metadata_port: int | None = None,
 ) -> dict[str, str]:
     """Environment for a worker subprocess (set before any MPI/UCX import happens).
 
-    `manifest_dir` enables the per-rank weight manifests; the worker forwards it,
-    together with its role, to the executor rank processes through
-    `LLM(env_overrides=...)`.
+    `transfer_log_dir` is exported as `MX_TRANSFER_LOG_DIR`, which also raises
+    the `modelexpress` logger to INFO so the RDMA completion records reach the
+    worker log. `manifest_dir` enables the per-rank weight manifests; the
+    worker forwards it, together with its role, to the executor rank processes
+    through `LLM(env_overrides=...)`. `metadata_port` sets the NIXL base port
+    of an MX role (see `mx_metadata_ports`).
     """
     transfer_log_dir.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -382,6 +397,8 @@ def worker_environment(
         environment["MX_WEIGHT_MANIFEST_DIR"] = str(manifest_dir)
     else:
         environment.pop("MX_WEIGHT_MANIFEST_DIR", None)
+    if metadata_port is not None:
+        environment["MX_METADATA_PORT"] = str(metadata_port)
     return environment
 
 
@@ -531,33 +548,19 @@ def assert_probe_payload(
     return token_ids
 
 
-def assert_transfer_evidence(
-    case: MxE2ECase,
-    receiver_log_path: Path,
-    receiver_transfer_log_dir: Path,
-    receiver_payload: Mapping[str, object] | None = None,
-) -> None:
-    """Authoritative post-check that the receiver's weights arrived through MX P2P."""
+def assert_transfer_evidence(case: MxE2ECase, receiver_log_path: Path) -> None:
+    """Authoritative post-check that the receiver's weights arrived through MX P2P.
+
+    The receiver log must hold exactly one non-empty `RDMA transfer complete`
+    record per TP rank and no fallback marker (see `mx_evidence`).
+    """
     receiver_log = receiver_log_path.read_text(encoding="utf-8", errors="replace")
-    try:
-        transfer_logs = transfer_logs_by_rank(receiver_transfer_log_dir)
-    except ValueError as error:
-        pytest.fail(f"{error}\nReceiver log:\n{receiver_log}")
-    problems = check_receiver_transfer_logs(transfer_logs, case.tp_size, extra_text=receiver_log)
+    problems = check_receiver_log(receiver_log, case.tp_size)
     if problems:
         pytest.fail(
             "MX receiver transfer evidence is incomplete:\n- "
             + "\n- ".join(problems)
             + f"\nReceiver log tail:\n{log_tail(receiver_log_path)}"
-        )
-    if receiver_payload is not None and receiver_payload.get("transfer_evidence") is not None:
-        expected = {
-            str(rank): summary.to_dict()
-            for rank, summary in sorted(summarize_transfer_logs(receiver_transfer_log_dir).items())
-        }
-        assert receiver_payload["transfer_evidence"] == expected, (
-            "The receiver's self-reported transfer evidence differs from the harness summary: "
-            f"{receiver_payload['transfer_evidence']} vs {expected}"
         )
 
 
@@ -730,6 +733,7 @@ def archive_run_artifacts(
 
 
 __all__ = [
+    "DEFAULT_MX_METADATA_PORT",
     "FINAL_TIER_PAIRS",
     "MIN_PROBE_NEW_TOKENS",
     "MIN_PROBE_PROMPTS",
@@ -755,6 +759,7 @@ __all__ = [
     "donor_session",
     "load_payload",
     "log_tail",
+    "mx_metadata_ports",
     "qualification_required",
     "report_timings",
     "require_mx_environment",

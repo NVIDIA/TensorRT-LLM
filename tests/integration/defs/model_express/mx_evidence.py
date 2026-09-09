@@ -14,26 +14,26 @@
 # limitations under the License.
 """Shared ModelExpress transfer-evidence rules (standard library only).
 
-The MX receiver's per-rank transfer logs (`rank<N>.log` under
-`MX_TRANSFER_LOG_DIR`, written by the upstream `modelexpress` client) are the
-proof that weights arrived through P2P rather than through the silent disk
-fallback. This module holds the single definition of what those logs must
-contain so the pytest orchestrator and the worker script apply identical rules.
+The ModelExpress strategy chain logs one `[Worker <rank>] ... RDMA transfer
+complete: <n> tensors, <x> GB` record per receiver rank when the shard arrived
+through P2P. Those records in the receiver's log, together with the absence of
+any fallback marker, are the proof that the receiver did not silently load from
+disk. This module holds the single definition of that evidence so every MX
+qualification test applies identical rules.
 
 It is importable both as `defs.model_express.mx_evidence` from pytest and as a
-bare `mx_evidence` from `mx_e2e_worker.py`, which runs as a script with its own
-directory on `sys.path`. Keep it free of third-party imports.
+bare `mx_evidence` from a worker script whose directory is on `sys.path`. Keep
+it free of third-party imports.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 RECEIVER_FAILURE_MARKERS = (
     "falling back to disk",
+    "falling back to native hugging face checkpoint loading",
     "partial fallback",
     "size mismatch",
     "still missing",
@@ -43,10 +43,8 @@ RECEIVER_FAILURE_MARKERS = (
     "sourceidentity mismatch",
     "invalid sourceidentity",
 )
-MATCHED_PARAMS_PATTERN = re.compile(r"Matched\s+(\d+)/(\d+)\s+params", re.IGNORECASE)
-RANK_LOG_PATTERN = re.compile(r"rank(\d+)\.log", re.IGNORECASE)
-TRANSFERRED_PARAMS_PATTERN = re.compile(
-    r"Rank\s+(\d+):\s+transferred\s+(\d+)\s+params",
+RDMA_TRANSFER_PATTERN = re.compile(
+    r"\[Worker\s+(\d+)\].*?RDMA transfer complete:\s+(\d+)\s+tensors,\s+([0-9.]+)\s+GB",
     re.IGNORECASE,
 )
 DONOR_PROCESS_FAILURE_MARKERS = (
@@ -58,28 +56,21 @@ DONOR_PROCESS_FAILURE_OVERLAP = max(len(marker) for marker in DONOR_PROCESS_FAIL
 
 
 @dataclass(frozen=True)
-class RankTransferSummary:
-    """What one receiver rank log says about the transfer.
+class RdmaTransfer:
+    """One `RDMA transfer complete` record of a receiver rank.
 
     Attributes:
-        rank: Tensor-parallel rank the log belongs to.
-        matched_summaries: Every `Matched m/n params` occurrence as `(m, n)`.
-        transfer_summaries: Every `Rank r: transferred k params` occurrence as `(r, k)`.
-        failure_markers: Failure markers found in the log, lower-cased.
+        rank: Tensor-parallel rank that logged the record.
+        tensor_count: Number of tensors the rank received.
+        size_gb: Total bytes received, in GB as logged by ModelExpress.
     """
 
     rank: int
-    matched_summaries: tuple[tuple[int, int], ...]
-    transfer_summaries: tuple[tuple[int, int], ...]
-    failure_markers: tuple[str, ...]
+    tensor_count: int
+    size_gb: float
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "rank": self.rank,
-            "matched_summaries": [list(item) for item in self.matched_summaries],
-            "transfer_summaries": [list(item) for item in self.transfer_summaries],
-            "failure_markers": list(self.failure_markers),
-        }
+        return {"rank": self.rank, "tensor_count": self.tensor_count, "size_gb": self.size_gb}
 
 
 def find_failure_markers(text: str) -> tuple[str, ...]:
@@ -95,103 +86,34 @@ def find_failure_markers(text: str) -> tuple[str, ...]:
     return tuple(marker for marker in RECEIVER_FAILURE_MARKERS if marker in lowered)
 
 
-def transfer_logs_by_rank(transfer_log_dir: Path) -> dict[int, str]:
-    """Map rank to log text for the non-empty `rank<N>.log` files in a directory.
+def rdma_transfers_by_rank(text: str) -> dict[int, tuple[RdmaTransfer, ...]]:
+    """Group every `RDMA transfer complete` record in `text` by rank.
 
     Args:
-        transfer_log_dir: The receiver's `MX_TRANSFER_LOG_DIR`.
+        text: The receiver's log (stdout and stderr of every rank).
 
     Returns:
-        A dict from rank to the log text of that rank.
-
-    Raises:
-        ValueError: No non-empty log exists, a file does not follow the
-            `rank<N>.log` naming, or a rank appears twice.
+        A dict from rank to its records in log order; ranks without a record
+        are absent.
     """
-    log_files = tuple(path for path in Path(transfer_log_dir).rglob("*") if path.is_file())
-    logs = tuple(path for path in log_files if path.stat().st_size > 0)
-    if not logs:
-        entries = ", ".join(
-            f"{path.relative_to(transfer_log_dir)} ({path.stat().st_size} bytes)"
-            for path in log_files
+    transfers: dict[int, list[RdmaTransfer]] = {}
+    for rank, tensor_count, size_gb in RDMA_TRANSFER_PATTERN.findall(text):
+        transfers.setdefault(int(rank), []).append(
+            RdmaTransfer(rank=int(rank), tensor_count=int(tensor_count), size_gb=float(size_gb))
         )
-        raise ValueError(
-            "ModelExpress created no non-empty receiver transfer logs in "
-            f"{transfer_log_dir}; entries: {entries or '<none>'}"
-        )
-
-    logs_by_rank: dict[int, str] = {}
-    for path in sorted(logs):
-        match = RANK_LOG_PATTERN.fullmatch(path.name)
-        if match is None:
-            raise ValueError(f"Unexpected ModelExpress receiver transfer log: {path}")
-        rank = int(match.group(1))
-        if rank in logs_by_rank:
-            raise ValueError(
-                f"ModelExpress created multiple receiver transfer logs for rank {rank}"
-            )
-        logs_by_rank[rank] = path.read_text(encoding="utf-8", errors="replace")
-    return logs_by_rank
+    return {rank: tuple(records) for rank, records in transfers.items()}
 
 
-def summarize_rank_log(rank: int, text: str) -> RankTransferSummary:
-    """Extract the matched/transferred summaries and failure markers of one rank log.
-
-    Args:
-        rank: Rank the log belongs to.
-        text: Full text of that rank's log.
-
-    Returns:
-        The `RankTransferSummary` for the log.
-    """
-    matched = tuple(
-        (int(found), int(total)) for found, total in MATCHED_PARAMS_PATTERN.findall(text)
-    )
-    transferred = tuple(
-        (int(found_rank), int(count))
-        for found_rank, count in TRANSFERRED_PARAMS_PATTERN.findall(text)
-    )
-    return RankTransferSummary(
-        rank=rank,
-        matched_summaries=matched,
-        transfer_summaries=transferred,
-        failure_markers=find_failure_markers(text),
-    )
-
-
-def summarize_transfer_logs(transfer_log_dir: Path) -> dict[int, RankTransferSummary]:
-    """Summarize every rank log in `transfer_log_dir`.
-
-    Args:
-        transfer_log_dir: The receiver's `MX_TRANSFER_LOG_DIR`.
-
-    Returns:
-        A dict from rank to its `RankTransferSummary`.
-
-    Raises:
-        ValueError: Propagated from `transfer_logs_by_rank`.
-    """
-    return {
-        rank: summarize_rank_log(rank, text)
-        for rank, text in transfer_logs_by_rank(transfer_log_dir).items()
-    }
-
-
-def check_receiver_transfer_logs(
-    rank_logs: Mapping[int, str], tp_size: int, extra_text: str = ""
-) -> list[str]:
+def check_receiver_log(text: str, tp_size: int) -> list[str]:
     """Return the problems with a receiver's transfer evidence (empty means pass).
 
-    Rules: exactly ranks `0..tp_size-1` are present; neither the rank logs nor
-    `extra_text` contains a failure marker; each rank log has exactly one
-    `Matched m/n params` summary with `m == n > 0` and exactly one
-    `Rank r: transferred k params` summary with `r == rank` and `k == m`.
+    Rules: exactly ranks `0..tp_size-1` logged an RDMA completion; the log
+    contains no failure marker; each rank logged exactly one completion, and
+    that completion moved at least one tensor and more than zero GB.
 
     Args:
-        rank_logs: Rank to log text, as returned by `transfer_logs_by_rank`.
+        text: The receiver's log.
         tp_size: Expected number of ranks.
-        extra_text: Additional text to scan for failure markers, typically the
-            receiver's stdout.
 
     Returns:
         Human-readable problem descriptions; an empty list means the evidence
@@ -199,56 +121,40 @@ def check_receiver_transfer_logs(
     """
     problems: list[str] = []
     expected_ranks = set(range(tp_size))
-    if set(rank_logs) != expected_ranks:
+    transfers = rdma_transfers_by_rank(text)
+    if set(transfers) != expected_ranks:
         problems.append(
-            f"Expected receiver transfer logs for ranks {sorted(expected_ranks)}, "
-            f"got {sorted(rank_logs)}"
+            f"Expected RDMA transfer completion for ranks {sorted(expected_ranks)}, "
+            f"got {sorted(transfers)}"
         )
 
-    combined = extra_text + "\n" + "\n".join(rank_logs[rank] for rank in sorted(rank_logs))
-    for marker in find_failure_markers(combined):
-        problems.append(f"MX receiver logs contain failure marker {marker!r}")
+    for marker in find_failure_markers(text):
+        problems.append(f"MX receiver log contains failure marker {marker!r}")
 
-    for rank in sorted(expected_ranks & set(rank_logs)):
-        summary = summarize_rank_log(rank, rank_logs[rank])
-        matched: int | None = None
-        if len(summary.matched_summaries) != 1:
+    for rank in sorted(expected_ranks & set(transfers)):
+        records = transfers[rank]
+        if len(records) != 1:
             problems.append(
-                f"Expected one matched-parameter summary for rank {rank}, "
-                f"got {list(summary.matched_summaries)}"
+                f"Expected one RDMA transfer completion for rank {rank}, "
+                f"got {[record.to_dict() for record in records]}"
             )
-        else:
-            matched, total = summary.matched_summaries[0]
-            if not (matched == total > 0):
-                problems.append(
-                    f"MX receiver rank {rank} reported incomplete parameter match {matched}/{total}"
-                )
-        if len(summary.transfer_summaries) != 1:
+            continue
+        record = records[0]
+        if record.tensor_count <= 0 or record.size_gb <= 0:
             problems.append(
-                f"Expected one transfer summary for rank {rank}, "
-                f"got {list(summary.transfer_summaries)}"
+                f"MX receiver rank {rank} reported an empty transfer: "
+                f"{record.tensor_count} tensors, {record.size_gb} GB"
             )
-        else:
-            transferred_rank, transferred_count = summary.transfer_summaries[0]
-            if transferred_rank != rank or (matched is not None and transferred_count != matched):
-                problems.append(
-                    f"MX receiver rank {rank} matched {matched} params but reported transfer "
-                    f"summary {list(summary.transfer_summaries[0])}"
-                )
     return problems
 
 
 __all__ = [
     "DONOR_PROCESS_FAILURE_MARKERS",
     "DONOR_PROCESS_FAILURE_OVERLAP",
-    "MATCHED_PARAMS_PATTERN",
-    "RANK_LOG_PATTERN",
+    "RDMA_TRANSFER_PATTERN",
     "RECEIVER_FAILURE_MARKERS",
-    "TRANSFERRED_PARAMS_PATTERN",
-    "RankTransferSummary",
-    "check_receiver_transfer_logs",
+    "RdmaTransfer",
+    "check_receiver_log",
     "find_failure_markers",
-    "summarize_rank_log",
-    "summarize_transfer_logs",
-    "transfer_logs_by_rank",
+    "rdma_transfers_by_rank",
 ]
