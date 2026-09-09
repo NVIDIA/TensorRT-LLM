@@ -36,6 +36,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...locality_domain.runtime import LocalityDomainRuntime
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs)
@@ -242,6 +243,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         return min(self.max_seq_len, self.max_num_tokens)
 
+    # Locality domain two-kernel attention fields (backend-specific, not in interface.py)
+    locality_domain_enabled: bool = False
+    locality_domain_runtime: Optional[LocalityDomainRuntime] = None
+    locality_domain_num_ctx_tokens: Optional[List[int]] = None
+    locality_domain_num_gen_tokens: Optional[List[int]] = None
+    # Cumulative boundary arrays of length N+1 (N = num_locality_domains).
+    # locality_domain_ctx_req_splits[i]..[i+1] is the range of context requests
+    # belonging to locality domain i.
+    locality_domain_ctx_req_splits: Optional[List[int]] = None
+    locality_domain_gen_req_splits: Optional[List[int]] = None
+    locality_domain_ctx_token_splits: Optional[List[int]] = None
+    locality_domain_gen_token_splits: Optional[List[int]] = None
+    locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
+    draft_locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
+    # Per-locality-domain MLA generation state computed by mla_rope_generation.
+    locality_domain_mla_gen_state: Optional[List[Optional[dict]]] = None
+    # Pre-allocated per-locality-domain workspaces.
+    locality_domain_workspaces: Optional[List[torch.Tensor]] = None
+    locality_domain_cuda_graph_workspaces: Optional[List[torch.Tensor]] = None
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -387,6 +408,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
                 dtype=torch.int8,
             )
+
+        self._ensure_locality_domain_workspaces()
 
         if self.kv_cache_manager is not None:
             num_attention_op_pools = getattr(self.kv_cache_manager,
@@ -558,6 +581,26 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
+
+    def _ensure_locality_domain_workspaces(self) -> None:
+        if not self.locality_domain_enabled:
+            return
+
+        num_locality_domains = (self.kv_cache_manager.num_locality_domains
+                                if self.kv_cache_manager is not None else 2)
+        if (not self.is_cuda_graph
+                and (self.locality_domain_workspaces is None
+                     or len(self.locality_domain_workspaces) != num_locality_domains)):
+            self.locality_domain_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
+        if (self.locality_domain_cuda_graph_workspaces is None
+                or len(self.locality_domain_cuda_graph_workspaces) != num_locality_domains):
+            self.locality_domain_cuda_graph_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
 
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
