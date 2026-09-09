@@ -103,10 +103,8 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
         sequence_lengths=logical_lengths,
         scan_lengths=scan_lengths,
         next_n=2,
-        radix_ext_kwargs={
-            "radix_aux_indices": radix_indices,
-            "radix_aux_logits": radix_values,
-        },
+        radix_aux_indices=radix_indices,
+        radix_aux_logits=radix_values,
     )
     cute_dsl.assert_not_called()
     trtllm.assert_called_once()
@@ -354,10 +352,8 @@ def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:
         is_prefill=False,
         sequence_lengths=lengths,
         scan_lengths=lengths,
-        radix_ext_kwargs={
-            "radix_aux_indices": radix_indices,
-            "radix_aux_logits": radix_values,
-        },
+        radix_aux_indices=radix_indices,
+        radix_aux_logits=radix_values,
     )
 
     assert top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
@@ -397,10 +393,8 @@ def test_cuda_graph_workspace_isolated_from_eager_growth(monkeypatch) -> None:
             is_prefill=False,
             sequence_lengths=static_lengths,
             scan_lengths=static_lengths,
-            radix_ext_kwargs={
-                "radix_aux_indices": graph_indices,
-                "radix_aux_logits": graph_values,
-            },
+            radix_aux_indices=graph_indices,
+            radix_aux_logits=graph_values,
         )
 
     eager_scores = torch.randn(2, num_columns, device=device)
@@ -412,10 +406,8 @@ def test_cuda_graph_workspace_isolated_from_eager_growth(monkeypatch) -> None:
         is_prefill=False,
         sequence_lengths=eager_lengths,
         scan_lengths=eager_lengths,
-        radix_ext_kwargs={
-            "radix_aux_indices": torch.empty(2, 10, top_k, dtype=torch.int32, device=device),
-            "radix_aux_logits": torch.empty(2, 10, top_k, device=device),
-        },
+        radix_aux_indices=torch.empty(2, 10, top_k, dtype=torch.int32, device=device),
+        radix_aux_logits=torch.empty(2, 10, top_k, device=device),
     )
 
     assert graph_indices.data_ptr() == graph_pointer

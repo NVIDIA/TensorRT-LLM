@@ -87,7 +87,8 @@ class TopK(nn.Module):
         next_n: int = 1,
         max_seq_len: int | None = None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
-        radix_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
+        radix_aux_indices: torch.Tensor | None = None,
+        radix_aux_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -109,8 +110,10 @@ class TopK(nn.Module):
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
                 shape ``[num_requests]`` on the same device.
-            radix_ext_kwargs: Caller-owned ``radix_aux_indices`` and
-                ``radix_aux_logits`` for native CUDA Radix split work.
+            radix_aux_indices: Caller-owned int32 workspace for native CUDA
+                Radix split work.
+            radix_aux_logits: Caller-owned float32 workspace for native CUDA
+                Radix split work.
 
         Returns:
             ``output_indices`` after the selected implementation writes it.
@@ -128,7 +131,8 @@ class TopK(nn.Module):
             next_n,
             max_seq_len,
             gvr_ext_kwargs,
-            radix_ext_kwargs,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_prefill(
@@ -178,7 +182,8 @@ class TopK(nn.Module):
         next_n: int,
         max_seq_len: int | None,
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None,
-        radix_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -190,7 +195,8 @@ class TopK(nn.Module):
                 output_indices,
                 next_n,
                 max_seq_len=max_seq_len,
-                radix_ext_kwargs=radix_ext_kwargs,
+                radix_aux_indices=radix_aux_indices,
+                radix_aux_logits=radix_aux_logits,
                 **(gvr_ext_kwargs or {}),
             )
 
@@ -200,7 +206,8 @@ class TopK(nn.Module):
             scan_lengths,
             output_indices,
             next_n,
-            radix_ext_kwargs,
+            radix_aux_indices,
+            radix_aux_logits,
         )
 
     def _forward_decode_radix(
@@ -210,7 +217,8 @@ class TopK(nn.Module):
         scan_lengths: torch.Tensor,
         output_indices: torch.Tensor,
         next_n: int,
-        radix_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         use_cute_dsl = self.decode_implementation == TopKImplementation.CUTE_DSL_RADIX and not (
             self.compress_ratio > 1 and next_n > 1
@@ -225,7 +233,9 @@ class TopK(nn.Module):
             )
             return output_indices
 
-        radix_indices, radix_values = self._get_radix_workspace(scores, radix_ext_kwargs)
+        radix_indices, radix_values = self._get_radix_workspace(
+            scores, radix_aux_indices, radix_aux_logits
+        )
         torch.ops.trtllm.indexer_topk_decode(
             scores,
             sequence_lengths,
@@ -241,23 +251,22 @@ class TopK(nn.Module):
     def _get_radix_workspace(
         self,
         scores: torch.Tensor,
-        radix_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if scores.dtype != torch.float32:
             # The C++ bf16/fp16 entry has no split-work tier or aux-buffer
             # arguments and rejects widths that would require split work.
             return None, None
 
-        if radix_ext_kwargs is None:
-            raise ValueError("Native CUDA Radix TopK requires radix_ext_kwargs")
-        radix_indices = radix_ext_kwargs.get("radix_aux_indices")
-        radix_values = radix_ext_kwargs.get("radix_aux_logits")
-        if radix_indices is None or radix_values is None:
-            raise ValueError("radix_ext_kwargs must contain radix_aux_indices and radix_aux_logits")
+        if radix_aux_indices is None or radix_aux_logits is None:
+            raise ValueError(
+                "Native CUDA Radix TopK requires radix_aux_indices and radix_aux_logits"
+            )
         num_rows = scores.shape[0]
         return (
-            radix_indices[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
-            radix_values[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
+            radix_aux_indices[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
+            radix_aux_logits[:num_rows, :_MAX_RADIX_BLOCKS_PER_ROW, : self.top_k],
         )
 
     def _forward_decode_gvr(
@@ -267,7 +276,8 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         next_n: int,
         max_seq_len: int | None,
-        radix_ext_kwargs: dict[str, torch.Tensor | None] | None,
+        radix_aux_indices: torch.Tensor | None,
+        radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -321,7 +331,9 @@ class TopK(nn.Module):
                 "falling back to the CUDA insertion/radix Top-K path.",
                 key="selfsampling_topk_fallthrough",
             )
-            radix_indices, radix_values = self._get_radix_workspace(scores, radix_ext_kwargs)
+            radix_indices, radix_values = self._get_radix_workspace(
+                scores, radix_aux_indices, radix_aux_logits
+            )
             torch.ops.trtllm.indexer_topk_decode(
                 scores,
                 sequence_lengths,

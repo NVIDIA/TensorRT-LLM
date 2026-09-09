@@ -1873,10 +1873,6 @@ class Indexer(nn.Module):
             )
             assert metadata.radix_aux_indices is not None
             assert metadata.radix_aux_logits is not None
-            radix_ext_kwargs = {
-                "radix_aux_indices": metadata.radix_aux_indices,
-                "radix_aux_logits": metadata.radix_aux_logits,
-            }
             self.top_k(
                 logits_decode,
                 topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
@@ -1886,7 +1882,8 @@ class Indexer(nn.Module):
                 next_n=next_n,
                 max_seq_len=indexer_max_seq_len,
                 gvr_ext_kwargs=gvr_ext_kwargs,
-                radix_ext_kwargs=radix_ext_kwargs,
+                radix_aux_indices=metadata.radix_aux_indices,
+                radix_aux_logits=metadata.radix_aux_logits,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
