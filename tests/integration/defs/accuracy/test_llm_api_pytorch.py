@@ -54,6 +54,7 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length,
                             assert_acceptance_length_for_llm,
+                            assert_kv_cache_reuse_for_llm,
                             compute_acceptance_length)
 
 
@@ -2447,6 +2448,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             elif quant_dtype == "nvfp4":
                 assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            if (quant_dtype == "none" and kv_cache_reuse and overlap_scheduler):
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 255)
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -6049,6 +6053,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/120B-MXFP4"
+
+            # One active configuration is sufficient to verify a direct hit;
+            # the remaining variants retain their existing accuracy coverage.
+            if not v2_kv_cache and one_model:
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 255)
 
             # GSM8K
             task = GSM8K(model_name)

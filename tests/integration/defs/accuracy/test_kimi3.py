@@ -39,6 +39,7 @@ from .accuracy_core import (
     ForceTokenLogitsProcessor,
     LlmapiAccuracyTestHarness,
     assert_acceptance_length_for_llm,
+    assert_kv_cache_reuse_for_llm,
 )
 
 
@@ -146,7 +147,9 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 self._assert_logits_processor(llm)
                 self._assert_guided_decoding(llm)
             elif mode == "reuse":
-                self._assert_kv_cache_reuse(llm)
+                # Sequential requests on the idle default router are assigned
+                # to the same ADP rank, so explicit rank pinning is unnecessary.
+                assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 510 + [43])
 
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
@@ -238,39 +241,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 )
                 == 1
             )
-
-    @staticmethod
-    def _assert_kv_cache_reuse(llm: LLM) -> None:
-        prompt_token_ids = [1] + [42] * 510 + [43]
-        output_length = 8
-        sampling_params = SamplingParams(
-            max_tokens=output_length,
-            temperature=0,
-            end_id=-1,
-            return_perf_metrics=True,
-        )
-        # Sequential requests on an otherwise idle default router are assigned
-        # to the same ADP rank, so explicit rank pinning is unnecessary here.
-
-        cold_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-        warm_output = llm.generate(
-            [prompt_token_ids],
-            sampling_params=sampling_params,
-            use_tqdm=False,
-        )[0].outputs[0]
-
-        cold_metrics = cold_output.request_perf_metrics
-        warm_metrics = warm_output.request_perf_metrics
-        assert cold_metrics is not None
-        assert warm_metrics is not None
-        assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
-        assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
-        assert len(cold_output.token_ids) == output_length
-        assert warm_output.token_ids == cold_output.token_ids
 
     @staticmethod
     def _assert_logits_processor(llm: LLM) -> None:
