@@ -180,3 +180,33 @@ def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
 
     sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=1, end=5)
     assert sliced == [tokens[1], *mm_tokens]
+
+
+def test_augment_tokens_for_block_reuse_reports_missing_vocab_size():
+    """https://github.com/NVIDIA/TensorRT-LLM/issues/18849: a manager built
+    without vocab_size must name the missing construction argument instead of
+    reaching the cache-key binding with a None id_offset."""
+    tokens = list(range(8))
+    manager = _make_manager(None)
+    req = _make_request(
+        tokens,
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[2],
+        multimodal_lengths=[3],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
+    )
+
+    with pytest.raises(RuntimeError, match="without vocab_size"):
+        KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req)
+
+
+def test_augment_tokens_for_block_reuse_ignores_missing_vocab_size_for_text():
+    """Text-only requests never build multimodal cache keys, so they must keep
+    working on a manager that has no vocab_size."""
+    tokens = list(range(8))
+    manager = _make_manager(None)
+    req = _make_request(tokens)
+
+    assert KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req) == tokens

@@ -2325,6 +2325,22 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _resolve_vocab_size(config) -> Optional[int]:
+    """Vocabulary size the V2 manager needs to build multimodal cache keys.
+
+    ``KVCacheManagerV2`` reserves token ids at and above ``vocab_size`` for the
+    synthetic tokens that carry a multimodal item's content digest into the
+    radix tree, so every V2 manager needs the value before the first image
+    request; text-only traffic never reads it.  Composite VLM configs keep the
+    field on the nested ``text_config``, so fall back there rather than
+    reading ``config.vocab_size`` directly.
+    """
+    vocab_size = getattr(config, "vocab_size", None)
+    if vocab_size is not None:
+        return vocab_size
+    return getattr(getattr(config, "text_config", None), "vocab_size", None)
+
+
 def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
                                     is_draft: bool):
     """Align target-only PLE state with a target/draft cache layout."""
@@ -2511,6 +2527,10 @@ def _create_kv_cache_manager(
             draft_config_for_kv)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
+        # Set here rather than per branch: the hybrid-Mamba branches below used
+        # to omit vocab_size, and a manager built without it fails inside the
+        # first multimodal request instead of at start-up.
+        manager_extra_kwargs["vocab_size"] = _resolve_vocab_size(config)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
@@ -2616,7 +2636,6 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            vocab_size=config.vocab_size,
             max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
@@ -2900,7 +2919,6 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            vocab_size=config.vocab_size,
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,

@@ -921,7 +921,7 @@ class KVCacheManagerV2(BaseResourceManager):
         dtype: DataType = DataType.HALF,
         spec_config=None,
         layer_mask: Optional[List[bool]] = None,
-        vocab_size: int = None,
+        vocab_size: Optional[int] = None,
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfigCpp] = None,
         max_beam_width: int = 1,
@@ -3095,6 +3095,16 @@ class KVCacheManagerV2(BaseResourceManager):
             or req.multimodal_lengths is None
         ):
             return tokens[chunk_start:chunk_end] if is_sliced else tokens
+
+        if self.vocab_size is None:
+            # Only multimodal requests read vocab_size, so a manager built
+            # without it serves text traffic indefinitely and then fails on the
+            # first image. Name the missing argument here; the alternative is a
+            # binding TypeError reporting a NoneType id_offset.
+            raise RuntimeError(
+                f"{type(self).__name__} was constructed without vocab_size, "
+                "which is required to build multimodal block-reuse cache keys"
+            )
 
         # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
         # which flows through the per-element binding fallback. tokens may be a zero-copy numpy

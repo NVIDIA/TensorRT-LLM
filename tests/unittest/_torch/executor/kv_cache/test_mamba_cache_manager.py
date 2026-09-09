@@ -544,6 +544,93 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert not any("RecordingV2Manager was selected" in log for log in fallback_logs)
 
 
+def _capture_qwen3_hybrid_manager_ctor(monkeypatch, manager_base, pretrained_config):
+    """Route a Qwen3 hybrid config through _create_kv_cache_manager and capture
+    the constructor kwargs."""
+    captured = {}
+
+    class RecordingManager(manager_base):
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.get_sm_version", lambda: 90)
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=issubclass(manager_base, KVCacheManagerV2)
+        ),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=256,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=SimpleNamespace(pretrained_config=pretrained_config, quant_config=None),
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+    return captured
+
+
+def _qwen3_hybrid_pretrained_config(*, vocab_size=None, text_vocab_size=None):
+    config = SimpleNamespace(
+        architectures=["Qwen3_5ForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+        linear_key_head_dim=8,
+        linear_conv_kernel_dim=4,
+        linear_num_value_heads=4,
+        linear_num_key_heads=1,
+        linear_value_head_dim=8,
+        num_key_value_heads=2,
+        num_attention_heads=4,
+        hidden_size=32,
+        torch_dtype=torch.bfloat16,
+    )
+    if vocab_size is not None:
+        config.vocab_size = vocab_size
+    if text_vocab_size is not None:
+        config.text_config = SimpleNamespace(vocab_size=text_vocab_size)
+    return config
+
+
+def test_hybrid_v2_manager_receives_vocab_size(monkeypatch):
+    """https://github.com/NVIDIA/TensorRT-LLM/issues/18849: the hybrid-Mamba
+    branch omitted vocab_size, so the V2 manager could not build multimodal
+    cache keys and the first image request killed the executor."""
+    kwargs = _capture_qwen3_hybrid_manager_ctor(
+        monkeypatch,
+        MambaHybridCacheManagerV2,
+        _qwen3_hybrid_pretrained_config(vocab_size=151936),
+    )
+    assert kwargs["vocab_size"] == 151936
+
+
+def test_hybrid_v2_manager_reads_vocab_size_from_text_config(monkeypatch):
+    """Composite VLM configs keep vocab_size on the nested text_config."""
+    kwargs = _capture_qwen3_hybrid_manager_ctor(
+        monkeypatch,
+        MambaHybridCacheManagerV2,
+        _qwen3_hybrid_pretrained_config(text_vocab_size=151936),
+    )
+    assert kwargs["vocab_size"] == 151936
+
+
+def test_hybrid_v1_manager_does_not_receive_vocab_size(monkeypatch):
+    """vocab_size is a V2-only parameter; MixedMambaHybridCacheManager has no
+    **kwargs, so passing it there would be a TypeError at start-up."""
+    kwargs = _capture_qwen3_hybrid_manager_ctor(
+        monkeypatch,
+        MixedMambaHybridCacheManager,
+        _qwen3_hybrid_pretrained_config(vocab_size=151936),
+    )
+    assert "vocab_size" not in kwargs
+
+
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
     monkeypatch,
 ):
