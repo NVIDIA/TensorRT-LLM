@@ -361,61 +361,6 @@ def get_qwen3_hybrid_num_attention_layers(config):
     return sum(layer_mask)
 
 
-def get_qwen4_exp_ple_layer_mask(
-        config: transformers.PretrainedConfig) -> list[bool]:
-    """Return the decoder-layer mask for the one-based PLE layer IDs."""
-    ple_layer_ids = list(getattr(config, "ple_layer_ids", None) or [])
-    invalid_ids = [
-        layer_id for layer_id in ple_layer_ids
-        if not isinstance(layer_id, int) or isinstance(layer_id, bool)
-        or not 1 <= layer_id <= config.num_hidden_layers
-    ]
-    if invalid_ids:
-        raise ValueError(
-            "ple_layer_ids must contain one-based decoder-layer IDs in "
-            f"[1, {config.num_hidden_layers}], got {invalid_ids}")
-    if len(ple_layer_ids) != len(set(ple_layer_ids)):
-        raise ValueError("ple_layer_ids must not contain duplicate layer IDs")
-    if len(ple_layer_ids) > 1:
-        # Qwen4ExpModel._prepare_ple_state currently resolves one shared state
-        # tuple. Supporting multiple PLE layers requires separate per-layer
-        # metadata and pools; removing only this guard would silently reuse state.
-        raise ValueError(
-            "Qwen4-Exp currently supports at most one PLE decoder layer, "
-            f"got ple_layer_ids={ple_layer_ids}")
-    ple_layer_id_set = set(ple_layer_ids)
-    return [(layer_id + 1) in ple_layer_id_set
-            for layer_id in range(config.num_hidden_layers)]
-
-
-@dataclasses.dataclass
-class Qwen4ExpPLECacheParams:
-    """Shapes and dtypes for PLE recurrent-state pools."""
-
-    ple_layer_mask: list[bool]
-    num_ple_layers: int
-    short_conv_channels: int
-    short_conv_state_len: int
-    ngram_context_len: int
-    conv_state_dtype: torch.dtype
-
-
-def extract_qwen4_exp_ple_cache_params(
-        config: transformers.PretrainedConfig) -> Qwen4ExpPLECacheParams:
-    """Derive PLE recurrent-state pool dimensions from the model config."""
-    ple_layer_mask = get_qwen4_exp_ple_layer_mask(config)
-    hc_count = getattr(config, "hc_count", 1) or 1
-    return Qwen4ExpPLECacheParams(
-        ple_layer_mask=ple_layer_mask,
-        num_ple_layers=sum(ple_layer_mask),
-        short_conv_channels=hc_count * config.hidden_size,
-        short_conv_state_len=(config.ple_conv_kernel_size - 1) *
-        config.ngram_size,
-        ngram_context_len=config.ngram_size - 1,
-        conv_state_dtype=resolve_hf_torch_dtype(config) or torch.bfloat16,
-    )
-
-
 @dataclasses.dataclass
 class MambaKVCacheParams:
     """Normalized mamba-related inputs for kv_cache_manager_cls.

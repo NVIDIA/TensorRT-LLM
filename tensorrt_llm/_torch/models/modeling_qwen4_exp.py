@@ -44,8 +44,13 @@ from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
+from ..modules.qwen4_exp.ple_cache import (
+    PLE_CACHE_EXTENSION_KEY,
+    Qwen4ExpPLECacheExtension,
+    get_qwen4_exp_ple_layer_mask,
+)
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_exp_ple_layer_mask
+from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
@@ -468,12 +473,12 @@ class Qwen4ExpModel(DecoderModel):
         # Fallback per-slot PLE recurrent state (short-conv state + n-gram
         # context) for harnesses WITHOUT a cache manager. At checkpoint scale the
         # authoritative pools are owned by **KVCacheManagerV2** and read via
-        # ``kv_cache_manager.ple_layer_cache``; these model-owned
+        # the model-owned PLE cache extension; these model-owned
         # tensors are only the no-cache-manager fallback (unit tests). Lazily
         # allocated to the cache slot count and carried in place across the
         # prefill->decode boundary, mirroring the GDN conv/ssm per-slot pools and
         # indexed by the SAME mamba ``state_indices`` (see ``_prepare_ple_state``).
-        # Shapes match ``config_utils.extract_qwen4_exp_ple_cache_params``
+        # Shapes match ``qwen4_exp.extract_qwen4_exp_ple_cache_params``
         # (conv_state_shape / ngram_context_len).
         self._ple_conv_state: Optional[torch.Tensor] = None
         self._ple_ngram_context: Optional[torch.Tensor] = None
@@ -551,7 +556,7 @@ class Qwen4ExpModel(DecoderModel):
         boundary, indexed by the SAME per-sequence mamba ``state_indices`` as the
         GDN conv/ssm state, and are advanced in place by :meth:`Qwen4ExpPLE.forward`.
         At checkpoint scale the pools are owned by **KVCacheManagerV2** and read via
-        ``attn_metadata.kv_cache_manager.ple_layer_cache``; a
+        ``attn_metadata.kv_cache_manager``'s typed PLE extension; a
         harness without a cache manager falls back to persistent model-owned pools
         (``_ple_conv_state`` / ``_ple_ngram_context``). Both paths are **host-sync
         free** on the decode path (no ``int(state_indices.max().item())``) so the
@@ -699,8 +704,8 @@ class Qwen4ExpModel(DecoderModel):
         """Resolve the PLE (short-conv-state, n-gram-context) pools for a forward.
 
         Priority (all host-sync-free):
-          1. **KVCacheManagerV2-owned pools** (serving runtime) —
-             exposed via ``attn_metadata.kv_cache_manager.ple_layer_cache``.
+          1. **KVCacheManagerV2-owned pools** (serving runtime) — exposed by
+             ``Qwen4ExpPLECacheExtension``.
           2. **Explicitly-provided pools** — ``attn_metadata.qwen4_exp_ple_state``
              set by a unit-test harness that owns its own state tensors.
           3. **Persistent model-owned pools** — no cache manager present; sized to
@@ -709,9 +714,13 @@ class Qwen4ExpModel(DecoderModel):
         """
         kv_cache_manager = attn_metadata.kv_cache_manager
         if kv_cache_manager is not None:
-            if not hasattr(kv_cache_manager, "ple_layer_cache"):
+            get_extension = getattr(kv_cache_manager, "get_aux_cache_extension", None)
+            extension = (
+                get_extension(PLE_CACHE_EXTENSION_KEY) if get_extension is not None else None
+            )
+            if not isinstance(extension, Qwen4ExpPLECacheExtension):
                 raise RuntimeError("Qwen4-Exp PLE requires cache-manager-owned recurrent pools")
-            pools = kv_cache_manager.ple_layer_cache(ple_layer_idx)
+            pools = extension.get_layer_cache(ple_layer_idx)
             if pools is None:
                 raise RuntimeError(f"PLE cache pools are unavailable for layer {ple_layer_idx}")
             conv_state, ngram_context = pools

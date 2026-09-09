@@ -379,9 +379,9 @@ def test_text_model_is_eligible_for_online_eplb() -> None:
 
 def test_hybrid_and_ple_layout_is_derived_from_config() -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
+    from tensorrt_llm._torch.modules.qwen4_exp.ple_cache import extract_qwen4_exp_ple_cache_params
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         extract_mamba_kv_cache_params,
-        extract_qwen4_exp_ple_cache_params,
         get_qwen3_hybrid_layer_types,
     )
 
@@ -395,7 +395,7 @@ def test_hybrid_and_ple_layout_is_derived_from_config() -> None:
     mamba = extract_mamba_kv_cache_params(config)
     assert mamba.num_mamba_layers == 3
     ple = extract_qwen4_exp_ple_cache_params(config)
-    assert ple.ple_layer_mask == [False, True, False, False]
+    assert ple.ple_layer_mask == (False, True, False, False)
     assert ple.short_conv_channels == 4 * 128
     assert ple.short_conv_state_len == 9
     assert ple.ngram_context_len == 2
@@ -404,7 +404,7 @@ def test_hybrid_and_ple_layout_is_derived_from_config() -> None:
 @pytest.mark.parametrize("ple_layer_ids", [[2, 2], [0], [5], [True], [[2]], [1, 2]])
 def test_ple_layer_ids_reject_ambiguous_or_out_of_range_values(ple_layer_ids) -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
-    from tensorrt_llm._torch.pyexecutor.config_utils import get_qwen4_exp_ple_layer_mask
+    from tensorrt_llm._torch.modules.qwen4_exp.ple_cache import get_qwen4_exp_ple_layer_mask
 
     fields = _text_config_dict()
     fields["ple_layer_ids"] = ple_layer_ids
@@ -416,23 +416,23 @@ def test_ple_layer_ids_reject_ambiguous_or_out_of_range_values(ple_layer_ids) ->
 
 def test_ple_cache_layout_excludes_separate_mtp_draft() -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
-    from tensorrt_llm._torch.pyexecutor._util import _get_qwen4_exp_ple_cache_params
+    from tensorrt_llm._torch.modules.qwen4_exp.ple_cache import build_qwen4_exp_ple_cache_extension
 
     config = Qwen4ExpTextConfig.from_dict(_text_config_dict())
 
-    target = _get_qwen4_exp_ple_cache_params(config, total_layers=4, is_draft=False)
-    unified = _get_qwen4_exp_ple_cache_params(config, total_layers=5, is_draft=False)
-    draft = _get_qwen4_exp_ple_cache_params(config, total_layers=5, is_draft=True)
+    target = build_qwen4_exp_ple_cache_extension(config, total_layers=4, is_draft=False)
+    unified = build_qwen4_exp_ple_cache_extension(config, total_layers=5, is_draft=False)
+    draft = build_qwen4_exp_ple_cache_extension(config, total_layers=5, is_draft=True)
 
-    assert target.ple_layer_mask == [False, True, False, False]
-    assert unified.ple_layer_mask == [False, True, False, False, False]
-    assert unified.num_ple_layers == 1
+    assert target.params.ple_layer_mask == (False, True, False, False)
+    assert unified.params.ple_layer_mask == (False, True, False, False, False)
+    assert unified.params.num_ple_layers == 1
     assert draft is None
 
 
 def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
-    from tensorrt_llm._torch.pyexecutor.config_utils import extract_qwen4_exp_ple_cache_params
+    from tensorrt_llm._torch.modules.qwen4_exp.ple_cache import extract_qwen4_exp_ple_cache_params
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
     )
@@ -464,50 +464,85 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
     assert with_ple[1] - without_ple[1] == 3 * bytes_per_slot
 
 
-def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-        MambaHybridCacheManagerV2,
-        MambaRole,
+def test_ple_states_use_v2_lifecycle_buffers() -> None:
+    from tensorrt_llm._torch.modules.qwen4_exp.ple_cache import (
+        PLE_CACHE_EXTENSION_KEY,
+        PLE_CONV_STATE,
+        PLE_NGRAM_CONTEXT,
+        Qwen4ExpPLECacheExtension,
+        Qwen4ExpPLECacheParams,
     )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaCacheBuildContext
+    from tensorrt_llm.mapping import Mapping
 
     ngram_context = torch.full((12, 2), 11, dtype=torch.int64)
     conv_state = torch.zeros((12, 16, 6), dtype=torch.bfloat16)
     requested = []
 
     def fake_get_state_buffer(
-        self: object,
         local_layer_idx: int,
-        role: MambaRole,
+        role: object,
         dtype: torch.dtype,
         state_shape: list[int],
     ) -> torch.Tensor:
-        del self
         requested.append((local_layer_idx, role, dtype, state_shape))
-        if role == MambaRole.PLE_NGRAM_CONTEXT:
+        if role == PLE_NGRAM_CONTEXT:
             return ngram_context
-        if role == MambaRole.PLE_CONV_STATE:
+        if role == PLE_CONV_STATE:
             return conv_state
         raise AssertionError(f"unexpected role {role}")
 
-    monkeypatch.setattr(MambaHybridCacheManagerV2, "_get_state_buffer", fake_get_state_buffer)
-    manager = object.__new__(MambaHybridCacheManagerV2)
-    manager._ple_layer_ids = [1]
-    manager._ple_ngram_context_shape = [2]
-    manager._ple_conv_state_shape = [16, 6]
-    manager._ple_conv_state_dtype = torch.bfloat16
-    manager._ple_ngram_contexts = {}
-    manager._ple_conv_states = {}
-    manager.layer_offsets = {1: 0}
+    manager = SimpleNamespace(
+        layer_offsets={1: 0},
+        _get_state_buffer=fake_get_state_buffer,
+    )
+    extension = Qwen4ExpPLECacheExtension(
+        Qwen4ExpPLECacheParams(
+            ple_layer_mask=(False, True),
+            num_ple_layers=1,
+            short_conv_channels=16,
+            short_conv_state_len=6,
+            ngram_context_len=2,
+            eos_token_id=11,
+            conv_state_dtype=torch.bfloat16,
+        )
+    )
+    context = MambaCacheBuildContext(
+        layer_mask=(True, True),
+        pp_layers=(0, 1),
+        mamba_pp_layers=(0, 1),
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        conv_state_shape=(1, 1),
+        ssm_state_shape=(1, 1, 1),
+        conv_state_dtype=torch.bfloat16,
+        ssm_state_dtype=torch.bfloat16,
+        n_groups_per_rank=1,
+        max_batch_size=4,
+        state_index_capacity=4,
+        slot_capacity=12,
+        spec_config=None,
+        backend="v2",
+    )
+    extension.validate(context)
+    extension.bind(context, manager)
 
-    manager._setup_ple_states(num_state_slots=12)
-
-    actual_conv, actual_context = manager.ple_layer_cache(1)
+    actual_conv, actual_context = extension.get_layer_cache(1)
     assert actual_conv is conv_state
     assert actual_context is ngram_context
+    assert extension.key == PLE_CACHE_EXTENSION_KEY
     assert requested == [
-        (0, MambaRole.PLE_CONV_STATE, torch.bfloat16, [16, 6]),
-        (0, MambaRole.PLE_NGRAM_CONTEXT, torch.int64, [2]),
+        (0, PLE_CONV_STATE, torch.bfloat16, [16, 6]),
+        (0, PLE_NGRAM_CONTEXT, torch.int64, [2]),
     ]
+
+    conv_state.fill_(3)
+    ngram_context.fill_(7)
+    extension.reset_slots(torch.tensor([1, 3]), [1, 3])
+    assert torch.count_nonzero(conv_state[[1, 3]]) == 0
+    assert torch.all(ngram_context[[1, 3]] == 11)
+
+    extension.shutdown()
+    assert extension.get_layer_cache(1) is None
 
 
 def test_ple_pool_resolution_rejects_a_cache_manager_without_ple_state() -> None:

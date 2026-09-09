@@ -11,6 +11,7 @@ reset without per-forward `torch.randint`.
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.mamba.cache_manager import Mamba2ReplayLayerCache
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     PythonMambaCacheManager,
     _allocate_mamba_seed_buffer,
@@ -91,7 +92,7 @@ def test_buffer_allocated_when_sr_only_no_replay():
     assert seed_buf.dtype == torch.int64
     assert seed_buf.device.type == "cuda"
     # Replay-only buffers are not allocated.
-    assert mgr.mamba_cache.old_x is None
+    assert not isinstance(mgr.mamba_cache, Mamba2ReplayLayerCache)
     assert mgr.mamba_cache.intermediate_ssm is not None  # legacy SSM cache
     # SpeculativeState exposes the same buffer (same Python identity).
     assert mgr.mamba_cache.mamba_ssm_rand_seed is seed_buf
@@ -219,7 +220,7 @@ def test_cpp_hybrid_non_replay_mtp_layer_cache_carries_rand_seed():
     assert layer_cache.mamba_ssm_rand_seed is mgr.mamba_ssm_rand_seed
     # And the SpeculativeState is on the non-replay legacy branch.
     assert layer_cache.intermediate_ssm is not None
-    assert layer_cache.old_x is None
+    assert not isinstance(layer_cache, Mamba2ReplayLayerCache)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

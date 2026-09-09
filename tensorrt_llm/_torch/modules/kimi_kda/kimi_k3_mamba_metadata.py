@@ -47,11 +47,12 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.kda_chunk_indices: torch.Tensor | None = None
         self.kda_varlen_is_aligned: bool | None = None
         self.kda_single_sequence_length: int | None = None
-        # KDA's CuTe verify kernel requires a 16-byte-aligned DLPack pointer.
-        # Keep the backing allocation stable so metadata preparation remains
-        # safe for CUDA graph capture and replay.
+        # KDA's CuTe verify kernel requires an aligned DLPack pointer. Keep
+        # the backing allocation stable for CUDA graph capture and replay.
         self._generation_state_indices = torch.empty(
-            max_batch_size, dtype=torch.int32, device="cuda"
+            max_batch_size,
+            dtype=torch.int32,
+            device="cuda",
         )
         self.generation_state_indices: torch.Tensor | None = None
 
@@ -66,10 +67,18 @@ class KimiK3MambaMetadata(Mamba2Metadata):
         self.generation_state_indices = None
         batch_size = attn_metadata.seq_lens.shape[0]
         generation_state_indices = self.state_indices[attn_metadata.num_contexts : batch_size]
+        manager = attn_metadata.kv_cache_manager
+        get_strategy = getattr(manager, "get_state_update_strategy", None)
+        strategy = get_strategy() if get_strategy is not None else None
+        alignment = getattr(strategy, "state_indices_alignment", 1)
+        # V1 managers retain their legacy KDA capability flag until that
+        # deprecated implementation is removed.
+        if alignment == 1 and getattr(manager, "use_kda_replay_update", False):
+            alignment = 16
         if (
-            getattr(attn_metadata.kv_cache_manager, "use_kda_replay_update", False)
+            alignment > 1
             and generation_state_indices.numel() > 0
-            and generation_state_indices.data_ptr() % 16
+            and generation_state_indices.data_ptr() % alignment
         ):
             aligned_state_indices = self._generation_state_indices[
                 : generation_state_indices.shape[0]

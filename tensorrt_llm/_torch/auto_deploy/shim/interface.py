@@ -822,10 +822,20 @@ class CachedSequenceInterface:
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
         """
-        # Detect replay mode from presence of ReplayOldXHandler resources.
-        use_replay = len(replay_old_x) > 0
-        if use_replay and self._spec_config is None:
+        # Exported replay resources are the AutoDeploy capability signal. Use
+        # the same owner-side feature factory as the executor so validation
+        # and replay semantics do not drift into another manager-specific path.
+        from tensorrt_llm._torch.modules.mamba.cache_manager import (
+            build_default_mamba_state_update_strategy,
+        )
+
+        if replay_old_x and self._spec_config is None:
             raise RuntimeError("Replay SSM state update requires speculative decoding config.")
+        state_update_strategy = build_default_mamba_state_update_strategy(
+            spec_config=self._spec_config,
+            use_replay=bool(replay_old_x),
+        )
+        use_replay = state_update_strategy.uses_replay
 
         # Mamba state params can be derived from reference handlers and number of managed (non-speculative) resources.
         mamba_params = self._get_mamba_state_params(
