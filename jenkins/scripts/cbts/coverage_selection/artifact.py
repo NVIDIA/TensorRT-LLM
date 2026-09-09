@@ -14,19 +14,19 @@
 """Resolve which post-merge CBTS touch DBs to use.
 
 Candidates are recent builds of `<ARTIFACT_BASE>` with both x86 and SBSA
-coverage tarballs. A candidate must have collected a revision at or before the
-PR base; the candidate closest to that base wins, with build number only a
-tie-break. Revision ordering comes from the forge compare API — the CI checkout
-is depth-1, so git cannot answer it — and needs `GITHUB_API_TOKEN`, the anonymous
-quota being per-IP and exhausted by shared CI egress.
+coverage tarballs. The newest complete pair wins. The PR diff must apply
+cleanly to that DB's revision; otherwise Tier 2 declines rather than choosing
+an older DB. Revision metadata comes from the forge compare API and needs
+`GITHUB_API_TOKEN`, the anonymous quota being per-IP and exhausted by shared CI
+egress.
 
 The selected architecture DBs are merged locally through the compact coverage
 schema, producing the one DB consumed by `main.py`.
 
 Two entry points. `--print-selection` prints `{urls, build, commit, lag,
-base_commit, drift, drift_status}` and stops. `--prepare DIR` goes on to
-download, unpack, and merge the winner, drop that JSON beside it, and print
-`{path, meta}` — the two paths `main.py` needs.
+base_commit, drift, drift_status, patch_apply_status}` and stops. `--prepare
+DIR` goes on to download, unpack, and merge the winner, drop that JSON beside
+it, and print `{path, meta}` — the two paths `main.py` needs.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -43,7 +44,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "coverage_utils"))
 
@@ -68,6 +69,7 @@ GITHUB_TOKEN_ENV = "GITHUB_API_TOKEN"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
+_GITHUB_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Cover the 30-commit freshness window plus missing or unsuccessful builds.
 _MAX_PROBE = 50
@@ -77,6 +79,8 @@ _TIMEOUT = 15
 _DOWNLOAD_TIMEOUT = 300
 # Tarball download attempts.
 _RETRIES = 3
+
+_PatchApplyStatus = Literal["clean", "conflict", "unknown"]
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -204,18 +208,159 @@ def drift(db_commit: str, base_commit: str) -> tuple[Optional[int], str]:
         return None, "unknown"
 
 
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    input_data: Optional[bytes] = None,
+    env: Optional[dict[str, str]] = None,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        input=input_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+
+
+def _patch_apply_status(
+    pr_base_commit: str,
+    pr_head: str,
+    db_commit: str,
+    repo_root: Path = Path("."),
+    upstream_url: str = _GITHUB_GIT_REPO,
+) -> _PatchApplyStatus:
+    """Return clean/conflict/unknown for applying the PR diff to the DB revision."""
+    repo_source = repo_root.resolve()
+    checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
+    if (
+        checked_out_head.returncode != 0
+        or checked_out_head.stdout.decode("ascii", "replace").strip() != pr_head
+    ):
+        print(f"[artifact] checked-out revision is not PR head {pr_head[:10]}", file=sys.stderr)
+        return "unknown"
+    with tempfile.TemporaryDirectory(prefix="cbts_patch_check_") as temp_dir:
+        temp = Path(temp_dir)
+        git_dir = temp / "repo.git"
+        initialized = _run_git(["init", "--bare", str(git_dir)], cwd=temp)
+        if initialized.returncode != 0:
+            print("[artifact] could not initialize the patch-check repository", file=sys.stderr)
+            return "unknown"
+
+        # Fetching into a temporary bare repository leaves the shallow CI checkout and its
+        # index untouched. The checked-out PR head is available locally; both main revisions
+        # are fetched from the public upstream repository.
+        fetched_head = _run_git(
+            [
+                "--git-dir",
+                str(git_dir),
+                "fetch",
+                "--no-tags",
+                "--depth=1",
+                str(repo_source),
+                "HEAD",
+            ],
+            cwd=temp,
+        )
+        if fetched_head.returncode != 0:
+            print(
+                f"[artifact] could not load PR head {pr_head[:10]} for patch check",
+                file=sys.stderr,
+            )
+            return "unknown"
+
+        revisions = list(dict.fromkeys((pr_base_commit, db_commit)))
+        fetched_revisions = _run_git(
+            [
+                "--git-dir",
+                str(git_dir),
+                "fetch",
+                "--no-tags",
+                "--depth=1",
+                upstream_url,
+                *revisions,
+            ],
+            cwd=temp,
+        )
+        if fetched_revisions.returncode != 0:
+            print(
+                "[artifact] could not load the base/coverage revisions for patch check",
+                file=sys.stderr,
+            )
+            return "unknown"
+
+        diff = _run_git(
+            [
+                "--git-dir",
+                str(git_dir),
+                "diff",
+                "--binary",
+                "--full-index",
+                pr_base_commit,
+                pr_head,
+            ],
+            cwd=temp,
+        )
+        if diff.returncode != 0:
+            print("[artifact] could not generate the PR diff for patch check", file=sys.stderr)
+            return "unknown"
+
+        index = temp / "index"
+        git_env = os.environ.copy()
+        git_env["GIT_INDEX_FILE"] = str(index)
+        read_tree = _run_git(
+            ["--git-dir", str(git_dir), "read-tree", db_commit], cwd=temp, env=git_env
+        )
+        if read_tree.returncode != 0:
+            print(
+                "[artifact] could not read the coverage revision for patch check",
+                file=sys.stderr,
+            )
+            return "unknown"
+
+        applied = _run_git(
+            [
+                "--git-dir",
+                str(git_dir),
+                "apply",
+                "--cached",
+                "--3way",
+                "--whitespace=nowarn",
+                "-",
+            ],
+            cwd=temp,
+            input_data=diff.stdout,
+            env=git_env,
+        )
+        return "clean" if applied.returncode == 0 else "conflict"
+
+
+def _selection_accepts_pr_diff(sel: dict, pr_base_commit: str, pr_head: str) -> bool:
+    sel["patch_apply_status"] = _patch_apply_status(pr_base_commit, pr_head, sel["commit"])
+    if sel["patch_apply_status"] == "clean":
+        return True
+    print(
+        f"[artifact] coverage tier declined: PR diff does not apply cleanly to "
+        f"latest DB commit {sel['commit'][:10]} ({sel['patch_apply_status']})",
+        file=sys.stderr,
+    )
+    return False
+
+
 def select_tarball(
     pr_base_commit: str,
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
 ) -> Optional[dict]:
-    """Closest complete architecture pair collected at or before `pr_base_commit`."""
+    """Newest complete architecture pair with measurable PR-base topology."""
     build = latest_build_number(jenkins_base)
     if build is None:
         print("[artifact] could not resolve latest build number", file=sys.stderr)
         return None
-    candidates = []
     for b in range(build, max(0, build - max_probe), -1):
         urls = tarball_urls(b, artifact_base)
         if not all(_exists(url) for url in urls):
@@ -227,42 +372,35 @@ def select_tarball(
         distance, status = drift(commit, pr_base_commit)
         if distance is None:
             print(
-                f"[artifact] build {b}: ordering against the PR base unknown; skipped",
+                f"[artifact] latest complete build {b}: topology against the PR base unknown",
                 file=sys.stderr,
             )
-            continue
-        if status not in ("ahead", "identical"):
+            return None
+        if status not in ("ahead", "behind", "identical"):
             print(
-                f"[artifact] build {b}: relation to the PR base is {status or 'unknown'}; skipped",
+                f"[artifact] latest complete build {b}: relation to the PR base is "
+                f"{status or 'unknown'}",
                 file=sys.stderr,
             )
-            continue
-        candidates.append(
-            {
-                "url": urls[0],
-                "urls": urls,
-                "build": b,
-                "commit": commit,
-                "base_commit": pr_base_commit,
-                "drift": distance,
-                "drift_status": status,
-            }
-        )
-    if not candidates:
-        print(
-            f"[artifact] no complete x86/SBSA coverage pair at or before the PR base "
-            f"in the last {max_probe} builds",
-            file=sys.stderr,
-        )
-        return None
-    best = min(candidates, key=lambda c: (c["drift"], -c["build"]))
-    best["lag"] = compare_distance(best["commit"])
-    if best["lag"] is None:
-        print(
-            f"[artifact] build {best['build']}: lag behind main unknown",
-            file=sys.stderr,
-        )
-    return best
+            return None
+        selected = {
+            "url": urls[0],
+            "urls": urls,
+            "build": b,
+            "commit": commit,
+            "base_commit": pr_base_commit,
+            "drift": distance,
+            "drift_status": status,
+            "lag": compare_distance(commit),
+        }
+        if selected["lag"] is None:
+            print(f"[artifact] build {b}: lag behind main unknown", file=sys.stderr)
+        return selected
+    print(
+        f"[artifact] no complete x86/SBSA coverage pair in the last {max_probe} builds",
+        file=sys.stderr,
+    )
+    return None
 
 
 def measure_drift(sel: dict, pr_head: Optional[str]) -> dict:
@@ -336,7 +474,7 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
     """
     if not pr_head:
-        print("[artifact] PR head is required to select an ancestor coverage DB", file=sys.stderr)
+        print("[artifact] PR head is required to select a coverage DB", file=sys.stderr)
         return None
     pr_base_commit = merge_base(pr_head)
     if not pr_base_commit:
@@ -344,6 +482,8 @@ def prepare(dest_dir: str, pr_head: Optional[str]) -> Optional[dict]:
         return None
     sel = select_tarball(pr_base_commit)
     if sel is None:
+        return None
+    if not _selection_accepts_pr_diff(sel, pr_base_commit, pr_head):
         return None
     print(describe(sel), file=sys.stderr)
 
@@ -383,7 +523,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--print-selection",
         action="store_true",
-        help="resolve and print {urls, build, commit, lag, base_commit, drift, drift_status} as JSON",
+        help="resolve and print {urls, build, commit, lag, base_commit, drift, "
+        "drift_status, patch_apply_status} as JSON",
     )
     ap.add_argument(
         "--build", type=int, default=None, help="pin a build number (skip auto-resolve)"
@@ -398,8 +539,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument(
         "--pr-head",
         default=None,
-        help="required PR head revision; its merge base is the inclusive upper bound "
-        "for eligible coverage revisions",
+        help="required PR head revision; its merge base measures DB drift and defines "
+        "the diff checked against the latest coverage revision",
     )
     args = ap.parse_args(argv)
 
@@ -433,11 +574,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             "lag": compare_distance(commit) if commit else None,
         }
         measure_drift(best, args.pr_head)
-        if best["drift_status"] not in ("ahead", "identical"):
+        if best["drift"] is None or best["drift_status"] not in ("ahead", "behind", "identical"):
             return 1
     else:
         best = select_tarball(pr_base_commit)
     if best is None:
+        return 1
+    if not _selection_accepts_pr_diff(best, pr_base_commit, args.pr_head):
         return 1
     print(json.dumps(best))
     return 0
