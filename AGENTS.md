@@ -167,8 +167,8 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 ### Triggering CI
 
-The new-contributor open-PR cap is implemented in `.github/workflows/pr-rate-limit.yml`;
-see `CONTRIBUTING.md` for the default five-open-PR cap, exemptions and manual recovery. Its mocked API tests
+The contributor open-PR caps are implemented in `.github/workflows/pr-rate-limit.yml`;
+see `CONTRIBUTING.md` for the default five/ten-open-PR caps based on merge history, exemptions and manual recovery. Its mocked API tests
 run with `node --test .github/scripts/pr_rate_limit.test.js` and are registered in Release Checks.
 
 CI is triggered by posting comments on the PR. Basic commands:

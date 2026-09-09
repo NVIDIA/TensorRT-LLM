@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: New Contributor PR Rate Limit
+name: Contributor Open PR Limit
 
 on:
   pull_request_target:
@@ -53,11 +53,13 @@ jobs:
           DRY_RUN: ${{ vars.PR_RATE_LIMIT_DRY_RUN }}
           EXEMPT_USERS: ${{ vars.PR_RATE_LIMIT_EXEMPT_USERS }}
           MAX_OPEN: ${{ vars.PR_RATE_LIMIT_MAX_OPEN }}
+          MAX_OPEN_ESTABLISHED: ${{ vars.PR_RATE_LIMIT_MAX_OPEN_ESTABLISHED }}
         with:
           script: |
-            const OPEN_LIMIT = Number(process.env.MAX_OPEN?.trim() || '5');
-            if (!Number.isSafeInteger(OPEN_LIMIT) || OPEN_LIMIT < 1) {
-              core.warning('Invalid PR_RATE_LIMIT_MAX_OPEN; no moderation performed.');
+            const NEW_LIMIT = Number(process.env.MAX_OPEN?.trim() || '5');
+            const ESTABLISHED_LIMIT = Number(process.env.MAX_OPEN_ESTABLISHED?.trim() || '10');
+            if (![NEW_LIMIT, ESTABLISHED_LIMIT].every((limit) => Number.isSafeInteger(limit) && limit >= 1)) {
+              core.warning('Invalid contributor open-PR cap configuration; no moderation performed.');
               return;
             }
             const EXEMPT_LABEL = 'pr-rate-limit-exempt';
@@ -114,11 +116,12 @@ jobs:
             // Include the triggering PR even if its listing has not caught up yet.
             history.set(pull.number, pull);
             let openCount = [...history.values()].filter((item) => item.state === 'open').length;
-            if (openCount <= OPEN_LIMIT) return;
             // A closed PR is not necessarily a contribution: require an actual merge.
             // Check history directly rather than trusting author_association or a
             // search result that may not yet include a recent merge.
-            if ([...history.values()].some((item) => item.pull_request?.merged_at)) return;
+            const hasMergedPR = [...history.values()].some((item) => item.pull_request?.merged_at);
+            const OPEN_LIMIT = hasMergedPR ? ESTABLISHED_LIMIT : NEW_LIMIT;
+            if (openCount <= OPEN_LIMIT) return;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pull_number, per_page: 100,
             });
@@ -134,7 +137,8 @@ jobs:
               ' open PRs, including this one (limit: ' + OPEN_LIMIT + ')';
             const body = [
               'Closing this PR because ' + reason + '.',
-              'Contributors with no merged PRs in this repository may keep up to ' + OPEN_LIMIT + ' PRs open, including drafts.',
+              'Contributors ' + (hasMergedPR ? 'with merged PRs' : 'with no merged PRs') +
+                ' in this repository may keep up to ' + OPEN_LIMIT + ' PRs open, including drafts.',
               'Please wait until your existing PRs are reviewed or merged before opening more. ' +
                 'Reviewed PRs still count while open. ' +
                 'You may ask a maintainer to reopen this PR when fewer than ' + OPEN_LIMIT + ' of your other PRs are open, ' +

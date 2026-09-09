@@ -118,27 +118,30 @@ For NVIDIA developers,  please submit feature or bug fixes to the dedicated bran
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
-### Open pull requests for new contributors
+### Open pull requests for contributors
 
-Contributors with no merged PRs in this repository may keep up to five PRs open at a time,
-including drafts. Please wait until your existing PRs are reviewed or merged before opening more.
+Contributors with no merged PRs in this repository may keep up to five PRs open at a time.
+Contributors with at least one merged PR may keep up to ten open PRs. Both caps include drafts;
+a first merge raises the cap instead of removing it.
+Please wait until your existing PRs are reviewed or merged before opening more.
 Reviewed PRs still count while open; closing or merging a PR frees capacity.
 Excess PRs are automatically closed after creation or reopening. The explanation includes the
 observed open count and configured cap; retries reuse that comment, so its counts describe the
 original evaluation. Closed PRs do not consume capacity, and there is no submission cooldown.
-Ask a maintainer to reopen a PR when fewer than five other PRs are open. GitHub may prevent authors
+Ask a maintainer to reopen a PR when the number of other open PRs is below your applicable cap. GitHub may prevent authors
 from reopening PRs closed by the bot. Concurrent submissions or reopenings may be closed while
 the observed open count exceeds the cap, regardless of how old the PRs are.
 
 Users with write access and bot accounts are exempt. Maintainers can apply `pr-rate-limit-exempt`
 to an individual PR before reopening it. Administrators can exempt trusted contributors through the
-comma-separated `PR_RATE_LIMIT_EXEMPT_USERS` repository variable, set `PR_RATE_LIMIT_MAX_OPEN`
-to a positive integer to override the default cap of five, or set `PR_RATE_LIMIT_DRY_RUN=true`
+comma-separated `PR_RATE_LIMIT_EXEMPT_USERS` repository variable. Set `PR_RATE_LIMIT_MAX_OPEN`
+to override the newcomer cap of five, or `PR_RATE_LIMIT_MAX_OPEN_ESTABLISHED` to override the
+merged-contributor cap of ten; both require positive integers. Set `PR_RATE_LIMIT_DRY_RUN=true`
 to log decisions without commenting or closing. The workflow does not prevent independently triggered
 CI jobs from starting. Incomplete history or unavailable permission checks (403/404) produce warnings
 and skip moderation. Invalid cap configuration also warns and skips. Other API failures fail the job.
 
-Maintainers should monitor warnings and failed **New Contributor PR Rate Limit** runs in the Actions
+Maintainers should monitor warnings and failed **Contributor Open PR Limit** runs in the Actions
 tab. After resolving the reported problem, re-run the job or choose **Run workflow** on the default
 branch and enter the affected PR number. Manual recovery uses the same exemptions, dry-run setting
 and cap, and reuses an existing bot comment before retrying closure. Recovery is manual; there is no

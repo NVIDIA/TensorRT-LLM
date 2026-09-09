@@ -108,13 +108,42 @@ test('history pagination and duplicate entries do not change quota', async () =>
   assert.equal(writes.length, 2);
   assert.match(writes[0].body, /currently have 6 open PRs/);
 });
-test('actual merged history exempts; author association alone does not', async () => {
+test('actual merged history raises the cap; author association alone does not', async () => {
   const history = Array.from({ length: 6 }, (_, i) => pr(i + 1));
   history.push(pr(0, { state: 'closed', pull_request: { merged_at: '2026-09-08T00:00:00Z' } }));
   const result = await run({ history });
   assert.deepEqual(result.writes, []);
   assert.deepEqual(result.calls, [6]);
   assert.equal((await run({ current: pr(6, { author_association: 'CONTRIBUTOR' }) })).writes.length, 2);
+});
+test('merged contributors may keep ten open PRs but the eleventh closes, including drafts', async () => {
+  const merged = pr(0, { state: 'closed', pull_request: { merged_at: '2026-09-08T00:00:00Z' } });
+  for (let n = 6; n <= 10; n++) {
+    const history = [merged, ...Array.from({ length: n }, (_, i) => pr(i + 1))];
+    assert.deepEqual((await run({ current: pr(n), history })).writes, []);
+  }
+  const history = [merged, ...Array.from({ length: 10 }, (_, i) => pr(i + 1))];
+  const current = pr(11, { draft: true });
+  const { writes, calls } = await run({ current, history });
+  assert.deepEqual(writes.map((w) => w.kind), ['comment', 'close']);
+  assert.match(writes[0].body, /11 open PRs, including this one \(limit: 10\)/);
+  assert.match(writes[0].body, /Contributors with merged PRs/);
+  assert.match(writes[0].body, /fewer than 10 of your other PRs/);
+  assert.ok(calls.every((number) => number === 11));
+  assert.deepEqual((await run({ current, history, openHistory: history.slice(1, 10) })).writes, []);
+  assert.deepEqual((await run({ current, history, env: { DRY_RUN: 'true' } })).writes, []);
+});
+test('the established-contributor cap is configurable and invalid values skip safely', async () => {
+  const history = [pr(0, { state: 'closed', pull_request: { merged_at: '2026-09-08T00:00:00Z' } }),
+    ...Array.from({ length: 7 }, (_, i) => pr(i + 1))];
+  const { writes } = await run({ current: pr(7), history, env: { MAX_OPEN_ESTABLISHED: '6' } });
+  assert.match(writes[0].body, /limit: 6/);
+  for (const value of ['0', '-1', '1.5', 'bad', 'Infinity', '9007199254740992']) {
+    const result = await run({ env: { MAX_OPEN_ESTABLISHED: value } });
+    assert.deepEqual(result.calls, []);
+    assert.deepEqual(result.writes, []);
+    assert.equal(result.warnings.length, 1);
+  }
 });
 test('maintainers, bots, allowlisted users and labeled PRs are exempt', async () => {
   for (const permission of ['write', 'admin', 'maintain'])
