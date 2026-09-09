@@ -39,6 +39,8 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import yaml
+
 from agent_flow.workflows.perf_optimize.bench_cli import (
     GEN_ONLY_CSV,
     BenchCliError,
@@ -53,6 +55,7 @@ TRACKS_KEY = "tracks"
 DESIGN_KEY = "design"
 DESIGN_DIR_KEY = "design_dir"
 PREFER_KEY = "prefer"
+DESIGN_SWEEP_KEY = "design_sweep"
 
 #: What `create-sweep` calls its state file. Read, never written: this module
 #: is a consumer of that skill's output, not a reimplementation of it.
@@ -690,6 +693,100 @@ def verify_sweep_matches_point(sweep: Path, track: str, point: Mapping[str, Any]
         )
 
 
+#: Where a derived sweep may be written, and the whole of the rule.
+#:
+#: Inside the campaign's own workspace, never anywhere else. The check is
+#: blunt on purpose: an earlier module in this package took an output path as
+#: a free parameter and would have overwritten a curated config that other
+#: people maintain, which is unrecoverable in a way that a wrong measurement
+#: is not. A derivation that cannot escape the workspace cannot make that
+#: mistake, whatever it is asked to write.
+DERIVED_SWEEP_NAME = "sweep-at-selected-point.yaml"
+
+
+def derive_sweep_at_point(
+    design_sweep: Path, track: str, point: Mapping[str, Any], *, into: Path
+) -> Path:
+    """Cut the design's sweep down to the one row the campaign will freeze on.
+
+    The last link in the chain, and it exists because of a shape problem
+    rather than a preference. The design sweep is the whole measured space —
+    six shapes, each with its own concurrency ladder — and a campaign cannot
+    run it: two shapes measured at one concurrency both land in
+    ``concurrency_<c>``, which :func:`.sol_track._place` refuses, because a
+    campaign's operating points have to be addressable by concurrency alone.
+    So the campaign needs exactly one row, and which row is not known until
+    the design has been measured and selected from.
+
+    Derived rather than authored: every field except the row filter comes
+    from the design's own sweep, so the campaign measures the configuration
+    the selection was made on and not a hand-typed approximation of it. The
+    two campaigns this layer replaces differed from their own recorded point
+    in three fields at once, and nothing noticed.
+
+    Written into the campaign's workspace and nowhere else — see
+    :data:`DERIVED_SWEEP_NAME`.
+    """
+    into = Path(into).resolve()
+    out = into / DERIVED_SWEEP_NAME
+    config = load_yaml(Path(design_sweep))
+
+    if track == GEN_TRACK:
+        wanted = (point.get("shape"), point.get("concurrency"))
+        kept = [row for row in (config.get("gen_configs") or []) if _gen_row_matches(row, wanted)]
+        if len(kept) != 1:
+            raise DisaggSolError(
+                f"{design_sweep} has {len(kept)} rows matching the selected point "
+                f"{wanted[0]} @ concurrency {wanted[1]}; a campaign needs exactly "
+                f"one. The design sweep and the measured space have diverged."
+            )
+        row = list(kept[0])
+        row[9] = str(wanted[1])  # this point only, not the row's whole ladder
+        config["gen_configs"] = [row]
+    else:
+        wanted_ctx = (point.get("ctx_gpus"), point.get("max_batch"))
+        kept_ctx = [
+            {**entry, "tp_size": [wanted_ctx[0]], "max_batch": [wanted_ctx[1]]}
+            for entry in (config.get("benchmarks") or [])
+            if isinstance(entry, Mapping)
+            and wanted_ctx[0] in (entry.get("tp_size") or [])
+            and wanted_ctx[1] in (entry.get("max_batch") or [])
+        ]
+        if len(kept_ctx) != 1:
+            raise DisaggSolError(
+                f"{design_sweep} has {len(kept_ctx)} benchmark entries matching the "
+                f"selected ctx point tp_size {wanted_ctx[0]} @ max_batch "
+                f"{wanted_ctx[1]}; a campaign needs exactly one."
+            )
+        config["benchmarks"] = kept_ctx
+        config.pop("gpu_overrides", None)
+
+    config["_derived_from"] = {
+        "design_sweep": str(design_sweep),
+        "selected": {k: point.get(k) for k in ("shape", "concurrency", "ctx_gpus", "max_batch")},
+        "why": (
+            "the design sweep is the whole measured space; a campaign freezes one "
+            "row of it, because two shapes at one concurrency cannot both be "
+            "'concurrency_<c>'"
+        ),
+    }
+    into.mkdir(parents=True, exist_ok=True)
+    out.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return out
+
+
+def _gen_row_matches(row: Any, wanted: tuple) -> bool:
+    if not isinstance(row, (list, tuple)) or len(row) < 10:
+        return False
+    tp, adp, mtp, eplb = row[2], row[5], row[7], row[8]
+    name = f"{'dep' if adp else 'tep'}_{tp}_eplb{eplb}_mtp{mtp}"
+    if name != wanted[0]:
+        return False
+    return any(
+        token.strip().isdigit() and int(token) == wanted[1] for token in str(row[9]).split(",")
+    )
+
+
 class CampaignLaunch:
     """One campaign, described completely enough to be checked before it runs.
 
@@ -728,6 +825,7 @@ def launch_plan(
     label: str,
     point: Mapping[str, Any],
     design: Path,
+    design_sweep: Path | None = None,
 ) -> list[CampaignLaunch]:
     """What this spec would start, in full, before anything starts.
 
@@ -739,9 +837,15 @@ def launch_plan(
     refused here rather than left to the launcher's care.
     """
     wanted = tracks(base)
-    missing = [t for t in wanted if t not in sweeps]
+    missing = [t for t in wanted if t not in sweeps and design_sweep is None]
     if missing:
-        raise DisaggSolError(f"no sweep given for track(s) {missing}")
+        raise DisaggSolError(
+            f"track(s) {missing} have neither a sweep of their own nor a "
+            f"'{DESIGN_KEY}.{DESIGN_SWEEP_KEY}' to cut one from. A campaign has to "
+            f"freeze exactly one row, and which row is not known until the design "
+            f"has been measured -- so either name the design's sweep and let it be "
+            f"derived, or name a sweep that already contains the selected point."
+        )
     missing = [t for t in wanted if t not in repos]
     if missing:
         raise DisaggSolError(f"no trtllm_repo_path given for track(s) {missing}")
@@ -758,8 +862,13 @@ def launch_plan(
                 f"measurement that followed would be of neither's code."
             )
         seen_repos[str(repo)] = track
-        verify_sweep_matches_point(Path(sweeps[track]), track, point)
         workspace = campaign_workspace(workspace_root, track, label)
+        if track in sweeps:
+            # A sweep the caller chose: check it, never rewrite it.
+            sweep = Path(sweeps[track])
+            verify_sweep_matches_point(sweep, track, point)
+        else:
+            sweep = derive_sweep_at_point(Path(design_sweep), track, point, into=workspace)
         launches.append(
             CampaignLaunch(
                 track=track,
@@ -857,6 +966,9 @@ def supervise(
         record["ctx_point"] = select_ctx_point(ctx_points(design), incumbent=incumbent)
 
     point = record.get("gen_point") or record.get("ctx_point") or {}
+    block = _block(base).get(DESIGN_KEY)
+    block = block if isinstance(block, Mapping) else {}
+    stated_sweep = block.get(DESIGN_SWEEP_KEY)
     launches = launch_plan(
         base,
         sweeps=sweeps,
@@ -865,6 +977,7 @@ def supervise(
         label=label,
         point=point,
         design=design,
+        design_sweep=Path(stated_sweep) if stated_sweep else None,
     )
     record["campaigns"] = [
         {"track": run.track, "workspace": str(run.workspace), "argv": run.argv} for run in launches
