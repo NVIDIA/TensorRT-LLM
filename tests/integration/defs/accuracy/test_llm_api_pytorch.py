@@ -6351,11 +6351,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    max_draft_len: Optional[int],
                    check_acceptance_length: bool,
                    moe_expert_parallel_size: int = 1,
-                   enable_attention_dp: bool = False) -> LLM:
+                   enable_attention_dp: bool = False,
+                   enable_block_reuse: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        enable_block_reuse=False,
+                                        enable_block_reuse=enable_block_reuse,
                                         mamba_ssm_cache_dtype="bfloat16")
+        if enable_block_reuse:
+            # Attention pages alone cannot restore GDN or PLE state, so the
+            # runtime turns reuse back off without a snapshot policy.
+            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
                                             enable_padding=True)
         mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
@@ -6385,7 +6390,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    monkeypatch: pytest.MonkeyPatch,
                    mocker,
                    moe_expert_parallel_size: int = 1,
-                   enable_attention_dp: bool = False) -> None:
+                   enable_attention_dp: bool = False,
+                   enable_block_reuse: bool = False) -> None:
         if not os.path.exists(model_path):
             pytest.skip(f"Model directory {model_path} does not exist")
 
@@ -6395,14 +6401,15 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
             and max_draft_len == 3 and moe_expert_parallel_size == 4
-            and enable_attention_dp)
+            and enable_attention_dp and not enable_block_reuse)
         with self._build_llm(model_path,
                              tensor_parallel_size,
                              moe_backend,
                              max_draft_len,
                              check_acceptance_length,
                              moe_expert_parallel_size=moe_expert_parallel_size,
-                             enable_attention_dp=enable_attention_dp) as llm:
+                             enable_attention_dp=enable_attention_dp,
+                             enable_block_reuse=enable_block_reuse) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
@@ -6452,6 +6459,29 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                         mocker=mocker,
                         moe_expert_parallel_size=4,
                         enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_adp4_mtp3_prefix_cache(self, monkeypatch: pytest.MonkeyPatch,
+                                        mocker) -> None:
+        """test_fp8_adp4_mtp3_trtllm_ple_offload with block reuse enabled.
+
+        A reused prefix restores the Gated DeltaNet and PLE state from a
+        recurrent-state snapshot instead of recomputing it, so accuracy holds
+        only if the snapshot carries every role in the recurrent page.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True,
+                        enable_block_reuse=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
