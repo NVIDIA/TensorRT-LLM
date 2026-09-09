@@ -435,6 +435,21 @@ def _key_of(v):
 
 
 @cute.jit
+def _fabs(x):
+    return F32(
+        _llvm.inline_asm(
+            _T.f32(),
+            [F32(x).ir_value()],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=_llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
 def _f32_of_i32(i):
     return F32(_llvm.bitcast(F32.mlir_type, I32(i).ir_value()))
 
@@ -747,7 +762,8 @@ def _dsv4_kernel(
     # the preceding kernel
     _gdc_wait()
     if tidx < 64:
-        sW[tidx] = cute.make_tensor(w_ptr, cute.make_layout(1 << 20))[b * 64 + tidx]
+        # per-head weights staged pre-halved: the epilogue's relu is 2 * relu (see below)
+        sW[tidx] = cute.make_tensor(w_ptr, cute.make_layout(1 << 20))[b * 64 + tidx] * F32(0.5)
     if tidx < 128:
         sfq = cute.make_tensor(sfq_ptr, cute.make_layout(1 << 20))
         sSFB_u32[(tidx % 32) * 4 + (tidx // 32)] = sfq[
@@ -991,12 +1007,7 @@ def _dsv4_kernel(
         a0 = cute.make_tensor(tmem_ptr, lay32)
         tt = tcgen05.make_tmem_copy(atom_t2r, a0)
         thr = tt.get_slice(lane)
-        s00 = thr.partition_S(cute.make_tensor(tmem_ptr, lay32))
-        s01 = thr.partition_S(cute.make_tensor(tmem_ptr + 32, lay32))
-        s10 = thr.partition_S(cute.make_tensor(tmem_ptr + HD, lay32))
-        s11 = thr.partition_S(cute.make_tensor(tmem_ptr + HD + 32, lay32))
-        s20 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD, lay32))
-        s21 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD + 32, lay32))
+        gcol = gwg * HD
         tD = thr.partition_D(cute.make_identity_tensor(a0.shape))
         frg = cute.make_rmem_tensor(tD.shape, F32)
         # All 64 per-head weights are loop invariant: hoist them into registers
@@ -1005,9 +1016,10 @@ def _dsv4_kernel(
         wr = cute.make_rmem_tensor(cute.make_layout(64), F32)
         cute.autovec_copy(sW, wr)
         z = F32(0.0)
-        # relu is scalar (there is no max.f32x2) but the weighted accumulation
-        # runs on the Blackwell packed FP32 datapath: 64 fmax + 32 fma.f32x2
-        # instead of 64 fmax + 64 fma per token.
+        # relu(x) = (x + |x|) / 2 keeps the whole reduction on the packed FP32
+        # datapath (32 add.f32x2 + 32 fma.f32x2 per token, no fmax on the ALU
+        # pipe); the halving is folded into the staged weights, which is exact,
+        # so every FMA rounds the same real product as w * relu(x).
         wl = tidx % 32
         lmaskw = (I32(1) << wl) - I32(1)
         ndense = ntl
@@ -1074,33 +1086,25 @@ def _dsv4_kernel(
                         )
             if i < ntl:
                 cute.arch.mbarrier_wait(acc_full + gwg, (i // NACC) & 1)
-                if gwg == 0:
-                    cute.copy(tt, s00, frg)
-                elif gwg == 1:
-                    cute.copy(tt, s10, frg)
-                else:
-                    cute.copy(tt, s20, frg)
+                cute.copy(tt, thr.partition_S(cute.make_tensor(tmem_ptr + gcol, lay32)), frg)
                 cute.arch.fence_view_async_tmem_load()
                 acc = [[z, z], [z, z], [z, z], [z, z]]
                 for j in cutlass.range_constexpr(16):
                     k = j & 3
-                    r0 = cute.arch.fmax(frg[2 * j], z)
-                    r1 = cute.arch.fmax(frg[2 * j + 1], z)
+                    x0 = frg[2 * j]
+                    x1 = frg[2 * j + 1]
+                    r0, r1 = cute.arch.add_packed_f32x2((x0, x1), (_fabs(x0), _fabs(x1)))
                     acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
                         (wr[2 * j], wr[2 * j + 1]), (r0, r1), (acc[k][0], acc[k][1])
                     )
-                if gwg == 0:
-                    cute.copy(tt, s01, frg)
-                elif gwg == 1:
-                    cute.copy(tt, s11, frg)
-                else:
-                    cute.copy(tt, s21, frg)
+                cute.copy(tt, thr.partition_S(cute.make_tensor(tmem_ptr + (gcol + 32), lay32)), frg)
                 cute.arch.fence_view_async_tmem_load()
                 cute.arch.mbarrier_arrive(acc_empty + gwg)
                 for j in cutlass.range_constexpr(16):
                     k = j & 3
-                    r0 = cute.arch.fmax(frg[2 * j], z)
-                    r1 = cute.arch.fmax(frg[2 * j + 1], z)
+                    x0 = frg[2 * j]
+                    x1 = frg[2 * j + 1]
+                    r0, r1 = cute.arch.add_packed_f32x2((x0, x1), (_fabs(x0), _fabs(x1)))
                     acc[k][0], acc[k][1] = cute.arch.fma_packed_f32x2(
                         (wr[32 + 2 * j], wr[33 + 2 * j]), (r0, r1), (acc[k][0], acc[k][1])
                     )
@@ -1944,12 +1948,7 @@ def _dsv4_kernel(
             a0 = cute.make_tensor(tmem_ptr, lay32)
             tt = tcgen05.make_tmem_copy(atom_t2r, a0)
             thr = tt.get_slice(lane)
-            s00 = thr.partition_S(cute.make_tensor(tmem_ptr, lay32))
-            s01 = thr.partition_S(cute.make_tensor(tmem_ptr + 32, lay32))
-            s10 = thr.partition_S(cute.make_tensor(tmem_ptr + HD, lay32))
-            s11 = thr.partition_S(cute.make_tensor(tmem_ptr + HD + 32, lay32))
-            s20 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD, lay32))
-            s21 = thr.partition_S(cute.make_tensor(tmem_ptr + 2 * HD + 32, lay32))
+            gcol = gwg * HD
             tD = thr.partition_D(cute.make_identity_tensor(a0.shape))
             frg = cute.make_rmem_tensor(tD.shape, F32)
             wr = cute.make_rmem_tensor(cute.make_layout(64), F32)
@@ -1958,33 +1957,25 @@ def _dsv4_kernel(
             j0 = ntl + ((gwg - (ntl % NACC) + NACC) % NACC)
             for j in cutlass.range(j0, ntl + nvt, NACC, unroll=1):
                 cute.arch.mbarrier_wait(acc_full + gwg, (j // NACC) & 1)
-                if gwg == 0:
-                    cute.copy(tt, s00, frg)
-                elif gwg == 1:
-                    cute.copy(tt, s10, frg)
-                else:
-                    cute.copy(tt, s20, frg)
+                cute.copy(tt, thr.partition_S(cute.make_tensor(tmem_ptr + gcol, lay32)), frg)
                 cute.arch.fence_view_async_tmem_load()
                 acc = [[z, z], [z, z], [z, z], [z, z]]
                 for jj in cutlass.range_constexpr(16):
                     kq = jj & 3
-                    m0 = cute.arch.fmax(frg[2 * jj], z)
-                    m1 = cute.arch.fmax(frg[2 * jj + 1], z)
+                    x0 = frg[2 * jj]
+                    x1 = frg[2 * jj + 1]
+                    m0, m1 = cute.arch.add_packed_f32x2((x0, x1), (_fabs(x0), _fabs(x1)))
                     acc[kq][0], acc[kq][1] = cute.arch.fma_packed_f32x2(
                         (wr[2 * jj], wr[2 * jj + 1]), (m0, m1), (acc[kq][0], acc[kq][1])
                     )
-                if gwg == 0:
-                    cute.copy(tt, s01, frg)
-                elif gwg == 1:
-                    cute.copy(tt, s11, frg)
-                else:
-                    cute.copy(tt, s21, frg)
+                cute.copy(tt, thr.partition_S(cute.make_tensor(tmem_ptr + (gcol + 32), lay32)), frg)
                 cute.arch.fence_view_async_tmem_load()
                 cute.arch.mbarrier_arrive(acc_empty + gwg)
                 for jj in cutlass.range_constexpr(16):
                     kq = jj & 3
-                    m0 = cute.arch.fmax(frg[2 * jj], z)
-                    m1 = cute.arch.fmax(frg[2 * jj + 1], z)
+                    x0 = frg[2 * jj]
+                    x1 = frg[2 * jj + 1]
+                    m0, m1 = cute.arch.add_packed_f32x2((x0, x1), (_fabs(x0), _fabs(x1)))
                     acc[kq][0], acc[kq][1] = cute.arch.fma_packed_f32x2(
                         (wr[32 + 2 * jj], wr[33 + 2 * jj]), (m0, m1), (acc[kq][0], acc[kq][1])
                     )
