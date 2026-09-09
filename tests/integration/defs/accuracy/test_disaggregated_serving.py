@@ -584,7 +584,9 @@ def run_parallel_test(model_name: str,
                       ctx_model: str = None,
                       gen_model: str = None,
                       cache_transceiver_backend: str = "DEFAULT",
-                      trust_remote_code: bool = False):
+                      trust_remote_code: bool = False,
+                      quant_algo: str = None,
+                      kv_cache_quant_algo: str = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -637,6 +639,10 @@ def run_parallel_test(model_name: str,
                                   model_path,
                                   ctx_model=ctx_model,
                                   gen_model=gen_model) as llm:
+        if quant_algo is not None:
+            llm.args.quant_config.quant_algo = quant_algo
+        if kv_cache_quant_algo is not None:
+            llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
         run_accuracy_test(llm, model_name, test_sets)
 
 
@@ -1663,6 +1669,10 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
+            # MODEL_PATH is the FP8 block-scales checkpoint; the gsm8k.yaml
+            # reference for this quant_algo differs from the unquantized one.
+            llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(4)
@@ -1680,7 +1690,9 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
                                  gen_instances=1,
                                  test_sets=[GSM8K],
                                  cache_transceiver_backend="NIXL",
-                                 trust_remote_code=True)
+                                 trust_remote_code=True,
+                                 quant_algo="FP8_BLOCK_SCALES",
+                                 kv_cache_quant_algo="FP8")
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
