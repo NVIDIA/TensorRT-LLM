@@ -135,10 +135,10 @@ def get_model_yaml_config(model_label: str,
                 'max_seq_len': 10240,
             }
         },
-        # DeepSeek V4 Pro-Base FP8 serving settings for single-node 8xB300.
+        # DeepSeek V4 Pro-Base FP8 throughput settings for single-node 8xB300.
         {
             'patterns': [
-                'deepseek_v4_pro_base_fp8-serve-pytorch-float8-maxbs:32-maxnt:8448',
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:32-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -164,6 +164,41 @@ def get_model_yaml_config(model_label: str,
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'max_draft_len': 1,
+                },
+                'stream_interval': 100,
+                'num_postprocess_workers': 4,
+            }
+        },
+        # DeepSeek V4 Pro-Base FP8 latency settings for single-node 8xB300.
+        {
+            'patterns': [
+                'deepseek_v4_pro_base_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8448',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'enable_lm_head_tp_in_adp': False,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                    'use_low_precision_moe_combine': True,
+                },
+                'max_seq_len': 9256,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                    'tokens_per_block': 128,
+                },
+                'cuda_graph_config': {
+                    'enable_padding':
+                    True,
+                    'batch_sizes': [
+                        1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96,
+                        104, 112, 120, 128
+                    ],
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
                 },
                 'stream_interval': 100,
                 'num_postprocess_workers': 4,
