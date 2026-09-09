@@ -27,9 +27,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
+    DFlashDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
+    PARDDecodingConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -871,6 +873,82 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
     assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 192 * 10)
     assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "headroom", "generation_blocks"),
+    [
+        pytest.param(None, 1, 17, id="normal"),
+        pytest.param(
+            DFlashDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            8,
+            17,
+            id="dflash",
+        ),
+        pytest.param(
+            PARDDecodingConfig(max_draft_len=4, speculative_model="draft"),
+            11,
+            18,
+            id="pard",
+        ),
+    ],
+)
+@pytest.mark.parametrize("scratch", [False, True])
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("max_tokens", [64, 4096, 8192])
+def test_v2_static_and_runtime_cache_costs_agree(
+    spec_config: DFlashDecodingConfig | PARDDecodingConfig | None,
+    headroom: int,
+    generation_blocks: int,
+    scratch: bool,
+    is_draft: bool,
+    max_tokens: int,
+) -> None:
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32, num_attention_heads=4, num_key_value_heads=2
+        )
+
+        def get_num_attention_layers(self) -> int:
+            return 3
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._has_cp_helix = False
+    manager.num_local_layers = 3
+    manager.max_attention_window_vec = [504, 504, None]
+    manager.tokens_per_block = 32
+    manager.max_batch_size = 3
+    manager.max_num_tokens = 4096
+    manager._generation_kv_capacity_headroom = headroom
+    manager.enable_swa_scratch_reuse = scratch
+    manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: 64
+
+    cost = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            Mapping(),
+            tokens_per_block=32,
+            max_seq_len=16384,
+            max_batch_size=3,
+            max_num_tokens=4096,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False, max_attention_window=[504, 504, 16384]
+            ),
+            spec_config=spec_config,
+            is_draft=is_draft,
+            enable_swa_scratch_reuse=scratch,
+        )
+    )
+    # Each layer stores 64 B/token. The two SWA layers can share context
+    # scratch, but both retain their own generation pages. W=504 puts PARD's
+    # 11-token headroom across a page boundary that DFlash's 8 tokens fit under.
+    context_swa_bytes = 64 if scratch else 128
+    generation_bytes = 3 * 2 * generation_blocks * 32 * 64
+    expected_quota = max_tokens * 64 + min(max_tokens, 4096) * context_swa_bytes + generation_bytes
+    assert cost == CacheCost(slope=64, intercept=4096 * context_swa_bytes + generation_bytes)
+    assert manager._get_quota_from_max_tokens(max_tokens) == expected_quota
+    assert manager._get_max_tokens_from_quota(expected_quota) == max_tokens
 
 
 # ---------------------------------------------------------------------------
