@@ -135,6 +135,27 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
+def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
+    position_ids = [4, 7, 9]
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+        position_ids=position_ids,
+    )
+
+    assert llm_request.py_position_ids == position_ids
+    assert llm_request.child_requests[0].py_position_ids == position_ids
+    assert llm_request.child_requests[0].py_position_ids is not llm_request.py_position_ids
+
+
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""
 

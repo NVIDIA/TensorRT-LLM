@@ -309,16 +309,6 @@ void initBindings(nb::module_& m)
                 }
                 return lengths;
             })
-        .def_prop_ro("position_ids",
-            [](GenLlmReq& self)
-            {
-                std::optional<std::vector<GenLlmReq::SizeType32>> positionIds = std::nullopt;
-                if (self.getPositionIds())
-                {
-                    positionIds = *self.getPositionIds().value();
-                }
-                return positionIds;
-            })
         .def_prop_rw(
             "draft_tokens",
             [](GenLlmReq& self)
@@ -380,9 +370,7 @@ void initBindings(nb::module_& m)
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
                 tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
                 executor::SamplingConfig sampling_config, bool is_streaming,
-                std::optional<tb::LlmRequest::SizeType32> end_id,
-                std::optional<std::vector<tb::LlmRequest::SizeType32>> position_ids,
-                std::optional<at::Tensor> prompt_embedding_table,
+                std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
@@ -428,7 +416,7 @@ void initBindings(nb::module_& m)
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
 
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    end_id, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
+                    end_id, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
                     multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_embedding_tensor_ptr,
                     mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
                     lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
@@ -440,19 +428,19 @@ void initBindings(nb::module_& m)
                     multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
-            nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("position_ids") = std::nullopt,
-            nb::arg("prompt_embedding_table") = std::nullopt, nb::arg("prompt_vocab_size") = std::nullopt,
-            nb::arg("multimodal_hashes") = std::nullopt, nb::arg("multimodal_positions") = std::nullopt,
-            nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_uuids") = std::nullopt,
-            nb::arg("multimodal_embedding") = std::nullopt, nb::arg("mrope_rotary_cos_sin") = std::nullopt,
-            nb::arg("mrope_position_deltas") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
-            nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
-            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
-            nb::arg("draft_tokens") = std::nullopt, nb::arg("exclude_input_from_output") = false,
-            nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
-            nb::arg("client_id") = std::nullopt, nb::arg("priority") = executor::Request::kDefaultPriority,
-            nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
+            nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("prompt_embedding_table") = std::nullopt,
+            nb::arg("prompt_vocab_size") = std::nullopt, nb::arg("multimodal_hashes") = std::nullopt,
+            nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
+            nb::arg("multimodal_uuids") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
+            nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
+            nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
+            nb::arg("lora_config") = std::nullopt, nb::arg("kv_cache_retention_config") = std::nullopt,
+            nb::arg("return_log_probs") = false, nb::arg("return_context_logits") = false,
+            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
+            nb::arg("exclude_input_from_output") = false, nb::arg("encoder_input_tokens") = std::nullopt,
+            nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
+            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_features") = std::nullopt,
+            nb::arg("encoder_output_len") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("return_perf_metrics") = false,
             nb::arg("guided_decoding_params") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
