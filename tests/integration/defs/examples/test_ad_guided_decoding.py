@@ -16,10 +16,11 @@
 import json
 import os
 
+from tensorrt_llm.sampling_params import GuidedDecodingParams
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
 from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
-
-from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
 def test_autodeploy_guided_decoding_main_json():

@@ -22,6 +22,7 @@ import torch
 import tensorrt_llm._mnnvl_utils as mnnvl
 from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm.mapping import Mapping
 
 
 class _FakeComm:
@@ -757,3 +758,222 @@ def test_two_sided_combine_requires_new_prepare_before_next_dispatch(monkeypatch
 
     with pytest.raises(ValueError, match=r"requires prepare_dispatch\(\) to be called first"):
         communication.dispatch(None, None, None, None, [1])
+
+
+class _FakeSplitComm:
+    """Sub-communicator returned by _FakeWorld.Split()."""
+
+    def __init__(self, size):
+        self._size = size
+        self.freed = False
+
+    def Get_size(self):
+        return self._size
+
+    def Free(self):
+        self.freed = True
+
+
+class _FakeWorld:
+    """Minimal MPI world standing in for MPI_COMM_WORLD.
+
+    group_sizes maps a split color to the sub-communicator size MPI would report for it,
+    stated by the test instead of derived from the split rule under test: a get_comm() that
+    computed an unexpected color would raise here rather than quietly agree with itself.
+    """
+
+    def __init__(self, group_sizes):
+        self.group_sizes = group_sizes
+        self.split_calls = []
+
+    def Split(self, color, key):
+        self.split_calls.append((color, key))
+        return _FakeSplitComm(self.group_sizes[color])
+
+
+class _CommCacheMemory(mnnvl.MnnvlMemory):
+    """Isolated comm state, courtesy of MnnvlMemory.__init_subclass__."""
+
+
+def _moe_mapping(rank, *, tp_size, pp_size, moe_ep_size, world_size=4):
+    return Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=world_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        moe_tp_size=1,
+        moe_ep_size=moe_ep_size,
+        enable_attention_dp=True,
+    )
+
+
+def _install_world(monkeypatch, group_sizes):
+    world = _FakeWorld(group_sizes)
+    monkeypatch.setattr(mnnvl, "mpi_comm", lambda: world)
+    return world
+
+
+class _FakeCuda:
+    """Stands in for the driver module, faking only the one call this file reaches.
+
+    new_mnnvl_memory_address() reserves virtual address space; everything else,
+    _check_cu_result's CUresult lookup included, is served by the real module.
+    """
+
+    def __init__(self, real, address):
+        self._real = real
+        self._address = address
+        self.reserved_sizes = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def cuMemAddressReserve(self, size, alignment, addr, flags):
+        self.reserved_sizes.append(size)
+        return (self._real.CUresult.CUDA_SUCCESS, self._address)
+
+
+@pytest.fixture
+def comm_cache_cls():
+    def reset():
+        _CommCacheMemory.comm = None
+        _CommCacheMemory.comm_signature = None
+        _CommCacheMemory.allocated_map = {}
+        _CommCacheMemory.current_start_address = 0
+        _CommCacheMemory.current_rank_stride = 0
+        _CommCacheMemory.current_mem_offset = 0
+        _CommCacheMemory.current_address_comm_size = 0
+
+    reset()
+    yield _CommCacheMemory
+    reset()
+
+
+def test_get_comm_rebuilds_when_parallel_layout_changes(comm_cache_cls, monkeypatch):
+    """A reused MPI worker must not inherit the previous test's communicator.
+
+    The CI worker pool is keyed on world size alone, so a tp4/ep4 test and a tp2/pp2/ep2
+    test are served by the same process. The cached communicator's size becomes the
+    leading dimension of the MoE workspace (as_torch_strided_tensor), so a stale one used
+    to fail the epSize check inside the all-to-all kernel instead of being rejected here.
+    """
+
+    def polluter(rank):
+        return _moe_mapping(rank, tp_size=4, pp_size=1, moe_ep_size=4)
+
+    def victim(rank):
+        return _moe_mapping(rank, tp_size=2, pp_size=2, moe_ep_size=2)
+
+    # Rank 0 lands in the first PP group either way; that group spans the whole world
+    # under tp4/pp1 and only half of it under tp2/pp2.
+    _install_world(monkeypatch, {0: 4})
+    stale = comm_cache_cls.get_comm(polluter(0))
+    assert stale.Get_size() == polluter(0).moe_ep_size == 4
+
+    _install_world(monkeypatch, {0: 2})
+    fresh = comm_cache_cls.get_comm(victim(0))
+
+    assert fresh is not stale
+    assert fresh.Get_size() == victim(0).moe_ep_size == 2
+    # Dropped, never freed. MPI_Comm_free is collective and allocated_map empties by
+    # per-rank object lifetime, so no local answer to "is anyone still using it" may gate
+    # the free; see drop_cached_comm().
+    assert not stale.freed
+
+
+def test_get_comm_reuses_communicator_within_one_layout(comm_cache_cls, monkeypatch):
+    """An equal-but-distinct mapping must hit the cache: Split() is collective.
+
+    Rebuilding unconditionally would satisfy the test above just as well, while putting a
+    collective on a path whose callers expect a lookup.
+    """
+
+    def layout(rank):
+        return _moe_mapping(rank, tp_size=4, pp_size=1, moe_ep_size=4)
+
+    world = _install_world(monkeypatch, {0: 4})
+
+    first = comm_cache_cls.get_comm(layout(0))
+    second = comm_cache_cls.get_comm(layout(0))
+
+    assert second is first
+    assert len(world.split_calls) == 1
+
+
+def test_comm_layout_signature_is_rank_invariant():
+    """Every rank must reach the same cache verdict, or Split() deadlocks.
+
+    If the signature embedded a per-rank field, one rank could reuse the cached
+    communicator while the others blocked in the collective Split().
+    """
+    signatures = {
+        mnnvl.MnnvlMemory.comm_layout_signature(
+            _moe_mapping(rank, tp_size=2, pp_size=2, moe_ep_size=2)
+        )
+        for rank in range(4)
+    }
+
+    assert len(signatures) == 1
+
+
+def test_allocation_keeps_its_own_layout_after_the_comm_is_rebuilt(memory, monkeypatch):
+    """An allocation is described by the layout it was mapped with, not the current one.
+
+    Rebuilding the class-level communicator lets an allocation outlive the communicator it
+    was created with, so its segment count and its handle index have to keep coming from
+    its own record. The hazard exists only because get_comm() can now rebuild at all.
+    """
+    obj, record = memory
+    obj.segment_size = record.aligned_size
+    obj.rank_stride = record.rank_stride
+
+    seen = {}
+
+    def fake_pack(ptr, segment_size, rank_stride, num_segments, dtype, dev_id):
+        seen["num_segments"] = num_segments
+        return "tensor"
+
+    monkeypatch.setattr(mnnvl, "pack_strided_memory", fake_pack)
+    # A communicator for a different, larger layout, as get_comm() would leave behind.
+    monkeypatch.setattr(
+        _TestMnnvlMemory, "comm", _FakeComm(rank=1, size=4, membership=(0, 1, 2, 3))
+    )
+
+    assert obj.as_torch_strided_tensor(torch.uint64) == "tensor"
+    assert seen["num_segments"] == record.comm_size == 2
+    assert obj.local_mem_handle == record.mem_handles[record.comm_rank] == 11
+
+
+def test_reserved_address_range_is_not_shared_across_communicator_sizes(
+    comm_cache_cls, monkeypatch
+):
+    """A reserved range belongs to the rank count it was reserved for.
+
+    The range is one slot of rank_stride bytes per rank, so free bytes inside a slot do not
+    make it reusable on their own. A larger communicator would map its extra ranks past the
+    end of the range, and a range shared by two rank counts would be handed to
+    cuMemAddressFree with a length matching neither, since close_mnnvl_memory() reads that
+    length off whichever allocation closes last. Before get_comm() could rebuild, the rank
+    count could not change within a process and the byte check alone was sufficient.
+    """
+    stride = mnnvl.MnnvlMemory.fabric_page_size
+    quarter = stride // 4
+    _install_world(monkeypatch, {0: 2})
+    cuda_stub = _FakeCuda(mnnvl.cuda, address=1 << 40)
+    monkeypatch.setattr(mnnvl, "cuda", cuda_stub)
+
+    comm_cache_cls.new_mnnvl_memory_address(
+        _moe_mapping(0, tp_size=2, pp_size=2, moe_ep_size=2), quarter
+    )
+    # What open_mnnvl_memory() would leave behind after placing one allocation.
+    comm_cache_cls.current_mem_offset = quarter
+
+    assert cuda_stub.reserved_sizes == [stride * 2]
+    assert comm_cache_cls.current_address_comm_size == 2
+    # Three quarters of the slot are free, so only the rank count separates these.
+    assert comm_cache_cls._address_window_fits(quarter, 2)
+    assert not comm_cache_cls._address_window_fits(quarter, 4)
+    assert not comm_cache_cls._address_window_fits(quarter, 1)
+    # A matching rank count does not excuse an allocation that overruns the slot.
+    assert not comm_cache_cls._address_window_fits(stride, 2)

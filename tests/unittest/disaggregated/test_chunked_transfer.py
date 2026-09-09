@@ -69,6 +69,7 @@ def _stub_sender():
 def _stub_receiver():
     """Create a stub receiver with no-op methods needed by RxSession."""
     receiver = MagicMock()
+    receiver._enforce_physical_ownership = False
     receiver.setup_session = MagicMock()
     receiver.dispatch_task = MagicMock()
     return receiver
@@ -557,7 +558,7 @@ def test_pipelined_transfer_rejects_bounce_buffer():
 def test_pipelined_transfer_rejects_mamba_cache_manager():
     """Pipelined transfer does not support recurrent-state cache managers."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1)
@@ -576,8 +577,10 @@ def test_pipelined_transfer_rejects_mamba_cache_manager():
 
 def test_python_transceiver_rejects_cpp_mamba_cache_manager():
     """Python transceiver requires separate Python-managed Mamba state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import create_kv_cache_transceiver
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        CppMambaHybridCacheManager,
+    )
 
     kv_cache_manager = object.__new__(CppMambaHybridCacheManager)
     cache_transceiver_config = CacheTransceiverConfig(
@@ -903,10 +906,10 @@ def test_failed_pipelined_send_retires_without_mutating_request_state():
         py_kv_send_session_retired=False,
     )
     session = MagicMock()
+    session._enforce_physical_ownership = False
+    transceiver = object.__new__(KvCacheTransceiverV2)
 
-    KvCacheTransceiverV2._close_failed_sessions(
-        MagicMock(), {42: session}, {42: request}, [42], mark_retired=True
-    )
+    transceiver._close_failed_sessions({42: session}, {42: request}, [42], mark_retired=True)
 
     assert request.state == LlmRequestState.CONTEXT_INIT
     assert request.py_kv_send_session_retired
@@ -952,7 +955,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         py_beam_width=1,
         py_kv_send_session_retired=False,
         prepopulated_prompt_len=0,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         set_kv_cache_transfer_start=lambda _ts: None,
         state=LlmRequestState.CONTEXT_INIT,
     )

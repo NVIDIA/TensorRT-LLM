@@ -23,6 +23,11 @@ bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | s
 source "$bashUtilsPath"
 
 slurm_install_setup() {
+    : "${tarName:?tarName is required}"
+    : "${llmTarfile:?llmTarfile is required}"
+    : "${resourcePathNode:?resourcePathNode is required}"
+    : "${stageName:?stageName is required}"
+    : "${pytestCommand:?pytestCommand is required}"
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
@@ -74,7 +79,6 @@ slurm_install_setup() {
                 "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl" \
                 "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_${mambaArch}.whl"
         fi
-        retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
         retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
