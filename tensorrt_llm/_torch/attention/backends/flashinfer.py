@@ -125,6 +125,35 @@ def _get_page_table_num_blocks(kv_cache_manager, request_ids,
     ]
 
 
+def _get_blocks_in_primary_pool(kv_cache_manager) -> int:
+    """Primary-pool block count, for V2 and V1 KV cache managers alike.
+
+    ``KVCacheManagerV2`` always exposes ``blocks_in_primary_pool``. The V1
+    ``KVCacheManager`` only assigns that scalar when it ends up with a single
+    pool: the VSWA sizing path fills ``blocks_per_window`` instead and leaves
+    the scalar unset (see the FIXME next to it in
+    ``pyexecutor/resource_manager.py``). A bare attribute read here therefore
+    raises ``AttributeError`` for any VSWA model routed to a V1 manager.
+    Disaggregated serving is one such route: a model preference for V2 is
+    demoted to V1 outside the NIXL + Python-transceiver combination.
+
+    Fall back to the largest per-window primary count. That is an upper bound
+    across the pools, so the page-index buffer sized from it stays large
+    enough for every pool.
+    """
+    blocks_in_primary_pool = getattr(kv_cache_manager, 'blocks_in_primary_pool',
+                                     None)
+    if blocks_in_primary_pool is not None:
+        return int(blocks_in_primary_pool)
+    blocks_per_window = getattr(kv_cache_manager, 'blocks_per_window', None)
+    if not blocks_per_window:
+        raise AttributeError(
+            f"{type(kv_cache_manager).__name__} exposes neither "
+            "'blocks_in_primary_pool' nor a non-empty 'blocks_per_window'; "
+            "the FlashInfer backend cannot size its page-index buffer.")
+    return max(int(primary) for primary, _ in blocks_per_window.values())
+
+
 def _append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
@@ -1067,7 +1096,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._primary_kv_pool_id = 0
 
         if self.kv_cache_manager is not None:
-            blocks_in_primary_pool = self.kv_cache_manager.blocks_in_primary_pool
+            blocks_in_primary_pool = _get_blocks_in_primary_pool(
+                self.kv_cache_manager)
             attention_layer_indices = _get_attention_layer_indices(
                 self.kv_cache_manager)
 
