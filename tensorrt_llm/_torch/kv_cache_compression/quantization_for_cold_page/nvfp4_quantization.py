@@ -37,7 +37,7 @@ _ELEMENTS_PER_SCALE = 16
 _ELEMENTS_PER_HALF_GROUP = 8
 _MAX_HALF_GROUPS_PER_TILE = 2048
 _MAX_BUFFERS_PER_LAUNCH = 256
-_WIDE_FIELDS = 7
+_WIDE_FIELDS = 6
 _INTEGER_FIELDS = 6
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
@@ -426,8 +426,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             )
             layer_start = cold_page_bytes
             scale_start = layer_start + compressed_count * packed_bytes
-            suffix_start = scale_start + compressed_count * scale_bytes
-            cursor = suffix_start + compressed_count * suffix_bytes
+            scale_and_suffix_bytes = scale_bytes + suffix_bytes
+            cursor = scale_start + compressed_count * scale_and_suffix_bytes
 
             compressed_index = 0
             for buffer in layout.buffers:
@@ -441,10 +441,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
 
                 if is_compressed:
                     data_offset = layer_start + compressed_index * packed_bytes
-                    scale_offset = scale_start + compressed_index * scale_bytes
-                    suffix_offset = (
-                        suffix_start + compressed_index * suffix_bytes if suffix_bytes else 0
-                    )
+                    scale_offset = scale_start + compressed_index * scale_and_suffix_bytes
                     compressed_index += 1
                     if raw_bytes != expected_raw_bytes:
                         raise ValueError("Hot buffer size does not match NVFP4 geometry")
@@ -459,7 +456,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 else:
                     data_offset = cursor
                     scale_offset = 0
-                    suffix_offset = 0
                     cursor += raw_bytes
 
                 wide_rows.append(
@@ -470,7 +466,6 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         data_offset,
                         scale_offset,
                         0,
-                        suffix_offset,
                     ]
                 )
                 integer_rows.append(

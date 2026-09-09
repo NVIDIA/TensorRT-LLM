@@ -77,7 +77,6 @@ struct Nvfp4ColdPageTestBuffer
     std::uint32_t coldPaddingBytes;
     Nvfp4ColdPageTransform transform;
     Nvfp4ColdPageKernelParams params;
-    std::size_t coldSuffixOffset{};
 };
 
 struct Nvfp4ColdPageTestMetadata
@@ -104,7 +103,7 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
         metadata.wide[index] = {static_cast<std::int64_t>(buffer.rawBase),
             static_cast<std::int64_t>(buffer.rawSlotBytes), static_cast<std::int64_t>(buffer.rawBytes),
             static_cast<std::int64_t>(buffer.coldDataOffset), static_cast<std::int64_t>(buffer.coldScaleOffset),
-            static_cast<std::int64_t>(buffer.coldPaddingOffset), static_cast<std::int64_t>(buffer.coldSuffixOffset)};
+            static_cast<std::int64_t>(buffer.coldPaddingOffset)};
         metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
             static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
             buffer.params.headDim, buffer.params.rawRowStrideElements};
@@ -1018,7 +1017,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     {
         std::vector<Nvfp4ColdPageTestBuffer> const buffers{
             {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, payloadBytes,
-                paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params, packed + scales}};
+                paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);
@@ -1121,7 +1120,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
         std::size_t const payloadBytes = packed + scales + suffix;
         std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
             rawPageBytes, 0U, packed, payloadBytes, static_cast<std::uint32_t>(coldPageBytes - payloadBytes),
-            Nvfp4ColdPageTransform::kNvfp4, params, packed + scales}};
+            Nvfp4ColdPageTransform::kNvfp4, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);

@@ -310,7 +310,6 @@ def test_omitted_scale_checkpoint_uses_identity_and_keeps_kv_geometry():
     assert metadata.cold_page_bytes == 2880
     assert metadata.wide[:2, 3].tolist() == [0, 1280]
     assert metadata.wide[:2, 4].tolist() == [2560, 2720]
-    assert metadata.wide[:2, 6].tolist() == [0, 0]
     assert metadata.integers[:2, 0].tolist() == [0, 0]
     assert metadata.integers[:2, 5].tolist() == [128, 128]
 
@@ -436,7 +435,7 @@ def test_codec_state_metadata_stays_on_cpu_with_non_cpu_default_device() -> None
     with torch.device("meta"):
         metadata = _configure_default_lifecycle(native, raw_bytes=2048)
     for tensor, dtype, shape in (
-        (metadata.wide, torch.int64, (256, 7)),
+        (metadata.wide, torch.int64, (256, 6)),
         (metadata.integers, torch.int32, (256, 6)),
         (metadata.scales, torch.float32, (256, 4)),
     ):
@@ -817,7 +816,6 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     assert metadata.cold_page_bytes == cold_page_bytes
     assert metadata.wide[:2, 3].tolist() == [0, indexer_offset]
     assert metadata.wide[:2, 4].tolist() == [7168, 0]
-    assert metadata.wide[:2, 6].tolist() == [8064, 0]
     assert metadata.integers[0].tolist() == [0, 0, 1, 32, 448, 512]
     assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0]
 

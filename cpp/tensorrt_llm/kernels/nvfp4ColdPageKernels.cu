@@ -63,7 +63,6 @@ enum WideField : std::uint32_t
     kColdDataOffset,
     kColdScaleOffset,
     kColdPaddingOffset,
-    kColdSuffixOffset,
 };
 
 enum IntegerField : std::uint32_t
@@ -110,7 +109,6 @@ struct Nvfp4ColdPageBuffer
     std::size_t coldDataOffset;
     std::size_t coldScaleOffset;
     std::size_t coldPaddingOffset;
-    std::size_t coldSuffixOffset;
     std::uint32_t coldPaddingBytes;
     Nvfp4ColdPageTransform transform;
     Nvfp4ColdPageKernelParams params;
@@ -185,10 +183,17 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
     return {static_cast<std::uintptr_t>(w[kRawBase]), static_cast<std::size_t>(w[kRawSlotBytes]),
         static_cast<std::size_t>(w[kRawBytes]), static_cast<std::size_t>(w[kColdDataOffset]),
         static_cast<std::size_t>(w[kColdScaleOffset]), static_cast<std::size_t>(w[kColdPaddingOffset]),
-        static_cast<std::size_t>(w[kColdSuffixOffset]), static_cast<std::uint32_t>(i[kColdPaddingBytes]),
-        static_cast<Nvfp4ColdPageTransform>(i[kTransform]),
+        static_cast<std::uint32_t>(i[kColdPaddingBytes]), static_cast<Nvfp4ColdPageTransform>(i[kTransform]),
         {i[kNumKvHeads], i[kTokensPerPage], i[kHeadDim], i[kRawRowStrideElements], s[kNvfp4ScaleOrigQuant],
             s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant], s[kFp8ScaleQuantOrig]}};
+}
+
+// A strided buffer stores its unquantized row suffix immediately after its NVFP4 scales.
+__device__ constexpr std::size_t coldSuffixOffset(Nvfp4ColdPageBuffer const& buffer)
+{
+    return buffer.coldScaleOffset + static_cast<std::size_t>(buffer.params.numKvHeads)
+        * static_cast<std::size_t>(buffer.params.tokensPerPage) * static_cast<std::size_t>(buffer.params.headDim)
+        / kElementsPerScaleGroup;
 }
 
 __device__ OffloadBufferTask resolveOffloadTask(
@@ -198,7 +203,7 @@ __device__ OffloadBufferTask resolveOffloadTask(
     auto* coldPage = coldBase + static_cast<std::size_t>(page.dst) * coldPageBytes;
     return {reinterpret_cast<std::uint8_t const*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes),
         coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldPaddingOffset,
-        coldPage + buffer.coldSuffixOffset};
+        coldPage + coldSuffixOffset(buffer)};
 }
 
 __device__ OnboardBufferTask resolveOnboardTask(PageIndexPairView const& page, Nvfp4ColdPageBuffer const& buffer,
@@ -206,7 +211,7 @@ __device__ OnboardBufferTask resolveOnboardTask(PageIndexPairView const& page, N
 {
     std::size_t const gpuPage = static_cast<std::size_t>(page.dst);
     auto const* coldPage = coldBase + static_cast<std::size_t>(page.src) * coldPageBytes;
-    return {coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldSuffixOffset,
+    return {coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + coldSuffixOffset(buffer),
         reinterpret_cast<std::uint8_t*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes)};
 }
 
