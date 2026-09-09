@@ -44,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
+    TorchLlmArgs,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -660,9 +661,7 @@ def test_nemotron_nano_v2_vl_defaults_keep_block_reuse_opt_in():
     the two, block reuse stays on with no Mamba state snapshot policy and no
     warning.
     """
-    # `NemotronHForCausalLM.get_model_defaults` returns a constant, so the
-    # args object only has to exist.
-    llm_args = SimpleNamespace()
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
 
     defaults = NemotronH_Nano_VL_V2.get_model_defaults(llm_args)
 

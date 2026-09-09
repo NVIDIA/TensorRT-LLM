@@ -2912,31 +2912,17 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             weights.mark_consumed("language_model")
 
     @property
-    def vocab_size_padded(self) -> int:
-        return self.llm.vocab_size_padded
-
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
-
-    @property
     def language_model(self) -> torch.nn.Module:
-        # `MultimodalModelMixin.set_guided_decoder` reaches the inner model
-        # through this property, and its base implementation raises. Without it
-        # guided decoding plus a one-model speculative mode (MTP) dies with
-        # `NotImplementedError` at executor creation.
+        # `MultimodalModelMixin` routes `vocab_size_padded`,
+        # `infer_max_seq_len` and `set_guided_decoder` through this property,
+        # and its base implementation raises.
         return self.llm
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        # `ModelLoader` applies `get_model_defaults()` on the resolved outer
-        # model class (this VL wrapper), not on the inner decoder, so the inner
-        # `NemotronHForCausalLM` defaults were never reaching the user's args.
-        # Delegate to keep block reuse opt-in until a Mamba state snapshot
-        # policy is configured. The hybrid auto-disable in
-        # `_validate_and_adjust_mamba_snapshot_config` cannot cover this: it
-        # tests `is_nemotron_hybrid`, which reads a flat
-        # `hybrid_override_pattern` that only appears on the inner config after
-        # `post_config` below reassigns `pretrained_config`.
+        # `ModelLoader` reads this hook off the resolved outer model class
+        # (this VL wrapper), not the inner decoder, so delegate to keep block
+        # reuse opt-in until a Mamba state snapshot policy is configured.
         return NemotronHForCausalLM.get_model_defaults(llm_args)
 
     def post_config(self):
