@@ -274,6 +274,10 @@ llm_perf_core:
   #deepseek_v4_pro_base_fp8 (1.6T MoE, FP8 block-scale, 8-GPU B300)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-bench-pytorch-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_base_fp8-bench-pytorch-float8-maxbs:32-maxnt:8448-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  #kimi_k3 (TEP8 interactive serving, 8-GPU)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-streaming-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:20-con:4-ep:8-tp:8-gpus:8] TIMEOUT (120)
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT (120) #min_latency
+  - perf/test_perf.py::test_perf[kimi_k3-serve-pytorch-float4-maxbs:16-maxnt:8208-kv_frac:0.25-input_output_len:8192,1024-reqs:80-con:16-ep:8-tp:8-gpus:8] TIMEOUT (120) #max_throughput
 
 
 # 9: H100, B200, B300, RTX6000-Server test cases
