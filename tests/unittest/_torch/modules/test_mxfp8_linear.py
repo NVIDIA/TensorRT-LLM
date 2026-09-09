@@ -20,9 +20,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
 import tensorrt_llm._torch.modules.linear as linear_module
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
     MXFP8GemmRunner,
     _get_mxfp8_large_m_tuning_buckets,
     _map_to_mxfp8_large_m_bucket,
@@ -527,5 +529,83 @@ def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
         with flashinfer_mxfp8_decode_graph_capture():
             graph_output = flashinfer_linear(static_x)
     assert flashinfer_gemm.call_count == 1
+    graph.replay()
+    torch.testing.assert_close(graph_output, native_output, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(),
+    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+)
+@pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
+def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_size):
+    """Per-bucket tuned decode graphs must match the native op.
+
+    Profile the quantizer and GEMM backends for a decode bucket during the
+    warmup-only pass, then capture the same shape and replay it. This covers
+    the CuTeDSL scale layouts and the in-process winner cache used by capture.
+    """
+    if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
+        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
+
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    torch.manual_seed(0)
+    out_f, in_f = 256, 512
+    weight = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    weight_e4m3, weight_scale = quant_bf16_to_mxfp8(weight, 32)
+    x = torch.randn(batch_size, in_f, dtype=torch.bfloat16, device="cuda")
+    quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+
+    native = Linear(
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+    ).cuda()
+    tuned = Linear(
+        in_features=in_f,
+        out_features=out_f,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=quant_config,
+    ).cuda()
+    weights = [{"weight": weight_e4m3, "weight_scale_inv": weight_scale}]
+    native.load_weights(weights)
+    tuned.load_weights(weights)
+    native_output = native(x)
+
+    method = tuned.quant_method
+    assert isinstance(method, MXFP8LinearMethod)
+    assert method.enable_flashinfer_auto()
+    method.tune_decode_graph_backends = True
+
+    # Record the (quantize, GEMM) tactics each pass selects.
+    chosen_tactics = []
+    choose_tactic = custom_ops_module._choose_mxfp8_tactic
+
+    def record_tactic(*args, **kwargs):
+        tactic = choose_tactic(*args, **kwargs)
+        chosen_tactics.append(tactic)
+        return tactic
+
+    monkeypatch.setattr(custom_ops_module, "_choose_mxfp8_tactic", record_tactic)
+
+    # Warmup-only pass: profile both backends of each stage for this bucket.
+    with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
+        warmup_output = tuned(x)
+    torch.testing.assert_close(warmup_output, native_output, rtol=2e-2, atol=2e-2)
+    assert len(chosen_tactics) == 2
+    warmup_tactics = tuple(chosen_tactics)
+    chosen_tactics.clear()
+
+    # Capture pass: the in-process winners are reused without profiling.
+    static_x = x.clone()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        with flashinfer_mxfp8_decode_graph_capture():
+            graph_output = tuned(static_x)
+    assert tuple(chosen_tactics) == warmup_tactics
     graph.replay()
     torch.testing.assert_close(graph_output, native_output, rtol=2e-2, atol=2e-2)
