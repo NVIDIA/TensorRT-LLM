@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +48,11 @@ class TestTritonKernelsVendoring(unittest.TestCase):
         self.assertTrue(license_file.exists(), f"LICENSE file not found at {license_file}.")
 
     def test_version_matches_requirements(self):
-        """Verify vendored triton_kernels VERSION matches triton version in requirements.txt."""
+        """Verify vendored triton_kernels VERSION matches the triton lower bound in requirements.txt.
+
+        The requirement is either an exact pin (``triton==X``) or a range
+        (``triton>=X,<=Y``); the vendored copy tracks the lower bound either way.
+        """
         import re
 
         repo_root = Path(__file__).parent.parent.parent.parent
@@ -59,7 +63,10 @@ class TestTritonKernelsVendoring(unittest.TestCase):
         requirements_file = repo_root / "requirements.txt"
         requirements_text = requirements_file.read_text()
 
-        match = re.search(r"^triton==([^\s#]+)", requirements_text, re.MULTILINE)
+        # The first specifier is the lower bound for both `triton==X` and `triton>=X,<=Y`.
+        match = re.search(
+            r"^triton[ \t]*[<>~!=]*=[ \t]*([^\s,#]+)", requirements_text, re.MULTILINE
+        )
         self.assertIsNotNone(match, "Could not find triton version in requirements.txt")
         requirements_version = match.group(1)
 
