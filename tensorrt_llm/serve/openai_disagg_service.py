@@ -32,6 +32,7 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     DisaggScheduleStyle,
     ModelList,
+    PromptTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
     UCompletionRequest,
@@ -80,10 +81,20 @@ def _ctx_usage_info(response: UCompletionResponse) -> Optional[UsageInfo]:
     usage = getattr(response, "usage", None)
     if usage is None or isinstance(usage, UsageInfo):
         return usage
+    # The cached count has to make the trip too. It is the one number the
+    # generation worker cannot recompute: from there the whole prompt arrived
+    # as transferred KV, so its own cached_tokens is the prompt length and
+    # reporting it would say every request was a full cache hit. Dropping it
+    # here left `ctx_usage` carrying three of the four numbers, so a consumer
+    # that read it still had to invent the fourth.
+    cached = getattr(usage, "input_tokens_details", None)
     return UsageInfo(
         prompt_tokens=usage.input_tokens,
         completion_tokens=usage.output_tokens,
         total_tokens=usage.total_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=getattr(cached, "cached_tokens", 0) or 0
+        ),
     )
 
 

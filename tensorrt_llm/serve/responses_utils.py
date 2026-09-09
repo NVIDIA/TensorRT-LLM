@@ -48,6 +48,7 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
                                                   ReasoningParserFactory,
@@ -71,7 +72,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ResponseUsage,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
-                                                UCompletionResponse,
+                                                UCompletionResponse, UsageInfo,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
@@ -1686,6 +1687,25 @@ def _tool_call_output_item(
     return item
 
 
+def _ctx_usage_from_result(final_res: GenerationResult) -> Optional[Any]:
+    """The context phase's usage, as the handoff left it on the outputs.
+
+    Mirrors the chat path's `_ctx_usage_from_outputs`. An aggregated server has
+    no handoff and returns None, which leaves the caller on the local counts.
+    """
+    for output in getattr(final_res, "outputs", None) or []:
+        disaggregated_params = getattr(output, "disaggregated_params", None)
+        if disaggregated_params is None:
+            continue
+        ctx_usage = getattr(disaggregated_params, "ctx_usage", None)
+        if ctx_usage is None:
+            continue
+        if isinstance(ctx_usage, UsageInfo):
+            return ctx_usage
+        return UsageInfo.model_validate(ctx_usage)
+    return None
+
+
 def _create_usage(
         final_res: GenerationResult,
         num_prompt_tokens: Optional[int] = None) -> Optional[ResponseUsage]:
@@ -1711,6 +1731,19 @@ def _create_usage(
     input_tokens = num_prompt_tokens
     output_tokens = sum(len(output.token_ids) for output in final_res.outputs)
     cached_tokens = getattr(final_res, "cached_tokens", None) or 0
+
+    # Under disaggregated serving the counts above describe the generation
+    # worker, and from there the entire prompt arrived as KV transferred from
+    # the context worker -- so its cached_tokens equals the prompt length and
+    # every response claims a complete cache hit. The context phase is the only
+    # place that knows what was really reused, and it sends its own usage along
+    # with the handoff. Chat completions has taken it from there since #14177;
+    # this route was reading the generation worker's numbers instead.
+    ctx_prompt_tokens, ctx_cached_tokens = get_usage_tokens_from_ctx(
+        _ctx_usage_from_result(final_res))
+    if ctx_prompt_tokens is not None:
+        input_tokens = ctx_prompt_tokens
+        cached_tokens = ctx_cached_tokens
 
     return ResponseUsage(
         input_tokens=input_tokens,
