@@ -209,9 +209,10 @@ Generally, we create a YAML file that contains various performance switches. For
 
 ```yaml
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
 print_iter_log: true
-kv_cache_dtype: fp8
+kv_cache_config:
+  dtype: fp8
 enable_attention_dp: true
 ```
 

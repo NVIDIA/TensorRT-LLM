@@ -1542,6 +1542,9 @@ class PyTorchModelEngine(ModelEngine):
         # nvcc-driven JIT compile (~3s stall inside _prepare_inputs) on
         # first touch. Pre-touching every bucket funnels that cost into
         # warmup. No-op on non-DSA models.
+        # Both DSA hooks read attn_metadata, which only a warmup forward
+        # creates; build it when every forward above was skipped.
+        self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
         self._warmup_dg_paged_mqa_logits_metadata()
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
         self._warmup_cute_dsl_radix_topk()
@@ -1720,6 +1723,30 @@ class PyTorchModelEngine(ModelEngine):
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("indexer-Q CuTe DSL prewarm complete")
+
+    def _ensure_dsa_attn_metadata_for_warmup(
+            self, resource_manager: ResourceManager) -> None:
+        """Build the DSA attention metadata if no warmup forward created it, so
+        the top-K pre-compile hooks still run (draft engine, guided decoder or
+        context-only server without general warmup). No-op unless DSA."""
+        if getattr(self, "attn_metadata", None) is not None:
+            return
+        try:
+            from ..attention.backends.sparse.dsa import \
+                DSAtrtllmAttentionMetadata
+        except ImportError:
+            return
+        metadata_cls = getattr(self.attn_backend, "Metadata", None)
+        if metadata_cls is None or not issubclass(metadata_cls,
+                                                  DSAtrtllmAttentionMetadata):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if kv_cache_manager is None:
+            return
+        self._set_up_attn_metadata(
+            kv_cache_manager,
+            self._get_draft_kv_cache_manager(resource_manager))
 
     def _warmup_cute_dsl_radix_topk(self) -> None:
         """Pre-compile the DSA radix-filter CuTe DSL decode top-k for every
