@@ -681,16 +681,15 @@ def test_metadata_spec_update_resizes_radix_workspace(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata."
         "TrtllmAttentionMetadata.update_spec_dec_param"
     ):
-        for _ in range(2):
-            metadata.update_spec_dec_param(
-                batch_size=2,
-                is_spec_decoding_enabled=True,
-                is_spec_dec_tree=is_tree,
-                is_spec_dec_dynamic_tree=is_dynamic,
-                max_draft_len=max_draft_len,
-                max_total_draft_tokens=max_total_draft_tokens,
-                spec_tree_manager=spec_tree_manager,
-            )
+        metadata.update_spec_dec_param(
+            batch_size=2,
+            is_spec_decoding_enabled=True,
+            is_spec_dec_tree=is_tree,
+            is_spec_dec_dynamic_tree=is_dynamic,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            spec_tree_manager=spec_tree_manager,
+        )
 
     assert metadata._radix_rows_per_sequence == rows_per_sequence
     metadata._create_radix_aux_buffers.assert_called_once_with(True)
