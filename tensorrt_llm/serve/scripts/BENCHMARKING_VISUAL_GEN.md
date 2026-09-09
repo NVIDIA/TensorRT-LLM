@@ -108,27 +108,25 @@ sequenceDiagram
     participant C as benchmark_visual_gen<br/>(client)
     participant S as trtllm-serve
 
-    Note over C: load --workload: merge common_params, read every path
+    C->>C: load --workload: merge common_params, read every path
 
     alt image backend
         C->>S: POST /v1/images/generations | /v1/images/edits
-        S-->>C: 200 + body + Server-Timing
-        Note right of S: e2e_latency only
-    else video backend
-        C->>S: POST /v1/videos
-        Note right of S: 202 + job id
-        C->>S: GET /v1/videos/{id}
-        Note right of S: every --poll-interval
-        S-->>C: status: postprocessing
-        Note right of S: ends gen_latency
-        S-->>C: status: completed
-        C->>S: GET /v1/videos/{id}/content
-        S-->>C: 200 + media + Server-Timing
-        Note right of S: ends e2e_latency
+        S-->>C: 200 + body + Server-Timing (ends e2e_latency)
     end
 
-    Note over C: --output-media-dir writes outside the concurrency slot
-    Note over C: aggregate, and exit non-zero if any request failed
+    alt video backend
+        C->>S: POST /v1/videos
+        S-->>C: 202 + job id
+        C->>S: GET /v1/videos/{id} (every --poll-interval)
+        S-->>C: status: postprocessing (ends gen_latency)
+        S-->>C: status: completed
+        C->>S: GET /v1/videos/{id}/content
+        S-->>C: 200 + media + Server-Timing (ends e2e_latency)
+    end
+
+    C->>C: --output-media-dir writes outside the concurrency slot
+    C->>C: aggregate, and exit non-zero if any request failed
 ```
 
 ```math
