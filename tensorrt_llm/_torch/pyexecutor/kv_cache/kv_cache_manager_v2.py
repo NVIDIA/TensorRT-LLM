@@ -2567,6 +2567,32 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return request_id % self.num_locality_domains
 
+    def get_locality_domain(self, request_id: int) -> int:
+        """Return the locality domain index assigned to an allocated request."""
+        if self.num_locality_domains <= 1:
+            return 0
+        kv_cache = self.kv_cache_map.get(request_id)
+        assert kv_cache is not None, (
+            f"get_locality_domain: request {request_id} has no allocated KV cache "
+            f"(num_locality_domains={self.num_locality_domains}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        locality_domain_id = getattr(kv_cache, "locality_domain_id", None)
+        assert locality_domain_id is not None, (
+            f"get_locality_domain: request {request_id} has no concrete locality_domain_id "
+            f"(num_locality_domains={self.num_locality_domains}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        return locality_domain_id
+
+    def get_per_locality_domain_free_slots(self) -> list[int]:
+        """Free slot count per locality domain, summed across all pool groups."""
+        getter = getattr(self.impl, "get_per_locality_domain_free_slots", None)
+        if getter is not None:
+            return getter()
+        peak_stats = self.impl.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
+        return [sum(pg.available for pg in peak_stats)]
+
     def _request_locality_domain_id(self, req: LlmRequest) -> int | None:
         """Return the request-owned locality domain id after validating the invariant."""
         locality_domain_id = getattr(req, "py_locality_domain_id", None)
@@ -4007,6 +4033,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
+                    assert (
+                        getattr(draft_kv_cache, "locality_domain_id", None)
+                        == draft_locality_domain_id
+                    )
                     success = draft_kv_cache.resume(draft_kv_cache_manager._stream.cuda_stream)
                     if not success:
                         release_resources(req, free_draft_resources=True)
