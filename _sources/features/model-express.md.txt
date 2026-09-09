@@ -27,6 +27,8 @@ profiles:
 |---------|------------|-----------------|-------|----------|----------------------|-------------|
 | `llama-for-causal-lm-target-v1` | `LlamaForCausalLM` | `LlamaForCausalLM` / `llama` | Target model | 1 | `trtllm-llama-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -38,6 +40,18 @@ The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact `Qwen2ForCausalLM` / `qwen2` pair and satisfy the constraints above.
 Other Qwen roots and variants, including checkpoints with tied embeddings, do
 not match this profile.
+
+The Mistral identity covers dense Hugging Face-format checkpoints that resolve
+to the exact `MistralForCausalLM` / `mistral` pair and whose realized attention
+runs without a sliding window on every layer; Mistral-7B-Instruct-v0.3 is the
+qualified canary. Checkpoints that enable `sliding_window`, including
+Ministral-style `layer_types` mixes, do not match this profile. YaRN scaling
+and tied embeddings are separate constraints that also exclude a checkpoint.
+The native `mistral` checkpoint format (`params.json` with
+`consolidated.safetensors`) is a separate `checkpoint_format` that rewrites the
+model type to `mistral_common`; it cannot be combined with the MX loading path.
+The unregistered Llama-based `MistralForCausalLM` class in `modeling_llama.py`
+shares components with the qualified root but is not qualified.
 
 TensorRT LLM applies two independent compatibility gates:
 
@@ -57,14 +71,21 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Llama and Qwen2 profiles are text-only and do not enable reward-model, MoE,
-or vision-language roots. FP16, quantized weights or KV cache, alternate
-attention backends, YaRN or unfused RoPE, tied embeddings, TP greater than 2,
-PP greater than 1, CP greater than 1, LoRA, sparse attention, attention DP,
-multi-node transfer, and speculative decoding require separate qualification
-rows. The profiles do not constrain MoE-only backend and mapping settings
-because these dense roots do not consume them. `SourceIdentity` still requires
-donor and receiver configurations to match.
+The Llama, Qwen2, Qwen3, and Mistral profiles are text-only and do not enable
+reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
+or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
+than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
+DP, multi-node transfer, and speculative decoding require separate
+qualification rows. Each profile also pins its qualified RoPE realization:
+Llama, Qwen2, and Mistral require the default fused RoPE path, so unfused RoPE
+requires separate qualification for them, while Qwen3 fuses RoPE into the
+QK-norm kernel and therefore requires `rope_fusion=False` in the realized
+configuration. The Mistral profile additionally pins the realized attention
+window: every attention layer must run without a sliding window, so
+sliding-window checkpoints such as Ministral fall back to the Hugging Face path
+until they are qualified separately. The profiles do not constrain MoE-only
+backend and mapping settings because these dense roots do not consume them.
+`SourceIdentity` still requires donor and receiver configurations to match.
 
 ### Adding a Model Family
 
@@ -112,12 +133,16 @@ pytest -v tests/integration/defs/model_express/test_model_express.py \
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
-checkpoint path. `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model,
-or NIXL prerequisites from skips into failures and must be set by a CI
-qualification stage. That stage must also allocate the GPUs declared by the
-selected test row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout
-used for the baseline worker, receiver worker, and donor-readiness wait;
-increase it for slow model storage or startup.
+checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
+`qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`, and
+`mistral-bf16-tp1` / `mistral-bf16-tp2`, with optional model path overrides in
+`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, and `TRTLLM_MX_MISTRAL_MODEL`.
+`TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
+prerequisites from skips into failures and must be set by a CI qualification
+stage. That stage must also allocate the GPUs declared by the selected test
+row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout used for the
+baseline worker, receiver worker, and donor-readiness wait; increase it for
+slow model storage or startup.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
 sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
@@ -251,10 +276,14 @@ path.
 
 ## Notes and Limitations
 
-- Post-transform MX reception is currently limited to the exact Llama and
-  Qwen2/Qwen2.5 dense profiles above. Other roots and variants that do not
-  match the documented identity and runtime envelope safely fall back to
-  Hugging Face loading until explicitly qualified.
+- Post-transform MX reception is currently limited to the exact Llama,
+  Qwen2/Qwen2.5 dense, Qwen3 dense, and Mistral dense profiles above. Other
+  roots and variants that do not match the documented identity and runtime
+  envelope safely fall back to Hugging Face loading until explicitly qualified.
+- Mistral checkpoints served through the native `mistral` checkpoint format
+  (`mistral_common` model type), sliding-window or Ministral `layer_types`
+  variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
+  are not qualified and use the Hugging Face fallback.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

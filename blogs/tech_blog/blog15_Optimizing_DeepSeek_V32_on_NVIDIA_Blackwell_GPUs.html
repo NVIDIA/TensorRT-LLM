@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,60 +663,60 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="optimizing-deepseek-v3-2-on-nvidia-blackwell-gpus">
+  <section class="tex2jax_ignore mathjax_ignore" id="optimizing-deepseek-v3-2-on-nvidia-blackwell-gpus">
 <h1>Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs<a class="headerlink" href="#optimizing-deepseek-v3-2-on-nvidia-blackwell-gpus" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT LLM team</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#optimizing-deepseek-v32-on-nvidia-blackwell-gpus"><span class="xref myst">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</span></a></p>
+<li><p><a class="reference internal" href="#optimizing-deepseek-v3-2-on-nvidia-blackwell-gpus">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
-<li><p><a class="reference internal" href="../../torch/adding_new_model.html#introduction"><span class="std std-ref">Introduction</span></a></p></li>
-<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa"><span class="xref myst">DeepSeek Sparse Attention (DSA)</span></a></p></li>
-<li><p><a class="reference internal" href="#precision-strategy"><span class="xref myst">Precision Strategy</span></a></p></li>
-<li><p><a class="reference internal" href="#parallel-strategy"><span class="xref myst">Parallel Strategy</span></a></p></li>
-<li><p><a class="reference internal" href="#key-features"><span class="xref myst">Key Features</span></a></p>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#introduction">Introduction</a></p></li>
+<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa">DeepSeek Sparse Attention (DSA)</a></p></li>
+<li><p><a class="reference internal" href="#precision-strategy">Precision Strategy</a></p></li>
+<li><p><a class="reference internal" href="#parallel-strategy">Parallel Strategy</a></p></li>
+<li><p><a class="reference internal" href="#key-features">Key Features</a></p>
 <ul>
-<li><p><a class="reference internal" href="../../features/speculative-decoding.html#mtp"><span class="std std-ref">MTP</span></a></p></li>
-<li><p><a class="reference internal" href="#disaggregated-serving"><span class="xref myst">Disaggregated Serving</span></a></p></li>
-<li><p><a class="reference internal" href="#chunked-prefill-and-kv-cache-reuse"><span class="xref myst">Chunked Prefill and KV Cache Reuse</span></a></p></li>
-<li><p><a class="reference internal" href="#wide-expert-parallelism-wide-ep"><span class="xref myst">Wide Expert Parallelism (Wide-EP)</span></a></p></li>
-<li><p><a class="reference internal" href="#chat-template-and-tool-parser"><span class="xref myst">Chat Template and Tool Parser</span></a></p></li>
+<li><p><a class="reference internal" href="#mtp">MTP</a></p></li>
+<li><p><a class="reference internal" href="#disaggregated-serving">Disaggregated Serving</a></p></li>
+<li><p><a class="reference internal" href="#chunked-prefill-and-kv-cache-reuse">Chunked Prefill and KV Cache Reuse</a></p></li>
+<li><p><a class="reference internal" href="#wide-expert-parallelism-wide-ep">Wide Expert Parallelism (Wide-EP)</a></p></li>
+<li><p><a class="reference internal" href="#chat-template-and-tool-parser">Chat Template and Tool Parser</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#key-optimizations"><span class="xref myst">Key Optimizations</span></a></p>
+<li><p><a class="reference internal" href="#key-optimizations">Key Optimizations</a></p>
 <ul>
-<li><p><a class="reference internal" href="#kernel-optimizations"><span class="xref myst">Kernel Optimizations</span></a></p>
+<li><p><a class="reference internal" href="#kernel-optimizations">Kernel Optimizations</a></p>
 <ul>
-<li><p><a class="reference internal" href="#sparse-mla-kernel"><span class="xref myst">Sparse MLA Kernel</span></a></p></li>
-<li><p><a class="reference internal" href="#indexer-top-k-kernel"><span class="xref myst">Indexer Top-K Kernel</span></a></p></li>
-<li><p><a class="reference internal" href="#deepgemm-mqa-kernel"><span class="xref myst">DeepGEMM MQA Kernel</span></a></p></li>
-<li><p><a class="reference internal" href="#kernel-fusion"><span class="xref myst">Kernel Fusion</span></a></p></li>
+<li><p><a class="reference internal" href="#sparse-mla-kernel">Sparse MLA Kernel</a></p></li>
+<li><p><a class="reference internal" href="#indexer-top-k-kernel">Indexer Top-K Kernel</a></p></li>
+<li><p><a class="reference internal" href="#deepgemm-mqa-kernel">DeepGEMM MQA Kernel</a></p></li>
+<li><p><a class="reference internal" href="#kernel-fusion">Kernel Fusion</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#system-optimizations"><span class="xref myst">System Optimizations</span></a></p>
+<li><p><a class="reference internal" href="#system-optimizations">System Optimizations</a></p>
 <ul>
-<li><p><a class="reference internal" href="#multi-streams"><span class="std std-ref">Multi-streams</span></a></p></li>
-<li><p><a class="reference internal" href="#a-fast-path-for-short-sequences"><span class="xref myst">A Fast Path for Short Sequences</span></a></p></li>
+<li><p><a class="reference internal" href="#multi-streams">Multi-streams</a></p></li>
+<li><p><a class="reference internal" href="#a-fast-path-for-short-sequences">A Fast Path for Short Sequences</a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#how-to-reproduce"><span class="xref myst">How to Reproduce</span></a></p>
+<li><p><a class="reference internal" href="#how-to-reproduce">How to Reproduce</a></p>
 <ul>
-<li><p><a class="reference internal" href="#accuracy-evaluation"><span class="xref myst">Accuracy Evaluation</span></a></p></li>
-<li><p><a class="reference internal" href="#benchmark-on-b200"><span class="xref myst">Benchmark on B200</span></a></p>
+<li><p><a class="reference internal" href="#accuracy-evaluation">Accuracy Evaluation</a></p></li>
+<li><p><a class="reference internal" href="#benchmark-on-b200">Benchmark on B200</a></p>
 <ul>
-<li><p><a class="reference internal" href="#min-latency"><span class="std std-ref">Min-latency</span></a></p></li>
-<li><p><a class="reference internal" href="#max-throughput"><span class="std std-ref">Max-throughput</span></a></p></li>
+<li><p><a class="reference internal" href="#min-latency">Min-latency</a></p></li>
+<li><p><a class="reference internal" href="#max-throughput">Max-throughput</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#benchmark-with-wide-ep-on-gb200"><span class="xref myst">Benchmark with Wide-EP on GB200</span></a></p></li>
+<li><p><a class="reference internal" href="#benchmark-with-wide-ep-on-gb200">Benchmark with Wide-EP on GB200</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#future-works"><span class="xref myst">Future Works</span></a></p></li>
-<li><p><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
+<li><p><a class="reference internal" href="#future-works">Future Works</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
 </ul>
 </li>
 </ul>
@@ -666,16 +734,17 @@
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. The architecture of DSA. The green part illustrates how DSA selects the Top-K key-value entries according to the indexer.</em></sub></p>
-<p>Figure 1 illustrates the overall architecture: a lightning indexer first determines the importance of all key-value entries for each query token. Subsequently, the Top-K Selector retains only the top-$k$ entries (typically $k=2048$) based on the index scores. Finally, attention is computed exclusively between the query token and these selected entries.</p>
+<p>Figure 1 illustrates the overall architecture: a lightning indexer first determines the importance of all key-value entries for each query token. Subsequently, the Top-K Selector retains only the top-<span class="math notranslate nohighlight">\(k\)</span> entries (typically <span class="math notranslate nohighlight">\(k=2048\)</span>) based on the index scores. Finally, attention is computed exclusively between the query token and these selected entries.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog15_indexer_topk.png" alt="tech_blog15_indexer_topk" width="900" height="auto">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. The architecture of the DSA indexer and Top-K logics.</em></sub></p>
-<p>Figure 2 illustrates the DSA indexer and the Top-K selection mechanism. Firstly, two low-rank linear layers project $c_t^Q$ and the input $h_t$ into lower-dimensional tensors. Following operations of LayerNorm to the K tensor and RoPE to both Q and K, we obtain the tensors $Q_t^I$ and $K_t^I$. Simultaneously, a separate weight projection layer processes $h_t$ to generate the weights $W_t^I$. These tensors are then used to compute the index scores (labeled as MQA Logits in Figure 2):</p>
-<p>$$I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)$$</p>
-<p>Finally, a Top-K operation is applied to the index scores to identify the most relevant indices, which are subsequently used for the sparse MLA computation. To reduce computational overhead, the K tensor $K_t^I$ is stored in the indexer K cache, allowing for reuse in subsequent iterations.</p>
+<p>Figure 2 illustrates the DSA indexer and the Top-K selection mechanism. Firstly, two low-rank linear layers project <span class="math notranslate nohighlight">\(c_t^Q\)</span> and the input <span class="math notranslate nohighlight">\(h_t\)</span> into lower-dimensional tensors. Following operations of LayerNorm to the K tensor and RoPE to both Q and K, we obtain the tensors <span class="math notranslate nohighlight">\(Q_t^I\)</span> and <span class="math notranslate nohighlight">\(K_t^I\)</span>. Simultaneously, a separate weight projection layer processes <span class="math notranslate nohighlight">\(h_t\)</span> to generate the weights <span class="math notranslate nohighlight">\(W_t^I\)</span>. These tensors are then used to compute the index scores (labeled as MQA Logits in Figure 2):</p>
+<div class="math notranslate nohighlight">
+\[I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)\]</div>
+<p>Finally, a Top-K operation is applied to the index scores to identify the most relevant indices, which are subsequently used for the sparse MLA computation. To reduce computational overhead, the K tensor <span class="math notranslate nohighlight">\(K_t^I\)</span> is stored in the indexer K cache, allowing for reuse in subsequent iterations.</p>
 <p>Regarding implementation, DSA diverges from the MLA used in DeepSeek-V3/R1/V3.1 models, which alternates between MHA mode (prefill) and MQA mode (decoding) as discussed in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a>. Instead, our current DSA implementation operates only in MQA mode for both prefill and decoding phases to maximize kernel efficiency. We are continuing to explore further optimizations, including potential support for MHA mode in future iterations.</p>
 <p>The DSA implementation is built upon the TensorRT LLM sparse attention framework, which is designed to provide flexible and extensible support for various sparse attention methods. For more information, please refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/sparse-attention.md">sparse attention documentation</a>, and a technical blog providing further details will be released soon.</p>
 </section>
@@ -729,7 +798,7 @@
 </tbody>
 </table>
 </div>
-<p><sub><em>* Currently, the NVFP4 checkpoint has not yet been published on Hugging Face. Please stay tuned, or refer to the <a class="reference internal" href="#how-to-reproduce"><span class="xref myst">How to reproduce</span></a> section to learn how to quantize the model to NVFP4.<br />
+<p><sub><em>* Currently, the NVFP4 checkpoint has not yet been published on Hugging Face. Please stay tuned, or refer to the <a class="reference internal" href="#how-to-reproduce">How to reproduce</a> section to learn how to quantize the model to NVFP4.<br />
 ** Note there are some run-to-run variance for these evaluations. Our experiments indicate that the NVFP4 recipe delivers accuracy on par with FP8 on these datasets.</em></sub></p>
 </section>
 <section id="parallel-strategy">
@@ -816,7 +885,7 @@
 </tbody>
 </table>
 </div>
-<p>Another important optimization is SwapsMmaAb, designed specifically for Tensor Parallelism (TP) scenarios. When TP is enabled for sparse MLA, input tensors are partitioned along the Q head dimension. Consequently, each rank processes a reduced number of Q heads ($128 / \text{TP}$), leading to Tensor Core underutilization. SwapsMmaAb addresses this bottleneck by swapping the A and B operands during matrix multiplication to improve hardware utilization.</p>
+<p>Another important optimization is SwapsMmaAb, designed specifically for Tensor Parallelism (TP) scenarios. When TP is enabled for sparse MLA, input tensors are partitioned along the Q head dimension. Consequently, each rank processes a reduced number of Q heads (<span class="math notranslate nohighlight">\(128 / \text{TP}\)</span>), leading to Tensor Core underutilization. SwapsMmaAb addresses this bottleneck by swapping the A and B operands during matrix multiplication to improve hardware utilization.</p>
 </section>
 <section id="indexer-top-k-kernel">
 <h4>Indexer Top-K Kernel<a class="headerlink" href="#indexer-top-k-kernel" title="Link to this heading">#</a></h4>
@@ -943,7 +1012,7 @@ Our key optimization is to bypass the remaining radix‑select iterations and sw
 <p>The DeepGEMM MQA kernel computes logits for the Top-K selection process. To enhance efficiency on Blackwell GPUs, several optimizations were implemented targeting both performance and ease of use:</p>
 <ul class="simple">
 <li><p>Larger MMA Tile Size: We increased the MMA tile size for both the prefill and decoding MQA kernels, yielding up to a 10% performance improvement. This optimization was implemented in commit <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM/commit/2f9d87877ed691a62796c25f2e9496a5e0b7123a">2f9d878</a> and <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM/commit/fc97232c6f23bf5b4be5bdef52af8ce5dc499460">fc97232</a>.</p></li>
-<li><p>Flexible Paged KV Cache Configurations: The decoding MQA kernel now supports a wider range of configurations. While the initial version was restricted to a block size of 64 tokens, commit <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM/commit/c5d4d7448665ae90a81d9d31d60d445010da50f0">c5d4d74</a> enabled support for any block size $B$ satisfying the condition $64 % B = 0$.</p></li>
+<li><p>Flexible Paged KV Cache Configurations: The decoding MQA kernel now supports a wider range of configurations. While the initial version was restricted to a block size of 64 tokens, commit <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM/commit/c5d4d7448665ae90a81d9d31d60d445010da50f0">c5d4d74</a> enabled support for any block size <span class="math notranslate nohighlight">\(B\)</span> satisfying the condition <span class="math notranslate nohighlight">\(64 \% B = 0\)</span>.</p></li>
 <li><p>MTP-3 Support: Previously, the kernel was limited to MTP-0 or MTP-1 (predicting at most one draft token). Since MTP-3 typically delivers superior performance in low-latency scenarios, optimizations were introduced (see commit <a class="reference external" href="https://github.com/deepseek-ai/DeepGEMM/commit/2be3f367854702e3887ff5b28b274cb16b441af9">2be3f36</a>) to enable native MTP-3 support.</p></li>
 </ul>
 </section>
@@ -974,7 +1043,7 @@ Our key optimization is to bypass the remaining radix‑select iterations and sw
 </section>
 <section id="a-fast-path-for-short-sequences">
 <h4>A Fast Path for Short Sequences<a class="headerlink" href="#a-fast-path-for-short-sequences" title="Link to this heading">#</a></h4>
-<p>DeepSeek-V3.2 employs K=2048 for the Top-K selector. For sequences with length $N \le 2048$, all past KV tokens are inherently selected, rendering the MQA and Top-K operations redundant. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/9524">PR-9524</a> implements a “fast path” to bypass these unnecessary operations for short sequences.</p>
+<p>DeepSeek-V3.2 employs K=2048 for the Top-K selector. For sequences with length <span class="math notranslate nohighlight">\(N \le 2048\)</span>, all past KV tokens are inherently selected, rendering the MQA and Top-K operations redundant. <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/9524">PR-9524</a> implements a “fast path” to bypass these unnecessary operations for short sequences.</p>
 <p>For the implementation, we can simply generate dense indices during DSA preparation, and directly change to use these dense indices in the indexer forward for prefill requests. However, decoding requests present a challenge due to CUDA Graph integration since the CUDA graph is usually enabled for decoding-only iterations. To ensure compatibility, we capture separate CUDA graphs for short and long sequences. At the start of each iteration, the system checks the sequence lengths: if any request in the batch exceeds the threshold, the long-sequence graph is triggered; otherwise, the short-sequence graph is utilized. This optimization yields approximately 1.03x speedup for 1K/1K scenarios.</p>
 </section>
 </section>
@@ -1374,9 +1443,9 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

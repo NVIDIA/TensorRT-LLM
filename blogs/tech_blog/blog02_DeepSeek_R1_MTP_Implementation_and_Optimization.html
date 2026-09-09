@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,50 +663,50 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="deepseek-r1-mtp-implementation-and-optimization">
+  <section class="tex2jax_ignore mathjax_ignore" id="deepseek-r1-mtp-implementation-and-optimization">
 <h1>DeepSeek R1 MTP Implementation and Optimization<a class="headerlink" href="#deepseek-r1-mtp-implementation-and-optimization" title="Link to this heading">#</a></h1>
 <p>by NVIDIA TensorRT LLM team</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#deepseek-r1-mtp-implementation-and-optimization"><span class="xref myst">DeepSeek R1 MTP Implementation and Optimization</span></a></p>
+<li><p><a class="reference internal" href="#deepseek-r1-mtp-implementation-and-optimization">DeepSeek R1 MTP Implementation and Optimization</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
-<li><p><a class="reference internal" href="#mtp-for-inference"><span class="xref myst">MTP for inference</span></a></p>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#mtp-for-inference">MTP for inference</a></p>
 <ul>
-<li><p><a class="reference internal" href="../../torch/features/lora.html#background"><span class="std std-ref">Background</span></a></p></li>
-<li><p><a class="reference internal" href="#mtp-vanilla"><span class="xref myst">MTP Vanilla</span></a></p></li>
-<li><p><a class="reference internal" href="#mtp-eagle"><span class="xref myst">MTP Eagle</span></a></p></li>
+<li><p><a class="reference internal" href="#background">Background</a></p></li>
+<li><p><a class="reference internal" href="#mtp-vanilla">MTP Vanilla</a></p></li>
+<li><p><a class="reference internal" href="#mtp-eagle">MTP Eagle</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#mtp-implementation-in-tensorrt-llm"><span class="xref myst">MTP implementation in TensorRT LLM</span></a></p>
+<li><p><a class="reference internal" href="#mtp-implementation-in-tensorrt-llm">MTP implementation in TensorRT LLM</a></p>
 <ul>
-<li><p><a class="reference internal" href="#basic-implementation"><span class="xref myst">Basic Implementation</span></a></p></li>
-<li><p><a class="reference internal" href="#mtp-modules"><span class="xref myst">MTP Modules</span></a></p></li>
-<li><p><a class="reference internal" href="#attention-for-mtp"><span class="xref myst">Attention for MTP</span></a></p></li>
-<li><p><a class="reference internal" href="#how-to-run-deepseek-models-with-mtp"><span class="xref myst">How to run DeepSeek models with MTP</span></a></p></li>
+<li><p><a class="reference internal" href="#basic-implementation">Basic Implementation</a></p></li>
+<li><p><a class="reference internal" href="#mtp-modules">MTP Modules</a></p></li>
+<li><p><a class="reference internal" href="#attention-for-mtp">Attention for MTP</a></p></li>
+<li><p><a class="reference internal" href="#how-to-run-deepseek-models-with-mtp">How to run DeepSeek models with MTP</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#mtp-optimization---relaxed-acceptance"><span class="xref myst">MTP optimization - Relaxed Acceptance</span></a></p>
+<li><p><a class="reference internal" href="#mtp-optimization-relaxed-acceptance">MTP optimization - Relaxed Acceptance</a></p>
 <ul>
-<li><p><a class="reference internal" href="#relaxed-acceptance"><span class="xref myst">Relaxed Acceptance</span></a></p></li>
-<li><p><a class="reference internal" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance"><span class="xref myst">How to run the DeepSeek-R1 model with Relaxed Acceptance</span></a></p></li>
+<li><p><a class="reference internal" href="#relaxed-acceptance">Relaxed Acceptance</a></p></li>
+<li><p><a class="reference internal" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance">How to run the DeepSeek-R1 model with Relaxed Acceptance</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html#evaluation"><span class="std std-ref">Evaluation</span></a></p>
+<li><p><a class="reference internal" href="#evaluation">Evaluation</a></p>
 <ul>
-<li><p><a class="reference internal" href="#achieving-speedup-with-mtp-speculative-decoding"><span class="xref myst">Achieving speedup with MTP speculative decoding</span></a></p></li>
-<li><p><a class="reference internal" href="#accuracy-studies-for-relaxed-acceptance"><span class="xref myst">Accuracy studies for Relaxed Acceptance</span></a></p></li>
+<li><p><a class="reference internal" href="#achieving-speedup-with-mtp-speculative-decoding">Achieving speedup with MTP speculative decoding</a></p></li>
+<li><p><a class="reference internal" href="#accuracy-studies-for-relaxed-acceptance">Accuracy studies for Relaxed Acceptance</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#future-works"><span class="xref myst">Future Works</span></a></p>
+<li><p><a class="reference internal" href="#future-works">Future Works</a></p>
 <ul>
-<li><p><a class="reference internal" href="#tree-based-speculative-decoding-support"><span class="xref myst">Tree-based speculative decoding support</span></a></p></li>
-<li><p><a class="reference internal" href="#eagle3-support"><span class="xref myst">Eagle3 support</span></a></p></li>
+<li><p><a class="reference internal" href="#tree-based-speculative-decoding-support">Tree-based speculative decoding support</a></p></li>
+<li><p><a class="reference internal" href="#eagle3-support">Eagle3 support</a></p></li>
 <li><p><a class="reference internal" href="#fix-known-issues"><span class="xref myst">Fix known issues</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html#acknowledgment"><span class="std std-ref">Acknowledgment</span></a></p></li>
+<li><p><a class="reference internal" href="#acknowledgment">Acknowledgment</a></p></li>
 </ul>
 </li>
 </ul>
@@ -668,8 +736,8 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 </div>
 <p align="left"><sub><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></sub></p>
 <p>MTP Vanilla method is more similar to the MTP training, and it sequentially uses different MTP modules to predict multiple draft tokens. This method can support model checkpoints with weights of multiple different MTP modules. And each MTP module will have its own KV cache.</p>
-<p>Figure 2 illustrates the MTP vanilla inference. In the context phase, assuming there are a total of four input tokens, we will get the output token $t_5$ and the hidden states after the main model forward. The output token will be appended to the input tokens, then we shift out the first token to get tokens from $t_2$ to $t_5$ as the input tokens of the first MTP module. The hidden states from the main model will be directly used as the input of the first MTP module to predict the first draft token. For the next few MTP modules, we’ll append the newly generated draft token and the hidden states corresponding to the last input token to the input tokens and hidden states. Then we’ll shift out the first token to prepare the inputs for the next MTP module. In this way, we can retain as much information as possible from the main model, which helps the draft layer make more accurate predictions.</p>
-<p>In the generation phase, there will be a little difference. The predicted token $t_5$ and the draft tokens will be used as inputs for the main model. After the main model forward, we will do the verification to get the accepted tokens. In this example, assuming $j$ draft tokens $d_6$~$d_{j+5}$ are accepted. Then prepare the MTP module inputs.  Different from the context phase, we will prepare input IDs and hidden states of a total of $K$ tokens before the last accepted token. In this example, the last accepted token is $t_{j+6}$. Then we can get the first draft token after the first MTP module forward. For the sequential MTP modules, we can prepare their inputs in a similar way to the MTP modules in the context phase, so all of those MTP modules have the same input sequence length. After predicting all of the draft tokens, we need to evict the keys/values of those rejected draft tokens from the main model’s KV cache to ensure the subsequent calculation is correct.</p>
+<p>Figure 2 illustrates the MTP vanilla inference. In the context phase, assuming there are a total of four input tokens, we will get the output token <span class="math notranslate nohighlight">\(t_5\)</span> and the hidden states after the main model forward. The output token will be appended to the input tokens, then we shift out the first token to get tokens from <span class="math notranslate nohighlight">\(t_2\)</span> to <span class="math notranslate nohighlight">\(t_5\)</span> as the input tokens of the first MTP module. The hidden states from the main model will be directly used as the input of the first MTP module to predict the first draft token. For the next few MTP modules, we’ll append the newly generated draft token and the hidden states corresponding to the last input token to the input tokens and hidden states. Then we’ll shift out the first token to prepare the inputs for the next MTP module. In this way, we can retain as much information as possible from the main model, which helps the draft layer make more accurate predictions.</p>
+<p>In the generation phase, there will be a little difference. The predicted token <span class="math notranslate nohighlight">\(t_5\)</span> and the draft tokens will be used as inputs for the main model. After the main model forward, we will do the verification to get the accepted tokens. In this example, assuming <span class="math notranslate nohighlight">\(j\)</span> draft tokens <span class="math notranslate nohighlight">\(d_6\)</span>~<span class="math notranslate nohighlight">\(d_{j+5}\)</span> are accepted. Then prepare the MTP module inputs.  Different from the context phase, we will prepare input IDs and hidden states of a total of <span class="math notranslate nohighlight">\(K\)</span> tokens before the last accepted token. In this example, the last accepted token is <span class="math notranslate nohighlight">\(t_{j+6}\)</span>. Then we can get the first draft token after the first MTP module forward. For the sequential MTP modules, we can prepare their inputs in a similar way to the MTP modules in the context phase, so all of those MTP modules have the same input sequence length. After predicting all of the draft tokens, we need to evict the keys/values of those rejected draft tokens from the main model’s KV cache to ensure the subsequent calculation is correct.</p>
 </section>
 <section id="mtp-eagle">
 <h3>MTP Eagle<a class="headerlink" href="#mtp-eagle" title="Link to this heading">#</a></h3>
@@ -707,12 +775,12 @@ For the draft stage in MTP, there are two different MTP methods, MTP vanilla and
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. MTP model architecture</em></sub></p>
-<p>Figure 5 introduces the basic model architecture of <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L326">MTP Vanilla</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L1047">MTP Eagle</a>, and the basic <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L829">MTP module</a> design. Because MTP vanilla needs $K$ input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. $j&lt;K$, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past $K$ input IDs and the hidden states of past $K$ tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward $K$ times to get $K$ new draft tokens.</p>
+<p>Figure 5 introduces the basic model architecture of <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L326">MTP Vanilla</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L1047">MTP Eagle</a>, and the basic <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L829">MTP module</a> design. Because MTP vanilla needs <span class="math notranslate nohighlight">\(K\)</span> input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. <span class="math notranslate nohighlight">\(j&lt;K\)</span>, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past <span class="math notranslate nohighlight">\(K\)</span> input IDs and the hidden states of past <span class="math notranslate nohighlight">\(K\)</span> tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward <span class="math notranslate nohighlight">\(K\)</span> times to get <span class="math notranslate nohighlight">\(K\)</span> new draft tokens.</p>
 <p>The MTP module follows the design in DeepSeek-V3. The embedding layer and output head in MTP modules are shared with the main model, which can save GPU memory consumption.</p>
 </section>
 <section id="attention-for-mtp">
 <h3>Attention for MTP<a class="headerlink" href="#attention-for-mtp" title="Link to this heading">#</a></h3>
-<p>Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be $K+1$ input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.</p>
+<p>Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be <span class="math notranslate nohighlight">\(K+1\)</span> input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.</p>
 </section>
 <section id="how-to-run-deepseek-models-with-mtp">
 <h3>How to run DeepSeek models with MTP<a class="headerlink" href="#how-to-run-deepseek-models-with-mtp" title="Link to this heading">#</a></h3>
@@ -1018,9 +1086,9 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSe
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

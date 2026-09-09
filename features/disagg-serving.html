@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -441,7 +441,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="current nav bd-sidenav">
@@ -501,6 +566,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,28 +661,28 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="disaggregated-serving">
+  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-serving">
 <h1>Disaggregated Serving<a class="headerlink" href="#disaggregated-serving" title="Link to this heading">#</a></h1>
 <ul class="simple">
-<li><p><a class="reference internal" href="ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
-<li><p><a class="reference internal" href="#kv-cache-exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
+<li><p><a class="reference internal" href="#kv-cache-exchange">KV Cache Exchange</a></p>
 <ul>
-<li><p><a class="reference internal" href="#multi-backend-support"><span class="xref myst">Multi-backend Support</span></a></p></li>
-<li><p><a class="reference internal" href="#overlap-optimization"><span class="xref myst">Overlap Optimization</span></a></p></li>
-<li><p><a class="reference internal" href="#cache-layout-transformation"><span class="xref myst">Cache Layout Transformation</span></a></p></li>
-<li><p><a class="reference internal" href="#unique-global-request-id"><span class="xref myst">Unique Global Request ID</span></a></p></li>
+<li><p><a class="reference internal" href="#multi-backend-support">Multi-backend Support</a></p></li>
+<li><p><a class="reference internal" href="#overlap-optimization">Overlap Optimization</a></p></li>
+<li><p><a class="reference internal" href="#cache-layout-transformation">Cache Layout Transformation</a></p></li>
+<li><p><a class="reference internal" href="#unique-global-request-id">Unique Global Request ID</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="../torch/features/overlap_scheduler.html#usage"><span class="std std-ref">Usage</span></a></p>
+<li><p><a class="reference internal" href="#usage">Usage</a></p>
 <ul>
-<li><p><a class="reference internal" href="#dynamo"><span class="std std-ref">Dynamo</span></a></p></li>
-<li><p><a class="reference internal" href="#trtllm-serve"><span class="std std-ref">trtllm-serve</span></a></p></li>
-<li><p><a class="reference internal" href="#multiple-instances"><span class="xref myst">Multiple Instances</span></a></p></li>
-<li><p><a class="reference internal" href="#coordinator-and-worker-fleet"><span class="xref myst">Coordinator and Worker Fleet</span></a></p></li>
+<li><p><a class="reference internal" href="#dynamo">Dynamo</a></p></li>
+<li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
+<li><p><a class="reference internal" href="#multiple-instances">Multiple Instances</a></p></li>
+<li><p><a class="reference internal" href="#coordinator-and-worker-fleet">Coordinator and Worker Fleet</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#environment-variables"><span class="xref myst">Environment Variables</span></a></p></li>
-<li><p><a class="reference internal" href="#troubleshooting-and-faq"><span class="xref myst">Troubleshooting and FAQ</span></a></p></li>
+<li><p><a class="reference internal" href="#environment-variables">Environment Variables</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-and-faq">Troubleshooting and FAQ</a></p></li>
 </ul>
 <p>For the internals of the component that actually moves the KV blocks, see
 <a class="reference internal" href="../developer-guide/kv-transfer.html"><span class="std std-doc">Introduction to KV Cache Transmission</span></a>.</p>
@@ -675,7 +741,7 @@
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
-<p>The optimizations required for KV cache transmission vary depending on whether it’s single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details <a class="reference internal" href="#environment-variables"><span class="xref myst">Environment Variables</span></a>.</p>
+<p>The optimizations required for KV cache transmission vary depending on whether it’s single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details <a class="reference internal" href="#environment-variables">Environment Variables</a>.</p>
 </section>
 <section id="unique-global-request-id">
 <h3>Unique Global Request ID<a class="headerlink" href="#unique-global-request-id" title="Link to this heading">#</a></h3>
@@ -686,7 +752,7 @@
 </div>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">node_id</span></code> (0–255) identifies the node (defaults to a hash of the MAC address; overridable via <code class="docutils literal notranslate"><span class="pre">node_id</span></code> in the disaggregated config).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">process_id</span></code> (0–63) identifies the orchestrator process on that node. In a <a class="reference internal" href="#coordinator-and-worker-fleet"><span class="xref myst">coordinator + worker fleet</span></a> each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_WORKER_PROCESS_ID</span></code> environment variable (assigned automatically per worker by the launcher).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">process_id</span></code> (0–63) identifies the orchestrator process on that node. In a <a class="reference internal" href="#coordinator-and-worker-fleet">coordinator + worker fleet</a> each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_WORKER_PROCESS_ID</span></code> environment variable (assigned automatically per worker by the launcher).</p></li>
 <li><p>The <code class="docutils literal notranslate"><span class="pre">(node_id,</span> <span class="pre">process_id)</span></code> pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.</p></li>
 </ul>
 <p>Global disaggregated IDs occupy the range <code class="docutils literal notranslate"><span class="pre">[1</span> <span class="pre">&lt;&lt;</span> <span class="pre">40,</span> <span class="pre">2**63)</span></code>; worker-local and warm-up request IDs occupy the disjoint range <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1</span> <span class="pre">&lt;&lt;</span> <span class="pre">40)</span></code>, so the two never collide. If a client supplies its own positive <code class="docutils literal notranslate"><span class="pre">disagg_request_id</span></code>, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.</p>
@@ -776,7 +842,7 @@ it would look like:</p>
 when routing requests to the generation servers, the disaggregated server will mark the requests as “generation-only” to skip the context phase.</p>
 <p>The config also accepts an optional field that tunes the HTTP listeners:</p>
 <ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">server_keep_alive_timeout</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">10</span></code>) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator’s listener when it runs in-process (see <a class="reference internal" href="#coordinator-and-worker-fleet"><span class="xref myst">Coordinator and Worker Fleet</span></a>). Raise it (for example, <code class="docutils literal notranslate"><span class="pre">3600</span></code>) when clients hold large idle connection pools and hit <code class="docutils literal notranslate"><span class="pre">Connection</span> <span class="pre">reset</span> <span class="pre">by</span> <span class="pre">peer</span></code> on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">server_keep_alive_timeout</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">10</span></code>) — HTTP keep-alive timeout in seconds, applied to the client-facing listener and to the coordinator’s listener when it runs in-process (see <a class="reference internal" href="#coordinator-and-worker-fleet">Coordinator and Worker Fleet</a>). Raise it (for example, <code class="docutils literal notranslate"><span class="pre">3600</span></code>) when clients hold large idle connection pools and hit <code class="docutils literal notranslate"><span class="pre">Connection</span> <span class="pre">reset</span> <span class="pre">by</span> <span class="pre">peer</span></code> on a reused connection: the server closing an idle connection first leaves the client with a half-closed socket that fails on the next request.</p></li>
 </ul>
 <p>Clients can then send requests to the disaggregated server at <code class="docutils literal notranslate"><span class="pre">localhost:8000</span></code>, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">curl</span> <span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span><span class="o">/</span><span class="n">v1</span><span class="o">/</span><span class="n">completions</span> \
@@ -791,7 +857,7 @@ when routing requests to the generation servers, the disaggregated server will m
 </div>
 <section id="launching-disaggregated-servers-on-slurm-clusters">
 <h4>Launching disaggregated servers on SLURM clusters<a class="headerlink" href="#launching-disaggregated-servers-on-slurm-clusters" title="Link to this heading">#</a></h4>
-<p>Please refer to <a class="reference internal" href="#source:examples/disaggregated/slurm"><span class="xref myst">Disaggregated Inference Benchmark Scripts</span></a>.</p>
+<p>Please refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9/examples/disaggregated/slurm">Disaggregated Inference Benchmark Scripts</a>.</p>
 </section>
 </section>
 <section id="multiple-instances">
@@ -826,7 +892,7 @@ when routing requests to the generation servers, the disaggregated server will m
 <p>The two roles split as follows:</p>
 <ul class="simple">
 <li><p><strong>Coordinator</strong> — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (<code class="docutils literal notranslate"><span class="pre">/select</span></code>, <code class="docutils literal notranslate"><span class="pre">/finish</span></code>, <code class="docutils literal notranslate"><span class="pre">/cluster_info</span></code>, <code class="docutils literal notranslate"><span class="pre">/health</span></code>).</p></li>
-<li><p><strong>Fleet workers</strong> — <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> stateless disaggregated servers that share the public port via <code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code> (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct <code class="docutils literal notranslate"><span class="pre">process_id</span></code> for the <a class="reference internal" href="#unique-global-request-id"><span class="xref myst">global request ID</span></a>.</p></li>
+<li><p><strong>Fleet workers</strong> — <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> stateless disaggregated servers that share the public port via <code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code> (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct <code class="docutils literal notranslate"><span class="pre">process_id</span></code> for the <a class="reference internal" href="#unique-global-request-id">global request ID</a>.</p></li>
 </ul>
 <p>This is controlled by two fields in the disaggregated config:</p>
 <ul class="simple">
@@ -863,7 +929,7 @@ when routing requests to the generation servers, the disaggregated server will m
 </div>
 <section id="example-implicit-coordinator-4-worker-fleet">
 <h4>Example: implicit coordinator + 4-worker fleet<a class="headerlink" href="#example-implicit-coordinator-4-worker-fleet" title="Link to this heading">#</a></h4>
-<p>Extend the <code class="docutils literal notranslate"><span class="pre">disagg_config.yaml</span></code> from the <a class="reference internal" href="#trtllm-serve"><span class="std std-ref">trtllm-serve</span></a> example with <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> and a router type:</p>
+<p>Extend the <code class="docutils literal notranslate"><span class="pre">disagg_config.yaml</span></code> from the <a class="reference internal" href="#trtllm-serve">trtllm-serve</a> example with <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> and a router type:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">hostname</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">localhost</span>
 <span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8000</span>
 <span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pytorch</span>
@@ -926,7 +992,7 @@ when routing requests to the generation servers, the disaggregated server will m
 <p>TRT-LLM uses some environment variables to control the behavior of disaggregated service.</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, the generation worker will not overlap KV cache transfer with model inference. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code>: Selects the transport NIXL itself uses. Valid values are <code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default) and <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code>; an unsupported value logs a warning and falls back to <code class="docutils literal notranslate"><span class="pre">UCX</span></code>. <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> additionally requires a NIXL build carrying the libfabric plugin — see the <a class="reference internal" href="#source:examples/disaggregated/README.md"><span class="xref myst">disaggregated serving examples</span></a>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_NIXL_KVCACHE_BACKEND</span></code>: Selects the transport NIXL itself uses. Valid values are <code class="docutils literal notranslate"><span class="pre">UCX</span></code> (default) and <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code>; an unsupported value logs a warning and falls back to <code class="docutils literal notranslate"><span class="pre">UCX</span></code>. <code class="docutils literal notranslate"><span class="pre">LIBFABRIC</span></code> additionally requires a NIXL build carrying the libfabric plugin — see the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9/examples/disaggregated/README.md">disaggregated serving examples</a>.</p></li>
 </ul>
 <p>There are some other useful environment variables that may help when encountering failures or performance issues.</p>
 <ul class="simple">
@@ -1151,9 +1217,9 @@ NCCL’s default graph mixing behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-295 captured fields.
+296 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -51,12 +51,14 @@ unset or when the safety sanitizer rejects the runtime value.
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `batch_wait_timeout_ms` | `<class 'float'>` | `value` |  |  |
 | `cache_transceiver_config.backend` | `Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]` | `categorical` |  | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
+| `cache_transceiver_config.enable_pipelined_transfer` | `<class 'bool'>` | `value` |  |  |
 | `cache_transceiver_config.kv_cache_bounce_size_mb` | `<class 'int'>` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_poll_interval_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
 | `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
+| `checkpoint_io_policy` | `Literal['auto', 'native', 'rank_striped_read_ahead']` | `categorical` |  | `auto`, `native`, `rank_striped_read_ahead` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `cp_config.cp_type` | `<enum 'CpType'>` | `categorical` |  | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `Optional[int]` | `value` |  |  |
@@ -91,6 +93,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_lora` | `<class 'bool'>` | `value` |  |  |
 | `enable_low_latency_host_dispatch` | `<class 'bool'>` | `value` |  |  |
 | `enable_min_latency` | `<class 'bool'>` | `value` |  |  |
+| `enable_mla_skip_correction` | `<class 'bool'>` | `value` |  |  |
 | `enable_resource_governor` | `<class 'bool'>` | `value` |  |  |
 | `enable_speculative_beam_history_d2h` | `<class 'bool'>` | `value` |  |  |
 | `encode_only` | `<class 'bool'>` | `value` |  |  |
@@ -112,11 +115,12 @@ unset or when the safety sanitizer rejects the runtime value.
 | `gpus_per_node` | `Optional[int]` | `value` |  |  |
 | `guided_decoding_backend` | `Optional[Literal['xgrammar', 'llguidance']]` | `categorical` |  | `xgrammar`, `llguidance` |
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
-| `kv_cache_compression_config.algorithm` | `Literal['triattention']` | `categorical` |  | `triattention` |
+| `kv_cache_compression_config.algorithm` | `Literal['triattention']` | `categorical` | allowlist | `quantization_for_cold_page`, `triattention` |
 | `kv_cache_compression_config.beta` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_compression_config.budget` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_compression_config.eviction_mode` | `Literal['union', 'per_head', 'per_layer_perhead']` | `categorical` |  | `union`, `per_head`, `per_layer_perhead` |
 | `kv_cache_compression_config.normalize_scores` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_compression_config.quant` | `Literal['nvfp4']` | `categorical` |  | `nvfp4` |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `kv_cache_config.block_reuse_config.max_num_turns` | `<class 'int'>` | `value` |  |  |
@@ -139,6 +143,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.enable_branch_snapshot` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
@@ -167,6 +172,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `max_seq_len` | `Optional[int]` | `value` |  |  |
 | `max_stats_len` | `<class 'int'>` | `value` |  |  |
+| `mla_skip_correction_threshold` | `<class 'float'>` | `value` |  |  |
 | `mm_encoder_only` | `<class 'bool'>` | `value` |  |  |
 | `moe_cluster_parallel_size` | `Optional[int]` | `value` |  |  |
 | `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM', 'MEGAMOE_CUTEDSL']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL` |
@@ -219,7 +225,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `request_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `return_perf_metrics` | `<class 'bool'>` | `value` |  |  |
 | `sampler_force_async_worker` | `<class 'bool'>` | `value` |  |  |
-| `sampler_type` | `Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]` | `categorical` | allowlist | `TRTLLMSampler`, `TorchSampler`, `auto` |
 | `scheduler_config.capacity_scheduler_policy` | `<enum 'CapacitySchedulerPolicy'>` | `categorical` |  | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
 | `scheduler_config.context_chunking_policy` | `Optional[tensorrt_llm.llmapi.llm_args.ContextChunkingPolicy]` | `categorical` |  | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `<class 'int'>` | `value` |  |  |
@@ -229,7 +234,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.use_python_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.waiting_queue_policy` | `<enum 'WaitingQueuePolicy'>` | `categorical` |  | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `<class 'bool'>` | `value` |  |  |
-| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `deepseek_v4`, `minimax_m3`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `List[int]` | `value` |  |  |
 | `sparse_attention_config.enable_heuristic_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.implementation` | `Literal['triton', 'msa']` | `categorical` |  | `triton`, `msa` |
@@ -270,7 +275,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.attention_backend` | `Literal['VANILLA', 'TRTLLM']` | `categorical` |  | `VANILLA`, `TRTLLM` |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
-| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
+| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `MTP`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
@@ -290,15 +295,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_concurrency` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `speculative_config.max_draft_len` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.max_matching_ngram_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.max_ngram_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_non_leaves_per_layer` | `Optional[int]` | `value` |  |  |
 | `speculative_config.max_total_draft_tokens` | `Optional[int]` | `value` |  |  |
-| `speculative_config.max_verification_set_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.max_window_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.medusa_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
-| `speculative_config.num_medusa_heads` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.posterior_threshold` | `Optional[float]` | `value` |  |  |
 | `speculative_config.relaxed_delta` | `<class 'float'>` | `value` |  |  |
@@ -313,7 +313,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `<class 'int'>` | `value` |  |  |
 | `stream_interval` | `<class 'int'>` | `value` |  |  |
 | `telemetry_config.disabled` | `<class 'bool'>` | `value` |  |  |
-| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval` |
+| `telemetry_config.usage_context` | `<enum 'UsageContext'>` | `categorical` |  | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `tokenizer_mode` | `Literal['auto', 'slow']` | `categorical` |  | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
@@ -327,3 +327,4 @@ unset or when the safety sanitizer rejects the runtime value.
 | `use_cute_dsl_bf16_gemm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_bmm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_mm` | `<class 'bool'>` | `value` |  |  |
+| `use_fine_grained_sync` | `<class 'bool'>` | `value` |  |  |

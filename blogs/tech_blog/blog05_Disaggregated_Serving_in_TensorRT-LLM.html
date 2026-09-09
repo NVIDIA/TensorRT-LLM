@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,47 +663,47 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="disaggregated-serving-in-tensorrt-llm">
+  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-serving-in-tensorrt-llm">
 <h1>Disaggregated Serving in TensorRT LLM<a class="headerlink" href="#disaggregated-serving-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT LLM Team</p>
 <ul class="simple">
-<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm"><span class="xref myst">Disaggregated Serving in TensorRT LLM</span></a></p>
+<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm">Disaggregated Serving in TensorRT LLM</a></p>
 <ul>
-<li><p><a class="reference internal" href="../../features/ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
-<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm-1"><span class="xref myst">Disaggregated Serving in TensorRT LLM</span></a></p>
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
+<li><p><a class="reference internal" href="#id1">Disaggregated Serving in TensorRT LLM</a></p>
 <ul>
-<li><p><a class="reference internal" href="../../features/disagg-serving.html#trtllm-serve"><span class="std std-ref">trtllm-serve</span></a></p></li>
-<li><p><a class="reference internal" href="../../features/disagg-serving.html#dynamo"><span class="std std-ref">Dynamo</span></a></p></li>
-<li><p><a class="reference internal" href="#triton-inference-server"><span class="xref myst">Triton Inference Server</span></a></p></li>
+<li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
+<li><p><a class="reference internal" href="#dynamo">Dynamo</a></p></li>
+<li><p><a class="reference internal" href="#triton-inference-server">Triton Inference Server</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#kv-cache-exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
+<li><p><a class="reference internal" href="#kv-cache-exchange">KV Cache Exchange</a></p>
 <ul>
-<li><p><a class="reference internal" href="#multi-backend-support"><span class="xref myst">Multi-backend Support</span></a></p></li>
-<li><p><a class="reference internal" href="#overlap-optimization"><span class="xref myst">Overlap Optimization</span></a></p></li>
-<li><p><a class="reference internal" href="#cache-layout-transformation"><span class="xref myst">Cache Layout Transformation</span></a></p></li>
+<li><p><a class="reference internal" href="#multi-backend-support">Multi-backend Support</a></p></li>
+<li><p><a class="reference internal" href="#overlap-optimization">Overlap Optimization</a></p></li>
+<li><p><a class="reference internal" href="#cache-layout-transformation">Cache Layout Transformation</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#performance-studies"><span class="xref myst">Performance Studies</span></a></p>
+<li><p><a class="reference internal" href="#performance-studies">Performance Studies</a></p>
 <ul>
-<li><p><a class="reference internal" href="#measurement-methodology"><span class="xref myst">Measurement Methodology</span></a></p></li>
-<li><p><a class="reference internal" href="#deepseek-r1"><span class="xref myst">DeepSeek R1</span></a></p>
+<li><p><a class="reference internal" href="#measurement-methodology">Measurement Methodology</a></p></li>
+<li><p><a class="reference internal" href="#deepseek-r1">DeepSeek R1</a></p>
 <ul>
-<li><p><a class="reference internal" href="#isl-4400---osl-1200-machine-translation-dataset"><span class="xref myst">ISL 4400 - OSL 1200 (Machine Translation Dataset)</span></a></p></li>
-<li><p><a class="reference internal" href="#isl-8192---osl-256-synthetic-dataset"><span class="xref myst">ISL 8192 - OSL 256 (Synthetic Dataset)</span></a></p></li>
-<li><p><a class="reference internal" href="#isl-4096---osl-1024-machine-translation-dataset"><span class="xref myst">ISL 4096 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-4400-osl-1200-machine-translation-dataset">ISL 4400 - OSL 1200 (Machine Translation Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-8192-osl-256-synthetic-dataset">ISL 8192 - OSL 256 (Synthetic Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-4096-osl-1024-machine-translation-dataset">ISL 4096 - OSL 1024 (Machine Translation Dataset)</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#qwen-3"><span class="xref myst">Qwen 3</span></a></p>
+<li><p><a class="reference internal" href="#qwen-3">Qwen 3</a></p>
 <ul>
-<li><p><a class="reference internal" href="#isl-8192---osl-1024-machine-translation-dataset"><span class="xref myst">ISL 8192 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-8192-osl-1024-machine-translation-dataset">ISL 8192 - OSL 1024 (Machine Translation Dataset)</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#reproducing-steps"><span class="xref myst">Reproducing Steps</span></a></p></li>
+<li><p><a class="reference internal" href="#reproducing-steps">Reproducing Steps</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#future-work"><span class="xref myst">Future Work</span></a></p></li>
-<li><p><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
+<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
 </ul>
 </li>
 </ul>
@@ -781,7 +849,7 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 <li><p>Measure total throughput (tok/s) and latency (tok/s/user) for generation servers from different TP/EP/DP/PP mappings, concurrency levels and speculative decoding turned on/off.</p></li>
 <li><p>Find the ratio of context to generation workers such that aggregated throughput of context servers matches the aggregated throughput of generation servers for the workload’s input sequence length (ISL) and output sequence length (OSL)</p></li>
 <li><p>Calculate the throughput per GPU using the formula:
-$\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \text{GenReqRate}}{\text{CtxReqRate}}\right) + \text{NumGenGPUs}}$</p></li>
+<span class="math notranslate nohighlight">\(\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \text{GenReqRate}}{\text{CtxReqRate}}\right) + \text{NumGenGPUs}}\)</span></p></li>
 <li><p>Once the ideal ratio of context to generation servers is computed, the “rate-matched” Pareto curve can be constructed to identify the best configuration to use at different latencies (tok/s/user)</p></li>
 </ul>
 </li>
@@ -1053,9 +1121,9 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

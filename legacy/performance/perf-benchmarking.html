@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -439,7 +439,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -499,6 +564,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -593,7 +659,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="tensorrt-llm-benchmarking">
+  <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-benchmarking">
 <span id="perf-benchmarking"></span><h1>TensorRT-LLM Benchmarking<a class="headerlink" href="#tensorrt-llm-benchmarking" title="Link to this heading">#</a></h1>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
@@ -753,7 +819,7 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <p>The workflow for <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> is composed of the following steps:</p>
 <ol class="arabic simple">
 <li><p>Prepare a dataset to drive the inflight batching benchmark.</p></li>
-<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand (not required for <a class="reference internal" href="#running-with-the-pytorch-workflow"><span class="xref myst">PyTorch flow</span></a>).</p></li>
+<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand (not required for <a class="reference internal" href="#running-with-the-pytorch-workflow">PyTorch flow</a>).</p></li>
 <li><p>Run the max throughput benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand or low latency benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">latency</span></code> subcommand.</p></li>
 </ol>
 <section id="preparing-a-dataset">
@@ -946,7 +1012,7 @@ upper bound throughput number.</p>
 <section id="how-the-benchmarker-works">
 <h4>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading">#</a></h4>
 <p>The benchmarker reads a data file where a single line contains
-a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><code class="xref myst docutils literal notranslate"><span class="pre">preparing-a-dataset</span></code></a>.
+a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.
 The process that the benchmarker follows is:</p>
 <ol class="arabic simple">
 <li><p>Iterate over all input requests. If <code class="docutils literal notranslate"><span class="pre">logits</span></code> is specified, construct the request using the specified
@@ -954,8 +1020,8 @@ list of logits. Otherwise, tokenize the <code class="docutils literal notranslat
 <li><p>Submit the dataset to the TensorRT-LLM <code class="docutils literal notranslate"><span class="pre">Executor</span></code> API as fast as possible (offline mode).</p></li>
 <li><p>Wait for all requests to return, compute statistics, and then report results.</p></li>
 </ol>
-<p>To run the benchmarker, run the following commands with the <a class="reference internal" href="#building-a-benchmark-engine"><span class="xref myst">engine</span></a> and
-<a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">dataset</span></a> generated from previous steps:</p>
+<p>To run the benchmarker, run the following commands with the <a class="reference internal" href="#building-a-benchmark-engine">engine</a> and
+<a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 <span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.17.0
 <span class="o">[</span><span class="m">01</span>/18/2025-01:01:13<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Preparing<span class="w"> </span>to<span class="w"> </span>run<span class="w"> </span>throughput<span class="w"> </span>benchmark...
@@ -1032,9 +1098,9 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
 Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
 </div>
-<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">dataset</span></a> generated from previous steps. With the PyTorch flow, you will not need to
+<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. With the PyTorch flow, you will not need to
 run <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>; the <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the
-dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes"><span class="xref myst">above</span></a>).
+dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes">above</a>).
 Note that CUDA graph is enabled by default. You can add additional pytorch config with
 <code class="docutils literal notranslate"><span class="pre">--config</span></code> followed by the path to a YAML file. For more details, please refer to the
 help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
@@ -1329,19 +1395,18 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
 </section>
 <section id="low-latency-benchmark">
 <h2>Low Latency Benchmark<a class="headerlink" href="#low-latency-benchmark" title="Link to this heading">#</a></h2>
-<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#max-throughput-benchmark"><span class="xref myst">throughput benchmark</span></a>
+<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#max-throughput-benchmark">throughput benchmark</a>
 but requires building the engine separately from <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>. Low latency benchmarks has the following modes:</p>
 <ul class="simple">
 <li><p>A single-request low-latency engine</p></li>
-<li><p>A Medusa-enabled speculative-decoding engine</p></li>
 </ul>
 <section id="low-latency-tensorrt-llm-engine-for-llama-3-70b">
 <h3>Low Latency TensorRT-LLM Engine for Llama-3 70B<a class="headerlink" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b" title="Link to this heading">#</a></h3>
 <p>To build a low-latency engine for the latency benchmark, run the following quantize and build commands.
 The <code class="docutils literal notranslate"><span class="pre">$checkpoint_dir</span></code> is the path to the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3-70B">meta-llama/Meta-Llama-3-70B</a> Hugging Face checkpoint in your cache or downloaded to a specific location with the <a class="reference external" href="https://huggingface.co/docs/huggingface_hub/en/guides/cli">huggingface-cli</a>.
-To prepare a dataset, follow the same process as specified in <a class="reference internal" href="#preparing-a-dataset"><code class="xref myst docutils literal notranslate"><span class="pre">preparing-a-dataset</span></code></a>.</p>
-<section id="benchmarking-a-non-medusa-low-latency-engine">
-<h4>Benchmarking a non-Medusa Low Latency Engine<a class="headerlink" href="#benchmarking-a-non-medusa-low-latency-engine" title="Link to this heading">#</a></h4>
+To prepare a dataset, follow the same process as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.</p>
+<section id="benchmarking-a-low-latency-engine">
+<h4>Benchmarking a Low Latency Engine<a class="headerlink" href="#benchmarking-a-low-latency-engine" title="Link to this heading">#</a></h4>
 <p>To quantize the checkpoint:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>tensorrt_llm/examples/models/core/llama
 python<span class="w"> </span>../quantization/quantize.py<span class="w"> </span><span class="se">\</span>
@@ -1385,68 +1450,6 @@ python<span class="w"> </span>../quantization/quantize.py<span class="w"> </span
 </div>
 </section>
 </section>
-<section id="building-a-medusa-low-latency-engine">
-<h3>Building a Medusa Low-Latency Engine<a class="headerlink" href="#building-a-medusa-low-latency-engine" title="Link to this heading">#</a></h3>
-<p>To build a Medusa-enabled engine requires checkpoints that contain Medusa heads.
-NVIDIA provides TensorRT-LLM checkpoints on the <a class="reference external" href="https://huggingface.co/nvidia">NVIDIA</a> page on Hugging Face.
-The checkpoints are pre-quantized and can be directly built after downloading them with the
-<a class="reference external" href="https://huggingface.co/docs/huggingface_hub/en/guides/cli">huggingface-cli</a>.
-After you download the checkpoints, run the following command. Make sure to
-specify the <code class="docutils literal notranslate"><span class="pre">$tp_size</span></code> supported by your Medusa checkpoint and the path to its stored location <code class="docutils literal notranslate"><span class="pre">$checkpoint_dir</span></code>.
-Additionally, <code class="docutils literal notranslate"><span class="pre">$max_seq_len</span></code> should be set to the model’s maximum position embedding.</p>
-<p>Using Llama-3.1 70B as an example, for a tensor parallel 8 and bfloat16 dtype:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">tp_size</span><span class="o">=</span><span class="m">8</span>
-<span class="nv">max_seq_len</span><span class="o">=</span><span class="m">131072</span>
-trtllm-build<span class="w"> </span>--checkpoint_dir<span class="w"> </span><span class="nv">$checkpoint_dir</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--speculative_decoding_mode<span class="w"> </span>medusa<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--gpt_attention_plugin<span class="w"> </span>bfloat16<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="nv">$max_seq_len</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--output_dir<span class="w"> </span>/tmp/meta-llama/Meta-Llama-3.1-70B/medusa/engine<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--use_fused_mlp<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--paged_kv_cache<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--use_paged_context_fmha<span class="w"> </span>disable<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--multiple_profiles<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--reduce_fusion<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--use_fp8_context_fmha<span class="w"> </span><span class="nb">enable</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--workers<span class="w"> </span><span class="nv">$tp_size</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--low_latency_gemm_plugin<span class="w"> </span>fp8
-</pre></div>
-</div>
-<p>After the engine is built, you need to define the Medusa choices.
-The choices are specified with a YAML file like the following example (<code class="docutils literal notranslate"><span class="pre">medusa.yaml</span></code>):</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">2</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">3</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">3</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">4</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">4</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">2</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">5</span><span class="p p-Indicator">]</span>
-<span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span>
-</pre></div>
-</div>
-<p>To run the Medusa-enabled engine, run the following command:</p>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>env<span class="w"> </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">UB_ONESHOT</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">UB_TP_SIZE</span><span class="o">=</span><span class="nv">$tp_size</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">TRTLLM_PDL_OVERLAP_RATIO</span><span class="o">=</span><span class="m">0</span>.15<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="nv">TRTLLM_PREFETCH_RATIO</span><span class="o">=</span>-1<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Meta-Llama-3-70B<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>latency<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--dataset<span class="w"> </span><span class="nv">$DATASET_PATH</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Meta-Llama-3-70B/medusa/engine<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--medusa_choices<span class="w"> </span>medusa.yml
-</pre></div>
-</div>
-</section>
 </section>
 <section id="summary">
 <h2>Summary<a class="headerlink" href="#summary" title="Link to this heading">#</a></h2>
@@ -1473,30 +1476,26 @@ The choices are specified with a YAML file like the following example (<code cla
 </tr>
 <tr class="row-odd"><td><p>Latency</p></td>
 <td><p>Build</p></td>
-<td><p>See <a class="reference internal" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b"><span class="xref myst">section about building low latency engines</span></a></p></td>
+<td><p>See <a class="reference internal" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b">section about building low latency engines</a></p></td>
 </tr>
-<tr class="row-even"><td><p>Non-Medusa Latency</p></td>
+<tr class="row-even"><td><p>Latency</p></td>
 <td><p>Benchmark</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$HF_MODEL</span> <span class="pre">latency</span> <span class="pre">--dataset</span> <span class="pre">$DATASET_PATH</span> <span class="pre">--engine_dir</span> <span class="pre">$ENGINE_DIR</span></code></p></td>
-</tr>
-<tr class="row-odd"><td><p>Medusa Latency</p></td>
-<td><p>Benchmark</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">--model</span> <span class="pre">$HF_MODEL</span> <span class="pre">latency</span> <span class="pre">--dataset</span> <span class="pre">$DATASET_PATH</span> <span class="pre">--engine_dir</span> <span class="pre">$ENGINE_DIR</span> <span class="pre">--medusa_choices</span> <span class="pre">$MEDUSA_CHOICES</span></code></p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <p>where,</p>
-<p><code class="docutils literal notranslate"><span class="pre">$HF_MODEL</span></code>
-: The Hugging Face name of a model.</p>
-<p><code class="docutils literal notranslate"><span class="pre">$NUM_REQUESTS</span></code>
-: The number of requests to generate.</p>
-<p><code class="docutils literal notranslate"><span class="pre">$DATASET_PATH</span></code>
-: The path where the dataset was written when preparing the dataset.</p>
-<p><code class="docutils literal notranslate"><span class="pre">$ENGINE_DIR</span></code>
-: The engine directory as printed by <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">$MEDUSA_CHOICES</span></code>
-: A YAML config representing the Medusa tree for the benchmark.</p>
+<dl class="simple myst">
+<dt><code class="docutils literal notranslate"><span class="pre">$HF_MODEL</span></code></dt><dd><p>The Hugging Face name of a model.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">$NUM_REQUESTS</span></code></dt><dd><p>The number of requests to generate.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">$DATASET_PATH</span></code></dt><dd><p>The path where the dataset was written when preparing the dataset.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">$ENGINE_DIR</span></code></dt><dd><p>The engine directory as printed by <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>.</p>
+</dd>
+</dl>
 </section>
 </section>
 
@@ -1570,10 +1569,9 @@ The choices are specified with a YAML file like the following example (<code cla
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency-benchmark">Low Latency Benchmark</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b">Low Latency TensorRT-LLM Engine for Llama-3 70B</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-a-non-medusa-low-latency-engine">Benchmarking a non-Medusa Low Latency Engine</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmarking-a-low-latency-engine">Benchmarking a Low Latency Engine</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#building-a-medusa-low-latency-engine">Building a Medusa Low-Latency Engine</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#summary">Summary</a></li>
@@ -1668,9 +1666,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

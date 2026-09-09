@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -439,7 +439,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -499,6 +564,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -597,7 +663,7 @@
 SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
-<section id="use-encoder-decoder-models-with-the-pytorch-backend">
+<section class="tex2jax_ignore mathjax_ignore" id="use-encoder-decoder-models-with-the-pytorch-backend">
 <h1>Use encoder-decoder models with the PyTorch backend<a class="headerlink" href="#use-encoder-decoder-models-with-the-pytorch-backend" title="Link to this heading">#</a></h1>
 <p>TensorRT LLM can run supported Hugging Face encoder-decoder checkpoints directly
 with the PyTorch backend. You do not need to convert the checkpoint or build a
@@ -632,10 +698,10 @@ the following Hugging Face architectures:</p>
 defines <code class="docutils literal notranslate"><span class="pre">forced_bos_token_id</span></code>, the PyTorch backend seeds that token in the
 decoder prefix. Source- and target-language selection remains
 checkpoint-specific, so validate the configured language tokens before
-deployment. Refer to <a class="reference internal" href="#understand-bart-and-mbart-decoder-tokens"><span class="xref myst">Understand BART and mBART decoder tokens</span></a>
+deployment. Refer to <a class="reference internal" href="#understand-bart-and-mbart-decoder-tokens">Understand BART and mBART decoder tokens</a>
 for BOS, EOS, and output-limit behavior.</p>
 <p>Whisper consumes audio rather than a text prompt. The sections up to
-<a class="reference internal" href="#transcribe-audio-with-whisper"><span class="xref myst">Transcribe audio with Whisper</span></a> describe the
+<a class="reference internal" href="#transcribe-audio-with-whisper">Transcribe audio with Whisper</a> describe the
 text-to-text models; the runtime configuration, KV cache manager, beam search,
 CUDA graph, and parallelism guidance in this guide applies to all architectures.</p>
 <section id="feature-support">
@@ -675,7 +741,7 @@ CUDA graph, and parallelism guidance in this guide applies to all architectures.
 </tr>
 <tr class="row-even"><td><p>Encoder CUDA graphs</p></td>
 <td><p>Yes</p></td>
-<td><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config=EncodeCudaGraphConfig(...)</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>. Usually set <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> lower than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend is required.</p></td>
+<td><p>Set <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config=EncodeCudaGraphConfig(...)</span></code> and <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>. Usually set <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> lower than <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend is required. Text encoders also require <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code>; a fixed-shape feature encoder such as Whisper derives both from the model and needs only <code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Overlap scheduler</p></td>
 <td><p>Yes</p></td>
@@ -1057,6 +1123,44 @@ size, total packed tokens, and maximum sequence length. The
 <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> value is the hard encoder capacity and admission
 limit. With beam search, decoder graph batch sizes must cover the active
 decoder sequences after beam expansion.</p>
+<p>Which encoder buckets you must supply depends on the model. A text encoder,
+such as BART or T5, packs a variable number of tokens per request, so
+<code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> and <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> are part of its key space and are required; leaving
+either unset is rejected at <code class="docutils literal notranslate"><span class="pre">LLM(...)</span></code> for any architecture TensorRT-LLM
+recognizes, and at model engine initialization otherwise, since only the loaded
+model states with certainty which kind of encoder it has. An encoder whose input is a
+fixed-shape per-request feature tensor, such as Whisper’s fixed 30-second
+zero-padded audio waveform (the mel transform runs inside the encoder, so the
+per-request input is the waveform itself, not a spectrogram), produces the same
+number of encoder positions for every request, so both lists follow from the
+model and are derived rather than configured. For those models
+<code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code> alone enables capture, and any <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> or <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> you set
+is ignored.</p>
+<p>Batch sizes that do not fit <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> divided by the model’s
+encoder output length are dropped, and the encoder stays eager when none fit.
+Size the encoder token budget for the largest bucket before setting the
+buckets: Whisper emits 1500 encoder positions per request, so <code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code> up
+to 8 needs <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code> of at least 12000. <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>
+falls back to <code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> when unset, which is a decoder-sized number and
+usually too small.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">EncodeCudaGraphConfig</span>
+
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"openai/whisper-large-v3"</span><span class="p">,</span>
+    <span class="n">backend</span><span class="o">=</span><span class="s2">"pytorch"</span><span class="p">,</span>
+    <span class="n">attn_backend</span><span class="o">=</span><span class="s2">"TRTLLM"</span><span class="p">,</span>
+    <span class="n">max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="n">encoder_max_batch_size</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span>
+    <span class="c1"># 8 buckets * 1500 encoder positions. Leave this at the default and the</span>
+    <span class="c1"># 4 and 8 buckets are silently dropped.</span>
+    <span class="n">encoder_max_num_tokens</span><span class="o">=</span><span class="mi">12000</span><span class="p">,</span>
+    <span class="n">encoder_cuda_graph_config</span><span class="o">=</span><span class="n">EncodeCudaGraphConfig</span><span class="p">(</span><span class="n">batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">]),</span>
+    <span class="c1"># ... the remaining Whisper settings from "Transcribe audio with Whisper",</span>
+    <span class="c1"># whose `max_batch_size=4` this example raises to 8</span>
+<span class="p">)</span>
+</pre></div>
+</div>
 <p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> controls the total decoder concurrency, while
 <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code> controls encoder microbatch admission. For better
 performance, tune <code class="docutils literal notranslate"><span class="pre">encoder_max_batch_size</span></code>, <code class="docutils literal notranslate"><span class="pre">encoder_max_num_tokens</span></code>, and the
@@ -1215,7 +1319,7 @@ encoder CUDA graphs, padded decoder CUDA graphs, and mixed encoder-decoder CUDA
 graphs. Compared with the legacy TensorRT path, the PyTorch backend delivered
 65.8%, 12.6%, and 11.8% higher request throughput at concurrencies 8, 32, and
 64, respectively. P99 latency was 51.6%, 31.0%, and 33.5% lower.</p>
-<p>Follow <a class="reference internal" href="#enable-encoder-and-decoder-cuda-graphs"><span class="xref myst">Enable encoder and decoder CUDA graphs</span></a>
+<p>Follow <a class="reference internal" href="#enable-encoder-and-decoder-cuda-graphs">Enable encoder and decoder CUDA graphs</a>
 and choose capture buckets that cover the batch sizes, packed encoder token
 counts, and sequence lengths expected in production. Capture grids that omit
 common runtime shapes fall back to eager execution and can lose these
@@ -1259,6 +1363,13 @@ size.</p></li>
 that the encoder graph buckets cover the request shape, and that
 <code class="docutils literal notranslate"><span class="pre">attn_backend=&quot;TRTLLM&quot;</span></code>. Unsupported shapes and attention backends fall back to
 eager encoder execution.</p>
+</section>
+<section id="num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction">
+<h3><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> or <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> unset is rejected at engine construction<a class="headerlink" href="#num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction" title="Link to this heading">#</a></h3>
+<p>A text encoder needs both bucket lists, so the engine raises rather than
+silently running eager. Supply them, or drop <code class="docutils literal notranslate"><span class="pre">encoder_cuda_graph_config</span></code> if you
+do not want encoder graphs. A fixed-shape feature encoder such as Whisper does
+not hit this: it derives both from the model and needs only <code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code>.</p>
 </section>
 <section id="output-quality-differs-from-the-hugging-face-example">
 <h3>Output quality differs from the Hugging Face example<a class="headerlink" href="#output-quality-differs-from-the-hugging-face-example" title="Link to this heading">#</a></h3>
@@ -1327,6 +1438,7 @@ differences can change lower-ranked beam hypotheses when scores are close.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-manager-v2-fails-with-beam-search">KV cache manager V2 fails with beam search</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallel-initialization-is-rejected">Tensor parallel initialization is rejected</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#encoder-cuda-graphs-fall-back-to-eager-execution">Encoder CUDA graphs fall back to eager execution</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#num-tokens-or-seq-lens-unset-is-rejected-at-engine-construction"><code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> or <code class="docutils literal notranslate"><span class="pre">seq_lens</span></code> unset is rejected at engine construction</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#output-quality-differs-from-the-hugging-face-example">Output quality differs from the Hugging Face example</a></li>
 </ul>
 </li>
@@ -1421,9 +1533,9 @@ differences can change lower-ranked beam hypotheses when scores are close.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

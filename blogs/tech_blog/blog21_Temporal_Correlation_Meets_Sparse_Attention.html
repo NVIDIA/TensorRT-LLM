@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,51 +663,51 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="temporal-correlation-meets-sparse-attention-guess-verify-refine-top-k-for-blackwell">
+  <section class="tex2jax_ignore mathjax_ignore" id="temporal-correlation-meets-sparse-attention-guess-verify-refine-top-k-for-blackwell">
 <h1>Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell<a class="headerlink" href="#temporal-correlation-meets-sparse-attention-guess-verify-refine-top-k-for-blackwell" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT LLM team</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="../../torch/adding_new_model.html#introduction"><span class="std std-ref">Introduction</span></a></p></li>
-<li><p><a class="reference internal" href="#why-decode-time-top-k-matters-in-dsa"><span class="xref myst">Why Decode-Time Top-K Matters in DSA</span></a></p>
+<li><p><a class="reference internal" href="#introduction">Introduction</a></p></li>
+<li><p><a class="reference internal" href="#why-decode-time-top-k-matters-in-dsa">Why Decode-Time Top-K Matters in DSA</a></p>
 <ul>
-<li><p><a class="reference internal" href="#lightweight-indexer-and-top-k-selection"><span class="xref myst">Lightweight Indexer and Top-K Selection</span></a></p></li>
-<li><p><a class="reference internal" href="#why-long-context-makes-top-k-a-bottleneck"><span class="xref myst">Why Long Context Makes Top-K a Bottleneck</span></a></p></li>
+<li><p><a class="reference internal" href="#lightweight-indexer-and-top-k-selection">Lightweight Indexer and Top-K Selection</a></p></li>
+<li><p><a class="reference internal" href="#why-long-context-makes-top-k-a-bottleneck">Why Long Context Makes Top-K a Bottleneck</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#why-temporal-correlation-exists"><span class="xref myst">Why Temporal Correlation Exists</span></a></p>
+<li><p><a class="reference internal" href="#why-temporal-correlation-exists">Why Temporal Correlation Exists</a></p>
 <ul>
-<li><p><a class="reference internal" href="#what-we-observe-in-real-decode-traces"><span class="xref myst">What We Observe in Real Decode Traces</span></a></p></li>
-<li><p><a class="reference internal" href="#why-rope-and-yarn-make-this-predictable"><span class="xref myst">Why RoPE and YaRN Make This Predictable</span></a></p></li>
+<li><p><a class="reference internal" href="#what-we-observe-in-real-decode-traces">What We Observe in Real Decode Traces</a></p></li>
+<li><p><a class="reference internal" href="#why-rope-and-yarn-make-this-predictable">Why RoPE and YaRN Make This Predictable</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#how-gvr-works"><span class="xref myst">How GVR Works</span></a></p>
+<li><p><a class="reference internal" href="#how-gvr-works">How GVR Works</a></p>
 <ul>
-<li><p><a class="reference internal" href="#phase-1-guess-from-previous-step-top-k"><span class="xref myst">Phase 1: Guess from Previous-Step Top-K</span></a></p></li>
-<li><p><a class="reference internal" href="#phase-2-verify-with-secant-threshold-search"><span class="xref myst">Phase 2: Verify with Secant Threshold Search</span></a></p></li>
-<li><p><a class="reference internal" href="#phase-3-ballot-free-candidate-collection"><span class="xref myst">Phase 3: Ballot-Free Candidate Collection</span></a></p></li>
-<li><p><a class="reference internal" href="#phase-4-exact-refinement-in-shared-memory"><span class="xref myst">Phase 4: Exact Refinement in Shared Memory</span></a></p></li>
-<li><p><a class="reference internal" href="#why-this-is-still-exact"><span class="xref myst">Why This Is Still Exact</span></a></p></li>
+<li><p><a class="reference internal" href="#phase-1-guess-from-previous-step-top-k">Phase 1: Guess from Previous-Step Top-K</a></p></li>
+<li><p><a class="reference internal" href="#phase-2-verify-with-secant-threshold-search">Phase 2: Verify with Secant Threshold Search</a></p></li>
+<li><p><a class="reference internal" href="#phase-3-ballot-free-candidate-collection">Phase 3: Ballot-Free Candidate Collection</a></p></li>
+<li><p><a class="reference internal" href="#phase-4-exact-refinement-in-shared-memory">Phase 4: Exact Refinement in Shared Memory</a></p></li>
+<li><p><a class="reference internal" href="#why-this-is-still-exact">Why This Is Still Exact</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#tensorrt-llm-integration"><span class="xref myst">TensorRT-LLM Integration</span></a></p>
+<li><p><a class="reference internal" href="#tensorrt-llm-integration">TensorRT-LLM Integration</a></p>
 <ul>
-<li><p><a class="reference internal" href="#where-gvr-fits-in-the-dsa-stack"><span class="xref myst">Where GVR Fits in the DSA Stack</span></a></p></li>
-<li><p><a class="reference internal" href="#how-to-enable-it"><span class="xref myst">How to Enable It</span></a></p></li>
-<li><p><a class="reference internal" href="#when-it-falls-back-to-radix-select"><span class="xref myst">When It Falls Back to Radix Select</span></a></p></li>
+<li><p><a class="reference internal" href="#where-gvr-fits-in-the-dsa-stack">Where GVR Fits in the DSA Stack</a></p></li>
+<li><p><a class="reference internal" href="#how-to-enable-it">How to Enable It</a></p></li>
+<li><p><a class="reference internal" href="#when-it-falls-back-to-radix-select">When It Falls Back to Radix Select</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="../../legacy/performance/performance-tuning-guide/benchmarking-default-performance.html#results"><span class="std std-ref">Results</span></a></p>
+<li><p><a class="reference internal" href="#results">Results</a></p>
 <ul>
-<li><p><a class="reference internal" href="#single-operator-performance"><span class="xref myst">Single-Operator Performance</span></a></p></li>
-<li><p><a class="reference internal" href="#ablation-architecture-vs-prediction-quality"><span class="xref myst">Ablation: Architecture vs Prediction Quality</span></a></p></li>
-<li><p><a class="reference internal" href="#end-to-end-accuracy"><span class="xref myst">End-to-End Accuracy</span></a></p></li>
-<li><p><a class="reference internal" href="#end-to-end-tpot-reduction"><span class="xref myst">End-to-End TPOT Reduction</span></a></p></li>
+<li><p><a class="reference internal" href="#single-operator-performance">Single-Operator Performance</a></p></li>
+<li><p><a class="reference internal" href="#ablation-architecture-vs-prediction-quality">Ablation: Architecture vs Prediction Quality</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-accuracy">End-to-End Accuracy</a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-tpot-reduction">End-to-End TPOT Reduction</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#further-reading-and-reproduction"><span class="xref myst">Further Reading and Reproduction</span></a></p></li>
-<li><p><a class="reference internal" href="../../legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html#conclusion"><span class="std std-ref">Conclusion</span></a></p></li>
+<li><p><a class="reference internal" href="#further-reading-and-reproduction">Further Reading and Reproduction</a></p></li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
 </ul>
 </section>
 <section id="introduction">
@@ -666,8 +734,9 @@
 <section id="lightweight-indexer-and-top-k-selection">
 <h3>Lightweight Indexer and Top-K Selection<a class="headerlink" href="#lightweight-indexer-and-top-k-selection" title="Link to this heading">#</a></h3>
 <p>As described in the <a class="reference external" href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a>, DSA computes index scores with a lightweight MQA-style indexer:</p>
-<p>$$I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)$$</p>
-<p>The index score tensor $I_t \in \mathbb{R}^N$ (where $N$ is the current sequence length) estimates which past KV tokens matter most for the current query token. A Top-K operator then selects the top 2048 positions, and only those selected entries participate in sparse MLA.</p>
+<div class="math notranslate nohighlight">
+\[I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)\]</div>
+<p>The index score tensor <span class="math notranslate nohighlight">\(I_t \in \mathbb{R}^N\)</span> (where <span class="math notranslate nohighlight">\(N\)</span> is the current sequence length) estimates which past KV tokens matter most for the current query token. A Top-K operator then selects the top 2048 positions, and only those selected entries participate in sparse MLA.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_indexer_topk.png" alt="Indexer Top-K Selection" width="900" height="auto">
@@ -684,33 +753,33 @@
 <tr class="row-odd"><th class="head text-left"><p>Component</p></th>
 <th class="head text-left"><p>Scaling</p></th>
 <th class="head text-left"><p>Total Memory Traffic</p></th>
-<th class="head text-left"><p>Trend as $N$ Grows</p></th>
+<th class="head text-left"><p>Trend as <span class="math notranslate nohighlight">\(N\)</span> Grows</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p><strong>Indexer MQA</strong></p></td>
-<td class="text-left"><p>$O(N)$</p></td>
-<td class="text-left"><p>$N \cdot d_i \cdot 2B$</p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(O(N)\)</span></p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(N \cdot d_i \cdot 2B\)</span></p></td>
 <td class="text-left"><p>Linear growth</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p><strong>Top-K (radix-select)</strong></p></td>
-<td class="text-left"><p>$O(R \cdot N)$</p></td>
-<td class="text-left"><p>$R \cdot N \cdot 4B$</p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(O(R \cdot N)\)</span></p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(R \cdot N \cdot 4B\)</span></p></td>
 <td class="text-left"><p>Linear growth</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p><strong>Sparse MLA</strong></p></td>
-<td class="text-left"><p>$O(K)$</p></td>
-<td class="text-left"><p>$K \cdot d \cdot 2B$</p></td>
-<td class="text-left"><p>Constant ($K$ fixed)</p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(O(K)\)</span></p></td>
+<td class="text-left"><p><span class="math notranslate nohighlight">\(K \cdot d \cdot 2B\)</span></p></td>
+<td class="text-left"><p>Constant (<span class="math notranslate nohighlight">\(K\)</span> fixed)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Here $K = 2048$ is fixed, while $N$ grows with the request’s decode-time context length.</p>
+<p>Here <span class="math notranslate nohighlight">\(K = 2048\)</span> is fixed, while <span class="math notranslate nohighlight">\(N\)</span> grows with the request’s decode-time context length.</p>
 <p>This creates a very specific long-context effect:</p>
 <ul class="simple">
-<li><p>sparse MLA stays roughly constant because it always attends to only $K$ tokens,</p></li>
-<li><p>but the decode-stage Top-K still has to inspect all $N$ scores,</p></li>
+<li><p>sparse MLA stays roughly constant because it always attends to only <span class="math notranslate nohighlight">\(K\)</span> tokens,</p></li>
+<li><p>but the decode-stage Top-K still has to inspect all <span class="math notranslate nohighlight">\(N\)</span> scores,</p></li>
 <li><p>so the <strong>Top-K fraction of DSA latency grows with context length</strong>.</p></li>
 </ul>
 <p>That is why Top-K becomes worth optimizing as a standalone operator rather than being treated as a small side cost. The production radix-select kernel is already very strong, but it still pays for multiple full-row passes and shared-memory atomic serialization. GVR keeps exactness, but uses temporal structure in the workload to reduce those passes.</p>
@@ -720,7 +789,7 @@
 <h2>Why Temporal Correlation Exists<a class="headerlink" href="#why-temporal-correlation-exists" title="Link to this heading">#</a></h2>
 <section id="what-we-observe-in-real-decode-traces">
 <h3>What We Observe in Real Decode Traces<a class="headerlink" href="#what-we-observe-in-real-decode-traces" title="Link to this heading">#</a></h3>
-<p>A key empirical observation is that the Top-K index sets in DSA have strong temporal stability across decode steps: the important tokens at step $t$ often overlap substantially with the important tokens at step $t-1$.</p>
+<p>A key empirical observation is that the Top-K index sets in DSA have strong temporal stability across decode steps: the important tokens at step <span class="math notranslate nohighlight">\(t\)</span> often overlap substantially with the important tokens at step <span class="math notranslate nohighlight">\(t-1\)</span>.</p>
 <p>We measured this on real DeepSeek-V3.2 decode-stage indexer logits using a long-context coding prompt from <strong>SWE-bench-derived LongSeqTasks</strong>. Concretely, the prompt used here is entry 1 of the 64K bucket, built from repository files of a single SWE-bench task; its actual prompt length is 68,665 tokens, followed by 2,025 decode steps.</p>
 <div align="center">
 <figure>
@@ -740,7 +809,7 @@
 <p>The empirical observation is not accidental. It is tied to how the DSA indexer uses RoPE-encoded query and key tensors.</p>
 <p>At a high level:</p>
 <ul class="simple">
-<li><p>the positional score contribution depends on relative position $\Delta = n - m$,</p></li>
+<li><p>the positional score contribution depends on relative position <span class="math notranslate nohighlight">\(\Delta = n - m\)</span>,</p></li>
 <li><p>so the positional score landscape is Toeplitz-like,</p></li>
 <li><p>and advancing the query by one decode step produces a smooth translation rather than a random reshuffling.</p></li>
 </ul>
@@ -778,15 +847,17 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">pmax</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">pmean</span></code></p></li>
 </ul>
-<p>The most important quantity is <code class="docutils literal notranslate"><span class="pre">pmean</span></code>, which gives a much better initial threshold estimate than the unconditional mean of the full score vector. In real decode workloads, the hit ratio of <code class="docutils literal notranslate"><span class="pre">preIdx</span></code> is much larger than the trivial baseline $K/N$, so <code class="docutils literal notranslate"><span class="pre">pmean</span></code> is already biased toward the Top-K tail.</p>
+<p>The most important quantity is <code class="docutils literal notranslate"><span class="pre">pmean</span></code>, which gives a much better initial threshold estimate than the unconditional mean of the full score vector. In real decode workloads, the hit ratio of <code class="docutils literal notranslate"><span class="pre">preIdx</span></code> is much larger than the trivial baseline <span class="math notranslate nohighlight">\(K/N\)</span>, so <code class="docutils literal notranslate"><span class="pre">pmean</span></code> is already biased toward the Top-K tail.</p>
 </section>
 <section id="phase-2-verify-with-secant-threshold-search">
 <h3>Phase 2: Verify with Secant Threshold Search<a class="headerlink" href="#phase-2-verify-with-secant-threshold-search" title="Link to this heading">#</a></h3>
 <p>Starting from <code class="docutils literal notranslate"><span class="pre">pmean</span></code> and the bracket <code class="docutils literal notranslate"><span class="pre">[pmin,</span> <span class="pre">pmax]</span></code>, GVR runs a secant-style threshold search over the monotone count function:</p>
-<p>$$f(T) = |{i : x_i \geq T}|$$</p>
-<p>The target is to find a threshold $T^\ast$ such that the candidate count falls into a safe refinement range:</p>
-<p>$$K \leq f(T^\ast) \leq C$$</p>
-<p>where $C$ is a bounded candidate capacity.</p>
+<div class="math notranslate nohighlight">
+\[f(T) = |\{i : x_i \geq T\}|\]</div>
+<p>The target is to find a threshold <span class="math notranslate nohighlight">\(T^\ast\)</span> such that the candidate count falls into a safe refinement range:</p>
+<div class="math notranslate nohighlight">
+\[K \leq f(T^\ast) \leq C\]</div>
+<p>where <span class="math notranslate nohighlight">\(C\)</span> is a bounded candidate capacity.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_secant_method.png" alt="Secant Method Threshold Search" width="750" height="auto">
@@ -807,7 +878,7 @@
 </section>
 <section id="phase-4-exact-refinement-in-shared-memory">
 <h3>Phase 4: Exact Refinement in Shared Memory<a class="headerlink" href="#phase-4-exact-refinement-in-shared-memory" title="Link to this heading">#</a></h3>
-<p>If the candidate count is already exactly $K$, GVR is done.</p>
+<p>If the candidate count is already exactly <span class="math notranslate nohighlight">\(K\)</span>, GVR is done.</p>
 <p>Otherwise, GVR performs exact refinement entirely in shared memory:</p>
 <ol class="arabic simple">
 <li><p>scan candidates for min/max,</p></li>
@@ -926,7 +997,7 @@
 <h2>Results<a class="headerlink" href="#results" title="Link to this heading">#</a></h2>
 <section id="single-operator-performance">
 <h3>Single-Operator Performance<a class="headerlink" href="#single-operator-performance" title="Link to this heading">#</a></h3>
-<p>On synthetic data, GVR shows the expected scaling behavior: there is fixed overhead at short sequence length, but the reduced pass count wins as $N$ grows. Production dispatch uses a hardware-aware GVR gate rather than a single hard crossover: the default small-sequence lower bound is <code class="docutils literal notranslate"><span class="pre">12288</span></code>, while a hardware-aware batch threshold routes large-batch or L2-pressure cases back to radix.</p>
+<p>On synthetic data, GVR shows the expected scaling behavior: there is fixed overhead at short sequence length, but the reduced pass count wins as <span class="math notranslate nohighlight">\(N\)</span> grows. Production dispatch uses a hardware-aware GVR gate rather than a single hard crossover: the default small-sequence lower bound is <code class="docutils literal notranslate"><span class="pre">12288</span></code>, while a hardware-aware batch threshold routes large-batch or L2-pressure cases back to radix.</p>
 <div align="center">
 <figure>
   <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog21_synthetic_scaling.png" alt="Synthetic Data Scaling" width="750" height="auto">
@@ -961,7 +1032,7 @@
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p>preIdx Source</p></th>
-<th class="head text-center"><p>Overlap ($\alpha$)</p></th>
+<th class="head text-center"><p>Overlap (<span class="math notranslate nohighlight">\(\alpha\)</span>)</p></th>
 <th class="head text-center"><p>Kernel Latency</p></th>
 <th class="head text-center"><p>vs. Radix Baseline</p></th>
 </tr>
@@ -1306,9 +1377,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

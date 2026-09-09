@@ -1,0 +1,1255 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Evaluating Agentic Serving with Trace Replay and Job-Level Metrics" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html" />
+    <link rel="prev" title="Sparse Attention Development Guide" href="../../developer-guide/sparse-attention-development-guide.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc26" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="accelerating-video-generation-with-gemm-quantization-attention-quantization-and-skip-softmax-attention-in-tensorrt-llm">
+<h1>Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM<a class="headerlink" href="#accelerating-video-generation-with-gemm-quantization-attention-quantization-and-skip-softmax-attention-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT-LLM Team</p>
+<section id="introduction">
+<h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
+<p>Video diffusion transformers (DiTs) repeatedly process long spatiotemporal token sequences across multiple denoising steps. Linear and attention layers therefore dominate much of the compute, making them the two most direct targets for reducing generation latency.</p>
+<p>Figure 1 breaks down pipeline-forward time for Wan 2.2 T2V-A14B on a single NVIDIA B200. For an 81-frame, 1280×720 video with 40 denoising steps, attention and linear-layer GEMMs account for 70.3% and 21.0% of BF16 pipeline-forward time, respectively.</p>
+<p align="center">
+  <img src="../media/tech_blog28_bf16_time_breakdown.png" alt="Pie chart showing that Wan 2.2 T2V-A14B in BF16 spends 70.3% of pipeline-forward time in attention, 21.0% in GEMMs, and 8.7% in other work" width="1080">
+</p>
+<p align="center"><sub><em>Figure 1. Diffusion pipeline-forward breakdown for Wan 2.2 T2V-A14B in BF16 on B200.</em></sub></p>
+<p>Our earlier post, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md">Scaling Video Generation Across NVL72 Rack with TensorRT-LLM</a>, showed how to accelerate video generation with multiple GPUs. This post focuses on three complementary techniques within one GPU: GEMM quantization, quantized attention, and sparse attention. The central question is how to reduce latency without giving up more visual quality than the application can tolerate.</p>
+</section>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#gemm-quantization">GEMM Quantization</a></p></li>
+<li><p><a class="reference internal" href="#attention-optimizations">Attention Optimizations</a></p></li>
+<li><p><a class="reference internal" href="#results">Results</a></p></li>
+<li><p><a class="reference internal" href="#reproduction">Reproduction</a></p></li>
+<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
+<li><p><a class="reference internal" href="#references">References</a></p></li>
+</ul>
+</section>
+<section id="gemm-quantization">
+<h2>GEMM Quantization<a class="headerlink" href="#gemm-quantization" title="Link to this heading">#</a></h2>
+<p>GEMM quantization reduces the numerical precision of weights and activations so linear-layer GEMMs can use higher-throughput, low-precision Tensor Core paths. TensorRT-LLM VisualGen supports the following GEMM quantization paths:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p><code class="docutils literal notranslate"><span class="pre">quant_algo</span></code></p></th>
+<th class="head text-left"><p>Weight precision</p></th>
+<th class="head text-left"><p>Weight scaling</p></th>
+<th class="head text-left"><p>Activation precision</p></th>
+<th class="head text-left"><p>Activation scaling</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">FP8</span></code></p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per tensor (FP32)</p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per tensor (FP32)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">FP8_BLOCK_SCALES</span></code></p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per 128×128 block (FP32<sup>*</sup>)</p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per 1×128 block (FP32<sup>*</sup>)</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">FP8_PER_CHANNEL_PER_TOKEN</span></code> (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/16847">WIP</a>)</p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per output channel (FP32)</p></td>
+<td class="text-left"><p>FP8 E4M3</p></td>
+<td class="text-left"><p>Per token (FP32)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">NVFP4</span></code></p></td>
+<td class="text-left"><p>FP4 E2M1</p></td>
+<td class="text-left"><p>Per 16-element block (FP8 E4M3), plus a per-tensor scale (FP32)</p></td>
+<td class="text-left"><p>FP4 E2M1</p></td>
+<td class="text-left"><p>Per 16-element block (FP8 E4M3), plus a per-tensor scale (FP32)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p align="center"><sub><em><sup>*</sup> FP8 blockwise scale values use FP32 in the checkpoint and generic interface. On B200, weight scales are converted to UE8M0 and activation scales are generated in UE8M0 for the Blackwell block-scaled MMA.</em></sub></p>
+<p>There are two distinct quantization paths:</p>
+<ul class="simple">
+<li><p><strong>Static quantization:</strong> Weights are quantized offline. Meanwhile, some representative inputs are forwarded through the network to determine the static scaling factors for the activation. After this procedure of offline quantization and calibration, the quantized weights, weight scales and activation scales are stored in the checkpoint. But note that only per-tensor activation scales will be calibrated offline, such as the FP32 for per-tensor <code class="docutils literal notranslate"><span class="pre">FP8</span></code> and the second-level per-tensor in <code class="docutils literal notranslate"><span class="pre">NVFP4</span></code>. Other activation scales, such as the block scales in <code class="docutils literal notranslate"><span class="pre">NVFP4</span></code> are still computed dynamically during runtime. In addition, accuracy-sensitive modules can be discovered and remained in higher precision during offline quantization.</p></li>
+<li><p><strong>Dynamic quantization:</strong> The original BF16 checkpoint is directly loaded. The weights are quantized to the target precision during loading. The activation is always quantized dynamically during runtime, including the scaling factors, which might be more expensive compared to static quantization path, especially for the per-tensor scales. With dynamic quantization, it is easier to try the target quantization recipe without preparing a dedicated quantized checkpoint, but generally preserves less accuracy than static quantization that could calibrate activation scales and protect sensitive modules.</p></li>
+</ul>
+<p>Static quantization has advantage over dynamic quantization in terms of both speed and accuracy, and should be preferred if possible. The public checkpoints used in this post were quantized with <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA Model Optimizer (ModelOpt)</a>. The <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/blob/main/examples/diffusers/README.md#post-training-quantization-ptq">ModelOpt diffusion PTQ example</a> shows how to calibrate and quantize diffusion models.</p>
+</section>
+<section id="attention-optimizations">
+<h2>Attention Optimizations<a class="headerlink" href="#attention-optimizations" title="Link to this heading">#</a></h2>
+<p>There are two orthogonal directions for accelerating attention: quantized attention lowers numerical precision, while sparse attention uses an attention-score criterion to omit selected KV-block contributions and their corresponding computation. The optimizations introduced in this section are available for the <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> attention backend.</p>
+<section id="quantized-attention">
+<h3>Quantized Attention<a class="headerlink" href="#quantized-attention" title="Link to this heading">#</a></h3>
+<p>An attention OP performs two matrix multiplications around softmax: <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code> produces attention scores, and <code class="docutils literal notranslate"><span class="pre">PV</span></code> linearly combines the V vectors with weights given by the softmax probabilities P. SAGE Attention quantizes the operands of both operations, allowing <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code> and <code class="docutils literal notranslate"><span class="pre">PV</span></code> to use 8-bit paths. <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> SAGE recipe follows the <a class="reference external" href="https://arxiv.org/abs/2411.10958">SageAttention2</a> line of work, using INT8 or FP8 for <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code> and FP8 for <code class="docutils literal notranslate"><span class="pre">PV</span></code>.</p>
+<p>A quantization block is a group of values that shares one scale. The five fields in <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code> define the low-precision formats and scaling granularity used by SAGE Attention:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">qk_dtype</span></code> selects the low-precision format for <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> SAGE attention kernels support <code class="docutils literal notranslate"><span class="pre">int8</span></code> and <code class="docutils literal notranslate"><span class="pre">fp8</span></code>; this post uses <code class="docutils literal notranslate"><span class="pre">int8</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">v_dtype</span></code> selects the low-precision format for <code class="docutils literal notranslate"><span class="pre">PV</span></code>. The <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> SAGE attention kernels currently only support <code class="docutils literal notranslate"><span class="pre">fp8</span></code> (E4M3).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">q_block_size</span></code> is the number of consecutive query tokens that share a Q scale. A value of <code class="docutils literal notranslate"><span class="pre">1</span></code> gives each query token its own scale.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">k_block_size</span></code> is the number of consecutive key tokens that share a K scale. A value of <code class="docutils literal notranslate"><span class="pre">16</span></code> shares one scale across 16 key tokens.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">v_block_size</span></code> controls scaling along the hidden dimension of V. The value <code class="docutils literal notranslate"><span class="pre">1</span></code> gives each V channel within an attention head its own scale, computed across the tokens.</p></li>
+</ul>
+</section>
+<section id="sparse-attention-with-skip-softmax">
+<h3>Sparse Attention with Skip Softmax<a class="headerlink" href="#sparse-attention-with-skip-softmax" title="Link to this heading">#</a></h3>
+<p><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html"><span class="std std-doc">Skip Softmax Attention</span></a>, also known as <a class="reference external" href="https://arxiv.org/abs/2512.12087">BLASST</a>, keeps the <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code> calculation but rejects score blocks that fall sufficiently below the running maximum. For query row <span class="math notranslate nohighlight">\(i\)</span> and KV block <span class="math notranslate nohighlight">\(j\)</span>, the block is negligible when</p>
+<div class="math notranslate nohighlight">
+\[
+\exp(\tilde{m}_i^{(j)} - m_i^{(j)}) &lt; \lambda,
+\]</div>
+<p>where <span class="math notranslate nohighlight">\(\tilde{m}_i^{(j)}\)</span> is the maximum score in the current block, <span class="math notranslate nohighlight">\(m_i^{(j)}\)</span> is the running maximum, and <span class="math notranslate nohighlight">\(\lambda\)</span> is the threshold. A larger <span class="math notranslate nohighlight">\(\lambda\)</span> rejects more blocks. Rejected blocks skip exponentiation and the corresponding <code class="docutils literal notranslate"><span class="pre">PV</span></code> accumulation.</p>
+<p>Because the score distribution depends on the input, a fixed threshold <span class="math notranslate nohighlight">\(\lambda\)</span> does not guarantee fixed sparsity. To make sparsity easier to control, NVIDIA ModelOpt can calibrate a formula that maps a desired <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> to the threshold and store it in the checkpoint configuration. See the <a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers/sparsity">ModelOpt Wan 2.2 Skip Softmax example</a> for the calibration workflow. With this metadata, two controls shape the quality-speed tradeoff:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> expresses how aggressively to skip as an intuitive target.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> keeps the early denoising steps dense before enabling Skip Softmax.</p></li>
+</ul>
+<p>The mapping from <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code> keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps">VisualGen Skip Softmax Attention documentation</a> for the scheduler-dependent mapping.</p>
+<p>The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/sparse-attention.md#skip-softmax-attention">VisualGen Skip Softmax Attention documentation</a> for direct-threshold configuration.</p>
+</section>
+</section>
+<section id="results">
+<h2>Results<a class="headerlink" href="#results" title="Link to this heading">#</a></h2>
+<section id="experimental-setup">
+<h3>Experimental setup<a class="headerlink" href="#experimental-setup" title="Link to this heading">#</a></h3>
+<p>We evaluate the three techniques on a fixed Wan 2.2 workload while varying GEMM precision, attention precision, and Skip Softmax settings.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Item</p></th>
+<th class="head text-left"><p>Setting</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Checkpoints</p></td>
+<td class="text-left"><p><a class="reference external" href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers">Official BF16</a>, <a class="reference external" href="https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-FP8">ModelOpt FP8 per-tensor</a>, and <a class="reference external" href="https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4">ModelOpt NVFP4</a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>GPU</p></td>
+<td class="text-left"><p>NVIDIA B200</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Generated video</p></td>
+<td class="text-left"><p>1280×720, 81 frames at 16 FPS</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Denoising</p></td>
+<td class="text-left"><p>40 steps; guidance 4.0 for the high-noise expert and 3.0 for the low-noise expert</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Attention paths</p></td>
+<td class="text-left"><p>Dense, or SAGE with INT8 <code class="docutils literal notranslate"><span class="pre">QKᵀ</span></code>, FP8 <code class="docutils literal notranslate"><span class="pre">PV</span></code>, and Q/K/V block sizes of 1/16/1</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The ModelOpt checkpoints have already included calibrated Skip Softmax metadata. For the BF16 Skip Softmax rows, the same metadata is added to the BF16 checkpoint.</p>
+<p>We use compiled BF16 with standard attention and no Skip Softmax as the common baseline:</p>
+<ul class="simple">
+<li><p><strong>Quality:</strong> LPIPS compares each video with the BF16 generation from the same prompt and seed, with <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> enabled.</p></li>
+<li><p><strong>Speed:</strong> Speedup compares pipeline-forward latency with the same compiled BF16 baseline, whose mean latency is <strong>412.6 seconds</strong> across the seven prompts. This excludes compilation’s own speedup and isolates the three optimizations studied here.</p></li>
+</ul>
+<p>The 96 configurations are a characterization sweep, not a recommended per-model tuning cost:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>{BF16 reference, FP8 per-tensor, NVFP4}
+× {dense attention, SAGE}
+× {no Skip Softmax, or
+   target_sparsity {0.65, 0.70, 0.75}
+   × disabled_until_timestep {0.86, 0.90, 0.94, 0.97, 1.00}}
+</pre></div>
+</div>
+<p>Every setting uses the same seven prompt-and-seed pairs. Latency covers one complete 40-step pipeline forward; model loading, HTTP handling, and video encoding are outside the measurement. These 96 points form the quality-speed frontier shown next.</p>
+</section>
+<section id="quality-speed-frontier">
+<h3>Quality-speed frontier<a class="headerlink" href="#quality-speed-frontier" title="Link to this heading">#</a></h3>
+<p>Figure 2 organizes the 96 data points in two levels. Color identifies one of six GEMM/attention quantization families: three GEMM precisions, each with and without SAGE. Within each color, a square marks no Skip Softmax and the other 15 points sweep three <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> values across five <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> values. We highlight two of these Skip Softmax configurations:</p>
+<ul class="simple">
+<li><p><strong>Conservative:</strong> <code class="docutils literal notranslate"><span class="pre">target_sparsity=0.75</span></code>, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code>, shown as a star.</p></li>
+<li><p><strong>Aggressive:</strong> <code class="docutils literal notranslate"><span class="pre">target_sparsity=0.75</span></code>, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=1.00</span></code>, shown as a triangle.</p></li>
+</ul>
+<p>The aggressive point shows the upper-speed end of the sweep rather than a recommended setting. The remaining Skip Softmax configurations are circles, and the dashed line traces the global Pareto frontier across all six families.</p>
+<p align="center">
+  <img src="../media/tech_blog28_quality_speed_frontier.png" alt="Scatter plot of speedup versus mean LPIPS for the Wan 2.2 optimization sweep, with squares for runs without Skip Softmax, stars for conservative configurations, triangles for aggressive configurations, and a dashed global Pareto frontier" width="1080">
+</p>
+<p align="center"><sub><em>Figure 2. Speedup–quality frontier across all 96 configurations. Both LPIPS and speedup are measured against compiled BF16 with standard attention and no Skip Softmax.</em></sub></p>
+</section>
+<section id="frontier-analysis">
+<h3>Frontier analysis<a class="headerlink" href="#frontier-analysis" title="Link to this heading">#</a></h3>
+<p>The table condenses the 18 marked points into six GEMM/attention quantization families and three representative Skip Softmax settings. Each cell reports <code class="docutils literal notranslate"><span class="pre">speedup</span> <span class="pre">/</span> <span class="pre">mean</span> <span class="pre">LPIPS</span></code>; the star and triangle use the same Skip Softmax settings as Figure 2.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>GEMM/attention quantization</p></th>
+<th class="head text-left"><p>■ No Skip Softmax</p></th>
+<th class="head text-left"><p>★ Conservative Skip Softmax</p></th>
+<th class="head text-left"><p>▲ Aggressive Skip Softmax</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>BF16</p></td>
+<td class="text-left"><p>1.000× / 0.0000</p></td>
+<td class="text-left"><p>1.098× / 0.1105</p></td>
+<td class="text-left"><p>1.194× / 0.4948</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>BF16 + SAGE</p></td>
+<td class="text-left"><p>1.091× / 0.2907</p></td>
+<td class="text-left"><p>1.191× / 0.3107</p></td>
+<td class="text-left"><p>1.288× / 0.4884</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>FP8 per-tensor</p></td>
+<td class="text-left"><p>1.069× / 0.2516</p></td>
+<td class="text-left"><p>1.202× / 0.2702</p></td>
+<td class="text-left"><p>1.311× / 0.4938</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>FP8 per-tensor + SAGE</p></td>
+<td class="text-left"><p>1.210× / 0.3074</p></td>
+<td class="text-left"><p>1.354× / 0.3253</p></td>
+<td class="text-left"><p>1.475× / 0.4880</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>NVFP4</p></td>
+<td class="text-left"><p>1.133× / 0.3701</p></td>
+<td class="text-left"><p>1.275× / 0.3820</p></td>
+<td class="text-left"><p>1.404× / 0.4867</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>NVFP4 + SAGE</p></td>
+<td class="text-left"><p>1.272× / 0.3653</p></td>
+<td class="text-left"><p>1.427× / 0.3811</p></td>
+<td class="text-left"><p>1.540× / 0.4887</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>With compiled BF16 as the common origin, conservative Skip Softmax on BF16 reaches <code class="docutils literal notranslate"><span class="pre">1.098×</span></code> at <code class="docutils literal notranslate"><span class="pre">0.1105</span></code> LPIPS. Moving directly to FP8 per-tensor reaches <code class="docutils literal notranslate"><span class="pre">1.069×</span></code> at <code class="docutils literal notranslate"><span class="pre">0.2516</span></code> LPIPS, while NVFP4 reaches <code class="docutils literal notranslate"><span class="pre">1.133×</span></code> at <code class="docutils literal notranslate"><span class="pre">0.3701</span></code> LPIPS. For this workload, Skip Softmax offers the gentler first step; GEMM quantization opens a faster operating range with a larger quality tradeoff.</p>
+<p>SAGE adds speed in all three GEMM families, but its quality effect depends on the precision: the LPIPS shift is substantial from BF16, modest from FP8 per-tensor, and nearly flat for NVFP4. This is why the combined frontier is more useful than prescribing a fixed order in which to enable the optimizations.</p>
+<p>Skip Softmax then fills the space within each family. <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> controls how much work can be rejected, while <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> controls how early that rejection begins. Together they provide a continuum between the conservative stars and aggressive triangles instead of a single all-or-nothing sparse mode.</p>
+<p>This layering explains the shape of the Pareto frontier: its higher-speed region is dominated by configurations that combine SAGE with Skip Softmax, and no single technique reaches there alone.</p>
+</section>
+<section id="latency-step-down">
+<h3>Latency step-down<a class="headerlink" href="#latency-step-down" title="Link to this heading">#</a></h3>
+<p>Figure 3 isolates the attention optimizations within each GEMM precision. Each group starts with standard attention, adds SAGE, and then adds the conservative Skip Softmax setting from the frontier. The bars report absolute pipeline-forward latency, while their labels retain the common speedup against the compiled BF16 baseline.</p>
+<p align="center">
+  <img src="../media/tech_blog28_latency_step_down.png" alt="Horizontal latency step-down bars for BF16, FP8 per-tensor, and NVFP4, each progressing from dense attention to SAGE and then SAGE with conservative Skip Softmax" width="1080">
+</p>
+<p align="center"><sub><em>Figure 3. Pipeline-forward latency after successively adding SAGE and conservative Skip Softmax within each GEMM precision. Lower is better.</em></sub></p>
+</section>
+<section id="visual-validation">
+<h3>Visual validation<a class="headerlink" href="#visual-validation" title="Link to this heading">#</a></h3>
+<p>Figure 4 compares the generated videos for prompt P1 across the same six GEMM/attention quantization families used in the frontier. The compiled BF16 baseline is also the visual reference.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p>BF16 baseline</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><img alt="BF16 baseline P1 generation" src="../../_images/tech_blog28_video_p01_compiled_bf16.gif" /></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The six videos below are grouped by GEMM precision, with the SAGE variant on the right. All six use the <strong>Conservative</strong> Skip Softmax setting (★): <code class="docutils literal notranslate"><span class="pre">target_sparsity=0.75</span></code> and <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p><strong>BF16 + Skip Softmax (1.10×)</strong></p></th>
+<th class="head text-center"><p><strong>BF16 + SAGE + Skip Softmax (1.19×)</strong></p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><img alt="BF16 with Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_bf16_skip_softmax.gif" /></p></td>
+<td class="text-center"><p><img alt="BF16 with SAGE and Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_bf16_sage_skip_softmax.gif" /></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><strong>FP8 per-tensor + Skip Softmax (1.20×)</strong></p></td>
+<td class="text-center"><p><strong>FP8 per-tensor + SAGE + Skip Softmax (1.35×)</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><img alt="FP8 per-tensor with Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_fp8_skip_softmax.gif" /></p></td>
+<td class="text-center"><p><img alt="FP8 per-tensor with SAGE and Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_fp8_sage_skip_softmax.gif" /></p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><strong>NVFP4 + Skip Softmax (1.27×)</strong></p></td>
+<td class="text-center"><p><strong>NVFP4 + SAGE + Skip Softmax (1.43×)</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><img alt="NVFP4 with Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_nvfp4_skip_softmax.gif" /></p></td>
+<td class="text-center"><p><img alt="NVFP4 with SAGE and Skip Softmax P1 generation" src="../../_images/tech_blog28_video_p01_nvfp4_sage_skip_softmax.gif" /></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p align="center"><sub><em>Figure 4. P1 video comparison across the BF16 baseline and six conservative Skip Softmax configurations.</em></sub></p>
+<p>Figure 5 expands the first-frame comparison to all seven prompts. Each row compares the BF16 baseline with the same six conservative configurations as Figure 4. The previews are downsampled from the original videos.</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p01_cat_garden.jpg" alt="First-frame comparison for a cat in a sunlit garden, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p03_park_kids.jpg" alt="First-frame comparison for children in a park, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p04_drone_coast.jpg" alt="First-frame comparison for a coastal drone shot, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p05_neon_sign.jpg" alt="First-frame comparison for a neon OPEN sign, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p06_woman_smile.jpg" alt="First-frame comparison for a studio portrait, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p07_horse_gallop.jpg" alt="First-frame comparison for a galloping racehorse, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center">
+  <img src="../media/tech_blog28_visual_comparison_p10_market.jpg" alt="First-frame comparison for a street market, with a BF16 baseline and six conservative Skip Softmax results across the GEMM and attention configurations" width="1080">
+</p>
+<p align="center"><sub><em>Figure 5. First-frame comparison across all seven prompts. Every Skip Softmax result uses `target_sparsity=0.75` and `disabled_until_timestep=0.86`, corresponding to the stars in Figure 2.</em></sub></p>
+</section>
+</section>
+<section id="reproduction">
+<h2>Reproduction<a class="headerlink" href="#reproduction" title="Link to this heading">#</a></h2>
+<p>The commands below target TensorRT-LLM 1.3.0rc26. The ModelOpt <a class="reference external" href="https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-FP8">static FP8 per-tensor checkpoint</a> or the <a class="reference external" href="https://huggingface.co/nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4">static NVFP4 checkpoint</a> has contained the Skip Softmax calibration config, and you may need to manually copy the configs into the official BF16 checkpoint for reproduction.</p>
+<section id="visualgen-configuration">
+<h3>VisualGen configuration<a class="headerlink" href="#visualgen-configuration" title="Link to this heading">#</a></h3>
+<p>Save the following configuration as <code class="docutils literal notranslate"><span class="pre">visual_gen.yaml</span></code>. It enables SAGE and the conservative Skip Softmax setting used by the stars in Figure 2:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
+<span class="w">  </span><span class="nt">quant_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">qk_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int8</span>
+<span class="w">    </span><span class="nt">v_dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
+<span class="w">    </span><span class="nt">q_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">    </span><span class="nt">k_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
+<span class="w">    </span><span class="nt">v_block_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">    </span><span class="nt">target_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.75</span>
+<span class="w">    </span><span class="nt">disabled_until_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.86</span>
+
+<span class="nt">torch_compile_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">enable</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">enable_autotune</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</pre></div>
+</div>
+<p>SAGE Attention and Skip Softmax can be disabled independently by removing the <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code> and <code class="docutils literal notranslate"><span class="pre">sparse_attention_config</span></code> blocks, respectively. See <a class="reference internal" href="#attention-optimizations">Attention Optimizations</a> for the meaning of each option.</p>
+<p>For a model that does not yet have a prequantized checkpoint, dynamic quantization can be applied to its BF16 checkpoint by adding a top-level <code class="docutils literal notranslate"><span class="pre">quant_config</span></code> block:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">quant_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">quant_algo</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NVFP4</span>
+<span class="w">  </span><span class="nt">dynamic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>Replace <code class="docutils literal notranslate"><span class="pre">NVFP4</span></code> with others when the model supports that format. Dynamic quantization is an optional path and was not measured in this post.</p>
+</section>
+<section id="run-with-trtllm-serve">
+<h3>Run with trtllm-serve<a class="headerlink" href="#run-with-trtllm-serve" title="Link to this heading">#</a></h3>
+<p>Start <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> with the NVFP4 checkpoint and the configuration above. Replace the model ID with the FP8 checkpoint to switch the GEMM format without changing the YAML:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL</span><span class="o">=</span>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4
+trtllm-serve<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL</span><span class="s2">"</span><span class="w"> </span>--visual_gen_args<span class="w"> </span>visual_gen.yaml
+</pre></div>
+</div>
+<p>Then submit the P1 prompt from another shell. The synchronous endpoint returns the encoded video directly:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>--fail<span class="w"> </span>--silent<span class="w"> </span>--show-error<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--request<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/videos/sync<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--header<span class="w"> </span><span class="s1">'Content-Type: application/json'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--output<span class="w"> </span>wan22_nvfp4_sage_skip.mp4<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--data<span class="w"> </span><span class="s1">'{</span>
+<span class="s1">      "prompt": "A cat walking through a sunlit garden, gentle breeze rustling leaves, slow tracking shot",</span>
+<span class="s1">      "width": 1280,</span>
+<span class="s1">      "height": 720,</span>
+<span class="s1">      "num_frames": 81,</span>
+<span class="s1">      "frame_rate": 16,</span>
+<span class="s1">      "num_inference_steps": 40,</span>
+<span class="s1">      "guidance_scale": 4.0,</span>
+<span class="s1">      "seed": 1001,</span>
+<span class="s1">      "format": "mp4",</span>
+<span class="s1">      "extra_params": {</span>
+<span class="s1">        "guidance_scale_2": 3.0</span>
+<span class="s1">      }</span>
+<span class="s1">    }'</span>
+</pre></div>
+</div>
+<details>
+<summary>Seven-prompt evaluation manifest</summary>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>ID</p></th>
+<th class="head text-right"><p>Seed</p></th>
+<th class="head text-left"><p>Prompt</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p01_cat_garden</span></code></p></td>
+<td class="text-right"><p>1001</p></td>
+<td class="text-left"><p>A cat walking through a sunlit garden, gentle breeze rustling leaves, slow tracking shot</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p03_park_kids</span></code></p></td>
+<td class="text-right"><p>1003</p></td>
+<td class="text-left"><p>Children playing in a busy park, a golden retriever running between them, sunny afternoon, wide shot</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p04_drone_coast</span></code></p></td>
+<td class="text-right"><p>1004</p></td>
+<td class="text-left"><p>Drone shot flying over a rugged coastline at sunset, waves crashing on cliffs below, golden hour lighting</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p05_neon_sign</span></code></p></td>
+<td class="text-right"><p>1005</p></td>
+<td class="text-left"><p>A neon sign reading ‘OPEN’ flickering in a rainy alley at night, reflections on wet pavement, cinematic</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p06_woman_smile</span></code></p></td>
+<td class="text-right"><p>1006</p></td>
+<td class="text-left"><p>A young woman smiling at the camera, soft studio lighting, slight head tilt, cinematic close-up portrait</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p07_horse_gallop</span></code></p></td>
+<td class="text-right"><p>1007</p></td>
+<td class="text-left"><p>A racehorse galloping on a dirt track, kicking up dust, side tracking shot, dramatic lighting</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">p10_market</span></code></p></td>
+<td class="text-right"><p>1010</p></td>
+<td class="text-left"><p>A bustling outdoor street market with people walking and vendors selling fresh fruit, Mediterranean style, midday sun</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</details>
+<p>For the reported latency, the pipeline forward is bracketed by CUDA synchronization and the seven prompt times are averaged. The compiled BF16 baseline enables <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> and disables quantization, SAGE, and Skip Softmax. AlexNet LPIPS is computed against its corresponding frames, averaged over all 81 frames and then over the seven prompts.</p>
+</section>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Accelerating video diffusion is a process of trading off between the desired accuracy and speedup. TensorRT-LLM exposes GEMM quantization, quantized attention, and Skip Softmax as composable controls, so deployments can choose an operating point that matches their own quality bar instead of inheriting one fixed recipe.</p>
+<p>That operating point is model-, prompt-, and hardware-dependent. A useful optimization workflow therefore combines representative prompts, deployment-relevant latency, aggregate quality metrics, and direct inspection of generated videos. In the future, we will explore agentic search to automate these experiments and navigate the speed-quality tradeoff.</p>
+<p>These single-GPU techniques complement the multi-GPU methods described in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md">Scaling Video Generation Across NVL72 Rack with TensorRT-LLM</a> and can be combined with multi-GPU parallelism when the deployment requires higher throughput or larger workloads.</p>
+</section>
+<section id="references">
+<h2>References<a class="headerlink" href="#references" title="Link to this heading">#</a></h2>
+<ol class="arabic simple">
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md">Scaling Video Generation Across NVL72 Rack with TensorRT-LLM</a></p></li>
+<li><p><a class="reference external" href="https://arxiv.org/abs/2410.02367">SageAttention: Accurate 8-Bit Attention for Plug-and-play Inference Acceleration</a></p></li>
+<li><p><a class="reference external" href="https://arxiv.org/abs/2411.10958">SageAttention2: Efficient Attention with Thorough Outlier Smoothing and Per-thread INT4 Quantization</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers">NVIDIA Model Optimizer Diffusers Quantization Example</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/diffusers/sparsity">NVIDIA Model Optimizer Skip Softmax Calibration Example</a></p></li>
+<li><p><a class="reference external" href="https://arxiv.org/abs/2512.12087">BLASST: Dynamic BLocked Attention Sparsity via Softmax Thresholding</a></p></li>
+</ol>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/sparse-attention-development-guide.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Sparse Attention Development Guide</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gemm-quantization">GEMM Quantization</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-optimizations">Attention Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quantized-attention">Quantized Attention</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sparse-attention-with-skip-softmax">Sparse Attention with Skip Softmax</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results">Results</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-setup">Experimental setup</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quality-speed-frontier">Quality-speed frontier</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#frontier-analysis">Frontier analysis</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#latency-step-down">Latency step-down</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-validation">Visual validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproduction">Reproduction</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#visualgen-configuration">VisualGen configuration</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-with-trtllm-serve">Run with trtllm-serve</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#references">References</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 04, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

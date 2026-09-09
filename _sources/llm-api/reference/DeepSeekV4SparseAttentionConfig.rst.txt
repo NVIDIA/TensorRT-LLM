@@ -1,0 +1,10 @@
+DeepSeekV4SparseAttentionConfig
+===============================
+
+.. autoclass:: tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
