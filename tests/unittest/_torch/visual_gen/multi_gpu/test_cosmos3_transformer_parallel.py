@@ -743,6 +743,11 @@ def _logic_cosmos3_ulysses_unequal_text_vs_single_gpu(rank, world_size):
     assert captured_text_tower["text_mask_shape"] == expected_text_shape
     assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
     assert ulysses_model.cached_kv is captured_text_tower["cached_kv"]
+    assert ulysses_model.cached_real_text_lens.device.type == "cpu"
+    torch.testing.assert_close(
+        ulysses_model.cached_real_text_lens,
+        torch.tensor([2, _TEXT_LEN], dtype=torch.int32),
+    )
     ulysses_out_float = ulysses_out.float()
     ref_out_float = ref_out.float()
     error = ulysses_out_float - ref_out_float

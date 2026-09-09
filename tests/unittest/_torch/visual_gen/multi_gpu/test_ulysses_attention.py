@@ -402,7 +402,20 @@ def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
     k_shard = k_full[:, start:end].contiguous()
     v_shard = v_full[:, start:end].contiguous()
 
-    inner = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    class _RecordingVanillaAttention(VanillaAttention):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.kv_seq_lens = []
+
+        def forward(self, q, k, v, *, key_padding_mask=None, **kwargs):
+            assert key_padding_mask is None
+            self.kv_seq_lens.append(k.shape[2])
+            return super().forward(q, k, v, key_padding_mask=key_padding_mask, **kwargs)
+
+    inner = _RecordingVanillaAttention(
+        num_heads=num_heads // world_size,
+        head_dim=head_dim,
+    )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
     output = attention(
         q_shard,
@@ -411,9 +424,10 @@ def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
         attention_mask=PredefinedAttentionMask.FULL,
         replicated_k=context_k,
         replicated_v=context_v,
-        replicated_k_lengths=context_lengths,
+        replicated_k_lengths=torch.tensor(context_lengths, dtype=torch.int32),
         global_generated_seq_len=generated_len,
     )
+    assert inner.kv_seq_lens == [generated_len + length for length in context_lengths]
 
     reference = []
     for batch_idx, text_len in enumerate(context_lengths):

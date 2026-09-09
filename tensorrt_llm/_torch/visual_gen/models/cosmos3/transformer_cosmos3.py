@@ -75,8 +75,7 @@ def _resolve_cosmos3_cross_attention_backend(
     if attn2d_size > 1:
         raise ValueError(
             "Cosmos3 cross-attention with Attention2D does not support the "
-            "CUTEDSL backend: unequal text lengths require a key-padding mask, "
-            "which CUTEDSL does not consume. Use attention backend FA4."
+            "CUTEDSL backend for unequal text lengths. Use attention backend FA4."
         )
     if visual_gen_mapping.ulysses_size > 1:
         return "VANILLA"
@@ -671,10 +670,7 @@ class Cosmos3CrossAttention(Attention):
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
             if original_backend == "CUTEDSL":
-                reason = (
-                    "does not support the key-padding mask required by Cosmos3 "
-                    "Ulysses cross-attention"
-                )
+                reason = "is disabled for unequal-length sequence-parallel text conditioning"
             else:
                 reason = "is not supported for Cosmos3 cross-attention"
             logger.warning_once(
@@ -713,6 +709,73 @@ class Cosmos3CrossAttention(Attention):
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
         return self.norm_q(q), self.norm_k(k)
 
+    @torch.compiler.disable
+    def _forward_with_text_prefixes(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        real_text_lens: torch.Tensor,
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the unsharded batch with each sample's exact text prefix."""
+        if real_text_lens.device.type != "cpu":
+            raise ValueError("Cosmos3 text lengths must be cached on the CPU.")
+        if real_text_lens.ndim != 1 or real_text_lens.shape[0] != q.shape[0]:
+            raise ValueError(
+                f"Expected {q.shape[0]} Cosmos3 text lengths, got "
+                f"shape {tuple(real_text_lens.shape)}."
+            )
+        text_lens = [int(length) for length in real_text_lens.tolist()]
+        if any(not 0 <= length <= k_und.shape[1] for length in text_lens):
+            raise ValueError(
+                f"Cosmos3 text lengths must be in [0, {k_und.shape[1]}], got {text_lens}."
+            )
+
+        if all(length == text_lens[0] for length in text_lens):
+            text_len = text_lens[0]
+            return self._attn_impl(
+                q,
+                torch.cat([k_und[:, :text_len], k], dim=1),
+                torch.cat([v_und[:, :text_len], v], dim=1),
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+            )
+
+        outputs = []
+        for batch_idx, text_len in enumerate(text_lens):
+            timestep_batch = (
+                timestep[batch_idx : batch_idx + 1]
+                if torch.is_tensor(timestep)
+                and timestep.ndim > 0
+                and timestep.shape[0] == q.shape[0]
+                else timestep
+            )
+            outputs.append(
+                self._attn_impl(
+                    q[batch_idx : batch_idx + 1],
+                    torch.cat(
+                        [
+                            k_und[batch_idx : batch_idx + 1, :text_len],
+                            k[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    ),
+                    torch.cat(
+                        [
+                            v_und[batch_idx : batch_idx + 1, :text_len],
+                            v[batch_idx : batch_idx + 1],
+                        ],
+                        dim=1,
+                    ),
+                    attention_mask=PredefinedAttentionMask.FULL,
+                    timestep=timestep_batch,
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -721,7 +784,7 @@ class Cosmos3CrossAttention(Attention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         timestep=None,
-        real_text_lens: Optional[list[int]] = None,
+        real_text_lens: Optional[torch.Tensor] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
@@ -764,21 +827,15 @@ class Cosmos3CrossAttention(Attention):
                 global_generated_seq_len=global_generated_seq_len,
             )
         elif real_text_lens is not None and batch_size > 1:
-            outs = []
-            for b in range(batch_size):
-                Lb = int(real_text_lens[b])
-                k_all_b = torch.cat([k_und[b : b + 1, :Lb], k[b : b + 1]], dim=1)
-                v_all_b = torch.cat([v_und[b : b + 1, :Lb], v[b : b + 1]], dim=1)
-                outs.append(
-                    self._attn_impl(
-                        q[b : b + 1],
-                        k_all_b,
-                        v_all_b,
-                        attention_mask=PredefinedAttentionMask.FULL,
-                        timestep=timestep,
-                    )
-                )
-            out = torch.cat(outs, dim=0)
+            out = self._forward_with_text_prefixes(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                real_text_lens,
+                timestep,
+            )
         else:
             k_all = torch.cat([k_und, k], dim=1).contiguous()
             v_all = torch.cat([v_und, v], dim=1).contiguous()
@@ -930,7 +987,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
-        real_text_lens: Optional[list[int]] = None,
+        real_text_lens: Optional[torch.Tensor] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1240,6 +1297,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         )
 
         self.cached_kv = None
+        self.cached_real_text_lens = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1528,6 +1586,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
     def reset_cache(self):
         self.cached_kv = None
+        self.cached_real_text_lens = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1611,7 +1670,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             )
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        real_text_lens = text_mask.sum(dim=1).tolist()
 
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
@@ -1641,7 +1699,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             hidden_gen = hidden_gen + time_embed.unsqueeze(1)
 
         if self.cached_kv is None:
-            max_real_len = int(max(real_text_lens))
+            self.cached_real_text_lens = text_mask.sum(dim=1).to(device="cpu", dtype=torch.int32)
+            max_real_len = int(self.cached_real_text_lens.max().item())
             # Trim the tower inputs as views so its per-layer K/V outputs have
             # the required length without copying every cached K/V tensor.
             text_ids_for_cache = text_ids[:, :max_real_len]
@@ -1665,6 +1724,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     timestep=timestep,
                 )
             self.cached_freqs_gen = freqs_gen
+
+        if self.cached_real_text_lens is None:
+            raise RuntimeError("Cosmos3 text lengths are missing from the K/V cache.")
+        real_text_lens = self.cached_real_text_lens
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp

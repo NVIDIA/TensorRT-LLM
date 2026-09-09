@@ -76,6 +76,8 @@ class _LSEVanillaAttention(nn.Module):
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.NHD
+        self.kv_seq_lens = []
+        self.saw_key_padding_mask = False
 
     def _expand_kv_heads(
         self, k_t: torch.Tensor, v_t: torch.Tensor
@@ -118,12 +120,14 @@ class _LSEVanillaAttention(nn.Module):
 
     def forward_with_lse(self, q, k, v, batch_size=None, seq_len=None, **kwargs):
         """Return (output [B, S, H, D], lse [B, H, S])."""
+        self.kv_seq_lens.append(k.shape[1])
         q_t = q.transpose(1, 2).float()  # [B, H_q, S_q, D]
         k_t = k.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
         k_t, v_t = self._expand_kv_heads(k_t, v_t)
         scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
         key_padding_mask = kwargs.get("key_padding_mask")
+        self.saw_key_padding_mask = self.saw_key_padding_mask or key_padding_mask is not None
         if key_padding_mask is not None:
             scores = scores.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
         lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
@@ -289,10 +293,15 @@ def _logic_attn2d_vs_standard(rank, world_size):
     )
 
 
-def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
+def _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4):
     """A 1x2 mesh partitions replicated context and excludes both padding tails."""
+    if use_fa4 and not _flash_attn4_available:
+        pytest.skip("FlashAttn4 JIT kernels not available")
+
     row_size, col_size = 1, 2
-    batch, num_heads, head_dim = 2, 4, 16
+    batch, num_heads = 2, 4
+    head_dim = 128 if use_fa4 else 16
+    dtype = torch.bfloat16 if use_fa4 else torch.float32
     generated_len = 5
     seq_per_rank = 3
     generated_padded_len = seq_per_rank * world_size
@@ -301,18 +310,28 @@ def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
     device = torch.device(f"cuda:{rank}")
 
     row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
-    inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
+    inner = (
+        FlashAttn4Attention(num_heads=num_heads, head_dim=head_dim)
+        if use_fa4
+        else _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
+    )
     try:
         attn = Attention2DAttention(inner, row_pg, col_pg)
     except ImportError:
         pytest.skip("flash_attn_combine JIT kernels not available")
 
     torch.manual_seed(42)
-    q_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
-    k_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
-    v_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
-    context_k = torch.randn(batch, context_len, num_heads, head_dim, device=device)
-    context_v = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+    q_full = torch.randn(
+        batch, generated_padded_len, num_heads, head_dim, device=device, dtype=dtype
+    )
+    k_full = torch.randn(
+        batch, generated_padded_len, num_heads, head_dim, device=device, dtype=dtype
+    )
+    v_full = torch.randn(
+        batch, generated_padded_len, num_heads, head_dim, device=device, dtype=dtype
+    )
+    context_k = torch.randn(batch, context_len, num_heads, head_dim, device=device, dtype=dtype)
+    context_v = torch.randn(batch, context_len, num_heads, head_dim, device=device, dtype=dtype)
 
     start = rank * seq_per_rank
     end = start + seq_per_rank
@@ -323,9 +342,13 @@ def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
         attention_mask=PredefinedAttentionMask.FULL,
         replicated_k=context_k,
         replicated_v=context_v,
-        replicated_k_lengths=context_lengths,
+        replicated_k_lengths=torch.tensor(context_lengths, dtype=torch.int32),
         global_generated_seq_len=generated_len,
     )
+    if not use_fa4:
+        expected_kv_seq_lens = [5] if rank == 0 else [2, 5]
+        assert inner.kv_seq_lens == expected_kv_seq_lens
+        assert not inner.saw_key_padding_mask
 
     reference = []
     for batch_idx, text_len in enumerate(context_lengths):
@@ -345,11 +368,13 @@ def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
         )
         reference.append(
             F.scaled_dot_product_attention(
-                q_full[batch_idx : batch_idx + 1, :generated_len].transpose(1, 2),
-                k_valid.transpose(1, 2),
-                v_valid.transpose(1, 2),
+                q_full[batch_idx : batch_idx + 1, :generated_len].transpose(1, 2).float(),
+                k_valid.transpose(1, 2).float(),
+                v_valid.transpose(1, 2).float(),
                 scale=1.0 / math.sqrt(head_dim),
-            ).transpose(1, 2)
+            )
+            .transpose(1, 2)
+            .to(output.dtype)
         )
     reference = torch.cat(reference, dim=0)
 
@@ -358,10 +383,18 @@ def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
         torch.testing.assert_close(
             output[:, :valid_in_shard],
             reference[:, start : start + valid_in_shard],
-            rtol=1e-4,
-            atol=1e-4,
+            rtol=1e-2 if use_fa4 else 1e-4,
+            atol=1e-2 if use_fa4 else 1e-4,
             msg=f"Rank {rank}: replicated K/V padding changed Attention2D output",
         )
+
+
+def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
+    _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4=False)
+
+
+def _logic_attn2d_fa4_replicated_kv_unequal_lengths(rank, world_size):
+    _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4=True)
 
 
 def _logic_attn2d_invalid_mask(rank, world_size):
@@ -848,6 +881,14 @@ class TestAttn2DAttentionFlashAttn4:
     def test_attn2d_fa4_vs_standard(self):
         """FlashAttn4 inner backend: output matches standard full-sequence SDPA (2x2 mesh)."""
         run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_fa4_vs_standard, use_cuda=True)
+
+    def test_attn2d_fa4_replicated_kv_unequal_lengths(self):
+        """FA4 uses exact per-sample text prefixes on a 1x2 mesh."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_attn2d_fa4_replicated_kv_unequal_lengths,
+            use_cuda=True,
+        )
 
     def test_attn2d_fa4_1x4_mesh(self):
         """FA4 with 1x4 mesh: asymmetric Q/KV lengths, no _combine call."""
