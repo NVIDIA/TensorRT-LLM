@@ -16,6 +16,7 @@
  */
 
 #include "fusedSamplingKernelsCommon.cuh"
+#include "tensorrt_llm/common/cudaUtils.h"
 
 namespace tensorrt_llm
 {
@@ -84,6 +85,7 @@ void launchFusedSampling(FusedSamplingParams const& params, cudaStream_t stream)
     {
         fusedSamplingKernel<T, BLOCK, false, true><<<grid, block, 0, stream>>>(params);
     }
+    sync_check_cuda_error(stream);
 }
 
 } // namespace

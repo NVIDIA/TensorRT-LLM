@@ -29,6 +29,11 @@ namespace kernels
 template <typename T>
 void invokeFusedSampling(FusedSamplingParams const& params, cudaStream_t stream)
 {
+    if (params.numRows == 0)
+    {
+        return;
+    }
+
     if (fusedSampling::shouldUseMultiCta(params))
     {
         fusedSampling::launchFusedSamplingMultiCta<T>(params, stream);

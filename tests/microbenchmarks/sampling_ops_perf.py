@@ -345,8 +345,9 @@ class Result:
     #: its number describes less work than the case specifies.
     equivalent: bool = True
 
-    def key(self) -> str:
-        return f"{self.impl}|{self.case}|{self.shape}|{self.rows}|{self.vocab}|{self.dtype}"
+    def key(self, *, impl: Optional[str] = None) -> str:
+        impl = self.impl if impl is None else impl
+        return f"{impl}|{self.case}|{self.shape}|{self.rows}|{self.vocab}|{self.dtype}"
 
 
 def run_sweep(
@@ -451,9 +452,7 @@ def evaluate_gates(
     ``None`` is reported as unjudged rather than silently passed -- min_p has no
     baseline, and pretending otherwise is how a regression hides.
     """
-    by_key: dict[tuple[str, str, str, int, int], Result] = {
-        (r.impl, r.case, r.shape, r.rows, r.vocab): r for r in results
-    }
+    by_key = {r.key(): r for r in results}
     cases_by_name = {c.name: c for c in FILTER_CASES}
     passes: list[str] = []
     failures: list[str] = []
@@ -466,9 +465,7 @@ def evaluate_gates(
         if case.gate is None or case.baseline_mode is None:
             passes.append(f"  [unjudged] {label}  ({case.gate_note})")
             continue
-        base = by_key.get(
-            (f"flashinfer:{case.baseline_mode.value}", r.case, r.shape, r.rows, r.vocab)
-        )
+        base = by_key.get(r.key(impl=f"flashinfer:{case.baseline_mode.value}"))
         cand_us = getattr(r, metric)
         base_us = getattr(base, metric) if base is not None else None
         if base_us is None or cand_us is None:

@@ -140,8 +140,9 @@ __global__ void smallBatchSplitOutputKernel(FusedSamplingParams params)
     float const scale = 1.0f / rowStats.sum;
     int const begin = splitBegin > kSmallBatchWorkspaceFloats ? splitBegin : kSmallBatchWorkspaceFloats;
 
-    int const vecBegin = (begin + 3) / 4;
-    int const vecEnd = splitEnd / 4;
+    bool const probsAligned = (reinterpret_cast<uintptr_t>(rowProbs) % kVecBytes) == 0;
+    int const vecBegin = probsAligned ? (begin + 3) / 4 : 0;
+    int const vecEnd = probsAligned ? splitEnd / 4 : 0;
     float localProbMass = 0.0f;
     int const prologueEnd = vecBegin * 4 < splitEnd ? vecBegin * 4 : splitEnd;
     for (int i = begin + tid; i < prologueEnd; i += blockDim.x)

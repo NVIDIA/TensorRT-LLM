@@ -69,6 +69,7 @@ tk::FusedSamplingParams buildParams(torch::Tensor const& logits, torch::Tensor c
     params.numRows = numRows;
     params.vocabSize = vocabSize;
 
+    TORCH_CHECK(seed.has_value() == offset.has_value(), "seed and offset must be provided together");
     if (seed.has_value() && offset.has_value())
     {
         auto const& s = seed.value();

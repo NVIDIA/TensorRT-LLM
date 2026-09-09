@@ -272,7 +272,9 @@ def test_large_vocab_dispatch_boundary_matches_reference(dtype, vocab):
     rows = 4
     logits = (torch.randn(rows, vocab, device=dev) * 2.0).to(dtype)
     temps, top_ks, top_ps, min_ps = _params(rows, device=dev)
-    top_ps[1] = 0.9
+    # Keep row 1 neutral: odd vocab sizes make its output pointer unaligned and
+    # exercise the scalar fallback in the multi-CTA probability-writing path.
+    top_ps[0] = 0.9
     top_ks[2] = 50
     top_ks[3], top_ps[3], min_ps[3] = 50, 0.9, 0.05
 
