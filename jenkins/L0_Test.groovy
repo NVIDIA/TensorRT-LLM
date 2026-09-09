@@ -6112,6 +6112,10 @@ def buildStageConfigsFromSpecs(specs) {
     specs.each { spec ->
         def bucket = spec.target ?: ((spec.arch == "SBSA") ? (spec.slurm ? "sbsaSlurm" : "sbsa")
                                                             : (spec.slurm ? "x86Slurm" : "x86"))
+        if (!grouped.containsKey(bucket)) {
+            error("Invalid target '${bucket}' for stage spec '${spec.name}' in test_stage_configs.json; " +
+                  "must be one of ${grouped.keySet()}")
+        }
         def expanded = spec.slurm ?
             buildStageConfigs(spec.name, spec.platform, spec.testDB, spec.splits,
                                spec.gpuCount ?: 1, spec.nodeCount ?: 1,
