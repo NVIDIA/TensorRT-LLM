@@ -502,7 +502,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens: torch.Tensor
         """Device tensor containing latest sampled tokens.
 
-        Shape: ``NEW_TOKENS_SHAPE`` -- (max_tokens, max_num_sequences, max_beam_width).
+        Shape: ``NEW_TOKENS_SHAPE`` -- (max_tokens, max_num_sequences + 1, max_beam_width);
+        the trailing row is ``dummy_slot_row`` scratch, not a sequence slot.
         """
         beam_search_store: "BeamSearchStore | None" = None
         """Holds data related to beam search."""
