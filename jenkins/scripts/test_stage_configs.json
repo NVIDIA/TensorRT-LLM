@@ -515,9 +515,7 @@
       "slurm": false,
       "platform": "cpu",
       "testDB": "l0_cpu",
-      "splits": 1,
-      "gpuCount": 0,
-      "nodeCount": 1
+      "splits": 1
     },
     {
       "name": "GH200-PyTorch-Post-Merge",
@@ -525,9 +523,7 @@
       "slurm": false,
       "platform": "gh200",
       "testDB": "l0_gh200",
-      "splits": 1,
-      "gpuCount": 1,
-      "nodeCount": 1
+      "splits": 1
     },
     {
       "name": "GB10-PyTorch",
@@ -535,9 +531,7 @@
       "slurm": false,
       "platform": "gb10x",
       "testDB": "l0_gb10",
-      "splits": 1,
-      "gpuCount": 1,
-      "nodeCount": 1
+      "splits": 1
     },
     {
       "name": "GB200-4_GPUs-PyTorch",
