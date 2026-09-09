@@ -42,6 +42,7 @@ _INTEGER_FIELDS = 6
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
+_NVFP4_WITH_LOSSLESS_SUFFIX_TRANSFORM = 2
 
 _DEEPSEEK_V4_PREFIX = "deepseek_v4_"
 _DEEPSEEK_V4_SWA = f"{_DEEPSEEK_V4_PREFIX}swa"
@@ -458,6 +459,13 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     scale_offset = 0
                     cursor += raw_bytes
 
+                if not is_compressed:
+                    transform = _LOSSLESS_TRANSFORM
+                elif suffix_bytes:
+                    transform = _NVFP4_WITH_LOSSLESS_SUFFIX_TRANSFORM
+                else:
+                    transform = _NVFP4_TRANSFORM
+
                 wide_rows.append(
                     [
                         raw_base,
@@ -471,7 +479,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 integer_rows.append(
                     [
                         0,
-                        _NVFP4_TRANSFORM if is_compressed else _LOSSLESS_TRANSFORM,
+                        transform,
                         layout.num_kv_heads if is_compressed else 0,
                         layout.tokens_per_page if is_compressed else 0,
                         layout.head_dim if is_compressed else 0,

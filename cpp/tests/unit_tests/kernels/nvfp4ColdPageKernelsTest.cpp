@@ -64,6 +64,7 @@ enum class Nvfp4ColdPageTransform : std::int32_t
 {
     kNvfp4 = 0,
     kLosslessCopy = 1,
+    kNvfp4WithLosslessSuffix = 2,
 };
 
 struct Nvfp4ColdPageTestBuffer
@@ -100,16 +101,16 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
     for (std::size_t index = 0; index < buffers.size(); ++index)
     {
         auto const& buffer = buffers[index];
-        metadata.wide[index] = {static_cast<std::int64_t>(buffer.rawBase),
-            static_cast<std::int64_t>(buffer.rawSlotBytes), static_cast<std::int64_t>(buffer.rawBytes),
-            static_cast<std::int64_t>(buffer.coldDataOffset), static_cast<std::int64_t>(buffer.coldScaleOffset),
-            static_cast<std::int64_t>(buffer.coldPaddingOffset)};
+        metadata.wide[index]
+            = {static_cast<std::int64_t>(buffer.rawBase), static_cast<std::int64_t>(buffer.rawSlotBytes),
+                static_cast<std::int64_t>(buffer.rawBytes), static_cast<std::int64_t>(buffer.coldDataOffset),
+                static_cast<std::int64_t>(buffer.coldScaleOffset), static_cast<std::int64_t>(buffer.coldPaddingOffset)};
         metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
             static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
             buffer.params.headDim, buffer.params.rawRowStrideElements};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
-        if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4)
+        if (buffer.transform != Nvfp4ColdPageTransform::kLosslessCopy)
         {
             auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
                 * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
@@ -1005,8 +1006,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     for (std::size_t page = 0; page < numPages; ++page)
     {
         rawHost[page] = makeDeepseekV4RawPage(kind, page, geometry.tokensPerPage, true, params, geometry);
-        auto const nope
-            = extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, 0U, geometry.headDim);
+        auto const nope = extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, 0U, geometry.headDim);
         references[page] = compressReference(nope, kind, params, geometry);
         rawInput.copyFrom(static_cast<std::size_t>(inputSlots[page]) * rawSlotBytes, rawHost[page]);
         offloadTasks.push_back({coldSlots[page], inputSlots[page]});
@@ -1017,7 +1017,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     {
         std::vector<Nvfp4ColdPageTestBuffer> const buffers{
             {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, payloadBytes,
-                paddingBytes, Nvfp4ColdPageTransform::kNvfp4, params}};
+                paddingBytes, Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);
@@ -1040,8 +1040,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
         EXPECT_EQ(coldRegion(coldSlot, 0U, packed), references[page].packed);
         EXPECT_EQ(coldRegion(coldSlot, packed, scales), references[page].scales);
         EXPECT_EQ(coldRegion(coldSlot, packed + scales, suffix),
-            extractRowSpan(
-                rawHost[page], kind, rows, kDeepseekV4RowElements, geometry.headDim, ropeElements));
+            extractRowSpan(rawHost[page], kind, rows, kDeepseekV4RowElements, geometry.headDim, ropeElements));
         auto const padding = coldRegion(coldSlot, payloadBytes, paddingBytes);
         EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t value) { return value == 0U; }));
 
@@ -1120,7 +1119,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
         std::size_t const payloadBytes = packed + scales + suffix;
         std::vector<Nvfp4ColdPageTestBuffer> const buffers{{reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes,
             rawPageBytes, 0U, packed, payloadBytes, static_cast<std::uint32_t>(coldPageBytes - payloadBytes),
-            Nvfp4ColdPageTransform::kNvfp4, params}};
+            Nvfp4ColdPageTransform::kNvfp4WithLosslessSuffix, params}};
         return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
     };
     auto const inputMetadata = makeMetadata(rawInput);

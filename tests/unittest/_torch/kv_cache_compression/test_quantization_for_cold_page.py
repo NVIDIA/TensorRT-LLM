@@ -816,7 +816,7 @@ def test_deepseek_v4_csa_layout_quantizes_nope_and_preserves_other_bytes(
     assert metadata.cold_page_bytes == cold_page_bytes
     assert metadata.wide[:2, 3].tolist() == [0, indexer_offset]
     assert metadata.wide[:2, 4].tolist() == [7168, 0]
-    assert metadata.integers[0].tolist() == [0, 0, 1, 32, 448, 512]
+    assert metadata.integers[0].tolist() == [0, 2, 1, 32, 448, 512]
     assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0]
 
     sections = (
@@ -1003,7 +1003,7 @@ def test_deepseek_v4_csa_and_colocated_hca_cache_are_provider_owned() -> None:
         },
     )
     assert metadata.num_buffers == 3
-    assert metadata.integers[:3, 1].tolist() == [0, 1, 1]
+    assert metadata.integers[:3, 1].tolist() == [2, 1, 1]
     assert metadata.cold_page_bytes == 15360
     assert metadata.wide[:3, 3].tolist() == [0, 12160, 14336]
 
