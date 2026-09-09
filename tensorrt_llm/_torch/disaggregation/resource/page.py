@@ -24,7 +24,9 @@ import numpy as np
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
-        ("offset", np.uint32),
+        # 64-bit: layer-major recurrent-state pools address a layer at
+        # layer_index * num_slots * slot_bytes, which exceeds 4 GiB.
+        ("offset", np.uint64),
         ("size", np.uint32),
     ]
 )
@@ -64,9 +66,10 @@ class MapperKind(IntEnum):
     in ``bytes_per_layer``). View count per layer group is bounded by the
     number of role classes, never by layer count.
 
-    Mamba state pools do not use this enum: Mamba's transfer is dispatched
-    through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
-    bypasses the attention pool-matching path entirely.
+    Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
+    state, and REPLICATED for auxiliary recurrent state. The first two are
+    dispatched through :class:`MambaPolicy`; every REPLICATED view goes to
+    :class:`ReplicatedPolicy` regardless of its life cycle.
     """
 
     INDEXED = 0

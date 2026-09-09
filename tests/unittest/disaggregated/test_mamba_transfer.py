@@ -33,7 +33,11 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.native import peer as native_peer
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
@@ -208,6 +212,7 @@ def _create_managers(
     enable_attention_dp=False,
     use_v2=False,
     conv_state_layout="x_b_c",
+    with_ple=False,
 ):
     """Create Mamba hybrid cache managers for all TP ranks (PP=1).
 
@@ -228,6 +233,17 @@ def _create_managers(
             if use_v2
             else {}
         )
+        if with_ple:
+            if not use_v2:
+                raise ValueError("PLE state requires the V2 cache manager")
+            manager_kwargs["qwen4_exp_ple_cache_params"] = Qwen4ExpPLECacheParams(
+                ple_layer_mask=[False, False, True, False, False],
+                num_ple_layers=1,
+                short_conv_channels=12,
+                short_conv_state_len=3,
+                ngram_context_len=2,
+                conv_state_dtype=torch.float32,
+            )
         mgr = manager_cls(
             mamba_d_state=MAMBA_D_STATE,
             mamba_d_conv=MAMBA_D_CONV,
@@ -276,6 +292,11 @@ def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
+    if isinstance(manager, MambaHybridCacheManagerV2):
+        for state in manager._ple_conv_states.values():
+            state.zero_()
+        for state in manager._ple_ngram_contexts.values():
+            state.zero_()
 
 
 def test_mamba_receiver_payload_bytes_matched_tp():
@@ -298,6 +319,7 @@ def test_mamba_receiver_payload_bytes_matched_tp():
 
     conv_slot_bytes = 1024
     ssm_slot_bytes = 2048
+    side_slot_bytes = 128
     sorted_lids = [0, 1]
 
     conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
@@ -321,6 +343,13 @@ def test_mamba_receiver_payload_bytes_matched_tp():
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
         ),
+        PoolView(
+            pool_idx=2,
+            buffer_entries=np.array([(1, 0, side_slot_bytes)], dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=frozenset({"ple_ngram_context"}),
+            mapper_kind=MapperKind.REPLICATED,
+            bytes_per_layer=side_slot_bytes,
+        ),
     ]
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=1),
@@ -339,13 +368,127 @@ def test_mamba_receiver_payload_bytes_matched_tp():
         layer_groups=[mlg],
         pool_groups=[
             PhysicalPoolGroup(pools=[]),  # idx 0 placeholder
-            PhysicalPoolGroup(pools=[conv_pool, ssm_pool]),
+            PhysicalPoolGroup(
+                pools=[
+                    conv_pool,
+                    ssm_pool,
+                    PhysicalPool(
+                        base_address=0xC000,
+                        slot_bytes=side_slot_bytes,
+                        num_slots=8,
+                    ),
+                ]
+            ),
         ],
     )
 
     got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
-    # Full per-rank slot bytes for 2 layers x (conv + ssm)
-    assert got == 2 * (conv_slot_bytes + ssm_slot_bytes)
+    # Standard state covers both layers; the side role exists only on layer 2.
+    assert got == 2 * (conv_slot_bytes + ssm_slot_bytes) + side_slot_bytes
+
+
+def _make_rank_info(*, tp_size: int, tp_rank: int = 0) -> RankInfo:
+    return RankInfo(
+        instance_name="test",
+        instance_rank=tp_rank,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+
+
+def _make_side_state_page_table(*, include_side: bool = True):
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        MAMBA_CONV_ROLE,
+        MAMBA_SSM_ROLE,
+        KVCachePageTable,
+        LocalLayer,
+        MambaLayerGroup,
+        MapperKind,
+        PhysicalPool,
+        PhysicalPoolGroup,
+        PoolView,
+    )
+
+    local_layers = [
+        LocalLayer(local_layer_id=0, global_layer_id=1),
+        LocalLayer(local_layer_id=1, global_layer_id=2),
+    ]
+    pools = [
+        PhysicalPool(base_address=1000, slot_bytes=16, num_slots=4),
+        PhysicalPool(base_address=2000, slot_bytes=16, num_slots=4),
+    ]
+    views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=16,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array([(0, 0, 16), (1, 16, 16)], dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=16,
+        ),
+    ]
+    if include_side:
+        pools.append(PhysicalPool(base_address=3000, slot_bytes=8, num_slots=4))
+        views.append(
+            PoolView(
+                pool_idx=2,
+                buffer_entries=np.array([(1, 0, 8)], dtype=BUFFER_ENTRY_DTYPE),
+                pool_role=frozenset({"ple_ngram_context"}),
+                mapper_kind=MapperKind.REPLICATED,
+                bytes_per_layer=8,
+            )
+        )
+    return KVCachePageTable(
+        tokens_per_block=8,
+        layer_groups=[
+            MambaLayerGroup(
+                pool_group_idx=0,
+                local_layers=local_layers,
+                pool_views=views,
+                conv_section_bytes=[4, 4, 8],
+                ssm_bytes_per_head=16,
+            )
+        ],
+        pool_groups=[PhysicalPoolGroup(pools=pools)],
+    )
+
+
+def test_mamba_policy_rejects_incompatible_replicated_side_state():
+    rank_info = _make_rank_info(tp_size=1)
+
+    with pytest.raises(ValueError, match="differ on overlapping layers"):
+        native_peer.ReplicatedPolicy.validate_peer_compatible(
+            _make_side_state_page_table(),
+            _make_side_state_page_table(include_side=False),
+        )
+
+    # The state layer group selects the per-layer-pointer mapper.
+    state_lg = _make_side_state_page_table().layer_groups[0]
+    with pytest.raises(ValueError, match="Replicated state size differs"):
+        native_peer.ReplicatedPolicy(rank_info).build_mapper(
+            peer_ri=rank_info,
+            mapper_kind=peer.MapperKind.REPLICATED,
+            self_layer_offsets=np.array([0], dtype=np.int64),
+            peer_layer_offsets=np.array([0], dtype=np.int64),
+            self_bytes_per_layer=8,
+            peer_bytes_per_layer=16,
+            src_layer_off=0,
+            dst_layer_off=0,
+            self_lg=state_lg,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +615,31 @@ def _read_actual(gen_managers, gen_request_ids) -> Dict:
     return actual
 
 
+def _write_ple_ground_truth_to_ctx(managers, request_ids):
+    """Populate the replicated PLE state and return CPU reference tensors."""
+    expected = {}
+    for req_idx, request_id in enumerate(request_ids):
+        for layer_idx in sorted(managers[0]._ple_conv_states):
+            conv_state = managers[0]._ple_conv_states[layer_idx]
+            ngram_context = managers[0]._ple_ngram_contexts[layer_idx]
+            conv = (
+                torch.arange(conv_state[0].numel(), dtype=conv_state.dtype)
+                .reshape(conv_state[0].shape)
+                .add_(1000 * (req_idx + 1) + layer_idx)
+            )
+            ngram = (
+                torch.arange(ngram_context[0].numel(), dtype=ngram_context.dtype)
+                .reshape(ngram_context[0].shape)
+                .add_(100 * (req_idx + 1) + layer_idx)
+            )
+            expected[(req_idx, layer_idx)] = (conv, ngram)
+            for manager in managers:
+                slot = _mamba_state_slot(manager, request_id)
+                manager._ple_conv_states[layer_idx][slot].copy_(conv)
+                manager._ple_ngram_contexts[layer_idx][slot].copy_(ngram)
+    return expected
+
+
 # ---------------------------------------------------------------------------
 # Main test logic
 # ---------------------------------------------------------------------------
@@ -509,6 +677,7 @@ def run_mamba_transfer_test(
     gen_tp: int,
     use_v2: bool = False,
     conv_state_layout: str = "x_b_c",
+    with_ple: bool = False,
 ):
     """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP)."""
     # -- 1. Create managers, zero mamba caches --
@@ -516,11 +685,13 @@ def run_mamba_transfer_test(
         ctx_tp,
         use_v2=use_v2,
         conv_state_layout=conv_state_layout,
+        with_ple=with_ple,
     )
     gen_mgrs = _create_managers(
         gen_tp,
         use_v2=use_v2,
         conv_state_layout=conv_state_layout,
+        with_ple=with_ple,
     )
     for mgr in ctx_mgrs + gen_mgrs:
         _zero_mamba_states(mgr)
@@ -618,6 +789,7 @@ def run_mamba_transfer_test(
         ctx_rids,
         conv_state_layout,
     )
+    expected_ple = _write_ple_ground_truth_to_ctx(ctx_mgrs, ctx_rids) if with_ple else {}
 
     # -- 6. Compute expected BEFORE transfer --
     expected = _compute_expected(
@@ -663,6 +835,28 @@ def run_mamba_transfer_test(
                 ),
             )
 
+    # Only the V2 manager owns PLE state.
+    if with_ple:
+        for gen_rank, manager in enumerate(gen_mgrs):
+            for req_idx, request_id in enumerate(gen_rids):
+                slot = _mamba_state_slot(manager, request_id)
+                for layer_idx in sorted(manager._ple_conv_states):
+                    expected_conv, expected_ngram = expected_ple[(req_idx, layer_idx)]
+                    torch.testing.assert_close(
+                        manager._ple_conv_states[layer_idx][slot].cpu(),
+                        expected_conv,
+                        rtol=0,
+                        atol=0,
+                        msg=lambda msg, r=gen_rank: f"PLE conv mismatch on gen rank {r}: {msg}",
+                    )
+                    torch.testing.assert_close(
+                        manager._ple_ngram_contexts[layer_idx][slot].cpu(),
+                        expected_ngram,
+                        rtol=0,
+                        atol=0,
+                        msg=lambda msg, r=gen_rank: f"PLE n-gram mismatch on gen rank {r}: {msg}",
+                    )
+
     # -- 10. Cleanup --
     for mgr in ctx_mgrs + gen_mgrs:
         mgr.shutdown()
@@ -704,3 +898,9 @@ def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
         use_v2=True,
         conv_state_layout=conv_state_layout,
     )
+
+
+@pytest.mark.timeout(180)
+def test_v2_mamba_transfer_with_replicated_ple_state():
+    """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
+    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True)

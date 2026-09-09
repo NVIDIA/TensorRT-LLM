@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
     MapperKind,
 )
+from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -597,19 +598,19 @@ def mamba_receiver_payload_bytes(
     if sender_mlg is None or receiver_mlg is None:
         return 0
 
-    sender_globals = {ll.global_layer_id for ll in sender_mlg.local_layers}
-    receiver_globals = {ll.global_layer_id for ll in receiver_mlg.local_layers}
-    overlap = sender_globals & receiver_globals
-    if not overlap:
-        return 0
-
-    from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-
-    receiver_lg_idx = next(
-        i for i, lg in enumerate(receiver_page_table.layer_groups) if lg.kind == CacheKind.STATE
-    )
-    per_layer = sum(
-        get_physical_pool(receiver_page_table, receiver_lg_idx, pv.pool_idx).slot_bytes
-        for pv in receiver_mlg.pool_views
-    )
-    return len(overlap) * per_layer
+    sender_views = {
+        (pool_view.pool_role, pool_view.mapper_kind): pool_view
+        for pool_view in sender_mlg.pool_views
+    }
+    total = 0
+    for receiver_view in receiver_mlg.pool_views:
+        sender_view = sender_views.get((receiver_view.pool_role, receiver_view.mapper_kind))
+        if sender_view is None:
+            continue
+        sender_layers = set(get_pool_view_global_layer_ids(sender_view, sender_mlg))
+        receiver_layers = set(get_pool_view_global_layer_ids(receiver_view, receiver_mlg))
+        overlap = sender_layers & receiver_layers
+        if not overlap:
+            continue
+        total += len(overlap) * receiver_view.bytes_per_layer
+    return total

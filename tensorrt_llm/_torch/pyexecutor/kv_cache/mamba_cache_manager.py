@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
     from tensorrt_llm.sampling_params import SamplingParams
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy, KVCacheManagerV2, Role)
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import \
@@ -3353,6 +3354,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if conv is None or ngram is None:
             return None
         return conv, ngram
+
+    def get_disagg_role_mapper_kinds(self) -> Dict[DataRole, MapperKind]:
+        """PLE state is computed from replicated inputs, so every rank holds
+        identical bytes and the transfer copies whole per-layer regions."""
+        return {
+            **super().get_disagg_role_mapper_kinds(),
+            MambaRole.PLE_CONV_STATE:
+            MapperKind.REPLICATED,
+            MambaRole.PLE_NGRAM_CONTEXT:
+            MapperKind.REPLICATED,
+        }
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
