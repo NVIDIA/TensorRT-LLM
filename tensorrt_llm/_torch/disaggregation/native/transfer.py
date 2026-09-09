@@ -65,7 +65,11 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import (
+    PeerOverlap,
+    PeerRegistrar,
+    ReplicatedPolicy,
+)
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
@@ -2831,6 +2835,10 @@ class Receiver(ReceiverBase):
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
+                    self._registrar.self_extractor.page_table,
+                    sender_info.page_table,
+                )
+                ReplicatedPolicy.validate_peer_compatible(
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )

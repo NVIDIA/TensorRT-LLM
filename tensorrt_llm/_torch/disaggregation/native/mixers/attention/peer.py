@@ -636,8 +636,6 @@ class AttentionPolicy:
         (other role classes may interleave between this class's layers).
         The kind only decides the two irreducible semantic differences:
 
-        - REPLICATED skips head matching entirely (bytes are identical on
-          every TP rank; fan-in ownership is decided upstream).
         - Under head mismatch, HND (INDEXED) slices one contiguous head
           range per K/V buffer, while NHD must slice inside every token.
 
@@ -645,14 +643,6 @@ class AttentionPolicy:
         whose run merging degrades to a single whole-region copy per block
         when the selected layers are contiguous on both sides.
         """
-        if mapper_kind == MapperKind.REPLICATED:
-            return ReplicatedMapper(
-                self_layer_offsets,
-                peer_layer_offsets,
-                self_bytes_per_layer,
-                peer_bytes_per_layer,
-            )
-
         head_match, _ = self.head_match(peer_ri)
         if head_match:
             return IntactMapper(

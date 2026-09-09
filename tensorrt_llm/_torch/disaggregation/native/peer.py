@@ -15,19 +15,26 @@
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
+    ReplicatedMapper,
+)
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    MambaHeadMatchMapper,
+    MambaPolicy,
+)
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_global_layer_ids,
     get_layer_byte_ranges,
     get_layer_to_layer_group,
     get_pool_view_global_layer_ids,
@@ -47,16 +54,112 @@ class PeerOverlap:
     ranks: List[int] = field(default_factory=list)
 
 
+class ReplicatedPolicy:
+    """Transfer policy for views whose bytes are identical on every TP rank.
+
+    Index-key side caches and the recurrent side state of hybrid models are
+    computed from replicated inputs, so there is nothing to reshard: whole
+    per-layer regions are copied and one sender is elected so peers do not
+    write the same destination twice. The life cycle only decides how the
+    extractor hands over pointers -- PAGED views get slot-base pointers that
+    the mapper expands with per-layer byte offsets, STATE views get one
+    resolved pointer per layer of the view.
+    """
+
+    def __init__(self, self_rank_info: RankInfo):
+        self._ri = self_rank_info
+
+    def should_send(self, peer_overlap, peer_rank_info) -> "bool | None":
+        """Always defer to fan-in election: every rank holds the same bytes."""
+        return None
+
+    def build_mapper(
+        self,
+        *,
+        self_layer_offsets: "Sequence[int] | np.ndarray",
+        peer_layer_offsets: "Sequence[int] | np.ndarray",
+        self_bytes_per_layer: int,
+        peer_bytes_per_layer: int,
+        src_layer_off: Optional[int] = None,
+        dst_layer_off: Optional[int] = None,
+        self_lg,
+        **_unused,
+    ) -> RegionMapperBase:
+        if self_lg.kind == CacheKind.PAGED:
+            # PAGED: slot-base pointers the mapper expands with byte offsets.
+            # IntactMapper rejects a size mismatch on this path.
+            return ReplicatedMapper(
+                self_layer_offsets,
+                peer_layer_offsets,
+                self_bytes_per_layer,
+                peer_bytes_per_layer,
+            )
+        if self_lg.kind != CacheKind.STATE:
+            raise ValueError(f"No replicated mapper for cache kind {self_lg.kind.name}")
+        # STATE: extract_slot resolves one pointer per layer of the view.
+        if self_bytes_per_layer != peer_bytes_per_layer:
+            raise ValueError(
+                "Replicated state size differs between peers: "
+                f"local={self_bytes_per_layer}, peer={peer_bytes_per_layer}"
+            )
+        return MambaHeadMatchMapper(
+            transfer_layers=len(self_layer_offsets),
+            src_layer_off=src_layer_off,
+            dst_layer_off=dst_layer_off,
+            block_bytes_per_layer=self_bytes_per_layer,
+        )
+
+    @staticmethod
+    def validate_peer_compatible(self_page_table, peer_page_table) -> None:
+        """Reject a peer that does not describe the same replicated roles.
+
+        Pool matching drops a view with no counterpart silently, so a role the
+        peer never declares would leave the receiver holding zeroed state
+        instead of raising.
+        """
+        if self_page_table is None or peer_page_table is None:
+            return
+
+        def _replicated(page_table):
+            return {
+                (pool_view.pool_role, global_layer_id)
+                for layer_group in page_table.layer_groups
+                for pool_view in layer_group.pool_views
+                if pool_view.mapper_kind == MapperKind.REPLICATED
+                for global_layer_id in get_pool_view_global_layer_ids(pool_view, layer_group)
+            }
+
+        def _hosted(page_table):
+            return {gid for lg in page_table.layer_groups for gid in get_global_layer_ids(lg)}
+
+        shared = _hosted(self_page_table) & _hosted(peer_page_table)
+        differing = sorted(
+            (sorted(role), gid)
+            for role, gid in _replicated(self_page_table) ^ _replicated(peer_page_table)
+            if gid in shared
+        )
+        if differing:
+            raise ValueError(
+                "ReplicatedPolicy.validate_peer_compatible: replicated roles differ on "
+                f"overlapping layers: {differing}"
+            )
+
+
 class PeerRegistrar:
     # Registry: CacheKind -> PolicyClass. Add new layer types here.
     _POLICY_CLASSES = {
         CacheKind.PAGED: AttentionPolicy,
         CacheKind.STATE: MambaPolicy,
     }
+    # A mapper kind whose transfer semantics do not depend on the life cycle
+    # takes precedence over the CacheKind entry above.
+    _MAPPER_KIND_POLICY_CLASSES = {
+        MapperKind.REPLICATED: ReplicatedPolicy,
+    }
 
     def __init__(self, self_rank_info: RankInfo, self_extractor: KVRegionExtractorV1):
         self._ri = self_rank_info
-        self._policies: Dict[CacheKind, Union[AttentionPolicy, MambaPolicy]] = {}
+        self._policies: Dict[type, Union[AttentionPolicy, MambaPolicy, ReplicatedPolicy]] = {}
         self._peer_ri_cache: Dict[str, RankInfo] = {}
         self._kv_map_cache: Dict[
             tuple, RegionMapperBase
@@ -158,12 +261,16 @@ class PeerRegistrar:
         # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a
         # field-level diagnostic instead of returning False, so the precise
         # mismatch reaches the caller of register().
+        self_page_table = (
+            self._self_ext_cache.page_table if self._self_ext_cache is not None else None
+        )
         MambaPolicy.validate_peer_compatible(
             self._ri,
             peer_ri,
-            self._self_ext_cache.page_table if self._self_ext_cache is not None else None,
+            self_page_table,
             peer_ri.page_table,
         )
+        ReplicatedPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)
@@ -303,12 +410,22 @@ class PeerRegistrar:
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
 
-    def _get_policy(self, kind: CacheKind) -> Union[AttentionPolicy, MambaPolicy]:
-        """Return the policy for a CacheKind (lazily instantiated)."""
-        if kind not in self._policies:
+    def _get_policy(
+        self, kind: CacheKind, mapper_kind: Optional[MapperKind] = None
+    ) -> Union[AttentionPolicy, MambaPolicy, ReplicatedPolicy]:
+        """Return the policy for a view (lazily instantiated).
+
+        Keyed by class: CacheKind and MapperKind are both IntEnums whose
+        members share values, so they cannot key the same dict.
+        """
+        cls = None
+        if mapper_kind is not None:
+            cls = self._MAPPER_KIND_POLICY_CLASSES.get(mapper_kind)
+        if cls is None:
             cls = self._POLICY_CLASSES[kind]
-            self._policies[kind] = cls(self._ri)
-        return self._policies[kind]
+        if cls not in self._policies:
+            self._policies[cls] = cls(self._ri)
+        return self._policies[cls]
 
     def get_kv_map(
         self,
@@ -385,8 +502,8 @@ class PeerRegistrar:
             pool_idx=peer_pi,
         )
 
-        # Polymorphic dispatch: attention vs mamba policy
-        policy = self._get_policy(self_lg.kind)
+        # Polymorphic dispatch: attention, mamba, or replicated policy
+        policy = self._get_policy(self_lg.kind, self_pv.mapper_kind)
 
         # For mamba, compute ptr-array layer offsets for partial PP overlap.
         # extract_slot returns ptrs for ALL local_layer_ids in sorted order;
@@ -575,11 +692,8 @@ class PeerRegistrar:
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
-        if pool_view.mapper_kind == MapperKind.REPLICATED:
-            return self._owns_tp_fan_in(peer_rank_info)
-
         # Delegate to the policy's should_send. None means fan-in election.
-        policy = self._get_policy(layer_group.kind)
+        policy = self._get_policy(layer_group.kind, pool_view.mapper_kind)
         result = policy.should_send(peer_overlap, peer_rank_info)
         return self._owns_tp_fan_in(peer_rank_info) if result is None else result
 
