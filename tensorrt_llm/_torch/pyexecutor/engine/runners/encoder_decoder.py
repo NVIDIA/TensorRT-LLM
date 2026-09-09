@@ -15,10 +15,6 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer,
-    MoeLoadBalancerIterContext,
-)
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
@@ -329,7 +325,6 @@ class EncoderDecoderRunner(EncoderMixin):
         resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
         **model_inputs: Any,
     ) -> dict[str, Any]:
@@ -341,8 +336,7 @@ class EncoderDecoderRunner(EncoderMixin):
             runtime_draft_len=runtime_draft_len,
             **model_inputs,
         )
-        with MoeLoadBalancerIterContext(moe_load_balancer):
-            hidden_states = self._execute_prepared(prepared)
+        hidden_states = self._execute_prepared(prepared)
         return {
             "encoder_hidden_states": hidden_states,
             "encoder_seq_lens": prepared.sequence_lengths,

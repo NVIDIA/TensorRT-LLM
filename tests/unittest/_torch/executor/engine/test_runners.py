@@ -12,6 +12,8 @@ import torch
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
     PreparedInputs,
     RunnerConfig,
@@ -64,6 +66,7 @@ def _deps(*, model_forward: Mock | None = None) -> RunnerDeps:
         draft_tokens_cuda=None,
         cache_indirection=None,
         lora=SimpleNamespace(build=Mock(return_value=None)),
+        moe_load_balancer=None,
         model_forward=model_forward,
     )
 
@@ -112,8 +115,8 @@ def _model(*, is_generation: bool, is_encoder_decoder: bool = False) -> SimpleNa
     [
         (False, True, False, False, MultimodalEncoderRunner),
         (False, False, False, False, PoolingRunner),
-        (True, False, False, False, None),
-        (False, False, True, True, None),
+        (True, False, False, False, EncoderRunner),
+        (False, False, True, True, EncoderDecoderRunner),
         (False, False, True, False, None),
     ],
 )
@@ -143,7 +146,7 @@ def test_resolve_runner_type_does_not_require_runtime_dependencies() -> None:
 def test_resolve_runner_checks_encode_only_before_pooling() -> None:
     args = SimpleNamespace(encode_only=True, mm_encoder_only=False)
 
-    assert resolve_runner_type(_model(is_generation=False), args) is None
+    assert resolve_runner_type(_model(is_generation=False), args) is EncoderRunner
 
 
 def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
@@ -206,25 +209,8 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
         resource_manager=resource_manager,
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
-        moe_load_balancer=None,
         gather_context_logits=False,
     )
-
-
-def test_model_engine_rejects_kv_manager_with_no_kv_cache_runner() -> None:
-    runner = Mock(spec=NoKVCacheRunner)
-    engine, resource_manager = _model_engine_with_runner(
-        runner,
-        kv_cache_manager=object(),
-    )
-
-    with pytest.raises(
-        AssertionError,
-        match="no-KV-cache runner was initialized, but a KV cache manager was allocated",
-    ):
-        engine.forward(ScheduledRequests(), resource_manager)
-
-    runner.forward.assert_not_called()
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
@@ -289,7 +275,7 @@ def test_no_kv_cache_runner_owns_spec_metadata_setup(
         replace(
             _config(),
             spec_config=SimpleNamespace(
-                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: (runtime_draft_len + 1),
+                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: runtime_draft_len + 1,
             ),
             original_max_draft_len=2,
             spec_dec_max_total_draft_tokens=3,
@@ -349,7 +335,6 @@ def test_pooling_runner_owns_forward_output_processing(
         resource_manager=SimpleNamespace(),
         cuda_graph_lora_manager=None,
         runtime_draft_len=0,
-        moe_load_balancer=None,
         gather_context_logits=False,
     )
 

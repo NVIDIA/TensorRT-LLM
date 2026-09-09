@@ -978,9 +978,7 @@ class PyTorchModelEngine(ModelEngine):
         )
         return runner_cls(self.model, self._create_runner_deps(), runner_config)
 
-    def _create_runner_deps(self,
-                            *,
-                            use_cache_indirection: bool = True) -> RunnerDeps:
+    def _create_runner_deps(self) -> RunnerDeps:
         return RunnerDeps(
             dist=self.dist,
             mapping=self.mapping,
@@ -988,11 +986,11 @@ class PyTorchModelEngine(ModelEngine):
             position_ids_cuda=self.position_ids_cuda,
             gather_ids_cuda=getattr(self, "gather_ids_cuda", None),
             draft_tokens_cuda=getattr(self, "draft_tokens_cuda", None),
-            cache_indirection=(
-                self.cache_indirection_attention if use_cache_indirection
-                and self.attn_backend.Metadata is TrtllmAttentionMetadata else
-                None),
+            cache_indirection=(self.cache_indirection_attention
+                               if self.attn_backend.Metadata
+                               is TrtllmAttentionMetadata else None),
             lora=self._lora,
+            moe_load_balancer=self.moe_load_balancer,
             # Do not retain the engine through a bound method.
             model_forward=functools.partial(
                 type(self).model_forward, weakref.proxy(self)),
@@ -1352,10 +1350,6 @@ class PyTorchModelEngine(ModelEngine):
             raise RuntimeError(
                 "Encoder phase requires an initialized encoder-decoder model runner."
             )
-        if resource_manager is None:
-            raise ValueError(
-                "Encoder-decoder execution requires a resource manager.")
-
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = list(encoder_requests)
         outputs = self._runner.forward(
@@ -1363,7 +1357,6 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager=resource_manager,
             cuda_graph_lora_manager=None,
             runtime_draft_len=0,
-            moe_load_balancer=self.moe_load_balancer,
             gather_context_logits=False,
         )
         return (
@@ -3533,9 +3526,9 @@ class PyTorchModelEngine(ModelEngine):
 
         1. The optional ``ModelLoader`` (which in turn releases any
            GMS client; see :meth:`ModelLoader.cleanup`).
-        2. The runner, MM item scheduler, and model module reference, which
+        2. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
+        3. The runner, MM item scheduler, and model module reference, which
            hold references to the model.
-        3. CUDA Graph captures (via :meth:`_release_cuda_graphs`).
         4. Input processors.
 
         Idempotency:
@@ -6406,7 +6399,6 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager=resource_manager,
                 cuda_graph_lora_manager=self.cuda_graph_lora_manager,
                 runtime_draft_len=self.runtime_draft_len,
-                moe_load_balancer=self.moe_load_balancer,
                 gather_context_logits=gather_context_logits,
                 **model_inputs,
             )

@@ -60,6 +60,7 @@ class RunnerDeps:
     draft_tokens_cuda: torch.Tensor | None
     cache_indirection: torch.Tensor | None
     lora: LoraParamBuilder
+    moe_load_balancer: MoeLoadBalancer | None
     model_forward: Callable[..., Any]
 
 
@@ -100,7 +101,6 @@ class ModelRunner(Protocol):
         resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
         **model_inputs: Any,
     ) -> dict[str, Any]:

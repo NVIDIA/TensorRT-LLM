@@ -23,10 +23,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-    MoeLoadBalancer,
-    MoeLoadBalancerIterContext,
-)
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancerIterContext
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
@@ -575,12 +572,20 @@ class EncoderMixin:
         runner = self._encoder_cuda_graph_runner
         key = prepared.graph_key
         assert key is not None
+        # Only token encoder graphs participate in MoE load-balancer iterations.
+        moe_load_balancer = None if runner.feature_mode else self._deps.moe_load_balancer
         capture_outputs = None
         if runner.needs_capture(key):
-            capture_outputs = runner.capture(key, forward, prepared.kwargs)
+
+            def capture_forward(inputs: dict[str, Any]) -> object:
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    return forward(inputs)
+
+            capture_outputs = runner.capture(key, capture_forward, prepared.kwargs)
         if runner.is_warmup_only:
             return capture_outputs
-        return runner.replay(key, prepared.kwargs)
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            return runner.replay(key, prepared.kwargs)
 
     def release_graph(self) -> None:
         self._encoder_cuda_graph_runner.clear()
@@ -910,7 +915,8 @@ class EncoderRunner(EncoderMixin):
         graph_runner = self._encoder_cuda_graph_runner
         with with_shared_pool(graph_runner.get_graph_pool()):
             if prepared.graph_key is None:
-                return forward(prepared.kwargs)
+                with MoeLoadBalancerIterContext(self._deps.moe_load_balancer):
+                    return forward(prepared.kwargs)
             graph_outputs = self._execute_encoder_cuda_graph(prepared, forward)
         if not isinstance(graph_outputs, dict):
             raise TypeError("Encoder CUDA Graph replay must return a dictionary.")
@@ -933,7 +939,6 @@ class EncoderRunner(EncoderMixin):
         resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
         **model_inputs: Any,
     ) -> dict[str, Any]:
@@ -944,11 +949,10 @@ class EncoderRunner(EncoderMixin):
             runtime_draft_len=runtime_draft_len,
             **model_inputs,
         )
-        with MoeLoadBalancerIterContext(moe_load_balancer):
-            return self._execute_prepared(
-                prepared,
-                gather_context_logits=gather_context_logits,
-            )
+        return self._execute_prepared(
+            prepared,
+            gather_context_logits=gather_context_logits,
+        )
 
     def _forward_step(
         self,
