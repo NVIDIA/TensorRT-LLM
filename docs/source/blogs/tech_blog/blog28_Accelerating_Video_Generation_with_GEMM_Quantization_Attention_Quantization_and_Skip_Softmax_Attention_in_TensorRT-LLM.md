@@ -75,9 +75,9 @@ Because the score distribution depends on the input, a fixed threshold $\lambda$
 - `target_sparsity` expresses how aggressively to skip as an intuitive target.
 - `disabled_until_timestep` keeps the early denoising steps dense before enabling Skip Softmax.
 
-The mapping from `disabled_until_timestep` to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, `disabled_until_timestep=0.86` keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/visualgen-sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps) for the scheduler-dependent mapping.
+The mapping from `disabled_until_timestep` to actual denoising steps depends on the scheduler and is not linear. In the 40-step UniPC schedule used here, `disabled_until_timestep=0.86` keeps the 14/40 steps dense and enables Skip Softmax for the remaining 26. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#mapping-disabled_until_timestep-to-actual-denoising-steps) for the scheduler-dependent mapping.
 
-The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/visual-gen/features/visualgen-sparse-attention.md#skip-softmax-attention) for direct-threshold configuration.
+The ModelOpt checkpoints used in this experiment already include this calibration metadata. Without calibration, Skip Softmax can still be enabled by setting the threshold directly. See the [VisualGen Skip Softmax Attention documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/visualgen-sparse-attention.md#skip-softmax-attention) for direct-threshold configuration.
 
 ## Results
 
