@@ -75,6 +75,19 @@ def _make_transceiver(transfer_complete: bool = True) -> Mock:
     return transceiver
 
 
+def _make_v2_kv_cache_manager() -> Mock:
+    """A KV cache manager V2 stub for the benchmark-disagg flow tests.
+
+    Disk prefetch is off, so ``_prefetch_for_context_requests`` returns before
+    touching anything these tests do not model. Everything else about the
+    executor stays on the V2 path.
+    """
+    manager = Mock()
+    manager.enable_block_reuse = True
+    manager.disk_prefetch_num_reqs = 0
+    return manager
+
+
 class MockBenchmarkExecutor:
     """Minimal stub mirroring benchmark-fill PyExecutor attributes.
 
@@ -886,7 +899,9 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
-        ex.kv_cache_manager = Mock()
+        ex.kv_cache_manager = _make_v2_kv_cache_manager()
+        ex._is_kv_manager_v2 = True
+        ex._prefetched_request_ids = set()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0
@@ -1277,6 +1292,9 @@ class TestFailFastDuringBenchmarkFill:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        ex.kv_cache_manager = _make_v2_kv_cache_manager()
+        ex._is_kv_manager_v2 = True
+        ex._prefetched_request_ids = set()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = fill_phase_active
         ex._fill_admit_cap = 0
@@ -1554,6 +1572,9 @@ class TestFillPhaseEndToEnd:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = self.TOTAL_REQUESTS
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
+        ex.kv_cache_manager = _make_v2_kv_cache_manager()
+        ex._is_kv_manager_v2 = True
+        ex._prefetched_request_ids = set()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0

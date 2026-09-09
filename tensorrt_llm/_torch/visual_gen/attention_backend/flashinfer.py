@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024

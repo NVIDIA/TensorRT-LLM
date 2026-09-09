@@ -936,20 +936,17 @@ def test_check_passes_end_to_end_on_a_real_pytest_run(tmp_path):
     assert "sys.path check failed" not in result.stdout
 
 
-def test_relative_pythonpath_is_reported_before_any_test(tmp_path):
-    """A malformed environment is named at configure time, not as a later symptom.
-
-    Only the report is asserted: failing the run on this is currently commented
-    out in pytest_configure, so the run still proceeds. Assert the exit status
-    here once that is turned on.
-    """
+def test_relative_pythonpath_fails_the_run_before_any_test(tmp_path):
+    """A malformed environment fails the run at configure time, not as a later symptom."""
     result = _run_pytest_with_the_check(
         tmp_path / "repo", leak=False, extra_pythonpath="relative/dir"
     )
     output = result.stdout + result.stderr
 
+    assert result.returncode == pytest.ExitCode.USAGE_ERROR, output
     assert "PYTHONPATH check failed" in output, output
     assert "not absolute paths" in output and "'relative/dir'" in output
+    assert "passed" not in output, "the run must abort before executing any test"
 
 
 def test_check_reports_end_to_end_when_a_conftest_leaks(tmp_path):
@@ -957,8 +954,7 @@ def test_check_reports_end_to_end_when_a_conftest_leaks(tmp_path):
     result = _run_pytest_with_the_check(tmp_path / "repo", leak=True)
     output = result.stdout + result.stderr
 
-    # TODO: enable return code assertion
-    # assert result.returncode == pytest.ExitCode.USAGE_ERROR, result.stdout + result.stderr
+    assert result.returncode == pytest.ExitCode.USAGE_ERROR, result.stdout + result.stderr
     assert "sys.path check failed" in output, output
     assert os.path.join("tests", "helpers") in output
 

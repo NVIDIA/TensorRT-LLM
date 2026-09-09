@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import get_visual_gen_attention_backend
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig

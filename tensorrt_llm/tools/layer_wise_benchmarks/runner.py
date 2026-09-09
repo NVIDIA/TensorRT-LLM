@@ -632,7 +632,6 @@ class Runner:
         kv_cache_manager: KVCacheManager,
         attn_workspace: Optional[torch.Tensor] = None,
     ):
-        world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
         sparse_attention_config = self.model_config.sparse_attention_config
         sparse_params = (
@@ -674,7 +673,11 @@ class Runner:
             mapping=self.model_config.mapping,
             sparse_metadata_params=sparse_metadata_params,
         )
-        attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # One entry per attention-DP rank, not per world rank: the non-DP MoE path
+        # asserts len(all_rank_num_tokens) == 1.
+        attn_metadata.all_rank_num_tokens = [
+            batch_size * seq_len_q
+        ] * self.model_config.mapping.dp_size
         # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
         # serving the executor announces that via update_spec_dec_param(), the only
         # place max_draft_tokens is set. Without it the DSA indexer's context_lens
