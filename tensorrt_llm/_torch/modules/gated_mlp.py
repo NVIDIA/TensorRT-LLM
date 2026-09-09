@@ -144,10 +144,7 @@ class GatedMLP(nn.Module):
                                     **_common_proj_kwargs)
             self.up_proj = Linear(self.hidden_size, self.intermediate_size,
                                   **_common_proj_kwargs)
-            self.gate_up_proj = None
         else:
-            self.gate_proj = None
-            self.up_proj = None
             self.gate_up_proj = Linear(
                 self.hidden_size,
                 self.intermediate_size * 2,
@@ -348,7 +345,7 @@ class GatedMLP(nn.Module):
         - gate_up_proj uses NVFP4 quantization
         - gate_up_proj has no bias (bias not supported in fused kernel)
         """
-        if self.gate_up_proj is None:  # split path has no fused projection
+        if self.split_gate_up:  # no fused projection to fuse into
             return False
         return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
                 and self._is_plain_swiglu()
