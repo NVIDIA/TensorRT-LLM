@@ -20,8 +20,8 @@
 
 The classes subclass TrtllmAttention and TrtllmAttentionMetadata, imported at
 module scope. That is cycle-free only because the dependency runs one way: the
-two FMHA libraries reach the kernels through ...minimax_m3_kernels, never
-through this package, so trtllm's import chain does not come back here.
+two FMHA libraries reach the kernels through ...minimax_m3.kernels and never
+load this module, so trtllm's import chain does not come back here.
 """
 
 from __future__ import annotations
@@ -37,23 +37,23 @@ from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..minimax_m3_kernels.msa_utils import (
+from .common import (
+    MiniMaxM3SparseConfig,
+    MiniMaxM3SparseMetadataParams,
+    build_paged_kv_slot_mapping,
+    write_kv_slots,
+)
+from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     per_token_valid_blocks,
     require_msa_module,
 )
-from ..minimax_m3_kernels.trtllm_gen_dense_decode import (
+from .kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
     uniform_subpages_per_slot,
     write_subpage_block_table,
-)
-from .common import (
-    MiniMaxM3SparseConfig,
-    MiniMaxM3SparseMetadataParams,
-    build_paged_kv_slot_mapping,
-    write_kv_slots,
 )
 from .msa_indexer import MsaIndexer, cutedsl_score_runner
 

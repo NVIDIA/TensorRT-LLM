@@ -31,28 +31,41 @@ Layered as:
                                 selection submodule.
   * :mod:`.msa_availability`-- SM100 and fmha_sm100 gating for the MSA
                                 path.
-
-The kernels themselves, and the paged-cache write they share with these
-backends, live in the sibling :mod:`..minimax_m3_kernels` package so the FMHA
-libraries that drive them do not have to import this one.
+  * :mod:`.kernels`         -- the kernels themselves and the paged-cache
+                                write they share with the backends, imported
+                                directly by the FMHA libraries that drive
+                                them.
 
 This package's public surface re-exports the names callers
 historically imported from ``...sparse.minimax_m3`` so external
 importers (the model code, ``sparse.utils``, focused tests) keep
-working unchanged.
+working unchanged. The re-export is lazy (PEP 562 __getattr__) so that
+importing :mod:`.kernels` from an FMHA library does not pull in
+:mod:`.msa_backend`, which subclasses TrtllmAttention and would close a cycle
+back through the FMHA registry.
 """
 
-# The dense Triton oracle in the model imports these paged-cache helpers, so
-# they stay importable from the package. They are package-private and are not
+import importlib
+
+# The dense Triton oracle in the model imports the two paged-cache helpers, so
+# they stay reachable from the package. They are package-private and are not
 # part of __all__. Every other backend/metadata/config symbol is imported
 # directly from its defining submodule by the code that needs it.
-from .cache_manager import MiniMaxM3KVCacheManagerV2
-from .msa_backend import MiniMaxM3MsaSparseAttention
-from .triton_backend import (
-    MiniMaxM3SparseRuntimeBackend,
-    _gather_paged_batched,
-    _write_main_kv_slots_to_pool,
-)
+_LAZY_EXPORTS = {
+    "MiniMaxM3KVCacheManagerV2": ".cache_manager",
+    "MiniMaxM3MsaSparseAttention": ".msa_backend",
+    "MiniMaxM3SparseRuntimeBackend": ".triton_backend",
+    "_gather_paged_batched": ".triton_backend",
+    "_write_main_kv_slots_to_pool": ".triton_backend",
+}
+
+
+def __getattr__(name: str):
+    module = _LAZY_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module, __name__), name)
+
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",

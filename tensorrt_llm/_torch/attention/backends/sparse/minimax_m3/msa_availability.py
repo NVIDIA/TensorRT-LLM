@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
-from ..minimax_m3_kernels.msa_utils import msa_package_available
-from ..minimax_m3_kernels.trtllm_gen_dense_decode import flashinfer_available
+from .kernels.msa_utils import msa_package_available
+from .kernels.trtllm_gen_dense_decode import flashinfer_available
 
 # fmha_sm100 runs on the SM100 architecture family (SM100 and SM103). Other
 # architectures, including SM120, are not supported.

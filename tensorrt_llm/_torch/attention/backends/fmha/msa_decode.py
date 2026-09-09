@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..sparse.minimax_m3_kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_phase_kv
-from ..sparse.minimax_m3_kernels.trtllm_gen_dense_decode import (
+from ..sparse.minimax_m3.kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_phase_kv
+from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
     DenseDecodeWorkspaceLayout,
     dense_decode_workspace_layout,
     minimax_m3_trtllm_gen_dense_decode,
@@ -169,7 +169,7 @@ class MsaDecodeFmha(PhasedFmha):
     ) -> None:
         # Function-local: this module is on the import path of every
         # attention.backends.trtllm import, and the kernel pulls in Triton.
-        from ..sparse.minimax_m3_kernels.triton_sparse_decode import minimax_m3_sparse_attn_decode
+        from ..sparse.minimax_m3.kernels.triton_sparse_decode import minimax_m3_sparse_attn_decode
 
         attn = params.attn
         head_dim = attn.head_dim

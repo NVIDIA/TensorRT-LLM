@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..minimax_m3_kernels.msa_utils import (
+from .kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     per_token_valid_blocks,
     require_msa_module,

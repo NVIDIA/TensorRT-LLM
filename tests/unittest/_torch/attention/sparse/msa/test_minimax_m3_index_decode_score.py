@@ -12,13 +12,13 @@ The PyTorch oracle is ported from the vLLM reference linked in the file header
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _cutedsl_score
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3_kernels.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
     select_blocks_from_maxscore,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _cutedsl_score
 from tensorrt_llm._utils import get_sm_version
 
 PAGE_SIZE = 128

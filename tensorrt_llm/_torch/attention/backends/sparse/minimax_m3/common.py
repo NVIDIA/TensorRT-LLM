@@ -5,7 +5,7 @@
 Both the Triton reference and the MSA (fmha_sm100) path share these
 backend-neutral pieces: the lowered parameter and per-rank kernel config
 bundles, block-priority sentinels, and the paged-cache slot mapping builder.
-MSA-only helpers live in :mod:`...minimax_m3_kernels.msa_utils`.
+MSA-only helpers live in :mod:`.kernels.msa_utils`.
 """
 
 from __future__ import annotations
@@ -17,10 +17,11 @@ import torch
 
 from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
 
+from ..params import SparseMetadataParams, SparseParams
+
 # Re-exported so this module stays the one place the backends reach for
 # paged-cache plumbing, wherever it is defined.
-from ..minimax_m3_kernels.paged_cache import write_kv_slots
-from ..params import SparseMetadataParams, SparseParams
+from .kernels.paged_cache import write_kv_slots
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping

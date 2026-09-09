@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..sparse.minimax_m3_kernels.msa_utils import (
+from ..sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
     is_msa_layer,
     msa_paged_kv,

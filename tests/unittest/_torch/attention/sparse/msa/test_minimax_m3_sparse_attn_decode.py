@@ -13,12 +13,12 @@ truncated at the query token's own causal extent.
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3_kernels.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     build_kv_page_indices,
     msa_package_available,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3_kernels.triton_sparse_decode import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
     SPARSE_BLOCK_SIZE,
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
