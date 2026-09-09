@@ -25,7 +25,9 @@ Pass the Hub ID or local path via `--model`:
 Guardrails are enabled by default (required by the [NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license)). Install and authenticate as follows:
 
 ```bash
-pip install cosmos_guardrail==0.3.0 && pip uninstall opencv-python
+pip install cosmos_guardrail==0.3.0
+pip uninstall -y opencv-python
+pip install opencv-python-headless
 ```
 
 Accept the terms for the guardrail checkpoint at https://huggingface.co/nvidia/Cosmos-1.0-Guardrail and set a valid `HF_TOKEN` (the checkpoint is downloaded automatically on first run).
