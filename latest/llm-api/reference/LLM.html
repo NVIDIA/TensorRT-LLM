@@ -1,0 +1,1426 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="AsyncLLM" href="AsyncLLM.html" />
+    <link rel="prev" title="API Reference" href="../reference.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc26" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../reference.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../reference.html" class="nav-link">API Reference</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="llm">
+<h1>LLM<a class="headerlink" href="#llm" title="Link to this heading">#</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">LLM</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">PreTrainedTokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'slow'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">skip_tokenizer_init</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trust_remote_code</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tensor_parallel_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm.html#LLM"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">_TorchLLM</span></code></p>
+<p>LLM class is the main class for running a LLM model.</p>
+<p>For more details about the arguments, please refer to <a class="reference internal" href="TorchLlmArgs.html#tensorrt_llm.llmapi.TorchLlmArgs" title="tensorrt_llm.llmapi.TorchLlmArgs"><code class="xref py py-class docutils literal notranslate"><span class="pre">TorchLlmArgs</span></code></a>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>model</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>pathlib.Path</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The path to the model checkpoint or the model name from the Hugging Face Hub.</p></li>
+<li><p><strong>tokenizer</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>pathlib.Path</em><em>, </em><em>transformers.tokenization_utils_base.PreTrainedTokenizerBase</em><em>, </em><em>tensorrt_llm.tokenizer.tokenizer.TokenizerBase</em><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The path to the tokenizer checkpoint or the tokenizer name from the Hugging Face Hub. Defaults to None.</p></li>
+<li><p><strong>tokenizer_mode</strong> (<em>Literal</em><em>[</em><em>'auto'</em><em>, </em><em>'slow'</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The mode to initialize the tokenizer. Defaults to auto.</p></li>
+<li><p><strong>custom_tokenizer</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Specify a custom tokenizer implementation. Accepts either: (1) a built-in alias (e.g., ‘deepseek_v32’), or (2) a Python import path (e.g., ‘tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer’). The tokenizer class must implement ‘from_pretrained(path, <a href="#id1"><span class="problematic" id="id2">**</span></a>kwargs)’ and the TokenizerBase interface. Defaults to None.</p></li>
+<li><p><strong>post_processor_hook</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Python import path of a user post-processing hook applied after detokenization and before the per-endpoint response formatter (e.g. ‘my_pkg.guardrail.MyPostProcessorHook’). The class must be importable and picklable, take no constructor arguments, and be callable as ‘__call__(chunk) -&gt; verdict’ (see tensorrt_llm.executor.postprocessor_hook). It runs once per output, per streaming chunk, and may rewrite, suppress, or terminate the output; it owns its own per-request state. Defaults to None.</p></li>
+<li><p><strong>skip_tokenizer_init</strong> (<em>bool</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Whether to skip the tokenizer initialization. Defaults to False.</p></li>
+<li><p><strong>trust_remote_code</strong> (<em>bool</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Whether to trust the remote code. Defaults to False.</p></li>
+<li><p><strong>tensor_parallel_size</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The tensor parallel size. Defaults to 1.</p></li>
+<li><p><strong>dtype</strong> (<em>str</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The data type to use for the model. When ‘auto’ (default), it is read from the HF config.json (‘dtype’, or the deprecated ‘torch_dtype’); for composite/VLM configs it falls back to the nested text_config.dtype. Defaults to bfloat16 if none is found. Defaults to auto.</p></li>
+<li><p><strong>revision</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The revision to use for the model. Defaults to None.</p></li>
+<li><p><strong>tokenizer_revision</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The revision to use for the tokenizer. Defaults to None.</p></li>
+<li><p><strong>model_kwargs</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>Any</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Optional parameters overriding model config defaults. Precedence: (1) model_kwargs, (2) model config file, (3) model config class defaults. Unknown keys are ignored Defaults to None.</p></li>
+<li><p><strong>pipeline_parallel_size</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The pipeline parallel size. Defaults to 1.</p></li>
+<li><p><strong>context_parallel_size</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The context parallel size. Defaults to 1.</p></li>
+<li><p><strong>gpus_per_node</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> The number of GPUs per node. Defaults to None.</p></li>
+<li><p><strong>moe_tensor_parallel_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The tensor parallel size for MoE model’s expert weights. Defaults to None.</p></li>
+<li><p><strong>moe_expert_parallel_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The expert parallel size for MoE model’s expert weights. Defaults to None.</p></li>
+<li><p><strong>enable_attention_dp</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Enable attention data parallel. Defaults to False.</p></li>
+<li><p><strong>enable_lm_head_tp_in_adp</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable LM head TP in attention dp. Defaults to False.</p></li>
+<li><p><strong>pp_partition</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Pipeline parallel partition, a list of each rank’s layer number. Defaults to None.</p></li>
+<li><p><strong>cp_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.CpConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Context parallel config. Defaults to None.</p></li>
+<li><p><strong>load_format</strong> (<em>Union</em><em>[</em><em>str</em><em>, </em><em>tensorrt_llm.llmapi.llm_args.LoadFormat</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> How to load the model weights. By default, detect the weight type from the model checkpoint. Defaults to 0.</p></li>
+<li><p><strong>enable_lora</strong> (<em>bool</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Enable LoRA. Defaults to False.</p></li>
+<li><p><strong>lora_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm._torch.peft.lora.config.LoraConfig</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> LoRA configuration for the model. Defaults to None.</p></li>
+<li><p><strong>kv_cache_config</strong> (<a class="reference internal" href="KvCacheConfig.html#tensorrt_llm.llmapi.KvCacheConfig" title="tensorrt_llm.llmapi.llm_args.KvCacheConfig"><em>tensorrt_llm.llmapi.llm_args.KvCacheConfig</em></a>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> KV cache config. Defaults to None.</p></li>
+<li><p><strong>enable_chunked_prefill</strong> (<em>bool</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Enable chunked prefill. Defaults to False.</p></li>
+<li><p><strong>guided_decoding_backend</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'xgrammar'</em><em>, </em><em>'llguidance'</em><em>]</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Guided decoding backend. llguidance is supported in PyTorch backend only. Defaults to None.</p></li>
+<li><p><strong>batched_logits_processor</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.sampling_params.BatchedLogitsProcessor</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Batched logits processor. Defaults to None.</p></li>
+<li><p><strong>iter_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The maximum number of iterations for iter stats. Set to -1 to keep all iteration stats. Set to 0 to disable iteration stats in the TensorRT executor. Defaults to None.</p></li>
+<li><p><strong>request_stats_max_iterations</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The maximum number of iterations for request stats. Set to -1 to keep all request stats. Set to 0 to disable request stats. Defaults to None.</p></li>
+<li><p><strong>peft_cache_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.PeftCacheConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> PEFT cache config. Defaults to None.</p></li>
+<li><p><strong>scheduler_config</strong> (<a class="reference internal" href="SchedulerConfig.html#tensorrt_llm.llmapi.SchedulerConfig" title="tensorrt_llm.llmapi.llm_args.SchedulerConfig"><em>tensorrt_llm.llmapi.llm_args.SchedulerConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Scheduler config. Defaults to None.</p></li>
+<li><p><strong>cache_transceiver_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="CacheTransceiverConfig.html#tensorrt_llm.llmapi.CacheTransceiverConfig" title="tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig"><em>tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Cache transceiver config. Defaults to None.</p></li>
+<li><p><strong>sparse_attention_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="QSASparseAttentionConfig.html#tensorrt_llm.llmapi.QSASparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="RocketSparseAttentionConfig.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekSparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html#tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig</em></a><em>, </em><a class="reference internal" href="SkipSoftmaxAttentionConfig.html#tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig" title="tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig</em></a><em>, </em><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html#tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig" title="tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig"><em>tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Sparse attention config. Defaults to None.</p></li>
+<li><p><strong>kv_cache_compression_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html#tensorrt_llm.llmapi.ColdPageQuantizationCompressionConfig" title="tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig"><em>tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig</em></a><em>, </em><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html#tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig" title="tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig"><em>tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> KV-cache compression config; None disables compression. Defaults to None.</p></li>
+<li><p><strong>speculative_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="DraftTargetDecodingConfig.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DraftTargetDecodingConfig</em></a><em>, </em><a class="reference internal" href="Eagle3DecodingConfig.html#tensorrt_llm.llmapi.Eagle3DecodingConfig" title="tensorrt_llm.llmapi.llm_args.Eagle3DecodingConfig"><em>tensorrt_llm.llmapi.llm_args.Eagle3DecodingConfig</em></a><em>, </em><a class="reference internal" href="EagleDecodingConfig.html#tensorrt_llm.llmapi.EagleDecodingConfig" title="tensorrt_llm.llmapi.llm_args.EagleDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.EagleDecodingConfig</em></a><em>, </em><a class="reference internal" href="MTPDecodingConfig.html#tensorrt_llm.llmapi.MTPDecodingConfig" title="tensorrt_llm.llmapi.llm_args.MTPDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.MTPDecodingConfig</em></a><em>, </em><a class="reference internal" href="NGramDecodingConfig.html#tensorrt_llm.llmapi.NGramDecodingConfig" title="tensorrt_llm.llmapi.llm_args.NGramDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.NGramDecodingConfig</em></a><em>, </em><a class="reference internal" href="SADecodingConfig.html#tensorrt_llm.llmapi.SADecodingConfig" title="tensorrt_llm.llmapi.llm_args.SADecodingConfig"><em>tensorrt_llm.llmapi.llm_args.SADecodingConfig</em></a><em>, </em><a class="reference internal" href="UserProvidedDecodingConfig.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig" title="tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.UserProvidedDecodingConfig</em></a><em>, </em><a class="reference internal" href="SaveHiddenStatesDecodingConfig.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig" title="tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.SaveHiddenStatesDecodingConfig</em></a><em>, </em><a class="reference internal" href="PARDDecodingConfig.html#tensorrt_llm.llmapi.PARDDecodingConfig" title="tensorrt_llm.llmapi.llm_args.PARDDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.PARDDecodingConfig</em></a><em>, </em><a class="reference internal" href="DFlashDecodingConfig.html#tensorrt_llm.llmapi.DFlashDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DFlashDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DFlashDecodingConfig</em></a><em>, </em><a class="reference internal" href="DSparkDecodingConfig.html#tensorrt_llm.llmapi.DSparkDecodingConfig" title="tensorrt_llm.llmapi.llm_args.DSparkDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.DSparkDecodingConfig</em></a><em>, </em><a class="reference internal" href="AutoDecodingConfig.html#tensorrt_llm.llmapi.AutoDecodingConfig" title="tensorrt_llm.llmapi.llm_args.AutoDecodingConfig"><em>tensorrt_llm.llmapi.llm_args.AutoDecodingConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> Speculative decoding config. Defaults to None.</p></li>
+<li><p><strong>max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum batch size. Defaults to 2048.</p></li>
+<li><p><strong>max_input_len</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum input length. Defaults to 1024.</p></li>
+<li><p><strong>max_seq_len</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum sequence length. Defaults to None.</p></li>
+<li><p><strong>max_beam_width</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum beam width. Defaults to 1.</p></li>
+<li><p><strong>max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The maximum number of tokens. Defaults to 8192.</p></li>
+<li><p><strong>gather_generation_logits</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Gather generation logits. Defaults to False.</p></li>
+<li><p><strong>num_postprocess_workers</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of processes used for postprocessing the generated tokens, including detokenization. Defaults to 0.</p></li>
+<li><p><strong>postprocess_tokenizer_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The path to the tokenizer directory for postprocessing. Defaults to None.</p></li>
+<li><p><strong>num_serve_frontends</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The number of HTTP frontend processes serving one executor. Used by trtllm-serve: values &gt; 1 run additional attached frontend processes that share the serving port via SO_REUSEPORT (classic IPC executor path only). Defaults to 1.</p></li>
+<li><p><strong>reasoning_parser</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The parser to separate reasoning content from output. Defaults to None.</p></li>
+<li><p><strong>otlp_traces_endpoint</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Target URL to which OpenTelemetry traces will be sent. Defaults to None.</p></li>
+<li><p><strong>return_perf_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Allow serving responses to include per-request performance metrics when the request sets X-TRTLLM-return-metrics: 1. Defaults to False.</p></li>
+<li><p><strong>perf_metrics_output_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Directory for per-process performance metrics JSONL files. Setting this enables collection even when return_perf_metrics is false. Defaults to None.</p></li>
+<li><p><strong>prometheus_metrics_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="PrometheusMetricsConfig.html#tensorrt_llm.llmapi.PrometheusMetricsConfig" title="tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig"><em>tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for Prometheus metrics collection, including custom histogram bucket boundaries. Defaults to None.</p></li>
+<li><p><strong>enable_energy_metrics</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable GPU energy monitoring via NVML. When enabled, the server exposes an /energy_metrics endpoint that reports cumulative GPU energy consumption in joules. Defaults to False.</p></li>
+<li><p><strong>orchestrator_type</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'rpc'</em><em>, </em><em>'ray'</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The orchestrator type to use. Defaults to None, which uses MPI. Defaults to None.</p></li>
+<li><p><strong>env_overrides</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> [EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won’t update unless the code fetches them from os.environ on demand. Defaults to None.</p></li>
+<li><p><strong>telemetry_config</strong> (<em>tensorrt_llm.usage.config.TelemetryConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Telemetry configuration (opt-out, usage context). Defaults to None.</p></li>
+<li><p><strong>generation_config</strong> (<em>Literal</em><em>[</em><em>'auto'</em><em>, </em><em>'trtllm'</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Controls whether sampling defaults are loaded from the model’s generation_config.json. ‘auto’ applies supported values when the request does not specify them; ‘trtllm’ preserves TRT-LLM defaults. Precedence is request values, generation_config.json values, then TRT-LLM defaults. Defaults to trtllm.</p></li>
+<li><p><strong>garbage_collection_gen0_threshold</strong> (<em>int</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Threshold for Python garbage collection of generation 0 objects. Lower values trigger more frequent garbage collection. Defaults to 20000.</p></li>
+<li><p><strong>cuda_graph_config</strong> (<em>Union</em><em>[</em><a class="reference internal" href="DecodeCudaGraphConfig.html#tensorrt_llm.llmapi.DecodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig</em></a><em>, </em><a class="reference internal" href="EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig</em></a><em>, </em><em>NoneType</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> CUDA graph config. If true, use CUDA graphs for decoding.         CUDA graphs are only created for the batch sizes in cuda_graph_config.batch_sizes,         and are enabled for batches that consist of decoding requests <em>only</em>         (the reason is that it’s hard to capture a single graph with prefill requests         since the input shapes are a function of the sequence lengths).         Note that each CUDA graph can use up to 200 MB of extra memory. Defaults to None.</p></li>
+<li><p><strong>encoder_cuda_graph_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="EncodeCudaGraphConfig.html#tensorrt_llm.llmapi.EncodeCudaGraphConfig" title="tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig"><em>tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> CUDA graph configuration for the encoder forward pass of an encoder-decoder model. Use <cite>cuda_graph_config</cite> for the decoder and this field for the encoder. Encoder CUDA graphs require <cite>encoder_max_batch_size</cite> to be set. Defaults to None.</p></li>
+<li><p><strong>enable_encoder_decoder_mixed_cuda_graph</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable the mixed-batch CUDA graph performance optimization for encoder-decoder models. The graph handles decoder iterations containing both context and generation requests. It is enabled by default when both <cite>cuda_graph_config</cite> and <cite>encoder_cuda_graph_config</cite> produce usable graph shapes. Defaults to True.</p></li>
+<li><p><strong>multimodal_config</strong> (<a class="reference internal" href="MultimodalConfig.html#tensorrt_llm.llmapi.MultimodalConfig" title="tensorrt_llm.llmapi.llm_args.MultimodalConfig"><em>tensorrt_llm.llmapi.llm_args.MultimodalConfig</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
+<li><p><strong>attention_dp_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="AttentionDpConfig.html#tensorrt_llm.llmapi.AttentionDpConfig" title="tensorrt_llm.llmapi.llm_args.AttentionDpConfig"><em>tensorrt_llm.llmapi.llm_args.AttentionDpConfig</em></a><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Optimized load-balancing for the DP Attention scheduler. Defaults to None.</p></li>
+<li><p><strong>disable_overlap_scheduler</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Disable the overlap scheduler. Defaults to False.</p></li>
+<li><p><strong>moe_config</strong> (<a class="reference internal" href="MoeConfig.html#tensorrt_llm.llmapi.MoeConfig" title="tensorrt_llm.llmapi.llm_args.MoeConfig"><em>tensorrt_llm.llmapi.llm_args.MoeConfig</em></a>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> MoE config. Defaults to None.</p></li>
+<li><p><strong>nvfp4_gemm_config</strong> (<em>tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> NVFP4 GEMM backend config. Defaults to None.</p></li>
+<li><p><strong>dwdp_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.DwdpConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> DWDP (Distributed Weight Data Parallelism) config. Defaults to None.</p></li>
+<li><p><strong>encoder_max_batch_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of top-level encoder inputs processed in one iteration. For encoder-decoder models, each encoder request counts as one input. For multimodal models, each atomic image, video, or other encoder item counts as one input, even if it expands into multiple internal attention sequences. For encoder-decoder models, it also limits encoder CUDA graph batch sizes. Falls back to <cite>max_batch_size</cite> when unset. Defaults to None.</p></li>
+<li><p><strong>encoder_max_num_tokens</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of encoder tokens. For encoder-decoder models, this limits encoder CUDA graph total-token buckets. For multimodal models, it limits encoder attention tokens scheduled in one iteration and is shared across all encoded modalities. It falls back to <cite>max_num_tokens</cite> when unset. Because an atomic multimodal item cannot be split, the effective budget is raised to the model’s largest atomic item when necessary. Defaults to None.</p></li>
+<li><p><strong>attn_backend</strong> (<em>str</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Attention backend to use. Defaults to TRTLLM.</p></li>
+<li><p><strong>enable_mla_skip_correction</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable threshold-based skip-correction for trtllm-gen MLA attention kernels on SM100 and SM103. When enabled, mla_skip_correction_threshold controls the optimization threshold. Defaults to False.</p></li>
+<li><p><strong>mla_skip_correction_threshold</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Threshold for threshold-based skip-correction. This is used only when enable_mla_skip_correction is True. The default is 8. The maximum supported value depends on the selected kernel’s BMM2 dtype: 8 for E4M3, 15 for FP16, and 32 for BF16. Defaults to 8.0.</p></li>
+<li><p><strong>sampler_force_async_worker</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Force usage of the async worker in the sampler for D2H copies, even if confidential compute is not active. Normally, the async worker should only be used when confidential compute is active. This argument is provided to enable it for testing purposes, irrespective of confidential compute state. Defaults to False.</p></li>
+<li><p><strong>enable_speculative_beam_history_d2h</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Opt-in beam-search optimization: skip per-step beam-history D2H copies on likely-non-terminal steps via a host-side predictor and route the remaining copies through a private side stream. Mispredictions fall back to a synchronous .cpu(), preserving correctness but breaking overlap on that step. Incompatible with the async D2H worker (sampler_force_async_worker=True or confidential compute). Defaults to False.</p></li>
+<li><p><strong>enable_early_first_token_response</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Under the overlap scheduler, emit the first-token response ahead of the next sample step to reduce TTFT. No effect when the overlap scheduler is disabled. Defaults to False.</p></li>
+<li><p><strong>enable_low_latency_host_dispatch</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Use low-latency spin-wait mode for CUDA host task dispatch (cudaLaunchHostFunc_v2 with cudaHostTaskSpinWait). Reduces callback latency at the cost of a CPU core spinning while waiting for the GPU event. Requires CUDA 13.2+; on older CUDA versions, falls back to the default blocking mode and logs a one-time warning. Defaults to False.</p></li>
+<li><p><strong>enable_iter_perf_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable iteration performance statistics. Defaults to False.</p></li>
+<li><p><strong>enable_iter_req_stats</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats. Defaults to False.</p></li>
+<li><p><strong>print_iter_log</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Print iteration logs. Defaults to False.</p></li>
+<li><p><strong>batch_wait_timeout_ms</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs. Defaults to 0.</p></li>
+<li><p><strong>batch_wait_timeout_iters</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Maximum number of iterations the scheduler will wait to accumulate new coming requests for improved GPU utilization efficiency. If greater than 0, the scheduler will delay batch processing to gather more requests up to the specified iteration limit. If 0, disables timeout-iters-based batching delays. Defaults to 0.</p></li>
+<li><p><strong>batch_wait_max_tokens_ratio</strong> (<em>float</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays. Defaults to 0.</p></li>
+<li><p><strong>torch_compile_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="TorchCompileConfig.html#tensorrt_llm.llmapi.TorchCompileConfig" title="tensorrt_llm.llmapi.llm_args.TorchCompileConfig"><em>tensorrt_llm.llmapi.llm_args.TorchCompileConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Torch compile config. Defaults to None.</p></li>
+<li><p><strong>prefill_cuda_graph_backend</strong> (<a class="reference internal" href="PrefillCudaGraphBackend.html#tensorrt_llm.llmapi.PrefillCudaGraphBackend" title="tensorrt_llm.llmapi.PrefillCudaGraphBackend"><em>PrefillCudaGraphBackend</em></a>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> CUDA graph implementation used for prefill requests. Defaults to disabled. Defaults to disabled.</p></li>
+<li><p><strong>prefill_capture_num_tokens</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>int</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Token-count buckets captured by the selected prefill CUDA graph implementation. Defaults to None.</p></li>
+<li><p><strong>enable_autotuner</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false. Defaults to True.</p></li>
+<li><p><strong>use_fine_grained_sync</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable fine-grained synchronization for MoE kernels on SM107. The FC1 producer kernel signals per-tile completion flags in device memory and the FC2 consumer kernel waits on them, so the two GEMMs overlap instead of serializing at kernel launch boundaries. Defaults to False.</p></li>
+<li><p><strong>enable_layerwise_nvtx_marker</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> If true, enable layerwise nvtx marker. Defaults to False.</p></li>
+<li><p><strong>enable_min_latency</strong> (<em>bool</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> If true, enable min-latency mode. Currently only used for Llama4. Defaults to False.</p></li>
+<li><p><strong>stream_interval</strong> (<em>int</em>) – <code class="tag stable docutils literal notranslate"><span class="pre">stable</span></code> The iteration interval to create responses under the streaming mode. Set this to a larger value when the batch size is large, which helps reduce the streaming overhead. Defaults to 1.</p></li>
+<li><p><strong>force_dynamic_quantization</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, force dynamic quantization. Defaults to False. Defaults to False.</p></li>
+<li><p><strong>allreduce_strategy</strong> (<em>Optional</em><em>[</em><em>Literal</em><em>[</em><em>'AUTO'</em><em>, </em><em>'NCCL'</em><em>, </em><em>'UB'</em><em>, </em><em>'MINLATENCY'</em><em>, </em><em>'ONESHOT'</em><em>, </em><em>'TWOSHOT'</em><em>, </em><em>'LOWPRECISION'</em><em>, </em><em>'MNNVL'</em><em>, </em><em>'NCCL_SYMMETRIC'</em><em>]</em><em>]</em>) – <code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Allreduce strategy to use. Defaults to AUTO.</p></li>
+<li><p><strong>checkpoint_loader</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The checkpoint loader to use for this LLM instance. You may use a custom checkpoint loader by subclassing <cite>BaseCheckpointLoader</cite> and providing an instance of the subclass here to load weights from a custom checkpoint format.
+If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.
+If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored. Defaults to None.</p></li>
+<li><p><strong>checkpoint_format</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The registered checkpoint loader format to use. <cite>MX</cite> selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing <cite>BaseCheckpointLoader</cite> and registering it with <cite>register_checkpoint_loader</cite>.
+If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.
+If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored. Defaults to None.</p></li>
+<li><p><strong>checkpoint_io_policy</strong> (<em>Literal</em><em>[</em><em>'auto'</em><em>, </em><em>'native'</em><em>, </em><em>'rank_striped_read_ahead'</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Controls checkpoint storage I/O independently of checkpoint format. ‘auto’ selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. ‘native’ preserves the existing loader. ‘rank_striped_read_ahead’ lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation. Defaults to auto.</p></li>
+<li><p><strong>mx_config</strong> (<em>tensorrt_llm.llmapi.llm_args.ModelExpressConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> ModelExpress (MX) P2P checkpoint loading config. Defaults to None.</p></li>
+<li><p><strong>gms_config</strong> (<em>tensorrt_llm.llmapi.llm_args.GmsConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> GPU Memory Service (GMS) weight sharing config. Defaults to None.</p></li>
+<li><p><strong>kv_connector_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.KvCacheConnectorConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The config for KV cache connector. Defaults to None.</p></li>
+<li><p><strong>mm_encoder_only</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Only load/execute the vision encoder part of the full model. Defaults to False. Defaults to False.</p></li>
+<li><p><strong>disable_mm_encoder</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Skip instantiating and loading the multimodal (e.g. vision) encoder of a multimodal checkpoint and serve it text-only. Saves the encoder’s GPU memory (enlarging the KV cache pool) for workloads that never send image/video/audio inputs; such requests are rejected. Only takes effect for model implementations that support it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. Defaults to False. Defaults to False.</p></li>
+<li><p><strong>encode_only</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Set to True to use the batch-forward encode() path, which runs a single forward pass and returns the model output directly, bypassing the scheduler and autoregressive loop. Works for encoder-only models (BERT, RoBERTa, reward models) and decoder models used in single-prefill mode (e.g., extracting embeddings). When False (default), uses the standard generate() path. Defaults to False.</p></li>
+<li><p><strong>ray_worker_extension_cls</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The full worker extension class name including module path. Allows users to extend the functions of the RayGPUWorker class. Defaults to None.</p></li>
+<li><p><strong>ray_placement_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.RayPlacementConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Placement config for RayGPUWorker. Only used with AsyncLLM and orchestrator_type=’ray’. Defaults to None.</p></li>
+<li><p><strong>ray_worker_nsight_options</strong> (<em>Optional</em><em>[</em><em>dict</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Nsight options. Defaults to None.</p></li>
+<li><p><strong>sleep_config</strong> (<em>Optional</em><em>[</em><em>tensorrt_llm.llmapi.llm_args.SleepConfig</em><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Configuration for the LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. Only enable it if you intend to use this feature. Defaults to None.</p></li>
+<li><p><strong>reorder_policy_config</strong> (<em>Optional</em><em>[</em><a class="reference internal" href="ReorderRequestPolicyConfig.html#tensorrt_llm.llmapi.ReorderRequestPolicyConfig" title="tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig"><em>tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig</em></a><em>]</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The request reordering policy to use. Defaults to None.</p></li>
+<li><p><strong>enable_resource_governor</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Enable the resource governor for runtime cache management operations such as KV cache truncation. This adds a per-iteration broadcast collective. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_blockscaling_mm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling mm implementation. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_blockscaling_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL fp8 blockscaling bmm implementation. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_bf16_bmm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell. Defaults to False.</p></li>
+<li><p><strong>use_cute_dsl_bf16_gemm</strong> (<em>bool</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell. Defaults to False.</p></li>
+<li><p><strong>max_stats_len</strong> (<em>int</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> The max number of performance statistic entries. Set to -1 to keep all entries. Set to 0 to use a minimum buffer size of 1. Defaults to 1000.</p></li>
+<li><p><strong>layer_wise_benchmarks_config</strong> (<em>tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig</em>) – <code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code>  Defaults to None.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.tokenizer">
+<span class="sig-name descname"><span class="pre">tokenizer</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.tokenizer" title="Link to this definition">#</a></dt>
+<dd><p>The tokenizer loaded by LLM instance, if any.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.llm_id">
+<span class="sig-name descname"><span class="pre">llm_id</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.llm_id" title="Link to this definition">#</a></dt>
+<dd><p>The unique ID of the LLM instance.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>str</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.disaggregated_params">
+<span class="sig-name descname"><span class="pre">disaggregated_params</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.disaggregated_params" title="Link to this definition">#</a></dt>
+<dd><p>The disaggregated parameters of the LLM instance.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.startup_metrics">
+<span class="sig-name descname"><span class="pre">startup_metrics</span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.startup_metrics" title="Link to this definition">#</a></dt>
+<dd><p>The startup metrics reported by worker rank 0.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Path</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">PreTrainedTokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_mode</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'slow'</span></span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">skip_tokenizer_init</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trust_remote_code</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tensor_parallel_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'auto'</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">tokenizer_revision</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm.html#LLM.__init__"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.__init__" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.encode">
+<span class="sig-name descname"><span class="pre">encode</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span><span class="p"><span class="pre">]</span></span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">add_special_tokens</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">batch_indexed_model_output</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">copy_logits_to_host</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">return_raw_logits</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">model_kwargs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">EncoderOutput</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">EncoderOutput</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Tensor</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.encode" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Encode inputs using an encoder-only model (PyTorch backend only).</p>
+<p>Only available when encode_only=True is set in the LLM constructor.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>tensorrt_llm.inputs.data.PromptInputs</em><em>, </em><em>Sequence</em><em>[</em><em>tensorrt_llm.inputs.data.PromptInputs</em><em>]</em>) – The prompt text or token ids.
+It can be a single prompt or batched prompts.</p></li>
+<li><p><strong>add_special_tokens</strong> (<em>bool</em>) – Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.</p></li>
+<li><p><strong>batch_indexed_model_output</strong> (<em>bool</em>) – If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.</p></li>
+<li><p><strong>copy_logits_to_host</strong> (<em>bool</em>) – If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.</p></li>
+<li><p><strong>return_raw_logits</strong> (<em>bool</em>) – Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.</p></li>
+<li><p><strong>model_kwargs</strong> (<em>Any</em>) – Model-specific inputs passed through to the model’s forward(). Examples: token_type_ids (BERT),
+inputs_embeds (reward models).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>If return_raw_logits=True, returns the raw CPU logits tensor for the
+whole input batch. Otherwise, returns one EncoderOutput for a single
+input, or a list of EncoderOutput objects for batched inputs.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><strong>RuntimeError</strong> – If encode_only mode is not enabled.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.generate">
+<span class="sig-name descname"><span class="pre">generate</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span><span class="p"><span class="pre">]</span></span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sampling_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><span class="pre">SamplingParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><span class="pre">SamplingParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">use_tqdm</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">True</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lora_request</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><span class="pre">LoRARequest</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><span class="pre">LoRARequest</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">prompt_adapter_request</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">PromptAdapterRequest</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">PromptAdapterRequest</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_retention_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><span class="pre">KvCacheRetentionConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><span class="pre">KvCacheRetentionConfig</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scheduling_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><span class="pre">SchedulingParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><span class="pre">SchedulingParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">conversation_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cache_salt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">priority</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.5</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate" title="Link to this definition">#</a></dt>
+<dd><p>Generate output for the given prompts in the synchronous mode.
+Synchronous generation accepts either single prompt or batched prompts.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>tensorrt_llm.inputs.data.PromptInputs</em><em>, </em><em>Sequence</em><em>[</em><em>tensorrt_llm.inputs.data.PromptInputs</em><em>]</em>) – The prompt text or token ids.
+It can be single prompt or batched prompts.</p></li>
+<li><p><strong>sampling_params</strong> (<a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><em>tensorrt_llm.sampling_params.SamplingParams</em></a><em>, </em><em>List</em><em>[</em><a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><em>tensorrt_llm.sampling_params.SamplingParams</em></a><em>]</em><em>, </em><em>optional</em>) – The sampling params for the generation. Defaults to None.
+A default one will be used if not provided.</p></li>
+<li><p><strong>use_tqdm</strong> (<em>bool</em>) – Whether to use tqdm to display the progress bar. Defaults to True.</p></li>
+<li><p><strong>lora_request</strong> (<a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>]</em><em>, </em><em>optional</em>) – LoRA request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>Sequence</em><em>[</em><em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>]</em><em>, </em><em>optional</em>) – Prompt Adapter request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>kv_cache_retention_config</strong> (<a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>]</em><em>, </em><em>optional</em>) – Configuration for the request’s retention in the KV Cache. Defaults to None.</p></li>
+<li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>Sequence</em><em>[</em><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>]</em><em>, </em><em>optional</em>) – Disaggregated parameters. Defaults to None.</p></li>
+<li><p><strong>scheduling_params</strong> (<a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><em>tensorrt_llm.scheduling_params.SchedulingParams</em></a><em>, </em><em>List</em><em>[</em><a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><em>tensorrt_llm.scheduling_params.SchedulingParams</em></a><em>]</em><em>, </em><em>optional</em>) – Scheduling parameters. Defaults to None.</p></li>
+<li><p><strong>conversation_params</strong> (<a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>, </em><em>List</em><em>[</em><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>]</em><em>, </em><em>optional</em>) – Conversation parameters. Defaults to None.</p></li>
+<li><p><strong>cache_salt</strong> (<em>str</em><em>, </em><em>Sequence</em><em>[</em><em>str</em><em>]</em><em>, </em><em>optional</em>) – If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</p></li>
+<li><p><strong>priority</strong> (<em>float</em><em>, </em><em>List</em><em>[</em><em>float</em><em>]</em>) – The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The output data of the completion request to the LLM.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Union[<a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput">tensorrt_llm.llmapi.llm.RequestOutput</a>, List[<a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput">tensorrt_llm.llmapi.llm.RequestOutput</a>]]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.generate_async">
+<span class="sig-name descname"><span class="pre">generate_async</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">PreprocessedInputs</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sampling_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><span class="pre">SamplingParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">lora_request</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><span class="pre">LoRARequest</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">prompt_adapter_request</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">PromptAdapterRequest</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">streaming</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">kv_cache_retention_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><span class="pre">KvCacheRetentionConfig</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">trace_headers</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Mapping</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_postproc_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">PostprocParams</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">scheduling_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><span class="pre">SchedulingParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">conversation_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><span class="pre">ConversationParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">cache_salt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">priority</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">0.5</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput"><span class="pre">RequestOutput</span></a></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.generate_async" title="Link to this definition">#</a></dt>
+<dd><p>Generate output for the given prompt in the asynchronous mode.
+Asynchronous generation accepts single prompt only.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>Union</em><em>[</em><em>tensorrt_llm.inputs.data.PromptInputs</em><em>, </em><em>tensorrt_llm.llmapi.llm.PreprocessedInputs</em><em>]</em>) – The prompt text or token ids, or a <cite>PreprocessedInputs</cite> returned by <cite>preprocess</cite>. If the latter, preprocessing will be skipped by this method.</p></li>
+<li><p><strong>sampling_params</strong> (<a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><em>tensorrt_llm.sampling_params.SamplingParams</em></a><em>, </em><em>optional</em>) – The sampling params for the generation. Defaults to None.
+A default one will be used if not provided.</p></li>
+<li><p><strong>lora_request</strong> (<a class="reference internal" href="LoRARequest.html#tensorrt_llm.llmapi.LoRARequest" title="tensorrt_llm.executor.request.LoRARequest"><em>tensorrt_llm.executor.request.LoRARequest</em></a><em>, </em><em>optional</em>) – LoRA request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>prompt_adapter_request</strong> (<em>tensorrt_llm.executor.request.PromptAdapterRequest</em><em>, </em><em>optional</em>) – Prompt Adapter request to use for generation, if any. Defaults to None.</p></li>
+<li><p><strong>streaming</strong> (<em>bool</em>) – Whether to use the streaming mode for the generation. Defaults to False.</p></li>
+<li><p><strong>kv_cache_retention_config</strong> (<a class="reference internal" href="KvCacheRetentionConfig.html#tensorrt_llm.llmapi.KvCacheRetentionConfig" title="tensorrt_llm.bindings.executor.KvCacheRetentionConfig"><em>tensorrt_llm.bindings.executor.KvCacheRetentionConfig</em></a><em>, </em><em>optional</em>) – Configuration for the request’s retention in the KV Cache. Defaults to None.</p></li>
+<li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>optional</em>) – Disaggregated parameters. Defaults to None.</p></li>
+<li><p><strong>trace_headers</strong> (<em>Mapping</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>, </em><em>optional</em>) – Trace headers. Defaults to None.</p></li>
+<li><p><strong>scheduling_params</strong> (<a class="reference internal" href="SchedulingParams.html#tensorrt_llm.llmapi.SchedulingParams" title="tensorrt_llm.scheduling_params.SchedulingParams"><em>tensorrt_llm.scheduling_params.SchedulingParams</em></a><em>, </em><em>optional</em>) – Scheduling parameters. Defaults to None.</p></li>
+<li><p><strong>conversation_params</strong> (<a class="reference internal" href="ConversationParams.html#tensorrt_llm.llmapi.ConversationParams" title="tensorrt_llm.conversation_params.ConversationParams"><em>tensorrt_llm.conversation_params.ConversationParams</em></a><em>, </em><em>optional</em>) – Conversation parameters. Defaults to None.</p></li>
+<li><p><strong>cache_salt</strong> (<em>str</em><em>, </em><em>optional</em>) – If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</p></li>
+<li><p><strong>priority</strong> (<em>float</em>) – The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The output data of the completion request to the LLM.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="RequestOutput.html#tensorrt_llm.llmapi.RequestOutput" title="tensorrt_llm.llmapi.llm.RequestOutput">tensorrt_llm.llmapi.llm.RequestOutput</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_data_transceiver_state">
+<span class="sig-name descname"><span class="pre">get_data_transceiver_state</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">bytes</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_data_transceiver_state" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Get the serialized DataTransceiverState for arbitrary KV cache transfer.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Serialized DataTransceiverState, or empty bytes if no transceiver is configured.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>bytes</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_kv_cache_capacity">
+<span class="sig-name descname"><span class="pre">get_kv_cache_capacity</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">dict</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_capacity" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get the runtime’s static primary/GPU KV cache capacity.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Raises<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>RuntimeError</strong> – If called when <code class="docutils literal notranslate"><span class="pre">encode_only=True</span></code>.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><dl class="simple">
+<dt>KV cache capacity. The returned capacity covers the primary</dt><dd><p>GPU KV cache pool only; CPU/host offload capacity is not
+included.
+e.g., {“maxNumBlocks”: …, “tokensPerBlock”: …, “maxNumTokens”: …}</p>
+</dd>
+</dl>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_kv_cache_events">
+<span class="sig-name descname"><span class="pre">get_kv_cache_events</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get iteration KV events from the runtime.</p>
+<dl class="simple">
+<dt>KV events are used to track changes and operations within the KV Cache. Types of events:</dt><dd><ul class="simple">
+<li><p>KVCacheCreatedData: Indicates the creation of cache blocks.</p></li>
+<li><p>KVCacheStoredData: Represents a sequence of stored blocks.</p></li>
+<li><p>KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.</p></li>
+<li><p>KVCacheUpdatedData: Captures updates to existing cache blocks.</p></li>
+</ul>
+</dd>
+<dt>To enable KV events:</dt><dd><ul class="simple">
+<li><p>set <cite>event_buffer_max_size</cite> to a positive integer in the <cite>KvCacheConfig</cite>.</p></li>
+<li><p>set <cite>enable_block_reuse</cite> to True in the <cite>KvCacheConfig</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<em>float</em><em>, </em><em>optional</em>) – Max wait time in seconds when retrieving events from queue. Defaults to 2.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A list of runtime events as dict.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>List[dict]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_kv_cache_events_async">
+<span class="sig-name descname"><span class="pre">get_kv_cache_events_async</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get iteration KV events from the runtime.</p>
+<dl class="simple">
+<dt>KV events are used to track changes and operations within the KV Cache. Types of events:</dt><dd><ul class="simple">
+<li><p>KVCacheCreatedData: Indicates the creation of cache blocks.</p></li>
+<li><p>KVCacheStoredData: Represents a sequence of stored blocks.</p></li>
+<li><p>KVCacheRemovedData: Contains the hashes of blocks that are being removed from the cache.</p></li>
+<li><p>KVCacheUpdatedData: Captures updates to existing cache blocks.</p></li>
+</ul>
+</dd>
+<dt>To enable KV events:</dt><dd><ul class="simple">
+<li><p>set <cite>event_buffer_max_size</cite> to a positive integer in the <cite>KvCacheConfig</cite>.</p></li>
+<li><p>set <cite>enable_block_reuse</cite> to True in the <cite>KvCacheConfig</cite>.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<em>float</em><em>, </em><em>optional</em>) – Max wait time in seconds when retrieving events from queue. Defaults to 2.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>An async iterable object containing runtime events.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>tensorrt_llm.executor.result.IterationResult</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_stats">
+<span class="sig-name descname"><span class="pre">get_stats</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">dict</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get iteration statistics from the runtime.
+To collect statistics, call this function after prompts have been submitted with LLM().generate().</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<em>float</em><em>, </em><em>optional</em>) – Max wait time in seconds when retrieving stats from queue. Defaults to 2.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><dl class="simple">
+<dt>A list of runtime stats as dicts.</dt><dd><p>e.g., [{“cpuMemUsage”: …, “iter”: 0, …}, {“cpuMemUsage”: …, “iter”: 1, …}]</p>
+</dd>
+</dl>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>List[dict]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.get_stats_async">
+<span class="sig-name descname"><span class="pre">get_stats_async</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">2</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">IterationResult</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.get_stats_async" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Get iteration statistics from the runtime.
+To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you’re using trtllm-serve)
+after prompts have been submitted.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<em>float</em><em>, </em><em>optional</em>) – Max wait time in seconds when retrieving stats from queue. Defaults to 2.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>An async iterable object containing runtime stats.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>tensorrt_llm.executor.result.IterationResult</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.preprocess">
+<span class="sig-name descname"><span class="pre">preprocess</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">inputs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TextPrompt</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">TokensPrompt</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">sampling_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><span class="pre">SamplingParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">disaggregated_params</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><span class="pre">DisaggregatedParams</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">PreprocessedInputs</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.preprocess" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag prototype docutils literal notranslate"><span class="pre">prototype</span></code> Preprocess raw prompts into token IDs and multimodal params.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>inputs</strong> (<em>tensorrt_llm.inputs.data.PromptInputs</em>) – The prompt text or token ids; it must be single prompt.</p></li>
+<li><p><strong>sampling_params</strong> (<a class="reference internal" href="SamplingParams.html#tensorrt_llm.llmapi.SamplingParams" title="tensorrt_llm.sampling_params.SamplingParams"><em>tensorrt_llm.sampling_params.SamplingParams</em></a><em>, </em><em>optional</em>) – The sampling params for the generation. Defaults to None.
+A default one will be used if not provided.</p></li>
+<li><p><strong>disaggregated_params</strong> (<a class="reference internal" href="DisaggregatedParams.html#tensorrt_llm.llmapi.DisaggregatedParams" title="tensorrt_llm.disaggregated_params.DisaggregatedParams"><em>tensorrt_llm.disaggregated_params.DisaggregatedParams</em></a><em>, </em><em>optional</em>) – Disaggregated parameters. Defaults to None.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><dl class="simple">
+<dt>A preprocessed-inputs object that can be</dt><dd><p>passed directly to <a class="reference internal" href="#tensorrt_llm.llmapi.LLM.generate_async" title="tensorrt_llm.llmapi.LLM.generate_async"><code class="xref py py-meth docutils literal notranslate"><span class="pre">generate_async()</span></code></a> as <cite>inputs</cite>.</p>
+</dd>
+</dl>
+</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>tensorrt_llm.llmapi.llm.PreprocessedInputs</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.LLM.shutdown">
+<span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.LLM.shutdown" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> None</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="id0">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">disaggregated_params</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">dict</span></em><a class="headerlink" href="#id0" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> None</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="id3">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">llm_id</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">str</span></em><a class="headerlink" href="#id3" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> None</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="id4">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">startup_metrics</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">dict</span></em><a class="headerlink" href="#id4" title="Link to this definition">#</a></dt>
+<dd><p><code class="tag beta docutils literal notranslate"><span class="pre">beta</span></code> Cache and return rank-0 startup metrics.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>The cached metrics, or an empty dict when metrics retrieval fails.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>dict</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="id5">
+<em class="property"><span class="pre">property</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">tokenizer</span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">TokenizerBase</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></em><a class="headerlink" href="#id5" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../reference.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">API Reference</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="AsyncLLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">AsyncLLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM"><code class="docutils literal notranslate"><span class="pre">LLM</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.tokenizer"><code class="docutils literal notranslate"><span class="pre">tokenizer</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.llm_id"><code class="docutils literal notranslate"><span class="pre">llm_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.disaggregated_params"><code class="docutils literal notranslate"><span class="pre">disaggregated_params</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.startup_metrics"><code class="docutils literal notranslate"><span class="pre">startup_metrics</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.encode"><code class="docutils literal notranslate"><span class="pre">encode()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.generate"><code class="docutils literal notranslate"><span class="pre">generate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.generate_async"><code class="docutils literal notranslate"><span class="pre">generate_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_data_transceiver_state"><code class="docutils literal notranslate"><span class="pre">get_data_transceiver_state()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_capacity"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_capacity()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_events()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_kv_cache_events_async"><code class="docutils literal notranslate"><span class="pre">get_kv_cache_events_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats"><code class="docutils literal notranslate"><span class="pre">get_stats()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.get_stats_async"><code class="docutils literal notranslate"><span class="pre">get_stats_async()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.preprocess"><code class="docutils literal notranslate"><span class="pre">preprocess()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.LLM.shutdown"><code class="docutils literal notranslate"><span class="pre">shutdown()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id0"><code class="docutils literal notranslate"><span class="pre">disaggregated_params</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id3"><code class="docutils literal notranslate"><span class="pre">llm_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id4"><code class="docutils literal notranslate"><span class="pre">startup_metrics</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id5"><code class="docutils literal notranslate"><span class="pre">tokenizer</span></code></a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 04, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -439,7 +439,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -499,6 +564,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -593,20 +659,20 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="visualgen-sparse-attention">
+  <section class="tex2jax_ignore mathjax_ignore" id="visualgen-sparse-attention">
 <h1>VisualGen Sparse Attention<a class="headerlink" href="#visualgen-sparse-attention" title="Link to this heading">#</a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>This page is an unindexed draft until the VisualGen documentation hub is introduced.</p>
 </div>
 <ul class="simple">
-<li><p><a class="reference internal" href="#overview"><span class="std std-ref">Overview</span></a></p>
+<li><p><a class="reference internal" href="#overview">Overview</a></p>
 <ul>
-<li><p><a class="reference internal" href="#algorithms"><span class="std std-ref">Algorithms</span></a></p></li>
+<li><p><a class="reference internal" href="#algorithms">Algorithms</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#skip-softmax-attention"><span class="xref myst">Skip Softmax Attention</span></a></p></li>
-<li><p><a class="reference internal" href="#video-sparse-attention-vsa"><span class="xref myst">Video Sparse Attention (VSA)</span></a></p></li>
+<li><p><a class="reference internal" href="#skip-softmax-attention">Skip Softmax Attention</a></p></li>
+<li><p><a class="reference internal" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></p></li>
 </ul>
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
@@ -691,10 +757,63 @@
 <ul class="simple">
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> directly to pass a concrete threshold to the kernel. This does not require checkpoint calibration metadata.</p></li>
 <li><p>Set <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> to request a sparsity target. The runtime resolves it to <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> using the checkpoint calibration formula. If the checkpoint does not provide the required Skip Softmax Attention metadata, the runtime raises an error.</p></li>
-<li><p>Set <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to disable Skip Softmax Attention at the beginning of denoising. This cutoff is normalized and therefore independent of the user-selected number of denoising steps.</p></li>
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to disable Skip Softmax Attention at the beginning of denoising. The cutoff is expressed in normalized scheduler time; the number of dense steps it produces depends on the scheduler and the number of inference steps.</p></li>
 </ul>
 <p><code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> and <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> are alternatives: if both are present, <code class="docutils literal notranslate"><span class="pre">threshold_scale_factor</span></code> takes precedence and the calibration formula is not used. User-provided <code class="docutils literal notranslate"><span class="pre">target_sparsity</span></code> and <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> override checkpoint defaults. Checkpoint <code class="docutils literal notranslate"><span class="pre">ignore</span></code> patterns always disable Skip Softmax Attention for matching layers.</p>
-<p>Skip Softmax Attention only works with the <strong>TRTLLM</strong> attention backend in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to <code class="docutils literal notranslate"><span class="pre">TRTLLM</span></code> when enabling it.</p>
+<p>Skip Softmax Attention works with both the <strong>TRTLLM</strong> and <strong>CUTEDSL</strong> attention backends in VisualGen. Set <code class="docutils literal notranslate"><span class="pre">attention_config.backend</span></code> to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with <code class="docutils literal notranslate"><span class="pre">quant_attention_config</span></code>’s block-scaled Q/K recipes (MXFP8, NVFP4); VSA is the only CUTEDSL sparse-attention algorithm that is mutually exclusive with quantized attention.</p>
+<section id="mapping-disabled-until-timestep-to-actual-denoising-steps">
+<h4>Mapping <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to Actual Denoising Steps<a class="headerlink" href="#mapping-disabled-until-timestep-to-actual-denoising-steps" title="Link to this heading">#</a></h4>
+<p>VisualGen passes each transformer a normalized scheduler timestep <code class="docutils literal notranslate"><span class="pre">t</span></code> in <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1]</span></code>. Denoising proceeds from high to low <code class="docutils literal notranslate"><span class="pre">t</span></code>. Skip Softmax Attention is disabled while <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> and enabled once <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">&lt;</span> <span class="pre">disabled_until_timestep</span></code>. Equality therefore belongs to the dense phase.</p>
+<p>For a scheduler sequence <code class="docutils literal notranslate"><span class="pre">t[0],</span> <span class="pre">...,</span> <span class="pre">t[N-1]</span></code>, the number of initial dense-attention steps is the number of entries whose normalized timestep is greater than or equal to <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code>:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>dense_steps = count(t[i] &gt;= disabled_until_timestep)
+skip_softmax_steps = N - dense_steps
+</pre></div>
+</div>
+<p>The mapping must be computed from the actual scheduler sequence and can differ across models, schedulers, scheduler settings, and numbers of inference steps. <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> is not simply a fraction of <code class="docutils literal notranslate"><span class="pre">N</span></code> when the schedule is nonlinear. The following 40-step Wan 2.2 UniPC schedule is one example. Here, <code class="docutils literal notranslate"><span class="pre">s[i]</span></code> is the unshifted normalized flow sigma at denoising step <code class="docutils literal notranslate"><span class="pre">i</span></code>: it represents the base noise level before <code class="docutils literal notranslate"><span class="pre">flow_shift</span></code> is applied. The checkpoint uses 1,000 training timesteps and <code class="docutils literal notranslate"><span class="pre">flow_shift=3.0</span></code>:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>s[i] = 1 - i * (1 - 1/1000) / 40,              i = 0, ..., 39
+shifted_sigma[i] = 3 * s[i] / (1 + 2 * s[i])
+</pre></div>
+</div>
+<p>The flow shift concentrates timesteps near the high-noise end of the schedule. UniPC converts these shifted sigmas into the normalized runtime timestep sequence <code class="docutils literal notranslate"><span class="pre">t[i]</span></code>. Each row below is obtained from that actual sequence by evaluating <code class="docutils literal notranslate"><span class="pre">t[i]</span> <span class="pre">&gt;=</span> <span class="pre">disabled_until_timestep</span></code> for all 40 steps and counting how many comparisons are true:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-center"><p><code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code></p></th>
+<th class="head text-right"><p>Initial dense steps</p></th>
+<th class="head text-right"><p>Skip Softmax steps</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">1.00</span></code></p></td>
+<td class="text-right"><p>0</p></td>
+<td class="text-right"><p>40</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.97</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>36</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.94</span></code></p></td>
+<td class="text-right"><p>7</p></td>
+<td class="text-right"><p>33</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.93</span></code></p></td>
+<td class="text-right"><p>8</p></td>
+<td class="text-right"><p>32</p></td>
+</tr>
+<tr class="row-even"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.90</span></code></p></td>
+<td class="text-right"><p>10</p></td>
+<td class="text-right"><p>30</p></td>
+</tr>
+<tr class="row-odd"><td class="text-center"><p><code class="docutils literal notranslate"><span class="pre">0.86</span></code></p></td>
+<td class="text-right"><p>14</p></td>
+<td class="text-right"><p>26</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For example, the actual sequence has <code class="docutils literal notranslate"><span class="pre">t[13]</span></code> at approximately <code class="docutils literal notranslate"><span class="pre">0.861</span></code> and <code class="docutils literal notranslate"><span class="pre">t[14]</span></code> at approximately <code class="docutils literal notranslate"><span class="pre">0.848</span></code>. Therefore, <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep=0.86</span></code> is true for <code class="docutils literal notranslate"><span class="pre">i=0,</span> <span class="pre">...,</span> <span class="pre">13</span></code>, giving 14 initial dense steps and 26 Skip Softmax steps.</p>
+<p>VisualGen defines this cutoff using the <strong>scheduler-derived normalized timestep</strong> <code class="docutils literal notranslate"><span class="pre">t[i]</span></code>, rather than the <strong>denoising-step index</strong> <code class="docutils literal notranslate"><span class="pre">i</span></code>, so the same configuration interface works across models, schedulers, and different numbers of inference steps while preserving each scheduler’s denoising trajectory.</p>
+<p>This control is specific to iterative visual generation: the same attention layers run repeatedly while the denoising state changes, so early high-noise steps can remain dense before sparsity is enabled later.</p>
+</section>
 <section id="python-api">
 <h4>Python API<a class="headerlink" href="#python-api" title="Link to this heading">#</a></h4>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
@@ -731,6 +850,18 @@
 <span class="p">)</span>
 </pre></div>
 </div>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># CUTEDSL backend:</span>
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">"&lt;path_or_hf_id&gt;"</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">"CUTEDSL"</span><span class="p">,</span>
+        <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">SkipSoftmaxAttentionConfig</span><span class="p">(</span>
+            <span class="n">threshold_scale_factor</span><span class="o">=</span><span class="mf">5000.0</span><span class="p">,</span>
+        <span class="p">),</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
 </section>
 <section id="yaml">
 <h4>YAML<a class="headerlink" href="#yaml" title="Link to this heading">#</a></h4>
@@ -749,6 +880,14 @@
 <span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
 <span class="w">    </span><span class="nt">target_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.5</span>
 <span class="w">    </span><span class="nt">disabled_until_timestep</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.6</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># CUTEDSL backend:</span>
+<span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">skip_softmax</span>
+<span class="w">    </span><span class="nt">threshold_scale_factor</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5000.0</span>
 </pre></div>
 </div>
 </section>
@@ -803,6 +942,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#skip-softmax-attention">Skip Softmax Attention</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#checkpoint-config">Checkpoint Config</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#user-configuration">User Configuration</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#mapping-disabled-until-timestep-to-actual-denoising-steps">Mapping <code class="docutils literal notranslate"><span class="pre">disabled_until_timestep</span></code> to Actual Denoising Steps</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#python-api">Python API</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#yaml">YAML</a></li>
 </ul>
@@ -902,9 +1042,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

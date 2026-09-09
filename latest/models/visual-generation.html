@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -441,7 +441,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +566,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,7 +661,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="visual-generation-beta">
+  <section class="tex2jax_ignore mathjax_ignore" id="visual-generation-beta">
 <h1>Visual Generation (Beta)<a class="headerlink" href="#visual-generation-beta" title="Link to this heading">#</a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -614,6 +680,7 @@ actively evolving and may change in future releases.</p>
 <li><p>Sparse attention support: see <a class="reference internal" href="../visual-gen/features/sparse-attention.html"><span class="std std-doc">VisualGen Sparse Attention</span></a>.</p></li>
 <li><p>Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).</p></li>
 <li><p><strong>Step caching</strong> — two runtime caching backends (<strong>TeaCache</strong> and <strong>Cache-DiT</strong>) that skip transformer computation on steps where the step-to-step change is small.</p></li>
+<li><p>CPU offloading to reduce peak GPU memory usage.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> integration with OpenAI-compatible API endpoints for image and video generation.</p></li>
 </ul>
 </section>
@@ -711,6 +778,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>NVFP4</p></th>
 <th class="head"><p>TeaCache</p></th>
 <th class="head"><p>Cache-DiT</p></th>
+<th class="head"><p>CPU Offloading</p></th>
 <th class="head"><p>CFG Parallelism</p></th>
 <th class="head"><p>Ulysses Parallelism</p></th>
 <th class="head"><p>Parallel VAE</p></th>
@@ -729,6 +797,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No <a class="footnote-reference brackets" href="#id8" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -745,6 +814,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No <a class="footnote-reference brackets" href="#id8" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -770,9 +840,11 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>Wan 2.1 VSA</strong> <a class="footnote-reference brackets" href="#id9" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -802,11 +874,13 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>FastWan 2.2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No <a class="footnote-reference brackets" href="#id13" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>7<span class="fn-bracket">]</span></a></p></td>
@@ -825,6 +899,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes <a class="footnote-reference brackets" href="#id11" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -841,6 +916,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -860,6 +936,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -871,6 +948,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-odd"><td><p><strong>Qwen-Image-Edit-2511</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -895,6 +973,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -903,6 +982,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-odd"><td><p><strong>HunyuanVideo 1.5</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -919,6 +999,7 @@ actively evolving and may change in future releases.</p>
 <tr class="row-even"><td><p><strong>GlmImage</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -1000,7 +1081,63 @@ actively evolving and may change in future releases.</p>
 </table>
 </div>
 <p>The asynchronous <code class="docutils literal notranslate"><span class="pre">/v1/videos</span></code> job advances through <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/videos/{id}</span></code>: <code class="docutils literal notranslate"><span class="pre">queued</span></code> → <code class="docutils literal notranslate"><span class="pre">generating</span></code> (model inference) → <code class="docutils literal notranslate"><span class="pre">postprocessing</span></code> (encode the media and/or write the output file) → <code class="docutils literal notranslate"><span class="pre">completed</span></code>. The <code class="docutils literal notranslate"><span class="pre">generating</span></code> → <code class="docutils literal notranslate"><span class="pre">postprocessing</span></code> transition marks the end of inference; the video is downloadable via <code class="docutils literal notranslate"><span class="pre">/content</span></code> once <code class="docutils literal notranslate"><span class="pre">completed</span></code>.</p>
-<p><code class="docutils literal notranslate"><span class="pre">response_format=&quot;path&quot;</span></code> returns the generated file’s server-side path (under <code class="docutils literal notranslate"><span class="pre">TRTLLM_MEDIA_STORAGE_PATH</span></code>) for co-located clients, enabled by default. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1</span></code> to reject such requests with HTTP 400. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve">serve examples</a> for the full <code class="docutils literal notranslate"><span class="pre">response_format</span></code> reference.</p>
+<p><code class="docutils literal notranslate"><span class="pre">response_format=&quot;path&quot;</span></code> returns the generated file’s server-side path (under <code class="docutils literal notranslate"><span class="pre">TRTLLM_MEDIA_STORAGE_PATH</span></code>) for co-located clients, enabled by default. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1</span></code> to reject such requests with HTTP 400; the same switch also rejects a reference sent with <code class="docutils literal notranslate"><span class="pre">format=&quot;path&quot;</span></code>, since both ask the server to trust a local filesystem path. See the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve">serve examples</a> for the full <code class="docutils literal notranslate"><span class="pre">response_format</span></code> reference.</p>
+</section>
+<section id="reference-inputs">
+<h3>Reference Inputs<a class="headerlink" href="#reference-inputs" title="Link to this heading">#</a></h3>
+<p>Conditioning references are supplied through the typed fields <code class="docutils literal notranslate"><span class="pre">image_reference</span></code>, <code class="docutils literal notranslate"><span class="pre">video_reference</span></code>, and <code class="docutils literal notranslate"><span class="pre">audio_reference</span></code>. Each field takes a single reference or a list. A reference is <code class="docutils literal notranslate"><span class="pre">MediaRef(content=...,</span> <span class="pre">format=...)</span></code>, and <code class="docutils literal notranslate"><span class="pre">format</span></code> is required.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">format</span></code></p></th>
+<th class="head"><p>Content</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">path</span></code></p></td>
+<td><p>A local file readable by the coordinator process</p></td>
+<td><p>Bare path or <code class="docutils literal notranslate"><span class="pre">file://</span></code> URI.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">url</span></code></p></td>
+<td><p>An <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> URL</p></td>
+<td><p>Fetched on the coordinator through the SSRF-guarded loader.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">base64</span></code></p></td>
+<td><p>Base64 text</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">data:</span></code> URI is also accepted.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bytes</span></code></p></td>
+<td><p>Raw <code class="docutils literal notranslate"><span class="pre">bytes</span></code></p></td>
+<td><p>Python API only.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Every pipeline declares the reference slots and roles it accepts through <code class="docutils literal notranslate"><span class="pre">ref_slot_specs</span></code>, and a request is validated against that declaration before generation begins. References are resolved to raw bytes on the coordinator, so a worker never needs a filesystem shared with the client.</p>
+<p>Most models take a single reference whose role is unambiguous:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGen</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="n">MediaRef</span>
+
+<span class="n">vg</span> <span class="o">=</span> <span class="n">VisualGen</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"Wan-AI/Wan2.2-TI2V-5B-Diffusers"</span><span class="p">)</span>
+<span class="n">params</span> <span class="o">=</span> <span class="n">vg</span><span class="o">.</span><span class="n">default_params</span>
+<span class="n">params</span><span class="o">.</span><span class="n">image_reference</span> <span class="o">=</span> <span class="n">MediaRef</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="s2">"start.png"</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"path"</span><span class="p">)</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">vg</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">inputs</span><span class="o">=</span><span class="s2">"the scene comes alive with gentle motion"</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Models that accept the same modality in more than one role need <code class="docutils literal notranslate"><span class="pre">role</span></code>. Wan 2.1 I2V takes a first frame and an optional last frame:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGen</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen</span><span class="w"> </span><span class="kn">import</span> <span class="n">MediaRef</span>
+
+<span class="n">vg</span> <span class="o">=</span> <span class="n">VisualGen</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">"Wan-AI/Wan2.1-I2V-14B-480P-Diffusers"</span><span class="p">)</span>
+<span class="n">params</span> <span class="o">=</span> <span class="n">vg</span><span class="o">.</span><span class="n">default_params</span>
+<span class="n">params</span><span class="o">.</span><span class="n">image_reference</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">MediaRef</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="s2">"start.png"</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"path"</span><span class="p">,</span> <span class="n">role</span><span class="o">=</span><span class="s2">"first_frame"</span><span class="p">),</span>
+    <span class="n">MediaRef</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="s2">"end.png"</span><span class="p">,</span> <span class="nb">format</span><span class="o">=</span><span class="s2">"path"</span><span class="p">,</span> <span class="n">role</span><span class="o">=</span><span class="s2">"last_frame"</span><span class="p">),</span>
+<span class="p">]</span>
+</pre></div>
+</div>
+<p>FLUX.2 and Qwen-Image-Edit accept a list of reference images on <code class="docutils literal notranslate"><span class="pre">image_reference</span></code>.</p>
+<p>The same fields carry references over <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>; see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/serve/</span></code></a> for request examples.</p>
 </section>
 </section>
 <section id="optimizations">
@@ -1258,6 +1395,10 @@ actively evolving and may change in future releases.</p>
 </pre></div>
 </div>
 </section>
+<section id="cpu-offloading">
+<h3>CPU Offloading<a class="headerlink" href="#cpu-offloading" title="Link to this heading">#</a></h3>
+<p>CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with <code class="docutils literal notranslate"><span class="pre">cpu_offload_config.enable:</span> <span class="pre">true</span></code>.</p>
+</section>
 <section id="multi-gpu-parallelism">
 <h3>Multi-GPU Parallelism<a class="headerlink" href="#multi-gpu-parallelism" title="Link to this heading">#</a></h3>
 <p>Configured under <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.parallel_config</span></code>. Modes can be combined:</p>
@@ -1450,6 +1591,7 @@ actively evolving and may change in future releases.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-endpoints">Serving Endpoints</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-inputs">Reference Inputs</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optimizations">Optimizations</a><ul class="nav section-nav flex-column">
@@ -1463,6 +1605,7 @@ actively evolving and may change in future releases.</p>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cpu-offloading">CPU Offloading</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
 </li>
@@ -1568,9 +1711,9 @@ actively evolving and may change in future releases.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

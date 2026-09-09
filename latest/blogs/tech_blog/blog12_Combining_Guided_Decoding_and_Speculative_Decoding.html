@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,41 +663,41 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">
+  <section class="tex2jax_ignore mathjax_ignore" id="combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">
 <h1>Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly<a class="headerlink" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly" title="Link to this heading">#</a></h1>
 <p><em>By NVIDIA TensorRT LLM Team and the XGrammar Team</em></p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly"><span class="xref myst">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</span></a></p>
+<li><p><a class="reference internal" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
-<li><p><a class="reference internal" href="#background-and-challenges"><span class="xref myst">Background and Challenges</span></a></p>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#background-and-challenges">Background and Challenges</a></p>
 <ul>
-<li><p><a class="reference internal" href="../../features/ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
-<li><p><a class="reference internal" href="#guided-decoding"><span class="xref myst">Guided Decoding</span></a></p></li>
-<li><p><a class="reference internal" href="#speculative-decoding"><span class="xref myst">Speculative Decoding</span></a></p></li>
-<li><p><a class="reference internal" href="#two-challenges"><span class="xref myst">Two Challenges</span></a></p></li>
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
+<li><p><a class="reference internal" href="#guided-decoding">Guided Decoding</a></p></li>
+<li><p><a class="reference internal" href="#speculative-decoding">Speculative Decoding</a></p></li>
+<li><p><a class="reference internal" href="#two-challenges">Two Challenges</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#trace-grammar-state-for-draft-token-proposal-and-rejection"><span class="xref myst">Trace Grammar State for Draft Token Proposal and Rejection</span></a></p>
+<li><p><a class="reference internal" href="#trace-grammar-state-for-draft-token-proposal-and-rejection">Trace Grammar State for Draft Token Proposal and Rejection</a></p>
 <ul>
-<li><p><a class="reference internal" href="#target-model"><span class="xref myst">Target Model</span></a></p></li>
-<li><p><a class="reference internal" href="#draft-model"><span class="xref myst">Draft Model</span></a></p></li>
+<li><p><a class="reference internal" href="#target-model">Target Model</a></p></li>
+<li><p><a class="reference internal" href="#draft-model">Draft Model</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#make-grammar-computation-capturable-by-cuda-graph"><span class="xref myst">Make Grammar Computation Capturable by CUDA Graph</span></a></p>
+<li><p><a class="reference internal" href="#make-grammar-computation-capturable-by-cuda-graph">Make Grammar Computation Capturable by CUDA Graph</a></p>
 <ul>
-<li><p><a class="reference internal" href="#cuda-callback"><span class="xref myst">CUDA Callback</span></a></p></li>
-<li><p><a class="reference internal" href="#integration-to-tensorrt-llm-python-runtime"><span class="xref myst">Integration to TensorRT LLM Python Runtime</span></a></p></li>
-<li><p><a class="reference internal" href="#cuda-graph-compatibility-grammar-computation"><span class="xref myst">CUDA Graph Compatibility: Grammar Computation</span></a></p></li>
-<li><p><a class="reference internal" href="#cuda-graph-compatibility-mask-applying-kernel"><span class="xref myst">CUDA Graph Compatibility: Mask Applying Kernel</span></a></p></li>
-<li><p><a class="reference internal" href="#troubleshooting-data-race-between-host-and-cuda-callback"><span class="xref myst">Troubleshooting: Data Race between Host and CUDA Callback</span></a></p></li>
-<li><p><a class="reference internal" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex"><span class="xref myst">Troubleshooting: Deadlock by GIL and CUDA Mutex</span></a></p></li>
+<li><p><a class="reference internal" href="#cuda-callback">CUDA Callback</a></p></li>
+<li><p><a class="reference internal" href="#integration-to-tensorrt-llm-python-runtime">Integration to TensorRT LLM Python Runtime</a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-grammar-computation">CUDA Graph Compatibility: Grammar Computation</a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-mask-applying-kernel">CUDA Graph Compatibility: Mask Applying Kernel</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-data-race-between-host-and-cuda-callback">Troubleshooting: Data Race between Host and CUDA Callback</a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex">Troubleshooting: Deadlock by GIL and CUDA Mutex</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#performance-and-analysis"><span class="xref myst">Performance and Analysis</span></a></p></li>
-<li><p><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html#acknowledgements"><span class="std std-ref">Acknowledgements</span></a></p></li>
+<li><p><a class="reference internal" href="#performance-and-analysis">Performance and Analysis</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
 </ul>
 </li>
 </ul>
@@ -684,10 +752,10 @@
 </ul>
 </li>
 </ul>
-<p>Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step $i$, there are two event waits:</p>
+<p>Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step <span class="math notranslate nohighlight">\(i\)</span>, there are two event waits:</p>
 <ul class="simple">
-<li><p>The host waits for the <em>token event</em> that indicates the readiness of CPU tokens from step $i-1$.</p></li>
-<li><p>The model forward stream waits for the <em>mask event</em> that indicates the readiness of GPU masks from step $i$.</p></li>
+<li><p>The host waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>.</p></li>
+<li><p>The model forward stream waits for the <em>mask event</em> that indicates the readiness of GPU masks from step <span class="math notranslate nohighlight">\(i\)</span>.</p></li>
 </ul>
 <div align="center">
 <figure>
@@ -727,11 +795,11 @@
 <li><p>CUDA events and event waits can be inserted before and after the host functions, which can be used to synchronize the CPU and GPU computation.</p></li>
 <li><p>The host functions can be captured and replayed by CUDA graph.</p></li>
 </ul>
-<p>Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step $i$:</p>
+<p>Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step <span class="math notranslate nohighlight">\(i\)</span>:</p>
 <ul class="simple">
 <li><p>The grammar stream:</p>
 <ul>
-<li><p>waits for the <em>token event</em> that indicates the readiness of CPU tokens from step $i-1$;</p></li>
+<li><p>waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>;</p></li>
 <li><p>performs grammar advance and mask gen (CUDA callback);</p></li>
 <li><p>asynchronously copies the CPU masks to GPU;</p></li>
 <li><p>records the <em>mask event</em>.</p></li>
@@ -822,9 +890,9 @@
 <p>Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20"><code class="docutils literal notranslate"><span class="pre">GuidedRequest</span></code></a>. It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then accessed only via CUDA callbacks. This prevents potential data race within an executor iteration.</p>
 <p>When overlap scheduler is enabled, another data race scenario exists between executor iterations:</p>
 <ul class="simple">
-<li><p>Iteration $i$ launches CUDA callbacks, which will read request states from a fixed address;</p></li>
-<li><p>Iteration $i+1$ updates the request states;</p></li>
-<li><p>Iteration $i$’s CUDA callbacks are executed, reading request states updated by iteration $i+1$.</p></li>
+<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span> launches CUDA callbacks, which will read request states from a fixed address;</p></li>
+<li><p>Iteration <span class="math notranslate nohighlight">\(i+1\)</span> updates the request states;</p></li>
+<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span>’s CUDA callbacks are executed, reading request states updated by iteration <span class="math notranslate nohighlight">\(i+1\)</span>.</p></li>
 </ul>
 <p>Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417">queue</a> is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existence of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.</p>
 </section>
@@ -1093,9 +1161,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

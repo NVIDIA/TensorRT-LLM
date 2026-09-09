@@ -59,11 +59,13 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
+    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +81,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -441,7 +443,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +568,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,63 +663,63 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep">
+  <section class="tex2jax_ignore mathjax_ignore" id="scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep">
 <h1>Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)<a class="headerlink" href="#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT LLM Team</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep"><span class="xref myst">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</span></a></p>
+<li><p><a class="reference internal" href="#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
-<li><p><a class="reference internal" href="#motivation-for-large-scale-ep"><span class="xref myst">Motivation for large-scale EP</span></a></p>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#motivation-for-large-scale-ep">Motivation for large-scale EP</a></p>
 <ul>
-<li><p><a class="reference internal" href="#observations-over-one-machine-translation-dataset"><span class="xref myst">Observations over one machine translation dataset</span></a></p></li>
-<li><p><a class="reference internal" href="#observation-over-gsm8k-dataset"><span class="xref myst">Observation over GSM8K dataset</span></a></p></li>
+<li><p><a class="reference internal" href="#observations-over-one-machine-translation-dataset">Observations over one machine translation dataset</a></p></li>
+<li><p><a class="reference internal" href="#observation-over-gsm8k-dataset">Observation over GSM8K dataset</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#high-level-design-introduction"><span class="xref myst">High-level design introduction</span></a></p></li>
-<li><p><a class="reference internal" href="#ep-communication-kernels"><span class="xref myst">EP communication kernels</span></a></p>
+<li><p><a class="reference internal" href="#high-level-design-introduction">High-level design introduction</a></p></li>
+<li><p><a class="reference internal" href="#ep-communication-kernels">EP communication kernels</a></p>
 <ul>
-<li><p><a class="reference internal" href="#motivation-of-ep-communication-kernels-for-gb200"><span class="xref myst">Motivation of EP communication kernels for GB200</span></a></p></li>
-<li><p><a class="reference internal" href="#ep-communication-kernels-implementation"><span class="xref myst">EP communication kernels implementation</span></a></p></li>
+<li><p><a class="reference internal" href="#motivation-of-ep-communication-kernels-for-gb200">Motivation of EP communication kernels for GB200</a></p></li>
+<li><p><a class="reference internal" href="#ep-communication-kernels-implementation">EP communication kernels implementation</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#ep-load-balancer"><span class="xref myst">EP Load Balancer</span></a></p>
+<li><p><a class="reference internal" href="#ep-load-balancer">EP Load Balancer</a></p>
 <ul>
-<li><p><a class="reference internal" href="#python-interface"><span class="xref myst">Python Interface</span></a></p></li>
-<li><p><a class="reference internal" href="#c-extension"><span class="xref myst">C++ extension</span></a></p></li>
-<li><p><a class="reference internal" href="#core-implementations-of-the-host-logic"><span class="xref myst">Core implementations of the host logic</span></a></p></li>
-<li><p><a class="reference internal" href="#core-implementations-of-the-gpu-logic"><span class="xref myst">Core implementations of the GPU logic</span></a></p></li>
-<li><p><a class="reference internal" href="#online-ep-load-balancer"><span class="xref myst">Online EP Load Balancer</span></a></p></li>
-<li><p><a class="reference internal" href="#offline-ep-load-balancer"><span class="xref myst">Offline EP Load Balancer</span></a></p></li>
+<li><p><a class="reference internal" href="#python-interface">Python Interface</a></p></li>
+<li><p><a class="reference internal" href="#c-extension">C++ extension</a></p></li>
+<li><p><a class="reference internal" href="#core-implementations-of-the-host-logic">Core implementations of the host logic</a></p></li>
+<li><p><a class="reference internal" href="#core-implementations-of-the-gpu-logic">Core implementations of the GPU logic</a></p></li>
+<li><p><a class="reference internal" href="#online-ep-load-balancer">Online EP Load Balancer</a></p></li>
+<li><p><a class="reference internal" href="#offline-ep-load-balancer">Offline EP Load Balancer</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#e2e-evaluation"><span class="xref myst">E2E evaluation</span></a></p>
+<li><p><a class="reference internal" href="#e2e-evaluation">E2E evaluation</a></p>
 <ul>
-<li><p><a class="reference internal" href="#the-effect-of-ep-load-balancer"><span class="xref myst">The effect of EP Load Balancer</span></a></p>
+<li><p><a class="reference internal" href="#the-effect-of-ep-load-balancer">The effect of EP Load Balancer</a></p>
 <ul>
-<li><p><a class="reference internal" href="#offline-ep-load-balancer-1"><span class="xref myst">Offline EP Load Balancer</span></a></p></li>
-<li><p><a class="reference internal" href="#online-ep-load-balancer-1"><span class="xref myst">Online EP Load Balancer</span></a></p></li>
+<li><p><a class="reference internal" href="#id1">Offline EP Load Balancer</a></p></li>
+<li><p><a class="reference internal" href="#id2">Online EP Load Balancer</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#performance-study"><span class="xref myst">Performance study</span></a></p></li>
+<li><p><a class="reference internal" href="#performance-study">Performance study</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#reproducing-steps"><span class="xref myst">Reproducing steps</span></a></p>
+<li><p><a class="reference internal" href="#reproducing-steps">Reproducing steps</a></p>
 <ul>
-<li><p><a class="reference internal" href="#the-effect-of-ep-load-balancer-1"><span class="xref myst">The effect of EP Load Balancer</span></a></p>
+<li><p><a class="reference internal" href="#id3">The effect of EP Load Balancer</a></p>
 <ul>
 <li><p><a class="reference internal" href="#step-1-run-inference-and-collect-statistics"><span class="xref myst">Step 1: Run inference and collect statistics</span></a></p></li>
 <li><p><a class="reference internal" href="#step-2-generate-the-eplb-configuration"><span class="xref myst">Step 2: Generate the EPLB configuration</span></a></p></li>
 <li><p><a class="reference internal" href="#step-3-run-inference-with-the-eplb-configuration"><span class="xref myst">Step 3: Run inference with the EPLB configuration</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#miscellaneous"><span class="std std-ref">Miscellaneous</span></a></p></li>
+<li><p><a class="reference internal" href="#miscellaneous">Miscellaneous</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#expanded-thoughts"><span class="xref myst">Expanded thoughts</span></a></p></li>
-<li><p><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
+<li><p><a class="reference internal" href="#expanded-thoughts">Expanded thoughts</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
 </ul>
 </li>
 </ul>
@@ -1047,7 +1115,7 @@ More details can be found in <a class="reference external" href="https://github.
 </figure>
 </div>
 <p align="center"><sub><em>Figure 21: The routed token count by experts (x-axis) and iterations (y-axis) at layer 36 (EPLB with 8 per-rank slots and EP 36)</em></sub></p>
-<p>For each layer and iteration, the load imbalance can be measured using simple metrics such as the standard deviation or the imbalance ratio. Given the routed token counts for all ranks (or experts), the imbalance ratio is defined as $(max - mean) / mean$, which represents the excessive workload received by the hottest rank (or expert). A perfectly balanced load would have an imbalance ratio of 0.</p>
+<p>For each layer and iteration, the load imbalance can be measured using simple metrics such as the standard deviation or the imbalance ratio. Given the routed token counts for all ranks (or experts), the imbalance ratio is defined as <span class="math notranslate nohighlight">\((max - mean) / mean\)</span>, which represents the excessive workload received by the hottest rank (or expert). A perfectly balanced load would have an imbalance ratio of 0.</p>
 <p>Table 1 reports the standard deviation and imbalance ratio for the aforementioned cases. Each number is averaged from the per-layer per-iteration metrics. Without EPLB, the load imbalance is significant – on average, the hottest rank receives 1.56 times more routed tokens than the mean. EPLB can effectively reduced the load imbalance – on average, the hottest rank receives only about 0.11 times more routed tokens than the mean.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
@@ -1539,9 +1607,9 @@ Based on our current performance analysis, when you plan to apply large-scale EP
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

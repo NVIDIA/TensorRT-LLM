@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -441,7 +441,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +566,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,7 +661,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="llm-api-introduction">
+  <section class="tex2jax_ignore mathjax_ignore" id="llm-api-introduction">
 <h1>LLM API Introduction<a class="headerlink" href="#llm-api-introduction" title="Link to this heading">#</a></h1>
 <p>The LLM API is a high-level Python API designed to streamline LLM inference workflows.</p>
 <p>It supports a broad range of use cases, from single-GPU setups to multi-GPU and multi-node deployments, with built-in support for various parallelism strategies and advanced features. The LLM API integrates seamlessly with the broader inference ecosystem, including NVIDIA <a class="reference external" href="https://github.com/ai-dynamo/dynamo">Dynamo</a>.</p>
@@ -682,14 +748,17 @@ backend does not provide startup metrics.</p>
 <span class="w">    </span><span class="nt">"total_model_loading_seconds"</span><span class="p">:</span><span class="w">  </span><span class="mf">1.971</span><span class="p">,</span>
 <span class="w">    </span><span class="nt">"checkpoint_preparation_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.177</span><span class="p">,</span>
 <span class="w">    </span><span class="nt">"weight_population_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.598</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"checkpoint_finalization_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.031</span><span class="p">,</span>
 <span class="w">    </span><span class="nt">"post_load_processing_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.005</span>
 <span class="w">  </span><span class="p">}</span>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>The <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> object contains timings for the main LLM weights. If a draft model is used,
-additional field <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code> and <code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code> will appear.
-A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> object can also appear in deprecated 2-model style MTP setting.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">model_loader</span></code> object contains timings for the main LLM weights. If a draft
+model is used, the additional fields <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code>,
+<code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code>, and <code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code>
+appear. A <code class="docutils literal notranslate"><span class="pre">draft_model_loader</span></code> object can also appear in the deprecated
+two-model MTP configuration.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Metric</p></th>
@@ -706,11 +775,17 @@ A <code class="docutils literal notranslate"><span class="pre">draft_model_loade
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">weight_population_seconds</span></code></p></td>
 <td><p>Time spent copying prepared checkpoint tensors into model parameters on GPUs. This metric can be absent for formats that populate weights directly during the above checkpoint preparation phase.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">checkpoint_finalization_seconds</span></code></p></td>
+<td><p>Time spent finalizing the checkpoint session after weight population. This includes loader-specific synchronization and cleanup; rank-striped read-ahead includes waiting for peer ranks and stopping background readers.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_preparation_seconds</span></code></p></td>
 <td><p>Checkpoint preparation time for draft weights loaded as part of the model loader.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">draft_weight_population_seconds</span></code></p></td>
 <td><p>Weight population time for draft weights loaded as part of the model loader.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">draft_checkpoint_finalization_seconds</span></code></p></td>
+<td><p>Checkpoint finalization time for draft weights loaded as part of the model loader.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">post_load_processing_seconds</span></code></p></td>
 <td><p>Time spent in format-specific hooks and model finalization, including post-load weight transformation, quantization and memory cleanup.</p></td>
@@ -752,19 +827,25 @@ A <code class="docutils literal notranslate"><span class="pre">draft_model_loade
 <p>Because the LLM API relies on the <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code> library, put the LLM class in a function and protect the main entrypoint to the program under the <code class="docutils literal notranslate"><span class="pre">__main__</span></code> namespace to avoid a <a class="reference external" href="https://mpi4py.readthedocs.io/en/stable/mpi4py.futures.html#mpipoolexecutor">recursive spawn</a> process in <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>.</p>
 <p>This limitation is applicable for multi-GPU inference only.</p>
 </section>
-<section id="flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers">
-<h3>FlashInfer JIT workspace for dynamically spawned MPI workers<a class="headerlink" href="#flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers" title="Link to this heading">#</a></h3>
-<p>When the LLM API dynamically spawns multiple MPI workers, users affected by
-concurrent FlashInfer source-generation races can enable persistent, per-worker
-cache slots for FlashInfer JIT artifacts. Set
-<code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1</span></code> before creating the LLM instance.
-The workaround preserves compiled artifacts between launches, and downloaded
-cubins remain in FlashInfer’s shared cache. It is disabled by default and can
-be removed once FlashInfer guards source generation before writing shared
-workspace files.</p>
-<p>An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> takes precedence. Workers
-started outside the LLM API’s dynamic MPI pool must configure their own
-workspace isolation.</p>
+<section id="flashinfer-jit-workspaces-for-mpi-workers">
+<h3>FlashInfer JIT workspaces for MPI workers<a class="headerlink" href="#flashinfer-jit-workspaces-for-mpi-workers" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> ranks and dynamically spawned <code class="docutils literal notranslate"><span class="pre">MpiPoolSession</span></code> workers
+isolate FlashInfer JIT source-generation workspaces by default. Each process
+normally claims a locked, persistent cache slot under
+<code class="docutils literal notranslate"><span class="pre">~/.cache/tensorrt_llm/flashinfer</span></code>, while downloaded cubins remain in
+FlashInfer’s shared cache. This prevents concurrent MPI processes from writing
+the same generated source files without forcing a cold JIT compilation on
+every launch. Set <code class="docutils literal notranslate"><span class="pre">TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0</span></code> before invoking
+the launcher or creating the LLM instance to disable this behavior.</p>
+<p>Persistent slots are not pruned automatically, so their count can grow with
+peak job concurrency. When no TensorRT-LLM processes are using the cache, the
+slots may be deleted safely; subsequent launches rebuild the removed JIT
+artifacts.</p>
+<p>If persistent workspace setup is unavailable, each process falls back to a
+process-unique temporary workspace that is removed when the process exits.
+Persistent cache reuse is not available for this fallback.</p>
+<p>An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_WORKSPACE_BASE</span></code> takes precedence in both
+launch modes. An explicitly configured <code class="docutils literal notranslate"><span class="pre">FLASHINFER_CUBIN_DIR</span></code> is also preserved.</p>
 </section>
 <section id="cannot-quit-after-generation">
 <h3>Cannot quit after generation<a class="headerlink" href="#cannot-quit-after-generation" title="Link to this heading">#</a></h3>
@@ -850,7 +931,7 @@ workspace isolation.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtimeerror-only-rank-0-can-start-multi-node-session-got-1">RuntimeError: only rank 0 can start multi-node session, got 1</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hang-issue-on-slurm-node">Hang issue on Slurm Node</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mpi-abort-was-invoked-on-rank-1-in-communicator-mpi-comm-world-with-errorcode-1">MPI_ABORT was invoked on rank 1 in communicator MPI_COMM_WORLD with errorcode 1.</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspace-for-dynamically-spawned-mpi-workers">FlashInfer JIT workspace for dynamically spawned MPI workers</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#flashinfer-jit-workspaces-for-mpi-workers">FlashInfer JIT workspaces for MPI workers</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cannot-quit-after-generation">Cannot quit after generation</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#single-node-hanging-when-using-docker-run-net-host">Single node hanging when using <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span> <span class="pre">--net=host</span></code></a></li>
 </ul>
@@ -946,9 +1027,9 @@ workspace isolation.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

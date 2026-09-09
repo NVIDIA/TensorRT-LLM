@@ -62,6 +62,8 @@
 
 
 
+
+
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
     defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
@@ -418,7 +420,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -432,7 +434,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -790,7 +792,72 @@ window.runMermaid = runMermaid;</script>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -850,6 +917,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -967,6 +1035,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
@@ -1006,7 +1075,9 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
+                       <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span>
+                       <span class="n">validate_token_encoder_bucket_config</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
@@ -1018,7 +1089,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="RequestOutput">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference/RequestOutput.html#tensorrt_llm.llmapi.RequestOutput">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">RequestOutput</span><span class="p">(</span><span class="n">DetokenizedGenerationResultBase</span><span class="p">,</span> <span class="n">GenerationResult</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">"""The output data of a completion request to the LLM.</span>
 
@@ -1034,7 +1105,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
 
 <div class="viewcode-block" id="RequestOutput.__init__">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.__init__">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference/RequestOutput.html#tensorrt_llm.llmapi.RequestOutput.__init__">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> is designed to be instantiated using </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">._from_generation_result by GenerationExecutor. "</span>
@@ -1357,6 +1428,9 @@ window.runMermaid = runMermaid;</script>
             <span class="n">valid_keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span>
                 <span class="nb">list</span><span class="p">(</span><span class="n">llm_args_cls</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span> <span class="o">+</span>
                 <span class="p">[</span><span class="s1">'_mpi_session'</span><span class="p">,</span> <span class="s1">'backend'</span><span class="p">])</span>
+            <span class="k">if</span> <span class="nb">issubclass</span><span class="p">(</span><span class="n">llm_args_cls</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">):</span>
+                <span class="c1"># Values are vetted by TorchLlmArgs._drop_removed_args.</span>
+                <span class="n">valid_keys</span> <span class="o">|=</span> <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span>
             <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
                 <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">valid_keys</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -1449,25 +1523,6 @@ window.runMermaid = runMermaid;</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="k">raise</span>
 
-        <span class="c1"># --- Usage telemetry (fail-silent) ---</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_usage</span>
-            <span class="n">telemetry_config</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">'telemetry_config'</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-            <span class="c1"># Promote UNKNOWN -&gt; LLM_CLASS for direct Python API usage.</span>
-            <span class="c1"># CLI commands set their specific context before LLM construction,</span>
-            <span class="c1"># so this only fires for users calling LLM() directly.</span>
-            <span class="k">if</span> <span class="n">telemetry_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="k">if</span> <span class="n">telemetry_config</span><span class="o">.</span><span class="n">usage_context</span> <span class="o">==</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">UNKNOWN</span><span class="p">:</span>
-                    <span class="n">telemetry_config</span> <span class="o">=</span> <span class="n">telemetry_config</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span>
-                        <span class="n">update</span><span class="o">=</span><span class="p">{</span><span class="s2">"usage_context"</span><span class="p">:</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="p">})</span>
-            <span class="n">_usage</span><span class="o">.</span><span class="n">report_usage</span><span class="p">(</span>
-                <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
-                <span class="n">pretrained_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span>
-                <span class="n">telemetry_config</span><span class="o">=</span><span class="n">telemetry_config</span><span class="p">,</span>
-            <span class="p">)</span>
-        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
-            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Usage telemetry setup failed: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
-
         <span class="k">try</span><span class="p">:</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">otlp_traces_endpoint</span><span class="p">:</span>
                 <span class="n">tracing</span><span class="o">.</span><span class="n">init_tracer</span><span class="p">(</span><span class="s2">"trt.llm"</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">otlp_traces_endpoint</span><span class="p">)</span>
@@ -1479,6 +1534,27 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">exception_handler</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">'shutdown'</span><span class="p">)</span>
         <span class="n">atexit</span><span class="o">.</span><span class="n">register</span><span class="p">(</span><span class="n">LLM</span><span class="o">.</span><span class="n">_shutdown_wrapper</span><span class="p">,</span> <span class="n">weakref</span><span class="o">.</span><span class="n">ref</span><span class="p">(</span><span class="bp">self</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_start_usage_reporting</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Start the success-only initial report and heartbeat stream."""</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_usage</span>
+
+            <span class="n">telemetry_config</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">'telemetry_config'</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+            <span class="c1"># Promote UNKNOWN -&gt; LLM_CLASS for direct Python API usage.</span>
+            <span class="c1"># CLI commands set their specific context before LLM construction,</span>
+            <span class="c1"># so this only fires for users calling LLM() directly.</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">telemetry_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">telemetry_config</span><span class="o">.</span><span class="n">usage_context</span>
+                    <span class="o">==</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">UNKNOWN</span><span class="p">):</span>
+                <span class="n">telemetry_config</span> <span class="o">=</span> <span class="n">telemetry_config</span><span class="o">.</span><span class="n">model_copy</span><span class="p">(</span>
+                    <span class="n">update</span><span class="o">=</span><span class="p">{</span><span class="s2">"usage_context"</span><span class="p">:</span> <span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="p">})</span>
+            <span class="n">_usage</span><span class="o">.</span><span class="n">report_usage</span><span class="p">(</span>
+                <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
+                <span class="n">pretrained_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span>
+                <span class="n">telemetry_config</span><span class="o">=</span><span class="n">telemetry_config</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="s2">"Usage telemetry setup failed: </span><span class="si">%s</span><span class="s2">"</span><span class="p">,</span> <span class="n">exc</span><span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"beta"</span><span class="p">)</span>
@@ -2651,6 +2727,13 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"beta"</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_shutdown_resources</span><span class="p">()</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_record_usage_shutdown</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_shutdown_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Release executors and any LLM-owned MPI session."""</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_executor"</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="kc">None</span>
@@ -2664,6 +2747,23 @@ window.runMermaid = runMermaid;</script>
                 <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_owns_mpi_session"</span><span class="p">,</span> <span class="kc">True</span><span class="p">)):</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_record_usage_shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Update the process counter at most once for this LLM object."""</span>
+        <span class="n">lifecycle_lock</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_usage_lifecycle_lock"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">lifecycle_lock</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="k">with</span> <span class="n">lifecycle_lock</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">"_usage_lifecycle_active"</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+                <span class="k">return</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_active</span> <span class="o">=</span> <span class="kc">False</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_usage</span>
+
+            <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_shutdown</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Usage telemetry shutdown tracking failed: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_health</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Check if the LLM is healthy.</span>
@@ -2724,22 +2824,58 @@ window.runMermaid = runMermaid;</script>
                  <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
                  <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 
+        <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_active</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
+        <span class="n">telemetry_config</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"telemetry_config"</span><span class="p">)</span>
+        <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">_usage</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="c1"># Telemetry: Track before construction so initialization failures are visible.</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm.usage</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">_usage</span>
+
+            <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
+                <span class="n">telemetry_config</span><span class="p">,</span>
+                <span class="n">default_usage_context</span><span class="o">=</span><span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"Usage telemetry initialization tracking failed: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
         <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"backend"</span><span class="p">,</span> <span class="s2">"pytorch"</span><span class="p">)</span>
 
-        <span class="c1"># Validate that only arguments supported by the PyTorch backend are passed.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_validate_args_for_torch_backend</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="c1"># Validate that only arguments supported by the PyTorch backend are passed.</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_validate_args_for_torch_backend</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span>
 
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span>
-                         <span class="n">tokenizer</span><span class="p">,</span>
-                         <span class="n">tokenizer_mode</span><span class="p">,</span>
-                         <span class="n">skip_tokenizer_init</span><span class="p">,</span>
-                         <span class="n">trust_remote_code</span><span class="p">,</span>
-                         <span class="n">tensor_parallel_size</span><span class="p">,</span>
-                         <span class="n">dtype</span><span class="p">,</span>
-                         <span class="n">revision</span><span class="p">,</span>
-                         <span class="n">tokenizer_revision</span><span class="p">,</span>
-                         <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
-                         <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span>
+                             <span class="n">tokenizer</span><span class="p">,</span>
+                             <span class="n">tokenizer_mode</span><span class="p">,</span>
+                             <span class="n">skip_tokenizer_init</span><span class="p">,</span>
+                             <span class="n">trust_remote_code</span><span class="p">,</span>
+                             <span class="n">tensor_parallel_size</span><span class="p">,</span>
+                             <span class="n">dtype</span><span class="p">,</span>
+                             <span class="n">revision</span><span class="p">,</span>
+                             <span class="n">tokenizer_revision</span><span class="p">,</span>
+                             <span class="n">backend</span><span class="o">=</span><span class="n">backend</span><span class="p">,</span>
+                             <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">usage_attempt_tracked</span><span class="p">:</span>
+                <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_failure</span><span class="p">()</span>
+            <span class="k">raise</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">usage_attempt_tracked</span> <span class="ow">and</span> <span class="n">_usage</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">usage_attempt_tracked</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialization_attempt</span><span class="p">(</span>
+                    <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">'telemetry_config'</span><span class="p">,</span> <span class="kc">None</span><span class="p">),</span>
+                    <span class="n">default_usage_context</span><span class="o">=</span><span class="n">_usage</span><span class="o">.</span><span class="n">UsageContext</span><span class="o">.</span><span class="n">LLM_CLASS</span><span class="o">.</span><span class="n">value</span><span class="p">,</span>
+                <span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">usage_attempt_tracked</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_usage_lifecycle_active</span> <span class="o">=</span> <span class="n">_usage</span><span class="o">.</span><span class="n">record_llm_initialized</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Usage telemetry completion tracking failed: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+
+        <span class="bp">self</span><span class="o">.</span><span class="n">_start_usage_reporting</span><span class="p">()</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">"prototype"</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_collective_rpc</span><span class="p">(</span>
@@ -2777,6 +2913,45 @@ window.runMermaid = runMermaid;</script>
                 <span class="sa">f</span><span class="s2">"Executor type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">)</span><span class="si">}</span><span class="s2"> does not support collective RPC."</span>
             <span class="p">)</span>
 
+    <span class="k">def</span><span class="w"> </span><span class="nf">_reject_token_encoder_config_without_buckets</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Reject a bucket-less token-encoder config before weights load.</span>
+
+<span class="sd">        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the</span>
+<span class="sd">        last word; this asks the class its architecture resolves to. It defers</span>
+<span class="sd">        wherever that class might not be the one the engine builds, so it can</span>
+<span class="sd">        only reject earlier, never differently. A model that installs</span>
+<span class="sd">        `encoder_graph_spec` at construction instead of declaring it on the</span>
+<span class="sd">        class would be misjudged here; no in-tree model does.</span>
+<span class="sd">        """</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">encoder_cuda_graph_config</span>
+        <span class="c1"># `checkpoint_loader`, a non-HF `checkpoint_format` and `model_kwargs`</span>
+        <span class="c1"># all feed `checkpoint_loader.load_config()`, which is where the engine</span>
+        <span class="c1"># gets its class from, so the on-disk architecture may not be the one</span>
+        <span class="c1"># it builds. Decoder-only models are left to the engine too: its</span>
+        <span class="c1"># "consumes packed tokens" wording would only confuse there.</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_encoder_decoder_model</span><span class="p">()</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">checkpoint_loader</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">checkpoint_format</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="s2">"HF"</span><span class="p">)):</span>
+            <span class="k">return</span>
+        <span class="n">bucket_config_error</span> <span class="o">=</span> <span class="n">validate_token_encoder_bucket_config</span><span class="p">(</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">num_tokens</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">seq_lens</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">bucket_config_error</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">architectures</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span> <span class="s2">"architectures"</span><span class="p">,</span>
+                                <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">architectures</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="c1"># Local: resolving an architecture imports its model module, which the</span>
+        <span class="c1"># client process otherwise never loads.</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.models.modeling_utils</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">get_registered_model_class</span>
+        <span class="n">model_cls</span> <span class="o">=</span> <span class="n">get_registered_model_class</span><span class="p">(</span><span class="n">architectures</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+        <span class="c1"># Unresolved, or a feature encoder that derives both dimensions itself.</span>
+        <span class="k">if</span> <span class="n">model_cls</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model_cls</span><span class="p">,</span> <span class="s2">"encoder_graph_spec"</span><span class="p">):</span>
+            <span class="k">return</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="n">bucket_config_error</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="kc">None</span>
@@ -2785,6 +2960,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_hf_model_config</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_reject_token_encoder_config_without_buckets</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config_explicit_values</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config_explicit_values</span><span class="p">(</span>
         <span class="p">)</span>
@@ -2840,7 +3016,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">return_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
-            <span class="n">executor_config</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
             <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
             <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
             <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
@@ -2860,14 +3035,13 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">_validate_args_for_torch_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Validate that only arguments supported by the PyTorch backend are passed.</span>
 <span class="sd">        """</span>
-        <span class="n">torchllm_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="c1"># Values of removed args are vetted by TorchLlmArgs._drop_removed_args.</span>
+        <span class="n">accepted_keys</span> <span class="o">=</span> <span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+                         <span class="o">|</span> <span class="n">TORCH_LLMARGS_REMOVED_ARGS</span>
+                         <span class="o">|</span> <span class="p">{</span><span class="s1">'_mpi_session'</span><span class="p">,</span> <span class="s1">'backend'</span><span class="p">})</span>
 
         <span class="c1"># Check if any arguments not supported by the PyTorch backend are passed.</span>
-        <span class="n">unsupported_args</span> <span class="o">=</span> <span class="p">[</span>
-            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span>
-            <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">torchllm_fields</span> <span class="ow">and</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">'_mpi_session'</span><span class="p">,</span>
-                                                          <span class="s1">'backend'</span><span class="p">)</span>
-        <span class="p">]</span>
+        <span class="n">unsupported_args</span> <span class="o">=</span> <span class="p">[</span><span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span> <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">accepted_keys</span><span class="p">]</span>
 
         <span class="k">if</span> <span class="n">unsupported_args</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -2876,11 +3050,11 @@ window.runMermaid = runMermaid;</script>
 
 
 <div class="viewcode-block" id="LLM">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference/LLM.html#tensorrt_llm.llmapi.LLM">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">LLM</span><span class="p">(</span><span class="n">_TorchLLM</span><span class="p">):</span>
 
 <div class="viewcode-block" id="LLM.__init__">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.LLM.__init__">[docs]</a>
+<a class="viewcode-back" href="../../../llm-api/reference/LLM.html#tensorrt_llm.llmapi.LLM.__init__">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
                  <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
@@ -3016,9 +3190,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

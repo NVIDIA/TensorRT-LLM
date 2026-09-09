@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc25';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc25" />
+  <meta name="docsearch:version" content="1.3.0rc26" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -441,7 +441,72 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../llm-api/reference.html">API Reference</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/PrefillCudaGraphBackend.html">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../llm-api/reference/MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
 <ul class="nav bd-sidenav">
@@ -501,6 +566,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
@@ -595,62 +661,62 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm">
+  <section class="tex2jax_ignore mathjax_ignore" id="how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm">
 <h1>How to get best performance on DeepSeek-R1 in TensorRT LLM<a class="headerlink" href="#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p>NVIDIA has announced world-record DeepSeek-R1 inference performance at NVIDIA GTC 2025. A single NVIDIA DGX system with eight NVIDIA Blackwell GPUs can achieve over 250 tokens per second per user or a maximum throughput of over 30,000 tokens per second on the massive, state-of-the-art 671 billion parameter DeepSeek-R1 model. <a class="reference external" href="https://developer.nvidia.com/blog/nvidia-blackwell-delivers-world-record-deepseek-r1-inference-performance/">NVIDIA Blackwell Delivers World-Record DeepSeek-R1 Inference Performance</a></p>
 <p>In this blog, we share the configurations and procedures about how to reproduce the number on both B200 and H200 with PyTorch workflow.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm"><span class="xref myst">How to get best performance on DeepSeek-R1 in TensorRT LLM</span></a></p>
+<li><p><a class="reference internal" href="#how-to-get-best-performance-on-deepseek-r1-in-tensorrt-llm">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
-<li><p><a class="reference internal" href="#prerequisites-install-tensorrt-llm-and-download-models"><span class="xref myst">Prerequisites: Install TensorRT LLM and download models</span></a></p>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#prerequisites-install-tensorrt-llm-and-download-models">Prerequisites: Install TensorRT LLM and download models</a></p>
 <ul>
-<li><p><a class="reference internal" href="#1-download-tensorrt-llm"><span class="xref myst">1. Download TensorRT LLM</span></a></p></li>
-<li><p><a class="reference internal" href="#2-download-the-deepseek-r1-models"><span class="xref myst">2. Download the DeepSeek R1 models</span></a></p></li>
-<li><p><a class="reference internal" href="#3-build-and-run-tensorrt-llm-container"><span class="xref myst">3. Build and run TensorRT LLM container</span></a></p></li>
-<li><p><a class="reference internal" href="#4-compile-and-install-tensorrt-llm"><span class="xref myst">4. Compile and Install TensorRT LLM</span></a></p></li>
-<li><p><a class="reference internal" href="#5-optional-tune-gpu-clocks"><span class="xref myst">5. Optional: Tune GPU clocks</span></a></p></li>
-<li><p><a class="reference internal" href="#6-dataset-preparation"><span class="xref myst">6. Dataset preparation</span></a></p></li>
+<li><p><a class="reference internal" href="#download-tensorrt-llm">1. Download TensorRT LLM</a></p></li>
+<li><p><a class="reference internal" href="#download-the-deepseek-r1-models">2. Download the DeepSeek R1 models</a></p></li>
+<li><p><a class="reference internal" href="#build-and-run-tensorrt-llm-container">3. Build and run TensorRT LLM container</a></p></li>
+<li><p><a class="reference internal" href="#compile-and-install-tensorrt-llm">4. Compile and Install TensorRT LLM</a></p></li>
+<li><p><a class="reference internal" href="#optional-tune-gpu-clocks">5. Optional: Tune GPU clocks</a></p></li>
+<li><p><a class="reference internal" href="#dataset-preparation">6. Dataset preparation</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#reproducing-steps"><span class="xref myst">Reproducing steps</span></a></p>
+<li><p><a class="reference internal" href="#reproducing-steps">Reproducing steps</a></p>
 <ul>
-<li><p><a class="reference internal" href="#b200-min-latency"><span class="xref myst">B200 min-latency</span></a></p>
+<li><p><a class="reference internal" href="#b200-min-latency">B200 min-latency</a></p>
 <ul>
-<li><p><a class="reference internal" href="#expected-results"><span class="xref myst">Expected Results</span></a></p></li>
+<li><p><a class="reference internal" href="#expected-results">Expected Results</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#b200-max-throughput-for-r1-0528-with-fp8-kv-cache"><span class="xref myst">B200 max-throughput for R1-0528 with FP8 KV cache</span></a></p>
+<li><p><a class="reference internal" href="#b200-max-throughput-for-r1-0528-with-fp8-kv-cache">B200 max-throughput for R1-0528 with FP8 KV cache</a></p>
 <ul>
-<li><p><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html#benchmark"><span class="std std-ref">Benchmark</span></a></p></li>
-<li><p><a class="reference internal" href="#expected-result-format"><span class="xref myst">Expected Result Format</span></a></p></li>
+<li><p><a class="reference internal" href="#benchmark">Benchmark</a></p></li>
+<li><p><a class="reference internal" href="#expected-result-format">Expected Result Format</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#b200-max-throughput-for-r1-with-fp16-kv-cache"><span class="xref myst">B200 max-throughput for R1 with FP16 KV cache</span></a></p>
+<li><p><a class="reference internal" href="#b200-max-throughput-for-r1-with-fp16-kv-cache">B200 max-throughput for R1 with FP16 KV cache</a></p>
 <ul>
-<li><p><a class="reference internal" href="#benchmark-1"><span class="xref myst">Benchmark</span></a></p></li>
-<li><p><a class="reference internal" href="#expected-result-format-1"><span class="xref myst">Expected Result Format</span></a></p></li>
+<li><p><a class="reference internal" href="#id1">Benchmark</a></p></li>
+<li><p><a class="reference internal" href="#id2">Expected Result Format</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#h200-min-latency"><span class="xref myst">H200 min-latency</span></a></p>
+<li><p><a class="reference internal" href="#h200-min-latency">H200 min-latency</a></p>
 <ul>
 <li><p><a class="reference internal" href="#expected-result-format-2"><span class="xref myst">Expected Result Format</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#h200-max-throughput"><span class="xref myst">H200 max-throughput</span></a></p>
+<li><p><a class="reference internal" href="#h200-max-throughput">H200 max-throughput</a></p>
 <ul>
 <li><p><a class="reference internal" href="#expected-result-format-3"><span class="xref myst">Expected Result Format</span></a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#exploring-more-islosl-combinations"><span class="xref myst">Exploring more ISL/OSL combinations</span></a></p>
+<li><p><a class="reference internal" href="#exploring-more-isl-osl-combinations">Exploring more ISL/OSL combinations</a></p>
 <ul>
-<li><p><a class="reference internal" href="#wip-enable-more-features-by-default"><span class="xref myst">WIP: Enable more features by default</span></a></p></li>
-<li><p><a class="reference internal" href="#mla-chunked-context"><span class="xref myst">MLA chunked context</span></a></p></li>
-<li><p><a class="reference internal" href="#out-of-memory-issues"><span class="xref myst">Out of memory issues</span></a></p></li>
+<li><p><a class="reference internal" href="#wip-enable-more-features-by-default">WIP: Enable more features by default</a></p></li>
+<li><p><a class="reference internal" href="#mla-chunked-context">MLA chunked context</a></p></li>
+<li><p><a class="reference internal" href="#out-of-memory-issues">Out of memory issues</a></p></li>
 </ul>
 </li>
 </ul>
@@ -743,7 +809,7 @@ The command to generate synthetic dataset will be attached to the max throughput
 <p>This section provides the reproducing steps for NVIDIA Blackwell B200 and H200 GPUs, for both min-latency and max-throughput scenarios.</p>
 <p>All the benchmarking is done by the trtllm-bench command line tool provided in the TensorRT LLM installation, see <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html">TensorRT LLM Benchmarking</a> for details of this tool.</p>
 <p>For brevity, we only provide the commands to reproduce the perf numbers without detailed explanation of the tools and options in this doc.</p>
-<p>All these commands here are assumed to be running inside the container started by <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">-C</span> <span class="pre">docker</span> <span class="pre">run</span> <span class="pre">...</span></code> command mentioned in the <a class="reference internal" href="#3-build-and-run-tensorrt-llm-container"><span class="xref myst">Build and run TensorRT LLM container section</span></a></p>
+<p>All these commands here are assumed to be running inside the container started by <code class="docutils literal notranslate"><span class="pre">make</span> <span class="pre">-C</span> <span class="pre">docker</span> <span class="pre">run</span> <span class="pre">...</span></code> command mentioned in the <a class="reference internal" href="#build-and-run-tensorrt-llm-container">Build and run TensorRT LLM container section</a></p>
 <section id="b200-min-latency">
 <h3>B200 min-latency<a class="headerlink" href="#b200-min-latency" title="Link to this heading">#</a></h3>
 <p>Our benchmark results are based on <strong>Batch = 1, ISL = 1K, OSL = 2K, num_requests = 10 from real dataset</strong></p>
@@ -1222,9 +1288,9 @@ trtllm-bench<span class="w"> </span>-m<span class="w"> </span>deepseek-ai/DeepSe
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 27, 2026.</p>
+  <p>Last updated on September 04, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/785c948">785c948</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
   
 </div></div>
       

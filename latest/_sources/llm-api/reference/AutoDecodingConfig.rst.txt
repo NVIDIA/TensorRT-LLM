@@ -1,0 +1,10 @@
+AutoDecodingConfig
+==================
+
+.. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
