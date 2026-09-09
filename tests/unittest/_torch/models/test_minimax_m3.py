@@ -163,6 +163,8 @@ def test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler(
 ) -> None:
     """A fused-communication MoE must not schedule a second boundary reduction."""
 
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0")
+
     class _DecoderComponent(nn.Module):
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
