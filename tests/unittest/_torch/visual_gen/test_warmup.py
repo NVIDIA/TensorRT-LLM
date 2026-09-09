@@ -325,10 +325,18 @@ class TestWarmupPhasing:
             == 1
         )
 
-    def test_single_rank_one_pass(self, monkeypatch):
+    def test_single_rank_two_passes_with_cuda_graph(self, monkeypatch):
         assert (
             self._count_passes(
                 monkeypatch, enable_autotune=True, world_size=1, cuda_graph_enable=True
+            )
+            == 2
+        )
+
+    def test_single_rank_graph_off_one_pass(self, monkeypatch):
+        assert (
+            self._count_passes(
+                monkeypatch, enable_autotune=True, world_size=1, cuda_graph_enable=False
             )
             == 1
         )
