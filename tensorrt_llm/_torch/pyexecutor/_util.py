@@ -642,7 +642,7 @@ class KvCacheCreator:
         self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
-        self._enable_overlap_scheduler = not llm_args.disable_overlap_scheduler
+        self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
         self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
@@ -1463,7 +1463,7 @@ class KvCacheCreator:
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
-            enable_overlap_scheduler=self._enable_overlap_scheduler,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -1670,7 +1670,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
-            enable_overlap_scheduler=self._enable_overlap_scheduler,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
@@ -2047,7 +2047,7 @@ class KvCacheCreator:
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            enable_overlap_scheduler=self._enable_overlap_scheduler,
+            disable_overlap_scheduler=self._disable_overlap_scheduler,
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
             CacheType.CROSS,
         )
@@ -2367,7 +2367,7 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        enable_overlap_scheduler: bool = False,
+        disable_overlap_scheduler: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
@@ -2510,7 +2510,7 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
-            "enable_overlap_scheduler"] = enable_overlap_scheduler
+            "disable_overlap_scheduler"] = disable_overlap_scheduler
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -3132,9 +3132,8 @@ def should_enable_disagg_adp_overlap_headroom(
     pipeline stage to agree on which requests are retiring.
     """
     is_disagg = is_disagg_enabled(cache_transceiver_config)
-    enable_overlap_scheduler = not disable_overlap_scheduler
     return (mapping.enable_attention_dp and not mapping.has_pp()
-            and (is_disagg or enable_overlap_scheduler))
+            and (is_disagg or not disable_overlap_scheduler))
 
 
 def create_py_executor_instance(

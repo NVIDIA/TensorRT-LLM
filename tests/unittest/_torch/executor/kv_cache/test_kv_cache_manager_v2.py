@@ -1551,7 +1551,7 @@ def _index_mapper_capacity_for(
     is_disagg: bool = False,
     num_reserved_index_slots: int = 1,
     enable_attention_dp: bool = False,
-    enable_overlap_scheduler: bool = False,
+    disable_overlap_scheduler: bool = False,
 ) -> tuple[int, int]:
     """Construct a manager and return (IndexMapper capacity, page-table capacity).
 
@@ -1589,7 +1589,7 @@ def _index_mapper_capacity_for(
             # ("Quota not set. Check kv_cache_config.max_tokens or
             # kv_cache_config.max_gpu_total_bytes"). The value is irrelevant to the
             # index-mapper arithmetic, which reads only max_batch_size, pp_size,
-            # enable_attention_dp, is_disagg, enable_overlap_scheduler and
+            # enable_attention_dp, is_disagg, disable_overlap_scheduler and
             # num_reserved_index_slots.
             KvCacheConfig(max_gpu_total_bytes=16 << 20),
             CacheType.SELFKONLY,
@@ -1611,7 +1611,7 @@ def _index_mapper_capacity_for(
             execution_stream=Mock(),
             is_disagg=is_disagg,
             num_reserved_index_slots=num_reserved_index_slots,
-            enable_overlap_scheduler=enable_overlap_scheduler,
+            disable_overlap_scheduler=disable_overlap_scheduler,
         )
     index_mapper_cls.assert_called_once()
     page_table.assert_called_once()
@@ -1621,38 +1621,39 @@ def _index_mapper_capacity_for(
     )
 
 
-# (max_batch_size, pp_size, adp, is_disagg, overlap, reserved, expected capacity)
+# (max_batch_size, pp_size, adp, is_disagg, disable_overlap, reserved, expected)
 #
-# capacity == max_batch_size * pp_size * (2 if is_disagg or (adp and overlap and
-# not pp) else 1) + reserved. Rows 1-2 are the nvbug 6627795 case: under
-# attention DP the overlap scheduler defers the retiring batch's teardown past
-# the point where its replacement is admitted, so both cohorts hold index slots
-# at once and a mapper sized at B+1 silently defers requests one at a time.
+# capacity == max_batch_size * pp_size * (2 if is_disagg or (adp and not
+# disable_overlap and not pp) else 1) + reserved. Rows 1-2 are the nvbug 6627795
+# case: under attention DP the overlap scheduler defers the retiring batch's
+# teardown past the point where its replacement is admitted, so both cohorts hold
+# index slots at once and a mapper sized at B+1 silently defers requests one at a
+# time.
 _INDEX_MAPPER_CAPACITY_CASES = [
     # ADP + overlap, no PP: both cohorts are resident, so the mapper needs 2B.
-    pytest.param(2, 1, True, False, True, 1, 5, id="adp_overlap"),
-    pytest.param(8, 1, True, False, True, 1, 17, id="adp_overlap_b8"),
+    pytest.param(2, 1, True, False, False, 1, 5, id="adp_overlap"),
+    pytest.param(8, 1, True, False, False, 1, 17, id="adp_overlap_b8"),
     # Either half of the conjunction missing leaves the pre-fix allocation.
-    pytest.param(2, 1, True, False, False, 1, 3, id="adp_no_overlap"),
-    pytest.param(2, 1, False, False, True, 1, 3, id="overlap_no_adp"),
+    pytest.param(2, 1, True, False, True, 1, 3, id="adp_no_overlap"),
+    pytest.param(2, 1, False, False, False, 1, 3, id="overlap_no_adp"),
     # Disagg already carried its own 2x; the two coefficients cover the same
     # extra cohort, so they do not compound.
-    pytest.param(2, 1, True, True, True, 1, 5, id="disagg_does_not_compound"),
-    pytest.param(2, 1, False, True, False, 1, 5, id="disagg_only"),
+    pytest.param(2, 1, True, True, False, 1, 5, id="disagg_does_not_compound"),
+    pytest.param(2, 1, False, True, True, 1, 5, id="disagg_only"),
     # Pipeline parallelism is out of scope: max_batch_size * pp_size already
     # covers the in-flight micro-batches, so the ADP coefficient stays off.
-    pytest.param(2, 4, True, False, True, 1, 9, id="pp4_adp_overlap"),
-    pytest.param(2, 4, False, False, False, 1, 9, id="pp4_plain"),
+    pytest.param(2, 4, True, False, False, 1, 9, id="pp4_adp_overlap"),
+    pytest.param(2, 4, False, False, True, 1, 9, id="pp4_plain"),
     # ... while the pre-existing disagg 2x under PP is left exactly as it was.
-    pytest.param(2, 4, False, True, False, 1, 17, id="pp4_disagg_unchanged"),
+    pytest.param(2, 4, False, True, True, 1, 17, id="pp4_disagg_unchanged"),
     # Reserved slots are still added on top of the widened pool.
-    pytest.param(2, 1, True, False, True, 5, 9, id="reserved_slots_still_added"),
+    pytest.param(2, 1, True, False, False, 5, 9, id="reserved_slots_still_added"),
 ]
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "max_batch_size,pp_size,adp,is_disagg,overlap,reserved,expected",
+    "max_batch_size,pp_size,adp,is_disagg,disable_overlap,reserved,expected",
     _INDEX_MAPPER_CAPACITY_CASES,
 )
 def test_index_mapper_capacity_covers_the_overlapping_cohorts(
@@ -1660,7 +1661,7 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     pp_size: int,
     adp: bool,
     is_disagg: bool,
-    overlap: bool,
+    disable_overlap: bool,
     reserved: int,
     expected: int,
 ) -> None:
@@ -1670,7 +1671,7 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
         is_disagg=is_disagg,
         num_reserved_index_slots=reserved,
         enable_attention_dp=adp,
-        enable_overlap_scheduler=overlap,
+        disable_overlap_scheduler=disable_overlap,
     )
     assert capacity == expected
     assert page_table_capacity == expected

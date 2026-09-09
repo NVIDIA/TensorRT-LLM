@@ -281,7 +281,7 @@ def test_sampler_uses_executor_slot_pool_capacity(slot_factor):
     assert args.max_num_sequences == max_num_sequences
 
 
-def _make_kv_cache_creator(enable_overlap_scheduler: bool) -> KvCacheCreator:
+def _make_kv_cache_creator(disable_overlap_scheduler: bool) -> KvCacheCreator:
     """Minimal creator whose only job is to reach _create_kv_cache_manager."""
     c = object.__new__(KvCacheCreator)
     c._mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
@@ -296,7 +296,7 @@ def _make_kv_cache_creator(enable_overlap_scheduler: bool) -> KvCacheCreator:
     c._kv_connector_manager = None
     c._execution_stream = None
     c._is_disagg = False
-    c._enable_overlap_scheduler = enable_overlap_scheduler
+    c._disable_overlap_scheduler = disable_overlap_scheduler
     # Short-circuit the post-construction max_seq_len fixup.
     c._skip_est = True
     c._get_model_kv_cache_manager_cls = Mock(return_value=Mock())
@@ -305,8 +305,8 @@ def _make_kv_cache_creator(enable_overlap_scheduler: bool) -> KvCacheCreator:
     return c
 
 
-@pytest.mark.parametrize("enable_overlap_scheduler", [False, True])
-def test_kv_cache_manager_receives_the_overlap_flag(enable_overlap_scheduler):
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_kv_cache_manager_receives_the_overlap_flag(disable_overlap_scheduler):
     """The manager sizes its own index pool, but needs the overlap flag to do it.
 
     The index pool must cover both the retiring cohort and its replacement when
@@ -316,7 +316,7 @@ def test_kv_cache_manager_receives_the_overlap_flag(enable_overlap_scheduler):
     capacity from ``max_batch_size * pp_size``, which is not comparable with a
     seat pool that also carries the PP multiplier.
     """
-    creator = _make_kv_cache_creator(enable_overlap_scheduler)
+    creator = _make_kv_cache_creator(disable_overlap_scheduler)
     model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
     )
@@ -327,4 +327,4 @@ def test_kv_cache_manager_receives_the_overlap_flag(enable_overlap_scheduler):
     ) as create:
         creator._create_kv_cache_manager(model_engine)
 
-    assert create.call_args.kwargs["enable_overlap_scheduler"] is enable_overlap_scheduler
+    assert create.call_args.kwargs["disable_overlap_scheduler"] is disable_overlap_scheduler

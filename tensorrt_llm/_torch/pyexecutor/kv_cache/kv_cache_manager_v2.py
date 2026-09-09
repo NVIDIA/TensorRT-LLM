@@ -931,7 +931,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
-        enable_overlap_scheduler: bool = False,
+        disable_overlap_scheduler: bool = False,
         is_estimating_kv_cache: bool = False,
         cold_page_codec_provider: Optional[object] = None,
         joint_kv_cache_reuse: bool = False,
@@ -1463,7 +1463,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # `max_num_sequences` already scales with the number of in-flight
         # microbatches.
         needs_extra_index_slots = is_disagg or (
-            mapping.enable_attention_dp and enable_overlap_scheduler and not mapping.has_pp()
+            mapping.enable_attention_dp and not disable_overlap_scheduler and not mapping.has_pp()
         )
         max_num_sequences = max_batch_size * mapping.pp_size
         assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
@@ -1473,7 +1473,7 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
             f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
-            f"enable_overlap_scheduler={enable_overlap_scheduler}, "
+            f"disable_overlap_scheduler={disable_overlap_scheduler}, "
             f"num_reserved_index_slots={num_reserved_index_slots}, "
             f"max_beam_width={max_beam_width})"
         )
