@@ -167,6 +167,10 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
 ### Triggering CI
 
+The new-contributor submission limit is implemented in `.github/workflows/pr-rate-limit.yml`;
+see `CONTRIBUTING.md` for the five-PR/24-hour policy and maintainer exemptions. Its mocked API tests
+run with `node --test .github/scripts/pr_rate_limit.test.js` and are registered in Release Checks.
+
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline
 - `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)

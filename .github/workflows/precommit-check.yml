@@ -36,6 +36,9 @@ jobs:
       - name: Test stale pull request cleanup workflow
         run: node .github/scripts/cleanup_stale_prs.test.js
 
+      - name: Test contributor PR rate limit workflow
+        run: node --test .github/scripts/pr_rate_limit.test.js
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

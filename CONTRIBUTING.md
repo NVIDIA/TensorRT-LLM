@@ -118,6 +118,19 @@ For NVIDIA developers,  please submit feature or bug fixes to the dedicated bran
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
+### Submission rate for new contributors
+
+Contributors with no merged PRs in this repository may submit up to five PRs per rolling 24 hours.
+Drafts and closed PRs count toward this limit. Please consolidate related changes into coherent,
+validated PRs. Excess submissions receive an explanation and are automatically closed after creation.
+The comment gives a time, 24 hours after that PR's creation, when it may be reopened for review.
+
+Users with write access and bot accounts are exempt. Maintainers can apply `pr-rate-limit-exempt`
+to an individual PR before reopening it. Administrators can exempt trusted contributors through the
+comma-separated `PR_RATE_LIMIT_EXEMPT_USERS` repository variable, or set `PR_RATE_LIMIT_DRY_RUN=true`
+to log decisions without commenting or closing. The workflow does not prevent independently triggered
+CI jobs from starting. If GitHub history cannot be read completely, it fails without closing the PR.
+
 ### Inactive pull requests
 
 TensorRT LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
