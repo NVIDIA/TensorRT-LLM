@@ -20,10 +20,8 @@ accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mg
 accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=True]
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=False]
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4

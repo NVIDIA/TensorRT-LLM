@@ -1122,9 +1122,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs={GSM8K: self.extra_evaluator_kwargs})
 
     @pytest.mark.skip_less_device(8)
+    # Two-model eagle3 (eagle3_one_model=False) is being removed (#18721),
+    # so only the one-model path is covered here.
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3(self, overlap_scheduler, eagle3_one_model, mocker):
+    def test_eagle3(self, overlap_scheduler, mocker):
         # Eagle3 disagg coverage kept on GPT-OSS; Qwen3.5 has no Eagle3 draft
         # checkpoint yet, so it cannot replace the Llama-3.1-8B Eagle3 case.
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
@@ -1135,7 +1136,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "max_draft_len": 3,
             "speculative_model":
             f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3",
-            "eagle3_one_model": eagle3_one_model
+            "eagle3_one_model": True
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1154,9 +1155,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cuda_graph_config": None,
         }
         gen_server_config = {
-            # Two-model eagle3 does not support overlap scheduler
-            "disable_overlap_scheduler": not eagle3_one_model
-            or not overlap_scheduler,
+            "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",

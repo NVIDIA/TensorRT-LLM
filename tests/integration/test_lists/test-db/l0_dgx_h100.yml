@@ -72,10 +72,8 @@ l0_dgx_h100:
       auto_trigger: gpt_oss
       orchestrator: mpi
   tests:
-  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
-  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=True]
-  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=False]
-  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
+  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=False]
+  - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=True]
 - condition:
     ranges:
       system_gpu_count:
