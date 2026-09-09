@@ -811,10 +811,10 @@ class Cosmos3CrossAttention(Attention):
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         if self._sequence_parallel:
-            if real_text_lens is None or global_generated_seq_len is None:
+            if global_generated_seq_len is None:
                 raise ValueError(
-                    "Sequence-parallel Cosmos3 cross-attention requires text and generated "
-                    "sequence lengths."
+                    "Sequence-parallel Cosmos3 cross-attention requires the generated "
+                    "sequence length."
                 )
             out = self._attn_impl(
                 q,
@@ -1299,6 +1299,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.cached_kv = None
         self.cached_real_text_lens = None
+        self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1588,6 +1589,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def reset_cache(self):
         self.cached_kv = None
         self.cached_real_text_lens = None
+        self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
         self.domain_ids_validated = False
@@ -1701,6 +1703,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         if self.cached_kv is None:
             self.cached_real_text_lens = text_mask.sum(dim=1).to(device="cpu", dtype=torch.int32)
+            real_text_lens_host = [int(length) for length in self.cached_real_text_lens.tolist()]
+            self.cached_text_lengths_uniform = bool(real_text_lens_host) and all(
+                length == real_text_lens_host[0] for length in real_text_lens_host
+            )
             max_real_len = int(self.cached_real_text_lens.max().item())
             # Trim the tower inputs as views so its per-layer K/V outputs have
             # the required length without copying every cached K/V tensor.
@@ -1728,16 +1734,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         if self.cached_real_text_lens is None:
             raise RuntimeError("Cosmos3 text lengths are missing from the K/V cache.")
+        if self.cached_text_lengths_uniform is None:
+            raise RuntimeError("Cosmos3 text-length uniformity is missing from the K/V cache.")
         real_text_lens = self.cached_real_text_lens
-        layer_text_lens = real_text_lens
-        if not self.sharder.is_active:
-            real_text_lens_host = [int(length) for length in real_text_lens.tolist()]
-            if real_text_lens_host and all(
-                length == real_text_lens_host[0] for length in real_text_lens_host
-            ):
-                # The text cache is already trimmed to this shared length, so
-                # the ordinary batched path is exact and remains fully compiled.
-                layer_text_lens = None
+        # The text cache is already trimmed to this shared length, so both
+        # unsharded and sequence-parallel paths can stay fully compiled.
+        layer_text_lens = None if self.cached_text_lengths_uniform else real_text_lens
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
@@ -1879,7 +1881,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         v_und,
                         freqs_gen,
                         timestep=timestep,
-                        real_text_lens=real_text_lens,
+                        real_text_lens=layer_text_lens,
                         global_generated_seq_len=S_gen,
                     )
 

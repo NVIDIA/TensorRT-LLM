@@ -148,6 +148,7 @@ class StubTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
         self.cached_real_text_lens = None
+        self.cached_text_lengths_uniform = None
         self.calls = []
         self.reset_calls = 0
 
@@ -156,6 +157,7 @@ class StubTransformer(nn.Module):
         self.cached_kv = None
         self.cached_freqs_gen = None
         self.cached_real_text_lens = None
+        self.cached_text_lengths_uniform = None
 
     def forward(self, *, hidden_states, timestep, raw_timestep, text_ids, text_mask, **kwargs):
         token = int(text_ids.reshape(-1)[0].item()) if text_ids.numel() else 0
@@ -176,6 +178,7 @@ class StubTransformer(nn.Module):
             self.cached_kv = [(marker, marker + 100)]
             self.cached_freqs_gen = (marker + 200, marker + 300)
             self.cached_real_text_lens = real_text_lens
+            self.cached_text_lengths_uniform = True
         else:
             torch.testing.assert_close(self.cached_real_text_lens, real_text_lens)
         control_bonus = 100 if control_latents is not None else 0

@@ -53,15 +53,20 @@ _REPLICATED_KV_KWARGS = (
 
 
 def _pop_replicated_kv(kwargs):
-    values = tuple(kwargs.pop(key, None) for key in _REPLICATED_KV_KWARGS)
-    if any(value is not None for value in values) and not all(
-        value is not None for value in values
+    replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len = (
+        kwargs.pop(key, None) for key in _REPLICATED_KV_KWARGS
+    )
+    required_values = (replicated_k, replicated_v, global_generated_seq_len)
+    if any(value is not None for value in required_values) and not all(
+        value is not None for value in required_values
     ):
         raise ValueError(
-            "Replicated K/V requires replicated_k, replicated_v, "
-            "replicated_k_lengths, and global_generated_seq_len."
+            "Replicated K/V requires replicated_k, replicated_v, and global_generated_seq_len."
         )
-    return values
+    if replicated_k_lengths is not None and replicated_k is None:
+        raise ValueError("Replicated K/V lengths require replicated K/V tensors.")
+    # None means every sample uses the complete, already-trimmed replicated cache.
+    return replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len
 
 
 @torch.compiler.disable
@@ -449,6 +454,21 @@ class UlyssesAttention(AttentionBackend):
                         "global_generated_seq_len": global_generated_seq_len,
                     }
                 )
+            elif replicated_k_lengths is None:
+                if not 0 <= global_generated_seq_len <= k.shape[1]:
+                    raise ValueError(
+                        "global_generated_seq_len must be within the generated K/V "
+                        f"sequence, got {global_generated_seq_len} for length {k.shape[1]}."
+                    )
+                k = torch.cat(
+                    [k[:, :global_generated_seq_len], replicated_k],
+                    dim=1,
+                )
+                v = torch.cat(
+                    [v[:, :global_generated_seq_len], replicated_v],
+                    dim=1,
+                )
+                kv_seq_len_full = k.shape[1]
             else:
                 output = _run_attention_with_replicated_kv(
                     self.inner_backend,
@@ -871,20 +891,49 @@ class Attention2DAttention(AttentionBackend):
                     max(global_generated_seq_len - shard_start, 0), shard_seq_kv
                 )
 
-            output, lse = _run_attention_with_replicated_kv(
-                self.inner_backend,
-                q,
-                k,
-                v,
-                replicated_k,
-                replicated_v,
-                replicated_k_lengths,
-                valid_generated_seq_len,
-                kwargs,
-                context_start=context_start,
-                context_end=context_end,
-                return_lse=True,
-            )
+            if replicated_k_lengths is None:
+                k = torch.cat(
+                    [
+                        k[:, :valid_generated_seq_len],
+                        replicated_k[:, context_start:context_end],
+                    ],
+                    dim=1,
+                )
+                v = torch.cat(
+                    [
+                        v[:, :valid_generated_seq_len],
+                        replicated_v[:, context_start:context_end],
+                    ],
+                    dim=1,
+                )
+                kv_seq_len = k.shape[1]
+                if self._inner_layout == AttentionTensorLayout.HND:
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                kwargs.update(
+                    {
+                        "batch_size": B,
+                        "seq_len": seq_len,
+                        "seq_len_kv": kv_seq_len,
+                    }
+                )
+                output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
+            else:
+                output, lse = _run_attention_with_replicated_kv(
+                    self.inner_backend,
+                    q,
+                    k,
+                    v,
+                    replicated_k,
+                    replicated_v,
+                    replicated_k_lengths,
+                    valid_generated_seq_len,
+                    kwargs,
+                    context_start=context_start,
+                    context_end=context_end,
+                    return_lse=True,
+                )
         else:
             if self._inner_layout == AttentionTensorLayout.HND:
                 q = q.transpose(1, 2)
