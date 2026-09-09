@@ -125,7 +125,8 @@ and keep up to five PRs open at a time. Drafts count toward both limits; closed 
 as submissions. Please consolidate related changes into coherent, validated PRs. Excess submissions
 or reopenings are automatically closed after creation or reopening. The initial explanation includes
 the observed counts; later retries reuse that comment, so its counts describe the original evaluation. An excess submission has a cooldown of 24 hours from its creation. After that cooldown,
-reopening still requires fewer than five other open PRs; waiting does not exempt an open backlog.
+ask a maintainer to reopen the PR when fewer than five other PRs are open; waiting does not exempt an
+open backlog. GitHub may prevent authors from reopening PRs closed by the bot.
 Concurrent submissions or reopenings may be closed while the observed open count exceeds five.
 
 Users with write access and bot accounts are exempt. Maintainers can apply `pr-rate-limit-exempt`

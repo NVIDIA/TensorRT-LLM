@@ -199,7 +199,7 @@ test('open-PR limit prevents reopening a backlog after the submission cooldown',
   const { writes } = await run({ current, history });
   assert.deepEqual(writes.map((w) => w.kind), ['comment', 'close']);
   assert.match(writes[0].body, /currently have 6 open PRs/);
-  assert.match(writes[0].body, /fewer than 5 of your other PRs are open/);
+  assert.match(writes[0].body, /ask a maintainer to reopen this PR when fewer than 5 of your other PRs are open/);
   assert.doesNotMatch(writes[0].body, /cooldown ends/);
   assert.deepEqual((await run({ current, history: history.slice(0, 4) })).writes, []);
 });

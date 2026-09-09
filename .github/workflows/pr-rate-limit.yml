@@ -146,7 +146,7 @@ jobs:
                 ' PRs per rolling 24 hours and keep up to ' + OPEN_LIMIT + ' PRs open, including drafts. ' +
                 'Closed PRs still count toward the submission limit.',
               (submissionExceeded ? 'The submission cooldown ends at ' + new Date(created + WINDOW_MS).toISOString() + '. ' : '') +
-                'You may reopen this PR only when fewer than ' + OPEN_LIMIT + ' of your other PRs are open' +
+                'You may ask a maintainer to reopen this PR when fewer than ' + OPEN_LIMIT + ' of your other PRs are open' +
                 (submissionExceeded ? ' and the submission cooldown has ended' : '') + '. ' +
                 'Please consolidate related changes into coherent, validated PRs, or ask a maintainer for an exception.',
               MARKER,
