@@ -135,10 +135,10 @@ def get_model_yaml_config(model_label: str,
                 'max_seq_len': 10240,
             }
         },
-        # DeepSeek V4 Pro-Base FP8 throughput settings for single-node 8xB300.
+        # DeepSeek V4 Pro-Base FP8 serving settings for single-node 8xB300.
         {
             'patterns': [
-                'deepseek_v4_pro_base_fp8-bench-pytorch-float8-maxbs:32-maxnt:8448',
+                'deepseek_v4_pro_base_fp8-serve-pytorch-float8-maxbs:32-maxnt:8448',
             ],
             'config': {
                 'enable_attention_dp': True,
