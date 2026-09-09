@@ -190,16 +190,21 @@ def extend_attention_op_pools_for_shared_draft_layers(
     ``(pool_pointers, pool_mapping, index_scales, kv_offsets, op_pools)`` with
     ``op_pools = [(attention_op_pool_id, source_storage_pool_id)]``.
     """
+    if pool_pointers.dim() == 3:
+        # NVFP4 pools carry [data, scale] pointer pairs; the draft layer's
+        # block-scale pages would need their own root and stride.
+        raise NotImplementedError(
+            "MiniMax-M3 shared Eagle3 draft layers do not support an NVFP4 KV cache."
+        )
     pointer_rows = pool_pointers.tolist()
     mapping_rows = pool_mapping.tolist()
-    nested = pool_pointers.dim() == 3  # NVFP4 carries [data, scale] pointer pairs
     index_scales: List[int] = []
     kv_offsets: List[int] = []
     op_pools: List[Tuple[int, int]] = []
     for i, (local_layer_idx, key_base_addr, sub_pages_per_slot) in enumerate(draft_layers):
         op_pool_id = num_pools + i
         source_pool_id = int(mapping_rows[local_layer_idx][0])
-        pointer_rows.append([[key_base_addr, 0], [0, 0]] if nested else [key_base_addr, 0])
+        pointer_rows.append([key_base_addr, 0])
         mapping_rows[local_layer_idx] = [op_pool_id, 0]
         index_scales.append(int(sub_pages_per_slot))
         kv_offsets.append(1)

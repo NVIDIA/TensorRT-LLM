@@ -500,10 +500,21 @@ def create_py_executor(
         # drafters, which it stranded on their private max_seq_len-dense arena.
         is_standalone_drafter = (spec_config.spec_dec_mode.is_dflash()
                                  or spec_config.spec_dec_mode.is_dspark())
-        # MiniMax-M3 always shares the target KV cache with its Eagle3 drafter.
+        # MiniMax-M3 supports one-model Eagle3 only; its drafter shares the
+        # target KV cache.
+        is_m3_eagle3 = (is_minimax_m3(m3_sparse_config)
+                        and spec_config.spec_dec_mode.is_eagle3_one_model())
         if ((cache_transceiver_config is not None and not is_standalone_drafter)
-                or is_minimax_m3(m3_sparse_config)):
+                or is_m3_eagle3):
             spec_config._allow_separate_draft_kv_cache = False
+        # The triton reference backend runs multi-token verify through its
+        # prefill builder, which cannot be CUDA-graph captured.
+        if (is_m3_eagle3 and m3_sparse_config.implementation != "msa"
+                and llm_args.cuda_graph_config is not None):
+            raise ValueError(
+                "MiniMax-M3 Eagle3 on the triton reference backend does not "
+                "support CUDA graphs; use implementation='msa' or set "
+                "cuda_graph_config=None.")
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(

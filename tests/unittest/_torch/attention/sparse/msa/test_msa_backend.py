@@ -764,12 +764,13 @@ def test_build_paged_kv_slot_mapping_out_cache_loc_matches_slot_grid():
 
 def test_msa_scratch_sizing_covers_spec_verify_tokens():
     """With Eagle3 a decode step has 1 + draft_len query tokens per request, so the
-    proxy scratch must be sized by tokens, not by batch.
+    proxy scratch must be sized by tokens, not by batch. The draft length comes
+    from the KV cache manager, which knows the speculative config at build time.
     """
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
-    metadata.kv_cache_manager = None
     # 2 sequences, 4 tokens each (draft_len=3): 8 decode tokens per step.
+    metadata.kv_cache_manager = SimpleNamespace(max_total_draft_tokens=3)
     metadata.max_num_sequences = 2
     metadata.max_num_tokens = 8
     # Store sized for batch-only sizing (4 heads * 16 k-tiles * 2), which is

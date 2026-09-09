@@ -1297,21 +1297,16 @@ class MiniMaxM3Attention(Attention):
                     )  # [1, H, q, d]
                 output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
-            # Decode: qo_len query tokens per request; token t of row b attends
-            # seq_lens[b] - qo_len + t + 1 positions (qo_len=1 is the usual mask).
-            qo_len = int(m3_meta.decode_qo_len)
-            ladder = torch.arange(1 - qo_len, 1, device=q.device, dtype=torch.long)
-            # eff[b, t] = attendable position count for token t of row b.
-            eff = seq_lens_dev.unsqueeze(-1) + ladder  # [batch, qo]
-            valid = kv_positions.unsqueeze(1) < eff.unsqueeze(-1)  # [batch, qo, max_k]
-            q_b = q_view.view(batch, qo_len, self.num_heads, self.head_dim).transpose(
+            # Decode: one query token per request at position seq_lens - 1.
+            valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
+            q_b = q_view.view(batch, 1, self.num_heads, self.head_dim).transpose(
                 1, 2
-            )  # [batch, H, qo, d]
-            mask_b = valid.unsqueeze(1)  # [batch, 1, qo, k]
+            )  # [batch, H, 1, d]
+            mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
             # Expand K/V one KV head at a time: all heads at once needs an
             # O(batch * max_k * num_heads) temporary that overflows the CUDA-graph
             # pool under attention DP.
-            out_b = q.new_empty(batch, self.num_heads, qo_len, self.head_dim)
+            out_b = q.new_empty(batch, self.num_heads, 1, self.head_dim)
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
                 for h in range(max(self.num_key_value_heads, 1)):
                     qh = slice(h * group, (h + 1) * group)
@@ -1324,10 +1319,10 @@ class MiniMaxM3Attention(Attention):
                         attn_mask=mask_b,
                         dropout_p=0.0,
                         is_causal=False,
-                    )  # [batch, group, qo, d]
-            # Copy through a token-major [batch, qo, H, dh] view; transpose(1, 2)
-            # .reshape would scramble (head, head_dim) when H != head_dim.
-            output.view(batch, qo_len, self.num_heads, self.head_dim).copy_(out_b.transpose(1, 2))
+                    )  # [batch, group, 1, d]
+            # Drop the singleton query axis; a transpose(1, 2).reshape would
+            # scramble (head, head_dim) when H != head_dim.
+            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
 
         return output
 

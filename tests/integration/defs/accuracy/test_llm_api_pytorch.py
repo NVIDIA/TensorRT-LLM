@@ -8916,8 +8916,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
-                                 attention_dp, overlap_scheduler, use_msa,
-                                 cuda_graph):
+                                 attention_dp, overlap_scheduler):
         """Disaggregated arm of test_nvfp4_eagle3.
 
         Context TP2 -> generation TP2 over NIXL on one 4-GPU node, block reuse
@@ -8925,9 +8924,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         acceptance probe, since accuracy alone does not notice a corrupted
         drafter KV (rejected drafts are re-verified).
         """
-        if not (overlap_scheduler and cuda_graph and use_msa):
-            pytest.skip("the disagg arm pins the production serving shape "
-                        "(overlap scheduler + CUDA graphs + MSA)")
         import requests
 
         from .test_disaggregated_serving import launch_disaggregated_llm
@@ -9084,29 +9080,29 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("disagg", [False, True])
-    @parametrize_with_ids("cuda_graph", [True])
-    @parametrize_with_ids("use_msa", [True])
-    @parametrize_with_ids("overlap_scheduler", [False, True])
+    # The disaggregated arm pins the production serving shape (overlap
+    # scheduler on), so the combinations are listed instead of a full grid.
+    @parametrize_with_ids("disagg,overlap_scheduler", [(False, False),
+                                                       (False, True),
+                                                       (True, True)])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa, cuda_graph, disagg):
-        # One-model Eagle3 on the MSA backend; the GQA drafter shares the
-        # target KV cache. MMLU + GSM8K plus a chat-GSM8K acceptance probe,
-        # since accuracy alone does not notice a corrupted drafter KV.
-        if use_msa:
-            from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import \
-                msa_package_available
-            if not msa_package_available():
-                pytest.skip("MSA kernels (fmha_sm100) not available")
+                          overlap_scheduler, disagg):
+        # One-model Eagle3 on the MSA backend with an FP8 KV cache and CUDA
+        # graphs; the GQA drafter shares the target KV cache. MMLU + GSM8K plus
+        # a chat-GSM8K acceptance probe, since accuracy alone does not notice a
+        # corrupted drafter KV.
+        from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import \
+            msa_package_available
+        if not msa_package_available():
+            pytest.skip("MSA kernels (fmha_sm100) not available")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
         max_draft_len = 3
         if disagg:
             self._run_nvfp4_eagle3_disagg(model_name, model_path, max_draft_len,
-                                          attention_dp, overlap_scheduler,
-                                          use_msa, cuda_graph)
+                                          attention_dp, overlap_scheduler)
             return
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
@@ -9115,26 +9111,24 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # The MSA path runs an FP8 KV cache, as in test_nvfp4.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
-                                        dtype="fp8" if use_msa else "auto")
+                                        dtype="fp8")
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=ep_size,
                 kv_cache_config=kv_cache_config,
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                    implementation="msa" if use_msa else "triton",
-                    indexer_kv_dtype="fp8" if use_msa else "bf16"),
+                    implementation="msa", indexer_kv_dtype="fp8"),
                 moe_config=MoeConfig(backend="CUTLASS"),
                 max_seq_len=4096,
                 # fmha_sm100 caps total_q x heads at 65536; with 4 verify
                 # tokens per row that is 512 (256 with unsharded heads).
                 max_batch_size=256 if attention_dp else 512,
                 speculative_config=spec_config,
-                # CUDA graphs + spec decoding needs the MSA path.
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
                     max_batch_size=64 if attention_dp else 128,
-                ) if cuda_graph else None,
+                ),
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
                 enable_iter_perf_stats=True,

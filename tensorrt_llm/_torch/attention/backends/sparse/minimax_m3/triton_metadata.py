@@ -93,8 +93,6 @@ class MiniMaxM3TritonSparseAttentionMetadata:
     prefix_lens: Optional[torch.Tensor] = None
     cu_seqlens_q: Optional[torch.Tensor] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
-    # Query tokens per request in decode: 1, or 1 + draft_len with Eagle3.
-    decode_qo_len: int = 1
     q_batch_row: Optional[torch.Tensor] = None
     q_positions: Optional[torch.Tensor] = None
     max_seqlen_q: int = field(default=1)

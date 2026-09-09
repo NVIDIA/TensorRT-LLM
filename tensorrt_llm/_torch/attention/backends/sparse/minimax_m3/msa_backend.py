@@ -93,7 +93,9 @@ def _worst_case_proxy_max_k_tiles(
 
 
 # Per-step fmha_sm100 plan tensors that must live in CUDA-graph-stable buffers.
-# At num_kv_splits=1 the plan carries no split-KV workspaces, and
+# The planner allocates each of them anew, and the launch reads seqused_k from
+# the plan too, so it needs a stable mirror like the worklists. At
+# num_kv_splits=1 the plan carries no split-KV workspaces, and
 # cute_workspace_buffer is the vendor's cached scratch (kept by reference, not
 # copied).
 _MSA_PLAN_STABLE_KEYS = (
@@ -105,6 +107,7 @@ _MSA_PLAN_STABLE_KEYS = (
     "qo_segment_lens",
     "kv_segment_lens",
     "qo_offset",
+    "seqused_k",
 )
 _MSA_PLAN_INT64_KEYS = ("packed_work_range", "packed_work_info")
 # fmha_sm100 sizes packed_work_info at 131072 * max(num_kv_splits, 1); forcing
@@ -471,16 +474,20 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_buffers_ready = True
 
     def _msa_max_decode_tokens(self) -> int:
-        """Worst-case query tokens in one decode step (1 + draft_len per row).
+        """Worst-case query tokens in one decode step: 1 + draft_len per row.
 
+        The KV cache manager knows the speculative config when this metadata is
+        built, so runs without speculative decoding size by max_num_sequences.
         Capped at 16384 so total_q * num_qo_heads stays under fmha_sm100's
         65536 planner limit with 4 index heads.
         """
         max_seqs = int(self.max_num_sequences)
+        draft_len = int(getattr(self.kv_cache_manager, "max_total_draft_tokens", 0) or 0)
+        tokens = max_seqs * (1 + draft_len)
         max_toks = int(self.max_num_tokens or 0)
-        if max_toks <= 0:
-            return max_seqs
-        return max(max_seqs, min(max_toks, 16384))
+        if max_toks > 0:
+            tokens = min(tokens, max_toks)
+        return max(max_seqs, min(tokens, 16384))
 
     def _alloc_msa_proxy_scratch(
         self,
@@ -658,6 +665,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             "qo_offset": (kv_true - qo_dev).clamp_min(0),
             "seqused_k": kv_true,
         }
+        # seqused_k mirrors the planner (kv length per row, 0 for an empty
+        # row). The clamp_min(1) on n_valid above is a different concern: it
+        # stops top-k from masking every block, which would NaN the GQA row.
         per_token = {
             "kv_segment_lens": kv_true_tok,
             "qo_offset": pos.clamp_min(0),
