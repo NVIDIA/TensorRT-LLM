@@ -203,12 +203,6 @@ _REQUEST_INPUT_FIELDS: dict[str, Any] = {
 }
 
 
-class VisualGenBenchMediaRef(MediaReferenceItem):
-    """One media reference in a workload document; ``format`` defaults to ``path``."""
-
-    format: Literal["path", "url", "base64"] = "path"
-
-
 def _reference_fields(backend: str) -> dict[str, Any]:
     """The reference slots this route carries.
 
@@ -216,7 +210,7 @@ def _reference_fields(backend: str) -> dict[str, Any]:
     declares. ``/v1/images/edits`` has a required ``image``, so its slot is
     required here rather than checked later.
     """
-    one_or_more = Union[VisualGenBenchMediaRef, list[VisualGenBenchMediaRef]]
+    one_or_more = Union[MediaReferenceItem, list[MediaReferenceItem]]
     required = backend == "openai-image-edits"
     return {
         slot: (one_or_more, ...) if required else (Optional[one_or_more], None)
@@ -439,7 +433,7 @@ def _resolve_reference(slot: str, reference: Any, base_dir: Path, index: int) ->
     """
     items = reference if isinstance(reference, list) else [reference]
     labels: list[str] = []
-    resolved: list[VisualGenBenchMediaRef] = []
+    resolved: list[MediaReferenceItem] = []
     for item in items:
         if item.format != "path":
             labels.append("<base64>" if item.format == "base64" else item.content)

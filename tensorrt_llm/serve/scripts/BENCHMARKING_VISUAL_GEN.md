@@ -48,7 +48,8 @@ requests:
   - prompt: A red fox trotting across a snowy field at dawn
   - prompt_file: prompts/aerial.json      # instead of prompt
     image_reference:
-      - content: ../media/frame.png       # format defaults to path
+      - content: ../media/frame.png
+        format: path
         role: first_frame
     width: 720                            # overrides common_params for this request
     height: 1280
@@ -84,8 +85,8 @@ rather than being replaced whole.
 #### File inputs
 
 `prompt_file` and `extra_params.action_file` are path strings. The three reference slots take
-the object `MediaReferenceItem` declares — `{content, format, role}`, `format` one of `path`
-(the default), `url` or `base64` — or a list of them. A relative path in any of these resolves
+the object `MediaReferenceItem` declares — `{content, format, role}`, `format` one of `path`,
+`url` or `base64` — or a list of them. A relative path in any of these resolves
 from the document, with `~` expanded and no variable expansion.
 
 | key | what it becomes |

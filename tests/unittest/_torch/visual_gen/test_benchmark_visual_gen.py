@@ -132,7 +132,10 @@ def test_cli_spelling_resolves_to_the_document_spelling(reference_file):
         "negative_prompt": "blurry",
         "extra_params": {"output_type": "video"},
     }
-    request = {"prompt": "a red fox", "image_reference": {"content": str(reference_file)}}
+    request = {
+        "prompt": "a red fox",
+        "image_reference": {"content": str(reference_file), "format": "path"},
+    }
     argv = ["--backend", "openai-videos", "--requests", json.dumps([request])]
     for key, value in fields.items():
         argv += [
@@ -232,7 +235,7 @@ def reference_file(tmp_path):
 def test_a_path_reference_goes_out_as_a_path(slot, reference_file):
     """Reading it here would fold the transfer into the measured request."""
     resolved = str(reference_file.resolve())
-    request = _workload(**{slot: {"content": str(reference_file)}}).requests[0]
+    request = _workload(**{slot: {"content": str(reference_file), "format": "path"}}).requests[0]
 
     assert getattr(request, slot).model_dump() == {
         "content": resolved,
@@ -256,7 +259,7 @@ def test_a_list_of_references_stays_a_list(reference_file):
     """Dropping one would condition the generation on less than the document said."""
     workload = _workload(
         image_reference=[
-            {"content": str(reference_file), "role": "first_frame"},
+            {"content": str(reference_file), "format": "path", "role": "first_frame"},
             {"content": "aGk=", "format": "base64", "role": "last_frame"},
         ]
     )
@@ -272,7 +275,7 @@ def test_a_list_of_references_stays_a_list(reference_file):
 @pytest.mark.parametrize("slot", REFERENCE_KEYS)
 def test_record_holds_the_locator_not_the_bytes(slot, reference_file):
     """A reference video is tens of MB; copying it per record dwarfs the result."""
-    workload = _workload(**{slot: {"content": str(reference_file)}})
+    workload = _workload(**{slot: {"content": str(reference_file), "format": "path"}})
     request = workload.requests[0]
     payload = build_payload(request, workload.backend, "m", "path", None)
     record = _make_record(0, request, payload)
@@ -321,7 +324,7 @@ def test_image_edits_requires_its_reference():
 
 def test_missing_reference_fails_before_the_run(tmp_path):
     with pytest.raises(ValueError, match="cannot read video_reference"):
-        _workload(video_reference={"content": str(tmp_path / "absent.mp4")})
+        _workload(video_reference={"content": str(tmp_path / "absent.mp4"), "format": "path"})
 
 
 @pytest.mark.parametrize(
