@@ -389,6 +389,11 @@ l0_b200:
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint); ~13 min, too heavy for pre_merge. Mirrors l0_gb300_multi_gpus.
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # Keep new full-corpus EAGLE-3 baselines in post_merge until repeated green
+  # runs establish stable references.
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[linear] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[dynamic] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]

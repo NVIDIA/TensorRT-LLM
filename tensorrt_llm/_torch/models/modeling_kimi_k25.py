@@ -1705,7 +1705,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     @property
     def mm_token_ids(self) -> torch.Tensor:
         """Surface the in-vocab media placeholder to the model engine so
-        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        ``runners.prepare_multimodal_indices`` selects the ``torch.isin`` predicate
         instead of the OOV (``>= vocab_size``) fallback (which would miss
         Kimi's placeholder and force ``fuse_input_embeds`` through the
         ``torch.where`` host-sync path on GPU input_ids).
@@ -1769,7 +1769,7 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # ``runners.prepare_multimodal_indices`` now sees Kimi's
             # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
             # that match ``find_input_mm_embeds``'s active-chunk slice. The
             # previous ``(input_ids == placeholder).sum().item()`` guard was a
