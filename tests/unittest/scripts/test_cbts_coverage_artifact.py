@@ -115,22 +115,22 @@ class CoverageArtifactTest(unittest.TestCase):
             _git(repo, "commit", "-m", "base")
             base = _git(repo, "rev-parse", "HEAD")
 
-            _git(repo, "switch", "-c", "pr")
+            _git(repo, "checkout", "-b", "pr")
             source.write_text("first\npr\nlast\n")
             _git(repo, "commit", "-am", "pr")
             head = _git(repo, "rev-parse", "HEAD")
 
-            _git(repo, "switch", "-c", "db-clean", base)
+            _git(repo, "checkout", "-b", "db-clean", base)
             (repo / "other.py").write_text("coverage revision\n")
             _git(repo, "add", "other.py")
             _git(repo, "commit", "-m", "non-conflicting db")
             clean_db = _git(repo, "rev-parse", "HEAD")
 
-            _git(repo, "switch", "-c", "db-conflict", base)
+            _git(repo, "checkout", "-b", "db-conflict", base)
             source.write_text("first\ndb\nlast\n")
             _git(repo, "commit", "-am", "conflicting db")
             conflicting_db = _git(repo, "rev-parse", "HEAD")
-            _git(repo, "switch", "pr")
+            _git(repo, "checkout", "pr")
 
             self.assertEqual(
                 artifact._patch_apply_status(base, head, clean_db, repo, str(repo)), "clean"
@@ -234,18 +234,30 @@ class CoverageArtifactTest(unittest.TestCase):
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
 
-    def test_prepare_declines_before_download_when_latest_db_conflicts(self) -> None:
-        selection = {"commit": "coverage-commit"}
-        with (
-            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
-            mock.patch.object(artifact, "select_tarball", return_value=selection),
-            mock.patch.object(artifact, "_patch_apply_status", return_value="conflict"),
-            mock.patch.object(artifact, "download") as download,
+    def test_git_timeout_returns_unknown_result(self) -> None:
+        with mock.patch.object(
+            artifact.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["git", "fetch"], 120),
         ):
-            ready = artifact.prepare("unused", "pr-head")
+            result = artifact._run_git(["fetch"], cwd=Path("."))
 
-        self.assertIsNone(ready)
-        download.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_prepare_declines_before_download_when_latest_db_is_not_usable(self) -> None:
+        for patch_status in ("conflict", "unknown"):
+            with self.subTest(patch_status=patch_status):
+                selection = {"commit": "coverage-commit"}
+                with (
+                    mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+                    mock.patch.object(artifact, "select_tarball", return_value=selection),
+                    mock.patch.object(artifact, "_patch_apply_status", return_value=patch_status),
+                    mock.patch.object(artifact, "download") as download,
+                ):
+                    ready = artifact.prepare("unused", "pr-head")
+
+                self.assertIsNone(ready)
+                download.assert_not_called()
 
     def test_freshness_default_is_thirty_commits(self) -> None:
         tree = ast.parse(_MAIN_PATH.read_text())

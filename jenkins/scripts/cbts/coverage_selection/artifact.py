@@ -77,6 +77,8 @@ _MAX_PROBE = 50
 _TIMEOUT = 15
 # Socket timeout for the tarball itself, which runs to hundreds of MB.
 _DOWNLOAD_TIMEOUT = 300
+# Timeout for local Git operations and the small fetches used by the patch check.
+_GIT_TIMEOUT = 120
 # Tarball download attempts.
 _RETRIES = 3
 
@@ -214,16 +216,23 @@ def _run_git(
     cwd: Path,
     input_data: Optional[bytes] = None,
     env: Optional[dict[str, str]] = None,
-) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        input=input_data,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        check=False,
-    )
+    timeout: int = _GIT_TIMEOUT,
+) -> Optional[subprocess.CompletedProcess[bytes]]:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            input=input_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        command = args[0] if args else "command"
+        print(f"[artifact] git {command} timed out after {timeout}s", file=sys.stderr)
+        return None
 
 
 def _patch_apply_status(
@@ -237,7 +246,8 @@ def _patch_apply_status(
     repo_source = repo_root.resolve()
     checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
     if (
-        checked_out_head.returncode != 0
+        checked_out_head is None
+        or checked_out_head.returncode != 0
         or checked_out_head.stdout.decode("ascii", "replace").strip() != pr_head
     ):
         print(f"[artifact] checked-out revision is not PR head {pr_head[:10]}", file=sys.stderr)
@@ -246,7 +256,7 @@ def _patch_apply_status(
         temp = Path(temp_dir)
         git_dir = temp / "repo.git"
         initialized = _run_git(["init", "--bare", str(git_dir)], cwd=temp)
-        if initialized.returncode != 0:
+        if initialized is None or initialized.returncode != 0:
             print("[artifact] could not initialize the patch-check repository", file=sys.stderr)
             return "unknown"
 
@@ -265,7 +275,7 @@ def _patch_apply_status(
             ],
             cwd=temp,
         )
-        if fetched_head.returncode != 0:
+        if fetched_head is None or fetched_head.returncode != 0:
             print(
                 f"[artifact] could not load PR head {pr_head[:10]} for patch check",
                 file=sys.stderr,
@@ -285,7 +295,7 @@ def _patch_apply_status(
             ],
             cwd=temp,
         )
-        if fetched_revisions.returncode != 0:
+        if fetched_revisions is None or fetched_revisions.returncode != 0:
             print(
                 "[artifact] could not load the base/coverage revisions for patch check",
                 file=sys.stderr,
@@ -304,7 +314,7 @@ def _patch_apply_status(
             ],
             cwd=temp,
         )
-        if diff.returncode != 0:
+        if diff is None or diff.returncode != 0:
             print("[artifact] could not generate the PR diff for patch check", file=sys.stderr)
             return "unknown"
 
@@ -314,7 +324,7 @@ def _patch_apply_status(
         read_tree = _run_git(
             ["--git-dir", str(git_dir), "read-tree", db_commit], cwd=temp, env=git_env
         )
-        if read_tree.returncode != 0:
+        if read_tree is None or read_tree.returncode != 0:
             print(
                 "[artifact] could not read the coverage revision for patch check",
                 file=sys.stderr,
@@ -335,6 +345,8 @@ def _patch_apply_status(
             input_data=diff.stdout,
             env=git_env,
         )
+        if applied is None:
+            return "unknown"
         return "clean" if applied.returncode == 0 else "conflict"
 
 
