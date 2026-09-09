@@ -193,6 +193,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_fixed_ssm_pool_group",
         "_event_manager",
         "__rawref__",
     )
@@ -206,6 +207,7 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _fixed_ssm_pool_group: PoolGroupIndex | None
     _event_manager: "KVCacheEventManager | None"
     __rawref__: rawref.ref["StorageManager"]
 
@@ -220,6 +222,7 @@ class StorageManager:
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
         max_util_for_resume: float = 1.0,
+        fixed_ssm_pool: bool = False,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -239,6 +242,15 @@ class StorageManager:
         self._slot_desc_list = config.slot_desc_list
         assert all(pg < self.num_pool_groups for pg in self._life_cycle_grouping)
         assert self.num_pool_groups == PoolGroupIndex(len(set(self._life_cycle_grouping)))
+        self._fixed_ssm_pool_group = None
+        ssm_life_cycle = life_cycles.ssm_life_cycle_id
+        if fixed_ssm_pool and initial_pool_ratio is None and ssm_life_cycle is not None:
+            ssm_pool_group = self._life_cycle_grouping[ssm_life_cycle]
+            attention_groups = [
+                self._life_cycle_grouping[lc] for lc, _ in life_cycles.attention_life_cycles()
+            ]
+            if attention_groups and ssm_pool_group not in attention_groups:
+                self._fixed_ssm_pool_group = ssm_pool_group
         slot_size_lists = typed_map(self._slot_desc_list, lambda pg: pg.slot_size_list)
 
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
@@ -852,7 +864,9 @@ class StorageManager:
                 f"Quota {new_quota} is insufficient for min_slots constraints "
                 f"(requires at least {min_quota})"
             )
-        new_num_slots = lvl_storage.compute_slot_count_list(new_ratio_list, min_slots, new_quota)
+        new_num_slots = lvl_storage.compute_slot_count_list(
+            self._allocation_ratio(level, new_ratio_list), min_slots, new_quota
+        )
         if level != num_cache_levels - 1:
             assert persistent_pages is None, (
                 "Persistent pages should be None for non-last level cache"
@@ -1082,6 +1096,18 @@ class StorageManager:
             for s in sizes
         )
 
+    def _allocation_ratio(
+        self,
+        level: CacheLevel,
+        ratio: TypedIndexList[PoolGroupIndex, float],
+    ) -> TypedIndexList[PoolGroupIndex, float]:
+        """Keep fixed hot SSM capacity at its constraint floor during every resize."""
+        if level != GPU_LEVEL or self._fixed_ssm_pool_group is None:
+            return ratio
+        weights = cast(TypedIndexList[PoolGroupIndex, float], list(ratio))
+        weights[self._fixed_ssm_pool_group] = 0.0
+        return weights
+
     def _compute_slot_count_for_level(
         self,
         level: CacheLevel,
@@ -1100,7 +1126,7 @@ class StorageManager:
             round_up(tier_config.quota, granularity),
         )
         return CacheLevelStorage.ratio_to_slot_count_list(
-            quota, slot_size_lists, ratio, granularity, min_slots
+            quota, slot_size_lists, self._allocation_ratio(level, ratio), granularity, min_slots
         )
 
     def constrain_pool_group_ratio(
@@ -1114,7 +1140,9 @@ class StorageManager:
         """
         gpu_storage = self._levels[GPU_LEVEL].storage
         granularity = gpu_storage.pool_size_granularity
-        slot_count_list = gpu_storage.compute_slot_count_list(ratio, self._min_slots)
+        slot_count_list = gpu_storage.compute_slot_count_list(
+            self._allocation_ratio(GPU_LEVEL, ratio), self._min_slots
+        )
         num_bytes = self._pool_group_slots_to_bytes(slot_count_list, granularity)
         total = sum(num_bytes)
         assert total > 0

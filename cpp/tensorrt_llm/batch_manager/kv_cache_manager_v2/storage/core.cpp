@@ -812,8 +812,9 @@ TypedVec<PoolGroupIndex, SlotCount> CacheLevelStorage::ratioToSlotCountList(size
 {
     PoolGroupIndex numPg = sizeLists.size();
     TLLM_CHECK_DEBUG(ratioList.size() == numPg);
-    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
-        "ratioToSlotCountList: all ratios must be positive");
+    TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(ratioList.begin(), ratioList.end(), [](auto x) { return x >= 0; })
+            && std::any_of(ratioList.begin(), ratioList.end(), [](auto x) { return x > 0; }),
+        "ratioToSlotCountList: ratios must be nonnegative with at least one positive weight");
     TLLM_CHECK_DEBUG(quota % granularity == 0);
     size_t totalGrains = quota / granularity;
     if (TLLM_UNLIKELY(gDebug))

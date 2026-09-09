@@ -279,6 +279,7 @@ class KVCacheManager:
             initial_pool_ratio=config.initial_pool_ratio,
             event_manager=event_manager,
             max_util_for_resume=config.max_util_for_resume,
+            fixed_ssm_pool=config.fixed_ssm_pool,
         )
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage

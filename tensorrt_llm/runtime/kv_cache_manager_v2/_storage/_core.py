@@ -820,7 +820,8 @@ class CacheLevelStorage:
         min_slots: TypedIndexList[PoolGroupIndex, int],
     ) -> TypedIndexList[PoolGroupIndex, int]:
         num_pool_groups = typed_len(ratio_list)
-        assert all(x > 0 for x in ratio_list)
+        # A zero weight pins that group to its grain-rounded min_slots floor.
+        assert all(x >= 0 for x in ratio_list) and any(x > 0 for x in ratio_list)
         assert num_pool_groups == typed_len(slot_size_lists)
         assert total_quota % pool_size_granularity == 0
         total_grains = total_quota // pool_size_granularity
