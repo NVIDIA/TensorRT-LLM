@@ -23,6 +23,7 @@ CUDA at construction, so these require a GPU, but no weights and no
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -41,7 +43,13 @@ _HIDDEN = 128
 _INTER = 256
 
 
-def test_workspace_reservation_covers_eager_prefill_capacity() -> None:
+@pytest.mark.parametrize(
+    ("max_batch_size", "max_tokens_per_seq", "max_num_tokens", "expected_tokens"),
+    ((4, 1, 256, 256), (4, 8, 16, 32)),
+)
+def test_workspace_reservation_uses_largest_token_capacity(
+    max_batch_size: int, max_tokens_per_seq: int, max_num_tokens: int, expected_tokens: int
+) -> None:
     reservations: list[tuple[int, int, int]] = []
 
     class _MoeStub(torch.nn.Module):
@@ -52,16 +60,25 @@ def test_workspace_reservation_covers_eager_prefill_capacity() -> None:
 
     model = torch.nn.Module()
     model.moe = _MoeStub()
-    manager = CudaGraphLoraManager.__new__(CudaGraphLoraManager)
-    manager.max_batch_size = 4
-    manager.max_tokens_per_seq = 1
-    manager.max_num_tokens = 256
-    manager.max_lora_rank = 16
-    manager.max_lora_size = 1
+    lora_model_config = LoraModelConfig(
+        lora_target_modules=[],
+        trtllm_modules_to_hf_modules={},
+        hidden_size=_HIDDEN,
+        dtype="bfloat16",
+    )
+    with patch("tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager.CudaGraphLoraParams"):
+        CudaGraphLoraManager(
+            max_lora_size=1,
+            max_batch_size=max_batch_size,
+            max_lora_rank=16,
+            model=model,
+            lora_model_config=lora_model_config,
+            device="cpu",
+            max_tokens_per_seq=max_tokens_per_seq,
+            max_num_tokens=max_num_tokens,
+        )
 
-    manager._reserve_moe_lora_workspaces(model)
-
-    assert reservations == [(256, 16, 1)]
+    assert reservations == [(expected_tokens, 16, 1)]
 
 
 class _ExtractStub:
