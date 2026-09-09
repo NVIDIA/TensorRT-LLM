@@ -533,7 +533,7 @@ struct KernelParams
         params.numExperts = data.numExperts;
         params.topK = data.topK;
         params.totalNumPaddedTokens = data.totalNumPaddedTokens;
-        params.hiddenDimPerBlock = data.hiddenDim;
+        params.hiddenDimPerBlock = 1;
         return params;
     }
 };

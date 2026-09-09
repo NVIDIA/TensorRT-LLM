@@ -5272,13 +5272,10 @@ class PyTorchModelEngine(ModelEngine):
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
         # are unchanged since the last full pass.
         previous_slots = self.previous_batch_indices_cuda[:num_requests]
-        torch.index_select(
-            new_tensors_device.new_tokens[0, :, :self.max_beam_width],
-            0,
-            previous_slots,
-            out=self.input_ids_cuda[:num_requests * self.max_beam_width].view(
-                num_requests, self.max_beam_width),
-        )
+        new_tokens = new_tensors_device.new_tokens[:1, previous_slots, :self.
+                                                   max_beam_width]
+        self.input_ids_cuda[:num_requests * self.max_beam_width].copy_(
+            new_tokens.flatten(), non_blocking=True)
 
         if not attn_metadata.is_cuda_graph:
             attn_metadata.seq_lens = cache['seq_lens_ones']
