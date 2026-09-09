@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import torch
 
 import tensorrt_llm
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
     MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
     _filter_cuda_graph_batch_sizes, _get_context_prompt_lookahead_token,
-    _make_single_token_context_graph_batch)
+    _get_num_heads_per_kv, _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
@@ -75,6 +75,28 @@ class DummyKvCacheConnectorWorker(KvCacheConnectorWorker):
 
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         pass
+
+
+def test_metadata_gqa_ratio_uses_model_provided_per_layer_kv_heads():
+
+    class StrictConfig:
+        num_hidden_layers = 12
+        num_attention_heads = 16
+
+        def __getattribute__(self, name):
+            if name == "num_key_value_heads":
+                raise RuntimeError(f"global geometry must not be read: {name}")
+            return super().__getattribute__(name)
+
+    model_config = ModelConfig(pretrained_config=StrictConfig())
+    model_config.set_kv_cache_layer_specs([
+        KVCacheLayerSpec(
+            head_dim=256,
+            num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
+        ) for layer_idx in range(12)
+    ])
+
+    assert _get_num_heads_per_kv(model_config) == 16
 
 
 class DummyModel(torch.nn.Module):

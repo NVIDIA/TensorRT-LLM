@@ -22,7 +22,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
-                    TypeVar)
+                    Sequence, Tuple, TypeVar)
 
 import filelock
 import torch
@@ -60,6 +60,25 @@ if TYPE_CHECKING:
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+
+@dataclass(frozen=True)
+class KVCacheLayerSpec:
+    """Model-provided, unsharded KV-cache geometry for one attention layer."""
+
+    head_dim: int
+    num_kv_heads: int
+    attention_window: Optional[int] = None
+
+
+def _get_kv_cache_layer_specs(
+    model_config: object, ) -> Optional[Sequence[KVCacheLayerSpec]]:
+    """Return concrete per-layer geometry from full or lightweight configs."""
+    layer_specs = getattr(model_config, "kv_cache_layer_specs", None)
+    if not isinstance(layer_specs, Sequence):
+        return None
+    return layer_specs
+
 
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
@@ -300,6 +319,16 @@ class ModelConfig(Generic[TConfig]):
 
     # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
     multimodal_config: MultimodalConfig | None = None
+
+    @property
+    def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:
+        """Return model-provided per-layer KV-cache geometry, if any."""
+        return self.extra_attrs.get("kv_cache_layer_specs")
+
+    def set_kv_cache_layer_specs(
+            self, layer_specs: Sequence[KVCacheLayerSpec]) -> None:
+        """Publish unsharded per-layer KV geometry to generic runtime code."""
+        self.extra_attrs["kv_cache_layer_specs"] = tuple(layer_specs)
 
     def __setattr__(self, key, value):
         """
