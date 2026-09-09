@@ -131,6 +131,31 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 )
 
 
+def _make_gpu_cache_tier_config(
+    quota: int, enable_locality_domains: bool = False
+) -> GpuCacheTierConfig:
+    """Construct GpuCacheTierConfig across Python and C++ backends."""
+    try:
+        return GpuCacheTierConfig(quota=int(quota), enable_locality_domains=enable_locality_domains)
+    except TypeError:
+        # The C++ binding only accepts quota; locality domains are Python-only.
+        return GpuCacheTierConfig(int(quota))
+
+
+def _make_reuse_scope(
+    lora_id: int | None,
+    salt: int | None,
+    locality_domain_id: int | None = None,
+) -> ReuseScope:
+    """Construct ReuseScope across bindings with and without locality domains."""
+    try:
+        return ReuseScope(lora_id=lora_id, salt=salt, locality_domain_id=locality_domain_id)
+    except TypeError:
+        if locality_domain_id is not None:
+            raise
+        return ReuseScope(lora_id=lora_id, salt=salt)
+
+
 class Role:
     KEY = DataRole("key")
     VALUE = DataRole("value")
@@ -967,6 +992,7 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
+        enable_locality_domains: bool = False,
         num_reserved_index_slots: int = 1,
         kv_events_config: Optional[KVEventsConfig] = None,
         is_estimating_kv_cache: bool = False,
@@ -1256,7 +1282,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
+        cache_tiers: List[CacheTierConfig] = [
+            _make_gpu_cache_tier_config(int(quota), enable_locality_domains)
+        ]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -1417,6 +1445,11 @@ class KVCacheManagerV2(BaseResourceManager):
         assert candidate is not None
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        # Cached at construction so the per-locality-domain metadata invariants
+        # stay stable for the manager's lifetime.
+        self._fork_join_attn = (
+            getattr(self.impl, "num_locality_domains", 1) > 1 and enable_locality_domains
+        )
         self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
@@ -2521,6 +2554,35 @@ class KVCacheManagerV2(BaseResourceManager):
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
+
+    @property
+    def num_locality_domains(self) -> int:
+        """Number of locality domains. Returns 1 for non-localized configurations."""
+        return getattr(self.impl, "num_locality_domains", 1)
+
+    def pick_locality_domain(self, request_id: int) -> int | None:
+        """Default locality domain placement for newly-created requests."""
+        if self.num_locality_domains <= 1:
+            return None
+        return request_id % self.num_locality_domains
+
+    def _request_locality_domain_id(self, req: LlmRequest) -> int | None:
+        """Return the request-owned locality domain id after validating the invariant."""
+        locality_domain_id = getattr(req, "py_locality_domain_id", None)
+        if self.num_locality_domains <= 1:
+            assert locality_domain_id is None or locality_domain_id == 0, (
+                "Non-localized requests must not use a nonzero locality_domain_id"
+            )
+            return None
+        assert locality_domain_id is not None, (
+            f"Request {req.py_request_id} must carry py_locality_domain_id "
+            "before localized KV-cache placement"
+        )
+        assert 0 <= locality_domain_id < self.num_locality_domains, (
+            f"locality_domain_id must be in [0, {self.num_locality_domains}), "
+            f"got {locality_domain_id}"
+        )
+        return locality_domain_id
 
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
