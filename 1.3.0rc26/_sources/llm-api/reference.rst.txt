@@ -1,0 +1,418 @@
+API Reference
+-------------
+
+.. note::
+    Since version 1.0, we have attached a status label to `LLM`, `LlmArgs` and `TorchLlmArgs` Classes.
+
+    1. :tag:`stable` - The item is stable and will keep consistent.
+    2. :tag:`prototype` - The item is a prototype and is subject to change.
+    3. :tag:`beta` - The item is in beta and approaching stability.
+    4. :tag:`deprecated` - The item is deprecated and will be removed in a future release.
+
+.. raw:: html
+
+    <script>
+      (() => {
+        const prefix = "#tensorrt_llm.llmapi.";
+        if (!window.location.hash.startsWith(prefix)) {
+          return;
+        }
+
+        const symbol = window.location.hash.slice(prefix.length).split(".", 1)[0];
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(symbol)) {
+          return;
+        }
+
+        const target = new URL(
+          `reference/${symbol}.html${window.location.hash}`,
+          window.location.href,
+        );
+        window.location.replace(target);
+      })();
+    </script>
+
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+
+    reference/LLM
+    reference/AsyncLLM
+    reference/MultimodalEncoder
+    reference/CompletionOutput
+    reference/RequestOutput
+    reference/GuidedDecodingParams
+    reference/SamplingParams
+    reference/DisaggregatedParams
+    reference/ConversationParams
+    reference/DisaggScheduleStyle
+    reference/BlockReuseConfig
+    reference/KvCacheConfig
+    reference/MambaStateConfig
+    reference/KvCacheRetentionConfig
+    reference/CudaGraphConfig
+    reference/DecodeCudaGraphConfig
+    reference/EncodeCudaGraphConfig
+    reference/MoeConfig
+    reference/EagleDecodingConfig
+    reference/Eagle3DecodingConfig
+    reference/MTPDecodingConfig
+    reference/SchedulerConfig
+    reference/CapacitySchedulerPolicy
+    reference/QuantConfig
+    reference/QuantAlgo
+    reference/CalibConfig
+    reference/RequestError
+    reference/MpiCommSession
+    reference/ExtendedRuntimePerfKnobConfig
+    reference/BatchingType
+    reference/ContextChunkingPolicy
+    reference/DynamicBatchConfig
+    reference/CacheTransceiverConfig
+    reference/NGramDecodingConfig
+    reference/PARDDecodingConfig
+    reference/DFlashDecodingConfig
+    reference/DSparkDecodingConfig
+    reference/SADecodingConfig
+    reference/SAEnhancerConfig
+    reference/UserProvidedDecodingConfig
+    reference/TorchCompileConfig
+    reference/DraftTargetDecodingConfig
+    reference/LlmArgs
+    reference/TorchLlmArgs
+    reference/AutoDecodingConfig
+    reference/AttentionDpConfig
+    reference/LoRARequest
+    reference/SaveHiddenStatesDecodingConfig
+    reference/RocketSparseAttentionConfig
+    reference/QSASparseAttentionConfig
+    reference/ReorderRequestPolicyConfig
+    reference/DeepSeekSparseAttentionConfig
+    reference/DeepSeekV4SparseAttentionConfig
+    reference/MiniMaxM3SparseAttentionConfig
+    reference/SchedulingParams
+    reference/SkipSoftmaxAttentionConfig
+    reference/ColdPageQuantizationCompressionConfig
+    reference/TriAttentionKvCacheCompressionConfig
+    reference/PrometheusMetricsConfig
+    reference/PrefillCudaGraphBackend
+    reference/ThinkingBudgetLogitsProcessor
+    reference/add_thinking_budget_logits_processor
+    reference/MultimodalConfig
+
+This page provides a searchable index of API names and parameters. Open an entry's full reference for complete member and inheritance documentation.
+
+.. autoclass:: tensorrt_llm.llmapi.LLM
+    :no-index:
+
+    :doc:`View the full LLM reference <reference/LLM>`
+
+.. autoclass:: tensorrt_llm.llmapi.AsyncLLM
+    :no-index:
+
+    :doc:`View the full AsyncLLM reference <reference/AsyncLLM>`
+
+.. autoclass:: tensorrt_llm.llmapi.MultimodalEncoder
+    :no-index:
+
+    :doc:`View the full MultimodalEncoder reference <reference/MultimodalEncoder>`
+
+.. autoclass:: tensorrt_llm.llmapi.CompletionOutput
+    :no-index:
+
+    :doc:`View the full CompletionOutput reference <reference/CompletionOutput>`
+
+.. autoclass:: tensorrt_llm.llmapi.RequestOutput
+    :no-index:
+
+    :doc:`View the full RequestOutput reference <reference/RequestOutput>`
+
+.. autoclass:: tensorrt_llm.llmapi.GuidedDecodingParams
+    :no-index:
+
+    :doc:`View the full GuidedDecodingParams reference <reference/GuidedDecodingParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.SamplingParams
+    :no-index:
+
+    :doc:`View the full SamplingParams reference <reference/SamplingParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.DisaggregatedParams
+    :no-index:
+
+    :doc:`View the full DisaggregatedParams reference <reference/DisaggregatedParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.ConversationParams
+    :no-index:
+
+    :doc:`View the full ConversationParams reference <reference/ConversationParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.DisaggScheduleStyle
+    :no-index:
+
+    :doc:`View the full DisaggScheduleStyle reference <reference/DisaggScheduleStyle>`
+
+.. autoclass:: tensorrt_llm.llmapi.BlockReuseConfig
+    :no-index:
+
+    :doc:`View the full BlockReuseConfig reference <reference/BlockReuseConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.KvCacheConfig
+    :no-index:
+
+    :doc:`View the full KvCacheConfig reference <reference/KvCacheConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.MambaStateConfig
+    :no-index:
+
+    :doc:`View the full MambaStateConfig reference <reference/MambaStateConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.KvCacheRetentionConfig
+    :no-index:
+
+    :doc:`View the full KvCacheRetentionConfig reference <reference/KvCacheRetentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.CudaGraphConfig
+    :no-index:
+
+    :doc:`View the full CudaGraphConfig reference <reference/CudaGraphConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DecodeCudaGraphConfig
+    :no-index:
+
+    :doc:`View the full DecodeCudaGraphConfig reference <reference/DecodeCudaGraphConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.EncodeCudaGraphConfig
+    :no-index:
+
+    :doc:`View the full EncodeCudaGraphConfig reference <reference/EncodeCudaGraphConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.MoeConfig
+    :no-index:
+
+    :doc:`View the full MoeConfig reference <reference/MoeConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.EagleDecodingConfig
+    :no-index:
+
+    :doc:`View the full EagleDecodingConfig reference <reference/EagleDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.Eagle3DecodingConfig
+    :no-index:
+
+    :doc:`View the full Eagle3DecodingConfig reference <reference/Eagle3DecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.MTPDecodingConfig
+    :no-index:
+
+    :doc:`View the full MTPDecodingConfig reference <reference/MTPDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.SchedulerConfig
+    :no-index:
+
+    :doc:`View the full SchedulerConfig reference <reference/SchedulerConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.CapacitySchedulerPolicy
+    :no-index:
+
+    :doc:`View the full CapacitySchedulerPolicy reference <reference/CapacitySchedulerPolicy>`
+
+.. autoclass:: tensorrt_llm.llmapi.QuantConfig
+    :no-index:
+
+    :doc:`View the full QuantConfig reference <reference/QuantConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.QuantAlgo
+    :no-index:
+
+    :doc:`View the full QuantAlgo reference <reference/QuantAlgo>`
+
+.. autoclass:: tensorrt_llm.llmapi.CalibConfig
+    :no-index:
+
+    :doc:`View the full CalibConfig reference <reference/CalibConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.RequestError
+    :no-index:
+
+    :doc:`View the full RequestError reference <reference/RequestError>`
+
+.. autoclass:: tensorrt_llm.llmapi.MpiCommSession
+    :no-index:
+
+    :doc:`View the full MpiCommSession reference <reference/MpiCommSession>`
+
+.. autoclass:: tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig
+    :no-index:
+
+    :doc:`View the full ExtendedRuntimePerfKnobConfig reference <reference/ExtendedRuntimePerfKnobConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.BatchingType
+    :no-index:
+
+    :doc:`View the full BatchingType reference <reference/BatchingType>`
+
+.. autoclass:: tensorrt_llm.llmapi.ContextChunkingPolicy
+    :no-index:
+
+    :doc:`View the full ContextChunkingPolicy reference <reference/ContextChunkingPolicy>`
+
+.. autoclass:: tensorrt_llm.llmapi.DynamicBatchConfig
+    :no-index:
+
+    :doc:`View the full DynamicBatchConfig reference <reference/DynamicBatchConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.CacheTransceiverConfig
+    :no-index:
+
+    :doc:`View the full CacheTransceiverConfig reference <reference/CacheTransceiverConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.NGramDecodingConfig
+    :no-index:
+
+    :doc:`View the full NGramDecodingConfig reference <reference/NGramDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.PARDDecodingConfig
+    :no-index:
+
+    :doc:`View the full PARDDecodingConfig reference <reference/PARDDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DFlashDecodingConfig
+    :no-index:
+
+    :doc:`View the full DFlashDecodingConfig reference <reference/DFlashDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DSparkDecodingConfig
+    :no-index:
+
+    :doc:`View the full DSparkDecodingConfig reference <reference/DSparkDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.SADecodingConfig
+    :no-index:
+
+    :doc:`View the full SADecodingConfig reference <reference/SADecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.SAEnhancerConfig
+    :no-index:
+
+    :doc:`View the full SAEnhancerConfig reference <reference/SAEnhancerConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.UserProvidedDecodingConfig
+    :no-index:
+
+    :doc:`View the full UserProvidedDecodingConfig reference <reference/UserProvidedDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.TorchCompileConfig
+    :no-index:
+
+    :doc:`View the full TorchCompileConfig reference <reference/TorchCompileConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DraftTargetDecodingConfig
+    :no-index:
+
+    :doc:`View the full DraftTargetDecodingConfig reference <reference/DraftTargetDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.LlmArgs
+    :no-index:
+
+    :doc:`View the full LlmArgs reference <reference/LlmArgs>`
+
+.. autoclass:: tensorrt_llm.llmapi.TorchLlmArgs
+    :no-index:
+
+    :doc:`View the full TorchLlmArgs reference <reference/TorchLlmArgs>`
+
+.. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
+    :no-index:
+
+    :doc:`View the full AutoDecodingConfig reference <reference/AutoDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.AttentionDpConfig
+    :no-index:
+
+    :doc:`View the full AttentionDpConfig reference <reference/AttentionDpConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.LoRARequest
+    :no-index:
+
+    :doc:`View the full LoRARequest reference <reference/LoRARequest>`
+
+.. autoclass:: tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig
+    :no-index:
+
+    :doc:`View the full SaveHiddenStatesDecodingConfig reference <reference/SaveHiddenStatesDecodingConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.RocketSparseAttentionConfig
+    :no-index:
+
+    :doc:`View the full RocketSparseAttentionConfig reference <reference/RocketSparseAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.QSASparseAttentionConfig
+    :no-index:
+
+    :doc:`View the full QSASparseAttentionConfig reference <reference/QSASparseAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.ReorderRequestPolicyConfig
+    :no-index:
+
+    :doc:`View the full ReorderRequestPolicyConfig reference <reference/ReorderRequestPolicyConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig
+    :no-index:
+
+    :doc:`View the full DeepSeekSparseAttentionConfig reference <reference/DeepSeekSparseAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig
+    :no-index:
+
+    :doc:`View the full DeepSeekV4SparseAttentionConfig reference <reference/DeepSeekV4SparseAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.MiniMaxM3SparseAttentionConfig
+    :no-index:
+
+    :doc:`View the full MiniMaxM3SparseAttentionConfig reference <reference/MiniMaxM3SparseAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.SchedulingParams
+    :no-index:
+
+    :doc:`View the full SchedulingParams reference <reference/SchedulingParams>`
+
+.. autoclass:: tensorrt_llm.llmapi.SkipSoftmaxAttentionConfig
+    :no-index:
+
+    :doc:`View the full SkipSoftmaxAttentionConfig reference <reference/SkipSoftmaxAttentionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.ColdPageQuantizationCompressionConfig
+    :no-index:
+
+    :doc:`View the full ColdPageQuantizationCompressionConfig reference <reference/ColdPageQuantizationCompressionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.TriAttentionKvCacheCompressionConfig
+    :no-index:
+
+    :doc:`View the full TriAttentionKvCacheCompressionConfig reference <reference/TriAttentionKvCacheCompressionConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.PrometheusMetricsConfig
+    :no-index:
+
+    :doc:`View the full PrometheusMetricsConfig reference <reference/PrometheusMetricsConfig>`
+
+.. autoclass:: tensorrt_llm.llmapi.PrefillCudaGraphBackend
+    :no-index:
+
+    :doc:`View the full PrefillCudaGraphBackend reference <reference/PrefillCudaGraphBackend>`
+
+.. autoclass:: tensorrt_llm.llmapi.ThinkingBudgetLogitsProcessor
+    :no-index:
+
+    :doc:`View the full ThinkingBudgetLogitsProcessor reference <reference/ThinkingBudgetLogitsProcessor>`
+
+.. autoclass:: tensorrt_llm.llmapi.add_thinking_budget_logits_processor
+    :no-index:
+
+    :doc:`View the full add_thinking_budget_logits_processor reference <reference/add_thinking_budget_logits_processor>`
+
+.. autoclass:: tensorrt_llm.llmapi.MultimodalConfig
+    :no-index:
+
+    :doc:`View the full MultimodalConfig reference <reference/MultimodalConfig>`
+

@@ -1,0 +1,28 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+tensor_parallel_size: 16
+moe_expert_parallel_size: 1
+pipeline_parallel_size: 1
+enable_attention_dp: false
+enable_lm_head_tp_in_adp: false
+disable_mm_encoder: true
+max_batch_size: 256
+max_num_tokens: 8960
+max_seq_len: 9472
+enable_chunked_prefill: false
+allreduce_strategy: AUTO
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.8
+  dtype: auto
+  mamba_ssm_cache_dtype: bfloat16
+moe_config:
+  backend: TRTLLM
+stream_interval: 10
+print_iter_log: false
+trust_remote_code: true
+num_postprocess_workers: 4

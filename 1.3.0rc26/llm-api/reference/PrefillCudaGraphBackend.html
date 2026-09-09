@@ -1,0 +1,1344 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>PrefillCudaGraphBackend &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=cb8930eaaf36d9849b67" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=4351f35f" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=cb8930eaaf36d9849b67"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=db50c9f4"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'llm-api/reference/PrefillCudaGraphBackend';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.21.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc26';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="ThinkingBudgetLogitsProcessor" href="ThinkingBudgetLogitsProcessor.html" />
+    <link rel="prev" title="PrometheusMetricsConfig" href="PrometheusMetricsConfig.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc26" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.8 MoE and Qwen3.5 MoE on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k3-on-trtllm.html">Deployment Guide for Kimi K3 on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">LLM API Introduction</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="../reference.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="LLM.html">LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AsyncLLM.html">AsyncLLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalEncoder.html">MultimodalEncoder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CompletionOutput.html">CompletionOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestOutput.html">RequestOutput</a></li>
+<li class="toctree-l2"><a class="reference internal" href="GuidedDecodingParams.html">GuidedDecodingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SamplingParams.html">SamplingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggregatedParams.html">DisaggregatedParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ConversationParams.html">ConversationParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DisaggScheduleStyle.html">DisaggScheduleStyle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BlockReuseConfig.html">BlockReuseConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheConfig.html">KvCacheConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MambaStateConfig.html">MambaStateConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="KvCacheRetentionConfig.html">KvCacheRetentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CudaGraphConfig.html">CudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DecodeCudaGraphConfig.html">DecodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EncodeCudaGraphConfig.html">EncodeCudaGraphConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MoeConfig.html">MoeConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="EagleDecodingConfig.html">EagleDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="Eagle3DecodingConfig.html">Eagle3DecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MTPDecodingConfig.html">MTPDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulerConfig.html">SchedulerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CapacitySchedulerPolicy.html">CapacitySchedulerPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantConfig.html">QuantConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QuantAlgo.html">QuantAlgo</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CalibConfig.html">CalibConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RequestError.html">RequestError</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MpiCommSession.html">MpiCommSession</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ExtendedRuntimePerfKnobConfig.html">ExtendedRuntimePerfKnobConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="BatchingType.html">BatchingType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ContextChunkingPolicy.html">ContextChunkingPolicy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DynamicBatchConfig.html">DynamicBatchConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="CacheTransceiverConfig.html">CacheTransceiverConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="NGramDecodingConfig.html">NGramDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PARDDecodingConfig.html">PARDDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DFlashDecodingConfig.html">DFlashDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DSparkDecodingConfig.html">DSparkDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SADecodingConfig.html">SADecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SAEnhancerConfig.html">SAEnhancerConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UserProvidedDecodingConfig.html">UserProvidedDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchCompileConfig.html">TorchCompileConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DraftTargetDecodingConfig.html">DraftTargetDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LlmArgs.html">LlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TorchLlmArgs.html">TorchLlmArgs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AutoDecodingConfig.html">AutoDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="AttentionDpConfig.html">AttentionDpConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="LoRARequest.html">LoRARequest</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SaveHiddenStatesDecodingConfig.html">SaveHiddenStatesDecodingConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="RocketSparseAttentionConfig.html">RocketSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="QSASparseAttentionConfig.html">QSASparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ReorderRequestPolicyConfig.html">ReorderRequestPolicyConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekSparseAttentionConfig.html">DeepSeekSparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="DeepSeekV4SparseAttentionConfig.html">DeepSeekV4SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MiniMaxM3SparseAttentionConfig.html">MiniMaxM3SparseAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SchedulingParams.html">SchedulingParams</a></li>
+<li class="toctree-l2"><a class="reference internal" href="SkipSoftmaxAttentionConfig.html">SkipSoftmaxAttentionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ColdPageQuantizationCompressionConfig.html">ColdPageQuantizationCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="TriAttentionKvCacheCompressionConfig.html">TriAttentionKvCacheCompressionConfig</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PrometheusMetricsConfig.html">PrometheusMetricsConfig</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">PrefillCudaGraphBackend</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ThinkingBudgetLogitsProcessor.html">ThinkingBudgetLogitsProcessor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="add_thinking_budget_logits_processor.html">add_thinking_budget_logits_processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MultimodalConfig.html">MultimodalConfig</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Prefill CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-cache-cold-page-codec.html">KVCacheManagerV2 Cold-Page Codec Design</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.html">Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.html">Evaluating Agentic Serving with Trace Replay and Job-Level Metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="../reference.html" class="nav-link">API Reference</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">PrefillCudaGraphBackend</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="prefillcudagraphbackend">
+<h1>PrefillCudaGraphBackend<a class="headerlink" href="#prefillcudagraphbackend" title="Link to this heading">#</a></h1>
+<dl class="py class">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend">
+<em class="property"><span class="pre">class</span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">tensorrt_llm.llmapi.</span></span><span class="sig-name descname"><span class="pre">PrefillCudaGraphBackend</span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">value</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">names=&lt;not</span> <span class="pre">given&gt;</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">*values</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">module=None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">qualname=None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">type=None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">start=1</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">boundary=None</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="reference internal" href="../../_modules/tensorrt_llm/llmapi/llm_args.html#PrefillCudaGraphBackend"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <code class="xref py py-class docutils literal notranslate"><span class="pre">StrEnum</span></code></p>
+<p>CUDA graph implementation used for prefill requests.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwds</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.__init__" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.capitalize">
+<span class="sig-name descname"><span class="pre">capitalize</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.capitalize" title="Link to this definition">#</a></dt>
+<dd><p>Return a capitalized version of the string.</p>
+<p>More specifically, make the first character have upper case and the rest lower
+case.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.casefold">
+<span class="sig-name descname"><span class="pre">casefold</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.casefold" title="Link to this definition">#</a></dt>
+<dd><p>Return a version of the string suitable for caseless comparisons.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.center">
+<span class="sig-name descname"><span class="pre">center</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fillchar</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'</span> <span class="pre">'</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.center" title="Link to this definition">#</a></dt>
+<dd><p>Return a centered string of length width.</p>
+<p>Padding is done using the specified fill character (default is a space).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.count">
+<span class="sig-name descname"><span class="pre">count</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sub</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.count" title="Link to this definition">#</a></dt>
+<dd><p>Return the number of non-overlapping occurrences of substring sub in
+string S[start:end].  Optional arguments start and end are
+interpreted as in slice notation.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.encode">
+<span class="sig-name descname"><span class="pre">encode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">encoding</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'utf-8'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">errors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'strict'</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.encode" title="Link to this definition">#</a></dt>
+<dd><p>Encode the string using the codec registered for encoding.</p>
+<dl class="simple">
+<dt>encoding</dt><dd><p>The encoding in which to encode the string.</p>
+</dd>
+<dt>errors</dt><dd><p>The error handling scheme to use for encoding errors.
+The default is ‘strict’ meaning that encoding errors raise a
+UnicodeEncodeError.  Other possible values are ‘ignore’, ‘replace’ and
+‘xmlcharrefreplace’ as well as any other name registered with
+codecs.register_error that can handle UnicodeEncodeErrors.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.endswith">
+<span class="sig-name descname"><span class="pre">endswith</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">suffix</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">bool</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.endswith" title="Link to this definition">#</a></dt>
+<dd><p>Return True if S ends with the specified suffix, False otherwise.
+With optional start, test S beginning at that position.
+With optional end, stop comparing S at that position.
+suffix can also be a tuple of strings to try.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.expandtabs">
+<span class="sig-name descname"><span class="pre">expandtabs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tabsize</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">8</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.expandtabs" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy where all tab characters are expanded using spaces.</p>
+<p>If tabsize is not given, a tab size of 8 characters is assumed.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.find">
+<span class="sig-name descname"><span class="pre">find</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sub</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.find" title="Link to this definition">#</a></dt>
+<dd><p>Return the lowest index in S where substring sub is found,
+such that sub is contained within S[start:end].  Optional
+arguments start and end are interpreted as in slice notation.</p>
+<p>Return -1 on failure.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.format">
+<span class="sig-name descname"><span class="pre">format</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">str</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.format" title="Link to this definition">#</a></dt>
+<dd><p>Return a formatted version of S, using substitutions from args and kwargs.
+The substitutions are identified by braces (‘{’ and ‘}’).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.format_map">
+<span class="sig-name descname"><span class="pre">format_map</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mapping</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">str</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.format_map" title="Link to this definition">#</a></dt>
+<dd><p>Return a formatted version of S, using substitutions from mapping.
+The substitutions are identified by braces (‘{’ and ‘}’).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.index">
+<span class="sig-name descname"><span class="pre">index</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sub</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.index" title="Link to this definition">#</a></dt>
+<dd><p>Return the lowest index in S where substring sub is found,
+such that sub is contained within S[start:end].  Optional
+arguments start and end are interpreted as in slice notation.</p>
+<p>Raises ValueError when the substring is not found.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalnum">
+<span class="sig-name descname"><span class="pre">isalnum</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalnum" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is an alpha-numeric string, False otherwise.</p>
+<p>A string is alpha-numeric if all characters in the string are alpha-numeric and
+there is at least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalpha">
+<span class="sig-name descname"><span class="pre">isalpha</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalpha" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is an alphabetic string, False otherwise.</p>
+<p>A string is alphabetic if all characters in the string are alphabetic and there
+is at least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isascii">
+<span class="sig-name descname"><span class="pre">isascii</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isascii" title="Link to this definition">#</a></dt>
+<dd><p>Return True if all characters in the string are ASCII, False otherwise.</p>
+<p>ASCII characters have code points in the range U+0000-U+007F.
+Empty string is ASCII too.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdecimal">
+<span class="sig-name descname"><span class="pre">isdecimal</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdecimal" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a decimal string, False otherwise.</p>
+<p>A string is a decimal string if all characters in the string are decimal and
+there is at least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdigit">
+<span class="sig-name descname"><span class="pre">isdigit</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdigit" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a digit string, False otherwise.</p>
+<p>A string is a digit string if all characters in the string are digits and there
+is at least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isidentifier">
+<span class="sig-name descname"><span class="pre">isidentifier</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isidentifier" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a valid Python identifier, False otherwise.</p>
+<p>Call keyword.iskeyword(s) to test whether string s is a reserved identifier,
+such as “def” or “class”.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.islower">
+<span class="sig-name descname"><span class="pre">islower</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.islower" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a lowercase string, False otherwise.</p>
+<p>A string is lowercase if all cased characters in the string are lowercase and
+there is at least one cased character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isnumeric">
+<span class="sig-name descname"><span class="pre">isnumeric</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isnumeric" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a numeric string, False otherwise.</p>
+<p>A string is numeric if all characters in the string are numeric and there is at
+least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isprintable">
+<span class="sig-name descname"><span class="pre">isprintable</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isprintable" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is printable, False otherwise.</p>
+<p>A string is printable if all of its characters are considered printable in
+repr() or if it is empty.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isspace">
+<span class="sig-name descname"><span class="pre">isspace</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isspace" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a whitespace string, False otherwise.</p>
+<p>A string is whitespace if all characters in the string are whitespace and there
+is at least one character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.istitle">
+<span class="sig-name descname"><span class="pre">istitle</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.istitle" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is a title-cased string, False otherwise.</p>
+<p>In a title-cased string, upper- and title-case characters may only
+follow uncased characters and lowercase characters only cased ones.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.isupper">
+<span class="sig-name descname"><span class="pre">isupper</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isupper" title="Link to this definition">#</a></dt>
+<dd><p>Return True if the string is an uppercase string, False otherwise.</p>
+<p>A string is uppercase if all cased characters in the string are uppercase and
+there is at least one cased character in the string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.join">
+<span class="sig-name descname"><span class="pre">join</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">iterable</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.join" title="Link to this definition">#</a></dt>
+<dd><p>Concatenate any number of strings.</p>
+<p>The string whose method is called is inserted in between each given string.
+The result is returned as a new string.</p>
+<p>Example: ‘.’.join([‘ab’, ‘pq’, ‘rs’]) -&gt; ‘ab.pq.rs’</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.ljust">
+<span class="sig-name descname"><span class="pre">ljust</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fillchar</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'</span> <span class="pre">'</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.ljust" title="Link to this definition">#</a></dt>
+<dd><p>Return a left-justified string of length width.</p>
+<p>Padding is done using the specified fill character (default is a space).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.lower">
+<span class="sig-name descname"><span class="pre">lower</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.lower" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy of the string converted to lowercase.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.lstrip">
+<span class="sig-name descname"><span class="pre">lstrip</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chars</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.lstrip" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy of the string with leading whitespace removed.</p>
+<p>If chars is given and not None, remove characters in chars instead.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.maketrans">
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">maketrans</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.maketrans" title="Link to this definition">#</a></dt>
+<dd><p>Return a translation table usable for str.translate().</p>
+<p>If there is only one argument, it must be a dictionary mapping Unicode
+ordinals (integers) or characters to Unicode ordinals, strings or None.
+Character keys will be then converted to ordinals.
+If there are two arguments, they must be strings of equal length, and
+in the resulting dictionary, each character in x will be mapped to the
+character at the same position in y. If there is a third argument, it
+must be a string, whose characters will be mapped to None in the result.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.partition">
+<span class="sig-name descname"><span class="pre">partition</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sep</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.partition" title="Link to this definition">#</a></dt>
+<dd><p>Partition the string into three parts using the given separator.</p>
+<p>This will search for the separator in the string.  If the separator is found,
+returns a 3-tuple containing the part before the separator, the separator
+itself, and the part after it.</p>
+<p>If the separator is not found, returns a 3-tuple containing the original string
+and two empty strings.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.removeprefix">
+<span class="sig-name descname"><span class="pre">removeprefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.removeprefix" title="Link to this definition">#</a></dt>
+<dd><p>Return a str with the given prefix string removed if present.</p>
+<p>If the string starts with the prefix string, return string[len(prefix):].
+Otherwise, return a copy of the original string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.removesuffix">
+<span class="sig-name descname"><span class="pre">removesuffix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">suffix</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.removesuffix" title="Link to this definition">#</a></dt>
+<dd><p>Return a str with the given suffix string removed if present.</p>
+<p>If the string ends with the suffix string and that suffix is not empty,
+return string[:-len(suffix)]. Otherwise, return a copy of the original
+string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.replace">
+<span class="sig-name descname"><span class="pre">replace</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">old</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">new</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.replace" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy with all occurrences of substring old replaced by new.</p>
+<blockquote>
+<div><dl class="simple">
+<dt>count</dt><dd><p>Maximum number of occurrences to replace.
+-1 (the default value) means replace all occurrences.</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>If the optional argument count is given, only the first count occurrences are
+replaced.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rfind">
+<span class="sig-name descname"><span class="pre">rfind</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sub</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rfind" title="Link to this definition">#</a></dt>
+<dd><p>Return the highest index in S where substring sub is found,
+such that sub is contained within S[start:end].  Optional
+arguments start and end are interpreted as in slice notation.</p>
+<p>Return -1 on failure.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rindex">
+<span class="sig-name descname"><span class="pre">rindex</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sub</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rindex" title="Link to this definition">#</a></dt>
+<dd><p>Return the highest index in S where substring sub is found,
+such that sub is contained within S[start:end].  Optional
+arguments start and end are interpreted as in slice notation.</p>
+<p>Raises ValueError when the substring is not found.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rjust">
+<span class="sig-name descname"><span class="pre">rjust</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fillchar</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'</span> <span class="pre">'</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rjust" title="Link to this definition">#</a></dt>
+<dd><p>Return a right-justified string of length width.</p>
+<p>Padding is done using the specified fill character (default is a space).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rpartition">
+<span class="sig-name descname"><span class="pre">rpartition</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sep</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rpartition" title="Link to this definition">#</a></dt>
+<dd><p>Partition the string into three parts using the given separator.</p>
+<p>This will search for the separator in the string, starting at the end. If
+the separator is found, returns a 3-tuple containing the part before the
+separator, the separator itself, and the part after it.</p>
+<p>If the separator is not found, returns a 3-tuple containing two empty strings
+and the original string.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rsplit">
+<span class="sig-name descname"><span class="pre">rsplit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sep</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxsplit</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rsplit" title="Link to this definition">#</a></dt>
+<dd><p>Return a list of the substrings in the string, using sep as the separator string.</p>
+<blockquote>
+<div><dl>
+<dt>sep</dt><dd><p>The separator used to split the string.</p>
+<p>When set to None (the default value), will split on any whitespace
+character (including n r t f and spaces) and will discard
+empty strings from the result.</p>
+</dd>
+<dt>maxsplit</dt><dd><p>Maximum number of splits.
+-1 (the default value) means no limit.</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>Splitting starts at the end of the string and works to the front.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.rstrip">
+<span class="sig-name descname"><span class="pre">rstrip</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chars</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rstrip" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy of the string with trailing whitespace removed.</p>
+<p>If chars is given and not None, remove characters in chars instead.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.split">
+<span class="sig-name descname"><span class="pre">split</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">sep</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxsplit</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.split" title="Link to this definition">#</a></dt>
+<dd><p>Return a list of the substrings in the string, using sep as the separator string.</p>
+<blockquote>
+<div><dl>
+<dt>sep</dt><dd><p>The separator used to split the string.</p>
+<p>When set to None (the default value), will split on any whitespace
+character (including n r t f and spaces) and will discard
+empty strings from the result.</p>
+</dd>
+<dt>maxsplit</dt><dd><p>Maximum number of splits.
+-1 (the default value) means no limit.</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>Splitting starts at the front of the string and works to the end.</p>
+<p>Note, str.split() is mainly useful for data that has been intentionally
+delimited.  With natural text that includes punctuation, consider using
+the regular expression module.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.splitlines">
+<span class="sig-name descname"><span class="pre">splitlines</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">keepends</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.splitlines" title="Link to this definition">#</a></dt>
+<dd><p>Return a list of the lines in the string, breaking at line boundaries.</p>
+<p>Line breaks are not included in the resulting list unless keepends is given and
+true.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.startswith">
+<span class="sig-name descname"><span class="pre">startswith</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">prefix</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">start</span></span></em><span class="optional">[</span>, <em class="sig-param"><span class="n"><span class="pre">end</span></span></em><span class="optional">]</span><span class="optional">]</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">bool</span></span></span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.startswith" title="Link to this definition">#</a></dt>
+<dd><p>Return True if S starts with the specified prefix, False otherwise.
+With optional start, test S beginning at that position.
+With optional end, stop comparing S at that position.
+prefix can also be a tuple of strings to try.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.strip">
+<span class="sig-name descname"><span class="pre">strip</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">chars</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.strip" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy of the string with leading and trailing whitespace removed.</p>
+<p>If chars is given and not None, remove characters in chars instead.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.swapcase">
+<span class="sig-name descname"><span class="pre">swapcase</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.swapcase" title="Link to this definition">#</a></dt>
+<dd><p>Convert uppercase characters to lowercase and lowercase characters to uppercase.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.title">
+<span class="sig-name descname"><span class="pre">title</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.title" title="Link to this definition">#</a></dt>
+<dd><p>Return a version of the string where each word is titlecased.</p>
+<p>More specifically, words start with uppercased characters and all remaining
+cased characters have lower case.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.translate">
+<span class="sig-name descname"><span class="pre">translate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">table</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.translate" title="Link to this definition">#</a></dt>
+<dd><p>Replace each character in the string using the given translation table.</p>
+<blockquote>
+<div><dl class="simple">
+<dt>table</dt><dd><p>Translation table, which must be a mapping of Unicode ordinals to
+Unicode ordinals, strings, or None.</p>
+</dd>
+</dl>
+</div></blockquote>
+<p>The table must implement lookup/indexing via __getitem__, for instance a
+dictionary or list.  If this operation raises LookupError, the character is
+left untouched.  Characters mapped to None are deleted.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.upper">
+<span class="sig-name descname"><span class="pre">upper</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.upper" title="Link to this definition">#</a></dt>
+<dd><p>Return a copy of the string converted to uppercase.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.zfill">
+<span class="sig-name descname"><span class="pre">zfill</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">width</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">/</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.zfill" title="Link to this definition">#</a></dt>
+<dd><p>Pad a numeric string with zeros on the left, to fill a field of the given width.</p>
+<p>The string is never truncated.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.BREAKABLE">
+<span class="sig-name descname"><span class="pre">BREAKABLE</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'breakable'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.BREAKABLE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.DISABLED">
+<span class="sig-name descname"><span class="pre">DISABLED</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'disabled'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.DISABLED" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.llmapi.PrefillCudaGraphBackend.PIECEWISE">
+<span class="sig-name descname"><span class="pre">PIECEWISE</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'piecewise'</span></em><a class="headerlink" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.PIECEWISE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="PrometheusMetricsConfig.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">PrometheusMetricsConfig</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="ThinkingBudgetLogitsProcessor.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">ThinkingBudgetLogitsProcessor</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend"><code class="docutils literal notranslate"><span class="pre">PrefillCudaGraphBackend</span></code></a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.__init__"><code class="docutils literal notranslate"><span class="pre">__init__()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.capitalize"><code class="docutils literal notranslate"><span class="pre">capitalize()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.casefold"><code class="docutils literal notranslate"><span class="pre">casefold()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.center"><code class="docutils literal notranslate"><span class="pre">center()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.count"><code class="docutils literal notranslate"><span class="pre">count()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.encode"><code class="docutils literal notranslate"><span class="pre">encode()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.endswith"><code class="docutils literal notranslate"><span class="pre">endswith()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.expandtabs"><code class="docutils literal notranslate"><span class="pre">expandtabs()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.find"><code class="docutils literal notranslate"><span class="pre">find()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.format"><code class="docutils literal notranslate"><span class="pre">format()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.format_map"><code class="docutils literal notranslate"><span class="pre">format_map()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.index"><code class="docutils literal notranslate"><span class="pre">index()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalnum"><code class="docutils literal notranslate"><span class="pre">isalnum()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isalpha"><code class="docutils literal notranslate"><span class="pre">isalpha()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isascii"><code class="docutils literal notranslate"><span class="pre">isascii()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdecimal"><code class="docutils literal notranslate"><span class="pre">isdecimal()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isdigit"><code class="docutils literal notranslate"><span class="pre">isdigit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isidentifier"><code class="docutils literal notranslate"><span class="pre">isidentifier()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.islower"><code class="docutils literal notranslate"><span class="pre">islower()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isnumeric"><code class="docutils literal notranslate"><span class="pre">isnumeric()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isprintable"><code class="docutils literal notranslate"><span class="pre">isprintable()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isspace"><code class="docutils literal notranslate"><span class="pre">isspace()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.istitle"><code class="docutils literal notranslate"><span class="pre">istitle()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.isupper"><code class="docutils literal notranslate"><span class="pre">isupper()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.join"><code class="docutils literal notranslate"><span class="pre">join()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.ljust"><code class="docutils literal notranslate"><span class="pre">ljust()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.lower"><code class="docutils literal notranslate"><span class="pre">lower()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.lstrip"><code class="docutils literal notranslate"><span class="pre">lstrip()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.maketrans"><code class="docutils literal notranslate"><span class="pre">maketrans()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.partition"><code class="docutils literal notranslate"><span class="pre">partition()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.removeprefix"><code class="docutils literal notranslate"><span class="pre">removeprefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.removesuffix"><code class="docutils literal notranslate"><span class="pre">removesuffix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.replace"><code class="docutils literal notranslate"><span class="pre">replace()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rfind"><code class="docutils literal notranslate"><span class="pre">rfind()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rindex"><code class="docutils literal notranslate"><span class="pre">rindex()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rjust"><code class="docutils literal notranslate"><span class="pre">rjust()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rpartition"><code class="docutils literal notranslate"><span class="pre">rpartition()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rsplit"><code class="docutils literal notranslate"><span class="pre">rsplit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.rstrip"><code class="docutils literal notranslate"><span class="pre">rstrip()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.split"><code class="docutils literal notranslate"><span class="pre">split()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.splitlines"><code class="docutils literal notranslate"><span class="pre">splitlines()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.startswith"><code class="docutils literal notranslate"><span class="pre">startswith()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.strip"><code class="docutils literal notranslate"><span class="pre">strip()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.swapcase"><code class="docutils literal notranslate"><span class="pre">swapcase()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.title"><code class="docutils literal notranslate"><span class="pre">title()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.translate"><code class="docutils literal notranslate"><span class="pre">translate()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.upper"><code class="docutils literal notranslate"><span class="pre">upper()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.zfill"><code class="docutils literal notranslate"><span class="pre">zfill()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.BREAKABLE"><code class="docutils literal notranslate"><span class="pre">BREAKABLE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.DISABLED"><code class="docutils literal notranslate"><span class="pre">DISABLED</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.llmapi.PrefillCudaGraphBackend.PIECEWISE"><code class="docutils literal notranslate"><span class="pre">PIECEWISE</span></code></a></li>
+</ul>
+</li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=cb8930eaaf36d9849b67"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=cb8930eaaf36d9849b67"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on September 04, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c295dd9">c295dd9</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

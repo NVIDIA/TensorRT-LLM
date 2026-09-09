@@ -1,0 +1,11 @@
+TorchLlmArgs
+============
+
+.. autoclass:: tensorrt_llm.llmapi.TorchLlmArgs
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: copy,model_fields,model_copy,validate,parse_obj,model_validate_strings,model_rebuild,model_post_init,from_orm,model_json_schema,model_extra,model_dump_json,model_config,dict,schema,update_forward_refs,model_dump,model_validate_json,json,construct,model_validate,model_fields_set,model_computed_fields,model_construct,parse_file,model_parametrized_name,schema_json,parse_raw

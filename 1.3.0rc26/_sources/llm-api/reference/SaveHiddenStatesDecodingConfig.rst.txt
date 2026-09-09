@@ -1,0 +1,10 @@
+SaveHiddenStatesDecodingConfig
+==============================
+
+.. autoclass:: tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
