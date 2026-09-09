@@ -27,6 +27,7 @@ import torch
 VSA_TILE_SIZE: Tuple[int, int, int] = (4, 4, 4)
 VSA_BLOCK_SIZE = VSA_TILE_SIZE[0] * VSA_TILE_SIZE[1] * VSA_TILE_SIZE[2]
 _DEFAULT_MAX_CACHED_SHAPES = 16
+_BITS_PER_WORD = 32
 
 
 def _get_tile_partition_indices(
@@ -80,29 +81,40 @@ def _construct_variable_block_sizes(
     return sizes.reshape(-1).to(torch.long)
 
 
+def _pack_valid_slots(valid_slots: torch.BoolTensor) -> torch.Tensor:
+    """Pack a padded-slot validity mask into little-endian 32-bit words."""
+    bit_weights = 1 << torch.arange(_BITS_PER_WORD, dtype=torch.int64, device=valid_slots.device)
+    words = (valid_slots.view(-1, _BITS_PER_WORD).to(torch.int64) * bit_weights).sum(dim=-1)
+    return words.to(torch.uint32)
+
+
 @dataclass(frozen=True, slots=True)
 class VSAMetadata:
-    """Per-step policy and shape metadata required by the VSA sparse path."""
+    """Per-step policy and shape metadata required by the VSA sparse path.
+
+    ``tile_source_index`` maps every padded slot to its compact token (``-1`` for padding),
+    ``untile_idx`` maps every compact token back to its padded slot,
+    ``variable_block_sizes`` counts the valid tokens per cube, and ``kv_valid_words`` packs
+    the padded valid-token mask into 32-bit words for the block-sparse kernels.
+    """
 
     current_timestep: int
     vsa_sparsity: float
     num_cubes: int
     padded_seq_length: int
     variable_block_sizes: torch.LongTensor
-    kv_token_mask: torch.BoolTensor
-    non_pad_index: torch.LongTensor
-    gather_idx: torch.LongTensor
+    tile_source_index: torch.LongTensor
     untile_idx: torch.LongTensor
+    kv_valid_words: torch.Tensor
 
 
 class _VSAShapeMetadata(TypedDict):
     num_cubes: int
     padded_seq_length: int
     variable_block_sizes: torch.LongTensor
-    kv_token_mask: torch.BoolTensor
-    non_pad_index: torch.LongTensor
-    gather_idx: torch.LongTensor
+    tile_source_index: torch.LongTensor
     untile_idx: torch.LongTensor
+    kv_valid_words: torch.Tensor
 
 
 class VSAMetadataBuilder:
@@ -147,20 +159,18 @@ class VSAMetadataBuilder:
             local_offsets < variable_block_sizes.unsqueeze(1)
         ]
 
+        tile_source_index = torch.full((padded_seq_length,), -1, dtype=torch.long, device=device)
+        tile_source_index[non_pad_index] = gather_idx
         untile_idx = torch.empty(total_seq_length, dtype=torch.long, device=device)
         untile_idx[gather_idx] = non_pad_index
-
-        kv_token_mask = torch.zeros(padded_seq_length, dtype=torch.bool, device=device)
-        kv_token_mask[non_pad_index] = True
 
         return _VSAShapeMetadata(
             num_cubes=num_cubes,
             padded_seq_length=padded_seq_length,
             variable_block_sizes=variable_block_sizes,
-            kv_token_mask=kv_token_mask,
-            non_pad_index=non_pad_index,
-            gather_idx=gather_idx,
+            tile_source_index=tile_source_index,
             untile_idx=untile_idx,
+            kv_valid_words=_pack_valid_slots(tile_source_index >= 0),
         )
 
     def build(
