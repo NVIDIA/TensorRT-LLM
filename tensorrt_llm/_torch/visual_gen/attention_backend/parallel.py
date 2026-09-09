@@ -64,18 +64,28 @@ def _pop_replicated_kv(kwargs):
     return values
 
 
-def _append_replicated_kv(
+@torch.compiler.disable
+def _run_attention_with_replicated_kv(
+    inner_backend: AttentionBackend,
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     replicated_k: torch.Tensor,
     replicated_v: torch.Tensor,
-    replicated_k_lengths: list[int],
+    replicated_k_lengths: torch.Tensor,
     valid_generated_seq_len: int,
+    kwargs: dict[str, object],
     *,
     context_start: int = 0,
     context_end: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Append a replicated K/V slice after an exact generated-token prefix."""
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run attention with exact generated and replicated K/V prefixes.
+
+    Unequal prefixes are evaluated per sample so backends never receive padded
+    keys or a dense padding mask. The helper is outside ``torch.compile`` so
+    prompt-length values do not specialize generator-block graphs.
+    """
     if k.ndim != 4 or replicated_k.ndim != 4:
         raise ValueError("Generated and replicated K/V must use [B, S, H, D] layout.")
     if k.shape != v.shape:
@@ -92,9 +102,12 @@ def _append_replicated_kv(
         )
     if k.device != replicated_k.device or k.dtype != replicated_k.dtype:
         raise ValueError("Generated and replicated K/V must have the same device and dtype.")
-    if len(replicated_k_lengths) != k.shape[0]:
+    if replicated_k_lengths.device.type != "cpu":
+        raise ValueError("Replicated K/V lengths must be cached on the CPU.")
+    if replicated_k_lengths.ndim != 1 or replicated_k_lengths.shape[0] != k.shape[0]:
         raise ValueError(
-            f"Expected {k.shape[0]} replicated K/V lengths, got {len(replicated_k_lengths)}."
+            f"Expected {k.shape[0]} replicated K/V lengths, got "
+            f"shape {tuple(replicated_k_lengths.shape)}."
         )
     if not 0 <= valid_generated_seq_len <= k.shape[1]:
         raise ValueError(
@@ -109,34 +122,121 @@ def _append_replicated_kv(
             f"Invalid replicated K/V slice [{context_start}, {context_end}) for "
             f"length {total_context_len}."
         )
-    if any(not 0 <= int(length) <= total_context_len for length in replicated_k_lengths):
+    replicated_k_lengths_host = replicated_k_lengths.tolist()
+    if any(not 0 <= int(length) <= total_context_len for length in replicated_k_lengths_host):
         raise ValueError(
             f"Replicated K/V lengths must be in [0, {total_context_len}], got "
-            f"{replicated_k_lengths}."
+            f"{replicated_k_lengths_host}."
         )
-
-    k = torch.cat(
-        [k[:, :valid_generated_seq_len], replicated_k[:, context_start:context_end]], dim=1
-    )
-    v = torch.cat(
-        [v[:, :valid_generated_seq_len], replicated_v[:, context_start:context_end]], dim=1
-    )
-
     context_slice_len = context_end - context_start
     valid_context_lens = [
         min(max(int(length) - context_start, 0), context_slice_len)
-        for length in replicated_k_lengths
+        for length in replicated_k_lengths_host
     ]
-    if all(length == context_slice_len for length in valid_context_lens):
-        return k, v, None
 
-    generated_mask = torch.ones(
-        k.shape[0], valid_generated_seq_len, dtype=torch.bool, device=k.device
-    )
-    context_positions = torch.arange(context_slice_len, device=k.device).unsqueeze(0)
-    context_lengths = torch.tensor(valid_context_lens, device=k.device).unsqueeze(1)
-    context_mask = context_positions < context_lengths
-    return k, v, torch.cat([generated_mask, context_mask], dim=1)
+    if kwargs.get("key_padding_mask") is not None:
+        raise ValueError("Replicated K/V cannot be combined with an existing key_padding_mask.")
+    base_kwargs = dict(kwargs)
+    base_kwargs.pop("key_padding_mask", None)
+    runner = inner_backend.forward_with_lse if return_lse else inner_backend.forward
+    inner_layout = inner_backend.preferred_layout
+
+    def _to_inner_layout(
+        q_batch: torch.Tensor,
+        k_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if inner_layout == AttentionTensorLayout.HND:
+            return (
+                q_batch.transpose(1, 2),
+                k_batch.transpose(1, 2),
+                v_batch.transpose(1, 2),
+            )
+        return q_batch, k_batch, v_batch
+
+    def _call(
+        q_batch: torch.Tensor,
+        k_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+        call_kwargs: dict[str, object],
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        q_batch, k_batch, v_batch = _to_inner_layout(q_batch, k_batch, v_batch)
+        call_kwargs.update(
+            {
+                "batch_size": q_batch.shape[0],
+                "seq_len": q.shape[1],
+                "seq_len_kv": k_batch.shape[2]
+                if inner_layout == AttentionTensorLayout.HND
+                else k_batch.shape[1],
+            }
+        )
+        return runner(q=q_batch, k=k_batch, v=v_batch, **call_kwargs)
+
+    if all(length == valid_context_lens[0] for length in valid_context_lens):
+        context_len = valid_context_lens[0]
+        k_all = torch.cat(
+            [
+                k[:, :valid_generated_seq_len],
+                replicated_k[:, context_start : context_start + context_len],
+            ],
+            dim=1,
+        )
+        v_all = torch.cat(
+            [
+                v[:, :valid_generated_seq_len],
+                replicated_v[:, context_start : context_start + context_len],
+            ],
+            dim=1,
+        )
+        return _call(q, k_all, v_all, base_kwargs)
+
+    outputs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    batch_size = q.shape[0]
+    for batch_idx, context_len in enumerate(valid_context_lens):
+        k_all = torch.cat(
+            [
+                k[batch_idx : batch_idx + 1, :valid_generated_seq_len],
+                replicated_k[
+                    batch_idx : batch_idx + 1,
+                    context_start : context_start + context_len,
+                ],
+            ],
+            dim=1,
+        )
+        v_all = torch.cat(
+            [
+                v[batch_idx : batch_idx + 1, :valid_generated_seq_len],
+                replicated_v[
+                    batch_idx : batch_idx + 1,
+                    context_start : context_start + context_len,
+                ],
+            ],
+            dim=1,
+        )
+        call_kwargs = {
+            key: value[batch_idx : batch_idx + 1]
+            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch_size
+            else value
+            for key, value in base_kwargs.items()
+        }
+        result = _call(
+            q[batch_idx : batch_idx + 1],
+            k_all,
+            v_all,
+            call_kwargs,
+        )
+        if return_lse:
+            output, lse = result
+            outputs.append(output)
+            lses.append(lse)
+        else:
+            outputs.append(result)
+
+    output = torch.cat(outputs, dim=0)
+    if return_lse:
+        return output, torch.cat(lses, dim=0)
+    return output
 
 
 def post_permute_5d_to_4d(out_5d, P):
@@ -350,21 +450,18 @@ class UlyssesAttention(AttentionBackend):
                     }
                 )
             else:
-                k, v, key_padding_mask = _append_replicated_kv(
+                output = _run_attention_with_replicated_kv(
+                    self.inner_backend,
+                    q,
                     k,
                     v,
                     replicated_k,
                     replicated_v,
                     replicated_k_lengths,
                     global_generated_seq_len,
+                    kwargs,
                 )
-                if kwargs.get("key_padding_mask") is not None:
-                    raise ValueError(
-                        "Replicated K/V cannot be combined with an existing key_padding_mask."
-                    )
-                if key_padding_mask is not None:
-                    kwargs["key_padding_mask"] = key_padding_mask
-                kv_seq_len_full = k.shape[1]
+                return self._output_a2a(output, batch_size, seq_len_full)
 
         if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
@@ -754,6 +851,7 @@ class Attention2DAttention(AttentionBackend):
                 .reshape(B, self.col_group_size * shard_seq_kv, H_kv, D)
             )
 
+        seq_len = q.shape[1]
         if replicated_k is not None:
             # Each Attention2D column owns one disjoint text slice. The row
             # reduction combines those partial attentions, so every text key
@@ -773,32 +871,27 @@ class Attention2DAttention(AttentionBackend):
                     max(global_generated_seq_len - shard_start, 0), shard_seq_kv
                 )
 
-            k, v, key_padding_mask = _append_replicated_kv(
+            output, lse = _run_attention_with_replicated_kv(
+                self.inner_backend,
+                q,
                 k,
                 v,
                 replicated_k,
                 replicated_v,
                 replicated_k_lengths,
                 valid_generated_seq_len,
+                kwargs,
                 context_start=context_start,
                 context_end=context_end,
+                return_lse=True,
             )
-            if kwargs.get("key_padding_mask") is not None:
-                raise ValueError(
-                    "Replicated K/V cannot be combined with an existing key_padding_mask."
-                )
-            if key_padding_mask is not None:
-                kwargs["key_padding_mask"] = key_padding_mask
-            kwargs["seq_len_kv"] = k.shape[1]
+        else:
+            if self._inner_layout == AttentionTensorLayout.HND:
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
 
-        seq_len = q.shape[1]
-
-        if self._inner_layout == AttentionTensorLayout.HND:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-
-        output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
+            output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
 
         if self._inner_layout == AttentionTensorLayout.HND:
             output = output.transpose(1, 2).contiguous()
