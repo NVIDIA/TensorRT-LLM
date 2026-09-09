@@ -301,6 +301,7 @@ class UlyssesAttention(AttentionBackend):
         self.sharded_num_kv_heads = getattr(inner_backend, "num_kv_heads", self.sharded_num_heads)
 
         self.world_size = torch.distributed.get_world_size(group=process_group)
+        self._ulysses_rank = torch.distributed.get_rank(group=process_group)
 
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
@@ -429,8 +430,7 @@ class UlyssesAttention(AttentionBackend):
         kv_seq_len_full = k.shape[1]
 
         if replicated_k is not None:
-            ulysses_rank = dist.get_rank(group=self.process_group)
-            head_start = ulysses_rank * self.sharded_num_kv_heads
+            head_start = self._ulysses_rank * self.sharded_num_kv_heads
             head_end = head_start + self.sharded_num_kv_heads
             if replicated_k.shape[2] != self.num_kv_heads:
                 raise ValueError(
@@ -742,6 +742,7 @@ class Attention2DAttention(AttentionBackend):
 
         self.row_group_size = torch.distributed.get_world_size(group=row_process_group)
         self.col_group_size = torch.distributed.get_world_size(group=col_process_group)
+        self._column_rank = torch.distributed.get_rank(group=row_process_group)
         # Always NHD: all-gather kernels operate on [B, S/P, H, D]. Any HND conversion
         # needed by the inner backend is handled internally in forward.
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -856,16 +857,15 @@ class Attention2DAttention(AttentionBackend):
             # Each Attention2D column owns one disjoint text slice. The row
             # reduction combines those partial attentions, so every text key
             # participates exactly once without sequence-sharding the cache.
-            column_rank = dist.get_rank(group=self.row_process_group)
             context_len = replicated_k.shape[1]
-            context_start = context_len * column_rank // self.row_group_size
-            context_end = context_len * (column_rank + 1) // self.row_group_size
+            context_start = context_len * self._column_rank // self.row_group_size
+            context_end = context_len * (self._column_rank + 1) // self.row_group_size
 
             # K/V were gathered over rows at fixed column. Their generated
             # chunks correspond to CP ranks r * num_columns + column_rank.
             valid_generated_seq_len = 0
             for row_rank in range(self.col_group_size):
-                cp_rank = row_rank * self.row_group_size + column_rank
+                cp_rank = row_rank * self.row_group_size + self._column_rank
                 shard_start = cp_rank * shard_seq_kv
                 valid_generated_seq_len += min(
                     max(global_generated_seq_len - shard_start, 0), shard_seq_kv

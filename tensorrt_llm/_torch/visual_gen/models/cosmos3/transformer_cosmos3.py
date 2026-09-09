@@ -785,6 +785,7 @@ class Cosmos3CrossAttention(Attention):
         freqs_sin: torch.Tensor,
         timestep=None,
         real_text_lens: Optional[torch.Tensor] = None,
+        uniform_text_len: Optional[int] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
@@ -827,15 +828,29 @@ class Cosmos3CrossAttention(Attention):
                 global_generated_seq_len=global_generated_seq_len,
             )
         elif real_text_lens is not None and batch_size > 1:
-            out = self._forward_with_text_prefixes(
-                q,
-                k,
-                v,
-                k_und,
-                v_und,
-                real_text_lens,
-                timestep,
-            )
+            if uniform_text_len is not None:
+                if not 0 <= uniform_text_len <= k_und.shape[1]:
+                    raise ValueError(
+                        "Cosmos3 uniform text length must be in "
+                        f"[0, {k_und.shape[1]}], got {uniform_text_len}."
+                    )
+                out = self._attn_impl(
+                    q,
+                    torch.cat([k_und[:, :uniform_text_len], k], dim=1),
+                    torch.cat([v_und[:, :uniform_text_len], v], dim=1),
+                    attention_mask=PredefinedAttentionMask.FULL,
+                    timestep=timestep,
+                )
+            else:
+                out = self._forward_with_text_prefixes(
+                    q,
+                    k,
+                    v,
+                    k_und,
+                    v_und,
+                    real_text_lens,
+                    timestep,
+                )
         else:
             k_all = torch.cat([k_und, k], dim=1).contiguous()
             v_all = torch.cat([v_und, v], dim=1).contiguous()
@@ -988,6 +1003,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
         real_text_lens: Optional[torch.Tensor] = None,
+        uniform_text_len: Optional[int] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1002,6 +1018,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             freqs_sin=sin,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            uniform_text_len=uniform_text_len,
             global_generated_seq_len=global_generated_seq_len,
         )
         hidden_states = residual + hidden_states
@@ -1728,6 +1745,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         if self.cached_real_text_lens is None:
             raise RuntimeError("Cosmos3 text lengths are missing from the K/V cache.")
         real_text_lens = self.cached_real_text_lens
+        uniform_text_len = None
+        if not self.sharder.is_active:
+            real_text_lens_host = [int(length) for length in real_text_lens.tolist()]
+            if real_text_lens_host and all(
+                length == real_text_lens_host[0] for length in real_text_lens_host
+            ):
+                uniform_text_len = real_text_lens_host[0]
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
@@ -1861,6 +1885,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         freqs_gen,
                         timestep=timestep,
                         real_text_lens=real_text_lens,
+                        uniform_text_len=uniform_text_len,
                     )
                 else:
                     hidden_gen = layer(
