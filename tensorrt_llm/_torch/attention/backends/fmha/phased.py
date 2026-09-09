@@ -24,7 +24,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     CustomAttentionMask,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 from .interface import Fmha

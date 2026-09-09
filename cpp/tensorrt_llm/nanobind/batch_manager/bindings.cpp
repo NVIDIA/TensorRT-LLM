@@ -22,7 +22,6 @@
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -512,14 +511,6 @@ void initBindings(nb::module_& m)
         // offset is shared with the native library rather than living in this
         // module's separate copy.
         .def_rw_static("global_steady_clock_offset", &tb::globalSteadyClockOffset());
-
-    nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
-        .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),
-            nb::arg("max_sequence_idle_microseconds"))
-        .def("get_sequence_slot", &tb::SequenceSlotManager::getSequenceSlot, nb::arg("start_flag"),
-            nb::arg("sequence_id"))
-        .def("free_sequence_slot", &tb::SequenceSlotManager::freeSequenceSlot, nb::arg("sequence_id"))
-        .def("free_idle_sequence_slots", &tb::SequenceSlotManager::freeIdleSequenceSlots);
 
     nb::class_<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(nb::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),

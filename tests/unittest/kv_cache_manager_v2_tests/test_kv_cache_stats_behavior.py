@@ -97,6 +97,7 @@ class _StatsRequest:
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
+        self.context_current_position = length
 
     @property
     def prepopulated_prompt_len(self) -> int:

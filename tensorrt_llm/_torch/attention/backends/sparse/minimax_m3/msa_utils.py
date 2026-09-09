@@ -23,7 +23,7 @@ MSA_REQUIRED_HEAD_DIM = 128
 
 
 def _install_msa_cutlass_compatibility() -> None:
-    """Provide the CUTLASS 4.5 names still referenced by the packaged MSA sources."""
+    """Provide legacy CuTe aliases still referenced by the packaged MSA sources."""
     try:
         import cutlass.cute as cute
     except ImportError:

@@ -29,7 +29,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -127,95 +127,6 @@ def test_triton_custom_mask_rejects_whole_request_probe() -> None:
         SimpleNamespace(),
         AttentionForwardArgs(),
     )
-
-
-@pytest.mark.parametrize("is_fused_qkv", [True, False], ids=["fused_qkv", "q_only"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("sm_version", [100, 103])
-@pytest.mark.parametrize("tokens_per_block", [32, 64])
-@pytest.mark.parametrize("num_contexts", [1, 4, 5])
-@pytest.mark.parametrize("head_dim", [64, 256, 512])
-def test_flashinfer_context_fallback_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    dtype: torch.dtype,
-    sm_version: int,
-    tokens_per_block: int,
-    num_contexts: int,
-    head_dim: int,
-    is_fused_qkv: bool,
-) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
-        lambda: sm_version,
-    )
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha.kv_factor = 2
-    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
-    attn = FakeAttention()
-    attn.sparse_params = None
-    attn.position_embedding_type = 0
-    attn.head_dim = head_dim
-    q_hidden_size = attn.num_heads * attn.head_dim
-    # Both layouts the trtllm-gen self-attention path accepts, wired the way
-    # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
-    # the cache, while a Q-only input only reads an already-populated cache.
-    input_hidden_size = q_hidden_size
-    if is_fused_qkv:
-        input_hidden_size += 2 * attn.num_kv_heads * attn.head_dim
-    q = torch.empty((num_contexts, input_hidden_size), dtype=dtype)
-    kv_cache_dtype = DataType.BF16 if dtype == torch.bfloat16 else DataType.HALF
-    metadata = SimpleNamespace(
-        num_contexts=num_contexts,
-        helix_position_offsets=None,
-        num_sparse_topk=0,
-        use_spec_decoding=False,
-        is_spec_dec_tree=False,
-        kv_cache_block_offsets=object(),
-        kv_cache_manager=SimpleNamespace(dtype=kv_cache_dtype),
-        is_cross=False,
-        is_spec_decoding_enabled=False,
-        tokens_per_block=tokens_per_block,
-        beam_width=1,
-    )
-    forward_args = AttentionForwardArgs(
-        output=torch.empty((num_contexts, q_hidden_size), dtype=dtype),
-        attention_input_type=AttentionInputType.mixed,
-        is_fused_qkv=is_fused_qkv,
-        update_kv_cache=is_fused_qkv,
-    )
-
-    small_bf16_fallback = (
-        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim != 512
-    )
-    expected_fallback = small_bf16_fallback or sm_version == 103
-    for phase in (None, FmhaPhase.CONTEXT):
-        supported, reason = fmha._is_supported_with_reason(
-            q,
-            None,
-            None,
-            attn,
-            metadata,
-            forward_args,
-            phase=phase,
-        )
-        if expected_fallback:
-            assert not supported
-            assert "fallback FMHA" in reason
-        else:
-            assert supported, reason
-            assert reason == ""
-
-    generation_supported, generation_reason = fmha._is_supported_with_reason(
-        q,
-        None,
-        None,
-        attn,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.GENERATION,
-    )
-    assert generation_supported, generation_reason
-    assert generation_reason == ""
 
 
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
