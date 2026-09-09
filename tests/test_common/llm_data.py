@@ -53,7 +53,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     # AutoDeploy accuracy tests - overlapping with model registry
-    "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
     "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
     "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
     "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",

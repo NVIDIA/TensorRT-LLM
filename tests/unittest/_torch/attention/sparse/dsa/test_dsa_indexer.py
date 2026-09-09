@@ -281,6 +281,55 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         cute_dsl_radix.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "use_self_sampling,sm_version,msl_c,should_warmup",
+    [
+        (True, 100, 65536, True),
+        (True, 100, 30001, True),  # odd msl_c must not skip the prefill leg
+        (False, 100, 65536, False),  # temporal-hint layers: no prefill engine
+        (True, 90, 65536, False),  # Hopper
+        (True, 120, 65536, False),  # consumer Blackwell (SM120): engine is SM100/103-only
+    ],
+)
+def test_metadata_warmup_selfsampling_prefill_leg(
+    use_self_sampling, sm_version, msl_c, should_warmup
+):
+    """The self-sampling warmup drives BOTH the decode (varlen) and the prefill
+    engines; the prefill leg sits before the DeepGEMM decode-stride guard so an
+    odd msl_c cannot skip it."""
+    metadata = SimpleNamespace(
+        enable_gvr_topk=True,
+        use_self_sampling_topk=use_self_sampling,
+        sparse_mla_topk=512,
+        _indexer_compress_ratio=4,
+        kv_cache_manager=SimpleNamespace(),
+        get_indexer_max_seq_len=Mock(return_value=msl_c),
+        sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        num_sms=148,
+    )
+    ss_host = (
+        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
+    )
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.get_sm_version",
+            return_value=sm_version,
+        ),
+        patch(f"{ss_host}.warmup_prefill") as warmup_prefill,
+        patch(f"{ss_host}.warmup_varlen"),
+    ):
+        DSAtrtllmAttentionMetadata.warmup_selfsampling_topk(metadata, next_n=1, batch_sizes=[8])
+
+    if should_warmup:
+        warmup_prefill.assert_called_once_with(512, max(msl_c, 32768))
+    else:
+        warmup_prefill.assert_not_called()
+
+
 def test_kv_lens_row_reorder_threshold():
     """Prepare row order only when CuTe DSL GVR has enough decode rows."""
     num_sms = 16
@@ -601,6 +650,12 @@ def test_indexer_two_level_gvr_dispatch(
     assert indexer.top_k.decode_implementation == expected_decode
     assert indexer.top_k.gvr_self_sampling == use_self_sampling
     assert indexer.top_k.needs_gvr_prior == (not use_self_sampling)
+    # Prefill uses the self-sampling engine on exactly the self-sampling
+    # layers; the temporal-hint layers keep the exact radix prefill.
+    expected_prefill = (
+        TopKImplementation.CUTE_DSL_GVR if use_self_sampling else TopKImplementation.CUDA_RADIX
+    )
+    assert indexer.top_k.prefill_implementation == expected_prefill
 
 
 @skip_pre_hopper
@@ -651,7 +706,7 @@ def cdiv(a: int, b: int) -> int:
 
 
 def _load_cast_back_from_fp4():
-    from test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
+    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
 
     return cast_back_from_fp4
 
@@ -1477,6 +1532,31 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     check_accuracy(
         logits, ref_logits, atol=1e-2, rtol=2e-1, percent=0.9
     )  # double check for per-element similarity
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+@pytest.mark.parametrize("seq_len_kv", [1027, 4099])
+def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
+    """The self-sampling GVR prefill engine engages only while DeepGEMM keeps
+    a float4-aligned row stride on odd-width logits; an exact-width producer
+    would silently route every such tile back to radix."""
+    torch.manual_seed(0)
+    num_heads, head_dim, seq_len = 64, 128, 64
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
+    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+
+    logits = deep_gemm.fp8_mqa_logits(
+        q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
+    )
+
+    assert logits.shape == (seq_len, seq_len_kv)
+    top_k = TopK(512, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    assert top_k._selfsampling_prefill_ok(logits), (logits.dtype, tuple(logits.stride()))
 
 
 def _create_mock_metadata(
