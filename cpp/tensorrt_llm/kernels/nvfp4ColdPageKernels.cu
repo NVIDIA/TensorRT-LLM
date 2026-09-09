@@ -63,16 +63,17 @@ enum WideField : std::uint32_t
     kColdDataOffset,
     kColdScaleOffset,
     kColdPaddingOffset,
-    kColdLosslessSuffixOffset,
+    kColdSuffixOffset,
 };
 
 enum IntegerField : std::uint32_t
 {
     kColdPaddingBytes,
     kTransform,
-    kRowCount,
-    kQuantizedPrefixElements,
-    kHotRowStrideElements,
+    kNumKvHeads,
+    kTokensPerPage,
+    kHeadDim,
+    kRawRowStrideElements,
 };
 
 enum ScaleField : std::uint32_t
@@ -85,9 +86,10 @@ enum ScaleField : std::uint32_t
 
 struct Nvfp4ColdPageKernelParams
 {
-    std::int32_t rowCount;
-    std::int32_t quantizedPrefixElements;
-    std::int32_t hotRowStrideElements;
+    std::int32_t numKvHeads;
+    std::int32_t tokensPerPage;
+    std::int32_t headDim;
+    std::int32_t rawRowStrideElements;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -108,7 +110,7 @@ struct Nvfp4ColdPageBuffer
     std::size_t coldDataOffset;
     std::size_t coldScaleOffset;
     std::size_t coldPaddingOffset;
-    std::size_t coldLosslessSuffixOffset;
+    std::size_t coldSuffixOffset;
     std::uint32_t coldPaddingBytes;
     Nvfp4ColdPageTransform transform;
     Nvfp4ColdPageKernelParams params;
@@ -163,14 +165,14 @@ struct OffloadBufferTask
     std::uint8_t* coldData;
     std::uint8_t* coldScale;
     std::uint8_t* coldPadding;
-    std::uint8_t* coldLosslessSuffix;
+    std::uint8_t* coldSuffix;
 };
 
 struct OnboardBufferTask
 {
     std::uint8_t const* coldData;
     std::uint8_t const* coldScale;
-    std::uint8_t const* coldLosslessSuffix;
+    std::uint8_t const* coldSuffix;
     std::uint8_t* raw;
 };
 
@@ -183,9 +185,9 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
     return {static_cast<std::uintptr_t>(w[kRawBase]), static_cast<std::size_t>(w[kRawSlotBytes]),
         static_cast<std::size_t>(w[kRawBytes]), static_cast<std::size_t>(w[kColdDataOffset]),
         static_cast<std::size_t>(w[kColdScaleOffset]), static_cast<std::size_t>(w[kColdPaddingOffset]),
-        static_cast<std::size_t>(w[kColdLosslessSuffixOffset]), static_cast<std::uint32_t>(i[kColdPaddingBytes]),
+        static_cast<std::size_t>(w[kColdSuffixOffset]), static_cast<std::uint32_t>(i[kColdPaddingBytes]),
         static_cast<Nvfp4ColdPageTransform>(i[kTransform]),
-        {i[kRowCount], i[kQuantizedPrefixElements], i[kHotRowStrideElements], s[kNvfp4ScaleOrigQuant],
+        {i[kNumKvHeads], i[kTokensPerPage], i[kHeadDim], i[kRawRowStrideElements], s[kNvfp4ScaleOrigQuant],
             s[kNvfp4ScaleQuantOrig], s[kFp8ScaleOrigQuant], s[kFp8ScaleQuantOrig]}};
 }
 
@@ -196,7 +198,7 @@ __device__ OffloadBufferTask resolveOffloadTask(
     auto* coldPage = coldBase + static_cast<std::size_t>(page.dst) * coldPageBytes;
     return {reinterpret_cast<std::uint8_t const*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes),
         coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldPaddingOffset,
-        coldPage + buffer.coldLosslessSuffixOffset};
+        coldPage + buffer.coldSuffixOffset};
 }
 
 __device__ OnboardBufferTask resolveOnboardTask(PageIndexPairView const& page, Nvfp4ColdPageBuffer const& buffer,
@@ -204,8 +206,7 @@ __device__ OnboardBufferTask resolveOnboardTask(PageIndexPairView const& page, N
 {
     std::size_t const gpuPage = static_cast<std::size_t>(page.dst);
     auto const* coldPage = coldBase + static_cast<std::size_t>(page.src) * coldPageBytes;
-    return {coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset,
-        coldPage + buffer.coldLosslessSuffixOffset,
+    return {coldPage + buffer.coldDataOffset, coldPage + buffer.coldScaleOffset, coldPage + buffer.coldSuffixOffset,
         reinterpret_cast<std::uint8_t*>(buffer.rawBase + gpuPage * buffer.rawSlotBytes)};
 }
 
@@ -236,30 +237,28 @@ __host__ __device__ constexpr std::uint32_t compactStageBytesForHalfGroups(std::
 // Flatten one buffer's quantized [row, dim] geometry into eight-element half-groups.
 __host__ __device__ constexpr std::uint32_t halfGroupCount(Nvfp4ColdPageKernelParams const& params)
 {
-    return static_cast<std::uint32_t>(params.rowCount)
-        * (static_cast<std::uint32_t>(params.quantizedPrefixElements) / kElementsPerHalfGroup);
+    return static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage)
+        * (static_cast<std::uint32_t>(params.headDim) / kElementsPerHalfGroup);
 }
 
 // Map a compact half-group back to a possibly strided row in the runtime Page.
 __host__ __device__ constexpr std::uint32_t rawHalfGroupElementOffset(
     Nvfp4ColdPageKernelParams const& params, std::uint32_t halfGroup)
 {
-    auto const halfGroupsPerRow
-        = static_cast<std::uint32_t>(params.quantizedPrefixElements) / kElementsPerHalfGroup;
+    auto const halfGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerHalfGroup;
     auto const row = halfGroup / halfGroupsPerRow;
     auto const halfGroupInRow = halfGroup % halfGroupsPerRow;
-    return row * static_cast<std::uint32_t>(params.hotRowStrideElements) + halfGroupInRow * kElementsPerHalfGroup;
+    return row * static_cast<std::uint32_t>(params.rawRowStrideElements) + halfGroupInRow * kElementsPerHalfGroup;
 }
 
 // Map one 16-element NVFP4 scale group back to the runtime Page.
 __host__ __device__ constexpr std::uint32_t rawScaleGroupElementOffset(
     Nvfp4ColdPageKernelParams const& params, std::uint32_t scaleGroup)
 {
-    auto const scaleGroupsPerRow
-        = static_cast<std::uint32_t>(params.quantizedPrefixElements) / kElementsPerScaleGroup;
+    auto const scaleGroupsPerRow = static_cast<std::uint32_t>(params.headDim) / kElementsPerScaleGroup;
     auto const row = scaleGroup / scaleGroupsPerRow;
     auto const scaleGroupInRow = scaleGroup % scaleGroupsPerRow;
-    return row * static_cast<std::uint32_t>(params.hotRowStrideElements) + scaleGroupInRow * kElementsPerScaleGroup;
+    return row * static_cast<std::uint32_t>(params.rawRowStrideElements) + scaleGroupInRow * kElementsPerScaleGroup;
 }
 
 // Cap a buffer tile at shared-memory capacity without splitting a scale group.
@@ -384,32 +383,34 @@ __device__ void copyStridedRows(std::uint8_t const* source, std::size_t sourceRo
 
 template <typename T>
 __device__ void offloadLosslessSuffix(
-    std::uint8_t const* raw, std::uint8_t* coldLosslessSuffix, Nvfp4ColdPageKernelParams const& params)
+    std::uint8_t const* raw, std::uint8_t* coldSuffix, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U || params.hotRowStrideElements == params.quantizedPrefixElements)
+    if (blockIdx.x != 0U || params.rawRowStrideElements == params.headDim)
     {
         return;
     }
-    std::size_t const hotRowBytes = static_cast<std::size_t>(params.hotRowStrideElements) * sizeof(T);
-    std::size_t const quantizedPrefixBytes = static_cast<std::size_t>(params.quantizedPrefixElements) * sizeof(T);
-    std::size_t const losslessSuffixBytes = hotRowBytes - quantizedPrefixBytes;
-    copyStridedRows(raw, hotRowBytes, quantizedPrefixBytes, coldLosslessSuffix, losslessSuffixBytes, 0,
-        static_cast<std::uint32_t>(params.rowCount), losslessSuffixBytes);
+    std::uint32_t const rows
+        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
+    std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
+    std::size_t const prefixBytes = static_cast<std::size_t>(params.headDim) * sizeof(T);
+    std::size_t const suffixBytes = rawRowBytes - prefixBytes;
+    copyStridedRows(raw, rawRowBytes, prefixBytes, coldSuffix, suffixBytes, 0, rows, suffixBytes);
 }
 
 template <typename T>
 __device__ void onboardLosslessSuffix(
-    std::uint8_t const* coldLosslessSuffix, std::uint8_t* raw, Nvfp4ColdPageKernelParams const& params)
+    std::uint8_t const* coldSuffix, std::uint8_t* raw, Nvfp4ColdPageKernelParams const& params)
 {
-    if (blockIdx.x != 0U || params.hotRowStrideElements == params.quantizedPrefixElements)
+    if (blockIdx.x != 0U || params.rawRowStrideElements == params.headDim)
     {
         return;
     }
-    std::size_t const hotRowBytes = static_cast<std::size_t>(params.hotRowStrideElements) * sizeof(T);
-    std::size_t const quantizedPrefixBytes = static_cast<std::size_t>(params.quantizedPrefixElements) * sizeof(T);
-    std::size_t const losslessSuffixBytes = hotRowBytes - quantizedPrefixBytes;
-    copyStridedRows(coldLosslessSuffix, losslessSuffixBytes, 0, raw, hotRowBytes, quantizedPrefixBytes,
-        static_cast<std::uint32_t>(params.rowCount), losslessSuffixBytes);
+    std::uint32_t const rows
+        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
+    std::size_t const rawRowBytes = static_cast<std::size_t>(params.rawRowStrideElements) * sizeof(T);
+    std::size_t const prefixBytes = static_cast<std::size_t>(params.headDim) * sizeof(T);
+    std::size_t const suffixBytes = rawRowBytes - prefixBytes;
+    copyStridedRows(coldSuffix, suffixBytes, 0, raw, rawRowBytes, prefixBytes, rows, suffixBytes);
 }
 
 __device__ __forceinline__ uint4 collectTwoFp8Words(std::uint64_t first, std::uint64_t second)
@@ -655,7 +656,7 @@ __global__ void offloadFrom16BitTiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    offloadLosslessSuffix<T>(task.raw, task.coldLosslessSuffix, params);
+    offloadLosslessSuffix<T>(task.raw, task.coldSuffix, params);
     clearColdPadding(task, buffer);
 #endif
 }
@@ -734,7 +735,7 @@ __global__ void offloadFromFp8TiledKernel(
             scaleBytesForHalfGroups(halfGroups));
         __syncthreads();
     }
-    offloadLosslessSuffix<__nv_fp8_e4m3>(task.raw, task.coldLosslessSuffix, params);
+    offloadLosslessSuffix<__nv_fp8_e4m3>(task.raw, task.coldSuffix, params);
     clearColdPadding(task, buffer);
 #endif
 }
@@ -788,7 +789,7 @@ __device__ void loadCompactRangeFromHost(std::uint8_t* compactStages, OnboardBuf
     }
     cp_async_wait_group<0>();
 
-    // quantizedPrefixElements % 16 makes packed intervals exact uint2 scale groups.
+    // headDim % 16 makes packed intervals exact uint2 scale groups.
     for (std::uint32_t pair = packedVectorBytes / sizeof(uint2) + threadIdx.x; pair < packedPairBytes / sizeof(uint2);
          pair += blockDim.x)
     {
@@ -875,7 +876,7 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
         // Finish consumers before reusing shared memory.
         __syncthreads();
     }
-    onboardLosslessSuffix<T>(task.coldLosslessSuffix, task.raw, params);
+    onboardLosslessSuffix<T>(task.coldSuffix, task.raw, params);
 #endif
 }
 

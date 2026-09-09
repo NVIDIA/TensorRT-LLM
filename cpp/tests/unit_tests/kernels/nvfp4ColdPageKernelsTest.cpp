@@ -50,9 +50,10 @@ using tensorrt_llm::kernels::Nvfp4ColdPageWideTable;
 
 struct Nvfp4ColdPageKernelParams
 {
-    std::int32_t rowCount;
-    std::int32_t quantizedPrefixElements;
-    std::int32_t hotRowStrideElements;
+    std::int32_t numKvHeads;
+    std::int32_t tokensPerPage;
+    std::int32_t headDim;
+    std::int32_t rawRowStrideElements;
     float nvfp4ScaleOrigQuant;
     float nvfp4ScaleQuantOrig;
     float fp8ScaleOrigQuant;
@@ -76,7 +77,7 @@ struct Nvfp4ColdPageTestBuffer
     std::uint32_t coldPaddingBytes;
     Nvfp4ColdPageTransform transform;
     Nvfp4ColdPageKernelParams params;
-    std::size_t coldLosslessSuffixOffset{};
+    std::size_t coldSuffixOffset{};
 };
 
 struct Nvfp4ColdPageTestMetadata
@@ -103,17 +104,17 @@ Nvfp4ColdPageTestMetadata makeNvfp4ColdPageTestMetadata(std::vector<Nvfp4ColdPag
         metadata.wide[index] = {static_cast<std::int64_t>(buffer.rawBase),
             static_cast<std::int64_t>(buffer.rawSlotBytes), static_cast<std::int64_t>(buffer.rawBytes),
             static_cast<std::int64_t>(buffer.coldDataOffset), static_cast<std::int64_t>(buffer.coldScaleOffset),
-            static_cast<std::int64_t>(buffer.coldPaddingOffset),
-            static_cast<std::int64_t>(buffer.coldLosslessSuffixOffset)};
+            static_cast<std::int64_t>(buffer.coldPaddingOffset), static_cast<std::int64_t>(buffer.coldSuffixOffset)};
         metadata.integers[index] = {static_cast<std::int32_t>(buffer.coldPaddingBytes),
-            static_cast<std::int32_t>(buffer.transform), buffer.params.rowCount,
-            buffer.params.quantizedPrefixElements, buffer.params.hotRowStrideElements};
+            static_cast<std::int32_t>(buffer.transform), buffer.params.numKvHeads, buffer.params.tokensPerPage,
+            buffer.params.headDim, buffer.params.rawRowStrideElements};
         metadata.scales[index] = {buffer.params.nvfp4ScaleOrigQuant, buffer.params.nvfp4ScaleQuantOrig,
             buffer.params.fp8ScaleOrigQuant, buffer.params.fp8ScaleQuantOrig};
         if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4)
         {
-            auto const halfGroups = static_cast<std::uint32_t>(buffer.params.rowCount)
-                * (static_cast<std::uint32_t>(buffer.params.quantizedPrefixElements) / 8U);
+            auto const halfGroups = static_cast<std::uint32_t>(buffer.params.numKvHeads)
+                * static_cast<std::uint32_t>(buffer.params.tokensPerPage)
+                * (static_cast<std::uint32_t>(buffer.params.headDim) / 8U);
             metadata.maxHalfGroupsPerTile = std::max(metadata.maxHalfGroupsPerTile, std::min(halfGroups, 2048U));
         }
     }
@@ -368,9 +369,10 @@ std::size_t scaleBytes(PageGeometry const& geometry)
 Nvfp4ColdPageKernelParams makeParams(PageGeometry const& geometry = kDefaultGeometry, std::uint32_t role = 0U)
 {
     Nvfp4ColdPageKernelParams params{};
-    params.rowCount = geometry.numHeads * geometry.tokensPerPage;
-    params.quantizedPrefixElements = geometry.headDim;
-    params.hotRowStrideElements = geometry.headDim;
+    params.numKvHeads = geometry.numHeads;
+    params.tokensPerPage = geometry.tokensPerPage;
+    params.headDim = geometry.headDim;
+    params.rawRowStrideElements = geometry.headDim;
     params.nvfp4ScaleOrigQuant = role == 0U ? 1.0F : 2.0F;
     params.nvfp4ScaleQuantOrig = role == 0U ? 1.0F : 0.5F;
     params.fp8ScaleOrigQuant = role == 0U ? 2.0F : 4.0F;
@@ -977,7 +979,7 @@ void runDeepseekV4StridedRoundTrip(RawKind kind, PageGeometry const& geometry = 
     std::size_t const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
     std::size_t const ropeElements = kDeepseekV4RowElements - geometry.headDim;
     auto params = makeParams(geometry);
-    params.hotRowStrideElements = kDeepseekV4RowElements;
+    params.rawRowStrideElements = kDeepseekV4RowElements;
     params.nvfp4ScaleOrigQuant = nvfp4ScaleOrigQuant;
     params.nvfp4ScaleQuantOrig = nvfp4ScaleQuantOrig;
     params.fp8ScaleOrigQuant = 1.0F;
@@ -1087,7 +1089,7 @@ void runDeepseekV4PartialPageTailIsolation(RawKind kind)
     std::size_t constexpr ropeElements = kDeepseekV4RowElements - kDeepseekV4NopeGeometry.headDim;
     std::size_t constexpr numPages = variantsPerCount * kDeepseekV4ValidTokenCounts.size();
     auto params = makeParams(kDeepseekV4NopeGeometry);
-    params.hotRowStrideElements = kDeepseekV4RowElements;
+    params.rawRowStrideElements = kDeepseekV4RowElements;
     params.fp8ScaleOrigQuant = 1.0F;
     params.fp8ScaleQuantOrig = 1.0F;
     std::size_t const elementBytes = rawElementBytes(kind);

@@ -38,7 +38,7 @@ _ELEMENTS_PER_HALF_GROUP = 8
 _MAX_HALF_GROUPS_PER_TILE = 2048
 _MAX_BUFFERS_PER_LAUNCH = 256
 _WIDE_FIELDS = 7
-_INTEGER_FIELDS = 5
+_INTEGER_FIELDS = 6
 _SCALE_FIELDS = 4
 _NVFP4_TRANSFORM = 0
 _LOSSLESS_TRANSFORM = 1
@@ -60,8 +60,8 @@ _DEEPSEEK_V4_ROLES = frozenset(
         f"{_DEEPSEEK_V4_PREFIX}indexer_compressor_score",
     }
 )
-_DEEPSEEK_V4_CSA_QUANTIZED_NOPE_ELEMENTS = 448
-_DEEPSEEK_V4_CSA_HOT_ROW_ELEMENTS = 512
+_DEEPSEEK_V4_NOPE_DIM = 448
+_DEEPSEEK_V4_ROW_STRIDE = 512
 _DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES = 584
 
 
@@ -82,9 +82,10 @@ class _Nvfp4BufferLayout:
 @dataclass(frozen=True)
 class _Nvfp4LayerLayout:
     layer_id: int
-    row_count: int
-    quantized_prefix_elements: int
-    hot_row_stride_elements: int
+    num_kv_heads: int
+    tokens_per_page: int
+    head_dim: int
+    raw_row_stride_elements: int
     buffers: tuple[_Nvfp4BufferLayout, ...]
 
 
@@ -266,9 +267,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         layer_layouts.append(
                             _Nvfp4LayerLayout(
                                 layer_id=layer_id,
-                                row_count=0,
-                                quantized_prefix_elements=0,
-                                hot_row_stride_elements=0,
+                                num_kv_heads=0,
+                                tokens_per_page=0,
+                                head_dim=0,
+                                raw_row_stride_elements=0,
                                 buffers=tuple(
                                     _Nvfp4BufferLayout(role=str(buffer.role))
                                     for buffer in layer.buffers
@@ -285,7 +287,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 tokens_per_page //= 4
 
                 element_bytes = 1 if runtime_type == 2 else 2
-                raw_bytes = tokens_per_page * _DEEPSEEK_V4_CSA_HOT_ROW_ELEMENTS * element_bytes
+                raw_bytes = tokens_per_page * _DEEPSEEK_V4_ROW_STRIDE * element_bytes
                 configured_bytes = next(
                     int(buffer.size)
                     for buffer in layer.buffers
@@ -318,9 +320,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 layer_layouts.append(
                     _Nvfp4LayerLayout(
                         layer_id=layer_id,
-                        row_count=tokens_per_page,
-                        quantized_prefix_elements=_DEEPSEEK_V4_CSA_QUANTIZED_NOPE_ELEMENTS,
-                        hot_row_stride_elements=_DEEPSEEK_V4_CSA_HOT_ROW_ELEMENTS,
+                        num_kv_heads=1,
+                        tokens_per_page=tokens_per_page,
+                        head_dim=_DEEPSEEK_V4_NOPE_DIM,
+                        raw_row_stride_elements=_DEEPSEEK_V4_ROW_STRIDE,
                         buffers=tuple(
                             _Nvfp4BufferLayout(
                                 role=str(buffer.role),
@@ -374,9 +377,10 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             layer_layouts.append(
                 _Nvfp4LayerLayout(
                     layer_id=layer_id,
-                    row_count=num_kv_heads * tokens_per_page,
-                    quantized_prefix_elements=head_dim,
-                    hot_row_stride_elements=head_dim,
+                    num_kv_heads=num_kv_heads,
+                    tokens_per_page=tokens_per_page,
+                    head_dim=head_dim,
+                    raw_row_stride_elements=head_dim,
                     buffers=tuple(buffer_layouts),
                 )
             )
@@ -403,21 +407,27 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             if set(hot_buffers) != expected_roles:
                 raise ValueError(f"Cold-page layer {layer_id} roles do not match its KVCM layout")
             element_bytes = 1 if codec_state.runtime_type == 2 else 2
-            elements = layout.row_count * layout.quantized_prefix_elements
-            expected_raw_bytes = layout.row_count * layout.hot_row_stride_elements * element_bytes
+            elements = layout.num_kv_heads * layout.tokens_per_page * layout.head_dim
+            expected_raw_bytes = (
+                layout.num_kv_heads
+                * layout.tokens_per_page
+                * layout.raw_row_stride_elements
+                * element_bytes
+            )
             half_groups = elements // _ELEMENTS_PER_HALF_GROUP
             compressed_count = sum(buffer.scales is not None for buffer in layout.buffers)
             packed_bytes = elements // _ELEMENTS_PER_BYTE
             scale_bytes = elements // _ELEMENTS_PER_SCALE
-            lossless_suffix_bytes = (
-                layout.row_count
-                * (layout.hot_row_stride_elements - layout.quantized_prefix_elements)
+            suffix_bytes = (
+                layout.num_kv_heads
+                * layout.tokens_per_page
+                * (layout.raw_row_stride_elements - layout.head_dim)
                 * element_bytes
             )
             layer_start = cold_page_bytes
             scale_start = layer_start + compressed_count * packed_bytes
-            lossless_suffix_start = scale_start + compressed_count * scale_bytes
-            cursor = lossless_suffix_start + compressed_count * lossless_suffix_bytes
+            suffix_start = scale_start + compressed_count * scale_bytes
+            cursor = suffix_start + compressed_count * suffix_bytes
 
             compressed_index = 0
             for buffer in layout.buffers:
@@ -432,10 +442,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 if is_compressed:
                     data_offset = layer_start + compressed_index * packed_bytes
                     scale_offset = scale_start + compressed_index * scale_bytes
-                    lossless_suffix_offset = (
-                        lossless_suffix_start + compressed_index * lossless_suffix_bytes
-                        if lossless_suffix_bytes
-                        else 0
+                    suffix_offset = (
+                        suffix_start + compressed_index * suffix_bytes if suffix_bytes else 0
                     )
                     compressed_index += 1
                     if raw_bytes != expected_raw_bytes:
@@ -451,7 +459,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 else:
                     data_offset = cursor
                     scale_offset = 0
-                    lossless_suffix_offset = 0
+                    suffix_offset = 0
                     cursor += raw_bytes
 
                 wide_rows.append(
@@ -462,16 +470,17 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         data_offset,
                         scale_offset,
                         0,
-                        lossless_suffix_offset,
+                        suffix_offset,
                     ]
                 )
                 integer_rows.append(
                     [
                         0,
                         _NVFP4_TRANSFORM if is_compressed else _LOSSLESS_TRANSFORM,
-                        layout.row_count if is_compressed else 0,
-                        layout.quantized_prefix_elements if is_compressed else 0,
-                        layout.hot_row_stride_elements if is_compressed else 0,
+                        layout.num_kv_heads if is_compressed else 0,
+                        layout.tokens_per_page if is_compressed else 0,
+                        layout.head_dim if is_compressed else 0,
+                        layout.raw_row_stride_elements if is_compressed else 0,
                     ]
                 )
                 buffer_scales = buffer.scales if is_compressed else _Nvfp4Scales(1.0, 1.0)

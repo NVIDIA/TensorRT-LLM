@@ -40,7 +40,7 @@ enum class Nvfp4ColdPageRuntimeType : std::uint8_t
 
 inline constexpr std::uint32_t kNvfp4ColdPageMaxBuffersPerLaunch = 256;
 inline constexpr std::uint32_t kNvfp4ColdPageWideFields = 7;
-inline constexpr std::uint32_t kNvfp4ColdPageIntegerFields = 5;
+inline constexpr std::uint32_t kNvfp4ColdPageIntegerFields = 6;
 inline constexpr std::uint32_t kNvfp4ColdPageScaleFields = 4;
 
 using Nvfp4ColdPageWideTable
