@@ -80,6 +80,20 @@ def parse_maintenance_config(content):
     }
 
 
+def write_maintenance_entries(reason, patterns, output_file):
+    if not patterns:
+        reason = ''
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(
+            {
+                'reason': reason,
+                'patterns': [pattern.strip() for pattern in patterns],
+            },
+            f,
+            indent=2)
+        f.write('\n')
+
+
 def merge_maintenance_config(cur_config, main_config, diff_file, output_file):
     """Apply only the PR's maintenance additions and deletions to target TOT."""
     addition_lines, deletion_lines = get_add_and_remove_lines_from_diff_file(
@@ -91,11 +105,13 @@ def merge_maintenance_config(cur_config, main_config, diff_file, output_file):
 
     with open(main_config, 'r', encoding='utf-8') as f:
         main = parse_maintenance_config(f.read())
+    if not addition_lines and not deletion_lines:
+        write_maintenance_entries(main['reason'], main['patterns'], output_file)
+        return
+
     if os.path.isfile(cur_config):
         with open(cur_config, 'r', encoding='utf-8') as f:
             current = parse_maintenance_config(f.read())
-    else:
-        current = {'reason': '', 'patterns': []}
 
     addition_lines = [line.strip() for line in addition_lines]
     deletion_lines = [line.strip() for line in deletion_lines]
@@ -111,18 +127,7 @@ def merge_maintenance_config(cur_config, main_config, diff_file, output_file):
     patterns = merge_lists(added_patterns, main['patterns'], removed_patterns)
     reason_changed = any(line.startswith('Reason:') for line in addition_lines)
     reason = current['reason'] if reason_changed else main['reason']
-    if not patterns:
-        reason = ''
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(
-            {
-                'reason': reason,
-                'patterns': [pattern.strip() for pattern in patterns],
-            },
-            f,
-            indent=2)
-        f.write('\n')
+    write_maintenance_entries(reason, patterns, output_file)
 
 
 if __name__ == '__main__':
