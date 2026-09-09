@@ -243,35 +243,76 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Set specialized warp ids
         self.compute_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
-        self.mma_warp_id = 8
+        self.mma_qk_warp_id = 8
         self.load_tma_k_warp_id = 9
         self.load_tma_v_warp_id = 10
-        self.empty_warp_ids = (11, )
+        self.mma_pv_warp_id = 11
+        self.second_compute_warp_ids = (12, 13, 14, 15)
+        self.num_total_compute_warps = self.num_compute_warps + len(
+            self.second_compute_warp_ids)
         self.threads_per_cta = self.threads_per_warp * len((
-            self.mma_warp_id,
+            self.mma_qk_warp_id,
             self.load_tma_k_warp_id,
             self.load_tma_v_warp_id,
             *self.compute_warp_ids,
+            *self.second_compute_warp_ids,
             *self.correction_warp_ids,
-            *self.empty_warp_ids,
+            self.mma_pv_warp_id,
         ))
 
         # register settings
-        self.softmax_reg_num = 192
-        self.correction_reg_num = 256
-        self.other_reg_num = 48
+        self.softmax_reg_num = 152
+        self.correction_reg_num = 152
+        self.other_reg_num = 56
         # Named barriers
+        # tmem_ptr_sync_bar: mma_qk(1) + mma_pv(1) + 8 compute + 4 correction = 14 warps * 32
         self.tmem_ptr_sync_bar = pipeline.NamedBarrier(
             barrier_id=1,
-            num_threads=(self.threads_per_warp +
-                         self.threads_per_warp * self.num_compute_warps * 2),
+            num_threads=(
+                self.threads_per_warp * 2  # mma_qk + mma_pv
+                + self.threads_per_warp *
+                self.num_total_compute_warps  # 8 compute
+                + self.threads_per_warp * self.num_compute_warps  # 4 correction
+            ),
         )
-        self.softmax_exchange_sync_bar = pipeline.NamedBarrier(
+        # softmax_exchange covers BOTH compute groups (8 warps) for cross-group
+        # row_max / row_sum merge.
+        self.softmax_exchange_sync_bar_0 = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=(self.threads_per_warp * self.num_compute_warps))
-        self.epilogue_exchange_sync_bar = pipeline.NamedBarrier(
+        self.softmax_exchange_sync_bar_1 = pipeline.NamedBarrier(
             barrier_id=3,
             num_threads=(self.threads_per_warp * self.num_compute_warps))
+        self.epilogue_exchange_sync_bar = pipeline.NamedBarrier(
+            barrier_id=4,
+            num_threads=(self.threads_per_warp * self.num_compute_warps))
+        # Pingpong order barriers (OrderedSequenceBarrier<1,2> pattern). Each
+        # group waits on its own bar via arrive_and_wait (= bar.sync); the OTHER
+        # group signals via split-phase .arrive() (non-blocking). num_threads
+        # MUST cover both groups (256 = wait-side 128 + signal-side 128) so the
+        # bar releases only after BOTH have arrived - that's the cross-group
+        # serialization that gives the TMEM peer-read its happens-before.
+        # Init-phase trick: g1 pre-arrives bar_0 once at warp setup so g0's
+        # first arrive_and_wait completes without waiting for g1's loop arrive.
+        self.softmax_order_bar_0 = pipeline.NamedBarrier(
+            barrier_id=5,
+            num_threads=(self.threads_per_warp * self.num_total_compute_warps),
+        )
+        self.softmax_order_bar_1 = pipeline.NamedBarrier(
+            barrier_id=6,
+            num_threads=(self.threads_per_warp * self.num_total_compute_warps),
+        )
+        self.softmax_warps_initial_sync_bar = pipeline.NamedBarrier(
+            barrier_id=7,
+            num_threads=(self.threads_per_warp * self.num_total_compute_warps),
+        )
+        # Init seed for TMEM corr (row_max, row_sum). load_other_group_metadata
+        # reads peer's prev-tile metadata; the first tile of each group needs a
+        # valid "no prev yet" seed: row_max = -inf, row_sum = 0 form the online
+        # softmax identity (fmax(x, -inf) = x; running_sum * 1 + s = s).
+        self.init_row_max = -float("inf")
+        # TMEM corr stage: 4 32-bit cols (row_sum, row_max, corr, no_corr).
+        self.tmem_corr_stage_cols = 4
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the MLA kernel operation.
@@ -545,6 +586,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -552,6 +594,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.mma_qk_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -809,7 +852,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                      cute.cosize(vc_smem_layout_staged)],
                 1024,
             ]
-            softmax_smem_exchange: cute.struct.MemRange[self.acc_dtype,
+            # 2softmax: doubled so both compute groups can write simultaneously.
+            # g0 slots [0, 128); g1 slots [128, 256).
+            softmax_smem_exchange: cute.struct.MemRange[self.acc_dtype, 2 *
                                                         self.num_compute_warps *
                                                         self.threads_per_warp]
             epilogue_smem_exchange: cute.struct.MemRange[
@@ -1098,7 +1143,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Prefetch tma descriptor
-        if warp_idx == self.mma_warp_id:
+        if warp_idx == self.mma_qk_warp_id:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
             cpasync.prefetch_descriptor(tma_atom_q_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent)
@@ -1109,11 +1154,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        # Tensor memory dealloc barrier init
+        # Tensor memory dealloc barrier init.
+        # TMEM lifetime is owned by mma_pv warp (W11) - the LAST TMEM user.
+        # W8 (mma_qk) finishes earlier via mma_s pipeline back-pressure, but W11
+        # keeps reading P / writing O until its mma_o.producer_tail. Putting
+        # allocate + free on W11 avoids the race where W8 frees TMEM while
+        # W11 still has in-flight mma_pv.
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
-            allocator_warp_id=self.mma_warp_id,
+            allocator_warp_id=self.mma_pv_warp_id,
             is_two_cta=self.use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
         )
@@ -1180,9 +1230,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(p_smem_layout_staged.outer,
                                        swizzle=p_smem_layout_staged.inner)
-        # (compute_threads,)
+        # (compute_threads,) - doubled for 2softmax (both groups exchange concurrently).
         softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
-            cute.make_layout(self.num_compute_warps * self.threads_per_warp))
+            cute.make_layout(2 * self.num_compute_warps *
+                             self.threads_per_warp))
         epilogue_smem_exchange = storage.epilogue_smem_exchange.get_tensor(
             cute.make_layout(self.num_compute_warps * self.threads_per_warp))
 
@@ -1194,9 +1245,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx >= self.empty_warp_ids[
-                0] and warp_idx <= self.empty_warp_ids[-1]:
-            cute.arch.setmaxregister_decrease(self.other_reg_num)
+        # Note: warp 11 (formerly empty filler) is now mma_pv_warp_id - handled below.
 
         if warp_idx == self.load_tma_k_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
@@ -1297,12 +1346,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             load_v_pipeline.producer_tail(load_v_producer_state)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  MMA warp
+        #  MMA-QK warp (W8): issues all mma_qk, produces S via mma_s pipeline.
+        #  Does NOT allocate or free TMEM (W11 owns TMEM lifetime).
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx == self.mma_warp_id:
+        if warp_idx == self.mma_qk_warp_id:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
-            # Alloc tensor memory buffer
-            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            # TMEM allocation done by W11; W8 just waits and retrieves the ptr.
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
@@ -1310,14 +1359,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Consumer, self.load_q_stage)
             load_k_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.load_k_stage)
-            load_v_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.load_v_stage)
             mma_s_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.mma_s_stage)
-            p_mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.p_mma_stage)
-            mma_o_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.mma_o_stage)
             tile_sched = create_mla_static_tile_scheduler(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
             work_tile = tile_sched.initial_work_tile_info()
@@ -1331,7 +1374,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         local_split_kv=local_split_kv,
                         load_q_pipeline=load_q_pipeline,
                         load_k_pipeline=load_k_pipeline,
-                        load_v_pipeline=load_v_pipeline,
                         tmem_ptr=tmem_ptr,
                         is_leader_cta=is_leader_cta,
                         L=mCL.shape[1],
@@ -1343,41 +1385,83 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         sKC=sKC,
                         sKC_rope=sKC_rope,
                     )
-                    mma_pv_params = SimpleNamespace(
+                    (
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                    ) = self.mma(
+                        mma_common_params,
+                        mma_qk_params,
+                        k_tile_count,
+                        tiled_mma_qk,
+                        load_q_consumer_state,
+                        load_k_consumer_state,
+                        mma_s_producer_state,
+                    )
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+
+            mma_s_pipeline.producer_tail(mma_s_producer_state)
+            # TMEM relinquish/free done by W11 (mma_pv warp, allocator).
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  MMA-PV warp (W11): owns TMEM lifetime. Issues all mma_pv.
+        # ///////////////////////////////////////////////////////////////////////////////
+        if warp_idx == self.mma_pv_warp_id:
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
+            # W11 (mma_pv) owns TMEM lifetime: allocate here, free after the loop.
+            tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            load_v_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.load_v_stage)
+            p_mma_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.p_mma_stage)
+            mma_o_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.mma_o_stage)
+            tile_sched = create_mla_static_tile_scheduler(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            work_tile = tile_sched.initial_work_tile_info()
+            while work_tile.is_valid_tile:
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                    split_kv, cache_seqs, block_split_kvs, blk_coord)
+                if k_tile_count > 0:
+                    mma_pv_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        local_split_kv=local_split_kv,
+                        load_v_pipeline=load_v_pipeline,
+                        tmem_ptr=tmem_ptr,
+                        is_leader_cta=is_leader_cta,
+                        L=mCL.shape[1],
+                    )
+                    mma_pv_only_params = SimpleNamespace(
                         p_mma_pipeline=p_mma_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
                         sP=sP,
                         sVC=sVC,
                     )
                     (
-                        tiled_mma_qk,
                         tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_k_consumer_state,
                         load_v_consumer_state,
-                        mma_s_producer_state,
                         p_mma_consumer_state,
                         mma_o_producer_state,
-                    ) = self.mma(
-                        mma_common_params,
-                        mma_qk_params,
-                        mma_pv_params,
+                    ) = self.mma_pv_warp_body(
+                        mma_pv_common_params,
+                        mma_pv_only_params,
                         k_tile_count,
-                        tiled_mma_qk,
                         tiled_mma_pv,
-                        load_q_consumer_state,
-                        load_k_consumer_state,
                         load_v_consumer_state,
-                        mma_s_producer_state,
                         p_mma_consumer_state,
                         mma_o_producer_state,
                     )
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-            mma_s_pipeline.producer_tail(mma_s_producer_state)
             mma_o_pipeline.producer_tail(mma_o_producer_state)
-
+            # W11 is the allocator; safe to free now that all mma_pv has retired.
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
@@ -1435,10 +1519,79 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             mma_s_consumer_state=mma_s_consumer_state,
                             p_mma_producer_state=p_mma_producer_state,
                             p_cor_producer_state=p_cor_producer_state,
+                            is_second_compute_warp=False,
                         ))
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            p_cor_pipeline.producer_tail(p_cor_producer_state)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        #  Compute warp - second group (g1, warps 12-15, odd k-tiles).
+        #  2softmax Strategy A: alternates k-tiles with g0; cross-group merges
+        #  inside softmax() via softmax_exchange_sync_bar.
+        # ///////////////////////////////////////////////////////////////////////////////
+        if (warp_idx >= self.second_compute_warp_ids[0]
+                and warp_idx <= self.second_compute_warp_ids[-1]):
+            cute.arch.setmaxregister_increase(self.softmax_reg_num)
+            mma_s_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mma_s_stage)
+            p_mma_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.p_mma_stage)
+            p_cor_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.p_cor_stage)
+            mma_o_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.mma_o_stage)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+            tile_sched = create_mla_static_tile_scheduler(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim())
+            work_tile = tile_sched.initial_work_tile_info()
+            mma_s_consumer_state.advance()
+            p_mma_producer_state.advance()
+            p_cor_producer_state.advance()
+            # Pingpong init-phase trick: g1 pre-arrives softmax_order_bar_0 once
+            # so g0's FIRST softmax_order_bar_0.arrive_and_wait() completes
+            # without waiting for g1's first loop arrive. Replaces a per-iter
+            # is_first_tile guard. Bar is num_total_compute_warps (256 threads)
+            # so wait-side 128 + signal-side 128 = 256 -> release.
+            while work_tile.is_valid_tile:
+                blk_coord = work_tile.tile_idx
+                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                    split_kv, cache_seqs, block_split_kvs, blk_coord)
+                if k_tile_count > 0:
+                    compute_common_params = SimpleNamespace(
+                        blk_coord=blk_coord,
+                        split_kv=split_kv,
+                        local_split_kv=local_split_kv,
+                        smem_exchange=softmax_smem_exchange,
+                        mAccO=mAccO,
+                        mO=mO,
+                        K=cache_seqs[blk_coord[2]],
+                        L=mCL.shape[1],
+                        tmem_ptr=tmem_ptr,
+                        tidx=tidx,
+                        p_cor_pipeline=p_cor_pipeline,
+                    )
+                    compute_softmax_params = SimpleNamespace(
+                        tiled_mma_qk=tiled_mma_qk,
+                        sP=sP,
+                        mma_s_pipeline=mma_s_pipeline,
+                        p_mma_pipeline=p_mma_pipeline,
+                        softmax_scale_log2=softmax_scale_log2,
+                    )
+                    mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = self.compute(
+                        compute_common_params,
+                        compute_softmax_params,
+                        k_index=k_index,
+                        k_tile_count=k_tile_count,
+                        mma_s_consumer_state=mma_s_consumer_state,
+                        p_mma_producer_state=p_mma_producer_state,
+                        p_cor_producer_state=p_cor_producer_state,
+                        is_second_compute_warp=True,
+                    )
+                tile_sched.advance_to_next_work()
+                work_tile = tile_sched.get_current_work()
+            # NOTE: g1 skips p_cor_pipeline.producer_tail - g0 already does it.
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction warp
@@ -2056,62 +2209,27 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self,
         common_params: SimpleNamespace,
         qk_params: SimpleNamespace,
-        pv_params: SimpleNamespace,
         k_tile_count: cutlass.Int32,
         tiled_mma_qk: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
         load_q_consumer_state: pipeline.PipelineState,
         load_k_consumer_state: pipeline.PipelineState,
-        load_v_consumer_state: pipeline.PipelineState,
         mma_s_producer_state: pipeline.PipelineState,
-        p_mma_consumer_state: pipeline.PipelineState,
-        mma_o_producer_state: pipeline.PipelineState,
     ) -> tuple[
             cute.TiledMma,
-            cute.TiledMma,
-            pipeline.PipelineState,
-            pipeline.PipelineState,
             pipeline.PipelineState,
             pipeline.PipelineState,
             pipeline.PipelineState,
     ]:
-        """MMA warp to compute the result of Q*K^T and P*V. Updates the tiled mma and pipeline states.
+        """MMA-QK warp body (W8). Issues K mma_qk calls producing S to TMEM.
 
-        :param common_params: The common parameters for mma qk and pv
-        :type common_params: SimpleNamespace
-        :param qk_params: The mma qk parameters
-        :type qk_params: SimpleNamespace
-        :param pv_params: The mma pv parameters
-        :type pv_params: SimpleNamespace
-        :param k_tile_count: The k tile count
-        :type k_tile_count: cutlass.Int32
-        :param tiled_mma_qk: The tiled mma qk
-        :type tiled_mma_qk: cute.TiledMma
-        :param tiled_mma_pv: The tiled mma pv
-        :type tiled_mma_pv: cute.TiledMma
-        :param load_q_consumer_state: The load q consumer state
-        :type load_q_consumer_state: pipeline.PipelineState
-        :param load_k_consumer_state: The load k consumer state
-        :type load_k_consumer_state: pipeline.PipelineState
-        :param load_v_consumer_state: The load v consumer state
-        :type load_v_consumer_state: pipeline.PipelineState
-        :param mma_s_producer_state: The mma s producer state
-        :type mma_s_producer_state: pipeline.PipelineState
-        :param p_mma_consumer_state: The p mma consumer state
-        :type p_mma_consumer_state: pipeline.PipelineState
-        :param mma_o_producer_state: The mma o producer state
-        :type mma_o_producer_state: pipeline.PipelineState
-
-        :return: The tiled mma qk, the tiled mma pv, the load q consumer state, the load k consumer state, the load v consumer state, the mma s producer state, the p mma consumer state, and the mma o producer state
-        :rtype: tuple[cute.TiledMma, cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
+        Split from the previous fused mma_qk_pv: PV is now handled by
+        mma_pv_warp_body on W11.
         """
 
         tSrQ = tiled_mma_qk.make_fragment_A(qk_params.sQ)
         tSrQ_rope = tiled_mma_qk.make_fragment_A(qk_params.sQ_rope)
         tSrKC = tiled_mma_qk.make_fragment_B(qk_params.sKC)
         tSrKC_rope = tiled_mma_qk.make_fragment_B(qk_params.sKC_rope)
-        tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
-        tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
 
         tStS_shape = tiled_mma_qk.partition_shape_C(
             cute.select(self.mma_qk_tiler, mode=[0, 1]))
@@ -2120,19 +2238,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # use real tmem ptr for tStS
         tStS_staged = cute.make_tensor(common_params.tmem_ptr,
                                        tStS_staged_fake.layout)
-        tOtO_shape = tiled_mma_pv.partition_shape_C(
-            cute.select(self.mma_pv_tiler, mode=[0, 1]))
-        # mma O has 1 stage.
-        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
-        tOtO_layout = cute.append(
-            tOtO.layout,
-            cute.make_layout(
-                common_params.L // self.mma_pv_tiler[1],
-                stride=self.mma_pv_tiler[1] // self.warps_in_n,
-            ),
-        )
-        tOtO_staged = cute.make_tensor(
-            tStS_staged.iterator + self.tmem_o_offset, tOtO_layout)
 
         # set more parameters
         qk_params.tSrQ = tSrQ
@@ -2140,31 +2245,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         qk_params.tSrKC = tSrKC
         qk_params.tSrKC_rope = tSrKC_rope
         qk_params.tStS_staged = tStS_staged
-        pv_params.tOrP = tOrP
-        pv_params.tOrVC = tOrVC
-        pv_params.tOtO_staged = tOtO_staged
 
-        # mma O accumulates on K, so the accumulate flag is set to False once before all K blocks.
-        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
         load_q_pipeline = common_params.load_q_pipeline
         if common_params.is_leader_cta:
             load_q_release_state = load_q_consumer_state.clone()
-            (
-                tiled_mma_qk,
-                load_q_consumer_state,
-                load_k_consumer_state,
-                mma_s_producer_state,
-            ) = self.mma_qk(
-                common_params,
-                qk_params,
-                tiled_mma_qk,
-                load_q_consumer_state,
-                load_k_consumer_state,
-                mma_s_producer_state,
-                wait_q=True,
-            )
-            k_tile_count -= 1
 
+            load_q_pipeline.consumer_wait(load_q_consumer_state)
+            load_q_consumer_state.advance()
             while k_tile_count > 0:
                 (
                     tiled_mma_qk,
@@ -2180,6 +2267,62 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     mma_s_producer_state,
                     wait_q=False,
                 )
+                k_tile_count -= 1
+            # release q consumer states
+            load_q_pipeline.consumer_release(load_q_release_state)
+            load_q_release_state.advance()
+            # NOTE: mma_pv (mainloop + epilog) is now handled by warp 11 (mma_pv_warp_body).
+
+        return (
+            tiled_mma_qk,
+            load_q_consumer_state,
+            load_k_consumer_state,
+            mma_s_producer_state,
+        )
+
+    @cute.jit
+    def mma_pv_warp_body(
+        self, common_params: SimpleNamespace, pv_params: SimpleNamespace,
+        k_tile_count: cutlass.Int32, tiled_mma_pv: cute.TiledMma,
+        load_v_consumer_state: pipeline.PipelineState,
+        p_mma_consumer_state: pipeline.PipelineState,
+        mma_o_producer_state: pipeline.PipelineState
+    ) -> tuple[
+            cute.TiledMma,
+            pipeline.PipelineState,
+            pipeline.PipelineState,
+            pipeline.PipelineState,
+    ]:
+        """PV-only MMA warp body (W11). Runs K mma_pv calls - one per k-tile.
+
+        W11 owns TMEM lifetime; allocate/free happen in the caller __call__
+        branch around this loop. ACCUMULATE=False is set once before the loop;
+        each mma_pv accumulates into the same TMEM O region across k-tiles.
+        """
+        tOrP = tiled_mma_pv.make_fragment_A(pv_params.sP)
+        tOrVC = tiled_mma_pv.make_fragment_B(pv_params.sVC)
+
+        tOtO_shape = tiled_mma_pv.partition_shape_C(
+            cute.select(self.mma_pv_tiler, mode=[0, 1]))
+        tOtO = tiled_mma_pv.make_fragment_C(tOtO_shape)
+        tOtO_layout = cute.append(
+            tOtO.layout,
+            cute.make_layout(
+                common_params.L // self.mma_pv_tiler[1],
+                stride=self.mma_pv_tiler[1] // self.warps_in_n,
+            ))
+        tOtO_staged = cute.make_tensor(
+            common_params.tmem_ptr + self.tmem_o_offset, tOtO_layout)
+
+        pv_params.tOrP = tOrP
+        pv_params.tOrVC = tOrVC
+        pv_params.tOtO_staged = tOtO_staged
+
+        # mma O accumulates across k-tiles, set ACCUMULATE=False once before loop.
+        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, False)
+
+        if common_params.is_leader_cta:
+            while k_tile_count > 0:
                 (
                     tiled_mma_pv,
                     load_v_consumer_state,
@@ -2194,30 +2337,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     mma_o_producer_state,
                 )
                 k_tile_count -= 1
-            # release q consumer states
-            load_q_pipeline.consumer_release(load_q_release_state)
-            load_q_release_state.advance()
-            (
-                tiled_mma_pv,
-                load_v_consumer_state,
-                p_mma_consumer_state,
-                mma_o_producer_state,
-            ) = self.mma_pv(
-                common_params,
-                pv_params,
-                tiled_mma_pv,
-                load_v_consumer_state,
-                p_mma_consumer_state,
-                mma_o_producer_state,
-            )
 
         return (
-            tiled_mma_qk,
             tiled_mma_pv,
-            load_q_consumer_state,
-            load_k_consumer_state,
             load_v_consumer_state,
-            mma_s_producer_state,
             p_mma_consumer_state,
             mma_o_producer_state,
         )
@@ -2380,6 +2503,22 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
 
     @cute.jit
+    def softmax_advance_to_next_group(
+        self,
+        common_params: SimpleNamespace,
+        p_mma_producer_state: pipeline.PipelineState,
+        mma_s_consumer_state: pipeline.PipelineState,
+        p_cor_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState,
+               pipeline.PipelineState]:
+        """Advance the P MMA producer state, the MMA s consumer state, and the P correction producer state to the next group."""
+        p_mma_producer_state.advance()
+        mma_s_consumer_state.advance()
+        p_cor_producer_state.advance()
+        common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
+        return p_mma_producer_state, mma_s_consumer_state, p_cor_producer_state
+
+    @cute.jit
     def compute(
         self,
         common_params: SimpleNamespace,
@@ -2389,6 +2528,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mma_s_consumer_state: pipeline.PipelineState,
         p_mma_producer_state: pipeline.PipelineState,
         p_cor_producer_state: pipeline.PipelineState,
+        is_second_compute_warp: bool,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState,
                pipeline.PipelineState]:
         """Compute warp to compute the result of softmax, rescale, and epilogue. Updates the related pipeline states.
@@ -2407,6 +2547,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type p_mma_producer_state: pipeline.PipelineState
         :param p_cor_producer_state: The P correction producer state
         :type p_cor_producer_state: pipeline.PipelineState
+        :param is_second_compute_warp: True for g1 (odd k-tiles), False for g0
+        :type is_second_compute_warp: bool
 
         :return: The MMA s consumer state, the P MMA producer state, and the P correction producer state
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
@@ -2414,11 +2556,35 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         k_tile_total = cute.ceil_div(common_params.K, self.mma_qk_tiler[1])
 
-        row_max = -self.acc_dtype.inf
+        # 2softmax: row_max initialised from the init seed (-inf) - same value
+        # that init_p_cor_metadata writes to peer-readable TMEM below, so the
+        # first tile's load_other_group_metadata + fmax(row_max_new, peer) gives
+        # the correct identity for online softmax.
+        row_max = self.acc_dtype(self.init_row_max)
         row_sum = self.acc_dtype(0)
         correction_factor = self.acc_dtype(1)
+        odd_k_tile = k_tile_count % 2 == 1
+        # 2softmax: g0 takes even k-tiles, g1 takes odd k-tiles. g1 advances all
+        # pipeline states once at entry to start on stage 1 (one stage per group).
+        if cutlass.const_expr(is_second_compute_warp):
+            k_index = k_index + 1
+            k_tile_count = k_tile_count // 2
+        else:
+            k_tile_count = (k_tile_count +
+                            1) // 2  # g0 takes the extra tile if odd
+        valid_k_tile_count = k_tile_count > 0
+        # wait for 2 softmax warp groups to arrive at the barrier to avoid divergent across waves.
+        self.softmax_warps_initial_sync_bar.arrive_and_wait()
         common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
 
+        # Seed this group's home p_cor TMEM stage so the FIRST tile's peer-read
+        # in load_other_group_metadata returns (row_max=-inf, row_sum=0) instead
+        # of uninitialised TMEM. Must run after producer_acquire so this group
+        # owns its stage write.
+        if cutlass.const_expr(is_second_compute_warp):
+            self.init_p_cor_metadata(common_params, softmax_params,
+                                     p_cor_producer_state)
+            self.softmax_order_bar_0.arrive()
         # Number of tiles from the global-K end that may contain causal-masked
         # positions. Min k_bound = K - (S_q-1), which can span up to
         # ceil((seq_len_q-2)/tile_N)+1 tiles (tile-boundary-crossing case). For
@@ -2432,7 +2598,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         first_mask_tile_idx = k_tile_total - mask_tile_count
 
         # Phase 1: pure unmasked bulk tiles (all columns strictly < min k_bound).
-        while k_tile_count > 1 and k_index < first_mask_tile_idx:
+        # 2softmax: each group steps by 2 k-tiles; phase boundaries respect this.
+        while k_tile_count > 0 and k_index < first_mask_tile_idx:
+            is_local_last_tile = (False if cutlass.const_expr(
+                common_params.mAccO is None) else k_tile_count == 1)
             (
                 mma_s_consumer_state,
                 p_mma_producer_state,
@@ -2450,15 +2619,24 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_max,
                 row_sum,
                 correction_factor,
+                is_second_compute_warp,
                 False,
-                False,
+                is_local_last_tile,
             )
-            k_index = k_index + 1
+            k_index = k_index + 2
             k_tile_count = k_tile_count - 1
+            if k_tile_count > 0:
+                p_mma_producer_state, mma_s_consumer_state, p_cor_producer_state = (
+                    self.softmax_advance_to_next_group(
+                        common_params,
+                        p_mma_producer_state,
+                        mma_s_consumer_state,
+                        p_cor_producer_state,
+                    ))
 
         # Phase 2: intermediate tiles that overlap the causal/K-bound region
         # but are not this work-split's final tile.
-        while k_tile_count > 1:
+        while k_tile_count > 0:
             (
                 mma_s_consumer_state,
                 p_mma_producer_state,
@@ -2476,59 +2654,41 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_max,
                 row_sum,
                 correction_factor,
+                is_second_compute_warp,
                 True,
-                False,
+                True,
             )
-            k_index = k_index + 1
+            k_index = k_index + 2
             k_tile_count = k_tile_count - 1
+            if k_tile_count > 0:
+                p_mma_producer_state, mma_s_consumer_state, p_cor_producer_state = (
+                    self.softmax_advance_to_next_group(
+                        common_params,
+                        p_mma_producer_state,
+                        mma_s_consumer_state,
+                        p_cor_producer_state,
+                    ))
 
-        # Phase 3: this work-split's final tile.
-        if cutlass.const_expr(common_params.mAccO is not None):
-            # Split-KV: only apply mask when this final tile is globally in
-            # the mask region (covers both last-split last-tile and straddling
-            # splits). Runtime comparison.
-            (
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-            ) = self.softmax(
-                common_params,
-                softmax_params,
-                k_index,
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-                k_index >= first_mask_tile_idx,
-                True,
-            )
+        if odd_k_tile and valid_k_tile_count:
+            if cutlass.const_expr(is_second_compute_warp):
+                # next first compute warp in this wave
+                p_mma_producer_state.advance()
+                mma_s_consumer_state.advance()
+                p_cor_producer_state.advance()
+                # first compute warp in next wave
+                p_mma_producer_state.advance()
+                mma_s_consumer_state.advance()
+                p_cor_producer_state.advance()
         else:
-            (
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-            ) = self.softmax(
-                common_params,
-                softmax_params,
-                k_index,
-                mma_s_consumer_state,
-                p_mma_producer_state,
-                p_cor_producer_state,
-                row_max,
-                row_sum,
-                correction_factor,
-                True,
-                True,
-            )
-
+            p_mma_producer_state.advance()
+            mma_s_consumer_state.advance()
+            p_cor_producer_state.advance()
+        if cutlass.const_expr(is_second_compute_warp):
+            if odd_k_tile:
+                self.softmax_order_bar_1.arrive_and_wait()
+        else:
+            if not odd_k_tile:
+                self.softmax_order_bar_0.arrive_and_wait()
         return mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state
 
     @cute.jit
@@ -2640,6 +2800,165 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         return p_cor_producer_state, row_max_new
 
     @cute.jit
+    def init_p_cor_metadata(
+        self,
+        common_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        p_cor_producer_state: pipeline.PipelineState,
+    ) -> None:
+        """Seed the TMEM correction-factor stage owned by this softmax warp.
+
+        Slot order matches exchange_p_cor_metadata (4 * 32-bit per stage):
+            rCor[0]  = row_sum           -> 0.0
+            rCor[1]  = row_max           -> -inf  (the load-bearing seed)
+            rCor[2]  = correction_factor -> 1.0
+            rCor[3]  = no_correction (Int32 via recast) -> 1
+
+        Called by each softmax warpgroup once after producer_acquire on its
+        starting stage (g0 -> stage 0, g1 -> stage 1), before entering the K-tile
+        mainloop. Without this seed, the FIRST tile's load_other_group_metadata
+        would read uninitialised TMEM and corrupt the running (row_max, row_sum).
+        """
+        init_tidx = common_params.tidx % (self.num_compute_warps *
+                                          self.threads_per_warp)
+        init_tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+            cute.select(self.mma_qk_tiler, mode=[0, 1]))
+        init_tStS_layout = softmax_params.tiled_mma_qk.make_fragment_C(
+            cute.append(init_tStS_shape, self.mma_s_stage)).layout
+        init_tStS = cute.make_tensor(common_params.tmem_ptr, init_tStS_layout)
+        init_tAcc = init_tStS[(None, None), 0, 0, 0]
+
+        init_corr_layout = cute.make_layout(
+            (init_tAcc.shape[0], 4, self.mma_s_stage),
+            stride=(init_tAcc.stride[0], 1, self.tmem_corr_stage_cols),
+        )
+        init_tCor = cute.make_tensor(
+            common_params.tmem_ptr + self.correction_factor_offset,
+            init_corr_layout,
+        )
+        init_cCor = cute.make_identity_tensor(init_tCor.shape)
+        init_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype)
+        init_tiled_copy = tcgen05.make_tmem_copy(init_store_atom, init_tCor)
+        init_thr_copy = init_tiled_copy.get_slice(init_tidx)
+        init_cCor_part = init_thr_copy.partition_S(init_cCor)
+        init_tCor_part = init_thr_copy.partition_D(init_tCor)
+        init_rCor = cute.make_fragment_like(init_cCor_part[None, None, None, 0],
+                                            self.acc_dtype)
+        init_rCor_int = cute.make_tensor(
+            cute.recast_ptr(init_rCor.iterator, dtype=cutlass.Int32),
+            init_rCor.layout,
+        )
+        init_rCor[0] = self.acc_dtype(0.0)
+        init_rCor[1] = self.acc_dtype(self.init_row_max)
+        init_rCor[2] = self.acc_dtype(1.0)
+        init_rCor_int[3] = cutlass.Int32(1)
+        cute.copy(
+            init_tiled_copy,
+            init_rCor,
+            init_tCor_part[None, None, None, p_cor_producer_state.index],
+        )
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
+    def load_other_group_metadata(
+        self,
+        common_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        p_cor_producer_state: pipeline.PipelineState,
+    ) -> tuple[cutlass.Float32, cutlass.Float32]:
+        """Load (row_max, row_sum) from the OTHER softmax warpgroup's home
+        p_cor TMEM stage.
+
+        Each group's exchange_p_cor_metadata writes to its OWN home stage
+        (g0 -> stage 0, g1 -> stage 1, due to the `advance * 2` skip in softmax).
+        The OPPOSITE stage thus holds the peer's most recent metadata (or the
+        init_p_cor_metadata seed before any cross-group write).
+
+        Safety: NO pipeline acquire/release - this is a pure cross-group
+        READ. The caller MUST have done a softmax_order_bar.arrive_and_wait()
+        with the peer right before this load so the peer's exchange_p_cor TMEM
+        store is happens-before.
+
+        Returns: (row_max, row_sum) from slot 1 and slot 0 respectively.
+        """
+        other_stage = (p_cor_producer_state.index + 1) % self.mma_s_stage
+
+        tidx = common_params.tidx % (self.num_compute_warps *
+                                     self.threads_per_warp)
+        tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
+            cute.select(self.mma_qk_tiler, mode=[0, 1]))
+        tStS_layout = softmax_params.tiled_mma_qk.make_fragment_C(
+            cute.append(tStS_shape, self.mma_s_stage)).layout
+        tStS = cute.make_tensor(common_params.tmem_ptr, tStS_layout)
+        tAcc = tStS[(None, None), 0, 0, 0]
+
+        corr_layout = cute.make_layout(
+            (tAcc.shape[0], 4, self.mma_s_stage),
+            stride=(tAcc.stride[0], 1, self.tmem_corr_stage_cols),
+        )
+        tCor = cute.make_tensor(
+            common_params.tmem_ptr + self.correction_factor_offset, corr_layout)
+        cCor = cute.make_identity_tensor(tCor.shape)
+        load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype)
+        load_tiled_copy = tcgen05.make_tmem_copy(load_atom, tCor)
+        load_thr_copy = load_tiled_copy.get_slice(tidx)
+        tCor_part = load_thr_copy.partition_S(tCor)
+        cCor_part = load_thr_copy.partition_D(cCor)
+        rCor = cute.make_fragment_like(cCor_part[None, None, None, 0],
+                                       self.acc_dtype)
+        cute.copy(
+            load_tiled_copy,
+            tCor_part[None, None, None, other_stage],
+            rCor,
+        )
+        return rCor[1], rCor[0]  # (row_max, row_sum)
+
+    @cute.jit
+    def store_p_cor_row_sum(
+        self,
+        common_params: SimpleNamespace,
+        row_sum: cutlass.Float32,
+        saved_stage_idx: cutlass.Int32,
+        tAcc: cute.Tensor,
+        tidx: cutlass.Int32,
+    ) -> None:
+        """Late store of row_sum ONLY (slot 0 of corr region) at the previously
+        committed stage. No commit / advance - caller already committed via
+        exchange_p_cor_metadata's full store. Used in pingpong's split-write
+        scheme: early store commits (row_max + corr + no_corr + placeholder
+        row_sum) so the correction warp can rescale; this late store patches
+        in the real row_sum once it has been reduced. Correction warp uses
+        row_sum only at the LAST tile (separate is_local_last_tile path), so
+        race-on-row_sum is benign.
+        """
+        corr_layout_1 = cute.make_layout(
+            (tAcc.shape[0], 1, self.mma_s_stage),
+            stride=(tAcc.stride[0], 1, self.tmem_corr_stage_cols),
+        )
+        tCor = cute.make_tensor(
+            common_params.tmem_ptr + self.correction_factor_offset,
+            corr_layout_1,
+        )
+        cCor = cute.make_identity_tensor(tCor.shape)
+        store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), self.acc_dtype)
+        tiled_copy = tcgen05.make_tmem_copy(store_atom, tCor)
+        thr_copy = tiled_copy.get_slice(tidx)
+        cCor_for_copy = thr_copy.partition_S(cCor)
+        tCor_for_copy = thr_copy.partition_D(tCor)
+        rCor = cute.make_fragment_like(cCor_for_copy[None, None, None, 0],
+                                       self.acc_dtype)
+        rCor[0] = row_sum
+        cute.copy(
+            tiled_copy,
+            rCor,
+            tCor_for_copy[None, None, None, saved_stage_idx],
+        )
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
     def softmax(
         self,
         common_params: SimpleNamespace,
@@ -2651,6 +2970,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max: cutlass.Float32,
         row_sum: cutlass.Float32,
         correction_factor: cutlass.Float32,
+        is_second_compute_warp: bool,
         apply_mask: bool,
         is_local_last_tile: cutlass.Boolean,
     ) -> tuple[
@@ -2692,7 +3012,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32]
         """
 
-        softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
+        softmax_exchange_sync_bar = (self.softmax_exchange_sync_bar_1
+                                     if is_second_compute_warp else
+                                     self.softmax_exchange_sync_bar_0)
         softmax_params.mma_s_pipeline.consumer_wait(mma_s_consumer_state)
 
         # load S from tmem
@@ -2800,24 +3122,68 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                                      row_max_new, 0)
             else:
                 row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
+        # fence between tmem load and mma s
+        cute.arch.fence_view_async_tmem_load()
 
-        # if warps in N is 2, reduce row_max across warps (0, 1) and (2, 3)
+        softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
+
+        # Intra-group warps_in_n=2 exchange across warps (0,1) <-> (2,3) within
+        # the group. Each group writes into its own half of softmax_smem_exchange:
+        # g0 -> slots [0, 128), g1 -> slots [128, 256). The named barrier covers
+        # both groups (one arrive_and_wait serves both the intra-group reduce
+        # AND the cross-group Sync #1 below - see the second smem_exchange read
+        # which gives this thread the PEER GROUP's row_max).
+        _group_offset = self.num_compute_warps * self.threads_per_warp
+        if cutlass.const_expr(is_second_compute_warp):
+            _my_base = _group_offset
+        else:
+            _my_base = 0
+
         if cutlass.const_expr(self.warps_in_n == 2):
-            common_params.smem_exchange[tidx] = row_max_new
-            self.softmax_exchange_sync_bar.wait()
+            common_params.smem_exchange[_my_base + tidx] = row_max_new
+            softmax_exchange_sync_bar.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
-                common_params.smem_exchange[(tidx + 64) %
-                                            (self.num_compute_warps *
-                                             self.threads_per_warp)],
+                common_params.smem_exchange[
+                    _my_base + (tidx + 64) %
+                    (self.num_compute_warps * self.threads_per_warp)],
             )
+
+        # === 2softmax cross-group merge via TMEM peer-read (tunePerf pattern) ===
+        # Pingpong A: wait for the OTHER group to release us. The peer's
+        # exchange_p_cor_metadata TMEM store on its prev tile is happens-before
+        # the .arrive() it issues at the bottom of its prev iter, so this
+        # arrive_and_wait gives us the acquire memory ordering needed for the
+        # load_other_group_metadata read below. g0's first wait is satisfied
+        # by g1's pre-arrive of bar_0 at warp setup (init-phase trick).
+        if cutlass.const_expr(is_second_compute_warp):
+            self.softmax_order_bar_1.arrive_and_wait()
+        else:
+            self.softmax_order_bar_0.arrive_and_wait()
+
+        # Serial inheritance: peer's prev-tile metadata IS the GLOBAL running
+        # state right before THIS tile in serial tile order (pingpong serializes
+        # tiles 0,1,2,3,... across g0/g1). Override (row_max, row_sum) with
+        # peer's prev values so the subsequent correction = exp2(prev_global -
+        # this_global) and the row_sum update gives running_sum_after_this_tile
+        # = GLOBAL state.
+        other_row_max, other_row_sum = self.load_other_group_metadata(
+            common_params, softmax_params, p_cor_producer_state)
+        row_max_new = cute.arch.fmax(row_max_new, other_row_max)
+        row_max = other_row_max
+        row_sum = other_row_sum
 
         # find correction factor
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2,
             fastmath=True)
-        # split kv case
-        if cutlass.const_expr(not is_local_last_tile):
+        saved_p_cor_idx = p_cor_producer_state.index
+        # Early store of (row_max_new, correction_factor, no_correction) - row_sum
+        # field carries the inherited peer-prev value (the global sum BEFORE this
+        # tile), which is a placeholder; the real updated row_sum is patched in
+        # via store_p_cor_row_sum below at saved_p_cor_idx. Safe because the
+        # correction warp uses row_sum only at the LAST tile path (separate is_local_last_tile branch).
+        if not is_local_last_tile:
             p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
                 common_params,
                 softmax_params,
@@ -2883,6 +3249,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         smem_thr_copy = smem_tiled_copy.get_slice(tidx)
         rP_copy_view = smem_thr_copy.retile(tTR_rS)
         sP_copy_view = smem_thr_copy.partition_D(sP_mk_view)
+
+        softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
         cute.copy(smem_tiled_copy, rP_copy_view, sP_copy_view)
 
         # fence between smem store and mma o
@@ -2890,7 +3258,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         softmax_params.p_mma_pipeline.producer_commit(p_mma_producer_state)
         p_mma_producer_state.advance()
 
-        # row_sum, using `add_packed_f32x2` to reduce the number of instructions
+        # row_sum update: tunePerf peer-inheritance pattern.
+        # row_sum entering this block = peer's prev-tile row_sum (the global
+        # running sum BEFORE this tile, inherited via load_other_group_metadata).
+        # Apply correction (rescale prev to new row_max base) and add this tile's
+        # locally reduced exp sum -> running_sum_after_this_tile = GLOBAL state.
+        # No cross-group SMEM exchange needed; the next iter's peer-read picks
+        # up this group's freshly written row_sum from TMEM corr.
         row_sum = row_sum * correction_factor
         row_sum_vec = (0.0, 0.0)
         for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
@@ -2898,8 +3272,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1]))
         row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
-        # split kv case
-        if cutlass.const_expr(is_local_last_tile):
+        # Late store of row_sum ONLY - patches in the real row_sum at the slot
+        # committed by the early store above so peer's next-iter
+        # load_other_group_metadata sees the updated global row_sum. No commit
+        # / advance (already done by early store).
+        if not is_local_last_tile:
+            self.store_p_cor_row_sum(
+                common_params,
+                row_sum,
+                saved_p_cor_idx,
+                tAcc,
+                tidx,
+            )
+
+        # Pingpong B - signal the OTHER group to start its critical section.
+        # Split-phase .arrive() contributes this group's threads to the other
+        # group's bar and falls through immediately. cfence: control-flow fence
+        # to prevent ptxas from hoisting subsequent work above bar.arrive.
+
+        if is_local_last_tile:
             p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
                 common_params,
                 softmax_params,
@@ -2912,13 +3303,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 p_cor_producer_state,
             )
 
-        # store correction factor/row_sum/row_max to tmem for correction warp
-        common_params.p_cor_pipeline.producer_acquire(p_cor_producer_state)
+        if cutlass.const_expr(is_second_compute_warp):
+            self.softmax_order_bar_0.arrive()  # g1 -> g0
+        else:
+            self.softmax_order_bar_1.arrive()  # g0 -> g1
 
-        # fence between tmem load and mma s
-        cute.arch.fence_view_async_tmem_load()
-
-        softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
         mma_s_consumer_state.advance()
 
         return (
@@ -3318,7 +3707,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         load_qkv_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, len([self.load_tma_k_warp_id]))
         load_qkv_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id]))
+            pipeline.Agent.Thread, len([self.mma_qk_warp_id]))
         return pipeline.PipelineTmaUmma.create(
             barrier_storage=load_qkv_mbar_ptr,
             num_stages=load_stages,
@@ -3344,7 +3733,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         mma_s_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id]))
+            pipeline.Agent.Thread, len([self.mma_qk_warp_id]))
         consumer_thread_size = (self.threads_per_warp *
                                 len(self.compute_warp_ids) *
                                 self.cluster_shape_mnk[0])
@@ -3383,7 +3772,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             producer_thread_size,
         )
         p_mma_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id]))
+            pipeline.Agent.Thread, len([self.mma_pv_warp_id]))
         return pipeline.PipelineAsyncUmma.create(
             barrier_storage=p_mma_mbar_ptr,
             num_stages=self.p_mma_stage,
@@ -3437,7 +3826,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         mma_o_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id]))
+            pipeline.Agent.Thread, len([self.mma_pv_warp_id]))
         consumer_thread_size = (self.threads_per_warp *
                                 len(self.compute_warp_ids) *
                                 self.cluster_shape_mnk[0])
