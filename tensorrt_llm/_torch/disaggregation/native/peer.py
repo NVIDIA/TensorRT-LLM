@@ -510,17 +510,12 @@ class PeerRegistrar:
         # the mapper must slice only the overlapping subset.
         extra_kwargs = {}
         if self_lg.kind == CacheKind.STATE:
-            # Position of each overlapping layer in the full sorted local_layer_ids
-            # used by extract_slot. These are indices into the ptrs array.
-            self_all_lids = sorted(set(int(e["local_layer_id"]) for e in self_pv.buffer_entries))
-            peer_all_lids = sorted(set(int(e["local_layer_id"]) for e in peer_pv.buffer_entries))
-            self_lid_to_pos = {lid: i for i, lid in enumerate(self_all_lids)}
-            peer_lid_to_pos = {lid: i for i, lid in enumerate(peer_all_lids)}
-            # overlapping_layers are global IDs; map them to local_layer_ids
-            self_overlap_positions = [self_lid_to_pos[self_g2l[gid]] for gid in overlapping_layers]
-            peer_overlap_positions = [
-                peer_lid_to_pos[peer_g2l[gid]] for gid in overlapping_layers if gid in peer_g2l
-            ]
+            # Positions index the ptr array ``extract_slot`` builds, which is
+            # ordered by view offset.
+            self_gid_to_pos = {gid: i for i, gid in enumerate(self_global_ids)}
+            peer_gid_to_pos = {gid: i for i, gid in enumerate(peer_global_ids)}
+            self_overlap_positions = [self_gid_to_pos[gid] for gid in overlapping_layers]
+            peer_overlap_positions = [peer_gid_to_pos[gid] for gid in overlapping_layers]
             # Under contiguous PP partitioning, overlapping layers form a
             # contiguous block in the ptrs array.
             extra_kwargs["src_layer_off"] = (

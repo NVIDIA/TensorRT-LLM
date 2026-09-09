@@ -20,6 +20,8 @@ import torch
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
+    _build_layer_group_for_v2_mamba,
+    _build_mamba_pool_views,
     _build_v2_mamba_state_pool,
     build_page_table,
     build_page_table_from_manager,
@@ -35,6 +37,10 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_unique_layers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
+    MambaRole,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -751,6 +757,77 @@ def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
     assert pool.layer_stride_bytes == 2 * state_bytes
 
 
+def test_v2_mamba_state_pool_allows_interleaved_unrelated_roles():
+    state_bytes = 64
+    storage = torch.empty((3, 7, state_bytes), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 3, :]]
+
+    pool = _build_v2_mamba_state_pool(states)
+
+    assert pool.slot_stride_bytes == 7 * state_bytes
+    assert pool.layer_stride_bytes == 3 * state_bytes
+
+
+def test_v2_mamba_layer_group_grafts_replicated_side_state():
+    """Side views built from the V2 descriptors address the right slot bytes."""
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        BUFFER_ENTRY_DTYPE,
+        KVCachePageTable,
+        PhysicalPool,
+        PoolView,
+    )
+
+    num_slots = 3
+    conv_storage = torch.empty((num_slots, 4, 4, 3), dtype=torch.float32)
+    ssm_storage = torch.empty((num_slots, 4, 2, 4, 5), dtype=torch.float32)
+    # One coalesced V2 slot holding two 64-byte buffers; the side role is the
+    # second, so it starts 64 bytes into every slot.
+    side_storage = torch.empty((num_slots, 2, 64), dtype=torch.uint8)
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager.mamba_layer_offsets = {10: 0, 11: 1}
+    manager.all_conv_states = [conv_storage[:, 0], conv_storage[:, 2]]
+    manager.all_ssm_states = [ssm_storage[:, 0], ssm_storage[:, 2]]
+    manager.conv_state_shape = [4, 3]
+    manager.conv_section_dims = [1, 1, 2]
+    manager.ssm_state_shape = [2, 4, 5]
+
+    side_views = [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array([(1, 64, 64)], dtype=BUFFER_ENTRY_DTYPE),
+            pool_role=frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)}),
+            mapper_kind=MapperKind.REPLICATED,
+            bytes_per_layer=64,
+        )
+    ]
+    side_pools = {
+        0: PhysicalPool(base_address=side_storage.data_ptr(), slot_bytes=128, num_slots=num_slots)
+    }
+
+    layer_group, pool_group = _build_layer_group_for_v2_mamba(
+        manager, pool_group_idx=0, side_state=(side_views, side_pools)
+    )
+
+    side_view_idx = next(
+        index
+        for index, view in enumerate(layer_group.pool_views)
+        if view.pool_role == frozenset({str(MambaRole.PLE_NGRAM_CONTEXT)})
+    )
+    # The graft must renumber pool_idx past the conv and ssm pools.
+    assert layer_group.pool_views[side_view_idx].pool_idx == 2
+    assert pool_group.pools[2].base_address == side_storage.data_ptr()
+
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[layer_group],
+        pool_groups=[pool_group],
+    )
+    extracted = KVRegionExtractorV1(page_table).extract_slot(
+        slot_id=2, layer_group_id=0, pool_idx=side_view_idx
+    )
+    assert extracted.memory.ptrs.tolist() == [side_storage[2, 1].data_ptr()]
+
+
 def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():
     state_bytes = 64
     storage = torch.empty((3, 2, state_bytes), dtype=torch.uint8)
@@ -838,6 +915,26 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
     # V2 interleaved: one shared pool registered once
     assert get_unique_pool_memory_descs(page_table, device_id=3) == [
         (1000, physical_slot_bytes * num_slots, 3, "kv_cache_memory_pool0")
+    ]
+
+
+def test_legacy_mamba_pool_views_address_layers_past_four_gib() -> None:
+    """V1 pools are layer-major, so a layer offset spans the whole pool."""
+    from tensorrt_llm._torch.disaggregation.resource.page import LocalLayer, PhysicalPool
+
+    num_layers = 4
+    slot_bytes = 1 << 20
+    num_slots = 2048  # 2 GiB per layer: layer 2 already sits past 4 GiB
+    conv_pool = PhysicalPool(base_address=1000, slot_bytes=slot_bytes, num_slots=num_slots)
+    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=slot_bytes, num_slots=num_slots)
+    local_layers = [
+        LocalLayer(local_layer_id=lid, global_layer_id=10 + lid) for lid in range(num_layers)
+    ]
+
+    conv_view, _ = _build_mamba_pool_views(conv_pool, ssm_pool, local_layers)
+
+    assert [int(entry["offset"]) for entry in conv_view.buffer_entries] == [
+        lid * num_slots * slot_bytes for lid in range(num_layers)
     ]
 
 
