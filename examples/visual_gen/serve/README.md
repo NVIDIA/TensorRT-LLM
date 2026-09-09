@@ -275,7 +275,7 @@ generator checkpoint:
 | Action — policy / forward / inverse dynamics | same | `extra_params.action_mode`, or a checkpoint-selected Policy mode; returns a tensor payload |
 | T2AV — video with synchronized audio | same | `extra_params: {"enable_audio": true}` |
 | T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
-| Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` |
+| Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` or `--enable_visual_gen` |
 
 The typed reference field declares the input modality at the HTTP boundary.
 Uploads are resolved to raw encoded bytes before dispatch, and every worker
@@ -289,7 +289,7 @@ Cosmos3 deployment configs live in `../configs/` (one level up from here) and
 are shared with the offline examples:
 
 ```bash
-# 1 GPU (Nano or Super)
+# 1 GPU Nano
 trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
 # 4 GPU / 8 GPU (Super): trtllm-serve starts the configured workers
@@ -300,18 +300,25 @@ trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gp
 # instead of the omni video shape
 trtllm-serve nvidia/Cosmos3-Super-Text2Image-4Step --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
 
+# 4 GPU distilled image-to-video deployment
+trtllm-serve nvidia/Cosmos3-Super-Image2Video-4Step --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
+
+# 1 GPU Edge generator: no YAML is needed, but select the VisualGen runtime
+trtllm-serve nvidia/Cosmos3-Edge --enable_visual_gen
+
 # 1 GPU DROID policy: the checkpoint supplies its Policy deployment recipe
-trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID
+trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID --enable_visual_gen
 ```
 
-`nvidia/Cosmos3-Super-Image2Video-4Step` and `nvidia/Cosmos3-Edge` need no
-config: their defaults already are the deployed shape. The DROID policy
-checkpoint likewise needs no config because its checkpoint metadata selects
-Policy mode and supplies the deployment defaults. A local checkpoint directory
-works in place of any Hub ID.
+The distilled image-to-video checkpoint reads its fixed four-step schedule from
+the checkpoint; the Super multi-GPU config supplies the parallel deployment for
+its 720p x 189-frame shape. Edge and DROID need no YAML because their checkpoint
+defaults already are the deployed shape, but they do need
+`--enable_visual_gen` to select the generator rather than the Reasoner. The
+DROID checkpoint metadata then selects Policy mode and supplies its deployment
+defaults. A local checkpoint directory works in place of any Hub ID.
 
-Guardrails are enabled by default and the server will not start without them —
-install and authenticate per
+Guardrails are enabled by default. Install and authenticate per
 [Guardrails](../models/cosmos3/README.md#guardrails) before serving.
 
 ### Per-mode requests
@@ -546,8 +553,8 @@ With the default `"response_format": "url"` the response carries a
 **Reasoner — chat**
 
 A Cosmos3 checkpoint holds two models: the **Reasoner** (a Qwen3-VL-based VLM)
-and the **Generator** (video / image diffusion). `--visual_gen_args` selects
-which one `trtllm-serve` loads — omit it to serve the Reasoner:
+and the **Generator** (video / image diffusion). `--visual_gen_args` or
+`--enable_visual_gen` selects the Generator — omit both to serve the Reasoner:
 
 ```bash
 trtllm-serve nvidia/Cosmos3-Nano --port 8000
