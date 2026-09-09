@@ -972,6 +972,9 @@ def test_cute_dsl_fp8_bmm_quantize_rubin_cuda_graph():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(*args)
+    # Poison the outputs so the assertions below can only pass if replay wrote them.
+    fused_fp8.fill_(0)
+    fused_scale.fill_(0)
     graph.replay()
     torch.cuda.synchronize()
 
