@@ -221,7 +221,7 @@ def test_adaln_modulation_keeps_dynamic_fp8_input_high_precision() -> None:
     ("quant_algo", "dynamic_weight_quant"),
     [
         (QuantAlgo.FP8, False),
-        (QuantAlgo.FP8_BLOCK_SCALES, True),
+        (QuantAlgo.FP8_BLOCK_SCALES, False),
         (QuantAlgo.NVFP4, False),
         (QuantAlgo.W4A8_AWQ, True),
     ],
@@ -230,13 +230,33 @@ def test_transformer_rejects_unvalidated_quantization_modes(
     quant_algo: QuantAlgo,
     dynamic_weight_quant: bool,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="FP8 / NVFP4"):
+    with pytest.raises(NotImplementedError, match="dynamically quantized"):
         h3.MiniMaxH3Transformer3DModel(
             _make_model_config(
                 quant_config=QuantConfig(quant_algo=quant_algo),
                 dynamic_weight_quant=dynamic_weight_quant,
             )
         )
+
+
+def test_transformer_excludes_small_media_projections_from_fp8_blockwise() -> None:
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(
+            quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+            dynamic_weight_quant=True,
+            hidden_size=128,
+            ffn_dim=256,
+            text_dim=128,
+            time_embed_dim=128,
+            num_attention_heads=1,
+            attention_head_dim=128,
+        )
+    )
+    for module in (model.proj_in, model.audio_proj_in, model.proj_out, model.audio_proj_out):
+        assert not module.has_any_quant
+        assert module.weight.dtype == torch.float32
+    assert model.context_embedder.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert model.context_embedder.weight.dtype == torch.float8_e4m3fn
 
 
 def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
@@ -836,8 +856,8 @@ def test_attention_backends_match_vanilla(backend: str) -> None:
     """
     if backend == "FA4" and not FA4_AVAILABLE:
         pytest.skip("FA4 kernel not available")
-    if backend == "CUTEDSL" and not _sm_at_least(10):
-        pytest.skip("CUTEDSL requires sm_100a or newer")
+    if backend in ("CUTEDSL", "TRTLLM") and not _sm_at_least(10):
+        pytest.skip(f"{backend} parity requires SM100 or newer")
 
     # _model_inputs draws unseeded randoms, so build one set and share it.
     inputs = _model_inputs("cuda")

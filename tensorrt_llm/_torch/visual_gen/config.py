@@ -630,6 +630,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                 pretrained_config._name_or_path = str(checkpoint_path)
 
             model_index_path = checkpoint_path / "model_index.json"
+            if not model_index_path.exists():
+                model_index_path = checkpoint_path / "modular_model_index.json"
             if model_index_path.exists():
                 with open(model_index_path) as f:
                     model_index = json.load(f)

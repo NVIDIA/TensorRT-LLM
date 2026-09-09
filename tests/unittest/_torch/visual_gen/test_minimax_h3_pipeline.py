@@ -24,7 +24,10 @@ import torch
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.config import discover_pipeline_components
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionPipelineConfig,
+    discover_pipeline_components,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3 as h3_pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     MINIMAX_H3_TEXT_TAG,
@@ -249,6 +252,34 @@ def test_public_visual_gen_lists_minimax_h3() -> None:
     from tensorrt_llm import VisualGen
 
     assert "MiniMaxAI/MiniMax-H3" in VisualGen.supported_models()
+
+
+def test_modular_manifest_preserves_pipeline_metadata(tmp_path: Path) -> None:
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "config.json").write_text('{"hidden_size": 32}')
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps(
+            {
+                "transformer": ["diffusers", "WanTransformer3DModel"],
+                "transformer_2": ["diffusers", "WanTransformer3DModel"],
+                "boundary_ratio": 0.9,
+                "expand_timesteps": True,
+            }
+        )
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path))
+    assert config.primary_pretrained_config.boundary_ratio == 0.9
+    assert config.primary_pretrained_config.expand_timesteps is True
+
+
+def test_trtllm_attention_rejects_older_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=1),
+        attention=SimpleNamespace(backend="TRTLLM"),
+    )
+    with pytest.raises(NotImplementedError, match="SM100"):
+        MiniMaxH3Pipeline(config)
 
 
 def test_hf_download_is_scoped_to_the_supported_fl2va_components(
@@ -477,6 +508,46 @@ def test_denoise_step_rejects_unusable_velocity(velocity: torch.Tensor, match: s
 
 def test_denoise_step_accepts_a_normal_velocity() -> None:
     h3_pipeline._check_denoise_step(torch.randn(1, 4, 2), "video", 3)
+
+
+@pytest.mark.parametrize("generated_value,condition_value", [(0.0, 1.0), (1.0, float("nan"))])
+def test_denoise_validates_only_generated_rows(
+    monkeypatch: pytest.MonkeyPatch, generated_value: float, condition_value: float
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    # A 32x32 image becomes 16x16 latents, or 64 rows of 2x2 patches.
+    condition_rows = 64
+    monkeypatch.setattr(pipeline, "_encode_keyframes", lambda *args: torch.zeros(condition_rows, 8))
+
+    class ConditionedTransformer(_FakeMiniMaxH3Transformer):
+        def __call__(
+            self,
+            *,
+            hidden_states: torch.Tensor,
+            audio_hidden_states: torch.Tensor,
+            **kwargs: object,
+        ):
+            video = torch.full_like(hidden_states, generated_value)
+            video[:, :condition_rows] = condition_value
+            return video, torch.ones_like(audio_hidden_states)
+
+    pipeline.transformer = ConditionedTransformer()
+    request = dict(
+        prompt="test",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=2,
+        keyframes=[Image.new("RGB", (32, 32))],
+        keyframe_anchors=("first",),
+    )
+    if generated_value == 0:
+        with pytest.raises(RuntimeError, match="all zeros"):
+            pipeline.forward(**request)
+    else:
+        assert pipeline.forward(**request).video.shape[1] == 124
 
 
 def _png_bytes(color: tuple[int, int, int] = (10, 20, 30)) -> bytes:

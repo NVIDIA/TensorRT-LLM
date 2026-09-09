@@ -88,6 +88,10 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        # GLM conditions on the explicit timestep labels while integrating with
+        # shifted sigmas. Diffusers 0.40 recomputes the labels from those sigmas;
+        # preserve the checkpoint's pre-0.40 conditioning schedule instead.
+        scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None and sigmas is None:

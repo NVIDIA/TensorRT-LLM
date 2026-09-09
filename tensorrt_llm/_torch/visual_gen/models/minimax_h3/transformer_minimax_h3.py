@@ -189,10 +189,6 @@ def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
     return norm(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
-def _rms_norm(hidden_size: int, eps: float, dtype: torch.dtype) -> RMSNorm:
-    return RMSNorm(hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True)
-
-
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
     """Produce six AdaLN vectors for every ``(timestep, modality)`` pair."""
 
@@ -232,7 +228,9 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         model_config: DiffusionModelConfig,
     ) -> None:
         super().__init__()
-        self.norm = _rms_norm(hidden_size, eps, model_config.torch_dtype)
+        self.norm = RMSNorm(
+            hidden_size=hidden_size, eps=eps, dtype=model_config.torch_dtype, has_weights=True
+        )
         self.linear = Linear(
             time_embed_dim,
             2 * hidden_size,
@@ -272,7 +270,9 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
-        self.norm1 = _rms_norm(hidden_size, norm_eps, model_config.torch_dtype)
+        self.norm1 = RMSNorm(
+            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        )
         self.attn = MiniMaxH3Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -282,7 +282,9 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             layer_idx=layer_idx,
             module_name=f"token_refiner.refiner_blocks.{layer_idx}.attn",
         )
-        self.norm2 = _rms_norm(hidden_size, norm_eps, model_config.torch_dtype)
+        self.norm2 = RMSNorm(
+            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        )
         self.ff = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -333,7 +335,12 @@ class MiniMaxH3TokenRefiner(nn.Module):
                 for layer_idx in range(num_layers)
             ]
         )
-        self.final_norm = _rms_norm(hidden_size, final_norm_eps, model_config.torch_dtype)
+        self.final_norm = RMSNorm(
+            hidden_size=hidden_size,
+            eps=final_norm_eps,
+            dtype=model_config.torch_dtype,
+            has_weights=True,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for block in self.refiner_blocks:
@@ -356,7 +363,9 @@ class MiniMaxH3TransformerBlock(nn.Module):
         layer_idx: int,
     ) -> None:
         super().__init__()
-        self.norm1 = _rms_norm(hidden_size, norm_eps, model_config.torch_dtype)
+        self.norm1 = RMSNorm(
+            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        )
         self.attn = MiniMaxH3Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -366,7 +375,9 @@ class MiniMaxH3TransformerBlock(nn.Module):
             layer_idx=layer_idx,
             module_name=f"transformer_blocks.{layer_idx}.attn",
         )
-        self.norm2 = _rms_norm(hidden_size, norm_eps, model_config.torch_dtype)
+        self.norm2 = RMSNorm(
+            hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
+        )
         self.ff = GatedMLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -419,9 +430,8 @@ class MiniMaxH3TransformerBlock(nn.Module):
 # Weight quantization is only wired for the load-time (dynamic) path, where
 # DynamicLinearWeightLoader quantizes the released BF16 checkpoint.  NVFP4 uses
 # the loader's fused-QKV path so the packed QKV projection shares one scale.
-# Both algorithms treat the checkpoint's FP32 projections identically: they are
-# quantized like every other Linear (see ``post_load_weights``).
-_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.FP8, QuantAlgo.NVFP4})
+# FP8 blockwise keeps the small FP32 media projections unquantized.
+_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4})
 
 # NVFP4 additionally needs runtime activation quantization.  The loader only
 # writes ``weight_scale`` / ``weight_scale_2``, so ``Linear.input_scale`` stays
@@ -436,10 +446,9 @@ _FORCE_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.NVFP4})
 # Only the vanilla backend can express this model's padding.  TRTLLM and CUTEDSL
 # accept ``key_padding_mask`` through ``**kwargs`` and silently drop it.  FA4
 # accepts it but reduces it to ``seqused_k = mask.sum(dim=1)``, which assumes the
-# valid positions form a prefix; MiniMax-H3 pads text rows, which sit at the
-# start of the packed sequence, so its valid set is never a prefix and FA4 would
-# keep the pads while dropping real media rows.  Either way the result would be
-# wrong rather than loud, so padded sequences are rejected up front.
+# valid positions form a prefix. Custom transformer inputs may put padding
+# between modalities instead. The normal pipeline never inserts padding, but
+# reject these custom layouts rather than silently attend to their dummy rows.
 _KEY_PADDING_MASK_BACKENDS = frozenset({"VANILLA"})
 
 
@@ -465,7 +474,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             quant_algo in _DYNAMIC_QUANT_ALGOS and model_config.dynamic_weight_quant
         ):
             raise NotImplementedError(
-                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / NVFP4 weights only."
+                "MiniMax-H3 supports BF16, or dynamically quantized FP8 / FP8_BLOCK_SCALES / NVFP4 weights only."
             )
         # The released checkpoint keeps proj_in / audio_proj_in / proj_out /
         # audio_proj_out in FP32 and feeds them FP32 activations.  NVFP4
@@ -505,6 +514,20 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         final_norm_eps = float(cfg.final_norm_eps)
 
         video_patch_dim = in_channels * patch_size[0] * patch_size[1] * patch_size[2]
+        # Block-scaled GEMMs require aligned dimensions. Keep the checkpoint's
+        # small FP32 media projections unquantized, including their output heads.
+        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            excluded = list(model_config.quant_config.exclude_modules or [])
+            for name, input_dim, output_dim in (
+                ("proj_in", video_patch_dim, hidden_size),
+                ("audio_proj_in", audio_in_channels, hidden_size),
+                ("proj_out", hidden_size, video_patch_dim),
+                ("audio_proj_out", hidden_size, audio_in_channels),
+            ):
+                if input_dim % 128 or output_dim % 128:
+                    if name not in excluded:
+                        excluded.append(name)
+            model_config.quant_config.exclude_modules = excluded
         self.config = SimpleNamespace(
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,

@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# 1-GPU BF16 MiniMax-H3 VisualGen configuration.
-# The checkpoint path is supplied by examples/visual_gen/models/minimax_h3.py
-# through --model. This file intentionally contains
-# only VisualGenArgs fields so it can be consumed by VisualGenArgs.from_yaml.
-#
+# Supply the checkpoint with --model. Small media projections stay in FP32.
+# Experimental: audio quality acceptance is still pending.
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
+
 cuda_graph_config:
   enable: false
 

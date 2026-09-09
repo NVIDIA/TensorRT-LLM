@@ -70,15 +70,6 @@ def _component_skipped(
     return component in skip_components or component.value in skip_components
 
 
-# All four backends produce sound output on sm_100, the architecture this build
-# targets.  test_attention_backends_match_vanilla pins them bit-identical, but
-# only on a 1-layer model over a 4-row packed sequence; a full 50-layer bf16 run
-# differs slightly because kernel reduction order does.  Measured on sm_89 the
-# TRTLLM result diverges badly, which is an artifact of running outside the
-# targeted architectures rather than a property of the model.
-_VALIDATED_ATTENTION_BACKENDS = frozenset({"VANILLA", "FA4", "TRTLLM", "CUTEDSL"})
-
-
 def _load_keyframe_image(content: Any) -> Image.Image:
     """Decode one keyframe reference into RGB.
 
@@ -156,11 +147,13 @@ class MiniMaxH3Pipeline(BasePipeline):
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
         if pipeline_config.mapping.world_size != 1:
             raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
-        if pipeline_config.attention.backend not in _VALIDATED_ATTENTION_BACKENDS:
+        if (
+            pipeline_config.attention.backend == "TRTLLM"
+            and torch.cuda.get_device_capability()[0] < 10
+        ):
             raise NotImplementedError(
-                f"MiniMax-H3 does not support the {pipeline_config.attention.backend} "
-                f"attention backend; validated backends are "
-                f"{', '.join(sorted(_VALIDATED_ATTENTION_BACKENDS))}."
+                "MiniMax-H3 TRTLLM attention requires SM100 or newer for numerical "
+                "correctness. Use VANILLA on older GPUs."
             )
         if pipeline_config.cache is not None:
             raise NotImplementedError(
@@ -758,7 +751,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         )
         timer.mark_denoise_start()
 
+        # H3 uses distinct video/audio timesteps; BasePipeline.denoise currently
+        # passes the primary timestep to every stream's scheduler.
+        denoise_start = time.time()
+        total_steps = len(self.scheduler.timesteps)
+        logger.info(f"Denoising [video, audio]: {total_steps} steps")
         for index, video_timestep in self._profile_denoise_steps(self.scheduler.timesteps):
+            step_start = time.time()
             unique_timesteps, timestep_indices = row_timestep_plan[index]
             video_velocity, audio_velocity = self.transformer(
                 hidden_states=latents[None],
@@ -779,9 +778,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             # video with silent audio.  The cause was never reproduced, so fail
             # loudly at the step that produced it instead of shipping the
             # corruption downstream.
-            _check_denoise_step(video_velocity, "video", index)
-            _check_denoise_step(audio_velocity, "audio", index)
             condition_rows = layout.num_condition_video_rows
+            _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
+            _check_denoise_step(audio_velocity, "audio", index)
             latents[condition_rows:] = self.scheduler.step(
                 video_velocity[0, condition_rows:].float(),
                 video_timestep,
@@ -794,7 +793,16 @@ class MiniMaxH3Pipeline(BasePipeline):
                 audio_latents,
                 return_dict=False,
             )[0]
+            step_time = time.time() - step_start
+            average_time = (time.time() - denoise_start) / (index + 1)
+            logger.info(
+                f"Step {index + 1}/{total_steps} | {step_time:.2f}s | "
+                f"Avg={average_time:.2f}s/step "
+                f"ETA={average_time * (total_steps - index - 1):.1f}s"
+            )
 
+        denoise_time = time.time() - denoise_start
+        logger.info(f"Denoising done: {denoise_time:.2f}s ({denoise_time / total_steps:.2f}s/step)")
         timer.mark_post_start()
         video = self._decode_video(
             latents,
