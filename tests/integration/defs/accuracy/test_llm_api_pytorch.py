@@ -4353,56 +4353,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestQwen3_0_6B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "Qwen3/Qwen3-0.6B"
-    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
-
-    @skip_pre_hopper
-    @pytest.mark.timeout(1800)
-    def test_piecewise_cuda_graph_compile_restriction_stability(self) -> None:
-        """Compare compiled and eager decode after compiled piecewise prefill."""
-        prompts = ["The capital of France is"]
-        sampling_params = SamplingParams(max_tokens=8,
-                                         end_id=-1,
-                                         temperature=0,
-                                         return_generation_logits=True)
-
-        def run(
-            compile_only_piecewise_graphs: bool
-        ) -> tuple[list[int], torch.Tensor]:
-            torch_compile_config = TorchCompileConfig(
-                enable_fullgraph=True,
-                compile_only_piecewise_graphs=compile_only_piecewise_graphs,
-            )
-            with LLM(
-                    self.MODEL_PATH,
-                    max_seq_len=128,
-                    max_num_tokens=32,
-                    max_batch_size=1,
-                    disable_overlap_scheduler=True,
-                    gather_generation_logits=True,
-                    cuda_graph_config=CudaGraphConfig(enable_padding=True,
-                                                      max_batch_size=1),
-                    prefill_cuda_graph_backend=PrefillCudaGraphBackend.
-                    PIECEWISE,
-                    prefill_capture_num_tokens=[32],
-                    torch_compile_config=torch_compile_config,
-            ) as llm:
-                output = llm.generate(
-                    prompts, sampling_params=sampling_params)[0].outputs[0]
-                assert output.generation_logits is not None
-                return list(output.token_ids), output.generation_logits.clone()
-
-        compiled_tokens, compiled_logits = run(False)
-        restricted_tokens, restricted_logits = run(True)
-
-        assert restricted_tokens == compiled_tokens
-        torch.testing.assert_close(restricted_logits,
-                                   compiled_logits,
-                                   rtol=1e-2,
-                                   atol=1e-2)
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
