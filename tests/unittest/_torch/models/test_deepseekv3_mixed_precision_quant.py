@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3MoE
+from tensorrt_llm._torch.moe.fused_moe import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -79,6 +80,34 @@ def test_experts_quant_config_falls_back_to_global_without_dict(mixed_precision_
     model_config = SimpleNamespace(quant_config=mixed_precision_config, quant_config_dict=None)
 
     assert Deepseekv3MoE._get_experts_quant_config(model_config, 0) is mixed_precision_config
+
+
+def test_expert_weight_loading_mode_w4a8_custom_for_w4a8_awq(w4a8_awq_config):
+    # The resolved W4A8_AWQ expert config selects the custom loading mode; this
+    # is the assignment the MoE construction makes from the resolved config.
+    assert (
+        Deepseekv3MoE._expert_weight_loading_mode(w4a8_awq_config)
+        is MoEWeightLoadingMode.W4A8_CUSTOM
+    )
+
+
+def test_expert_weight_loading_mode_vanilla_for_non_int4(mixed_precision_config):
+    # Neither the ambiguous MIXED_PRECISION global nor a plain FP8 config is
+    # int4-weight-per-group, so both fall to VANILLA.
+    assert (
+        Deepseekv3MoE._expert_weight_loading_mode(mixed_precision_config)
+        is MoEWeightLoadingMode.VANILLA
+    )
+    assert (
+        Deepseekv3MoE._expert_weight_loading_mode(QuantConfig(quant_algo=QuantAlgo.FP8))
+        is MoEWeightLoadingMode.VANILLA
+    )
+
+
+def test_expert_weight_loading_mode_none_is_vanilla():
+    # override_quant_config is Optional, so the resolved expert config is None on
+    # an unquantized layer; the mode selection must not dereference it.
+    assert Deepseekv3MoE._expert_weight_loading_mode(None) is MoEWeightLoadingMode.VANILLA
 
 
 def _bare_configurable_moe(override_quant_config):

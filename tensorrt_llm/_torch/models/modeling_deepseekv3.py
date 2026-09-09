@@ -1004,10 +1004,8 @@ class Deepseekv3MoE(nn.Module):
             layer_idx=layer_idx,
             # DS-R1 W4A8 is only supported through custom quantization script from
             # examples/quantization/quantize_mixed_precision_moe.py
-            weight_loading_mode=(MoEWeightLoadingMode.W4A8_CUSTOM
-                                 if expert_quant_config.layer_quant_mode.
-                                 is_int4_weight_only_per_group() else
-                                 MoEWeightLoadingMode.VANILLA),
+            weight_loading_mode=self._expert_weight_loading_mode(
+                expert_quant_config),
         )
 
         self.mapping = model_config.mapping
@@ -1101,6 +1099,19 @@ class Deepseekv3MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
+
+    @staticmethod
+    def _expert_weight_loading_mode(
+            expert_quant_config: Optional[QuantConfig]) -> MoEWeightLoadingMode:
+        # W4A8_CUSTOM only for the int4-weight-per-group experts produced by
+        # examples/quantization/quantize_mixed_precision_moe.py; everything else
+        # (including the unquantized case, where there is no expert quant config)
+        # uses VANILLA. Guard None: override_quant_config is Optional, so the
+        # resolved expert config can be None on an unquantized layer.
+        if (expert_quant_config is not None and expert_quant_config.
+                layer_quant_mode.is_int4_weight_only_per_group()):
+            return MoEWeightLoadingMode.W4A8_CUSTOM
+        return MoEWeightLoadingMode.VANILLA
 
     @staticmethod
     def _get_shared_experts_quant_config(model_config,
