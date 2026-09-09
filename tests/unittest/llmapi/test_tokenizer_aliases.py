@@ -32,6 +32,11 @@ from tensorrt_llm.llmapi import llm_args as llm_args_module
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.tokenizer import TOKENIZER_ALIASES
 
+# These are pure-Python alias-table checks with no GPU dependency. The l0_cpu
+# stage runs pytest with ``-m cpu_only`` and conftest drops any file lacking
+# this marker, so without it every test here is deselected and pytest exits 5.
+pytestmark = pytest.mark.cpu_only
+
 
 def test_llm_args_reuses_the_tokenizer_package_alias_table():
     assert llm_args_module.TOKENIZER_ALIASES is tokenizer_pkg.TOKENIZER_ALIASES
