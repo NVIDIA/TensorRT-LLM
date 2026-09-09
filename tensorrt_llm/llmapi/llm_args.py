@@ -5281,11 +5281,11 @@ class ModelExpressConfig(StrictBaseModel):
 
     server_query_timeout_s: Optional[NonNegativeInt] = Field(
         default=None,
-        description="Timeout in seconds for upstream MxLiveWeightLoader source "
-        "discovery. When unset, TRT-LLM first probes for existing sources: "
-        "no source uses a short 30-second fallback cap, while an existing "
-        "source uses modelexpress's default wait for long donor loads.",
-        status="prototype")
+        description="Deprecated and ignored. ModelExpress performs one source "
+        "discovery query and falls back to native checkpoint loading when no "
+        "compatible source is immediately available.",
+        status="deprecated",
+        deprecated=True)
 
     preshard_strategy: str = Field(
         default="per_module",
@@ -5666,6 +5666,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "async worker should only be used when confidential compute is active. "
         "This argument is provided to enable it for testing purposes, "
         "irrespective of confidential compute state.",
+        status="prototype")
+
+    enable_in_graph_sampling: bool = Field(
+        default=False,
+        description="Opt-in in-graph sampling: capture part of the "
+        "sampling work into the model's CUDA graph and run it there, instead "
+        "of eagerly after the forward. The sampler itself is unchanged; only "
+        "where its work runs differs. Batches whose sampling cannot be "
+        "captured are unaffected and keep the eager path. This captures an "
+        "additional set of CUDA graphs at startup, which makes warmup "
+        "noticeably slower and costs extra memory, in exchange for lower "
+        "per-step sampling overhead.",
         status="prototype")
 
     enable_speculative_beam_history_d2h: bool = Field(

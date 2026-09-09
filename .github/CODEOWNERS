@@ -205,7 +205,6 @@
 /tests/scripts/perf-sanity @NVIDIA/trt-llm-perf-devs
 
 # ===== KV CACHE MANAGER =====
-/cpp/include/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -213,7 +212,6 @@
 /cpp/include/tensorrt_llm/batch_manager/reorderPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/stringSetTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/templatedTrie* @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/blockKey* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/evictionPolicy* @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/batch_manager/kvCache* @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -427,7 +425,6 @@
 /cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/allocateKvCache.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
@@ -468,7 +465,7 @@
 /3rdparty/** @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/** @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /3rdparty/vendor_patches/flashinfer-prims-ts.patch @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-oss-compliance
-/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
+/3rdparty/vendor_sources.lock.yaml @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /ATTRIBUTIONS-*.md @NVIDIA/trt-llm-oss-compliance
 /LICENSE @NVIDIA/trt-llm-oss-compliance
 /constraints.txt @NVIDIA/trt-llm-oss-compliance

@@ -437,6 +437,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         for bs in batch_sizes or ():
             rows.add(int(bs) * nn)
         msl_c = int(self.get_indexer_max_seq_len())
+        # Prefill leg first: the decode-stride guard below may return early for
+        # an odd msl_c, but the DeepGEMM prefill stride is always 256-aligned.
+        try:
+            _ss_host.warmup_prefill(int(top_k), max(msl_c, 32768))
+        except torch.cuda.OutOfMemoryError:
+            logger.warning(
+                "self-sampling GVR prefill warmup ran out of memory; prefill "
+                "engines will JIT-compile lazily on first touch instead."
+            )
         if self.sparse_metadata_params.use_cute_dsl_paged_mqa_logits:
             # mirror the DSL paged-MQA arena stride (rows round up to 256
             # elements). A drift here only degrades warmup to unused keys —
