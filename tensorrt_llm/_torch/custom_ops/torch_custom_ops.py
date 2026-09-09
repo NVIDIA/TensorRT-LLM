@@ -2308,21 +2308,29 @@ def silu_and_mul_2in(gate: torch.Tensor,
     # Rank-agnostic: the kernel walks a flat run of numel() elements, so any
     # matching contiguous shape works. Models carry rank-3 [batch, seq, hidden]
     # activations, and requiring rank 2 here would force callers to reshape.
-    assert gate.shape == up.shape, (
-        f"gate and up must have the same shape, got {tuple(gate.shape)} and "
-        f"{tuple(up.shape)}")
-    assert gate.dtype == up.dtype, (
-        f"gate and up must have the same dtype, got {gate.dtype} and {up.dtype}"
-    )
-    assert gate.device == up.device, (
-        f"gate and up must be on the same device, got {gate.device} and "
-        f"{up.device}")
+    # Raises rather than asserts: assert statements are not emitted under
+    # `python -O`, and every condition below is one the kernel cannot detect for
+    # itself. Skipping them does not surface an error later, it reads the wrong
+    # memory and returns plausible garbage.
+    if gate.shape != up.shape:
+        raise ValueError(
+            f"gate and up must have the same shape, got {tuple(gate.shape)} and "
+            f"{tuple(up.shape)}")
+    if gate.dtype != up.dtype:
+        raise ValueError(
+            f"gate and up must have the same dtype, got {gate.dtype} and {up.dtype}"
+        )
+    if gate.device != up.device:
+        raise ValueError(
+            f"gate and up must be on the same device, got {gate.device} and "
+            f"{up.device}")
     # The kernel indexes both operands as flat contiguous runs, so a strided
     # view would read the wrong addresses and silently return garbage. Linear
     # outputs are contiguous; reject anything else rather than copying.
-    assert gate.is_contiguous() and up.is_contiguous(), (
-        f"gate and up must be contiguous, got strides {gate.stride()} and "
-        f"{up.stride()} for shape {tuple(gate.shape)}")
+    if not (gate.is_contiguous() and up.is_contiguous()):
+        raise ValueError(
+            f"gate and up must be contiguous, got strides {gate.stride()} and "
+            f"{up.stride()} for shape {tuple(gate.shape)}")
 
     o_dtype = dtype or gate.dtype
     o = torch.empty(gate.shape, dtype=o_dtype, device=gate.device)

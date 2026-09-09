@@ -190,14 +190,22 @@ def test_cuda_graph_capture():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_rejects_mismatched_inputs():
+@pytest.mark.parametrize(
+    "make_up, message",
+    [
+        # Factories, not tensors: parametrize arguments are built at collection
+        # time, which happens on CPU-only machines too, where skipif has not yet
+        # excluded the test and a device="cuda" tensor would fail to construct.
+        (lambda: torch.randn(8, 32, device="cuda", dtype=torch.bfloat16), "same shape"),
+        (lambda: torch.randn(8, 16, device="cuda", dtype=torch.float16), "same dtype"),
+        (lambda: torch.randn(8, 16, dtype=torch.bfloat16), "same device"),
+    ],
+    ids=["shape", "dtype", "device"],
+)
+def test_rejects_mismatched_inputs(make_up, message):
     gate = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(Exception, match="same shape"):
-        swiglu_2in(gate, torch.randn(8, 32, device="cuda", dtype=torch.bfloat16))
-    with pytest.raises(Exception, match="same dtype"):
-        swiglu_2in(gate, torch.randn(8, 16, device="cuda", dtype=torch.float16))
-    with pytest.raises(Exception, match="same device"):
-        swiglu_2in(gate, torch.randn(8, 16, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match=message):
+        swiglu_2in(gate, make_up())
 
 
 def test_quant_scale_without_quant_type_raises():
@@ -215,22 +223,22 @@ def test_quant_scale_without_quant_type_raises():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_rejects_non_contiguous():
+@pytest.mark.parametrize("compact_gate", [False, True], ids=["both_strided", "up_only"])
+def test_rejects_non_contiguous(compact_gate):
     """The kernel indexes flat runs, so a strided view must be rejected.
 
     Accepting one produced silently wrong output rather than an error: a (32, 2)
     view with inner stride 2 differed from the reference by 2.7 in BF16 and 272
-    with FP8 output.
+    with FP8 output. One strided operand is enough, hence the second case.
     """
     gate = torch.randn(32, 4, device="cuda", dtype=torch.bfloat16)[:, ::2]
     up = torch.randn(32, 4, device="cuda", dtype=torch.bfloat16)[:, ::2]
     assert not gate.is_contiguous()
+    if compact_gate:
+        gate = gate.contiguous()
 
-    with pytest.raises(Exception, match="contiguous"):
+    with pytest.raises(ValueError, match="contiguous"):
         swiglu_2in(gate, up)
-    # Contiguous in one operand only is still rejected.
-    with pytest.raises(Exception, match="contiguous"):
-        swiglu_2in(gate.contiguous(), up)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
