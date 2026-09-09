@@ -166,7 +166,6 @@ void initBindings(nb::module_& m)
         .def_prop_rw("state", &GenLlmReq::getState, &GenLlmReq::setState)
         .def_prop_ro("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_prop_rw("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
-        .def_rw("end_id", &GenLlmReq::mEndId)
         .def_rw("seq_slot", &GenLlmReq::mSeqSlot)
         .def_prop_ro("return_log_probs", &GenLlmReq::returnLogProbs)
         .def_prop_ro("return_context_logits", &GenLlmReq::getReturnContextLogits)
@@ -366,7 +365,7 @@ void initBindings(nb::module_& m)
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
                 tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
                 executor::SamplingConfig sampling_config, bool is_streaming,
-                std::optional<tb::LlmRequest::SizeType32> end_id, std::optional<at::Tensor> prompt_embedding_table,
+                std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
@@ -407,18 +406,17 @@ void initBindings(nb::module_& m)
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
 
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    end_id, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr,
-                    lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
-                    return_generation_logits, draft_tokens, exclude_input_from_output, encoder_input_tokens,
-                    return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
-                    encoder_output_length, llm_request_type, input_token_extra_ids, return_perf_metrics,
-                    allotted_time_ms, context_phase_params, arrival_time, std::move(agent_hierarchy),
-                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
-                    std::move(cache_salt)};
+                    prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
+                    multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
+                    kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
+                    draft_tokens, exclude_input_from_output, encoder_input_tokens, return_encoder_output, client_id,
+                    priority, encoder_input_features_tensor_ptr, encoder_output_length, llm_request_type,
+                    input_token_extra_ids, return_perf_metrics, allotted_time_ms, context_phase_params, arrival_time,
+                    std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
-            nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("prompt_embedding_table") = std::nullopt,
+            nb::arg("is_streaming"), nb::arg("prompt_embedding_table") = std::nullopt,
             nb::arg("prompt_vocab_size") = std::nullopt, nb::arg("multimodal_hashes") = std::nullopt,
             nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
             nb::arg("multimodal_uuids") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
@@ -439,7 +437,7 @@ void initBindings(nb::module_& m)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
-            nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
+            nb::arg("max_draft_len"), nb::arg("max_endocer_input_len") = std::nullopt,
             nb::arg("enable_kv_cache_reuse") = false)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,

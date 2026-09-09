@@ -923,6 +923,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             "multimodal_embedding", None)
         self.py_guided_decoding_params = kwargs.pop("guided_decoding_params",
                                                     None)
+        self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -975,7 +976,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
-        self.py_end_id = self.end_id
         self.py_min_length = self.sampling_config.min_tokens
         self.py_helix_is_inactive_rank = False
         # Manager-owned helix decode-step counter; see

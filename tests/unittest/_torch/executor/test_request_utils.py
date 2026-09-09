@@ -136,6 +136,25 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
+def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        end_id=7,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.py_end_id == 7
+    assert llm_request.child_requests[0].py_end_id == 7
+
+
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
     position_ids = [4, 7, 9]
     executor_request = trtllm.Request(
