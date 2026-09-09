@@ -2223,23 +2223,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         """Load every non-expert trunk parameter concurrently (with the
         per-parameter TP-shard / pad / fuse conversions) and return the
         number of parameters loaded."""
-        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
-        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
-        # instead, so context can project directly into the FMHA layout and
-        # absorbed decode can take zero-copy K/V views.
-        mla_mixers = [
-            layer.self_attn.mixer
-            for layer in self.model.layers
-            if not getattr(layer, "is_kda", True) and _has_weights(layer)
-        ]
-        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
-        mla_head_shard_linears = {}
-        for mixer in mla_mixers:
-            mla_head_shard_linears[id(mixer.q_b_proj.weight)] = mixer.q_b_proj
-            mla_head_shard_linears[id(mixer.o_proj.weight)] = mixer.o_proj
-            g_proj = getattr(mixer, "g_proj", None)
-            if g_proj is not None:
-                mla_head_shard_linears[id(g_proj.weight)] = g_proj
+        mla_mixers, mla_kv_b_mixers, mla_head_shard_linears = self._build_mla_head_shard_maps()
 
         device = next(self.parameters()).device
 
@@ -2256,54 +2240,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # Keep each FP8_PB_WO checkpoint pair alongside the BF16
         # parameter only when the later weight-read conversion consumes it.
         stash_ckpt_fp8 = _resolve_fp8_weight_read_gates()[0]
-        # KDA head-shard (attention-DP off): rank r loads head rows/cols
-        # [r*local : (r+1)*local] of every head-major KDA tensor.
-        kda_tp_size, kda_tp_rank = 1, 0
-        for layer in self.model.layers:
-            if getattr(layer, "is_kda", False):
-                kda_tp_size = layer.linear_attn._kda_tp_size
-                kda_tp_rank = layer.linear_attn._kda_tp_rank
-                break
-
-        COL = TensorParallelMode.COLUMN  # gate/up column shard (output rows)
+        kda_tp_size, kda_tp_rank = self._kda_tp_shard_info()
 
         def load_param(name: str, param: torch.nn.Parameter) -> None:
             if device.type == "cuda":
                 torch.cuda.set_device(device)
             if name.endswith(_GATE_UP_FUSED_SUFFIX):
-                # Row-concat the checkpoint's separate gate_proj / up_proj
-                # tensors into the fused [gate | up] parameter.
-                gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
-                inter = param.shape[0] // 2
-                # Materialize + FP8-block-dequant each half (this branch reads
-                # its own sources, so it needs the same FP8 handling as the
-                # single-tensor path below), then column(TP)-shard and
-                # row-concat. TP factor from the checkpoint-vs-param shapes; a
-                # subgroup smaller than model TP repeats, so the shard index is
-                # model tp_rank modulo the half's shard count.
-                gate_full = _dequantize_fp8_block_scaled(
-                    gate_key, _materialize(weights[gate_key]), weights
-                )
-                tp = gate_full.shape[0] // inter
-                # load_weight_shard returns the whole tensor when tp <= 1, so
-                # the rank needs no tp > 1 guard.
-                rk = model_tp_rank % tp
-                gate = load_weight_shard(gate_full, tp, rk, COL, device=param.device)
-                up = load_weight_shard(
-                    _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
-                    tp,
-                    rk,
-                    COL,
-                    device=param.device,
-                )
-                if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
-                    raise ValueError(
-                        f"{name}: checkpoint gate/up shapes "
-                        f"{tuple(gate.shape)} / {tuple(up.shape)} do not "
-                        f"concat to param shape {tuple(param.shape)}"
-                    )
-                param.data[:inter].copy_(gate.to(param.dtype))
-                param.data[inter:].copy_(up.to(param.dtype))
+                self._load_gate_up_fused_param(name, param, weights, name_map, model_tp_rank)
                 return
             src = _materialize(weights[name_map[name]])
             ckpt_fp8_pair = (
@@ -2317,46 +2260,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 return
             mla_mixer = mla_kv_b_mixers.get(id(param))
             if mla_mixer is not None:
-                h = mla_mixer.num_heads_tp
-                n = mla_mixer.qk_nope_head_dim
-                v = mla_mixer.v_head_dim
-                kv = mla_mixer.kv_lora_rank
-                local = mla_mixer.kv_b_proj.load_shard(src, device=param.device).view(h, n + v, kv)
-                k_weight, v_weight = local.split([n, v], dim=1)
-                param.data.copy_(
-                    torch.cat(
-                        [
-                            k_weight.reshape(h * n, kv),
-                            v_weight.reshape(h * v, kv),
-                        ],
-                        dim=0,
-                    ).to(param.dtype)
-                )
-                mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
-                v_weight = _helix_cp_v_b_shard(
-                    v_weight,
-                    num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
-                    cp_rank=mla_mixer.mapping.cp_rank,
-                )
-                mla_mixer.v_b_proj.data.copy_(v_weight)
+                self._load_mla_kv_b_param(mla_mixer, src, param)
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
-                # The checkpoint pads A_log from [num_heads] to [head_dim]
-                # (e.g. [96] -> [128]); the tail must be zeros. Under KDA
-                # head-shard TP the param holds this rank's head range
-                # instead of the full [num_heads].
-                assert src.numel() > param.numel(), (name, src.shape)
-                if kda_tp_size > 1:
-                    lo = kda_tp_rank * param.numel()
-                    src = src[lo : lo + param.numel()]
-                else:
-                    tail = src[param.numel() :]
-                    if tail.abs().max().item() != 0.0:
-                        raise ValueError(
-                            f"{name}: expected zero padding beyond "
-                            f"{param.numel()} entries, got nonzero tail"
-                        )
-                    src = src[: param.numel()]
+                src = self._slice_a_log_checkpoint_pad(name, src, param, kda_tp_size, kda_tp_rank)
             # KDA ``linear_attn`` (head-major) and shared-expert / dense-MLP
             # ``down_proj`` shards are shape-derived; replicated tensors and
             # every other name pass through unchanged. MLA head-shards and the
@@ -2405,6 +2312,133 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             f"Kimi K3: loaded {len(mla_mixers)} MLA KV-B projections in grouped runtime layout"
         )
         return len(param_jobs)
+
+    def _build_mla_head_shard_maps(self):
+        """Index the MLA mixers by parameter identity for the trunk loader:
+        the KV-B fuse map and the q_b/o/g head-shard Linear map."""
+        # The checkpoint stores every MLA KV-B head as interleaved [K | V]
+        # rows. Runtime keeps one DeepSeek-style [all K | all V] parameter
+        # instead, so context can project directly into the FMHA layout and
+        # absorbed decode can take zero-copy K/V views.
+        mla_mixers = [
+            layer.self_attn.mixer
+            for layer in self.model.layers
+            if not getattr(layer, "is_kda", True) and _has_weights(layer)
+        ]
+        mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
+        mla_head_shard_linears = {}
+        for mixer in mla_mixers:
+            mla_head_shard_linears[id(mixer.q_b_proj.weight)] = mixer.q_b_proj
+            mla_head_shard_linears[id(mixer.o_proj.weight)] = mixer.o_proj
+            g_proj = getattr(mixer, "g_proj", None)
+            if g_proj is not None:
+                mla_head_shard_linears[id(g_proj.weight)] = g_proj
+        return mla_mixers, mla_kv_b_mixers, mla_head_shard_linears
+
+    def _kda_tp_shard_info(self) -> Tuple[int, int]:
+        """KDA head-shard (attention-DP off): rank r loads head rows/cols
+        [r*local : (r+1)*local] of every head-major KDA tensor."""
+        kda_tp_size, kda_tp_rank = 1, 0
+        for layer in self.model.layers:
+            if getattr(layer, "is_kda", False):
+                kda_tp_size = layer.linear_attn._kda_tp_size
+                kda_tp_rank = layer.linear_attn._kda_tp_rank
+                break
+        return kda_tp_size, kda_tp_rank
+
+    def _load_gate_up_fused_param(
+        self,
+        name: str,
+        param: torch.nn.Parameter,
+        weights: Dict[str, torch.Tensor],
+        name_map: Dict[str, str],
+        model_tp_rank: int,
+    ) -> None:
+        """Row-concat the checkpoint's separate gate_proj / up_proj tensors
+        into the fused [gate | up] parameter."""
+        COL = TensorParallelMode.COLUMN  # gate/up column shard (output rows)
+        gate_key, up_key = _gate_up_ckpt_keys(name_map[name])
+        inter = param.shape[0] // 2
+        # Materialize + FP8-block-dequant each half (this branch reads
+        # its own sources, so it needs the same FP8 handling as the
+        # single-tensor path in load_param), then column(TP)-shard and
+        # row-concat. TP factor from the checkpoint-vs-param shapes; a
+        # subgroup smaller than model TP repeats, so the shard index is
+        # model tp_rank modulo the half's shard count.
+        gate_full = _dequantize_fp8_block_scaled(gate_key, _materialize(weights[gate_key]), weights)
+        tp = gate_full.shape[0] // inter
+        # load_weight_shard returns the whole tensor when tp <= 1, so
+        # the rank needs no tp > 1 guard.
+        rk = model_tp_rank % tp
+        gate = load_weight_shard(gate_full, tp, rk, COL, device=param.device)
+        up = load_weight_shard(
+            _dequantize_fp8_block_scaled(up_key, _materialize(weights[up_key]), weights),
+            tp,
+            rk,
+            COL,
+            device=param.device,
+        )
+        if gate.shape != (inter, param.shape[1]) or up.shape != gate.shape:
+            raise ValueError(
+                f"{name}: checkpoint gate/up shapes "
+                f"{tuple(gate.shape)} / {tuple(up.shape)} do not "
+                f"concat to param shape {tuple(param.shape)}"
+            )
+        param.data[:inter].copy_(gate.to(param.dtype))
+        param.data[inter:].copy_(up.to(param.dtype))
+
+    def _load_mla_kv_b_param(self, mla_mixer, src: torch.Tensor, param: torch.nn.Parameter) -> None:
+        """Convert one MLA KV-B checkpoint tensor (interleaved [K | V] head
+        rows) into the grouped [all K | all V] runtime parameter plus the
+        derived k_b_proj_trans / v_b_proj views."""
+        h = mla_mixer.num_heads_tp
+        n = mla_mixer.qk_nope_head_dim
+        v = mla_mixer.v_head_dim
+        kv = mla_mixer.kv_lora_rank
+        local = mla_mixer.kv_b_proj.load_shard(src, device=param.device).view(h, n + v, kv)
+        k_weight, v_weight = local.split([n, v], dim=1)
+        param.data.copy_(
+            torch.cat(
+                [
+                    k_weight.reshape(h * n, kv),
+                    v_weight.reshape(h * v, kv),
+                ],
+                dim=0,
+            ).to(param.dtype)
+        )
+        mla_mixer.k_b_proj_trans.data.copy_(k_weight.transpose(1, 2))
+        v_weight = _helix_cp_v_b_shard(
+            v_weight,
+            num_heads_tp_cp=mla_mixer.num_heads_tp_cp,
+            cp_rank=mla_mixer.mapping.cp_rank,
+        )
+        mla_mixer.v_b_proj.data.copy_(v_weight)
+
+    def _slice_a_log_checkpoint_pad(
+        self,
+        name: str,
+        src: torch.Tensor,
+        param: torch.nn.Parameter,
+        kda_tp_size: int,
+        kda_tp_rank: int,
+    ) -> torch.Tensor:
+        """The checkpoint pads A_log from [num_heads] to [head_dim]
+        (e.g. [96] -> [128]); the tail must be zeros. Under KDA
+        head-shard TP the param holds this rank's head range
+        instead of the full [num_heads]."""
+        assert src.numel() > param.numel(), (name, src.shape)
+        if kda_tp_size > 1:
+            lo = kda_tp_rank * param.numel()
+            src = src[lo : lo + param.numel()]
+        else:
+            tail = src[param.numel() :]
+            if tail.abs().max().item() != 0.0:
+                raise ValueError(
+                    f"{name}: expected zero padding beyond "
+                    f"{param.numel()} entries, got nonzero tail"
+                )
+            src = src[: param.numel()]
+        return src
 
     def _load_expert_slices(
         self,
@@ -2519,81 +2553,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             self.model_config.pretrained_config, "_name_or_path", None
         )
         index_path = os.path.join(ckpt_dir or "", "model.safetensors.index.json")
-        checkpoint_prefix = getattr(weights, "checkpoint_prefix", "")
-
-        def checkpoint_key(key: str) -> str:
-            return f"{checkpoint_prefix}{key}"
 
         if expert_jobs and ckpt_dir and os.path.isfile(index_path):
-            with open(index_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            per_file: Dict[str, list] = {}
-            split_file_jobs = []
-            for layer_idx, moe, base in expert_jobs:
-                del layer_idx
-                for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
-                    keys = [
-                        f"{base}.{expert_idx}.{w}.{kind}"
-                        for w in ("w1", "w2", "w3")
-                        for kind in moe.expert_ckpt_spec.kinds
-                    ]
-                    files = {weight_map[checkpoint_key(key)] for key in keys}
-                    job = (moe, base, local_slot_id, expert_idx)
-                    if len(files) == 1:
-                        per_file.setdefault(files.pop(), []).append(job)
-                    else:
-                        split_file_jobs.append((job, files))
-
-            def drop_file_pages(file_name: str):
-                path = os.path.join(ckpt_dir, file_name)
-                try:
-                    fd = os.open(path, os.O_RDONLY)
-                    try:
-                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-                except OSError:
-                    pass
-
-            def load_expert_file(file_name: str, jobs: list):
-                if device.type == "cuda":
-                    torch.cuda.set_device(device)
-                path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
-                    for moe, base, local_slot_id, expert_idx in jobs:
-                        load_expert(
-                            moe,
-                            base,
-                            local_slot_id,
-                            expert_idx,
-                            lambda key: fh.get_tensor(checkpoint_key(key)),
-                        )
-                # Handle closed -> pages unmapped -> the drop takes effect.
-                drop_file_pages(file_name)
-
-            def load_split_file_expert(job, files):
-                if device.type == "cuda":
-                    torch.cuda.set_device(device)
-                with ExitStack() as stack:
-                    handles = {
-                        file_name: stack.enter_context(
-                            safe_open(
-                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
-                            )
-                        )
-                        for file_name in files
-                    }
-
-                    def get_tensor(key):
-                        source_key = checkpoint_key(key)
-                        return handles[weight_map[source_key]].get_tensor(source_key)
-
-                    load_expert(*job, get_tensor)
-                for file_name in files:
-                    drop_file_pages(file_name)
-
-            run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
-            run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
+            self._stream_expert_slices_by_file(
+                weights, expert_jobs, load_expert, device, ckpt_dir, index_path
+            )
         else:
             # Falling back is a silent loss of the whole point of the block
             # above: the shared lazy dict keeps every shard mapped, which is
@@ -2607,6 +2571,101 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 )
             run_concurrently(load_experts_from_weights, expert_jobs, num_workers=4)
 
+        self._verify_expert_slots_filled(expert_jobs, finalized_backends)
+
+    def _stream_expert_slices_by_file(
+        self,
+        weights: Dict[str, torch.Tensor],
+        expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]],
+        load_expert: Callable,
+        device: torch.device,
+        ckpt_dir: str,
+        index_path: str,
+    ) -> None:
+        """Group the rank-local expert tensors by shard file and stream each
+        file through a short-lived handle (open -> copy -> close/unmap ->
+        fadvise(DONTNEED)); experts whose tensors span files get their own
+        multi-handle jobs."""
+        checkpoint_prefix = getattr(weights, "checkpoint_prefix", "")
+
+        def checkpoint_key(key: str) -> str:
+            return f"{checkpoint_prefix}{key}"
+
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        per_file: Dict[str, list] = {}
+        split_file_jobs = []
+        for layer_idx, moe, base in expert_jobs:
+            del layer_idx
+            for local_slot_id, expert_idx in enumerate(moe.local_expert_ids):
+                keys = [
+                    f"{base}.{expert_idx}.{w}.{kind}"
+                    for w in ("w1", "w2", "w3")
+                    for kind in moe.expert_ckpt_spec.kinds
+                ]
+                files = {weight_map[checkpoint_key(key)] for key in keys}
+                job = (moe, base, local_slot_id, expert_idx)
+                if len(files) == 1:
+                    per_file.setdefault(files.pop(), []).append(job)
+                else:
+                    split_file_jobs.append((job, files))
+
+        def drop_file_pages(file_name: str):
+            path = os.path.join(ckpt_dir, file_name)
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+
+        def load_expert_file(file_name: str, jobs: list):
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            path = os.path.join(ckpt_dir, file_name)
+            with safe_open(path, framework="pt", device="cpu") as fh:
+                for moe, base, local_slot_id, expert_idx in jobs:
+                    load_expert(
+                        moe,
+                        base,
+                        local_slot_id,
+                        expert_idx,
+                        lambda key: fh.get_tensor(checkpoint_key(key)),
+                    )
+            # Handle closed -> pages unmapped -> the drop takes effect.
+            drop_file_pages(file_name)
+
+        def load_split_file_expert(job, files):
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            with ExitStack() as stack:
+                handles = {
+                    file_name: stack.enter_context(
+                        safe_open(os.path.join(ckpt_dir, file_name), framework="pt", device="cpu")
+                    )
+                    for file_name in files
+                }
+
+                def get_tensor(key):
+                    source_key = checkpoint_key(key)
+                    return handles[weight_map[source_key]].get_tensor(source_key)
+
+                load_expert(*job, get_tensor)
+            for file_name in files:
+                drop_file_pages(file_name)
+
+        run_concurrently(load_expert_file, sorted(per_file.items()), num_workers=4)
+        run_concurrently(load_split_file_expert, split_file_jobs, num_workers=4)
+
+    def _verify_expert_slots_filled(
+        self,
+        expert_jobs: List[Tuple[int, KimiK3MoERuntime, str]],
+        finalized_backends: Set[int],
+    ) -> None:
+        """Verify every backend expert slot was filled and every layer that
+        needs it was finalized, then reset the transform flag."""
         for _, moe, _ in expert_jobs:
             spec = moe.expert_ckpt_spec
             backend = moe.routed_experts.backend
