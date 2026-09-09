@@ -17,8 +17,13 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v1]
+accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=False-overlap_scheduler=True]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4
@@ -27,6 +32,8 @@ accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True]
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2]
+accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_ctx_pp_gen_tp_asymmetric
+accuracy/test_disaggregated_serving.py::TestQwen3_5_4B::test_mismatched_block_reuse
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-False]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False-True]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[True-True]
