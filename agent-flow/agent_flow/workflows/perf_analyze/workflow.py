@@ -25,6 +25,7 @@ from .progress import (
     read_progress,
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts._common import profile_ranks_note
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
     STAGE_ANALYZER,
@@ -41,6 +42,7 @@ from .task_schema import (
     dump_task_yaml,
     is_curve_mode,
     load_and_validate_task_yaml,
+    profile_ranks,
     sol_enabled,
 )
 
@@ -144,8 +146,8 @@ class PerfAnalyzeWorkflow:
     """Linear benchmarker → projector → analyzer → reporter pipeline.
 
     Serves a model checkpoint with ``trtllm-serve``, benchmarks and
-    profiles it with ``benchmark_serving.py`` (nsys + torch profiler +
-    ncu per-kernel deep dive), and synthesizes a report whose headline
+    profiles it with ``benchmark_serving.py`` (nsys + ncu per-kernel
+    deep dive), and synthesizes a report whose headline
     is the main performance bottleneck. The projector stage — on unless
     ``task.yaml`` sets ``sol.enabled: false`` — derives an analytical
     speed-of-light (SOL) ceiling between the benchmarker and the analyzer
@@ -190,7 +192,7 @@ class PerfAnalyzeWorkflow:
         if clean:
             # Wipe the workflow's managed files so the constructor proceeds
             # as a fresh run. Other files in the workspace (run artifacts
-            # such as serve.log, *.nsys-rep, torch_trace/) are left alone.
+            # such as serve.log, *.nsys-rep, *.ncu-rep) are left alone.
             for path in (
                 self.state_path,
                 self.benchmark_results_path,
@@ -506,8 +508,8 @@ class PerfAnalyzeWorkflow:
         projection_context = ""
         correlation_instruction = ""
         findings_sections = (
-            "Profiling setup / nsys timeline / Torch profiler / ncu kernel "
-            "analysis / Ranked bottleneck hypotheses / Caveats"
+            "Profiling setup / nsys timeline / ncu kernel analysis / "
+            "Ranked bottleneck hypotheses / Caveats"
         )
         if self._sol_enabled():
             projection_context = (
@@ -536,9 +538,8 @@ class PerfAnalyzeWorkflow:
                 f"record `Correlation unavailable: <reason>` there instead.\n\n"
             )
             findings_sections = (
-                "Profiling setup / nsys timeline / Torch profiler / ncu "
-                "kernel analysis / SOL correlation / Ranked bottleneck "
-                "hypotheses / Caveats"
+                "Profiling setup / nsys timeline / ncu kernel analysis / "
+                "SOL correlation / Ranked bottleneck hypotheses / Caveats"
             )
         self.analyzer(
             f"Workspace: {self.workspace}\n\n"
@@ -556,31 +557,59 @@ class PerfAnalyzeWorkflow:
             f"inherits a known precedent.\n\n"
             f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under "
-            f"`{self._trtllm_hint()}` — `py_executor.py` for both "
-            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate) and the "
-            f"torch-trace env var (e.g. `TLLM_TORCH_PROFILE_TRACE`), and "
+            f"`{self._trtllm_hint()}` — `py_executor.py` for "
+            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate), and "
             f"`openai_server.py` for whether a `/start_profile` endpoint even "
             f"exists — use the names you find. Then run the profilers listed "
-            f"in `profile.methods` (default all three): **nsys** (GPU "
-            f"timeline), the **torch profiler**, and **ncu** (per-kernel deep "
-            f"dive) — nsys and torch gated server-side by "
+            f"in `profile.methods` (default both): **nsys** (GPU timeline) "
+            f"and **ncu** (per-kernel deep dive) — nsys gated server-side by "
             f"`TLLM_PROFILE_START_STOP` over `profile.nsys_iter_range` (not by "
             f"the client's `--profile` flag), ncu over the same window via "
             f"`--profile-from-start off`. Drive nsys from the **canonical "
             f"`nsys profile` command in your system prompt** (don't improvise "
             f"nsys flags): it keeps `--capture-range-end=stop` so the window "
             f"lands in steady-state load without tearing the engine down, and "
-            f"the replayed benchmark keeps `--no-test-input`. Run ncu last, "
-            f"per your system prompt's Run C: **load the "
+            f"the replayed benchmark keeps `--no-test-input`. "
+            f"{profile_ranks_note(self._profile_ranks())} Then "
+            f"**decompose that timeline with the "
+            f"`internal-perf-nsight-system-analysis` skill** (via the `Skill` tool; "
+            f"fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
+            f"name is not found), per your system prompt's Run A step 5: "
+            f"export the report with `nsys export --type sqlite`, run the "
+            f"skill's `run_all.py` single-variant into "
+            f"`{self.workspace}/nsys_analysis`, and report the *nsys "
+            f"timeline* section from what it produces — per-iteration time, "
+            f"the busy/idle rungs, and the compute-absent split "
+            f"(launch-starved / blocking / dependency-stalled) — not from "
+            f"the `nsys stats` table alone. After that "
+            f"timing pass lands, take the two **Run A2** nsys passes from your "
+            f"system prompt — `--gpu-metrics-devices` / "
+            f"`--gpu-metrics-frequency` for per-operator utilization, and the "
+            f"backtrace flags for call sites — as separate captures, never "
+            f"folded into the timing pass; skip either one gracefully (record "
+            f"the reason under *Caveats*) rather than fabricating it. When "
+            f"A2a lands, re-run the skill's `run_all.py` with "
+            f"`--metrics-profile` pointed at its sqlite so the utilization "
+            f"bullet comes from the pipeline too (it re-reads files only — no "
+            f"server, no GPU). Verify the taxonomy and author "
+            f"`{self.workspace}/nsys_analysis/items.json` as Run A step 5 "
+            f"requires — the opportunity list is the analysis's "
+            f"machine-readable half, and skipping it leaves only prose. Run ncu "
+            f"last, "
+            f"per your system prompt's Run B: **load the "
             f"`perf-nsight-compute-analysis` skill** (via the `Skill` tool; "
             f"fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if the bare "
             f"name is not found) as the capture + interpretation methodology, "
-            f"target the top kernels from the nsys table, keep the canonical "
+            f"target the top kernels from the timeline decomposition (not the "
+            f"`kern_sum` table — see Run B step 2), keep the canonical "
             f"ncu flags (`--launch-count` bounded), and classify each "
             f"profiled kernel (SOL%, bound class, occupancy, stalls). Save "
-            f"`server_nsys.nsys-rep`, the `nsys stats` output, the torch traces "
-            f"under `torch_trace/`, `server_ncu.ncu-rep` + its "
+            f"`server_nsys.nsys-rep`, the `nsys stats` output, the "
+            f"`nsys_analysis/` directory, "
+            f"`server_nsys_metrics.nsys-rep` and `server_nsys_stacks.nsys-rep` "
+            f"from the Run A2 passes, `server_ncu.ncu-rep` + its "
             f"`ncu_details.txt` / `ncu_raw.csv` summaries, and "
             f"`perf_metrics.json` if available. Tear "
             f"every server down.\n\n"
@@ -675,6 +704,10 @@ class PerfAnalyzeWorkflow:
         On by default — only ``sol.enabled: false`` turns it off.
         """
         return sol_enabled(self._task_data())
+
+    def _profile_ranks(self) -> tuple[int, ...]:
+        """The rank ids nsys must capture, from the resolved spec."""
+        return profile_ranks(self._task_data())
 
     def _curve_mode(self) -> bool:
         """Whether the resolved task spec runs in Pareto-curve mode."""

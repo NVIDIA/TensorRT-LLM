@@ -339,7 +339,7 @@ trtllm-bench \
   --model Qwen/Qwen2-VL-2B-Instruct \
   prepare-dataset \
   --output mm_data.jsonl \
-  real-dataset
+  real-dataset \
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
   --dataset-image-key image \

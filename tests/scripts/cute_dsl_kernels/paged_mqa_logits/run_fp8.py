@@ -7,7 +7,7 @@ reference. Intended for local development / sanity checks; not wired into CI
 (matching the convention of other scripts under ``tests/scripts/cute_dsl_kernels/``).
 
 - Reference and data prep are inlined from
-  tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py.
+  tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py.
 - Schedule metadata is computed in pure Python (mirrors DeepGEMM's
   PagedMQALogitsScheduler), avoiding the deep_gemm C++ binding. Same algorithm
   as run_fp4.py — both kernels use compute_block_kv=128 + NUM_MATH_WG=2 →
@@ -51,7 +51,7 @@ _TORCH_TO_CUTLASS = {
 }
 
 # Element-wise tolerance keyed by output_dtype — mirrors the unit test
-# tests/unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
+# tests/unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
 # which sets atol/rtol purely from output_dtype (epi_dtype = acc_dtype =
 # output_dtype in that test).
 _ELEM_TOL = {

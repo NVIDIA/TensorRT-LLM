@@ -24,12 +24,12 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.kernels import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import get_token_bytes
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.kernels import (
     deepseek_v4_local_to_global_indices,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest

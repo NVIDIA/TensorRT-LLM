@@ -534,7 +534,7 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 
 **Model Structure:**
 - Inherit from `StrictBaseModel` (which sets `extra="forbid"`) to fail fast when users specify invalid field names
-- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MedusaDecodingConfig`, etc.)
+- Use [discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions) when a field needs to accept one of several possible config classes (e.g. `speculative_config` accepts any of `EagleDecodingConfig`, `MTPDecodingConfig`, etc.)
 - **Do not define `__init__` methods** - this bypasses Pydantic's validation and type coercion, and can cause subtle bugs with model inheritance. Instead:
   - For validation logic, use `@field_validator` or `@model_validator`
   - For post-validation initialization (e.g. setting up private fields and state), use [`model_post_init()`](https://docs.pydantic.dev/latest/api/base_model/#pydantic.BaseModel.model_post_init)

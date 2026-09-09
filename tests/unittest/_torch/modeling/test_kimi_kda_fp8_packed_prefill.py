@@ -141,14 +141,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         attention.qkvg_proj = None
         ref_conv = conv_seed.clone()
         ref_state = state_seed.clone()
-        expected = attention.forward_prefill(
-            hidden,
-            cu_seqlens,
-            metadata,
-            num_prefills,
-            ref_conv,
-            ref_state,
-            slot_indices,
+        expected = attention._project_output(
+            attention.forward_prefill(
+                hidden,
+                cu_seqlens,
+                metadata,
+                num_prefills,
+                ref_conv,
+                ref_state,
+                slot_indices,
+            )
         )
         assert calls == {"qkvg": 0, "q": 1, "k": 1, "v": 1}
 
@@ -156,14 +158,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         attention.qkvg_proj = fused_qkvg
         actual_conv = conv_seed.clone()
         actual_state = state_seed.clone()
-        actual = attention.forward_prefill(
-            hidden,
-            cu_seqlens,
-            metadata,
-            num_prefills,
-            actual_conv,
-            actual_state,
-            slot_indices,
+        actual = attention._project_output(
+            attention.forward_prefill(
+                hidden,
+                cu_seqlens,
+                metadata,
+                num_prefills,
+                actual_conv,
+                actual_state,
+                slot_indices,
+            )
         )
         assert calls == {"qkvg": 1, "q": 0, "k": 0, "v": 0}
     finally:
@@ -193,14 +197,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
 
     repeat_conv = conv_seed.clone()
     repeat_state = state_seed.clone()
-    repeated = attention.forward_prefill(
-        hidden,
-        cu_seqlens,
-        metadata,
-        num_prefills,
-        repeat_conv,
-        repeat_state,
-        slot_indices,
+    repeated = attention._project_output(
+        attention.forward_prefill(
+            hidden,
+            cu_seqlens,
+            metadata,
+            num_prefills,
+            repeat_conv,
+            repeat_state,
+            slot_indices,
+        )
     )
     torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
     torch.testing.assert_close(repeat_conv, actual_conv, rtol=0, atol=0)

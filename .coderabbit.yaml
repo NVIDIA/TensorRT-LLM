@@ -14,36 +14,55 @@
 # limitations under the License.
 
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# https://docs.coderabbit.ai/getting-started/configure-coderabbit/
-# In PR, comment "@coderabbitai configuration" to get the full config including defaults
+# Docs: https://docs.coderabbit.ai/getting-started/configure-coderabbit/
+# In a PR, comment "@coderabbitai configuration" to view the resolved config.
+
 language: "en-US"
+
 reviews:
   profile: chill
-  auto_title_placeholder: '@coderabbitai title'
-  auto_title_instructions: 'Format: "[<category>] <title>". Category must be one of: fix, feat, doc, infra, style, refactor, perf, test, chore, revert. Enclose the category in square brackets. Title should be concise (<= 60 chars). Example: "[feat] Add logit_bias support".'
+
+  auto_title_placeholder: "@coderabbitai title"
+  auto_title_instructions: >-
+    Format: "[<category>] <title>". Category must be one of: fix, feat, doc,
+    infra, style, refactor, perf, test, chore, revert. Enclose the category in
+    square brackets. Keep the title concise (60 characters or fewer).
+    Example: "[feat] Add logit_bias support".
+
   commit_status: false
   high_level_summary_instructions: |
-    Always produce two review sections in the summary:
+    Provide two concise sections:
 
-    **Dev Engineer Review**
-    Review all changes for correctness and consistency, including:
-    - Code changes: correctness, performance, API consistency (CODING_GUIDELINES.md), error handling, regressions.
-    - Config files: valid values, no typos, consistency with related configs, no unintended scope changes.
-    - Test list files (test-db/, qa/, waives.txt): correct format, valid test paths, appropriate bug references, no duplicates.
+    ## Dev Engineer Review
+    Summarize material findings or risks in source code, configuration, and
+    test-list changes. Focus on correctness, API consistency, regressions,
+    performance, and unintended scope changes.
 
-    **QA Engineer Review**
-    Always include this section when any files under tests/ are touched.
-    For test-list-only changes (only tests/integration/test_lists/ files):
-      - List all modified test-list files, including waives.txt, and what entries were added or removed.
-      - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
-      - CBTS touchmap coverage evidence is not applicable: these changes are handled directly by Tier 1
-        path/diff rules, while the touchmap is used for residual source-code changes.
-      - Verdict: "sufficient" or "insufficient" based on the correctness and intended scope of the list changes.
-    For test-code changes (files outside tests/integration/test_lists/):
-      - List test functions added, modified, or removed.
-      - State whether each is covered in tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
-      - Verdict: sufficient, insufficient, or needs follow-up.
-    If no test files are touched, write "No test changes."
+    ## QA Engineer Review
+    If no files under `tests/` changed, write exactly: "No test changes."
+
+    Otherwise summarize:
+    - Test files and test-list files added, modified, or removed.
+    - Test functions, test IDs, selectors, or waivers added, modified, or
+      removed when discoverable.
+    - Important behavior, error paths, regressions, or components covered.
+    - Whether changed integration tests are listed in the appropriate
+      `test-db/` CI or `qa/` manual-QA lists when applicable.
+    - Coverage verdict: `sufficient`, `insufficient`, or `needs follow-up`.
+
+    For test-list-only changes, summarize the affected list files and entries
+    directly. Do not require test-function changes or CBTS touchmap evidence.
+
+    ## Per-File QA Perspective
+    For each changed file, include a concise QA perspective:
+    - For test-code files (tests/** excluding tests/integration/test_lists/**): note what
+      the test covers and whether it is listed in tests/integration/test_lists/test-db/ (CI)
+      or tests/integration/test_lists/qa/ (manual QA).
+    - For source files: note any observable behavior changes a QA engineer should verify
+      (new code paths, changed APIs, altered defaults, removed functionality).
+    - For configuration files (e.g. .coderabbit.yaml, *.yml, *.yaml, *.json, *.toml):
+      note any review or workflow behavior changes introduced by the config update.
+    Keep each entry to 1-2 sentences; omit if no QA-relevant impact.
   collapse_walkthrough: false
   assess_linked_issues: true
   related_issues: true
@@ -52,51 +71,219 @@ reviews:
   suggested_reviewers: true
   poem: false
   review_status: false
+
   auto_review:
     auto_incremental_review: true
     drafts: false
     base_branches: ["main", "release/.+"]
+
+  path_filters:
+    # Vendored/adapted FlashInfer kernels; excluded from review.
+    - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
+
   path_instructions:
+    # Production-code coverage review. This is required because tests/** rules
+    # do not run when a PR changes source code without changing a test file.
+    - path: "tensorrt_llm/**"
+      instructions: |
+        Perform the normal production code review with the same rigor as if
+        these test-coverage instructions were absent.
+
+        Test coverage review is additive. It must not replace, downgrade, or
+        suppress findings about correctness, API compatibility, error handling,
+        performance, backward compatibility, resource safety, CUDA/GPU
+        behavior, concurrency, distributed behavior, or security.
+
+        Review TensorRT-LLM production-code changes for meaningful test
+        coverage in addition to normal code review.
+
+        For each new or materially changed observable behavior, determine
+        whether this PR adds, updates, or clearly identifies an existing test
+        that meaningfully exercises the change. Consider tests under tests/**,
+        including unit, integration, distributed, and regression tests.
+
+        Leave an INLINE review comment on the smallest relevant changed
+        production-code hunk when a material test coverage gap exists. Do not
+        put an actionable missing-test finding only in the summary.
+
+        Flag material coverage gaps such as:
+        - A new or changed validation rule, error path, fallback, retry,
+          configuration option, API contract, serialization behavior, runtime
+          behavior, scheduler behavior, quantization behavior, distributed
+          behavior, or observable output with no meaningful test.
+        - A bug fix without a practical regression test that would have failed
+          before the fix.
+        - Authentication, authorization, input validation, error propagation,
+          or failure recovery changes covered only by a happy-path test.
+        - A removed or weakened test that leaves changed behavior without an
+          equivalent replacement or documented reason.
+
+        For each inline finding:
+        - Name the exact changed behavior that lacks coverage.
+        - State the concrete failure or regression the missing test could miss.
+        - Propose the smallest practical test scenario and likely test location.
+        - Do not make vague comments such as "add more tests".
+
+        Do not require tests for comments, documentation-only edits,
+        formatting-only changes, generated artifacts, type-only changes,
+        behavior-preserving renames/refactors, or dead-code removal when no
+        observable behavior changes.
+
+        Do not claim a coverage gap if existing tests clearly and meaningfully
+        cover the changed behavior.
+
+    # Test-code correctness review and test execution/list coverage review.
     - path: "tests/**"
       instructions: |
-        Act as a QA engineer reviewing test changes and coverage for TensorRT-LLM.
-        Always produce a test coverage summary, even if no issues are found.
+        Act as a QA engineer reviewing TensorRT-LLM test changes for test
+        correctness, reliability, and meaningful behavior coverage.
 
-        If the change touches ONLY files under tests/integration/test_lists/ (no test-code changes):
-        - Report all modified test-list files, including waives.txt, and what entries were added or removed.
+        Always produce a concise test coverage summary, even if no issues are
+        found. State:
+        - Test files added, modified, or removed.
+        - Test functions, parameterized test IDs, or cases added, modified, or
+          removed when discoverable.
+        - Behaviors, components, failure paths, or regressions covered.
+        - Relevant test-list/execution coverage and any material gaps.
+        - Coverage verdict: sufficient, insufficient, or needs follow-up.
+
+        Leave INLINE review comments anchored to the smallest relevant changed
+        line or hunk for every distinct, actionable test correctness or test
+        coverage issue. Do not put actionable findings only in the summary.
+
+        Add inline comments for:
+        - Missing, incorrect, overly weak, or non-observable assertions.
+        - Incorrect expected values or assertions that contradict the intended
+          API contract, test name, docstring, parameterization, or comments.
+        - Tests that can silently pass, including swallowed exceptions, bare
+          `except: pass`, assertions in unreachable code, assertions scoped
+          incorrectly, always-true conditions, disabled/skipped/xfail tests
+          without adequate justification, or mocks that bypass the behavior
+          purportedly under test.
+        - Faulty setup/teardown, resource leaks, fixture contamination,
+          un-restored environment variables, uncleaned temporary files,
+          subprocesses, global/shared state, CUDA state, or distributed process
+          groups.
+        - Flaky patterns, including unseeded randomness, timing dependence,
+          order dependence, arbitrary sleeps, polling without a bounded timeout,
+          race-prone asynchronous execution, external-state dependence, or
+          non-deterministic output/order assertions.
+        - A test name, docstring, parameterization, comment, or test-list entry
+          that does not match what the test actually validates.
+        - A removed or weakened test that reduces meaningful coverage without an
+          equivalent replacement or documented reason.
+        - A modified test-list entry that does not correspond to a discoverable
+          real test ID, parameterized test ID, or documented selector.
+
+        For each inline finding:
+        - Post one inline comment per distinct issue; do not combine unrelated
+          issues into one comment.
+        - Explain why the test can pass despite a defect or fail
+          non-deterministically.
+        - Identify the concrete behavior, failure mode, or regression that is
+          untested or incorrectly tested.
+        - Suggest the smallest practical correction or additional test case.
+        - Do not force comments when no actionable issue exists.
+
+        Test coverage principles:
+        - Prefer behavior and contract coverage over raw line coverage.
+        - Check normal behavior, meaningful boundaries, invalid inputs, error
+          paths, recovery paths, and regression scenarios when relevant.
+        - Prefer assertions on observable results and side effects over only
+          verifying mock call counts or internal implementation details.
+        - Do not require redundant tests for comments, formatting-only edits,
+          generated files, behavior-preserving renames, or trivial refactors.
+        - Do not claim a coverage gap unless the changed behavior is reasonably
+          identifiable from the PR context.
+
+        TensorRT-LLM-specific test checks:
+        - Require explicit, precise capability gating for CUDA version, GPU
+          architecture, GPU count, memory requirements, NCCL/distributed
+          availability, external model availability, and optional dependencies.
+          Do not accept broad skips that can mask unrelated failures.
+        - For multi-GPU or distributed tests, check rank-safe setup/teardown,
+          bounded synchronization and timeouts, and assertions on the intended
+          rank(s).
+        - For numerical tests, require tolerances appropriate to dtype,
+          quantization mode, backend, and expected numerical variance. Flag
+          tolerances broad enough to hide material regressions.
+        - Distinguish correctness tests from benchmarks. Do not require fixed
+          latency or throughput assertions unless the repository explicitly
+          defines stable hardware-specific performance baselines.
+        - Prefer deterministic local fixtures over network downloads, mutable
+          external model artifacts, or shared machine state where practical.
+
+        Special handling for test-list-only changes:
+        If the PR touches ONLY files under tests/integration/test_lists/ and
+        contains no test-code changes:
+        - Report all modified test-list files, including waives.txt, and every
+          entry, selector, test ID, or waiver added and removed.
         - Do NOT require changed test functions for this path.
-        - Review the list changes directly for valid test IDs, formatting, duplicates, and appropriate bug references.
-        - CBTS touchmap coverage evidence is not applicable: test-list-only changes are handled directly by
-          Tier 1 path/diff rules, while the touchmap is used for residual source-code changes.
-        - Do NOT use verdict "needs follow-up" solely because cbts_touchmap.sqlite or a CBTS coverage report
-          is unavailable. Use "sufficient" or "insufficient" based on the correctness and intended scope of
-          the list changes.
+        - Review list changes directly for valid test IDs/selectors, correct
+          formatting, duplicate entries, intended tier/scope, and appropriate
+          bug references.
+        - CBTS touchmap coverage evidence is not applicable: test-list-only
+          changes are handled directly by Tier 1 path/diff rules, while the
+          touchmap is used for residual source-code changes.
+        - Do NOT use verdict "needs follow-up" solely because
+          cbts_touchmap.sqlite or a CBTS coverage report is unavailable. Use
+          "sufficient" or "insufficient" based on the correctness and intended
+          scope of the list changes.
+        - For waiver additions, flag only when repository-required metadata is
+          absent, such as a clear rationale, owner/bug reference, or expiration
+          condition.
 
-        If the change includes test-code files (outside tests/integration/test_lists/), the summary must include:
-        1. Which test functions were added, modified, or removed.
-        2. Whether each changed test is listed in the appropriate test list files under
-           tests/integration/test_lists/ (test-db/ for CI, qa/ for manual QA).
+        For changes including test-code files outside
+        tests/integration/test_lists/, the summary must include:
+        1. Which test functions, parameterized test IDs, or cases were added,
+           modified, or removed.
+        2. Whether each changed integration test is listed in the appropriate
+           test-list files under tests/integration/test_lists/: test-db/ for
+           auto-run CI and qa/ for manually-triggered QA, when listing is
+           expected by repository convention.
         3. A coverage verdict: sufficient, insufficient, or needs follow-up.
-        Keep feedback actionable: reference concrete list file names when suggesting additions.
+        4. Concrete test-list file names whenever suggesting additions.
+
+    # Manual QA lists are independently maintained from CI test-db lists.
     - path: "tests/integration/test_lists/qa/**"
       instructions: |
-        Files here are manually-triggered QA perf/regression lists, maintained
-        by the QA team. They are NOT derived from, and do NOT need to mirror,
-        the auto-run CI test-db under tests/integration/test_lists/test-db/.
-        Do NOT suggest cross-syncing entries between qa/ and test-db/; coverage
-        in one does not imply coverage in the other and is decided independently.
+        Files here are manually-triggered QA performance/regression lists
+        maintained by the QA team. They are not derived from and do not need to
+        mirror the auto-run CI test-db under
+        tests/integration/test_lists/test-db/.
+
+        Do NOT suggest cross-syncing entries between qa/ and test-db/. Coverage
+        in one does not imply coverage in the other; their membership and scope
+        are decided independently.
+
+        Review entries for valid selectors/test IDs, formatting, duplicates,
+        intended QA scope, and repository-required bug references/metadata.
+
+    # Auto-run CI lists are independently maintained from manual QA lists.
     - path: "tests/integration/test_lists/test-db/**"
       instructions: |
-        Files here drive the auto-run CI test-db (per-GPU l0_*.yml tiers).
-        Adding or removing entries here changes what CI runs either in every PR (pre-merge) or three times a day (post-merge).
-        Do NOT suggest cross-syncing with the QA lists under
-        tests/integration/test_lists/qa/.
+        Files here drive the auto-run CI test-db, including per-GPU l0_*.yml
+        tiers. Adding or removing an entry changes what CI runs either in every
+        PR (pre-merge) or three times per day (post-merge).
+
+        Do NOT suggest cross-syncing entries with the manual QA lists under
+        tests/integration/test_lists/qa/. Coverage in QA and CI is decided
+        independently.
+
+        Review entries for valid selectors/test IDs, formatting, duplicates,
+        correct target tier/GPU scope, and repository-required bug references
+        or waiver metadata.
+
+    # Test list data files are intentionally headerless by repository convention.
     - path: "tests/integration/test_lists/**"
       instructions: |
-        Files here (waives.txt and the *.txt/*.yml list files) are plain-text
-        test-list data files, not source code. By repo convention they carry no
-        NVIDIA copyright/license header. Do NOT require or suggest adding a
-        copyright header to these files.
+        Files here, including waives.txt and *.txt/*.yml list files, are
+        plain-text test-list data files rather than source code. By repository
+        convention, they carry no NVIDIA copyright/license header.
+
+        Do NOT require or suggest adding a copyright, SPDX, or license header
+        to files under this directory.
+
 knowledge_base:
   code_guidelines:
     enabled: true

@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -41,31 +41,33 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..attention_backend import get_sparse_attn_kv_cache_manager
+from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..disaggregation.kv_cache_transceiver import (
+    AttentionTypeCpp, create_kv_cache_transceiver,
+    maybe_enable_fabric_memory_for_python_transceiver)
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
-from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
-                           get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
+                           get_num_spec_layers, get_spec_decoder,
+                           should_use_separate_draft_kv_cache)
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
+                           extract_qwen4_exp_ple_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
                            is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid,
+                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
+                                           CppMambaHybridCacheManager,
+                                           MambaHybridCacheManagerV2,
+                                           MixedMambaHybridCacheManager,
+                                           use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
-from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager,
-                                  MambaHybridCacheManagerV2,
-                                  MixedMambaHybridCacheManager,
-                                  use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
@@ -156,8 +158,12 @@ def get_kv_cache_manager_cls(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
+        if sparse_attn_algorithm == "qsa" and not use_v2:
+            raise ValueError(
+                "QSA with hybrid Mamba / linear-attention models requires "
+                "use_kv_cache_manager_v2=True.")
         if (sparse_attn_config is not None
-                and sparse_attn_algorithm != "skip_softmax"):
+                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -291,8 +297,17 @@ def get_kv_cache_manager_cls(
                 "V2 Mamba block reuse is not compatible with "
                 "enable_kv_pool_rebalance because the rebalancer does not "
                 "yet model retained recurrent-state snapshots.")
+        if sparse_attn_algorithm == "qsa":
+            return get_sparse_attn_kv_cache_manager(
+                sparse_attn_config, use_kv_cache_manager_v2=True)
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
+        if sparse_attn_algorithm == "qsa":
+            # The QSA manager extends the hybrid manager because it must retain
+            # both paged attention data and recurrent GDN state.
+            raise ValueError(
+                "QSA sparse attention currently requires a hybrid Mamba / "
+                "linear-attention model.")
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
@@ -363,7 +378,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
     workspace is reserved and no admission cap is installed for it. See ``ATTENTION_DEVELOPER_GUIDE.md``
     §2.3.
     """
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     # Resolved without ``sparse_params``: those are per-layer, while this workspace is one buffer shared
     # across every attention layer, so the declaration is a whole-model question. The sparse backends all
@@ -375,7 +390,7 @@ def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
 
 def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
     """Whether chunked prefill bounds the selected backend's runtime workspace."""
-    from ..attention_backend.utils import get_attention_backend
+    from ..attention.backends.utils import get_attention_backend
 
     return get_attention_backend(
         model_config.attn_backend).runtime_workspace_is_chunked_prefill_bounded(
@@ -524,6 +539,25 @@ def draft_config_defines_attention_layout(
         or bool(getattr(draft_pretrained_config, "layer_types", None)))
 
 
+def _expand_attention_window_pattern_to_global_layers(
+    max_attention_window: Optional[Sequence[int]],
+    layer_mask: Sequence[bool],
+) -> Optional[List[int]]:
+    """Expand an enabled-layer pattern into physical global-layer order."""
+    if max_attention_window is None:
+        return None
+
+    pattern = list(max_attention_window)
+    global_windows = [pattern[0]] * len(layer_mask)
+    enabled_layer_offset = 0
+    for layer_idx, enabled in enumerate(layer_mask):
+        if enabled:
+            global_windows[layer_idx] = pattern[enabled_layer_offset %
+                                                len(pattern)]
+            enabled_layer_offset += 1
+    return global_windows
+
+
 def _derive_draft_max_attention_window(
     kv_cache_config: KvCacheConfig,
     draft_pretrained_config: object,
@@ -558,6 +592,10 @@ class KvCacheCreator:
     # is preallocated. Every live manager reserves its own, so these budgets
     # must be divided rather than handed out whole.
     _OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
+
+    # Paired-reuse protocol flag. ``build_managers`` resolves it once and hands
+    # it to both constructors; the managers must not re-derive it.
+    _joint_kv_cache_reuse = False
 
     def __init__(
         self,
@@ -1425,6 +1463,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
             is_disagg=self._is_disagg,
             cold_page_codec_provider=cold_page_codec_provider,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
         if not self._skip_est:
@@ -1461,7 +1500,18 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
+        if self._speculative_config is None:
+            # No drafter at all, so there is nothing to give a manager to.
+            return False
+        # Narrower than is_external_drafter(): PARD and DRAFT_TARGET_ONE_MODEL
+        # never reach the arena this carve-out exists for.
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        is_standalone_drafter = (spec_dec_mode.is_dflash()
+                                 or spec_dec_mode.is_dspark())
+        if self._mapping.enable_attention_dp and not is_standalone_drafter:
+            # This bail suits MTP, whose draft layers are target-shaped and
+            # appendable to the target pool. A standalone drafter has nothing to
+            # append, so it would be stranded on the private arena instead.
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
@@ -1477,6 +1527,17 @@ class KvCacheCreator:
                 self._mapping.pp_size)
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _joint_reuse_supported(self) -> bool:
+        """Span half of the pairing decision; ``build_managers`` ANDs it with
+        ``has_separate_one_model_draft``. ``False`` = leave the run unpaired.
+        """
+        if not self._is_kv_cache_manager_v2:
+            return False
+        if not getattr(self._kv_cache_manager_cls,
+                       "_supports_reuse_match_backoff", False):
+            return False
+        return draft_prompt_lookahead(self._speculative_config) is not None
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -1560,6 +1621,11 @@ class KvCacheCreator:
             kv_cache_config,
             max_seq_len,
             estimating_kv_cache=estimating_kv_cache)
+        draft_kv_config.max_attention_window = (
+            _expand_attention_window_pattern_to_global_layers(
+                draft_kv_config.max_attention_window,
+                spec_dec_layer_mask,
+            ))
         if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
                 and draft_kv_config.pool_ratio is not None
                 and len(draft_kv_config.pool_ratio) != 1):
@@ -1614,6 +1680,7 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
             is_disagg=self._is_disagg,
             cold_page_codec_provider=cold_page_codec_provider,
+            joint_kv_cache_reuse=self._joint_kv_cache_reuse,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -2050,6 +2117,15 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
+        has_separate_one_model_draft = (
+            self._draft_model_engine is None
+            and self._should_create_separate_draft_kv_cache())
+        # One term per axis: a draft pool exists to pair with, block reuse is on,
+        # and the span is known. Anything outside keeps its unpaired path.
+        self._joint_kv_cache_reuse = (has_separate_one_model_draft and
+                                      self_kv_cache_config.enable_block_reuse
+                                      and self._joint_reuse_supported())
+
         # Estimation managers are throwaway probes whose pools only hold dummy
         # requests, so an explicit offload tier would reserve capacity the probe
         # cannot fill. Encoder-decoder runs skip estimation, so dropping the
@@ -2063,7 +2139,7 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers.
         has_draft = (
             self._draft_model_engine is not None  # two-model
-            or self._should_create_separate_draft_kv_cache())  # one-model
+            or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
         if has_draft:
             # The GPU split applies when each manager sizes its pools from
@@ -2249,6 +2325,29 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
+                                    is_draft: bool):
+    """Align target-only PLE state with a target/draft cache layout."""
+    if is_draft:
+        return None
+
+    params = extract_qwen4_exp_ple_cache_params(config)
+    num_target_layers = len(params.ple_layer_mask)
+    if num_target_layers > total_layers:
+        raise ValueError(
+            "PLE layer mask cannot exceed the hybrid cache layout: "
+            f"got {num_target_layers}, expected at most {total_layers}")
+    if num_target_layers == total_layers:
+        return params
+
+    # Unified one-model caches append attention-only MTP layers.
+    return dataclasses.replace(
+        params,
+        ple_layer_mask=params.ple_layer_mask + [False] *
+        (total_layers - num_target_layers),
+    )
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2275,7 +2374,8 @@ def _create_kv_cache_manager(
         head_dim: Optional[int] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
-        cold_page_codec_provider: Optional[object] = None) -> KVCacheManager:
+        cold_page_codec_provider: Optional[object] = None,
+        joint_kv_cache_reuse: bool = False) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -2414,6 +2514,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
@@ -2458,8 +2559,10 @@ def _create_kv_cache_manager(
         # states in place, replacing the intermediate-buffer + promotion
         # flow for KDA layers.
         kimi_extra_kwargs = {}
-        if spec_config is not None and issubclass(kv_cache_manager_cls,
-                                                  MixedMambaHybridCacheManager):
+        kda_replay_manager_types = (MixedMambaHybridCacheManager,
+                                    MambaHybridCacheManagerV2)
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
             from ..modules.kimi_kda._kda_kernels import \
                 is_kda_mtp_verify_available
             if is_kda_mtp_verify_available():
@@ -2644,7 +2747,7 @@ def _create_kv_cache_manager(
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
-    elif is_qwen3_hybrid(config):
+    elif is_qwen3_hybrid(config) or is_qwen4_exp(config):
         if max_beam_width > 1:
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
@@ -2720,6 +2823,23 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
+            # Resolve the side-cache shape from the same checkpoint geometry
+            # used to construct the QSA index projection.
+            mamba_manager_extra_kwargs.update(
+                sparse_attention_config=sparse_attention_config,
+                pretrained_config=config,
+            )
+        if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
+                                               MambaHybridCacheManagerV2):
+            ple_cache_params = _get_qwen4_exp_ple_cache_params(
+                config,
+                total_layers=len(mamba_layer_mask),
+                is_draft=is_draft,
+            )
+            if ple_cache_params is not None:
+                mamba_manager_extra_kwargs[
+                    "qwen4_exp_ple_cache_params"] = ple_cache_params
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

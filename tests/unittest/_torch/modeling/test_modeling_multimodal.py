@@ -16,8 +16,8 @@ from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrai
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
@@ -26,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig

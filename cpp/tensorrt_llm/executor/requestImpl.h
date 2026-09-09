@@ -51,7 +51,6 @@ public:
         OutputConfig outputConfig, std::optional<TokenIdType> const& endId, std::optional<TokenIdType> const& padId,
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
-        std::optional<ExternalDraftTokensConfig> externalDraftTokensConfig,
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
         std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
         std::optional<LoraConfig> loraConfig, std::optional<LookaheadDecodingConfig> lookaheadConfig,
@@ -60,7 +59,7 @@ public:
         std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
         PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
         std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
+        std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
         std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
@@ -75,7 +74,6 @@ public:
         , mBadWords(std::move(badWords))
         , mStopWords(std::move(stopWords))
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
-        , mExternalDraftTokensConfig(std::move(externalDraftTokensConfig))
         , mPTuningConfig(std::move(pTuningConfig))
         , mMultimodalInput(std::move(multimodalInput))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
@@ -95,7 +93,6 @@ public:
         , mEncoderOutputLength(encoderOutputLength)
         , mCrossAttentionMask(std::move(crossAttentionMask))
         , mNumReturnSequences(numReturnSequences)
-        , mEagleConfig(std::move(eagleConfig))
         , mSkipCrossAttnBlocks(std::move(skipCrossAttnBlocks))
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
@@ -188,11 +185,6 @@ public:
     [[nodiscard]] std::optional<Tensor> getEmbeddingBias() const
     {
         return mEmbeddingBias;
-    }
-
-    [[nodiscard]] std::optional<ExternalDraftTokensConfig> getExternalDraftTokensConfig() const
-    {
-        return mExternalDraftTokensConfig;
     }
 
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const
@@ -298,11 +290,6 @@ public:
         return mSamplingConfig.getNumReturnSequences();
     }
 
-    [[nodiscard]] std::optional<EagleConfig> getEagleConfig() const
-    {
-        return mEagleConfig;
-    }
-
     [[nodiscard]] std::optional<Tensor> getSkipCrossAttnBlocks() const
     {
         return mSkipCrossAttnBlocks;
@@ -371,11 +358,6 @@ public:
     void setEmbeddingBias(Tensor const& embeddingBias)
     {
         mEmbeddingBias = checkEmbeddingBias(embeddingBias);
-    }
-
-    void setExternalDraftTokensConfig(ExternalDraftTokensConfig const& externalDraftTokensConfig)
-    {
-        mExternalDraftTokensConfig = externalDraftTokensConfig;
     }
 
     void setPromptTuningConfig(PromptTuningConfig const& pTuningConfig)
@@ -477,11 +459,6 @@ public:
         mSamplingConfig.setNumReturnSequences(numReturnSequences);
     }
 
-    void setEagleConfig(std::optional<EagleConfig> eagleConfig)
-    {
-        mEagleConfig = std::move(eagleConfig);
-    }
-
     void setSkipCrossAttnBlocks(Tensor skipCrossAttnBlocks)
     {
         mSkipCrossAttnBlocks = skipCrossAttnBlocks;
@@ -561,7 +538,6 @@ private:
         lambda(mBadWords);
         lambda(mStopWords);
         lambda(mEmbeddingBias);
-        lambda(mExternalDraftTokensConfig);
         lambda(mPTuningConfig);
         lambda(mMultimodalInput);
         lambda(mMultimodalEmbedding);
@@ -580,7 +556,6 @@ private:
         lambda(mEncoderOutputLength);
         lambda(mCrossAttentionMask);
         lambda(mNumReturnSequences);
-        lambda(mEagleConfig);
         lambda(mSkipCrossAttnBlocks);
         lambda(mGuidedDecodingParams);
         lambda(mLanguageAdapterUid);
@@ -600,7 +575,6 @@ private:
     std::optional<std::list<VecTokens>> mBadWords;
     std::optional<std::list<VecTokens>> mStopWords;
     std::optional<Tensor> mEmbeddingBias;
-    std::optional<ExternalDraftTokensConfig> mExternalDraftTokensConfig;
     std::optional<PromptTuningConfig> mPTuningConfig;
     std::optional<MultimodalInput> mMultimodalInput;
     std::optional<Tensor> mMultimodalEmbedding;
@@ -620,7 +594,6 @@ private:
     std::optional<SizeType32> mEncoderOutputLength;
     std::optional<Tensor> mCrossAttentionMask;
     SizeType32 mNumReturnSequences;
-    std::optional<EagleConfig> mEagleConfig;
     std::optional<Tensor> mSkipCrossAttnBlocks;
     std::optional<GuidedDecodingParams> mGuidedDecodingParams;
     std::optional<SizeType32> mLanguageAdapterUid;

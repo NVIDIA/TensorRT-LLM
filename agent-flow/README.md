@@ -84,7 +84,7 @@ Ready-to-run multi-agent workflows ship as subpackages of
   one-shot **diagnosis** of a `trtllm-serve` deployment (Benchmarker →
   Projector → Analyzer → Reporter): it serves the checkpoint, benchmarks one
   operating point, derives an analytical speed-of-light ceiling, profiles the
-  same load under nsys / the torch profiler / ncu, and reports the single
+  same load under nsys / ncu, and reports the single
   dominant bottleneck. It applies nothing and never mutates the TensorRT-LLM
   checkout. Launch via `perf-analyze`.
 - [`agent_flow.workflows.perf_optimize`](agent_flow/workflows/perf_optimize) —

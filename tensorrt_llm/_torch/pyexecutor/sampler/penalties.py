@@ -39,7 +39,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 
 from ..llm_request import LlmRequest
 from .ops.vanilla import Fusions, occurrence_penalized_logits
-from .sampler_common import _get_max_beam_width, _unwrap_singleton
+from .sampler_common import _get_max_beam_width
 
 __all__ = [
     "PenaltyHandler",
@@ -55,9 +55,9 @@ __all__ = [
 
 def has_occurrence_penalty(request: LlmRequest) -> bool:
     sampling_config = request.sampling_config
-    repetition = _unwrap_singleton(sampling_config.repetition_penalty)
-    presence = _unwrap_singleton(sampling_config.presence_penalty)
-    frequency = _unwrap_singleton(sampling_config.frequency_penalty)
+    repetition = sampling_config.repetition_penalty
+    presence = sampling_config.presence_penalty
+    frequency = sampling_config.frequency_penalty
     return (
         (repetition is not None and repetition != 1.0)
         or (presence is not None and presence != 0.0)
@@ -313,10 +313,10 @@ class PenaltyHandler:
             return
 
         sampling_config = request.sampling_config
-        repetition = _unwrap_singleton(sampling_config.repetition_penalty)
-        presence = _unwrap_singleton(sampling_config.presence_penalty)
-        frequency = _unwrap_singleton(sampling_config.frequency_penalty)
-        prompt_ignore_length = _unwrap_singleton(sampling_config.prompt_ignore_length)
+        repetition = sampling_config.repetition_penalty
+        presence = sampling_config.presence_penalty
+        frequency = sampling_config.frequency_penalty
+        prompt_ignore_length = sampling_config.prompt_ignore_length
         # min(prompt_ignore_length, inputLen), matching the C++ kernel.
         prompt_ignore_length = min(
             prompt_ignore_length if prompt_ignore_length is not None else 0,

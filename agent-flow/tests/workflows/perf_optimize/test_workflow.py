@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,14 +13,28 @@ import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
+from agent_flow.workflows.perf_optimize import (
+    kernel_ledger,
+    nsys_items,
+    roadmap_schema,
+    task_schema,
+)
 from agent_flow.workflows.perf_optimize import progress as progress_module
-from agent_flow.workflows.perf_optimize import roadmap_schema, task_schema
 from agent_flow.workflows.perf_optimize import state as state_module
 from agent_flow.workflows.perf_optimize import workflow as workflow_module
 
 Workflow = workflow_module.PerfOptimizeWorkflow
 
-_ROLES = ("benchmarker", "projector", "analyzer", "optimizer", "evaluator", "qa", "reporter")
+_ROLES = (
+    "benchmarker",
+    "projector",
+    "analyzer",
+    "optimizer",
+    "evaluator",
+    "qa",
+    "reporter",
+)
+_AGENT_ROLES = (*_ROLES, "integrator")
 
 
 # --------------------------------------------------------------------- helpers
@@ -62,15 +77,6 @@ class FakeGitOps:
     def __init__(self, is_repo: bool = True):
         self.calls: list[tuple] = []
         self.is_repo_flag = is_repo
-        # Which host the workflow routed git to, or "" for local. Recorded rather
-        # than swallowed so a test can assert the choice was made — the failure it
-        # guards is a resumed run silently issuing git against a local path that
-        # does not exist.
-        self.cluster: str | None = None
-
-    def use_cluster(self, ssh_alias: str) -> None:
-        self.calls.append(("use_cluster", ssh_alias))
-        self.cluster = ssh_alias
 
     def is_git_repo(self, repo):
         self.calls.append(("is_git_repo", str(repo)))
@@ -78,7 +84,7 @@ class FakeGitOps:
 
     def worktree_clean(self, repo):
         self.calls.append(("worktree_clean", str(repo)))
-        return False
+        return str(repo).split("/")[-1] == "integration"
 
     def current_branch(self, repo):
         return "main"
@@ -99,6 +105,20 @@ class FakeGitOps:
 
     def discard_uncommitted(self, repo):
         self.calls.append(("discard_uncommitted", str(repo)))
+
+    def create_worktree(self, repo, path, branch, base):
+        self.calls.append(("create_worktree", str(path), branch, base))
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+    def remove_worktree(self, repo, path):
+        self.calls.append(("remove_worktree", str(path)))
+        shutil.rmtree(path, ignore_errors=True)
+
+    def reset_to(self, repo, commit):
+        self.calls.append(("reset_to", str(repo), commit))
+
+    def fast_forward(self, repo, branch):
+        self.calls.append(("fast_forward", str(repo), branch))
 
     def count(self, name: str) -> int:
         return sum(1 for c in self.calls if c[0] == name)
@@ -170,10 +190,17 @@ def _stub_agents(
     verdicts = list(evaluator_verdicts or [("APPROVE", "none", 8.4, 108.4)])
     counters = {"analyzer": 0, "evaluator": 0}
 
-    def _append(entry: dict) -> None:
-        data = progress_module.read_progress(workflow.progress_path)
-        data["optimization"].append(entry)
-        progress_module.write_progress(workflow.progress_path, data)
+    def _append(entry: dict, local_path: Path | None = None) -> None:
+        with workflow._progress_lock:
+            data = progress_module.read_progress(workflow.progress_path)
+            global_entry = dict(entry)
+            global_entry["step"] = len(data["optimization"]) + 1
+            data["optimization"].append(global_entry)
+            progress_module.write_progress(workflow.progress_path, data)
+        if local_path is not None:
+            data = progress_module.read_progress(local_path)
+            data["optimization"].append(entry)
+            progress_module.write_progress(local_path, data)
 
     def benchmarker(state):
         trace.append("benchmarker")
@@ -213,13 +240,22 @@ def _stub_agents(
         roadmap_schema.save_roadmap(workflow.roadmap_path, data)
         _append({"step": 1, "agent": "analyzer", "summary": "a"})
 
-    def optimizer(state):
+    def optimizer(state, *, agent=None, progress_ctx=None):
         trace.append("optimizer")
         summary = workflow._attempt_dir(state) / "optimization_summary.md"
         summary.write_text("# summary\n", encoding="utf-8")
-        _append({"step": 1, "agent": "optimizer", "summary": "o"})
+        _append(
+            {
+                "step": progress_ctx.current_step if progress_ctx else 1,
+                "agent": "optimizer",
+                "summary": "o",
+                "attempt": state.attempt_index + 1,
+                "item_id": state.current_item_id,
+            },
+            progress_ctx.path if progress_ctx else None,
+        )
 
-    def evaluator(state):
+    def evaluator(state, *, agent=None, progress_ctx=None):
         trace.append("evaluator")
         report = workflow._attempt_dir(state) / "evaluation.md"
         report.write_text("# evaluation\n", encoding="utf-8")
@@ -237,7 +273,48 @@ def _stub_agents(
         }
         if evaluator_curve is not None:
             entry["curve"] = [dict(p) for p in evaluator_curve]
-        _append(entry)
+        entry["attempt"] = state.attempt_index + 1
+        entry["item_id"] = state.current_item_id
+        _append(entry, progress_ctx.path if progress_ctx else None)
+
+    def integrator(prompt):
+        state = state_module.load_state(workflow.state_path)
+        candidates = [
+            entry for entry in state.item_batch if entry.get("status") == "candidate_ready"
+        ]
+        integration_repo = Path(state.integration_worktree_path)
+        if (integration_repo / ".git").exists():
+            for candidate in candidates:
+                commit = candidate.get("candidate_commit")
+                if commit:
+                    subprocess.run(
+                        ["git", "-C", str(integration_repo), "cherry-pick", str(commit)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+        integration_dir = workflow._round_dir(state) / "integration"
+        (integration_dir / "integration.md").write_text("# integration\n", encoding="utf-8")
+        included = [str(entry["current_item_id"]) for entry in candidates]
+        best = max(candidates, key=lambda entry: float(entry["measured_gain_pct"]))
+        noise_floor = float(workflow._optimize_block()["noise_floor_pct"])
+        best_gain = max(float(entry["measured_gain_pct"]) for entry in candidates)
+        verdict = {
+            "agent": "integrator",
+            "round": state.round_index + 1,
+            "summary": "integrated",
+            "decision": "APPROVE",
+            "included_item_ids": included,
+            "dropped_item_ids": [],
+            "remediation_attempts": 0,
+            "measured_gain_pct": float(best.get("measured_gain_pct") or 0),
+            "measured_value": float(best.get("measured_value") or 100),
+            "required_gain_pct": max(noise_floor, best_gain - noise_floor),
+            "best_candidate_id": included[0] if included else "",
+        }
+        if best.get("curve"):
+            verdict["curve"] = best["curve"]
+        _append(verdict)
 
     def qa(state):
         trace.append("qa")
@@ -263,6 +340,7 @@ def _stub_agents(
     workflow._run_analyzer = analyzer
     workflow._run_optimizer = optimizer
     workflow._run_evaluator = evaluator
+    workflow.integrator = integrator
     workflow._run_qa = qa
     workflow._run_reporter = reporter
     return trace
@@ -282,17 +360,6 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(workflow)
-    state_seen_at_commit: list[tuple[int, bool]] = []
-    original_commit = fake_git.commit_all
-
-    def commit_reading_checkpoint(repo, message):
-        checkpoint = state_module.load_state(ws / state_module.STATE_FILENAME)
-        state_seen_at_commit.append(
-            (checkpoint.accepts_since_analysis, checkpoint.profile_required)
-        )
-        return original_commit(repo, message)
-
-    fake_git.commit_all = commit_reading_checkpoint
     try:
         workflow.run(str(task))
     finally:
@@ -316,8 +383,8 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert state.projector_done is True
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") != ""
     assert state.reporter_done is True
-    assert state.git_branch.startswith("perf-optimize/")
-    assert state.git_base_commit == "b" * 40
+    assert state.campaign_git_branch.startswith("perf-optimize/")
+    assert state.campaign_git_base_commit == "b" * 40
 
     # The orchestrator recorded the accepted item's lifecycle.
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
@@ -326,7 +393,7 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert item["attempts"] == 1
     assert item["measured_gain_pct"] == pytest.approx(8.4)
     assert roadmap["current_best"]["value"] == pytest.approx(108.4)
-    assert "item_1_opt-001/attempt_1/evaluation.md" in roadmap["current_best"]["source"]
+    assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
 
     # One branch, one accept commit, no reverts.
     assert fake_git.count("create_branch") == 1
@@ -334,67 +401,74 @@ def test_happy_path_one_accepted_item(tmp_path, fake_git):
     assert fake_git.count("discard_uncommitted") == 0
     (commit_message,) = [c[1] for c in fake_git.calls if c[0] == "commit_all"]
     assert "opt-001" in commit_message
-    # The stale-profile decision is durable before the accepted change is
-    # committed. A crash inside commit cannot resume into replan-only mode.
-    assert state_seen_at_commit == [(1, True)]
-
     # The normalized spec and the tuning config pair were materialized.
     resolved = yaml.safe_load((ws / "task.yaml").read_text(encoding="utf-8"))
     assert resolved["optimize"]["max_rounds"] == 5
     assert resolved["optimize"]["max_items_per_round"] == 3
+    assert resolved["optimize"]["item_execution"] == "parallel"
     assert (ws / "tuning" / "extra_llm_api_options.yaml").read_text(encoding="utf-8") == "{}\n"
     assert (ws / "tuning" / "extra_llm_api_options.accepted.yaml").read_text(
         encoding="utf-8"
     ) == "{}\n"
 
 
-def test_accept_count_is_idempotent_when_commit_crashes(tmp_path, fake_git):
-    """Resuming the evaluator must not turn one approval into two accepts."""
+@pytest.mark.parametrize(
+    ("verdict_overrides", "error"),
+    [
+        ({"measured_gain_pct": 0.1}, "below required"),
+        ({"required_gain_pct": 0.0}, "required_gain_pct mismatch"),
+        ({"included_item_ids": []}, "included no candidates"),
+        ({"included_item_ids": ["opt-failed"]}, "non-candidate item"),
+        ({"round": 0}, "without a structured verdict"),
+    ],
+)
+def test_integrator_rejects_invalid_acceptance_verdict(
+    tmp_path, fake_git, verdict_overrides, error
+):
+    """A contradictory APPROVE cannot mutate the campaign checkout."""
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
-    seen_at_commit: list[tuple[int, str]] = []
-    original_commit = fake_git.commit_all
-    commit_calls = 0
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)
+    integrator_prompts: list[str] = []
 
-    def commit_crashing_once(repo, message):
-        nonlocal commit_calls
-        commit_calls += 1
-        checkpoint = state_module.load_state(ws / state_module.STATE_FILENAME)
-        seen_at_commit.append(
-            (checkpoint.accepts_since_analysis, checkpoint.last_counted_accept_id)
-        )
-        if commit_calls == 1:
-            raise RuntimeError("simulated crash inside commit")
-        return original_commit(repo, message)
+    def authoritative_integrator(prompt):
+        integrator_prompts.append(prompt)
+        state = state_module.load_state(workflow.state_path)
+        integration_dir = workflow._round_dir(state) / "integration"
+        (integration_dir / "integration.md").write_text("# authoritative\n", encoding="utf-8")
+        data = progress_module.read_progress(workflow.progress_path)
+        verdict = {
+            "step": len(data["optimization"]) + 1,
+            "agent": "integrator",
+            "round": state.round_index + 1,
+            "summary": "agent accepts despite a deliberately invalid verdict",
+            "decision": "APPROVE",
+            "included_item_ids": ["opt-001"],
+            "dropped_item_ids": [],
+            "remediation_attempts": 0,
+            "measured_gain_pct": 8.4,
+            "measured_value": 108.4,
+            "required_gain_pct": 7.4,
+            "best_candidate_id": "opt-001",
+        }
+        verdict.update(verdict_overrides)
+        data["optimization"].append(verdict)
+        progress_module.write_progress(workflow.progress_path, data)
 
-    fake_git.commit_all = commit_crashing_once
-    first = Workflow(workspace=ws)
-    _stub_agents(first)
-    try:
-        with pytest.raises(RuntimeError, match="simulated crash"):
-            first.run(str(task))
-    finally:
-        first.close()
+    workflow.integrator = authoritative_integrator
+    with pytest.raises(RuntimeError, match=error):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
 
-    crashed = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert crashed.stage == state_module.STAGE_EVALUATOR
-    assert crashed.accepts_since_analysis == 1
-    assert crashed.last_counted_accept_id == "opt-001"
-    assert crashed.profile_required is True
-
-    resumed = Workflow(workspace=ws)
-    _stub_agents(resumed, analyzer_items=[[]])
-    try:
-        resumed.run("ignored-on-resume")
-    finally:
-        resumed.close()
-
-    # Both commit attempts observed the same one-item tally. The closing
-    # analyzer then clears it after profiling the accepted state.
-    assert seen_at_commit == [(1, "opt-001"), (1, "opt-001")]
-    final = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert final.accepts_since_analysis == 0
-    assert final.last_counted_accept_id == ""
+    assert fake_git.count("fast_forward") == 0
+    active_repo = str(ws / "worktrees" / "round_1" / "integration")
+    assert f"Active runtime checkout: `{active_repo}`" in integrator_prompts[0]
+    assert (
+        f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in integrator_prompts[0]
+    )
 
 
 def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, monkeypatch):
@@ -416,9 +490,9 @@ def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, mo
 
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     source = roadmap["current_best"]["source"]
-    assert source == "rounds/round_1/item_1_opt-001/attempt_1/evaluation.md"
+    assert source == "rounds/round_1/integration/integration.md"
     reference = workflow._reference_result_dir()
-    assert reference == ws / "rounds" / "round_1" / "item_1_opt-001" / "attempt_1"
+    assert reference == ws / "rounds" / "round_1" / "integration"
     assert reference != workflow.baseline_dir
 
     # Pre-fix ledgers stored the path with the workspace prefix already
@@ -428,10 +502,7 @@ def test_relative_workspace_resolves_reference_result_dir(tmp_path, fake_git, mo
     legacy["current_best"] = dict(roadmap["current_best"])
     legacy["current_best"]["source"] = str(ws / source)
     roadmap_schema.save_roadmap(ws / "roadmap.yaml", legacy)
-    assert (
-        workflow._reference_result_dir()
-        == ws / "rounds" / "round_1" / "item_1_opt-001" / "attempt_1"
-    )
+    assert workflow._reference_result_dir() == ws / "rounds" / "round_1" / "integration"
 
 
 def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
@@ -478,19 +549,7 @@ def test_sol_run_executes_projector_once_before_round_one(tmp_path, fake_git):
     assert (ws / "sol_projection.md").read_text(encoding="utf-8") == "# SOL Projection\n"
 
 
-def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
-    """The routing is chosen before the first git command, on BOTH paths.
-
-    A run whose ``slurm-environment`` carries ``cluster_ssh`` is running off-cluster:
-    the checkout exists only on the cluster, so every git command has to travel over
-    ssh. Absent, nothing changes — which is what every other test here relies on.
-
-    The resume case is the one that decides where this call belongs. ``_init_state``
-    returns early when resuming, so setting the route there would leave every resumed
-    run issuing git against a local path that does not exist — and `is_git_repo`
-    swallows its error, so the run would report "not a git repository" and point at
-    the wrong machine.
-    """
+def test_git_stays_local_when_slurm_is_remote(tmp_path, fake_git):
     slurm = {
         "slurm-environment": {
             "slurm_partition": "batch",
@@ -504,35 +563,8 @@ def test_git_routes_over_ssh_when_the_task_names_a_cluster(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
     workflow.run(str(task))
-    assert fake_git.cluster == "me@login-01"
-
-    # RESUME: an UNFINISHED run reads the checkpointed task.yaml rather than the
-    # input file, and must still route remotely. Rewinding `done` is what makes this
-    # a resume — a completed workspace returns from `_init_state` as None and never
-    # reaches any git command, which is correct and would make this vacuous.
-    state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    state.done = False
-    state.stage = state_module.STAGE_REPORTER
-    state_module.save_state(ws / state_module.STATE_FILENAME, state)
-
-    fake_git.cluster = None
-    resumed = Workflow(workspace=ws)
-    _stub_agents(resumed)
-    resumed.run(str(task))
-    assert fake_git.cluster == "me@login-01", (
-        "a resumed run must route to the cluster too; `_init_state` returns early on "
-        "resume, so a route set only on the fresh path would be lost here — and "
-        "`is_git_repo` swallows its error, so the run would blame the wrong machine"
-    )
-
-
-def test_git_stays_local_without_a_cluster_ssh(tmp_path, fake_git):
-    """No `cluster_ssh` means the historical behaviour, explicitly asserted."""
-    task = _write_task(tmp_path)
-    workflow = Workflow(workspace=tmp_path / "ws")
-    _stub_agents(workflow)
-    workflow.run(str(task))
-    assert fake_git.cluster == "", "an ordinary run must not reach for an ssh host"
+    assert fake_git.count("is_git_repo") == 1
+    assert fake_git.count("create_branch") == 1
 
 
 def test_resume_parked_at_projector_with_block_runs_it(tmp_path, fake_git):
@@ -625,8 +657,8 @@ def test_resume_parked_at_projector_when_disabled_skips_forward(tmp_path, fake_g
         state_module.WorkflowState(
             task_path=str(ws / "task.yaml"),
             benchmarker_done=True,
-            git_branch="perf-optimize/seeded",
-            git_base_commit="a" * 40,
+            campaign_git_branch="perf-optimize/seeded",
+            campaign_git_base_commit="a" * 40,
             stage=state_module.STAGE_PROJECTOR,
         ),
     )
@@ -684,7 +716,7 @@ def test_evaluator_pushback_then_approve_retries_optimizer(tmp_path, fake_git):
     assert roadmap["current_best"]["value"] == pytest.approx(109.0)
 
     # The pushed-back attempt was reverted exactly once, then committed once.
-    assert fake_git.count("discard_uncommitted") == 1
+    assert fake_git.count("reset_to") >= 2
     assert fake_git.count("commit_all") == 1
     item_dir = ws / "rounds" / "round_1" / "item_1_opt-001"
     assert (item_dir / "attempt_1" / "evaluation.md").is_file()
@@ -726,7 +758,7 @@ def test_evaluator_reject_is_terminal_and_skips_final_verification(tmp_path, fak
     assert item["status"] == "failed"
     assert item["attempts"] == 1
     assert roadmap["current_best"]["value"] == pytest.approx(100.0)
-    assert fake_git.count("discard_uncommitted") == 1
+    assert fake_git.count("reset_to") >= 2
     assert fake_git.count("commit_all") == 0
     assert not (ws / "final_verification").exists()
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
@@ -768,7 +800,7 @@ def test_pushback_attempts_exhausted_marks_failed(tmp_path, fake_git):
     assert item["attempts"] == 2
     # A failed item never advances the accepted-measurement watermark.
     assert roadmap["current_best"]["value"] == pytest.approx(100.0)
-    assert fake_git.count("discard_uncommitted") == 2
+    assert fake_git.count("reset_to") >= 2
     assert fake_git.count("commit_all") == 0
 
 
@@ -778,12 +810,13 @@ def test_missing_evaluator_decision_counts_as_pushback(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(workflow)
 
-    def evaluator_without_decision(state):
+    def evaluator_without_decision(state, **kwargs):
         trace.append("evaluator")
         (workflow._attempt_dir(state) / "evaluation.md").write_text("# eval\n", encoding="utf-8")
-        data = progress_module.read_progress(workflow.progress_path)
+        path = kwargs["progress_ctx"].path
+        data = progress_module.read_progress(path)
         data["optimization"].append({"step": 1, "agent": "evaluator", "summary": "no decision"})
-        progress_module.write_progress(workflow.progress_path, data)
+        progress_module.write_progress(path, data)
 
     workflow._run_evaluator = evaluator_without_decision
     try:
@@ -810,7 +843,7 @@ def test_missing_evaluator_decision_counts_as_pushback(tmp_path, fake_git):
     item = roadmap_schema.find_item(roadmap, "opt-001")
     assert item["status"] == "failed"
     assert item["attempts"] == 2
-    assert fake_git.count("discard_uncommitted") == 2
+    assert fake_git.count("reset_to") >= 2
 
 
 def test_fixed_rounds_run_until_roadmap_exhausted(tmp_path, fake_git):
@@ -911,10 +944,10 @@ def test_round_that_accepts_nothing_opens_the_next_one_replan_only(tmp_path, fak
         "qa",
         "reporter",
     ]
-    assert fake_git.count("discard_uncommitted") == 1
+    # Rejected parallel candidates are discarded with their isolated
+    # worktree; the campaign checkout itself is never reverted.
+    assert fake_git.count("discard_uncommitted") == 0
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    # Cleared by the analyzer turn that closed the campaign.
-    assert state.accepts_since_analysis == 0
     # Replan rounds plan from the standing profile and never advance it;
     # round 3's re-profile is the newest analysis of the current build.
     assert state.last_profiled_analysis_dir == str(ws / "rounds" / "round_3" / "analysis")
@@ -969,15 +1002,14 @@ def test_dry_roadmap_without_accepts_replans_once_before_concluding(tmp_path, fa
     ]
     assert modes == [False, True]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.accepts_since_analysis == 0
     # Two rounds counted, three left unspent — the campaign stopped
     # because the analyzer had nothing to say, not because it ran out.
     assert state.round_index == 2
     assert state.max_rounds == 5
 
 
-def test_rejected_code_attempt_profiles_surviving_build_artifacts(tmp_path, fake_git):
-    """A source revert cannot prove a gitignored runtime binary reverted too."""
+def test_rejected_isolated_code_attempt_keeps_campaign_profile_current(tmp_path, fake_git):
+    """Rejected worker artifacts disappear with their isolated worktree."""
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -1007,10 +1039,9 @@ def test_rejected_code_attempt_profiles_surviving_build_artifacts(tmp_path, fake
     finally:
         workflow.close()
 
-    # The source reset happens, but ignored .so/JIT/AOT output may survive.
-    # Round 2 therefore profiles the current runtime instead of re-planning
-    # from round 1's now-stale traces.
-    assert modes == [False, False]
+    # The worker checkout is removed without mutating the campaign checkout,
+    # so round 2 can replan against round 1's still-current profile.
+    assert modes == [False, True]
     assert trace == [
         "benchmarker",
         "projector",
@@ -1020,11 +1051,10 @@ def test_rejected_code_attempt_profiles_surviving_build_artifacts(tmp_path, fake
         "analyzer",
         "reporter",
     ]
-    assert state_seen_at_revert == [True]
+    assert state_seen_at_revert == []
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.accepts_since_analysis == 0
     assert state.profile_required is False
-    assert state.last_profiled_analysis_dir == str(ws / "rounds" / "round_2" / "analysis")
+    assert state.last_profiled_analysis_dir == str(ws / "rounds" / "round_1" / "analysis")
 
 
 def test_a_dry_roadmap_out_of_rounds_concludes_without_another_turn(tmp_path, fake_git):
@@ -1075,9 +1105,9 @@ def test_dry_roadmap_after_an_accept_respects_the_round_budget(tmp_path, fake_gi
     ]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
     assert state.round_index == 1
-    # The accept is still outstanding against the standing analysis — the
-    # campaign closed on a build no analyzer ever saw, and the state says so.
-    assert state.accepts_since_analysis == 1
+    # The campaign closed on a build no analyzer ever saw, and the profile
+    # currency marker preserves that fact.
+    assert state.profile_required is True
 
 
 def test_target_improvement_reached_concludes_loop(tmp_path, fake_git):
@@ -1095,20 +1125,13 @@ def test_target_improvement_reached_concludes_loop(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    # opt-001's accept lifts current_best to 108.4 vs baseline 100.0 →
-    # +8.4% ≥ 5.0% target: the loop concludes with opt-002 untouched.
-    assert trace == [
-        "benchmarker",
-        "projector",
-        "analyzer",
-        "optimizer",
-        "evaluator",
-        "qa",
-        "reporter",
-    ]
+    # The whole selected batch runs before the target is checked.
+    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace.count("optimizer") == 2
+    assert trace.count("evaluator") == 2
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
-    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "pending"
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
 
 
@@ -1118,7 +1141,7 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
     Each still gets its own evaluation, accept commit, and roadmap
     bookkeeping.
     """
-    task = _write_task(tmp_path)  # default max_items_per_round = 3
+    task = _write_task(tmp_path, {"optimize": {"max_items_per_round": 2}})
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(
@@ -1134,10 +1157,65 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    # Both items ran inside round 1 — one analyzer profile shared between
-    # them, and one qa. The second analyzer is round 2's: the roadmap ran
-    # dry with two accepts outstanding, so the campaign spends a round
-    # profiling what they changed before closing on it.
+    # Both items share round 1's profile; the integrated accept makes round
+    # 2 profile the resulting campaign state before final verification.
+    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace.count("analyzer") == 2
+    assert trace.count("optimizer") == 2
+    assert trace.count("evaluator") == 2
+    assert trace[-2:] == ["qa", "reporter"]
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    one = roadmap_schema.find_item(roadmap, "opt-001")
+    two = roadmap_schema.find_item(roadmap, "opt-002")
+    assert one["status"] == "accepted"
+    assert sorted([one["measured_gain_pct"], two["measured_gain_pct"]]) == [3.0, 8.4]
+    assert two["status"] == "accepted"
+    # The Integrator reports the combined state once for the whole batch.
+    assert roadmap["current_best"]["value"] in (108.4, 111.6)
+    assert roadmap["current_best"]["source"] == "rounds/round_1/integration/integration.md"
+    # Per-item artifact dirs and one accept commit per item, in order.
+    round_dir = ws / "rounds" / "round_1"
+    assert (round_dir / "item_1_opt-001" / "attempt_1" / "evaluation.md").is_file()
+    assert (round_dir / "item_2_opt-002" / "attempt_1" / "evaluation.md").is_file()
+    events = [
+        entry.get("event")
+        for entry in progress_module.read_progress(workflow.progress_path)["optimization"]
+        if entry.get("agent") == "optimizer_evaluator"
+    ]
+    assert events == ["batch_started", "batch_completed"]
+    for item_dir in (round_dir / "item_1_opt-001", round_dir / "item_2_opt-002"):
+        local_agents = [
+            entry["agent"]
+            for entry in progress_module.read_progress(item_dir / "progress.yaml")["optimization"]
+        ]
+        assert local_agents == ["optimizer", "evaluator"]
+    messages = [c[1] for c in fake_git.calls if c[0] == "commit_all"]
+    assert len(messages) == 2
+    assert any("opt-001" in message for message in messages)
+    assert any("opt-002" in message for message in messages)
+
+
+def test_serial_items_reuse_worker_and_accept_directly(tmp_path, fake_git):
+    """Serial mode keeps v3 item artifacts but bypasses batch integration."""
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": "serial", "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[
+            ("APPROVE", "none", 8.4, 108.4),
+            ("APPROVE", "none", 3.0, 111.6),
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
     assert trace == [
         "benchmarker",
         "projector",
@@ -1146,28 +1224,161 @@ def test_multiple_items_applied_in_one_round(tmp_path, fake_git):
         "evaluator",
         "optimizer",
         "evaluator",
-        "analyzer",
         "qa",
         "reporter",
     ]
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.item_execution == "serial"
+    assert state.item_batch == []
+
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    one = roadmap_schema.find_item(roadmap, "opt-001")
-    two = roadmap_schema.find_item(roadmap, "opt-002")
-    assert one["status"] == "accepted"
-    assert one["measured_gain_pct"] == pytest.approx(8.4)
-    assert two["status"] == "accepted"
-    assert two["measured_gain_pct"] == pytest.approx(3.0)
-    # current_best advanced item by item to the second measurement.
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
     assert roadmap["current_best"]["value"] == pytest.approx(111.6)
-    assert "item_2_opt-002/attempt_1/evaluation.md" in roadmap["current_best"]["source"]
-    # Per-item artifact dirs and one accept commit per item, in order.
+    assert roadmap["current_best"]["source"] == (
+        "rounds/round_1/item_2_opt-002/attempt_1/evaluation.md"
+    )
+
+    global_entries = progress_module.read_progress(workflow.progress_path)["optimization"]
+    assert [
+        entry["agent"] for entry in global_entries if entry["agent"] in ("optimizer", "evaluator")
+    ] == ["optimizer", "evaluator", "optimizer", "evaluator"]
+    assert not any(
+        entry["agent"] in ("optimizer_evaluator", "integrator") for entry in global_entries
+    )
     round_dir = ws / "rounds" / "round_1"
-    assert (round_dir / "item_1_opt-001" / "attempt_1" / "evaluation.md").is_file()
-    assert (round_dir / "item_2_opt-002" / "attempt_1" / "evaluation.md").is_file()
-    messages = [c[1] for c in fake_git.calls if c[0] == "commit_all"]
-    assert len(messages) == 2
-    assert "opt-001" in messages[0]
-    assert "opt-002" in messages[1]
+    for item_dir in (round_dir / "item_1_opt-001", round_dir / "item_2_opt-002"):
+        local_entries = progress_module.read_progress(item_dir / "progress.yaml")["optimization"]
+        assert [entry["agent"] for entry in local_entries] == ["optimizer", "evaluator"]
+    assert not (round_dir / "integration").exists()
+
+    calls = [call[0] for call in fake_git.calls]
+    first_fast_forward = calls.index("fast_forward")
+    second_worktree = [i for i, name in enumerate(calls) if name == "create_worktree"][1]
+    assert first_fast_forward < second_worktree
+    assert fake_git.count("fast_forward") == 2
+
+
+def test_serial_target_stops_before_unstarted_batch_items(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {
+            "optimize": {
+                "item_execution": "serial",
+                "max_rounds": 1,
+                "target_improvement_pct": 5.0,
+            }
+        },
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[("APPROVE", "none", 8.4, 108.4)],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace.count("optimizer") == 1
+    assert trace.count("evaluator") == 1
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "pending"
+    assert not (ws / "rounds/round_1/item_2_opt-002").exists()
+    assert fake_git.count("create_worktree") == 1
+
+
+def test_serial_resume_finalizes_candidate_without_rerunning_worker(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"item_execution": "serial", "max_rounds": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    first_trace = _stub_agents(workflow)
+
+    def crash_before_finalization(state, item_id, log):
+        raise RuntimeError("simulated crash before serial finalization")
+
+    workflow._finalize_serial_item = crash_before_finalization
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    interrupted = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert interrupted.item_batch[0]["status"] == "candidate_ready"
+    assert interrupted.item_batch[0]["finalized"] is False
+    assert first_trace.count("optimizer") == 1
+    assert first_trace.count("evaluator") == 1
+
+    resumed = Workflow(workspace=ws)
+    resume_trace = _stub_agents(resumed)
+    try:
+        resumed.run("ignored-on-resume")
+    finally:
+        resumed.close()
+
+    assert "optimizer" not in resume_trace
+    assert "evaluator" not in resume_trace
+    assert resume_trace == ["qa", "reporter"]
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "accepted"
+
+
+def test_worktree_cleanup_retries_once(tmp_path, monkeypatch):
+    from agent_flow.workflows.perf_optimize import gitops as gitops_module
+
+    attempts: list[str] = []
+    sleeps: list[int] = []
+
+    def _remove(repo, path):
+        attempts.append(str(path))
+        if len(attempts) == 1:
+            raise gitops_module.GitOpsError("transient NFS error")
+
+    monkeypatch.setattr(workflow_module.gitops, "remove_worktree", _remove)
+    monkeypatch.setattr(workflow_module.time, "sleep", sleeps.append)
+
+    workflow = Workflow(workspace=tmp_path / "ws")
+    worktree = tmp_path / "item-worktree"
+    workflow._remove_worktree_best_effort("repo", str(worktree), None)
+
+    assert attempts == [str(worktree), str(worktree)]
+    assert sleeps == [1]
+
+
+def test_worktree_cleanup_failure_is_logged_and_suppressed(tmp_path, monkeypatch):
+    from agent_flow.workflows.perf_optimize import gitops as gitops_module
+
+    attempts: list[str] = []
+    messages: list[str] = []
+
+    def _remove(repo, path):
+        attempts.append(str(path))
+        raise gitops_module.GitOpsError("directory not empty")
+
+    monkeypatch.setattr(workflow_module.gitops, "remove_worktree", _remove)
+    monkeypatch.setattr(workflow_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        workflow_module,
+        "print_message",
+        lambda text, log=None: messages.append(text),
+    )
+
+    workflow = Workflow(workspace=tmp_path / "ws")
+    worktree = tmp_path / "item-worktree"
+    workflow._remove_worktree_best_effort("repo", str(worktree), None)
+
+    assert attempts == [str(worktree), str(worktree)]
+    assert len(messages) == 1
+    assert "leaving it in place and continuing" in messages[0]
+    assert str(worktree) in messages[0]
+    assert "directory not empty" in messages[0]
 
 
 def test_item_and_round_budgets_cap_the_campaign(tmp_path, fake_git):
@@ -1225,35 +1436,24 @@ def test_rejected_item_advances_to_next_item_in_same_round(tmp_path, fake_git):
     # opt-001's REJECT is terminal (no retries despite the attempt
     # budget); the round continued with opt-002 without a fresh analyzer
     # profile.
-    assert trace == [
-        "benchmarker",
-        "projector",
-        "analyzer",
-        "optimizer",
-        "evaluator",
-        "optimizer",
-        "evaluator",
-        "analyzer",
-        "qa",
-        "reporter",
-    ]
+    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace.count("analyzer") == 2
+    assert trace.count("optimizer") == 2
+    assert trace.count("evaluator") == 2
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "failed"
-    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
+    statuses = {
+        roadmap_schema.find_item(roadmap, item_id)["status"] for item_id in ("opt-001", "opt-002")
+    }
+    assert statuses == {"failed", "accepted"}
     assert roadmap["current_best"]["value"] == pytest.approx(104.0)
-    assert fake_git.count("discard_uncommitted") == 1
+    assert fake_git.count("reset_to") >= 2
     assert fake_git.count("commit_all") == 1
     round_dir = ws / "rounds" / "round_1"
     assert (round_dir / "item_1_opt-001" / "attempt_1" / "evaluation.md").is_file()
     assert (round_dir / "item_2_opt-002" / "attempt_1" / "evaluation.md").is_file()
 
 
-def test_optimizer_session_resets_at_item_boundaries_not_retries(tmp_path, fake_git):
-    """The optimizer session is scoped to one item.
-
-    Retries within an item share the session; each terminal item outcome
-    (accepted or failed) drops it so the next item starts fresh.
-    """
+def test_each_parallel_item_uses_its_own_optimizer_session(tmp_path, fake_git):
     task = _write_task(tmp_path)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -1273,25 +1473,12 @@ def test_optimizer_session_resets_at_item_boundaries_not_retries(tmp_path, fake_
     finally:
         workflow.close()
 
-    assert trace == [
-        "benchmarker",
-        "projector",
-        "analyzer",
-        "optimizer",
-        "evaluator",
-        "optimizer",
-        "evaluator",
-        "optimizer",
-        "evaluator",
-        "analyzer",
-        "qa",
-        "reporter",
-    ]
-    # Exactly one reset per terminal item outcome — after opt-001's accept
-    # (6 stages had run) and after opt-002's accept (8 stages) — and none
-    # between opt-001's rejected attempt and its retry (that would have
-    # been recorded at 4).
-    assert resets == [7, 9]
+    assert trace[0:3] == ["benchmarker", "projector", "analyzer"]
+    assert trace.count("optimizer") == 3
+    assert trace.count("evaluator") == 3
+    # The legacy campaign-wide optimizer is not used/reset; each worker owns
+    # and closes its own persistent optimizer layer.
+    assert resets == []
 
 
 def test_item_dir_sanitizes_analyzer_authored_ids(tmp_path):
@@ -1440,9 +1627,11 @@ def test_tuning_edit_in_code_only_run_is_auto_rejected(tmp_path, fake_git):
 
     original_optimizer = workflow._run_optimizer
 
-    def optimizer_editing_tuning(state):
-        original_optimizer(state)
-        workflow.tuning_config_path.write_text("cuda_graph_config: {}\n", encoding="utf-8")
+    def optimizer_editing_tuning(state, **kwargs):
+        original_optimizer(state, **kwargs)
+        workflow._state_tuning_paths(state)[0].write_text(
+            "cuda_graph_config: {}\n", encoding="utf-8"
+        )
 
     workflow._run_optimizer = optimizer_editing_tuning
     try:
@@ -1452,10 +1641,9 @@ def test_tuning_edit_in_code_only_run_is_auto_rejected(tmp_path, fake_git):
 
     # Both attempts were auto-rejected before the evaluator; nothing was
     # accepted, so the campaign reports without a final verification.
-    # The trailing analyzer profiles: although both attempts only violated
-    # the tuning restriction in this stub, they were code-approach turns,
-    # so the orchestrator conservatively assumes ignored build output may
-    # have changed. There is no evaluator verdict for it to read.
+    # The trailing analyzer replans from the standing profile. Both rejected
+    # attempts ran in isolated worktrees, so neither changed the campaign
+    # checkout; there is no evaluator verdict for it to read.
     assert trace == [
         "benchmarker",
         "projector",
@@ -1473,7 +1661,7 @@ def test_tuning_edit_in_code_only_run_is_auto_rejected(tmp_path, fake_git):
     # Each auto-reject reverted everything: the live tuning config is
     # back to the accepted snapshot, and the checkout was cleaned.
     assert workflow.tuning_config_path.read_text(encoding="utf-8") == "{}\n"
-    assert fake_git.count("discard_uncommitted") == 2
+    assert fake_git.count("reset_to") >= 2
     assert state_module.load_state(ws / state_module.STATE_FILENAME).approach_violation == ""
 
 
@@ -1490,11 +1678,11 @@ def test_auto_reject_then_clean_retry_reaches_evaluator(tmp_path, fake_git):
     original_optimizer = workflow._run_optimizer
     seen_violations: list[str] = []
 
-    def optimizer_violating_once(state):
+    def optimizer_violating_once(state, **kwargs):
         seen_violations.append(state.approach_violation)
-        original_optimizer(state)
+        original_optimizer(state, **kwargs)
         if len(seen_violations) == 1:
-            workflow.tuning_config_path.write_text("kv: 0.9\n", encoding="utf-8")
+            workflow._state_tuning_paths(state)[0].write_text("kv: 0.9\n", encoding="utf-8")
 
     workflow._run_optimizer = optimizer_violating_once
     try:
@@ -1537,8 +1725,8 @@ def test_code_edit_in_config_only_run_is_auto_rejected(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    # The trailing analyzer profiles: the disallowed checkout edit may
-    # have rebuilt a gitignored runtime artifact before it was reverted.
+    # The trailing analyzer replans from the standing profile because the
+    # rejected checkout edit was confined to an isolated worktree.
     assert trace == [
         "benchmarker",
         "projector",
@@ -1549,7 +1737,7 @@ def test_code_edit_in_config_only_run_is_auto_rejected(tmp_path, fake_git):
     ]
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
     assert roadmap_schema.find_item(roadmap, "opt-001")["status"] == "failed"
-    assert fake_git.count("discard_uncommitted") == 1
+    assert fake_git.count("reset_to") >= 2
 
 
 def test_clean_config_only_run_reaches_evaluator(tmp_path, fake_git):
@@ -1639,7 +1827,36 @@ def test_curve_mode_accept_records_current_best_curve(tmp_path, fake_git):
     assert roadmap["current_best"]["curve"] == measured
 
 
-def test_curve_mode_accept_without_curve_degrades_to_scalar(tmp_path, fake_git):
+def test_integrator_rejects_curve_point_beyond_regression_budget(tmp_path, fake_git):
+    task = _write_task(
+        tmp_path,
+        {
+            "benchmark": {"concurrency": [8, 32]},
+            "optimize": {"max_regression_pct": 1.0},
+        },
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    measured = [
+        {"concurrency": 8, "value": 108.0, "tok_s_user": 22.0, "tok_s_gpu": 108.0},
+        {"concurrency": 32, "value": 107.8, "tok_s_user": 11.8, "tok_s_gpu": 107.8},
+    ]
+    _stub_agents(
+        workflow,
+        evaluator_verdicts=[("APPROVE", "none", 8.0, 107.9)],
+        baseline_curve=_WF_CURVE,
+        evaluator_curve=measured,
+    )
+    with pytest.raises(RuntimeError, match="regresses concurrency 32"):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
+
+    assert fake_git.count("fast_forward") == 0
+
+
+def test_integrator_rejects_curve_mode_accept_without_curve(tmp_path, fake_git):
     task = _write_task(tmp_path, {"benchmark": {"concurrency": [8, 32]}})
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -1648,16 +1865,13 @@ def test_curve_mode_accept_without_curve_degrades_to_scalar(tmp_path, fake_git):
         evaluator_verdicts=[("APPROVE", "none", 5.5, 105.15)],
         baseline_curve=_WF_CURVE,
     )
-    try:
-        workflow.run(str(task))
-    finally:
-        workflow.close()
+    with pytest.raises(RuntimeError, match="curve verdict is missing a curve"):
+        try:
+            workflow.run(str(task))
+        finally:
+            workflow.close()
 
-    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    # No curve in the evaluator entry: the watermark degrades to scalar
-    # rather than keeping a stale curve.
-    assert roadmap["current_best"]["value"] == pytest.approx(105.15)
-    assert "curve" not in roadmap["current_best"]
+    assert fake_git.count("fast_forward") == 0
 
 
 # Per-point measurements shared by the focus-scored target tests:
@@ -1732,11 +1946,10 @@ def test_target_improvement_met_on_focus_subset_concludes(tmp_path, fake_git):
     finally:
         workflow.close()
 
-    # +40% at the focus point c=8 clears the 5% target after opt-001:
-    # opt-002 is never dispatched.
-    assert trace.count("optimizer") == 1
+    # The target is checked only after the selected parallel batch completes.
+    assert trace.count("optimizer") == 2
     roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
-    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "pending"
+    assert roadmap_schema.find_item(roadmap, "opt-002")["status"] == "accepted"
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
 
 
@@ -1854,14 +2067,32 @@ def test_resume_mid_round_starts_at_evaluator(tmp_path, monkeypatch):
             max_rounds=3,
             max_attempts_per_item=3,
             round_index=1,
-            attempt_index=1,
-            current_item_id="opt-002",
-            git_branch="perf-optimize/seeded",
-            git_base_commit="a" * 40,
+            campaign_git_branch="perf-optimize/seeded",
+            campaign_git_base_commit="a" * 40,
             benchmarker_done=True,
-            stage=state_module.STAGE_EVALUATOR,
+            item_batch=[
+                {
+                    "current_item_id": "opt-002",
+                    "item_index": 0,
+                    "attempt_index": 1,
+                    "approach_violation": "",
+                    "item_worktree_path": str(ws / "worktrees/round_2/item_1_opt-002"),
+                    "item_branch": "perf-optimize/seeded/round-2/item-opt-002",
+                    "item_base_commit": "b" * 40,
+                    "phase": state_module.STAGE_EVALUATOR,
+                    "status": "running",
+                }
+            ],
+            batch_started=True,
+            stage=state_module.STAGE_OPTIMIZER_EVALUATOR,
         ),
     )
+    (ws / "worktrees/round_2/item_1_opt-002").mkdir(parents=True)
+    item_dir = ws / "rounds/round_2/item_1_opt-002"
+    (item_dir / "tuning").mkdir(parents=True)
+    for name in ("extra_llm_api_options.yaml", "extra_llm_api_options.accepted.yaml"):
+        (item_dir / "tuning" / name).write_text("{}\n", encoding="utf-8")
+    progress_module.init_progress_file(item_dir / "progress.yaml")
 
     workflow = Workflow(workspace=ws)
     assert workflow.resume is True
@@ -1943,14 +2174,32 @@ def test_resume_redispatch_purges_stale_attempt_benchmark_results(tmp_path, monk
             max_rounds=3,
             max_attempts_per_item=3,
             round_index=1,
-            attempt_index=1,
-            current_item_id="opt-002",
-            git_branch="perf-optimize/seeded",
-            git_base_commit="a" * 40,
+            campaign_git_branch="perf-optimize/seeded",
+            campaign_git_base_commit="a" * 40,
             benchmarker_done=True,
-            stage=state_module.STAGE_EVALUATOR,
+            item_batch=[
+                {
+                    "current_item_id": "opt-002",
+                    "item_index": 0,
+                    "attempt_index": 1,
+                    "approach_violation": "",
+                    "item_worktree_path": str(ws / "worktrees/round_2/item_1_opt-002"),
+                    "item_branch": "perf-optimize/seeded/round-2/item-opt-002",
+                    "item_base_commit": "b" * 40,
+                    "phase": state_module.STAGE_EVALUATOR,
+                    "status": "running",
+                }
+            ],
+            batch_started=True,
+            stage=state_module.STAGE_OPTIMIZER_EVALUATOR,
         ),
     )
+    (ws / "worktrees/round_2/item_1_opt-002").mkdir(parents=True)
+    item_dir = ws / "rounds/round_2/item_1_opt-002"
+    (item_dir / "tuning").mkdir(parents=True)
+    for name in ("extra_llm_api_options.yaml", "extra_llm_api_options.accepted.yaml"):
+        (item_dir / "tuning" / name).write_text("{}\n", encoding="utf-8")
+    progress_module.init_progress_file(item_dir / "progress.yaml")
 
     # The killed sweep's leftovers, next to an artifact that must survive.
     attempt_dir = ws / "rounds" / "round_2" / "item_1_opt-002" / "attempt_2"
@@ -2002,7 +2251,7 @@ def _evaluator_state(ws) -> state_module.WorkflowState:
     return state_module.WorkflowState(
         task_path=str(ws / "task.yaml"),
         current_item_id="opt-001",
-        git_branch="perf-optimize/test-branch",
+        campaign_git_branch="perf-optimize/test-branch",
         stage=state_module.STAGE_EVALUATOR,
     )
 
@@ -2014,7 +2263,7 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["nsys", "torch"]}}),
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
             encoding="utf-8",
         )
         state = _evaluator_state(ws)
@@ -2037,6 +2286,31 @@ def test_run_evaluator_includes_accept_evidence_duty_when_nsys_configured(tmp_pa
         workflow.close()
 
 
+def test_accept_evidence_duty_decomposes_the_capture(tmp_path, fake_git):
+    """The accept-evidence trace is decomposed, not just kernel-summed."""
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    recorder = _RecordingAgent()
+    workflow.evaluator = recorder
+    try:
+        (ws / "task.yaml").write_text(
+            yaml.safe_dump({"profile": {"methods": ["nsys", "ncu"]}}),
+            encoding="utf-8",
+        )
+        state = _evaluator_state(ws)
+        workflow._run_evaluator(state)
+        prompt = recorder.messages[0]
+        profile_dir = workflow._attempt_dir(state) / "profile"
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{profile_dir}/nsys_analysis" in prompt
+        # The point of it: the mechanism check rests on a measured budget.
+        assert "rather than an eyeballed one" in prompt
+    finally:
+        workflow.close()
+
+
 def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -2044,7 +2318,7 @@ def test_run_evaluator_has_no_duty_without_nsys(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         workflow._run_evaluator(_evaluator_state(ws))
         assert "Accept-evidence duty" not in recorder.messages[0]
@@ -2059,7 +2333,7 @@ def test_run_evaluator_marks_the_final_attempt(tmp_path, fake_git):
     workflow.evaluator = recorder
     try:
         (ws / "task.yaml").write_text(
-            yaml.safe_dump({"profile": {"methods": ["torch"]}}), encoding="utf-8"
+            yaml.safe_dump({"profile": {"methods": ["ncu"]}}), encoding="utf-8"
         )
         state = _evaluator_state(ws)
         workflow._run_evaluator(state)
@@ -2077,10 +2351,9 @@ def _analyzer_state(ws, **overrides) -> state_module.WorkflowState:
     data = {
         "task_path": str(ws / "task.yaml"),
         "round_index": 1,
-        "accepts_since_analysis": 0,
         "profile_required": False,
         "last_profiled_analysis_dir": str(ws / "rounds" / "round_1" / "analysis"),
-        "git_branch": "perf-optimize/test-branch",
+        "campaign_git_branch": "perf-optimize/test-branch",
         "stage": state_module.STAGE_ANALYZER,
     }
     data.update(overrides)
@@ -2095,7 +2368,7 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
     workflow.analyzer = recorder
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        # Two items were attempted last round and all of them reverted.
+        # Two items were attempted last round and both were rejected.
         for item in ("item_1_opt-001", "item_2_opt-002"):
             (ws / "rounds" / "round_1" / item).mkdir(parents=True)
         workflow._run_analyzer(_analyzer_state(ws))
@@ -2104,15 +2377,16 @@ def test_replan_only_round_forbids_profiling_and_briefs_the_verdicts(tmp_path, f
         assert "**replan only**" in message
         assert "accepted **nothing**" in message
         assert "Its 2 attempted items are" in message
-        # The stronger premise behind the mode: no code attempt could
-        # have left a rebuilt ignored artifact behind, so the standing
-        # analysis still describes the runtime.
-        assert "None was a code attempt" in message
-        assert "runtime remains the state" in message
+        # The stronger premise behind the mode: rejected attempts were
+        # isolated from the campaign state, so the standing analysis still
+        # describes the runtime.
+        assert "isolated worktree" in message
+        assert "campaign checkout and accepted tuning config remain unchanged" in message
+        assert "runtime is still the state" in message
         assert "byte-identical" not in message
         # The three spends the round exists to avoid.
         assert "Do **not** launch `trtllm-serve`" in message
-        assert "do **not** run nsys / ncu / the torch profiler" in message
+        assert "do **not** run nsys / ncu" in message
         assert "do **not** run the benchmark" in message
         # …and the evidence it plans from instead.
         assert str(ws / "rounds" / "round_1" / "analysis") in message
@@ -2132,11 +2406,10 @@ def test_profiling_round_names_what_moved_the_build_since_the_last_analysis(tmp_
     workflow.analyzer = recorder
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        workflow._run_analyzer(_analyzer_state(ws, accepts_since_analysis=2, profile_required=True))
+        workflow._run_analyzer(_analyzer_state(ws, profile_required=True))
         message = recorder.messages[0]
 
         assert "**replan only**" not in message
-        assert "**2 item(s) have been accepted since your last analysis**" in message
         assert "Re-profile the **current** build" in message
         # Failed items are measurements too — the round should not re-propose
         # what the evaluator already disproved.
@@ -2153,13 +2426,13 @@ def test_profiling_round_does_not_invent_an_accept_for_unknown_runtime(tmp_path,
     workflow.analyzer = recorder
     try:
         (ws / "task.yaml").write_text(yaml.safe_dump({"sol": {"enabled": False}}), encoding="utf-8")
-        workflow._run_analyzer(_analyzer_state(ws, accepts_since_analysis=0, profile_required=True))
+        workflow._run_analyzer(_analyzer_state(ws, profile_required=True))
         message = recorder.messages[0]
 
         assert "**replan only**" not in message
         assert "**0 item(s) have been accepted" not in message
-        assert "checkpoint cannot prove the standing profile" in message
-        assert "reverted code attempt" in message
+        assert "standing profile is stale or unproven" in message
+        assert "checkpoint has not established a current local profile" in message
         assert "Re-profile the **current** build" in message
     finally:
         workflow.close()
@@ -2182,9 +2455,9 @@ def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
         original_analyzer(state)
         (workflow._analysis_dir(state) / "nsys_stats.txt").write_text("k\n", encoding="utf-8")
 
-    def evaluator_with_capture(state):
+    def evaluator_with_capture(state, **kwargs):
         seen_at_evaluation_time.append(state.last_nsys_dir)
-        original_evaluator(state)
+        original_evaluator(state, **kwargs)
         profile_dir = workflow._attempt_dir(state) / "profile"
         profile_dir.mkdir(parents=True, exist_ok=True)
         (profile_dir / "nsys_stats.txt").write_text("k\n", encoding="utf-8")
@@ -2199,13 +2472,13 @@ def test_accept_records_last_nsys_dir_from_captures(tmp_path, fake_git):
     assert trace[-1] == "reporter"
     # The evaluator judged with the analyzer's round profile as reference…
     assert seen_at_evaluation_time == [str(ws / "rounds" / "round_1" / "analysis")]
-    # …the accept advanced the pointer to the attempt's capture, which is
-    # what the closing re-profile of the changed build then saw…
-    accept_capture = ws / "rounds" / "round_1" / "item_1_opt-001" / "attempt_1" / "profile"
-    assert seen_at_analysis_time == ["", str(accept_capture)]
-    # …and that round's own profile is the freshest trace at the end.
+    # Item-local captures are candidates only. The closing analyzer sees the
+    # last accepted campaign capture, then records round 2 as the freshest.
+    round_1_analysis = ws / "rounds" / "round_1" / "analysis"
+    assert seen_at_analysis_time == ["", str(round_1_analysis)]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.last_nsys_dir == str(ws / "rounds" / "round_2" / "analysis")
+    expected = ws / "rounds" / "round_2" / "analysis"
+    assert state.last_nsys_dir == str(expected)
 
 
 def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, monkeypatch):
@@ -2240,16 +2513,17 @@ def test_crash_mid_accept_is_logged_and_leaves_resumable_checkpoint(tmp_path, mo
     workflow = Workflow(workspace=ws)
     _stub_agents(workflow)
     try:
-        with pytest.raises(gitops_module.GitOpsError):
+        with pytest.raises(RuntimeError, match="parallel optimization item"):
             workflow.run(str(task))
     finally:
         workflow.close()
 
     assert any("workflow aborted" in m and "pre-commit hook" in m for m in messages)
-    # The checkpoint still names the evaluator stage → re-running retries it.
+    # The batch checkpoint retains the failed worker for a targeted resume.
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.stage == "evaluator"
-    assert state.current_item_id == "opt-001"
+    assert state.stage == state_module.STAGE_OPTIMIZER_EVALUATOR
+    assert state.item_batch[0]["current_item_id"] == "opt-001"
+    assert state.item_batch[0]["status"] == "error"
     assert state.done is False
 
 
@@ -2282,7 +2556,7 @@ def test_optimizer_without_summary_blocks_advance(tmp_path, fake_git):
     workflow = Workflow(workspace=ws)
     trace = _stub_agents(workflow)
 
-    def optimizer_no_output(state):
+    def optimizer_no_output(state, **kwargs):
         trace.append("optimizer")
         # Writes nothing — mirrors an agent that yielded before its deliverable.
 
@@ -2295,8 +2569,8 @@ def test_optimizer_without_summary_blocks_advance(tmp_path, fake_git):
 
     assert trace == ["benchmarker", "projector", "analyzer", "optimizer"]
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert state.stage == state_module.STAGE_OPTIMIZER
-    assert state.current_item_id == "opt-001"
+    assert state.stage == state_module.STAGE_OPTIMIZER_EVALUATOR
+    assert state.item_batch[0]["phase"] == state_module.STAGE_OPTIMIZER
     assert state.done is False
 
 
@@ -2346,8 +2620,8 @@ def test_branch_is_checkpointed_before_creation(tmp_path, monkeypatch):
     class AssertingGit(FakeGitOps):
         def create_branch(self, repo, name):
             state = state_module.load_state(ws / state_module.STATE_FILENAME)
-            assert state.git_branch == name
-            assert state.git_base_commit == "b" * 40
+            assert state.campaign_git_branch == name
+            assert state.campaign_git_base_commit == "b" * 40
             super().create_branch(repo, name)
 
     fake = AssertingGit()
@@ -2447,7 +2721,7 @@ def test_clean_wipes_managed_files_and_dirs(tmp_path):
 def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
-        for role in _ROLES:
+        for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             assert layer.config.backend.kind == "claude-code", role
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL, role
@@ -2456,7 +2730,9 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
             # optimizer's persistent session is additionally reset per
             # item by the orchestrator (covered by
             # test_optimizer_session_resets_at_item_boundaries_not_retries).
-            expected_mode = "stateless" if role in ("qa", "evaluator") else "persistent"
+            expected_mode = (
+                "stateless" if role in ("qa", "evaluator", "integrator") else "persistent"
+            )
             assert layer.config.session.mode == expected_mode, role
     finally:
         workflow.close()
@@ -2465,7 +2741,7 @@ def test_all_agents_use_claude_code_backend_with_scoped_sessions(tmp_path):
 def test_each_agent_has_its_progress_tools(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
-        for role in _ROLES:
+        for role in _AGENT_ROLES:
             layer = getattr(workflow, role)
             tool_names = [t.name for t in layer.config.backend.tools]
             assert f"append_{role}_progress" in tool_names, role
@@ -2484,7 +2760,7 @@ def test_no_role_wires_an_external_mcp_server(tmp_path):
     """
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
-        for role in _ROLES:
+        for role in _AGENT_ROLES:
             assert getattr(workflow, role).config.backend.extra_mcp_servers is None, role
     finally:
         workflow.close()
@@ -2564,9 +2840,11 @@ def test_accept_with_real_git_commits_the_code_change(tmp_path):
 
     original_optimizer = workflow._run_optimizer
 
-    def optimizer_editing_repo(state):
-        (repo / "src.py").write_text("x = 2  # optimized\n", encoding="utf-8")
-        original_optimizer(state)
+    def optimizer_editing_repo(state, **kwargs):
+        (Path(state.item_worktree_path) / "src.py").write_text(
+            "x = 2  # optimized\n", encoding="utf-8"
+        )
+        original_optimizer(state, **kwargs)
 
     workflow._run_optimizer = optimizer_editing_repo
     try:
@@ -2576,7 +2854,7 @@ def test_accept_with_real_git_commits_the_code_change(tmp_path):
 
     assert trace[-1] == "reporter"
     state = state_module.load_state(ws / state_module.STATE_FILENAME)
-    assert _real_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == state.git_branch
+    assert _real_git(repo, "rev-parse", "--abbrev-ref", "HEAD") == state.campaign_git_branch
     assert "opt-001" in _real_git(repo, "log", "-1", "--pretty=%s")
     assert _real_git(repo, "status", "--porcelain") == ""
     assert (repo / "src.py").read_text(encoding="utf-8") == "x = 2  # optimized\n"
@@ -2587,8 +2865,8 @@ def test_accept_survives_installed_precommit_hook(tmp_path):
 
     Regression: TRT-LLM checkouts have `pre-commit install`ed hooks that
     reformat files and exit non-zero; the orchestrator's accept commit
-    aborted mid-`_accept_attempt`, crashing the run right after the
-    evaluator's APPROVE — before the roadmap/state advanced to QA.
+    aborted while accepting the candidate, crashing the run right after
+    the evaluator's APPROVE — before the roadmap/state advanced to QA.
     """
     repo = _init_real_repo(tmp_path)
     hook = repo / ".git" / "hooks" / "pre-commit"
@@ -2602,9 +2880,11 @@ def test_accept_survives_installed_precommit_hook(tmp_path):
 
     original_optimizer = workflow._run_optimizer
 
-    def optimizer_editing_repo(state):
-        (repo / "src.py").write_text("x = 2  # optimized\n", encoding="utf-8")
-        original_optimizer(state)
+    def optimizer_editing_repo(state, **kwargs):
+        (Path(state.item_worktree_path) / "src.py").write_text(
+            "x = 2  # optimized\n", encoding="utf-8"
+        )
+        original_optimizer(state, **kwargs)
 
     workflow._run_optimizer = optimizer_editing_repo
     try:
@@ -2639,10 +2919,11 @@ def test_reject_with_real_git_reverts_the_code_change(tmp_path):
 
     original_optimizer = workflow._run_optimizer
 
-    def optimizer_editing_repo(state):
-        (repo / "src.py").write_text("x = 999  # broken\n", encoding="utf-8")
-        (repo / "leftover.py").write_text("junk\n", encoding="utf-8")
-        original_optimizer(state)
+    def optimizer_editing_repo(state, **kwargs):
+        item_repo = Path(state.item_worktree_path)
+        (item_repo / "src.py").write_text("x = 999  # broken\n", encoding="utf-8")
+        (item_repo / "leftover.py").write_text("junk\n", encoding="utf-8")
+        original_optimizer(state, **kwargs)
 
     workflow._run_optimizer = optimizer_editing_repo
     try:
@@ -2678,8 +2959,10 @@ def _capture_driving_prompts(
         round_index=0,
         attempt_index=0,
         current_item_id="opt-001",
-        git_branch="perf-optimize/test-branch",
-        git_base_commit="a" * 40,
+        campaign_git_branch="perf-optimize/test-branch",
+        campaign_git_base_commit="a" * 40,
+        item_worktree_path=str(ws / "worktrees" / "round_1" / "item_1_opt-001"),
+        item_branch="perf-optimize/test-branch-round-1-item-1-opt-001",
         stage=state_module.STAGE_OPTIMIZER,
     )
 
@@ -2721,10 +3004,18 @@ def test_driving_prompts_reinforce_casebook_for_serving_analysis_roles(tmp_path)
 def test_optimizer_prompt_names_item_branch_and_attempt_dir(tmp_path):
     captured = _capture_driving_prompts(tmp_path)
     prompt = captured["optimizer"]
+    active_repo = str(tmp_path / "ws" / "worktrees" / "round_1" / "item_1_opt-001")
+    tuning_dir = tmp_path / "ws" / "rounds" / "round_1" / "item_1_opt-001" / "tuning"
+    active_tuning = str(tuning_dir / "extra_llm_api_options.yaml")
+    accepted_tuning = str(tuning_dir / "extra_llm_api_options.accepted.yaml")
     assert "opt-001" in prompt
     assert "perf-optimize/test-branch" in prompt
     assert "attempt_1" in prompt
     assert "never commit" in prompt
+    assert f"Active runtime checkout: `{active_repo}`" in prompt
+    assert f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in prompt
+    assert active_tuning in prompt
+    assert accepted_tuning not in prompt
 
 
 def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
@@ -2732,6 +3023,10 @@ def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
         tmp_path, {"optimize": {"accept_fraction": 0.7, "noise_floor_pct": 2.0}}
     )
     prompt = captured["evaluator"]
+    active_repo = str(tmp_path / "ws" / "worktrees" / "round_1" / "item_1_opt-001")
+    tuning_dir = tmp_path / "ws" / "rounds" / "round_1" / "item_1_opt-001" / "tuning"
+    active_tuning = str(tuning_dir / "extra_llm_api_options.yaml")
+    accepted_tuning = str(tuning_dir / "extra_llm_api_options.accepted.yaml")
     assert "accept_fraction=0.7" in prompt
     assert "noise_floor_pct=2.0" in prompt
     assert "current_best" in prompt
@@ -2739,6 +3034,10 @@ def test_evaluator_prompt_carries_the_gate_knobs(tmp_path):
     # The three-way decision vocabulary and the full-metric diff reference.
     assert "APPROVE|REJECT|PUSH_BACK" in prompt
     assert "full-metric diff" in prompt
+    assert f"Active runtime checkout: `{active_repo}`" in prompt
+    assert f'export PYTHONPATH="{active_repo}${{PYTHONPATH:+:$PYTHONPATH}}"' in prompt
+    assert f"Active tuning config: `{active_tuning}`" in prompt
+    assert f"Accepted tuning config snapshot: `{accepted_tuning}`" in prompt
 
 
 def test_qa_prompt_conditions_accuracy_on_task_block(tmp_path):
@@ -2807,13 +3106,13 @@ def test_curve_prompts_without_focus_score_all_points(tmp_path):
         assert "scored subset" not in captured[role], role
 
 
-def test_optimizer_prompt_points_at_earlier_verdicts(tmp_path):
+def test_optimizer_prompt_does_not_treat_parallel_siblings_as_earlier_verdicts(tmp_path):
     # First item of round 1: no earlier verdicts exist — no pointer.
     first = _capture_driving_prompts(tmp_path)["optimizer"]
     assert "Earlier items' verdicts" not in first
 
-    # A later item in the same round gets the pointer: verdicts issued
-    # after the roadmap was authored may have disproven its premises.
+    # Parallel siblings run from one frozen base, so a sibling's verdict
+    # cannot be assumed to exist when this prompt is authored.
     task = _write_task(tmp_path)
     ws = tmp_path / "ws2"
     workflow = Workflow(workspace=ws)
@@ -2825,8 +3124,8 @@ def test_optimizer_prompt_points_at_earlier_verdicts(tmp_path):
         item_index=1,
         attempt_index=0,
         current_item_id="opt-002",
-        git_branch="perf-optimize/test-branch",
-        git_base_commit="a" * 40,
+        campaign_git_branch="perf-optimize/test-branch",
+        campaign_git_base_commit="a" * 40,
         stage=state_module.STAGE_OPTIMIZER,
     )
     captured: dict[str, str] = {}
@@ -2838,9 +3137,18 @@ def test_optimizer_prompt_points_at_earlier_verdicts(tmp_path):
         workflow.optimizer = original
         workflow.close()
     prompt = captured["optimizer"]
-    assert "Earlier items' verdicts" in prompt
-    assert "Gap implication" in prompt
-    assert "blocker to record" in prompt
+    assert "Earlier items' verdicts" not in prompt
+
+    # Serial items really are ordered. A later item in the same round can
+    # and should consume the completed predecessors' failure evidence.
+    state.item_execution = "serial"
+    workflow = Workflow(workspace=ws)
+    workflow.optimizer = lambda prompt: captured.__setitem__("optimizer", prompt)
+    try:
+        workflow._run_optimizer(state)
+    finally:
+        workflow.close()
+    assert "Earlier items' verdicts" in captured["optimizer"]
 
 
 def test_reporter_prompt_points_at_base_commit_and_inputs(tmp_path):
@@ -2932,6 +3240,22 @@ def test_analyzer_optimizer_reporter_prompts_point_at_projection_iff_sol(tmp_pat
     assert "sol_projection.md" not in with_sol["qa"]
 
 
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
+    with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
+    # Not SOL-gated: every profiling round decomposes the timeline it just
+    # captured, into the round's own analysis directory.
+    for prompt in (without, with_sol):
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert "analysis/nsys_analysis" in prompt
+        assert "nsys_analysis/` directory" in prompt
+        # Ranking a host-exposure item and a slow-kernel item needs the
+        # split, not the kernel-sum table alone.
+        assert "not from the `nsys stats` table alone" in prompt
+
+
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     without = _capture_driving_prompts(tmp_path, _sol_off_extra())["analyzer"]
     with_sol = _capture_driving_prompts(tmp_path, _sol_extra(tmp_path))["analyzer"]
@@ -2969,8 +3293,8 @@ def test_optimizer_retry_prompt_distinguishes_auto_reject_from_evaluator_reject(
         round_index=0,
         attempt_index=1,  # attempt 2 — a retry
         current_item_id="opt-001",
-        git_branch="perf-optimize/test-branch",
-        git_base_commit="a" * 40,
+        campaign_git_branch="perf-optimize/test-branch",
+        campaign_git_base_commit="a" * 40,
         stage=state_module.STAGE_OPTIMIZER,
     )
     try:
@@ -3008,12 +3332,13 @@ _KC_EXTRA = {"profile": {"kernel_coverage": {}}}
 def _ledger_yaml(faster_ref: str = "opt-001") -> str:
     return yaml.safe_dump(
         {
-            "version": 1,
+            "version": kernel_ledger.LEDGER_VERSION,
             "source": "rounds/round_1/analysis/nsys_stats.txt",
             "coverage": {
                 "enumerated_share_pct": 96.0,
                 "other_share_pct": 4.0,
                 "min_share_pct": 0.5,
+                "gpu_busy_pct": 82.4,
             },
             "kernels": [
                 {
@@ -3027,11 +3352,21 @@ def _ledger_yaml(faster_ref: str = "opt-001") -> str:
                         "occupancy_pct": 62.0,
                         "bound": "memory",
                     },
+                    "elimination": {
+                        "disposition": "dismissed",
+                        "why_it_runs": "read by the next layer (NVTX + source)",
+                        "ref": "mandatory-math: per-step recurrence",
+                    },
                     "faster": {"disposition": "item", "ref": faster_ref},
                     "fusion": {
                         "disposition": "dismissed",
                         "neighbors": "rmsnorm -> THIS -> fp8_quant (cuda_gpu_trace)",
                         "ref": "already-fused: neighbors are inside this kernel",
+                    },
+                    "overlap": {
+                        "disposition": "dismissed",
+                        "concurrent_with": "moe_gemm (cuda_gpu_trace, stream 7)",
+                        "ref": "graph-disabled: cuda_graph_config unset in the live tuning config",
                     },
                 }
             ],
@@ -3166,6 +3501,65 @@ def test_kernel_coverage_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
     assert state.stage == state_module.STAGE_ANALYZER
 
 
+@pytest.mark.parametrize("dropped", ["elimination", "faster", "fusion", "overlap"])
+def test_kernel_coverage_unanswered_question_blocks_advance(tmp_path, fake_git, dropped):
+    """A row that skips any question aborts the stage.
+
+    The exhaustiveness guarantee is only worth the weakest question it
+    enforces — a ledger silently dropping one would let a campaign
+    conclude with a kernel nobody asked whether it had to exist, run
+    alone, or run at all.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_incomplete_ledger(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["kernels"][0][dropped]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_with_incomplete_ledger
+    try:
+        with pytest.raises(RuntimeError, match="answers all four questions"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_kernel_coverage_missing_gpu_busy_blocks_advance(tmp_path, fake_git):
+    """Materiality is denominated in wall clock, so the busy share is owed."""
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_without_busy_share(state):
+        original_analyzer(state)
+        data = yaml.safe_load(_ledger_yaml())
+        del data["coverage"]["gpu_busy_pct"]
+        (workflow._analysis_dir(state) / "kernel_ledger.yaml").write_text(
+            yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
+        )
+
+    workflow._run_analyzer = analyzer_without_busy_share
+    try:
+        with pytest.raises(RuntimeError, match="gpu_busy_pct"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
 def test_kernel_coverage_below_target_blocks_advance(tmp_path, fake_git):
     task = _write_task(tmp_path, _KC_EXTRA)
     ws = tmp_path / "ws"
@@ -3212,7 +3606,10 @@ def test_kernel_coverage_driving_prompts_name_ledger_and_section(tmp_path):
     assert "kernel_ledger.yaml" in analyzer
     assert "per-kernel coverage contract" in analyzer
     assert "0.5%" in analyzer and "95.0%" in analyzer
-    assert "faster? fusible?" in analyzer
+    assert "eliminable? faster? fusible? overlappable?" in analyzer
+    # The busy share is asked for by name — it is what converts a share of
+    # GPU time into the share of wall clock the noise floor judges.
+    assert "coverage.gpu_busy_pct" in analyzer
     # The default bounded top-kernel wording is superseded, not repeated.
     assert "on the top nsys kernels: keep the canonical ncu flags" not in analyzer
     reporter = captured["reporter"]
@@ -3244,8 +3641,8 @@ def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
             (analysis / "kernel_ledger.yaml").write_text(_ledger_yaml(), encoding="utf-8")
         state = state_module.WorkflowState(
             task_path=str(workflow.task_path),
-            git_branch="perf-optimize/test-branch",
-            git_base_commit="a" * 40,
+            campaign_git_branch="perf-optimize/test-branch",
+            campaign_git_base_commit="a" * 40,
             stage=state_module.STAGE_REPORTER,
         )
         workflow._run_reporter(state)
@@ -3257,7 +3654,147 @@ def test_reporter_prompt_names_the_highest_round_ledger(tmp_path, fake_git):
         workflow.close()
 
 
-# ------------------------------------------------ accept-driven round control
+# ------------------------------------------------ profile-aware round control
+
+
+def test_rejected_parallel_batch_replans_without_reprofile(tmp_path, fake_git):
+    """A fully rejected batch earns a replan without another profile.
+
+    Every attempt is hard-reverted, leaving the build byte-identical to
+    what the round's analyzer profiled — so the round keeps pulling
+    pending items instead of paying for a re-profile that would re-derive
+    the same findings.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[
+            [
+                _item("opt-001", gain=10.0),
+                _item("opt-002", gain=8.0),
+                _item("opt-003", gain=5.0),
+            ]
+        ],
+        evaluator_verdicts=[("REJECT", "perf_shortfall", -0.4, 99.6)],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace.count("benchmarker") == 1
+    assert trace.count("projector") == 1
+    assert trace.count("analyzer") == 2
+    assert trace.count("optimizer") == 3
+    assert trace.count("evaluator") == 3
+    assert trace.count("qa") == 0
+    assert trace.count("reporter") == 1
+    assert (ws / "rounds" / "round_2").exists()
+    roadmap = roadmap_schema.load_roadmap(ws / "roadmap.yaml")
+    for item_id in ("opt-001", "opt-002", "opt-003"):
+        assert roadmap_schema.find_item(roadmap, item_id)["status"] == "failed"
+    round_1 = ws / "rounds" / "round_1"
+    assert (round_1 / "item_1_opt-001").is_dir()
+    assert (round_1 / "item_2_opt-002").is_dir()
+    assert (round_1 / "item_3_opt-003").is_dir()
+    # Nothing accepted -> no final verification, and the campaign ends on
+    # the roadmap-exhausted break rather than the round budget.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.round_index == 2
+    assert state.done is True
+
+
+def test_item_budget_reprofiles_remaining_items(tmp_path, fake_git):
+    """A full three-item batch leaves the fourth item for round two."""
+    task = _write_task(tmp_path, {"optimize": {"max_items_per_round": 3}})
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[
+            [
+                _item("opt-001", gain=10.0),
+                _item("opt-002", gain=8.0),
+                _item("opt-003", gain=5.0),
+                _item("opt-004", gain=4.0),
+            ]
+        ],
+        evaluator_verdicts=[
+            ("REJECT", "perf_shortfall", -0.4, 99.6),
+            ("REJECT", "perf_shortfall", -0.2, 99.8),
+            ("APPROVE", "none", 8.4, 108.4),
+            ("APPROVE", "none", 3.0, 111.6),
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    assert trace.count("projector") == 1
+    assert trace.count("analyzer") == 3
+    assert trace.count("optimizer") == 4
+    assert trace.count("evaluator") == 4
+    assert trace.count("qa") == 1
+    assert trace.count("reporter") == 1
+    round_1 = ws / "rounds" / "round_1"
+    assert (round_1 / "item_1_opt-001").is_dir()
+    assert (round_1 / "item_2_opt-002").is_dir()
+    assert (round_1 / "item_3_opt-003").is_dir()
+    assert (ws / "rounds" / "round_2" / "analysis" / "profile_findings.md").is_file()
+    assert (ws / "rounds" / "round_2" / "item_1_opt-004").is_dir()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.round_index == 3
+
+
+def test_item_budget_is_checkpointed(tmp_path):
+    state = state_module.WorkflowState(task_path="t", max_items_per_round=2)
+    path = tmp_path / state_module.STATE_FILENAME
+    state_module.save_state(path, state)
+    assert state_module.load_state(path).max_items_per_round == 2
+
+
+def test_max_items_per_round_one_reprofiles_each_item(tmp_path, fake_git):
+    """A one-item batch leaves the second item for the next round."""
+    task = _write_task(
+        tmp_path,
+        {"optimize": {"max_items_per_round": 1}},
+    )
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(
+        workflow,
+        analyzer_items=[[_item("opt-001", gain=10.0), _item("opt-002", gain=5.0)]],
+        evaluator_verdicts=[
+            ("APPROVE", "none", 8.4, 108.4),
+            ("APPROVE", "none", 3.0, 111.6),
+        ],
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+
+    # Each one-item batch closes the round before the next item is selected.
+    assert trace == [
+        "benchmarker",
+        "projector",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "analyzer",
+        "qa",
+        "reporter",
+    ]
+    assert (ws / "rounds" / "round_1" / "item_1_opt-001").is_dir()
+    assert (ws / "rounds" / "round_2" / "item_1_opt-002").is_dir()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.max_items_per_round == 1
 
 
 # ------------------------------------------------------------- analysis reuse
@@ -3483,19 +4020,76 @@ def test_reused_round_without_a_ledger_does_not_enforce_the_coverage_gate(tmp_pa
     assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
 
 
-def test_reused_source_ledger_is_still_validated(tmp_path, fake_git):
-    """An imported ledger that fails the contract blocks the stage."""
+def _run_reuse_campaign_with_source_ledger(tmp_path, ledger_yaml: str):
+    """Run a one-round reuse campaign whose source carries ``ledger_yaml``."""
     source = _analyze_workspace(tmp_path / "prior")
-    (source / "kernel_ledger.yaml").write_text(_ledger_yaml("opt-does-not-exist"), encoding="utf-8")
-    task = _write_task(tmp_path, _KC_EXTRA)
+    (source / "kernel_ledger.yaml").write_text(ledger_yaml, encoding="utf-8")
+    extra = dict(_KC_EXTRA)
+    extra["optimize"] = {"max_rounds": 1}
+    task = _write_task(tmp_path, extra)
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws, reuse_analysis=source)
-    _stub_agents(workflow)
+    trace = _stub_agents(workflow)
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    return ws, trace
+
+
+def test_reused_source_ledger_that_fails_the_contract_is_waived(tmp_path, fake_git):
+    """An unsatisfiable imported ledger degrades; it never wedges the run.
+
+    The reused round is plan-only and never writes a ledger, so nothing a
+    retry does can repair the copy ``--reuse-analysis`` seeded — here one
+    whose ``item`` refs name the *source* campaign's roadmap ids. Aborting
+    on it would leave the campaign stuck on a failure no operator action
+    clears, so it takes the same warn-and-waive as a source with no ledger.
+    """
+    ws, trace = _run_reuse_campaign_with_source_ledger(tmp_path, _ledger_yaml("opt-does-not-exist"))
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_reused_source_ledger_predating_the_contract_is_waived(tmp_path, fake_git):
+    """The real trap: a source ledger written before the questions grew.
+
+    Every workspace produced before ``elimination`` / ``overlap`` /
+    ``gpu_busy_pct`` became required carries a ledger that can never
+    satisfy today's schema, and ``--reuse-analysis`` documents an earlier
+    campaign as a supported source.
+    """
+    stale = yaml.safe_load(_ledger_yaml())
+    stale["coverage"].pop("gpu_busy_pct")
+    for row in stale["kernels"]:
+        row.pop("elimination")
+        row.pop("overlap")
+    ws, trace = _run_reuse_campaign_with_source_ledger(
+        tmp_path, yaml.safe_dump(stale, sort_keys=False)
+    )
+
+    assert trace == ["projector", "analyzer", "optimizer", "evaluator", "qa", "reporter"]
+    assert state_module.load_state(ws / state_module.STATE_FILENAME).done is True
+
+
+def test_a_self_authored_ledger_is_never_waived(tmp_path, fake_git):
+    """The waive is scoped to the imported copy, not to every failure.
+
+    A round that profiled authored its own ledger, so a failing one is a
+    retryable defect and must still park the checkpoint.
+    """
+    task = _write_task(tmp_path, _KC_EXTRA)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_ledger(workflow, faster_ref="opt-does-not-exist")
     try:
         with pytest.raises(RuntimeError, match="coverage contract"):
             workflow.run(str(task))
     finally:
         workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
 
 
 def test_reused_analyzer_prompt_forbids_profiling_and_names_its_inputs(tmp_path):
@@ -3554,6 +4148,31 @@ def test_reused_analyzer_prompt_omits_prior_roadmap_when_absent(tmp_path):
         workflow.close()
 
     assert "read-only prior art" not in recorder.messages[0]
+
+
+def test_reporter_prompt_flags_an_inherited_baseline(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    recorder = _RecordingAgent()
+    workflow.reporter = recorder
+    try:
+        task = _write_task(tmp_path)
+        validated = task_schema.load_and_validate_task_yaml(str(task))
+        workflow.task_path.write_text(task_schema.dump_task_yaml(validated), encoding="utf-8")
+        workflow._run_reporter(
+            state_module.WorkflowState(
+                task_path=str(workflow.task_path),
+                reuse_analysis_dir=str(tmp_path / "prior"),
+                campaign_git_branch="perf-optimize/test-branch",
+                campaign_git_base_commit="a" * 40,
+                stage=state_module.STAGE_REPORTER,
+            )
+        )
+    finally:
+        workflow.close()
+
+    prompt = recorder.messages[0]
+    assert str(workflow.reuse_manifest_path) in prompt
+    assert "measured by that run, not this one" in prompt.replace("**", "")
 
 
 # --------------------------------------------------------------------------- #
@@ -3668,3 +4287,180 @@ def test_baseline_gate_ignores_unreadable_json(tmp_path):
     wf = _workflow_with_baseline(tmp_path, {"output_throughput": 1.0})
     (wf.baseline_dir / "junk.json").write_text("\x00not json\x00", encoding="utf-8")
     wf._require_baseline_measurement()  # the good one still counts
+
+
+# --------------------------------------------------------------------------- #
+# The nsys opportunity-coverage gate: the timeline analysis writes items.json,
+# and the roadmap must account for every id in it. Self-gating on the file, so
+# a round that could not decompose a trace owes nothing.
+# --------------------------------------------------------------------------- #
+
+
+def _stub_agents_with_nsys_items(workflow, rows, item_ids=("nsys-01",), **kwargs):
+    """`_stub_agents` plus an analyzer that writes items.json + the block.
+
+    ``rows`` is the ``nsys_items`` coverage block the analyzer writes into
+    ``roadmap.yaml``; ``item_ids`` are the opportunities ``items.json``
+    carries. Passing mismatched pairs is how the negative cases are built.
+    """
+    trace = _stub_agents(workflow, **kwargs)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_items(state):
+        original_analyzer(state)
+        analysis_dir = workflow._analysis_dir(state)
+        items_file = nsys_items.items_path(analysis_dir)
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text(
+            json.dumps({"items": [{"id": i, "title": i, "claim": "c"} for i in item_ids]}),
+            encoding="utf-8",
+        )
+        data = roadmap_schema.load_roadmap(workflow.roadmap_path)
+        data[nsys_items.ROADMAP_KEY] = [dict(row) for row in rows]
+        roadmap_schema.save_roadmap(workflow.roadmap_path, data)
+
+    workflow._run_analyzer = analyzer_with_items
+    return trace
+
+
+def test_nsys_items_covered_roadmap_completes(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}]
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unaccounted_opportunity_blocks_advance(tmp_path, fake_git):
+    """An opportunity neither planned nor dismissed stops the round."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [{"id": "nsys-01", "disposition": "item", "ref": "opt-001"}],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="unaccounted for"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    # Parked at the analyzer, so re-running retries the stage.
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_dismissal_with_evidence_is_enough(tmp_path, fake_git):
+    """Dismissing beats padding the roadmap with an item to disprove."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow,
+        [
+            {"id": "nsys-01", "disposition": "item", "ref": "opt-001"},
+            {"id": "nsys-02", "disposition": "dismissed", "ref": "below the noise floor"},
+        ],
+        item_ids=("nsys-01", "nsys-02"),
+    )
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_nsys_items_unresolved_item_ref_blocks_advance(tmp_path, fake_git):
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents_with_nsys_items(
+        workflow, [{"id": "nsys-01", "disposition": "item", "ref": "opt-999"}]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="does not match any roadmap item id"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.stage == state_module.STAGE_ANALYZER
+
+
+def test_nsys_items_malformed_file_blocks_advance(tmp_path, fake_git):
+    """The analyzer's own artifact being unreadable is worth stopping for."""
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    trace = _stub_agents(workflow)
+    original_analyzer = workflow._run_analyzer
+
+    def analyzer_with_broken_items(state):
+        original_analyzer(state)
+        items_file = nsys_items.items_path(workflow._analysis_dir(state))
+        items_file.parent.mkdir(parents=True, exist_ok=True)
+        items_file.write_text("{not json", encoding="utf-8")
+
+    workflow._run_analyzer = analyzer_with_broken_items
+    try:
+        with pytest.raises(RuntimeError, match="could not be read as JSON"):
+            workflow.run(str(task))
+    finally:
+        workflow.close()
+    assert trace[-1] == "analyzer"
+
+
+def test_no_items_json_means_no_coverage_owed(tmp_path, fake_git):
+    """A round whose pipeline could not run degrades, it does not fail.
+
+    The skill may be absent, the export may fail, or nsys may not be in
+    `profile.methods` at all — every such round writes no items.json and
+    records the reason under *Caveats* instead.
+    """
+    task = _write_task(tmp_path)
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    _stub_agents(workflow)  # never writes items.json
+    try:
+        workflow.run(str(task))
+    finally:
+        workflow.close()
+    state = state_module.load_state(ws / state_module.STATE_FILENAME)
+    assert state.done is True
+    assert not list((ws / "rounds").glob("*/analysis/nsys_analysis/items.json"))
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks reaches the analyzer's driving instruction: the
+# stateless agent should not have to re-derive which ranks to capture, and the
+# multi-rank case has to arrive as a duty rather than an option.
+# --------------------------------------------------------------------------- #
+
+
+def test_default_driving_prompt_asks_for_rank_zero_only(tmp_path):
+    analyzer = _capture_driving_prompts(tmp_path)["analyzer"]
+    assert "rank 0 only" in analyzer
+    # And says plainly that the imbalance step does not apply, rather than
+    # leaving the agent to report a spread it could not measure.
+    assert "rank-jitter step does not apply" in analyzer
+
+
+def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
+    analyzer = _capture_driving_prompts(
+        tmp_path, {"profile": {"methods": ["nsys", "ncu"], "profile_ranks": [0, 4]}}
+    )["analyzer"]
+    assert "ranks 0, 4" in analyzer
+    assert "one trace per rank" in analyzer
+    # Only the listed ranks are wrapped — a profiler-slowed rank would
+    # otherwise register as jitter the others wait on.
+    assert "only these ranks are wrapped" in analyzer
+    assert "Step 0 survey" in analyzer
+    assert "straggler verdict" in analyzer

@@ -20,14 +20,13 @@ import torch
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 from torch.fx import Graph
 
-import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
-
 # Registers torch.ops.trtllm.mla_custom_op_inplace, used below. The op is a
 # module-import side effect that the eagerly loaded model zoo used to provide
-# (models/__init__ -> modeling_deepseekv3 -> modules.mla); with the zoo lazy,
+# (models/__init__ -> modeling_deepseekv3 -> attention.mla); with the zoo lazy,
 # every test must import the ops it uses itself.
-import tensorrt_llm._torch.modules.mla  # noqa: F401
-from tensorrt_llm._torch.modules.fused_ops.fused_qk_norm_rope_gate import (
+import tensorrt_llm._torch.attention.mla  # noqa: F401
+import tensorrt_llm._torch.compilation.remove_copy_pass as remove_copy_pass
+from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_sigmoid_mul_inplace,  # noqa: F401
 )
 

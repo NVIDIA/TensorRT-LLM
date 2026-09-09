@@ -15,6 +15,8 @@ from agent_flow.workflows.perf_analyze.task_schema import (
     is_curve_mode,
     load_and_validate_task_yaml,
     num_prompts_per_point,
+    profile_ranks,
+    remote_run_root,
     sol_enabled,
 )
 
@@ -50,8 +52,11 @@ def test_valid_minimal_applies_defaults(tmp_path):
     assert data["benchmark"]["num_prompts"] == 200
     assert data["benchmark"]["concurrency"] == 64
     assert data["profile"] == {
-        "methods": ["nsys", "torch", "ncu"],
+        "methods": ["nsys", "ncu"],
         "nsys_iter_range": "100-150",
+        # Rank 0 only: the historical single-wrap behaviour, and all a
+        # spawn-launched server can give.
+        "profile_ranks": [0],
     }
     assert has_slurm_environment(data) is False
     # The projector is on by default, and the block is materialized so
@@ -741,7 +746,7 @@ def test_dump_task_yaml_round_trip(tmp_path):
     reloaded = yaml.safe_load(dump_task_yaml(data))
     assert reloaded["checkpoint_path"] == ckpt
     assert "serve" not in reloaded
-    assert reloaded["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert reloaded["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_dump_task_yaml_normalizes_float_inf():
@@ -770,14 +775,16 @@ def test_a_local_run_still_has_its_paths_checked(tmp_path):
         )
 
 
-def test_a_remote_run_does_not_have_them_checked_here(tmp_path):
-    """Same absent paths, plus `cluster_ssh` — they are on the other machine."""
+def test_a_remote_run_checks_local_repo_but_not_remote_checkpoint(tmp_path):
+    """Only runtime paths move to the SSH host."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
     data = load_and_validate_task_yaml(
         _write(
             tmp_path,
             {
                 "checkpoint_path": "/lustre/ckpt",
-                "trtllm_repo_path": "/lustre/repo",
+                "trtllm_repo_path": str(repo),
                 "slurm-environment": {
                     "slurm_partition": "p",
                     "docker_image": "i",
@@ -787,6 +794,24 @@ def test_a_remote_run_does_not_have_them_checked_here(tmp_path):
         )
     )
     assert data["checkpoint_path"] == "/lustre/ckpt"
+
+
+def test_a_remote_run_rejects_a_missing_local_repo(tmp_path):
+    with pytest.raises(TaskSchemaError, match="not a local directory"):
+        load_and_validate_task_yaml(
+            _write(
+                tmp_path,
+                {
+                    "checkpoint_path": "/lustre/ckpt",
+                    "trtllm_repo_path": "missing-repo",
+                    "slurm-environment": {
+                        "slurm_partition": "p",
+                        "docker_image": "i",
+                        "cluster_ssh": "me@login-01",
+                    },
+                },
+            )
+        )
 
 
 def test_skipping_existence_does_not_skip_anything_else(tmp_path):
@@ -835,13 +860,17 @@ def test_a_missing_required_path_is_still_missing_when_remote(tmp_path):
 
 
 def test_extra_llm_api_options_follows_the_same_rule(tmp_path):
-    """The third path, which is easy to forget because it is optional."""
+    """Remote execution still consumes the optional tuning YAML locally."""
     from agent_flow.workflows.perf_analyze.task_schema import paths_are_local
 
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    options = tmp_path / "opts.yaml"
+    options.write_text("{}\n", encoding="utf-8")
     remote = {
         "checkpoint_path": "/lustre/ckpt",
-        "trtllm_repo_path": "/lustre/repo",
-        "extra_llm_api_options": "/lustre/opts.yaml",
+        "trtllm_repo_path": "repo",
+        "extra_llm_api_options": "opts.yaml",
         "slurm-environment": {
             "slurm_partition": "p",
             "docker_image": "i",
@@ -849,14 +878,33 @@ def test_extra_llm_api_options_follows_the_same_rule(tmp_path):
         },
     }
     assert paths_are_local(remote) is False
-    load_and_validate_task_yaml(_write(tmp_path, remote))  # must not raise
+    data = load_and_validate_task_yaml(_write(tmp_path, remote))
+    assert data["trtllm_repo_path"] == str(repo.resolve())
+    assert data["extra_llm_api_options"] == str(options.resolve())
 
-    ckpt, repo = _paths(tmp_path)
-    local = {**remote, "checkpoint_path": ckpt, "trtllm_repo_path": repo}
-    local.pop("slurm-environment")
-    assert paths_are_local(local) is True
-    with pytest.raises(TaskSchemaError, match="extra_llm_api_options"):
-        load_and_validate_task_yaml(_write(tmp_path, local))
+
+def test_remote_run_root_is_optional_and_can_be_explicit(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task = {
+        "checkpoint_path": "/lustre/ckpt",
+        "trtllm_repo_path": str(repo),
+        "slurm-environment": {
+            "slurm_partition": "p",
+            "docker_image": "/image.sqsh",
+            "cluster_ssh": "me@login-01",
+        },
+    }
+    data = load_and_validate_task_yaml(_write(tmp_path, task))
+    assert remote_run_root(data, "campaign") == "~/agent_flow_workspace/campaign"
+
+    task["slurm-environment"]["remote_run_root"] = "/scratch/runs/campaign"
+    data = load_and_validate_task_yaml(_write(tmp_path, task))
+    assert remote_run_root(data, "ignored") == "/scratch/runs/campaign"
+
+    task["slurm-environment"]["remote_run_root"] = "relative/run"
+    with pytest.raises(TaskSchemaError, match="remote_run_root"):
+        load_and_validate_task_yaml(_write(tmp_path, task))
 
 
 def test_a_malformed_slurm_block_does_not_decide_the_question(tmp_path):
@@ -866,3 +914,73 @@ def test_a_malformed_slurm_block_does_not_decide_the_question(tmp_path):
     assert paths_are_local({"slurm-environment": "not-a-mapping"}) is True
     assert paths_are_local({"slurm-environment": {"cluster_ssh": "   "}}) is True
     assert paths_are_local({}) is True
+
+
+# --------------------------------------------------------------------------- #
+# profile.profile_ranks — which ranks nsys captures. Several ranks is what
+# buys the skill's rank-jitter step its straggler verdict; the knob is inert
+# without nsys, and inert config is what this schema exists to catch.
+# --------------------------------------------------------------------------- #
+
+
+def test_profile_ranks_accepts_several_ranks_and_sorts_them(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"profile_ranks": [4, 0]},
+        },
+    )
+    data = load_and_validate_task_yaml(path)
+    # Sorted for a deterministic resolved spec; the ids themselves are the
+    # skill's pairing key and are never renumbered.
+    assert data["profile"]["profile_ranks"] == [0, 4]
+    assert profile_ranks(data) == (0, 4)
+
+
+def test_profile_ranks_defaults_to_rank_zero():
+    assert profile_ranks({}) == (0,)
+    assert profile_ranks({"profile": {}}) == (0,)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ([], "non-empty list"),
+        ("all", "non-empty list"),
+        ([0, -1], "non-negative integers"),
+        ([0, "1"], "non-negative integers"),
+        ([True], "non-negative integers"),
+        ([0, 0], "duplicate rank ids"),
+    ],
+)
+def test_profile_ranks_rejects_malformed_values(tmp_path, value, expected):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"profile_ranks": value},
+        },
+    )
+    with pytest.raises(TaskSchemaError, match=expected):
+        load_and_validate_task_yaml(path)
+
+
+def test_profile_ranks_requires_nsys_in_methods(tmp_path):
+    # A rank is captured by wrapping it in nsys; without nsys the knob is
+    # inert, and silently inert config is the failure mode to avoid.
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "profile": {"methods": ["ncu"], "profile_ranks": [0, 1]},
+        },
+    )
+    with pytest.raises(TaskSchemaError, match="requires 'nsys' in 'profile.methods'"):
+        load_and_validate_task_yaml(path)

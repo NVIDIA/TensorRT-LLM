@@ -38,7 +38,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
-* **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) trtllm-gen generation kernel.
+* **`kv_cache_config.tokens_per_block` must be `64`** — required by the MLA (576, 512) generation kernels.
 * **Speculative decoding and disaggregated serving are not yet available** for Kimi K3; support is under development. See the "Current limitations" section of `examples/kimi_k3/README.md`.
 
 ## Deployment Steps
@@ -59,16 +59,6 @@ Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-p
 ```bash
 .venv-3.12/bin/python -m pip install fla-core einops
 ```
-
-To use the optimized CuTeDSL MLA kernel, install the FlashInfer revision used by the Kimi K3 example into the same in-place environment:
-
-```bash
-.venv-3.12/bin/python -u -m pip install --force-reinstall --no-deps \
-    --no-build-isolation \
-    "flashinfer-python[cu13] @ git+https://github.com/PerkzZheng/flashinfer-k3.git@b6cc594918baf76c40c3a6236fd53f0f8fb9d2dc"
-```
-
-The `packaging>=24.2` requirement of this source build is already satisfied by `requirements.txt`. The TensorRT LLM environment already provides FlashInfer's runtime dependencies. The `--no-deps` option prevents `pip` from replacing the pinned PyTorch, Triton, CUDA, and CuTeDSL packages. Install FlashInfer after TensorRT LLM because a later dependency-resolving TensorRT LLM installation can replace this source revision with the currently pinned `flashinfer-python==0.6.16`.
 
 For general build-from-source instructions see [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html).
 
@@ -211,7 +201,7 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 * **Options:**
   * `enable_block_reuse`: Off by default; set to `true` to enable prefix-cache reuse across requests.
   * `mamba_state_config.periodic_snapshot_interval`: With block reuse on, the KDA recurrent state is snapshotted every this many tokens so prefix hits can restore it (default `0` = snapshots off; hybrid models only expose reusable prefixes at snapshot boundaries, so set e.g. `256` for block reuse to engage; see `examples/kimi_k3/eval_extra_llm_options_reuse.yaml`).
-  * `tokens_per_block`: Must be `64`, required by the MLA (576, 512) trtllm-gen generation kernel.
+  * `tokens_per_block`: Must be `64`, required by the MLA (576, 512) generation kernels.
   * `free_gpu_memory_fraction`: Fraction of free GPU memory reserved for the paged KV cache after model load. The configuration above uses `0.25` to leave runtime headroom. Lower it if you hit out-of-memory errors.
 
 #### `trust_remote_code`

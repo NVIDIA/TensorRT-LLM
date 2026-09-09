@@ -1489,6 +1489,8 @@ __global__ void __launch_bounds__(HistogramScoresKernelConfig<typename KernelPar
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 
     // initialize the mPtrExpertCounts — use NumThreadsBlock for grid-stride
+    // This is the only place the raw-score path zeroes mPtrExpertCounts: callers hand in
+    // uninitialized scratch, and every kernel launched after this one only accumulates.
     int32_t expertCountsNum = 2 * params.mNumExperts;
     int32_t globalThreadIdx = blockIdx.x * NumThreadsBlock + threadIdx.x;
     int32_t globalThreadStride = gridDim.x * NumThreadsBlock;
@@ -1786,7 +1788,8 @@ void run(Data const& data, void* stream)
 
         if (useCoop)
         {
-            launchInitExpertCounts(data, numThreadsHist, stream);
+            // The preceding histogram-scores kernel clears both expert-count
+            // regions before publishing the Top-K scores consumed here.
             launchCoopKernel(lastKernelData, numBlocksCoop, numThreadsHist, stream);
         }
         else

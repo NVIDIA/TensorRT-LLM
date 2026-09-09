@@ -40,6 +40,7 @@ from .pipeline_wan import WanPipeline
         "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
     ],
     doc="FastWan 2.2 distilled (DMD) — 3-step Wan 2.2 TI2V-5B text-to-video.",
+    supports_nvfp4_vae=True,
 )
 class WanDMDPipeline(WanPipeline):
     """Wan 2.2 TI2V-5B with the DMD 3-step sampling loop.

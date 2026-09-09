@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import SkipSoftmaxScheduler
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 

@@ -70,6 +70,7 @@ class GatedMLP(nn.Module):
                 gpus_per_node=self.mapping.gpus_per_node,
                 tp_size=tp_size,
                 pp_size=pp_size,
+                enable_attention_dp=self.mapping.enable_attention_dp,
             )
         else:
             mapping = config.mapping

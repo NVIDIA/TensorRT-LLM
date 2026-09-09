@@ -31,7 +31,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     cu_seqlens_to_chunk_indices_offsets,
     cu_seqlens_to_chunk_indices_offsets_triton,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     ReplayStateUpdateMetadata,
 )

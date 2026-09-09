@@ -52,7 +52,7 @@ from ...inputs import (
 )
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM

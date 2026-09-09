@@ -702,6 +702,16 @@ class TestLocalityDomainMoePlanner:
     @patch(
         "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
     )
+    def test_moe_disabled_for_non_swiglu_activation(self, mock_locality_domain):
+        """Both locality-domain MoE kernels fuse SwiGLU; others stay unpartitioned."""
+        planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
+        plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True), activation="Relu2")
+        assert not plan.enabled
+        assert "SwiGLU only" in plan.reason_if_disabled
+
+    @patch(
+        "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled", return_value=True
+    )
     def test_moe_disabled_when_backend_not_cutedsl(self, mock_locality_domain):
         planner = LocalityDomainExecutionPlanner(LocalityDomainPolicy(enabled=True))
         plan = planner.plan_moe(_FakeMoeQuantConfig(nvfp4=True), moe_backend="CUTLASS")

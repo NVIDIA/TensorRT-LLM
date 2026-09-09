@@ -19,14 +19,14 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.attention import Attention
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -43,9 +43,9 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        support_multimodal_disaggregated)
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..attention_backend.utils import get_attention_backend
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from ..attention.backends.utils import get_attention_backend
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
 # Guarded module-level import: `flashinfer_apply_rope_with_cos_sin_cache_inplace`
@@ -67,8 +67,8 @@ except ImportError:
 
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
+from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin

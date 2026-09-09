@@ -460,6 +460,8 @@ def kda_mtp_decode_impl(
         out = torch.zeros(1, T_total, HV, V_dim, dtype=x_q.dtype, device=x_q.device)
     if num_accepted_tokens.dtype != torch.int32:
         num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+    if ssm_state_indices.data_ptr() % 16 != 0:
+        raise ValueError("ssm_state_indices must be 16-byte aligned before CuTe DLPack conversion")
 
     _require_stride_layout(
         x_q=x_q,

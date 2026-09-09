@@ -7,9 +7,9 @@ import pytest
 import torch
 from utils.util import skip_blackwell
 
-from tensorrt_llm._torch.attention_backend.interface import \
+from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
 
 def generate_attn_scenarios(num_q_heads_kv_heads: List[Tuple[int, int]],

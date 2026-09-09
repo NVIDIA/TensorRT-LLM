@@ -333,6 +333,38 @@ def top_pending_item(
     return None
 
 
+def top_pending_items(
+    data: Mapping[str, Any],
+    limit: int,
+    min_expected_gain_pct: float = 0.0,
+    allowed_approaches: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to ``limit`` actionable pending items in roadmap order."""
+    if limit < 1:
+        return []
+    selected: list[dict[str, Any]] = []
+    for item in data.get("items", []):
+        if item.get("status") != "pending":
+            continue
+        if item.get("expected_gain_pct", 0) < min_expected_gain_pct:
+            continue
+        if allowed_approaches is not None and item.get("approach") not in allowed_approaches:
+            continue
+        selected.append(item)
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def has_actionable_pending(
+    data: Mapping[str, Any],
+    noise_floor_pct: float,
+    allowed_approaches: Sequence[str] | None = None,
+) -> bool:
+    """True iff any pending item promises a gain at/above the noise floor."""
+    return top_pending_item(data, noise_floor_pct, allowed_approaches) is not None
+
+
 def _mutate(path: str | Path, item_id: str, updates: Mapping[str, Any]) -> None:
     """Read-validate-modify-write a single item's lifecycle fields."""
     data = load_roadmap(path)

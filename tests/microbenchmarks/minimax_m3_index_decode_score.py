@@ -16,8 +16,8 @@ import argparse
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _proxy_max_score
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_utils import (
     build_kv_page_indices,
     msa_package_available,
 )

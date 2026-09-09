@@ -121,6 +121,7 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
     ],
     doc="Wan 2.1 & 2.2 text-to-video family.",
+    supports_nvfp4_vae=True,
 )
 class WanPipeline(BasePipeline):
     def __init__(self, pipeline_config):
@@ -132,6 +133,7 @@ class WanPipeline(BasePipeline):
         # Derived model type flags
         self.is_wan22_14b = self.boundary_ratio is not None
         self.is_wan22_5b = self.expand_timesteps
+        self._fp4_vae_encoder_warmup_resolutions: set[tuple[int, int]] = set()
 
         # Fixed latent for reproducible benchmarking (e.g. MLPerf).
         # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
@@ -299,6 +301,9 @@ class WanPipeline(BasePipeline):
                 checkpoint_dir,
                 vae_device,
                 dtype=self.pipeline_config.torch_dtype,
+                quant_config=self.pipeline_config.vae_conv_quant_config,
+                dynamic_weight_quant=self.pipeline_config.vae_conv_dynamic_weight_quant,
+                dynamic_activation_quant=self.pipeline_config.vae_conv_dynamic_activation_quant,
             )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
@@ -398,8 +403,34 @@ class WanPipeline(BasePipeline):
                     "There is no built-in coefficient table for Wan 2.2."
                 )
 
+    def _warmup_fp4_vae_encoder(self, height: int, width: int) -> None:
+        if not self.is_wan22_5b:
+            return
+        resolution = (height, width)
+        if resolution in self._fp4_vae_encoder_warmup_resolutions:
+            return
+
+        from .wan_vae import NVFP4WanCausalConv3d
+
+        if not any(
+            isinstance(module, NVFP4WanCausalConv3d) for module in self.vae.encoder.modules()
+        ):
+            return
+        image = torch.zeros(
+            (1, 3, 1, height, width),
+            device=self.device,
+            dtype=self.vae.dtype,
+        )
+        self.vae.encode(image)
+        self._fp4_vae_encoder_warmup_resolutions.add(resolution)
+
+    def _run_warmup_pass(self, shapes: list[tuple[int, int, int]], steps: int) -> None:
+        self._fp4_vae_encoder_warmup_resolutions.clear()
+        super()._run_warmup_pass(shapes, steps)
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
+            self._warmup_fp4_vae_encoder(height, width)
             self.forward(
                 prompt="warmup",
                 negative_prompt="",

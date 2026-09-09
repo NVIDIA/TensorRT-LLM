@@ -61,7 +61,6 @@ class MultimodalEncoder(_TorchLLM):
 
         self._executor = self._executor_cls.create(
             self._engine_dir,
-            executor_config=None,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(

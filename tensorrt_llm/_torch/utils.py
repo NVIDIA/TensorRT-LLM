@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -417,21 +418,37 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16)
-    return scale_shape * 2
+def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the swizzled scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    return scale_shape
 
 
-def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
-    """Calculate the dimensions of the fp4 scale tensor.
-    """
-    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
-                                                     sf_vec_size=16,
-                                                     is_swizzled_layout=False)
-    return scale_shape * 2
+def mxfp8_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the number of bytes in an R128c4 MXFP8 scale tensor."""
+    input_shape = input_shapes[0]
+    m = math.prod(input_shape[:-1])
+    k = input_shape[-1]
+    return pad_up(m, 128) * pad_up(ceil_div(k, 32), 4)
+
+
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+    """Calculate the linear scale size for a packed FP4 input tensor."""
+    unpacked_shape = list(input_shapes[0])
+    unpacked_shape[-1] *= 2
+    _, scale_shape = fp4_utils.get_fp4_shape(
+        unpacked_shape,
+        sf_vec_size=16,
+        is_swizzled_layout=False,
+    )
+    return scale_shape
+
+
+def infer_output_m_shape(input_shapes: List[List[int]]) -> int:
+    """Infer the M dimension of the output tensor from the first input tensor."""
+    return input_shapes[0][0]
 
 
 def fp8_scale_infer_shape(input_shapes: List[List[int]]):

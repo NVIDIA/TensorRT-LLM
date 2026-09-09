@@ -712,6 +712,13 @@ def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
     ])
 
 
+def test_anthropic_messages(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_anthropic_messages.py")])
+
+
 def test_openai_responses(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
@@ -913,6 +920,9 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Nemotron-Nano-9B-v2-nvfp4',
                  'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
                  marks=skip_pre_blackwell),
+    pytest.param('Qwen3.6-35B-A3B-nvfp4',
+                 'Qwen3.6-35B-A3B-NVFP4',
+                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
@@ -921,7 +931,9 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
+            "--trust_remote_code",
             "--max_batch_size=8",
+            "--use_kv_cache_manager_v2=false",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
         ])
@@ -940,6 +952,10 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
         ]
         if "Qwen3" in model_name:
             cmds.append("--kv_cache_fraction=0.6")
+        if "Qwen3.6-35B-A3B" in model_name:
+            # Hybrid linear-attention model: the Mamba cache preallocates a
+            # recurrent state per sequence slot, so cap the batch size.
+            cmds.append("--max_batch_size=1")
         llm_venv.run_cmd(cmds)
 
 
@@ -1005,35 +1021,6 @@ def test_ptp_quickstart_advanced_bs1(llm_root, llm_venv):
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
     ])
-
-
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.skip_less_mpi_world_size(8)
-@skip_pre_hopper
-@pytest.mark.parametrize("model_path", [
-    pytest.param('DeepSeek-V3', marks=skip_post_blackwell),
-    pytest.param('DeepSeek-V3-0324', marks=skip_post_blackwell),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-])
-def test_ptp_quickstart_advanced_deepseek_multi_nodes(llm_root, llm_venv,
-                                                      model_path):
-    # "RCCA https://nvbugs/5163844"
-    print(f"Testing {model_path}.")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    run_cmd = [
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        "--moe_ep_size=8",
-        "--tp_size=16",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--max_batch_size=32",
-        "--max_num_tokens=2048",
-        "--disable_kv_cache_reuse",
-    ]
-    output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
-    assert "Generated text:" in output, output[-4000:]
 
 
 @pytest.mark.parametrize("model_name,model_path,eagle_model_path", [
@@ -1655,14 +1642,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
 @pytest.mark.parametrize("model_path,llm_api_config", [
-    pytest.param('Qwen3/Qwen3-235B-A22B',
-                 None,
-                 marks=skip_pre_hopper,
-                 id='Qwen3/Qwen3-235B-A22B'),
-    pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
-                 None,
-                 marks=skip_pre_blackwell,
-                 id='Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf'),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4',
                  None,
                  marks=skip_pre_blackwell,

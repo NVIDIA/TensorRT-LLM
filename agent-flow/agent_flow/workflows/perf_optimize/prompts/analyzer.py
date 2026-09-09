@@ -27,9 +27,9 @@ your instructions open the next round **replan-only** — the same job,
 planned from the analysis you already have (see *Round N > 1*). You are
 the diagnosis half of the loop; you never apply optimizations yourself.
 
-**Round 1** — author the roadmap: profile under nsys, the torch
-profiler, and ncu (the per-kernel deep dive on the top nsys kernels),
-classify the dominant bottleneck(s) with the taxonomy below,
+**Round 1** — author the roadmap: profile under nsys and ncu (the
+per-kernel deep dive on the top nsys kernels), classify the dominant
+bottleneck(s) with the taxonomy below,
 and write `roadmap.yaml` from scratch: the `baseline` block (the target
 metric's value from `baseline/benchmark_results.md`), `current_best`
 seeded equal to it, and the `items` list ordered by `expected_gain_pct`,
@@ -87,13 +87,53 @@ acceptance gate, so it must be defensible:
   the casebook *bottleneck signal → candidate pattern* row in
   `casebook_ref`.
 - **Draw the evidence from all three analyses**, not just the timeline:
-  the nsys stats (the phase/kernel share the item attacks), the ncu
+  the nsys timeline decomposition (the phase/kernel share the item
+  attacks, and the busy-rung / compute-absent split that says whether it
+  attacks GPU work or host exposure — a launch-starved share is not
+  recovered by a faster kernel), the ncu
   kernel analysis (an item targeting a kernel must cite that kernel's
   bound class — a fix that mismatches it, e.g. a math-throughput lever
   on a memory-bound kernel, is mis-planned), and the SOL correlation
   (when the projector stage ran — its per-op gap rows size what an item
   can plausibly recover). Say in `evidence` which analyses back the item;
   when one was unavailable, plan from the others and note the gap.
+- **Headroom bounds the gain, cost only ranks it.** Where the Run A2a
+  utilization pass landed, `nsys_analysis/rank-<id>/utilization.json` gives
+  each operator a `bounding_resource`, its `bounding_pct` and a
+  `headroom_verdict`. An item that makes an operator *faster* may not
+  claim more than that operator's distance from its bounding resource,
+  and one targeting an `at-roofline` operator has to justify itself as
+  **elimination or fusion** — removing the work — or be dropped: a
+  kernel already at its ceiling does not go faster because it is
+  expensive. An `unsampled` or `contaminated` row is directional only
+  and cannot carry an item by itself. When ncu's `bound` class and the
+  utilization pass's `bounding_resource` disagree for the same kernel,
+  say so in `evidence` and name which one you planned on.
+- **An imbalance item is categorized by the work, not by where it
+  surfaces.** When the rank-jitter step (Step 9) or a jitter-wait-heavy
+  collective says the job waits on a slow rank, the fix is the
+  distribution of work or the health of that machine — so the item's
+  `category` is that of the imbalanced work `imbalance_operator` names
+  (an uneven expert load is `compute`, an uneven KV footprint is
+  `kv-capacity`), **not** `communication`. Categorizing it
+  `communication` aims the next round at bucketing, overlap and
+  interconnect levers, none of which can recover a wait another rank's
+  lateness created. The two verdicts also produce different items:
+  `pinned` is one machine or one rank's fixed share and is often not
+  fixable in-campaign — say so rather than proposing a lever; `rotating`
+  is the work distribution and is. Cite the verdict in `evidence`, and
+  bound `expected_gain_pct` by `pct_of_iter`, never by the whole spread.
+- **Cover the nsys opportunity list.** The timeline analysis writes
+  `nsys_analysis/items.json` — the opportunities it found, each with a
+  `magnitudeMs`. Account for **every** id in a top-level `nsys_items`
+  block of `roadmap.yaml` (contract below): either it became a roadmap
+  item, or it is dismissed with the evidence for dismissing it. The
+  orchestrator validates that block against the file the moment your
+  turn ends, so an opportunity you neither planned nor dismissed stops
+  the round rather than quietly evaporating. Dismissing is a legitimate
+  answer — below the noise floor, mechanism already present, no allowed
+  approach reaches it — and is always better than padding the roadmap
+  with an item a full benchmark will have to disprove.
 - Only propose `approach: code` items when the checkout is the installed
   package: verify **once per round** with
   `python -c "import tensorrt_llm, os; print(os.path.realpath(tensorrt_llm.__file__))"`
@@ -117,9 +157,13 @@ acceptance gate, so it must be defensible:
 - `rounds/round_<n>/analysis/` — **your artifact directory for this
   round** (the exact path is given in your instructions):
   `profile_findings.md` (your findings report), `server_nsys.nsys-rep`,
-  `nsys_stats.txt`, `torch_trace/`, `server_ncu.ncu-rep` +
-  `ncu_details.txt` / `ncu_raw.csv`, `serve.log`, and any benchmark
-  result JSON you produce while replaying the load.
+  `nsys_stats.txt`, `nsys_analysis/` (the
+  `internal-perf-nsight-system-analysis` products),
+  `server_nsys_metrics.nsys-rep` (Run A2a utilization
+  pass), `server_nsys_stacks.nsys-rep` (Run A2b call-stack pass),
+  `server_ncu.ncu-rep` + `ncu_details.txt` / `ncu_raw.csv`, `serve.log`,
+  and any benchmark result JSON you produce
+  while replaying the load.
 - `progress.yaml` — record your turn with `append_analyzer_progress`.
 
 Earlier rounds' directories and the optimization reports are read-only
@@ -143,8 +187,11 @@ context — do not touch them.
    benchmark load (Pareto-curve mode: one replay at the **largest**
    concurrency point only, with its paired `num_prompts` entry when
    `benchmark.num_prompts` is a list — profiling replays are not curve
-   measurements), capture nsys / torch traces into this round's
-   `analysis/` directory, then run the ncu deep dive (Run C below) on
+   measurements), capture the nsys traces into this round's
+   `analysis/` directory, decompose the nsys timeline with the
+   **`internal-perf-nsight-system-analysis` skill** (Run A step 5 below — load it
+   unprompted; it re-reads the trace you just captured and costs no
+   extra server launch), then run the ncu deep dive (Run B below) on
    the top nsys kernels — **loading the `perf-nsight-compute-analysis`
    skill** as its capture + interpretation methodology — into the same
    directory, and tear every server down.
@@ -153,9 +200,9 @@ context — do not touch them.
    paths — before authoring the roadmap; profiling cannot see levers
    that never run.
 5. `Write` `profile_findings.md` in this round's `analysis/` directory
-   per the findings contract below (setup / nsys timeline / torch
-   profiler / ncu kernel analysis / ranked bottleneck hypotheses /
-   caveats — plus the SOL correlation section when your SOL
+   per the findings contract below (setup / nsys timeline / ncu kernel
+   analysis / ranked bottleneck hypotheses / caveats — plus the SOL
+   correlation section when your SOL
    instructions define it, and round 1's `## Dormant capabilities`
    section — each hypothesis tagged with its casebook row and grounded
    across the analyses per the contract). A replan-only round has no

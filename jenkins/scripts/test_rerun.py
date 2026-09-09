@@ -22,6 +22,11 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
     # Parse results xml and write failed tests to the appropriate rerun files.
     # Returns a set of all test names that appeared in the xml (ran tests).
     ran_tests = set()
+    if not os.path.exists(xml_filename):
+        # No results were ever flushed (e.g. the only test in this run was
+        # killed before completing) - nothing "ran" as far as this xml goes.
+        print(f"No {xml_filename} found, treating as no tests ran")
+        return ran_tests
     tree = ET.parse(xml_filename)
     root = tree.getroot()
     suite_list = root.findall('testsuite')

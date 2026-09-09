@@ -34,11 +34,37 @@ from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.sampling_params import LogitsProcessor
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
 from .video_mme import VideoMME as VideoMMEEvaluator
+
+
+class ForceTokenLogitsProcessor(LogitsProcessor):
+
+    def __init__(self, forced_token_id: int) -> None:
+        self._forced_token_id = forced_token_id
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: list[list[int]],
+        stream_ptr: int | None,
+        client_id: int | None,
+    ) -> None:
+        del req_id, token_ids, client_id
+        if stream_ptr is None:
+            self._force_token(logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._force_token(logits)
+
+    def _force_token(self, logits: torch.Tensor) -> None:
+        logits.fill_(float("-inf"))
+        logits[..., self._forced_token_id] = 0
 
 
 def compute_theta(num_samples: int,
@@ -123,6 +149,23 @@ Evaluated {self.metric_name}: {accuracy:.3f}
             assert accuracy >= self.threshold, err_msg
         else:
             assert accuracy <= self.threshold, err_msg
+
+
+def compute_acceptance_length(llm: PyTorchLLM) -> float:
+    """Mean acceptance length over speculative iterations.
+
+    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    """
+    stats = llm.get_stats(timeout=2)
+    spec_iters = [
+        stat["specDecodingStats"] for stat in stats
+        if stat.get("specDecodingStats")
+        and stat["specDecodingStats"]["numDraftTokens"] > 0
+    ]
+    assert spec_iters, "No iterations with speculative decoding stats"
+    accepted = sum(stat["numAcceptedTokens"] for stat in spec_iters)
+    requests = sum(stat["numRequestsWithDraftTokens"] for stat in spec_iters)
+    return (accepted + requests) / requests
 
 
 def assert_acceptance_length(test_key: str, al_value: float) -> None:

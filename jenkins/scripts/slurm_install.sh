@@ -23,6 +23,11 @@ bashUtilsPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | s
 source "$bashUtilsPath"
 
 slurm_install_setup() {
+    : "${tarName:?tarName is required}"
+    : "${llmTarfile:?llmTarfile is required}"
+    : "${resourcePathNode:?resourcePathNode is required}"
+    : "${stageName:?stageName is required}"
+    : "${pytestCommand:?pytestCommand is required}"
     cd $resourcePathNode
     llmSrcNode=$resourcePathNode/TensorRT-LLM/src
 
