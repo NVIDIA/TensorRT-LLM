@@ -138,9 +138,7 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
-        bool returnPerfMetrics = false,
-        std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
-        std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
+        bool returnPerfMetrics = false, std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
@@ -192,7 +190,6 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mInputTokenExtraIds(std::move(inputTokenExtraIds))
         , mReturnPerfMetrics(returnPerfMetrics)
-        , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
@@ -284,7 +281,6 @@ public:
         , mEncoderOutputLength(req.getEncoderOutputLength())
         , mContextPhaseParams(req.getContextPhaseParams())
         , mReturnPerfMetrics(req.getOutputConfig().returnPerfMetrics)
-        , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSalt(req.getCacheSalt())
     {
@@ -982,16 +978,6 @@ public:
     void setKvCacheRetentionConfig(executor::KvCacheRetentionConfig config)
     {
         mKvCacheRetentionConfig = config;
-    }
-
-    [[nodiscard]] std::optional<executor::GuidedDecodingParams> getGuidedDecodingParams() const
-    {
-        return mGuidedDecodingParams;
-    }
-
-    void setGuidedDecodingParams(executor::GuidedDecodingParams guidedDecodingParams)
-    {
-        mGuidedDecodingParams = guidedDecodingParams;
     }
 
     [[nodiscard]] bool returnLogProbs() const
@@ -2034,9 +2020,6 @@ protected:
     bool mReturnPerfMetrics{false};
     mutable executor::RequestPerfMetrics mPerfMetrics;
 
-    // Guided decoding params.
-    std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
-
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
     // Time in milliseconds after which the model is finished with a `timeout` finishReason.
@@ -2204,7 +2187,6 @@ public:
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, bool returnPerfMetrics = false,
-        std::optional<executor::GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<TimePoint> arrivalTime = std::nullopt,
@@ -2239,8 +2221,7 @@ public:
             llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
-            returnPerfMetrics, std::move(guidedDecodingParams), allottedTimeMs, contextPhaseParams, arrivalTime,
-            std::move(agent_hierarchy),
+            returnPerfMetrics, allottedTimeMs, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),

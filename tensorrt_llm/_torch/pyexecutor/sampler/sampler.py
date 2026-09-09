@@ -844,7 +844,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         state staged for its target.
         """
         return (
-            request.guided_decoding_params is not None
+            request.py_guided_decoding_params is not None
             or bool(getattr(request, "py_logits_post_processors", None))
             or bool(getattr(request, "py_is_draft", False))
         )

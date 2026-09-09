@@ -84,7 +84,7 @@ class GuidedRequest:
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
         return cls(
-            guided_decoding_params=request.guided_decoding_params,
+            guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
             seq_slot=(request.py_target_seq_slot
                       if request.py_is_draft else request.py_seq_slot),

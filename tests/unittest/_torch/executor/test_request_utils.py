@@ -180,6 +180,28 @@ def test_executor_request_to_llm_request_owns_multimodal_embedding_in_python() -
     assert child_embedding.data_ptr() != embedding.data_ptr()
 
 
+def test_executor_request_to_llm_request_owns_guided_decoding_params_in_python() -> None:
+    params = trtllm.GuidedDecodingParams(trtllm.GuidedDecodingParams.GuideType.REGEX, guide=r"\d+")
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        guided_decoding_params=params,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.py_guided_decoding_params.guide == params.guide
+    child_params = llm_request.child_requests[0].py_guided_decoding_params
+    assert child_params.guide == params.guide
+    assert child_params is not llm_request.py_guided_decoding_params
+
+
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""
 
