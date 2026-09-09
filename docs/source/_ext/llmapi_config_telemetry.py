@@ -74,14 +74,11 @@ def _table(rows: list[dict]) -> str:
 
 
 def generate_telemetry_reference(repo_root: Path | str, output_path: Path | str) -> None:
+    """Render every runtime configuration group in the telemetry manifest."""
     repo_root = Path(repo_root)
     golden = json.loads((repo_root / _GOLDEN_REL).read_text())
-    preferred = ("TorchLlmArgs", "VisualGenArgs")
-    model_names = [name for name in preferred if name in golden]
-    model_names.extend(sorted(set(golden) - set(model_names)))
     content = [_REFERENCE_PREAMBLE]
-    for model_name in model_names:
-        rows = golden[model_name]
+    for model_name, rows in golden.items():
         content.extend(
             [
                 f"### `{model_name}`",
