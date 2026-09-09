@@ -233,7 +233,11 @@ def test_rejects_non_contiguous(compact_gate):
     """
     gate = torch.randn(32, 4, device="cuda", dtype=torch.bfloat16)[:, ::2]
     up = torch.randn(32, 4, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    # Pin both preconditions: in the up_only case a contiguous `up` would make
+    # the call legal, and the test would fail as "DID NOT RAISE" rather than
+    # pointing at the setup that stopped being strided.
     assert not gate.is_contiguous()
+    assert not up.is_contiguous()
     if compact_gate:
         gate = gate.contiguous()
 
