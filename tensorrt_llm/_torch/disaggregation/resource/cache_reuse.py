@@ -75,6 +75,42 @@ class CacheReuseAdapter(ABC):
         """
 
     @abstractmethod
+    def get_block_ordinals(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+    ) -> np.ndarray:
+        """Positional block table for *req* (dtype ``int64``, single beam only).
+
+        Entry ``i`` is the primary-pool slot for tokens ``[i * tpb, ...)``, or
+        ``-1`` where the block is out-of-window (SWA-evicted) or unbound. Unlike
+        :meth:`get_block_ids`, position is carried by the index rather than by
+        the list length, so the caller can select a token range by slicing
+        instead of counting. Only meaningful for ``beam_width == 1`` (the packed
+        multi-beam layout is not positional).
+        """
+
+    def get_beam0_ordinals_and_tails(
+        self,
+        req: LlmRequest,
+        group_idx: int,
+        lg: AttentionLayerGroup,
+    ) -> "tuple[np.ndarray, np.ndarray]":
+        """Positional beam-0 ordinals plus the packed divergent beam tails.
+
+        ``beam0_ordinals`` follows the :meth:`get_block_ordinals` contract
+        (index==ordinal, ``-1`` for stale/unbound), so the caller selects beam-0's
+        window by slicing -- the same positional path as ``beam_width == 1``.
+        ``tails`` are the per-beam final blocks that differ from beam-0's, carried
+        verbatim after the window (they are not positional). Only V1 supports beam
+        search over disagg; V2 raises.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support beam_width > 1 disagg transfer"
+        )
+
+    @abstractmethod
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit KV blocks to radix tree for future prefix reuse.
 
@@ -123,6 +159,56 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         )
         return np.asarray(pool_indices, dtype=np.int64)
 
+    def get_block_ordinals(self, req, group_idx, lg):
+        # V1 keeps the whole pre-eviction chain in order (removeFrontBlock only
+        # bumps a counter, never drops the id), so the translated list is already
+        # positional. SWA-evicted front blocks are still real ids here; mask them
+        # to -1 using the manager's authoritative front-removed count so the
+        # positional contract matches V2 (which reports holes directly).
+        ids = self.get_block_ids(req, group_idx, lg)
+        if ids.size == 0:
+            return ids
+        window_size = lg.sliding_window_size
+        assert window_size is not None
+        stale = self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size)
+        if stale > 0:
+            ids = ids.copy()
+            ids[: min(stale, ids.size)] = -1
+        return ids
+
+    def get_beam0_ordinals_and_tails(self, req, group_idx, lg):  # noqa: ARG002
+        window_size = lg.sliding_window_size
+        assert window_size is not None
+        # Raw per-beam chains (before _pack_beam_cache_indices flattens them).
+        # result[0] is this request's list of beam chains; beam 0 owns the shared
+        # prefix, the others contribute only their final block.
+        beams = self._mgr.impl.get_batch_cache_block_ids([req.py_request_id], window_size)[0]
+        if not beams or not beams[0]:
+            empty = np.array([], dtype=np.int64)
+            return empty, empty
+        beam0 = list(beams[0])
+        beam0_last = beam0[-1]
+        tail_ids = [beam[-1] for beam in beams[1:] if beam and beam[-1] != beam0_last]
+        # Translate logical block ids to primary-pool slots (see get_block_ids).
+        beam0_pool = np.asarray(
+            self._mgr.get_memory_pool_block_indices(beam0, window_size=window_size),
+            dtype=np.int64,
+        )
+        # Mask the SWA-evicted front to -1 (authoritative count), matching the
+        # get_block_ordinals contract.
+        stale = self._mgr.get_num_front_blocks_removed(req.py_request_id, window_size=window_size)
+        if stale > 0:
+            beam0_pool[: min(stale, beam0_pool.size)] = -1
+        tails = (
+            np.asarray(
+                self._mgr.get_memory_pool_block_indices(tail_ids, window_size=window_size),
+                dtype=np.int64,
+            )
+            if tail_ids
+            else np.array([], dtype=np.int64)
+        )
+        return beam0_pool, tails
+
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         if not self.enable_block_reuse:
             return
@@ -161,6 +247,17 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         return np.fromiter(
             self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
                 group_idx, valid_only=True
+            ),
+            dtype=np.int64,
+        )
+
+    def get_block_ordinals(self, req, group_idx, lg):  # noqa: ARG002
+        # valid_only=False yields one entry per block ordinal, with -1
+        # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
+        # Position is the index; no length arithmetic needed.
+        return np.fromiter(
+            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
+                group_idx, valid_only=False
             ),
             dtype=np.int64,
         )

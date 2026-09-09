@@ -60,7 +60,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import DataType, LlmRequestState
@@ -390,77 +390,54 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                groups.append(
+                group = (
                     np.array([slot], dtype=np.int64)
                     if slot is not None
                     else np.array([], dtype=np.int64)
                 )
-                continue
-            block_ids = adapter.get_block_ids(req, idx, lg)
-            window_size = lg.sliding_window_size
-
-            if window_size is not None:
-                draft_len = get_draft_token_length(req) if is_gen_only else 0
-                allocated_blocks = (
-                    req.prompt_len
-                    + draft_len
-                    + self._kv_cache_manager.num_extra_kv_tokens
-                    + tpb
-                    - 1
-                ) // tpb
-                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
-                    block_ids,
-                    req.py_beam_width,
-                    allocated_blocks,
-                )
-                if beam0_block_ids.size > allocated_blocks:
-                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
-                    block_ids = (
-                        np.concatenate([beam0_block_ids, tail_block_ids])
-                        if tail_block_ids.size > 0
-                        else beam0_block_ids
-                    )
-                # Current PyExecutor cache managers disable KV-cache token sinks,
-                # so SWA block lists contain an evictable prompt prefix followed
-                # by the speculative scratch tail. If token sinks are enabled,
-                # this must use block-ordinal metadata to preserve the sink prefix.
-                # Remove scratch before trimming stale prompt blocks; otherwise a
-                # boundary-crossing allocation can displace initialized prompt KV.
-                scratch_blocks = max(0, allocated_blocks - prompt_blocks)
-                if scratch_blocks > 0:
-                    if req.py_beam_width != 1:
-                        raise ValueError("speculative scratch blocks require beam_width == 1")
-                    block_ids = (
-                        block_ids[:-scratch_blocks]
-                        if scratch_blocks < block_ids.size
-                        else np.array([], dtype=np.int64)
-                    )
-                # Drop stale blocks the manager may still expose (V1 pre-eviction).
-                stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
-                expected_valid = max(0, prompt_blocks - stale_end)
-                # Skip reused blocks that remain after stale-prefix pruning.
-                cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
+            elif req.py_beam_width == 1:
+                # Single beam (which is every MTP request -- spec decoding forces
+                # beam_width == 1): pick blocks by position. ordinal i holds
+                # tokens [i*tpb, ...), or -1 if the block is out-of-window or
+                # unbound. Keep [start:prompt_blocks): the upper bound drops the
+                # speculative tail and the ctx first-token block; start skips the
+                # receiver's cached prefix; the >= 0 filter drops stale/unbound
+                # holes.
+                ordinals = adapter.get_block_ordinals(req, idx, lg)
+                start = cached_per_lg[idx] // tpb
+                window = ordinals[start:prompt_blocks]
+                group = window[window >= 0].astype(np.int64)
             else:
-                # Drop the speculative scratch tail; only prompt_len is transferred.
-                if block_ids.size > prompt_blocks:
-                    block_ids = block_ids[:prompt_blocks]
-                expected_valid = prompt_blocks
-                cache_skip = cached_per_lg[idx] // tpb
-
-            block_ids = self._trim_packed_beam_block_ids(
-                block_ids,
-                beam_width=req.py_beam_width,
-                total_blocks=prompt_blocks,
-                expected_valid=expected_valid,
-                cache_skip=cache_skip,
-            )
-
-            groups.append(block_ids)
+                # Packed-beam layout: not positional, so keep the count path.
+                group = self._packed_beam_group(req, idx, lg, prompt_blocks, cached_per_lg[idx])
+            groups.append(group)
 
         return KVSlice(
             is_last_slice=True,
             block_ids_per_layer_groups=groups,
         )
+
+    def _packed_beam_group(self, req, group_idx, lg, prompt_blocks, cached_tokens):
+        """Block ids for one layer group of a packed-beam (beam_width > 1) request.
+
+        beam-0's chain is positional, so select its window exactly like the
+        beam_width == 1 path: the prompt_blocks upper bound drops the ctx
+        first-token over-hang (always non-speculative -- spec forces
+        beam_width == 1), ``start`` skips the receiver's cached prefix, and -1
+        holes (stale/unbound) are filtered. The divergent per-beam tails are not
+        positional; carry them verbatim after the window. If the receiver already
+        holds all of beam-0 (window empty), the tails go with it -- matching the
+        legacy trim.
+        """
+        adapter = self._reuse_adapter
+        tpb = adapter.tokens_per_block
+        beam0_ordinals, tails = adapter.get_beam0_ordinals_and_tails(req, group_idx, lg)
+        start = cached_tokens // tpb
+        window = beam0_ordinals[start:prompt_blocks]
+        window = window[window >= 0].astype(np.int64)
+        if window.size == 0 or tails.size == 0:
+            return window
+        return np.concatenate([window, tails])
 
     def _slice_num_bytes(self, slice: KVSlice) -> int:
         """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
@@ -492,56 +469,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     # Attention: n blocks, each slot covers all layers.
                     total += n * pool.slot_bytes
         return total
-
-    @staticmethod
-    def _split_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split 1-D block IDs into beam-0 prefix and appended beam-tail blocks."""
-        if beam_width <= 1 or block_ids.size <= total_blocks:
-            return block_ids, np.array([], dtype=np.int64)
-        tail_count = min(beam_width - 1, block_ids.size - total_blocks)
-        if tail_count <= 0:
-            return block_ids, np.array([], dtype=np.int64)
-        return block_ids[:-tail_count], block_ids[-tail_count:]
-
-    @staticmethod
-    def _trim_packed_beam_block_ids(
-        block_ids: np.ndarray,
-        beam_width: int,
-        total_blocks: int,
-        expected_valid: int,
-        cache_skip: int,
-    ) -> np.ndarray:
-        """Trim/skip beam-0 blocks while preserving packed beam-tail blocks."""
-        if expected_valid <= 0:
-            return np.array([], dtype=np.int64)
-
-        beam0_block_ids, tail_block_ids = KvCacheTransceiverV2._split_packed_beam_block_ids(
-            block_ids, beam_width, total_blocks
-        )
-
-        if beam0_block_ids.size > expected_valid:
-            beam0_block_ids = (
-                beam0_block_ids[-expected_valid:]
-                if expected_valid > 0
-                else np.array([], dtype=np.int64)
-            )
-            if beam0_block_ids.size == 0:
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if cache_skip > 0:
-            if cache_skip < beam0_block_ids.size:
-                beam0_block_ids = beam0_block_ids[cache_skip:]
-            else:
-                beam0_block_ids = np.array([], dtype=np.int64)
-                tail_block_ids = np.array([], dtype=np.int64)
-
-        if tail_block_ids.size == 0:
-            return beam0_block_ids
-        return np.concatenate([beam0_block_ids, tail_block_ids])
 
     @staticmethod
     def _need_aux_transfer(req: LlmRequest) -> bool:
