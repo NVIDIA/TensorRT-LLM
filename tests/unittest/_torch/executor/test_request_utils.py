@@ -202,6 +202,34 @@ def test_executor_request_to_llm_request_owns_guided_decoding_params_in_python()
     assert child_params is not llm_request.py_guided_decoding_params
 
 
+def test_executor_request_to_llm_request_owns_mrope_data_in_python() -> None:
+    rotary_cos_sin = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    position_deltas = torch.tensor([-3], dtype=torch.int32)
+    position_ids = torch.arange(9, dtype=torch.int32).reshape(3, 1, 3)
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        mrope_config=trtllm.MropeConfig(rotary_cos_sin, position_deltas),
+    )
+    executor_request.py_multimodal_data = {"mrope_config": {"mrope_position_ids": position_ids}}
+
+    llm_request = executor_request_to_llm_request(
+        42,
+        executor_request,
+        child_req_ids=[43],
+        exclude_last_generation_logits=False,
+    )
+
+    mrope_config = llm_request.py_multimodal_data["mrope_config"]
+    assert mrope_config["mrope_position_ids"] is position_ids
+    torch.testing.assert_close(mrope_config["mrope_rotary_cos_sin"], rotary_cos_sin)
+    torch.testing.assert_close(mrope_config["mrope_position_deltas"], position_deltas)
+    child_config = llm_request.child_requests[0].py_multimodal_data["mrope_config"]
+    torch.testing.assert_close(child_config["mrope_position_ids"], position_ids)
+    assert child_config["mrope_position_ids"].data_ptr() != position_ids.data_ptr()
+
+
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""
 
