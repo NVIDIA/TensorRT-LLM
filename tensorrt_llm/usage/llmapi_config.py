@@ -329,6 +329,8 @@ def _policy_signature(policy: _CapturePolicy) -> str:
     if policy.policy_type == "union":
         signatures = sorted({_policy_signature(branch) for branch in policy.branches})
         return "|".join(signatures)
+    if policy.policy_type == "enum":
+        return f"enum[{policy.runtime_type.__name__}]"
     return policy.policy_type
 
 

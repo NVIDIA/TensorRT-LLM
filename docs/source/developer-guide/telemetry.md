@@ -64,7 +64,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.transceiver_runtime` | `literal\|none` | `categorical` | `CPP`, `PYTHON`, `auto` |
 | `checkpoint_io_policy` | `literal` | `categorical` | `auto`, `native`, `rank_striped_read_ahead` |
 | `context_parallel_size` | `int` | `value` |  |
-| `cp_config.cp_type` | `enum` | `categorical` | `ULYSSES`, `RING`, `HELIX` |
+| `cp_config.cp_type` | `enum[CpType]` | `categorical` | `ULYSSES`, `RING`, `HELIX` |
 | `cp_config.fifo_version` | `int\|none` | `value` |  |
 | `cp_config.tokens_per_block` | `int\|none` | `value` |  |
 | `cp_config.use_nccl_for_alltoall` | `bool\|none` | `value` |  |
@@ -163,7 +163,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_connector_config.connector` | `allowlist\|none` | `categorical` | `lmcache`, `lmcache-mp`, `kvbm` |
 | `layer_wise_benchmarks_config.calibration_layer_indices` | `list[int]\|none` | `value` |  |
 | `layer_wise_benchmarks_config.calibration_mode` | `literal` | `categorical` | `NONE`, `MARK`, `COLLECT` |
-| `load_format` | `allowlist\|enum` | `categorical` | `auto`, `dummy`, `vision_only`, `gms`, `AUTO`, `DUMMY`, `VISION_ONLY`, `GMS` |
+| `load_format` | `allowlist\|enum[LoadFormat]` | `categorical` | `auto`, `dummy`, `vision_only`, `gms`, `AUTO`, `DUMMY`, `VISION_ONLY`, `GMS` |
 | `lora_config.cuda_graph_specialize_lora` | `bool` | `value` |  |
 | `lora_config.lora_ckpt_source` | `literal` | `categorical` | `hf`, `nemo` |
 | `lora_config.max_cpu_loras` | `int\|none` | `value` |  |
@@ -187,7 +187,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `moe_expert_parallel_size` | `int\|none` | `value` |  |
 | `moe_tensor_parallel_size` | `int\|none` | `value` |  |
 | `multimodal_config.encoder_cache_max_bytes` | `int` | `value` |  |
-| `multimodal_config.encoder_scheduling_policy` | `enum` | `categorical` | `DISABLED`, `DEFAULT`, `EAGER` |
+| `multimodal_config.encoder_scheduling_policy` | `enum[MultimodalEncoderSchedulingPolicy]` | `categorical` | `DISABLED`, `DEFAULT`, `EAGER` |
 | `multimodal_config.encoder_side_stream_max_ahead` | `int` | `value` |  |
 | `multimodal_config.video_pruning_rate` | `float\|none` | `value` |  |
 | `mx_config.preshard_strategy` | `allowlist` | `categorical` | `per_module` |
@@ -211,7 +211,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `pipeline_parallel_size` | `int` | `value` |  |
 | `pp_partition` | `list[int]\|none` | `value` |  |
 | `prefill_capture_num_tokens` | `list[int]\|none` | `value` |  |
-| `prefill_cuda_graph_backend` | `enum` | `categorical` | `disabled`, `piecewise`, `breakable` |
+| `prefill_cuda_graph_backend` | `enum[PrefillCudaGraphBackend]` | `categorical` | `disabled`, `piecewise`, `breakable` |
 | `print_iter_log` | `bool` | `value` |  |
 | `prometheus_metrics_config.e2e_request_latency_buckets` | `list[float]\|none` | `value` |  |
 | `prometheus_metrics_config.request_decode_time_buckets` | `list[float]\|none` | `value` |  |
@@ -230,14 +230,14 @@ unset or when the safety sanitizer rejects the runtime value.
 | `request_stats_max_iterations` | `int\|none` | `value` |  |
 | `return_perf_metrics` | `bool` | `value` |  |
 | `sampler_force_async_worker` | `bool` | `value` |  |
-| `scheduler_config.capacity_scheduler_policy` | `enum` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
-| `scheduler_config.context_chunking_policy` | `enum\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
+| `scheduler_config.capacity_scheduler_policy` | `enum[CapacitySchedulerPolicy]` | `categorical` | `MAX_UTILIZATION`, `GUARANTEED_NO_EVICT`, `STATIC_BATCH` |
+| `scheduler_config.context_chunking_policy` | `enum[ContextChunkingPolicy]\|none` | `categorical` | `FIRST_COME_FIRST_SERVED`, `EQUAL_PROGRESS`, `FORCE_CHUNK` |
 | `scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window` | `int` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_batch_size_tuning` | `bool` | `value` |  |
 | `scheduler_config.dynamic_batch_config.enable_max_num_tokens_tuning` | `bool` | `value` |  |
 | `scheduler_config.enable_prefix_aware_scheduling` | `bool` | `value` |  |
 | `scheduler_config.use_python_scheduler` | `bool` | `value` |  |
-| `scheduler_config.waiting_queue_policy` | `enum` | `categorical` | `fcfs`, `priority` |
+| `scheduler_config.waiting_queue_policy` | `enum[WaitingQueuePolicy]` | `categorical` | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `bool` | `value` |  |
 | `sparse_attention_config.algorithm` | `literal` | `categorical` | `dsa`, `deepseek_v4`, `minimax_m3`, `qsa`, `rocket`, `skip_softmax` |
 | `sparse_attention_config.compress_ratios` | `list[int]` | `value` |  |
@@ -279,7 +279,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.window_size` | `int\|none` | `value` |  |
 | `speculative_config.acceptance_rate_threshold` | `float\|none` | `value` |  |
 | `speculative_config.acceptance_rate_window_size` | `int\|none` | `value` |  |
-| `speculative_config.advanced_sampling_mode` | `enum` | `categorical` | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
+| `speculative_config.advanced_sampling_mode` | `enum[AdvancedSamplingMode]` | `categorical` | `full`, `no_topk`, `no_topp`, `no_topk_no_topp` |
 | `speculative_config.allow_advanced_sampling` | `bool` | `value` |  |
 | `speculative_config.attention_backend` | `literal` | `categorical` | `VANILLA`, `TRTLLM` |
 | `speculative_config.begin_thinking_phase_token` | `int` | `value` |  |
@@ -322,7 +322,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.write_interval` | `int` | `value` |  |
 | `stream_interval` | `int` | `value` |  |
 | `telemetry_config.disabled` | `bool` | `value` |  |
-| `telemetry_config.usage_context` | `enum` | `categorical` | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
+| `telemetry_config.usage_context` | `enum[UsageContext]` | `categorical` | `unknown`, `llm_class`, `cli_serve`, `cli_bench`, `cli_eval`, `disaggregated` |
 | `tensor_parallel_size` | `int` | `value` |  |
 | `tokenizer_mode` | `literal` | `categorical` | `auto`, `slow` |
 | `torch_compile_config.capture_num_tokens` | `list[int]\|none` | `value` |  |

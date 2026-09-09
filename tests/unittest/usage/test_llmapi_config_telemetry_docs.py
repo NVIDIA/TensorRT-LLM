@@ -289,6 +289,7 @@ def test_golden_manifest_uses_compact_semantic_policies():
 
     by_path = {row["path"]: row for row in golden_manifest()["TorchLlmArgs"]}
     bool_row = by_path["enable_chunked_prefill"]
+    enum_row = by_path["prefill_cuda_graph_backend"]
     literal_row = by_path["kv_cache_config.mamba_ssm_cache_dtype"]
 
     assert bool_row == {
@@ -303,6 +304,8 @@ def test_golden_manifest_uses_compact_semantic_policies():
         "bfloat16",
         "float32",
     ]
+    assert enum_row["capture_policy"] == "enum[PrefillCudaGraphBackend]"
+    assert enum_row["allowed_values"] == ["disabled", "piecewise", "breakable"]
     assert "annotation" not in literal_row
     assert "converter" not in literal_row
 

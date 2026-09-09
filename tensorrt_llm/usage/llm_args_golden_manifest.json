@@ -186,7 +186,7 @@
         "RING",
         "HELIX"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[CpType]",
       "kind": "categorical",
       "path": "cp_config.cp_type"
     },
@@ -768,7 +768,7 @@
         "VISION_ONLY",
         "GMS"
       ],
-      "capture_policy": "allowlist|enum",
+      "capture_policy": "allowlist|enum[LoadFormat]",
       "kind": "categorical",
       "path": "load_format"
     },
@@ -910,7 +910,7 @@
         "DEFAULT",
         "EAGER"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[MultimodalEncoderSchedulingPolicy]",
       "kind": "categorical",
       "path": "multimodal_config.encoder_scheduling_policy"
     },
@@ -1049,7 +1049,7 @@
         "piecewise",
         "breakable"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[PrefillCudaGraphBackend]",
       "kind": "categorical",
       "path": "prefill_cuda_graph_backend"
     },
@@ -1166,7 +1166,7 @@
         "GUARANTEED_NO_EVICT",
         "STATIC_BATCH"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[CapacitySchedulerPolicy]",
       "kind": "categorical",
       "path": "scheduler_config.capacity_scheduler_policy"
     },
@@ -1176,7 +1176,7 @@
         "EQUAL_PROGRESS",
         "FORCE_CHUNK"
       ],
-      "capture_policy": "enum|none",
+      "capture_policy": "enum[ContextChunkingPolicy]|none",
       "kind": "categorical",
       "path": "scheduler_config.context_chunking_policy"
     },
@@ -1210,7 +1210,7 @@
         "fcfs",
         "priority"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",
       "path": "scheduler_config.waiting_queue_policy"
     },
@@ -1453,7 +1453,7 @@
         "no_topp",
         "no_topk_no_topp"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[AdvancedSamplingMode]",
       "kind": "categorical",
       "path": "speculative_config.advanced_sampling_mode"
     },
@@ -1703,7 +1703,7 @@
         "cli_eval",
         "disaggregated"
       ],
-      "capture_policy": "enum",
+      "capture_policy": "enum[UsageContext]",
       "kind": "categorical",
       "path": "telemetry_config.usage_context"
     },
