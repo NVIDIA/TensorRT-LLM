@@ -20,7 +20,6 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
-from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import sol_attn_graph_phase
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
@@ -108,7 +107,7 @@ class BaseDiffusionModel(nn.Module):
             # the two phases must not share a captured graph.
             runner.register_extra_key_fn(
                 "sol_attn_phase",
-                lambda *args, **kwargs: sol_attn_graph_phase(
+                lambda *args, **kwargs: SkipSoftmaxScheduler.get_graph_phase_for_timestep(
                     kwargs.get("timestep"),
                     disabled_until_timestep=disabled_until_timestep,
                 ),
