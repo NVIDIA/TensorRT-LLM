@@ -237,10 +237,10 @@ All of it lands in the decision and in OpenSearch:
 |---|---|---|
 | `coverage_db_build` | `l_coverage_db_build` | 0 when no DB was consulted |
 | `coverage_db_commit` | `s_coverage_db_commit` | |
-| `coverage_db_lag` | `l_coverage_db_lag` | ranking / overall freshness; `null` / `-1` when unmeasurable |
+| `coverage_db_lag` | `l_coverage_db_lag` | overall freshness only; `null` / `-1` when unmeasurable |
 | `coverage_db_base_commit` | `s_coverage_db_base_commit` | the PR's merge base |
 | `coverage_db_drift` | `l_coverage_db_drift` | **the gated number**; `null` / `-1` when unmeasurable |
-| `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `identical` for every selected DB |
+| `coverage_db_drift_status` | `s_coverage_db_drift_status` | `ahead` / `behind` / `identical` for every selected DB |
 | `coverage_freshness` | `s_coverage_freshness` | `ok` / `stale` / `unknown`, empty when no DB |
 
 so the decline rate is queryable per verdict rather than only readable in `s_reason`.
