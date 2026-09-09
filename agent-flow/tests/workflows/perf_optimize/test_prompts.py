@@ -33,6 +33,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
     KERNEL_REUSE,
     MEASUREMENT_PROTOCOL,
+    NATIVE_RUNTIME_REUSE,
     OPTIMIZE_HTML_COMPANION,
     PROFILE_FINDINGS_CONTRACT,
     ROADMAP_SPEC,
@@ -62,6 +63,13 @@ _MEASURING = ("benchmarker", "analyzer", "evaluator", "qa")
 def _norm(text: str) -> str:
     """Collapse whitespace so substring assertions survive line-wrapping."""
     return re.sub(r"\s+", " ", text)
+
+
+def test_every_role_gets_the_static_wheel_runtime_guidance():
+    assert "normal wheel installation" in NATIVE_RUNTIME_REUSE
+    assert "`PYTHONPATH` alone does not supply missing native files" in _norm(NATIVE_RUNTIME_REUSE)
+    for prompt in vars(DEFAULT_PROMPTS).values():
+        assert NATIVE_RUNTIME_REUSE in prompt
 
 
 # Canonical ``benchmark_serving.py`` flags every measuring role must carry.
