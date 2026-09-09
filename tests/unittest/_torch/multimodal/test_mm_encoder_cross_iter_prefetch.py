@@ -74,6 +74,7 @@ class _CacheStubModel(_StubModel):
             )
         )
         self.last_encoder_batch_size = 0
+        self._initialize_multimodal_encoder_cache(4096)
 
     @property
     def embedding_dim(self) -> int:

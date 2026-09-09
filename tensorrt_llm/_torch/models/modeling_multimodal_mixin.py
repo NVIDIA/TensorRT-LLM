@@ -1066,7 +1066,7 @@ class MultimodalModelMixin:
         records each entry's producer event on the issuing (aux) stream; the next iteration's
         main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
-        encoder_cache = self._get_multimodal_encoder_cache()
+        encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
         partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
         if encoder_cache is not None:
@@ -1107,60 +1107,51 @@ class MultimodalModelMixin:
         self._validate_embeddings(embeddings, multimodal_params)
         return embeddings[0]
 
-    def _get_multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """Return the per-model full-request-path encoder clone cache, if enabled.
+    def _initialize_multimodal_encoder_cache(self, max_bytes: int) -> Optional[TensorLRUCache]:
+        """Initialize the model-owned multimodal encoder-output cache once.
 
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
-
-        Scope: the single encoder cache instance for a cache-enabled model
-        (`supports_encoder_cache`). The full-request (legacy inline-encode) consumers — side-stream
-        prefetch, `mm_encoder_only`/disagg encoding — populate and read it inline; the
-        item-scheduling path consumes the same instance read-through at encode time
-        (`ModelEngine.forward_multimodal_encoder_items`). The key format is shared
-        (`_encoder_cache_item_key`) so hits cross between paths. The item path's recorded outputs
-        are cloned, so cache eviction never invalidates an in-flight request.
+        `ModelEngine` resolves `max_bytes` as the larger of the item-scheduling
+        output budget and persistent-reuse capacity before runtime access.
+        Zero leaves the cache disabled.
         """
-        if not self.encoder_cache_active:
+        if self._multimodal_encoder_cache is not None:
+            return self._multimodal_encoder_cache
+
+        if max_bytes == 0:
             logger.debug_once(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
-                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because neither item scheduling nor "
+                "persistent reuse requires storage.",
                 key="mm_encoder_cache_disabled",
             )
             return None
 
         multimodal_config = self.model_config.multimodal_config
-        max_bytes = multimodal_config.encoder_cache_max_bytes
-        if self._multimodal_encoder_cache is None:
-            # Per-item embeddings are views produced by splitting a request-level encoder output.
-            # Clone them so a cached item neither aliases mutable caller output nor retains the
-            # entire batch allocation while cache accounting charges only its logical size. This
-            # briefly needs source and clone memory during insertion, but preserves existing cache
-            # entries when the copy cannot be allocated.
-            self._multimodal_encoder_cache = TensorLRUCache(
-                max_bytes,
-                name=_MM_ENCODER_CACHE_LOG_NAME,
-                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+        self._multimodal_encoder_cache = TensorLRUCache(
+            max_bytes,
+            name=_MM_ENCODER_CACHE_LOG_NAME,
+            cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+        )
+        try:
+            embedding_dim = self.embedding_dim
+            embedding_dtype = self.embedding_dtype
+        except NotImplementedError:
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                "embedding row capacity unavailable because the model does not implement "
+                "embedding_dim and embedding_dtype."
             )
-            try:
-                embedding_dim = self.embedding_dim
-                embedding_dtype = self.embedding_dtype
-            except NotImplementedError:
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    "embedding row capacity unavailable because the model does not implement "
-                    "embedding_dim and embedding_dtype."
-                )
-            else:
-                bytes_per_embedding_row = (
-                    embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
-                )
-                max_embedding_rows = max_bytes // bytes_per_embedding_row
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
-                    f"embedding_dtype={embedding_dtype}"
-                )
+        else:
+            bytes_per_embedding_row = (
+                embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+            )
+            max_embedding_rows = max_bytes // bytes_per_embedding_row
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
+                f"embedding_dtype={embedding_dtype}"
+            )
         return self._multimodal_encoder_cache
 
     @staticmethod
@@ -1678,7 +1669,7 @@ def _dispatch_cross_iter_prefetch(
     encoder_event = None
     try:
         with _run_on_aux_stream(aux_stream) as encoder_event:
-            encoder_cache = model._get_multimodal_encoder_cache() if encoder_cache_enabled else None
+            encoder_cache = model._multimodal_encoder_cache if encoder_cache_enabled else None
             cache_misses: list[MultimodalParams] = []
             partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
             if encoder_cache is None:

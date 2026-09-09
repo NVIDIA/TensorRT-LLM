@@ -12,6 +12,7 @@ from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
     MultimodalInput,
+    MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
@@ -74,6 +75,13 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
     assert multimodal_data["multimodal_embedding_lengths"] == [2]
     assert "multimodal_item_refs" not in multimodal_data
     assert "multimodal_encoder_token_lengths" not in multimodal_data
+
+    params = MultimodalParams(multimodal_data=multimodal_data)
+    params.to_handle("multimodal_data")
+    assert isinstance(
+        params.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY],
+        MultimodalEncoderItemMetadata,
+    )
 
 
 def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
