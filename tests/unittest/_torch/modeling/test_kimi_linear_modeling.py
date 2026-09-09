@@ -10,6 +10,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_kimi_linear
 from tensorrt_llm._torch.utils import AuxStreamType
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_kimi_linear_model_builds_shared_aux_stream_registry(
     monkeypatch: pytest.MonkeyPatch,
