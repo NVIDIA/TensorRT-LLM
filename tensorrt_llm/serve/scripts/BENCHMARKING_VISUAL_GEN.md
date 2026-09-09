@@ -112,17 +112,21 @@ sequenceDiagram
 
     alt image backend
         C->>S: POST /v1/images/generations | /v1/images/edits
-        S-->>C: 200 + body + Server-Timing<br/>ends e2e_latency
+        S-->>C: 200 + body + Server-Timing
+        Note over C,S: ends e2e_latency
     end
 
     alt video backend
         C->>S: POST /v1/videos
         S-->>C: 202 + job id
-        C->>S: GET /v1/videos/{id}<br/>every --poll-interval
-        S-->>C: status: postprocessing<br/>ends gen_latency
+        C->>S: GET /v1/videos/{id}
+        Note over C,S: every --poll-interval
+        S-->>C: status: postprocessing
+        Note over C,S: ends gen_latency
         S-->>C: status: completed
         C->>S: GET /v1/videos/{id}/content
-        S-->>C: 200 + media + Server-Timing<br/>ends e2e_latency
+        S-->>C: 200 + media + Server-Timing
+        Note over C,S: ends e2e_latency
     end
 
     C->>C: --output-media-dir writes outside the concurrency slot
