@@ -328,6 +328,35 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         self._select_op_provider()
 
         self._weights_created = False
+
+        # Not all models that use this backend define shared experts (e.g. non-DeepSeek
+        # MoEs), so fall back to 0 when the config has no `n_shared_experts`. Retain the
+        # scalar so ``_resolve_fused_shared_expert`` can recompute the fused-expert count
+        # without holding onto the whole pretrained config.
+        self._n_shared_experts = getattr(model_config.pretrained_config,
+                                         "n_shared_experts", 0) or 0
+
+        # ``num_fused_shared_expert`` is derived from the op backend, so resolve it here
+        # for the provider chosen above (recomputed in ``create_weights`` if the provider
+        # is re-resolved once the per-layer quant config is known).
+        self._resolve_fused_shared_expert()
+
+        # create_weights must see the final fused-expert count so the fused shared
+        # slots are allocated when fusion is enabled.
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+        self.layer_idx = layer_idx
+
+    def _resolve_fused_shared_expert(self) -> None:
+        """(Re)compute how many shared experts are folded into the routed-expert
+        grouped GEMM, given the *current* ``self.op_backend``.
+
+        The count depends on the op backend, which ``create_weights`` can switch
+        when it re-resolves the provider for the final per-layer quant config
+        (see ``_select_op_provider``). Recomputing here keeps
+        ``num_fused_shared_expert`` consistent with that provider instead of
+        relying on the value settled at ``__init__`` time.
+        """
         self.num_fused_shared_expert = 0
 
         # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
@@ -344,28 +373,17 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         # local); gate it out here so EP configs fall back to the unfused path instead
         # of tripping the runtime EP check in the TRTLLM-Gen runner.
         fusion_supported = (
-            fusion_enabled and on_trtllm_backend
-            and model_config.mapping.dp_size == 1
-            and model_config.mapping.moe_ep_size == 1
-            and self.quant_config is not None
+            fusion_enabled and on_trtllm_backend and self.mapping.dp_size == 1
+            and self.mapping.moe_ep_size == 1 and self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_fp8_block_scales())
         if fusion_supported:
-            # Not all models that use this backend define shared experts (e.g. non-DeepSeek
-            # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
-            self.num_fused_shared_expert = getattr(
-                model_config.pretrained_config, "n_shared_experts", 0) or 0
+            self.num_fused_shared_expert = self._n_shared_experts
             if self.num_fused_shared_expert > 0:
                 logger.info_once(
                     f"Shared-expert fusion enabled: folding "
                     f"{self.num_fused_shared_expert} shared expert(s) into the "
                     f"routed-expert grouped GEMM.",
                     key="trtllm_gen_shared_expert_fusion")
-
-        # create_weights must see the final fused-expert count so the fused shared
-        # slots are allocated when fusion is enabled.
-        if not model_config.skip_create_weights_in_init:
-            self.create_weights()
-        self.layer_idx = layer_idx
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -645,6 +663,10 @@ class TRTLLMGenFusedMoE(MoEImplBase):
         # ``_select_op_provider``), so re-resolve the provider before the quant
         # method is chosen from the same config.
         self._select_op_provider()
+
+        # The provider may have switched above, and the fused-shared-expert count is
+        # derived from it, so recompute it before it is consumed below.
+        self._resolve_fused_shared_expert()
 
         self.quant_method = self._get_quant_method()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_block_scales(
