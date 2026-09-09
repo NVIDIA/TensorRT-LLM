@@ -276,6 +276,130 @@ class TestFA4PaddedQRaggedK:
         sub_out = _run(q_bhsd[sub_idx], [k_list[i] for i in sub_idx], [v_list[i] for i in sub_idx])
         torch.testing.assert_close(sub_out, full_out[sub_idx], rtol=2e-2, atol=2e-2)
 
+    def test_min_length_matches_sdpa_reference(self):
+        """kv_lens=1 is the real minimum: an empty negative prompt still
+        tokenizes to one EOS token, never zero (verified against the actual
+        Wan tokenizer)."""
+        device, dtype = "cuda", torch.bfloat16
+        B, S_q, H, d_h = 2, 4, 8, 64
+        kv_lens = [1, 100]
+        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
+
+        torch.manual_seed(7)
+        q_bhsd = torch.randn(B, H, S_q, d_h, device=device, dtype=dtype)
+        k_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        v_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        ref = _sdpa_reference(q_bhsd, k_list, v_list, attn.scale)
+
+        q_nhd = q_bhsd.transpose(1, 2).contiguous()
+        k_ragged = torch.cat([k.transpose(0, 1) for k in k_list], dim=0)
+        v_ragged = torch.cat([v.transpose(0, 1) for v in v_list], dim=0)
+        cu_seqlens_kv = torch.nn.functional.pad(
+            torch.cumsum(torch.tensor(kv_lens, dtype=torch.int32, device=device), dim=0), (1, 0)
+        ).to(torch.int32)
+
+        out, _ = attn._fwd(
+            q_nhd,
+            k_ragged,
+            v_ragged,
+            causal=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=None,
+            max_seqlen_k=max(kv_lens),
+        )
+        out_bhsd = out.transpose(1, 2)
+        torch.testing.assert_close(out_bhsd, ref, rtol=2e-2, atol=2e-2)
+
+    def test_production_scale_matches_sdpa_reference(self):
+        """Same combination, at Wan2.2-14B-scale shapes (720p/81-frame),
+        not just small synthetic ones."""
+        device, dtype = "cuda", torch.bfloat16
+        B, S_q, H, d_h = 2, 75600, 40, 128
+        kv_lens = [500, 5]  # worst-for-padding
+        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
+
+        torch.manual_seed(6)
+        q_bhsd = torch.randn(B, H, S_q, d_h, device=device, dtype=dtype)
+        k_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        v_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        ref = _sdpa_reference(q_bhsd, k_list, v_list, attn.scale)
+
+        q_nhd = q_bhsd.transpose(1, 2).contiguous()
+        k_padded = torch.zeros(B, 512, H, d_h, device=device, dtype=dtype)
+        v_padded = torch.zeros(B, 512, H, d_h, device=device, dtype=dtype)
+        for i, n in enumerate(kv_lens):
+            k_padded[i, :n] = k_list[i].transpose(0, 1)
+            v_padded[i, :n] = v_list[i].transpose(0, 1)
+        k_ragged, v_ragged, cu_seqlens_kv = Attention.pack_ragged_kv(k_padded, v_padded, kv_lens)
+
+        out, _ = attn._fwd(
+            q_nhd,
+            k_ragged,
+            v_ragged,
+            causal=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=None,
+            max_seqlen_k=max(kv_lens),
+        )
+        out_bhsd = out.transpose(1, 2)
+        torch.testing.assert_close(out_bhsd, ref, rtol=2e-2, atol=2e-2)
+
+
+class TestPackRaggedKvCache:
+    """Attention._cu_seqlens_kv_cached correctness under repeated/interleaved
+    kv_lens. No FA4/CUDA needed -- pure tensor bookkeeping, runs on CPU."""
+
+    def setup_method(self):
+        Attention._cu_seqlens_kv_cached.cache_clear()
+
+    def _check(self, k, v, kv_lens):
+        k_ragged, v_ragged, cu = Attention.pack_ragged_kv(k, v, kv_lens)
+        expected_cu = [0]
+        for n in kv_lens:
+            expected_cu.append(expected_cu[-1] + n)
+        assert cu.tolist() == expected_cu
+        assert torch.equal(k_ragged, torch.cat([k[i, :n] for i, n in enumerate(kv_lens)], dim=0))
+        assert torch.equal(v_ragged, torch.cat([v[i, :n] for i, n in enumerate(kv_lens)], dim=0))
+
+    def test_interleaved_kv_lens_hit_and_miss_both_correct(self):
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 96, 8, 32
+        k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+        v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+
+        lens_a, lens_b = [50, 14], [10, 30]
+        self._check(k, v, lens_a)  # miss
+        self._check(k, v, lens_b)  # miss
+        self._check(k, v, lens_a)  # hit
+        self._check(k, v, lens_b)  # hit
+
+        info = Attention._cu_seqlens_kv_cached.cache_info()
+        assert info.misses == 2
+        assert info.hits == 2
+
+    def test_repeated_kv_lens_content_correct_on_new_k_v(self):
+        """Same kv_lens (cache hit on cu_seqlens_kv) but different K/V content
+        each call -- k_ragged/v_ragged must reflect the new content, not a
+        stale cached value."""
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 32, 4, 16
+        kv_lens = [7, 3]
+
+        for _ in range(3):
+            k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+            v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+            self._check(k, v, kv_lens)
+
+    def test_min_length_entry(self):
+        """kv_lens=1 is the real minimum (empty prompt -> one EOS token)."""
+        device, dtype = "cpu", torch.float32
+        B, S, H, d_h = 2, 96, 8, 32
+        k = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+        v = torch.randn(B, S, H, d_h, device=device, dtype=dtype)
+        self._check(k, v, [1, 60])
+
 
 class TestAttnImplVarlenDispatch:
     """Attention._attn_impl_varlen_kv: the reshape/dispatch glue, isolated
