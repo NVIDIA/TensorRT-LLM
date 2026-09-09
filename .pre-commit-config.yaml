@@ -1660,6 +1660,17 @@ repos:
         entry: ./scripts/check_test_list.py --validate
         language: script
         pass_filenames: false
+    -   id: check-binding-stubs
+        name: Verify collection binding stubs cover compiled extensions
+        entry: python scripts/check_binding_stubs.py
+        language: python
+        pass_filenames: false
+        files: >
+          (?x)^(
+            tests/integration/defs/stubify_bindings.py|
+            scripts/check_binding_stubs.py|
+            setup.py
+          )$
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py
