@@ -65,7 +65,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **MiniMax-H3** | Experimental | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **MiniMax-H3** | Yes [^8] | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
@@ -87,9 +87,19 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### MiniMax-H3 Notes
 
+[^8]: MiniMax-H3 FP8 blockwise execution is supported; audio quality acceptance remains open, as described below.
+
 - Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
   (Ref2VA) is not enabled yet.
-- TRTLLM attention requires SM100 or newer. Use VANILLA on older GPUs.
+- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
+  model-specific restriction, not a general VisualGen backend requirement. Use
+  VANILLA on other architectures pending numerical validation.
+- FP8 blockwise execution is supported, but its audio quality has not been accepted.
+  The 50-step B200 T2VA comparison (128×128, 124 frames, seed 0) measured audio
+  log-STFT distance 0.056177, above the [quality test's](../../../tests/integration/defs/examples/visual_gen/test_minimax_h3_e2e.py)
+  0.05 bound; BF16 measured 0.008525. This is a spectral regression metric,
+  not a listening-quality score. FP8 audio acceptance for the shorter 28-step profile
+  requires a fresh comparison.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

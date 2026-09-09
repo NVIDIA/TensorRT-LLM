@@ -414,14 +414,40 @@ def test_modular_manifest_preserves_pipeline_metadata(tmp_path: Path) -> None:
     assert config.primary_pretrained_config.expand_timesteps is True
 
 
-def test_trtllm_attention_rejects_older_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 9))
+@pytest.mark.parametrize("capability", [(8, 9), (9, 0), (10, 1), (12, 0)])
+def test_trtllm_attention_rejects_unvalidated_gpu(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     config = SimpleNamespace(
         mapping=SimpleNamespace(world_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
         MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_trtllm_attention_accepts_supported_gpu(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    config = SimpleNamespace(
+        mapping=SimpleNamespace(world_size=1),
+        attention=SimpleNamespace(backend="TRTLLM"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+    )
+    MiniMaxH3Pipeline(config)
+
+
+def test_default_generation_steps_match_reference_app() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    assert pipeline.default_generation_params["num_inference_steps"] == 28
 
 
 def test_hf_download_is_scoped_to_the_supported_fl2va_components(

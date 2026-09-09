@@ -149,11 +149,11 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise NotImplementedError("MiniMax-H3 initial support is single-GPU only.")
         if (
             pipeline_config.attention.backend == "TRTLLM"
-            and torch.cuda.get_device_capability()[0] < 10
+            and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
         ):
             raise NotImplementedError(
-                "MiniMax-H3 TRTLLM attention requires SM100 or newer for numerical "
-                "correctness. Use VANILLA on older GPUs."
+                "MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. "
+                "Other architectures need model-specific numerical validation; use VANILLA."
             )
         if pipeline_config.cache is not None:
             raise NotImplementedError(
@@ -183,7 +183,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": 50,
+            "num_inference_steps": 28,
         }
 
     @property

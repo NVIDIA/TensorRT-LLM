@@ -46,6 +46,7 @@ def main() -> None:
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
+    # Inherit the model's 28-step default, also used by the reference app.
     params.height = 512
     params.width = 512
 
