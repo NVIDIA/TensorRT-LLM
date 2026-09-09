@@ -77,7 +77,7 @@ def _double_precision_row(position: int, dim: int, theta: float) -> np.ndarray:
 def test_the_table_is_exact_at_position_zero():
     """Position 0 has no angle to get wrong: every entry is cos 0 / sin 0."""
     row = _plugin_row(0, HEAD_DIM, THETA)
-    np.testing.assert_allclose(row, _reference_row(0, HEAD_DIM, THETA), atol=1e-12)
+    np.testing.assert_array_equal(row, _reference_row(0, HEAD_DIM, THETA))
 
 
 def test_the_table_is_accurate_enough_below_eight_thousand():
