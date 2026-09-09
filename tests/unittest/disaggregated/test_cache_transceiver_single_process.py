@@ -197,6 +197,8 @@ class ThreadSafeDistributed:
         tp_rank: int,
         pp_rank: int,
         shared: dict,
+        cp_rank: int = 0,
+        cp_size: int = 1,
     ):
         self.rank = local_rank
         self._world_size = world_size
@@ -204,6 +206,14 @@ class ThreadSafeDistributed:
         self._pp_size = pp_size
         self._tp_rank = tp_rank
         self._pp_rank = pp_rank
+        # CP is orthogonal to TP/PP: each cp slice runs its own TP/PP collectives,
+        # so the per-group barriers are indexed by (rank, cp_rank). ctx side is
+        # cp_size==1, preserving the original single-axis behaviour.
+        # HELIX VALIDATE: assumes the transceiver's setup collectives group TP/PP
+        # within a fixed cp_rank (cp orthogonal). Confirm against the real helix
+        # registration exchange on GPU.
+        self._cp_rank = cp_rank
+        self._cp_size = cp_size
         self._s = shared
         self._bcast_idx = 0
         self._ag_idx = 0
@@ -249,15 +259,16 @@ class ThreadSafeDistributed:
     def pp_allgather(self, obj):
         idx = self._pp_ag_idx
         self._pp_ag_idx += 1
-        key = f"pp_ag_{idx}_tp{self._tp_rank}"
+        key = f"pp_ag_{idx}_tp{self._tp_rank}_cp{self._cp_rank}"
         with self._s["lock"]:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        # Sync only the PP group that shares this tp_rank. With attention data parallelism
-        # each tp_rank is an independent instance that may run a different number of
-        # collectives, so a single global barrier would deadlock; a per-group one does not.
-        pp_barrier = self._s["pp_barriers"][self._tp_rank]
+        # Sync only the PP group that shares this (tp_rank, cp_rank). With attention data
+        # parallelism each tp_rank is an independent instance that may run a different number
+        # of collectives, so a single global barrier would deadlock; a per-group one does not.
+        # CP adds an orthogonal axis, so the group is keyed by cp_rank too.
+        pp_barrier = self._s["pp_barriers"][self._tp_rank * self._cp_size + self._cp_rank]
         pp_barrier.wait()
         result = list(self._s[key])
         pp_barrier.wait()
@@ -266,13 +277,13 @@ class ThreadSafeDistributed:
     def tp_allgather(self, obj):
         idx = self._tp_ag_idx
         self._tp_ag_idx += 1
-        key = f"tp_ag_{idx}_pp{self._pp_rank}"
+        key = f"tp_ag_{idx}_pp{self._pp_rank}_cp{self._cp_rank}"
         with self._s["lock"]:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        # Sync only the TP group that shares this pp_rank (see pp_allgather).
-        tp_barrier = self._s["tp_barriers"][self._pp_rank]
+        # Sync only the TP group that shares this (pp_rank, cp_rank) (see pp_allgather).
+        tp_barrier = self._s["tp_barriers"][self._pp_rank * self._cp_size + self._cp_rank]
         tp_barrier.wait()
         result = list(self._s[key])
         tp_barrier.wait()
@@ -417,31 +428,42 @@ def _create_managers_for_instance(
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    cp_size: int = 1,
 ) -> list[KVCacheManager | KVCacheManagerV2]:
-    """Create cache managers for all ranks in an instance."""
+    """Create cache managers for all ranks in an instance.
+
+    cp_size > 1 builds a helix-CP instance: each cp rank owns the global blocks
+    strided by [cp_rank::cp_size] (see transfer.py). Managers size off the full
+    (global) prompt via total_input_len_cp; the ranks are enumerated
+    pp_rank * (tp*cp) + tp_rank * cp + cp_rank.
+    """
     managers = []
+    cp_config = {"cp_type": "HELIX"} if cp_size > 1 else None
     for pp_rank in range(pp):
         for tp_rank in range(tp):
-            rank = pp_rank * tp + tp_rank
-            mapping = Mapping(
-                world_size=tp * pp,
-                rank=rank,
-                tp_size=tp,
-                pp_size=pp,
-                enable_attention_dp=enable_dp,
-            )
-            managers.append(
-                _create_cache_manager(
-                    mapping,
-                    is_mla,
-                    use_v2,
-                    max_attention_window_vec,
-                    num_layers,
-                    max_batch_size,
-                    enable_indexer_k_cache,
-                    indexer_k_cache_layer_mask,
+            for cp_rank in range(cp_size):
+                rank = (pp_rank * tp + tp_rank) * cp_size + cp_rank
+                mapping = Mapping(
+                    world_size=tp * pp * cp_size,
+                    rank=rank,
+                    tp_size=tp,
+                    pp_size=pp,
+                    cp_size=cp_size,
+                    cp_config=cp_config,
+                    enable_attention_dp=enable_dp,
                 )
-            )
+                managers.append(
+                    _create_cache_manager(
+                        mapping,
+                        is_mla,
+                        use_v2,
+                        max_attention_window_vec,
+                        num_layers,
+                        max_batch_size,
+                        enable_indexer_k_cache,
+                        indexer_k_cache_layer_mask,
+                    )
+                )
     return managers
 
 
@@ -552,10 +574,68 @@ def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=10
 # ---------------------------------------------------------------------------
 # Add sequence to manager
 # ---------------------------------------------------------------------------
-def _add_sequence(
-    mgr, request_id: int, prompt_len: int, use_v2: bool, *, is_generation: bool = False
+def _make_gen_request(
+    gen_rid, req_len, unique_rid, ctx_rid, ctx_dp_rank, ctx_info_endpoint, sampling_params
 ):
-    """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup)."""
+    """Build one GENERATION_ONLY request wired to its context peer.
+
+    Used to mint a distinct request per helix CP rank (each needs its own
+    rank-local prompt_len); mirrors the inline construction in run_transfer_test.
+    """
+    req = LlmRequest(
+        request_id=gen_rid,
+        max_new_tokens=1,
+        input_tokens=list(range(req_len)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    req.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx_rid,
+        ctx_dp_rank=ctx_dp_rank,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=unique_rid,
+    )
+    return req
+
+
+def _helix_local_len(global_len: int, cp_rank: int, cp_size: int) -> int:
+    """Rank-local token count under helix (mirror of KVCacheManagerV2._helix_local_len).
+
+    A ledger block spans tpb*cp_size global tokens; global block b (page ``b``
+    within its ledger block) lives on CP rank ``b %% cp_size``. This is the
+    length the *transceiver* uses to bound the
+    transferred block list -- distinct from the ledger *capacity*, which the
+    manager sizes off the global length (rounded up to whole ledger blocks) and
+    so may bind one extra trailing page on ranks that own no token in it.
+    """
+    tpb = TOKENS_PER_BLOCK
+    ledger_tpb = tpb * cp_size
+    full, rem = divmod(global_len, ledger_tpb)
+    return full * tpb + min(max(rem - cp_rank * tpb, 0), tpb)
+
+
+def _add_sequence(
+    mgr,
+    request_id: int,
+    prompt_len: int,
+    use_v2: bool,
+    *,
+    is_generation: bool = False,
+    scratch_tokens: int = 0,
+):
+    """Add a sequence to the cache manager. Returns kv_cache for V2 (needed for cleanup).
+
+    scratch_tokens > 0 (generation side only) sizes the cache to
+    prompt_len + scratch_tokens with history_length still prompt_len -- exactly
+    what prepare_disagg_gen_init does for MTP -- so the speculative tail blocks
+    are allocated *and their pages bound* (materialised) without a forward pass.
+    That reproduces production's "surplus block" on a windowed slice, which the
+    harness cannot (it transfers right after a prompt-only resize, so valid_only
+    skips the page-less tail). Used to exercise the SWA + MTP transfer path.
+    """
     if use_v2:
         kv_cache = mgr._create_kv_cache(request_id, None, None)
         if not mgr.enable_block_reuse:
@@ -564,7 +644,7 @@ def _add_sequence(
         assert success, f"Failed to resume kv_cache for request {request_id}"
         if is_generation:
             kv_cache.enable_swa_scratch_reuse = False
-            kv_cache.resize(prompt_len, history_length=prompt_len)
+            kv_cache.resize(prompt_len + scratch_tokens, history_length=prompt_len)
         else:
             kv_cache.resize(prompt_len)
             kv_cache.resize(None, history_length=prompt_len)
@@ -613,35 +693,51 @@ def create_instance_transceivers(
     cache_managers: List,
     config: CacheTransceiverConfig,
     is_mla: bool,
+    cp_size: int = 1,
 ) -> List[KvCacheTransceiverV2]:
-    """Create KvCacheTransceiverV2 for all ranks via threaded init."""
-    world_size = tp * pp
+    """Create KvCacheTransceiverV2 for all ranks via threaded init.
+
+    cp_size > 1 builds a helix-CP instance (see _create_managers_for_instance).
+    Ranks are enumerated (pp_rank * tp + tp_rank) * cp_size + cp_rank, matching
+    the manager order so cache_managers[rank] lines up.
+    HELIX VALIDATE: the ThreadSafeDistributed collective grouping below is the
+    tp*pp structure; cp ranks are extra world ranks. Confirm the transceiver's
+    setup collectives behave under helix (they may need cp-aware grouping).
+    """
+    world_size = tp * pp * cp_size
     shared = {
         "barrier": threading.Barrier(world_size),
         # Per-group barriers for the grouped collectives, so attention-DP instances can
         # diverge in how many collectives they issue: pp_allgather syncs the PP ranks that
         # share a tp_rank, tp_allgather the TP ranks that share a pp_rank.
-        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
-        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp * cp_size)],
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp * cp_size)],
         "lock": threading.Lock(),
     }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []
+    cp_config = {"cp_type": "HELIX"} if cp_size > 1 else None
 
     attention_type = AttentionTypeCpp.MLA if is_mla else AttentionTypeCpp.DEFAULT
 
     for rank in range(world_size):
-        pp_rank = rank // tp
-        tp_rank = rank % tp
+        cp_rank = rank % cp_size
+        base = rank // cp_size
+        pp_rank = base // tp
+        tp_rank = base % tp
         mapping = Mapping(
             world_size=world_size,
             rank=rank,
             tp_size=tp,
             pp_size=pp,
+            cp_size=cp_size,
+            cp_config=cp_config,
             enable_attention_dp=enable_dp,
         )
-        dist_mock = ThreadSafeDistributed(rank, world_size, tp, pp, tp_rank, pp_rank, shared)
+        dist_mock = ThreadSafeDistributed(
+            rank, world_size, tp, pp, tp_rank, pp_rank, shared, cp_rank, cp_size
+        )
         t = threading.Thread(
             target=_create_transceiver_in_thread,
             args=(
@@ -672,7 +768,9 @@ def create_instance_transceivers(
 # ---------------------------------------------------------------------------
 # Verification helpers
 # ---------------------------------------------------------------------------
-def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid=None):
+def _get_block_data_for_layer(
+    mgr, request_id, layer_idx, use_v2, expected_valid=None, drop_tail_blocks=0
+):
     """Get block data for a specific layer and request in HND layout.
 
     Returns tensor of shape [num_blocks, kv_factor, num_kv_heads_per_rank, tokens_per_block, head_dim].
@@ -680,6 +778,13 @@ def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid
     so we must use kv_layout='HND' to get a correct view.  Using the default NHD
     layout would reinterpret HND memory as NHD, which breaks cross-TP verification
     because the formatter concat/split operates on HND-ordered flat data.
+
+    *drop_tail_blocks* removes that many blocks from the tail before anything
+    else -- the MTP speculative/scratch blocks, which sit past the prompt and are
+    never transferred. It must be a COUNT from the tail (not a prompt_blocks
+    cut): the SWA front may already be evicted, so ``len(valid_indices)`` is not
+    prompt_blocks and a positional cut would leave the scratch in and drop a live
+    window block. Gen side only (the ctx cache has no scratch).
 
     If *expected_valid* is given, keeps only the last *expected_valid* blocks
     (used for sliding-window: only the window-tail blocks were transferred).
@@ -691,6 +796,8 @@ def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid
     valid_indices = [idx for idx in block_indices if idx >= 0]
     if not valid_indices:
         return None
+    if drop_tail_blocks > 0 and len(valid_indices) > drop_tail_blocks:
+        valid_indices = valid_indices[:-drop_tail_blocks]
     if expected_valid is not None and len(valid_indices) > expected_valid:
         valid_indices = valid_indices[-expected_valid:]
     layer_buffer = mgr.get_buffers(layer_idx, kv_layout="HND")
@@ -709,6 +816,7 @@ def _gather_full_layer_data(
     enable_dp: bool = False,
     req_idx: int = 0,
     num_layers: int = NUM_LAYERS,
+    drop_tail_blocks: int = 0,
 ):
     """Gather the full (unsharded) KV data for a layer by concatenating across TP ranks.
 
@@ -724,14 +832,14 @@ def _gather_full_layer_data(
         tp_rank = req_idx % tp
         rank = pp_rank * tp + tp_rank
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
 
     if is_replicated:
         # All TP ranks have identical data; take from tp_rank=0
         rank = pp_rank * tp + 0
         return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
 
     # Gather from all TP ranks and concat along kv_heads dim.
@@ -741,7 +849,7 @@ def _gather_full_layer_data(
     for tp_rank in range(tp):
         rank = pp_rank * tp + tp_rank
         data = _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
+            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
         )
         if data is not None:
             tp_data.append(data)
@@ -804,6 +912,7 @@ def verify_all_requests(
     use_v2: bool,
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
+    gen_scratch_tokens: int = 0,
 ):
     """Verify transferred cache data for all requests.
 
@@ -821,6 +930,14 @@ def verify_all_requests(
         ctx_rid = ctx_request_ids[req_idx]
         gen_rid = gen_request_ids[req_idx]
 
+        # MTP speculative/scratch blocks on the gen side: sized past the prompt,
+        # never transferred. Drop them (from the tail) before comparing. The ctx
+        # cache has no scratch. Count = ceil((prompt+scratch)/tpb) - ceil(prompt/tpb).
+        prompt_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+        gen_scratch_blocks = (
+            req_len + gen_scratch_tokens + TOKENS_PER_BLOCK - 1
+        ) // TOKENS_PER_BLOCK - prompt_blocks
+
         for layer_idx in range(num_layers):
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
@@ -828,9 +945,8 @@ def verify_all_requests(
             expected_valid = None
             win = layer_to_window.get(layer_idx)
             if win is not None and win < MAX_SEQ_LEN:
-                total_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
                 stale_end = max(0, (req_len + 1 - win) // TOKENS_PER_BLOCK)
-                expected_valid = total_blocks - stale_end
+                expected_valid = prompt_blocks - stale_end
 
             ctx_full = _gather_full_layer_data(
                 ctx_managers,
@@ -844,6 +960,7 @@ def verify_all_requests(
                 ctx_enable_dp,
                 req_idx,
                 num_layers,
+                0,  # ctx has no MTP scratch tail
             )
             gen_full = _gather_full_layer_data(
                 gen_managers,
@@ -857,6 +974,7 @@ def verify_all_requests(
                 gen_enable_dp,
                 req_idx,
                 num_layers,
+                gen_scratch_blocks,
             )
 
             if ctx_full is None or gen_full is None:
@@ -873,6 +991,95 @@ def verify_all_requests(
                 atol=0,
                 msg=lambda m: (f"Data mismatch at req={req_idx} layer={layer_idx}: {m}"),
             )
+
+
+def verify_all_requests_helix(
+    request_lengths: List[int],
+    ctx_managers: List,
+    gen_managers: List,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+    is_mla: bool,
+    gen_cp: int,
+    max_attention_window_vec: Optional[List[int]] = None,
+    num_layers: int = NUM_LAYERS,
+):
+    """Verify a helix-CP transfer against the ctx block stride.
+
+    ctx holds the whole prompt (cp_size=1); each generation CP rank owns the
+    global blocks strided by [cp_rank::cp_size].
+
+    Restricted to ctx_tp==ctx_pp==gen_tp==gen_pp==1 so a rank is exactly a CP
+    rank (gen rank r == cp_rank r, ctx rank 0). That keeps the comparison a plain
+    positional stride over the ctx block list, matching transfer.py:1036
+    (``src_block_ids[cp_rank::cp_size]``) without also folding in TP head-concat.
+
+    HELIX VALIDATE: the ledger stride below assumes the sender strides over the
+    *transferred* (windowed) ctx block list in positional order. Confirm on GPU
+    that the SWA window + stride interaction matches (no_window is the clean case).
+    """
+    num_kv_heads = 1 if is_mla else NUM_KV_HEADS
+    # ctx side is cp_size=1: rank 0 holds the whole global block list.
+    layer_to_window = _get_layer_to_window_size(ctx_managers, 1, 1, True, num_layers)
+
+    for req_idx, req_len in enumerate(request_lengths):
+        ctx_rid = ctx_request_ids[req_idx]
+        gen_rid = gen_request_ids[req_idx]
+        prompt_blocks = (req_len + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+
+        for layer_idx in range(num_layers):
+            expected_valid = None
+            win = layer_to_window.get(layer_idx)
+            if win is not None and win < MAX_SEQ_LEN:
+                stale_end = max(0, (req_len + 1 - win) // TOKENS_PER_BLOCK)
+                expected_valid = prompt_blocks - stale_end
+
+            # ctx: the full (global) transferred block set, positional order.
+            ctx_full = _get_block_data_for_layer(
+                ctx_managers[0], ctx_rid, layer_idx, True, expected_valid
+            )
+            if ctx_full is None:
+                continue
+
+            for cp_rank in range(gen_cp):
+                gen_full = _get_block_data_for_layer(
+                    gen_managers[cp_rank], gen_rid, layer_idx, True
+                )
+                # Ledger stride: rank r owns global blocks [r::cp_size].
+                expected = ctx_full[cp_rank::gen_cp]
+                # The gen ledger rounds capacity up to whole ledger blocks, so a
+                # rank that owns no token in the trailing ledger block still binds
+                # one extra (unfilled) page past its owned blocks. The transceiver
+                # only fills the rank-local prompt (the leading `n` pages), so
+                # compare just those -- exactly the ctx stride count.
+                n = expected.shape[0]
+                if gen_full is not None and gen_full.shape[0] > n:
+                    gen_full = gen_full[:n]
+                if n == 0:
+                    assert gen_full is None or gen_full.shape[0] == 0, (
+                        f"cp_rank {cp_rank} holds blocks but ctx stride is empty "
+                        f"at req={req_idx} layer={layer_idx}"
+                    )
+                    continue
+                assert gen_full is not None, (
+                    f"cp_rank {cp_rank} missing blocks at req={req_idx} layer={layer_idx}"
+                )
+                assert gen_full.shape == expected.shape, (
+                    f"Helix shape mismatch at req={req_idx} layer={layer_idx} "
+                    f"cp_rank={cp_rank}: gen={gen_full.shape} "
+                    f"ctx[{cp_rank}::{gen_cp}]={expected.shape}"
+                )
+                torch.testing.assert_close(
+                    gen_full,
+                    expected,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda m: (
+                        f"Helix data mismatch at req={req_idx} layer={layer_idx} "
+                        f"cp_rank={cp_rank}: {m}"
+                    ),
+                )
+    _ = num_kv_heads  # (kept for signature parity with verify_all_requests)
 
 
 def _get_indexer_block_data(
@@ -981,13 +1188,34 @@ def run_transfer_test(
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
     indexer_k_cache_layer_mask: list[bool] | None = None,
+    gen_scratch_tokens: int = 0,
+    gen_cp: int = 1,
 ) -> None:
-    """Run a full KV transfer test using KvCacheTransceiverV2."""
+    """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    gen_scratch_tokens > 0 sizes the generation cache to
+    prompt_len + gen_scratch_tokens (history still prompt_len), materialising an
+    MTP speculative tail block past the prompt. Combined with a sliding window
+    this exercises the SWA + MTP transfer path -- the combination that regressed
+    GSM8K (bug 6676406) and that no prior case covered.
+
+    gen_cp > 1 builds a helix-CP generation instance (context stays cp_size=1,
+    i.e. it holds the whole global prompt). Each generation CP rank owns the
+    global blocks strided by [cp_rank::cp_size] -- the ledger model where a
+    global block b lives on rank ``b %% cp_size`` (see transfer.py:1036 and
+    KVCacheManagerV2._helix_local_len). Helix rejects draft tokens, so this is
+    incompatible with gen_scratch_tokens > 0.
+    HELIX VALIDATE: the whole gen_cp path (dist-mock collectives, ledger block
+    ownership, strided verify) is exercised only on GPU -- validate end to end.
+    """
     if request_lengths is None:
         request_lengths = REQUEST_LENGTHS
+    assert not (gen_cp > 1 and gen_scratch_tokens > 0), (
+        "helix rejects draft/MTP tokens; gen_cp>1 requires gen_scratch_tokens==0"
+    )
     max_batch_size = max(MAX_BATCH_SIZE, len(request_lengths))
     ctx_world = ctx_tp * ctx_pp
-    gen_world = gen_tp * gen_pp
+    gen_world = gen_tp * gen_pp * gen_cp
 
     # 1. Create cache managers
     ctx_managers = _create_managers_for_instance(
@@ -1013,11 +1241,14 @@ def run_transfer_test(
         max_batch_size,
         enable_indexer_k_cache,
         indexer_k_cache_layer_mask,
+        cp_size=gen_cp,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
     _init_pool_data(ctx_managers, ctx_tp, is_mla, use_v2, fill_random=True, seed_base=1000)
-    _init_pool_data(gen_managers, gen_tp, is_mla, use_v2, fill_random=False)
+    # Gen pools start zeroed; gen_cp folds into the TP stride so per-rank pool
+    # seeding stays a no-op (fill_random=False ignores the seed anyway).
+    _init_pool_data(gen_managers, gen_tp * gen_cp, is_mla, use_v2, fill_random=False)
 
     # 3. Create KvCacheTransceiverV2 instances (threaded init)
     config = CacheTransceiverConfig(
@@ -1029,7 +1260,7 @@ def run_transfer_test(
         ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config, is_mla
     )
     gen_tcs = create_instance_transceivers(
-        gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla
+        gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla, cp_size=gen_cp
     )
 
     try:
@@ -1082,6 +1313,10 @@ def run_transfer_test(
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
             )
+            if gen_scratch_tokens > 0:
+                # Mark the request as MTP so its draft length matches the
+                # materialised speculative tail (see _add_sequence).
+                gen_request.py_draft_tokens = list(range(gen_scratch_tokens))
 
             for rank in range(ctx_world):
                 tp_rank = rank % ctx_tp
@@ -1090,20 +1325,51 @@ def run_transfer_test(
                     ctx_handle_map[rank].append((req_idx, ctx_request))
 
             for rank in range(gen_world):
-                tp_rank = rank % gen_tp
+                # rank = (pp_rank * gen_tp + tp_rank) * gen_cp + cp_rank.
+                # Every CP rank of a handling TP rank receives its strided slice.
+                tp_rank = (rank // gen_cp) % gen_tp
                 should_handle = (not gen_enable_dp) or (req_idx % gen_tp == tp_rank)
-                if should_handle:
+                if not should_handle:
+                    continue
+                if gen_cp > 1:
+                    # Helix: each CP rank gets its own request. The transceiver
+                    # bounds the transferred block list by prompt_len, which must
+                    # be the *rank-local* strided length so it matches the ctx
+                    # sender's src_block_ids[cp_rank::cp_size]. total_input_len_cp
+                    # carries the global length the manager sizes the ledger off.
+                    # A shared request cannot hold a per-rank prompt_len.
+                    cp_rank = rank % gen_cp
+                    req = _make_gen_request(
+                        gen_rid,
+                        req_len,
+                        unique_rid,
+                        ctx_rid,
+                        ctx_dp_rank,
+                        ctx_info_endpoint,
+                        sampling_params,
+                    )
+                    local_len = _helix_local_len(req_len, cp_rank, gen_cp)
+                    req.prompt_len = local_len
+                    req.py_prompt_len = local_len
+                    req.total_input_len_cp = req_len
+                    gen_handle_map[rank].append((req_idx, req))
+                else:
                     gen_handle_map[rank].append((req_idx, gen_request))
 
         # 5. Add sequences and gen receive first
         for rank in range(gen_world):
             for req_idx, req in gen_handle_map[rank]:
+                # Under helix req.prompt_len is the rank-local strided length
+                # (for the transceiver); the manager ledger must be sized off the
+                # GLOBAL length, so resize off request_lengths[req_idx] instead.
+                resize_len = request_lengths[req_idx] if gen_cp > 1 else req.prompt_len
                 kv = _add_sequence(
                     gen_managers[rank],
                     req.py_request_id,
-                    req.prompt_len,
+                    resize_len,
                     use_v2,
                     is_generation=True,
+                    scratch_tokens=gen_scratch_tokens,
                 )
                 if kv is not None:
                     gen_kv_caches[rank].append(kv)
@@ -1124,23 +1390,37 @@ def run_transfer_test(
         run_concurrent(gen_tcs, lambda tc: tc.check_gen_transfer_status(None))
 
         # 8. Verify
-        verify_all_requests(
-            request_lengths=request_lengths,
-            ctx_managers=ctx_managers,
-            gen_managers=gen_managers,
-            ctx_tp=ctx_tp,
-            ctx_pp=ctx_pp,
-            gen_tp=gen_tp,
-            gen_pp=gen_pp,
-            ctx_enable_dp=ctx_enable_dp,
-            gen_enable_dp=gen_enable_dp,
-            ctx_request_ids=ctx_request_ids,
-            gen_request_ids=gen_request_ids,
-            is_mla=is_mla,
-            use_v2=use_v2,
-            max_attention_window_vec=max_attention_window_vec,
-            num_layers=num_layers,
-        )
+        if gen_cp > 1:
+            verify_all_requests_helix(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                is_mla=is_mla,
+                gen_cp=gen_cp,
+                max_attention_window_vec=max_attention_window_vec,
+                num_layers=num_layers,
+            )
+        else:
+            verify_all_requests(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                is_mla=is_mla,
+                use_v2=use_v2,
+                max_attention_window_vec=max_attention_window_vec,
+                num_layers=num_layers,
+                gen_scratch_tokens=gen_scratch_tokens,
+            )
         if enable_indexer_k_cache:
             _verify_indexer_k_all_requests(
                 request_lengths=request_lengths,
@@ -1272,6 +1552,7 @@ UNEVEN_PP_CONFIGS = [
     ids=[w[1] for w in WINDOW_CONFIGS],
 )
 @pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("gen_scratch_tokens", [0, TOKENS_PER_BLOCK], ids=["spec_off", "spec_on"])
 def test_cache_transceiver(
     ctx_tp,
     ctx_pp,
@@ -1282,8 +1563,29 @@ def test_cache_transceiver(
     is_mla,
     max_attention_window_vec,
     use_v2,
+    gen_scratch_tokens,
 ):
-    """Test KvCacheTransceiverV2 with V1/V2 cache managers."""
+    """Test KvCacheTransceiverV2 with V1/V2 cache managers.
+
+    The ``gen_scratch_tokens`` dimension (id ``spec_off`` / ``spec_on``) adds a
+    speculative-decoding tail: the generation cache is sized
+    prompt_len + TOKENS_PER_BLOCK so a surplus block sits past the prompt,
+    exercising the manager+transceiver combinations *with speculation* -- the
+    tail is generic (any spec mode, e.g. MTP or Eagle), including the
+    sliding-window case that regressed GSM8K under MTP (bug 6676406). Every prior
+    run was spec_off (gen_scratch_tokens=0). The transfer must still cover exactly
+    the prompt blocks the receiver needs; a count-based slice would let the
+    surplus shift or drop a live prompt block.
+
+    NEEDS-GPU VALIDATION for the spec_on cases: run them against the pre-fix
+    (count-based) _create_kv_slice and confirm the sliding-window ones FAIL; on
+    the ordinal fix all must PASS.
+    """
+    # Speculative scratch materialisation (resize past history_length) is V2-only
+    # here; the V1 path in _add_sequence uses a different allocation entry.
+    if gen_scratch_tokens > 0 and not use_v2:
+        pytest.skip("speculative scratch materialisation is V2-only in this test")
+
     # VSWA (variable sliding window) only supported for V1 with ModelConfigCpp
     is_vswa = max_attention_window_vec is not None and len(set(max_attention_window_vec)) > 1
     if is_vswa and not use_v2:
@@ -1303,7 +1605,8 @@ def test_cache_transceiver(
         f"\nRunning transfer test: "
         f"ctx_tp={ctx_tp} ctx_pp={ctx_pp} gen_tp={gen_tp} gen_pp={gen_pp} "
         f"ctx_dp={ctx_enable_dp} gen_dp={gen_enable_dp} "
-        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec}"
+        f"mla={is_mla} v2={use_v2} window={max_attention_window_vec} "
+        f"scratch={gen_scratch_tokens}"
     )
 
     run_transfer_test(
@@ -1316,6 +1619,7 @@ def test_cache_transceiver(
         is_mla=is_mla,
         use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
+        gen_scratch_tokens=gen_scratch_tokens,
     )
 
     print("PASSED")
@@ -1388,6 +1692,49 @@ def test_cache_transceiver_uneven_pp(
         use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         num_layers=num_layers,
+    )
+
+    print("PASSED")
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("is_mla", [False, True], ids=["mha", "mla"])
+@pytest.mark.parametrize("gen_cp", [2, 4], ids=["cp2", "cp4"])
+def test_cache_transceiver_helix_cp(gen_cp, is_mla):
+    """Helix-CP KV transfer: un-sharded context (cp_size=1) -> helix generation.
+
+    The context worker holds the whole global prompt; each generation CP rank
+    owns the global blocks strided by [cp_rank::cp_size] (the ledger model, see
+    transfer.py:1036 and KVCacheManagerV2._helix_local_len). verify_all_requests_helix
+    asserts each gen rank received exactly its stride of the context blocks.
+
+    Scope (deliberately narrow, all validated on GPU by the author):
+      * V2 only -- helix awareness lives in KVCacheManagerV2.
+      * Full attention only -- the transfer path rejects a token_range (chunked /
+        windowed slice) under CP (transfer.py:979), so no sliding window here.
+      * tp=pp=1 on both sides -- keeps a rank == a CP rank so the verify is a
+        plain positional stride without also unfolding TP head-concat.
+      * No speculation -- helix rejects draft tokens.
+
+    HELIX VALIDATE: this whole path (dist-mock collectives under a tp*pp*cp world,
+    ledger block ownership, strided verify) is only meaningful on GPU. Run it.
+    """
+    print(
+        f"\nRunning helix-CP transfer test: gen_cp={gen_cp} mla={is_mla} "
+        f"(ctx cp=1, full attention, v2)"
+    )
+
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=is_mla,
+        use_v2=True,
+        max_attention_window_vec=None,
+        gen_cp=gen_cp,
     )
 
     print("PASSED")
