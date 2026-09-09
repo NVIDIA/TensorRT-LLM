@@ -743,6 +743,9 @@ def _dsv4_kernel(
                 if ((jj >> 2) < ntl) and (gi < MAXB):
                     sBT[jj] = gBT[gi]
 
+    # block table and context lengths are the scheduler's; everything from here on may come from
+    # the preceding kernel
+    _gdc_wait()
     if tidx < 64:
         sW[tidx] = cute.make_tensor(w_ptr, cute.make_layout(1 << 20))[b * 64 + tidx]
     if tidx < 128:
@@ -1198,6 +1201,8 @@ def _dsv4_kernel(
     if cutlass.const_expr(CS > 1 and GM == 0):
         cute.arch.cluster_arrive()
     cute.arch.barrier()
+    # every page of the row except the tie class has been read: the dependent kernel may start
+    _gdc_launch_dependents()
     if cutlass.const_expr(REFINE == 0):
         if warp_idx == 0:
             cute.arch.dealloc_tmem(tmem_ptr, 512)
@@ -2018,6 +2023,35 @@ def _dsv4_kernel(
                     gV[base2 + rk] = tv
 
 
+TRTLLM_ENABLE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
+@cute.jit
+def _gdc_wait():
+    _llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.wait;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _gdc_launch_dependents():
+    _llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.launch_dependents;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def _red_add_gpu(addr, v):
     """red.relaxed.gpu.global.add.s32 (no return value, pipelines)."""
@@ -2224,6 +2258,7 @@ def _launch(
         cluster=[1 if GM else CS, 1, 1],
         smem=smem_bytes,
         stream=stream,
+        **({"use_pdl": True} if TRTLLM_ENABLE_PDL else {}),
     )
 
 
