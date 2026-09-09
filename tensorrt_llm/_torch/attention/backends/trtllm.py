@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
 
+from itertools import accumulate
+
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -256,7 +258,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     locality_domain_ctx_token_splits: Optional[List[int]] = None
     locality_domain_gen_token_splits: Optional[List[int]] = None
     locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
-    draft_locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
+    draft_locality_domain_kv_cache_block_offsets: Optional[List[
+        torch.Tensor]] = None
     # Per-locality-domain MLA generation state computed by mla_rope_generation.
     locality_domain_mla_gen_state: Optional[List[Optional[dict]]] = None
     # Pre-allocated per-locality-domain workspaces.
@@ -588,15 +591,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         num_locality_domains = (self.kv_cache_manager.num_locality_domains
                                 if self.kv_cache_manager is not None else 2)
-        if (not self.is_cuda_graph
-                and (self.locality_domain_workspaces is None
-                     or len(self.locality_domain_workspaces) != num_locality_domains)):
+        if (not self.is_cuda_graph and
+            (self.locality_domain_workspaces is None
+             or len(self.locality_domain_workspaces) != num_locality_domains)):
             self.locality_domain_workspaces = [
                 torch.empty(0, device='cuda', dtype=torch.int8)
                 for _ in range(num_locality_domains)
             ]
         if (self.locality_domain_cuda_graph_workspaces is None
-                or len(self.locality_domain_cuda_graph_workspaces) != num_locality_domains):
+                or len(self.locality_domain_cuda_graph_workspaces)
+                != num_locality_domains):
             self.locality_domain_cuda_graph_workspaces = [
                 torch.empty(0, device='cuda', dtype=torch.int8)
                 for _ in range(num_locality_domains)
@@ -615,6 +619,92 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+
+        if (not self.locality_domain_enabled or self.kv_cache_manager is None
+                or self.request_ids is None):
+            return
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        sequence_lengths = self.seq_lens[:self.num_seqs].tolist()
+
+        per_locality_domain_ctx_reqs = [0] * num_locality_domains
+        per_locality_domain_ctx_tokens = [0] * num_locality_domains
+        per_locality_domain_gen_reqs = [0] * num_locality_domains
+        per_locality_domain_gen_tokens = [0] * num_locality_domains
+
+        def locality_domain_from_splits(splits: Optional[List[int]],
+                                        local_req_idx: int) -> Optional[int]:
+            if splits is None:
+                return None
+            for locality_domain_idx in range(len(splits) - 1):
+                if splits[locality_domain_idx] <= local_req_idx < splits[
+                        locality_domain_idx + 1]:
+                    return locality_domain_idx
+            return None
+
+        old_ctx_req_splits = self.locality_domain_ctx_req_splits
+        old_gen_req_splits = self.locality_domain_gen_req_splits
+        for req_idx, request_id in enumerate(self.request_ids[:self.num_seqs]):
+            if req_idx < self.num_contexts:
+                locality_domain_id = locality_domain_from_splits(
+                    old_ctx_req_splits, req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_ctx_reqs[locality_domain_id] += 1
+                per_locality_domain_ctx_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+            else:
+                gen_req_idx = req_idx - self.num_contexts
+                locality_domain_id = locality_domain_from_splits(
+                    old_gen_req_splits, gen_req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_gen_reqs[locality_domain_id] += 1
+                per_locality_domain_gen_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+        self.locality_domain_ctx_req_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_reqs))
+        self.locality_domain_gen_req_splits = [0] + list(
+            accumulate(per_locality_domain_gen_reqs))
+        self.locality_domain_ctx_token_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_tokens))
+        self.locality_domain_gen_token_splits = [0] + list(
+            accumulate(per_locality_domain_gen_tokens))
+        self.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
+        self.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
+
+        if self.host_request_types is not None:
+            self.host_request_types[:self.num_contexts].fill_(0)
+            self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        if self.kv_cache_block_offsets is not None:
+            self.locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.kv_cache_block_offsets,
+                    '_locality_domain_block_offsets_buf'))
+
+        if self.draft_kv_cache_block_offsets is not None:
+            self.draft_locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    '_draft_locality_domain_block_offsets_buf'))
+
+        if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+            self._locality_domain_host_total_kv_lens_buf = [
+                torch.zeros(2, dtype=torch.int, device='cpu')
+                for _ in range(num_locality_domains)
+            ]
+
+        if self.is_cuda_graph:
+            for locality_domain_idx in range(num_locality_domains):
+                buf = self._locality_domain_host_total_kv_lens_buf[
+                    locality_domain_idx]
+                buf[0] = self.max_seq_len * per_locality_domain_ctx_reqs[
+                    locality_domain_idx]
+                buf[1] = self.max_seq_len * per_locality_domain_gen_reqs[
+                    locality_domain_idx]
 
     def update_helix_param(
         self,
@@ -641,6 +731,51 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+
+    def build_locality_domain_block_offsets(
+        self,
+        source_block_offsets: Optional[torch.Tensor],
+        buffer_attr: str,
+    ) -> Optional[List[torch.Tensor]]:
+        if (not self.locality_domain_enabled or source_block_offsets is None
+                or self.kv_cache_manager is None):
+            return None
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        buffers = getattr(self, buffer_attr, None)
+        if buffers is None:
+            buffers = [
+                torch.zeros_like(source_block_offsets)
+                for _ in range(num_locality_domains)
+            ]
+            setattr(self, buffer_attr, buffers)
+
+        packed_block_offsets = []
+        num_ctx = self.num_contexts
+        for locality_domain_idx in range(num_locality_domains):
+            ctx_start = self.locality_domain_ctx_req_splits[locality_domain_idx]
+            ctx_end = self.locality_domain_ctx_req_splits[locality_domain_idx +
+                                                          1]
+            gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx]
+            gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx + 1]
+            num_ctx_reqs = ctx_end - ctx_start
+            num_gen_reqs = gen_end - gen_start
+            num_seqs = num_ctx_reqs + num_gen_reqs
+            block_offsets = buffers[locality_domain_idx]
+            block_offsets.zero_()
+            if num_seqs > 0:
+                if num_ctx_reqs > 0:
+                    block_offsets[:, :num_ctx_reqs].copy_(
+                        source_block_offsets[:, ctx_start:ctx_end],
+                        non_blocking=True)
+                if num_gen_reqs > 0:
+                    block_offsets[:, num_ctx_reqs:num_seqs].copy_(
+                        source_block_offsets[:, gen_start:gen_end],
+                        non_blocking=True)
+            packed_block_offsets.append(block_offsets)
+        return packed_block_offsets
 
     def _bind_runtime_views(
         self,
