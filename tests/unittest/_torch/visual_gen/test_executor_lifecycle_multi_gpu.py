@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
+from tensorrt_llm._torch.visual_gen import launch as launch_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
 
 _COLD_SPAWN_TIMEOUT = 120.0
@@ -76,7 +77,7 @@ def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"requires {world_size} GPUs")
 
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     ready_queue = context.Queue()
     parent_pid = os.getpid()
     workers = [
@@ -110,10 +111,9 @@ def test_sigkill_one_worker_contains_real_multi_gpu_group() -> None:
         assert _process_state(failed_worker.pid) == "Z"
 
         client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-        client.worker_processes = workers
-        client._worker_spawner = executor_module._WorkerProcessSpawner(workers)
-        client._ext_worker_thread = None
-        client._monitor_worker_liveness = True
+        client._workers = launch_module._SpawnWorkers(
+            workers, launch_module._WorkerProcessSpawner(workers)
+        )
         client._worker_failure = None
         client._shutdown_started = False
         client._request_to_send = None

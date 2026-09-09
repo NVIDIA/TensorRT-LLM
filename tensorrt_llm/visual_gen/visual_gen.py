@@ -15,15 +15,14 @@
 import asyncio
 import itertools
 import secrets
-import sys
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
-from tensorrt_llm._torch.visual_gen.executor import (
-    DiffusionRemoteClient,
-    _detect_external_launch,
-    run_diffusion_worker,
+from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
+from tensorrt_llm._torch.visual_gen.launch import (
+    resolve_launch_plan,
+    run_worker_and_exit_if_not_leader,
 )
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
@@ -244,42 +243,12 @@ class VisualGen:
         self.model = str(model)
         self.args = (args or VisualGenArgs()).model_copy(update={"model": self.model})
 
-        # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
-        # workers and never return to user code.
-        ext = _detect_external_launch()
-        if ext is not None:
-            rank, local_rank, world_size, master_addr, master_port = ext
-            n_workers = self.args.parallel_config.n_workers
-            if world_size != n_workers:
-                raise ValueError(
-                    f"Launcher world_size ({world_size}) does not match "
-                    f"n_workers ({n_workers}). "
-                    "Launch exactly n_workers tasks."
-                )
-            if rank != 0:
-                logger.info(
-                    f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
-                    "starting as worker (external launch mode)"
-                )
-                run_diffusion_worker(
-                    rank=rank,
-                    world_size=n_workers,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                    request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
-                    response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
-                    visual_gen_args=self.args,
-                    req_hmac_key=None,
-                    resp_hmac_key=None,
-                    local_rank=local_rank,
-                )
-                sys.exit(0)
-            logger.info(
-                f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
-            )
+        plan = resolve_launch_plan(self.args.parallel_config.n_workers)
+        run_worker_and_exit_if_not_leader(plan, self.args)
 
         self.executor = DiffusionRemoteClient(
             args=self.args,
+            plan=plan,
         )
         self._req_counter = itertools.count()
 

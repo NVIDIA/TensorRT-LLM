@@ -32,6 +32,7 @@ import zmq
 from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
+from tensorrt_llm._torch.visual_gen import launch as launch_module
 from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
 from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
@@ -45,6 +46,18 @@ def _pre_set_event() -> threading.Event:
     event = _THREADING_EVENT()
     event.set()
     return event
+
+
+def _install_spawn_workers(client, processes, spawner=None):
+    """Attach the worker handle the constructor would have built.
+
+    These tests build the client through ``__new__``, so the launch layer never
+    runs and ``_workers`` -- what every lifecycle method delegates to -- is unset.
+    """
+    if spawner is None:
+        spawner = launch_module._WorkerProcessSpawner(processes)
+    client._workers = launch_module._SpawnWorkers(processes, spawner)
+    return spawner
 
 
 def _process_is_running(pid: int) -> bool:
@@ -154,7 +167,7 @@ def _run_temporary_constructor_coordinator(
     lifecycle_context: SpawnProcessContext,
     worker_entrypoint: Callable[..., None] = _parent_bound_worker,
 ) -> None:
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     args = SimpleNamespace(parallel_config=SimpleNamespace(n_workers=1))
     startup_error = []
     clients = []
@@ -167,26 +180,31 @@ def _run_temporary_constructor_coordinator(
         try:
             with (
                 patch.object(
-                    executor_module,
+                    launch_module,
                     "_detect_external_launch",
                     return_value=None,
+                ),
+                # resolve_launch_plan takes the distributed master port, then
+                # DiffusionRemoteClient takes the request and response ZMQ
+                # ports. The patched networking paths below never bind these;
+                # fixed placeholders keep construction deterministic.
+                patch.object(
+                    launch_module,
+                    "find_free_port",
+                    return_value=29500,
                 ),
                 patch.object(
                     executor_module,
                     "find_free_port",
-                    # DiffusionRemoteClient requests the distributed master,
-                    # request ZMQ, and response ZMQ ports in this order. The
-                    # patched networking paths below never bind these ports;
-                    # fixed placeholders keep construction deterministic.
-                    side_effect=[29500, 29501, 29502],
+                    side_effect=[29501, 29502],
                 ),
                 patch.object(
-                    executor_module,
+                    launch_module,
                     "get_ip_address",
                     return_value="127.0.0.1",
                 ),
                 patch.object(
-                    executor_module,
+                    launch_module,
                     "_get_mp_context",
                     return_value=context,
                 ),
@@ -220,7 +238,7 @@ def _run_parent_death_coordinator(
     lifecycle_context: SpawnProcessContext,
     worker_target: Callable[..., None] = _parent_bound_worker,
 ) -> None:
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     worker = context.Process(
         target=worker_target,
         args=(os.getpid(), lifecycle_context),
@@ -234,7 +252,7 @@ def _run_worker_containment_coordinator(
     worker_count: int,
     begin_monitoring,
 ) -> None:
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     ready_queue = context.Queue()
     workers = [
         context.Process(
@@ -257,10 +275,7 @@ def _run_worker_containment_coordinator(
             raise TimeoutError("parent did not release worker monitoring")
 
         client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-        client.worker_processes = workers
-        client._worker_spawner = executor_module._WorkerProcessSpawner(workers)
-        client._ext_worker_thread = None
-        client._monitor_worker_liveness = True
+        _install_spawn_workers(client, workers)
         client._worker_failure = None
         client._shutdown_started = False
         client._request_to_send = None
@@ -297,7 +312,7 @@ def _run_worker_watchdog_coordinator(
     worker_count: int,
 ) -> None:
     """Spawn supervised workers, then remain alive until the test kills us."""
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     ready_queue = context.Queue()
     workers = [
         context.Process(
@@ -327,7 +342,7 @@ def _run_sigint_during_shutdown(lifecycle_context: SpawnProcessContext) -> None:
     signal.signal(signal.SIGINT, signal.default_int_handler)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
 
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     worker = context.Process(target=_pause)
     worker.start()
 
@@ -341,12 +356,10 @@ def _run_sigint_during_shutdown(lifecycle_context: SpawnProcessContext) -> None:
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
     client.shutdown_event = threading.Event()
-    client.worker_processes = [worker]
-    client._worker_spawner = None
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [worker])
 
     reap_started = threading.Event()
-    real_reap_worker_process = executor_module._reap_worker_process
+    real_reap_worker_process = launch_module._reap_worker_process
 
     def reap_worker_process(process) -> bool:
         reap_started.set()
@@ -360,7 +373,7 @@ def _run_sigint_during_shutdown(lifecycle_context: SpawnProcessContext) -> None:
     interrupt_thread = threading.Thread(target=interrupt_shutdown, daemon=True)
     try:
         with patch.object(
-            executor_module,
+            launch_module,
             "_reap_worker_process",
             side_effect=reap_worker_process,
         ):
@@ -610,7 +623,7 @@ def test_worker_exits_if_coordinator_dies_before_watchdog_registration() -> None
 @pytest.mark.parametrize("killed_worker_count", [1, 2])
 @pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_sigkill_workers_contains_remaining_group(killed_worker_count: int) -> None:
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     begin_monitoring = context.Event()
     worker_pids = []
     try:
@@ -689,14 +702,15 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
     args.parallel_config.n_workers = 1
 
     with (
-        patch.object(executor_module, "_detect_external_launch", return_value=None),
-        patch.object(executor_module, "find_free_port", side_effect=[29500, 29501, 29502]),
-        patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
-        patch.object(executor_module, "_get_mp_context", return_value=context),
+        patch.object(launch_module, "_detect_external_launch", return_value=None),
+        patch.object(launch_module, "find_free_port", return_value=29500),
+        patch.object(executor_module, "find_free_port", side_effect=[29501, 29502]),
+        patch.object(launch_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(launch_module, "_get_mp_context", return_value=context),
         patch.object(executor_module, "_Thread") as thread_class,
         patch.object(executor_module, "_Event", side_effect=_pre_set_event),
         patch.object(
-            executor_module,
+            launch_module,
             "_WorkerProcessSpawner",
             return_value=spawner,
         ) as spawner_class,
@@ -717,7 +731,7 @@ def test_cleanup_is_registered_before_waiting_for_ready() -> None:
 
 def test_worker_spawner_exits_after_spawn_batch() -> None:
     process = MagicMock()
-    spawner = executor_module._WorkerProcessSpawner([process])
+    spawner = launch_module._WorkerProcessSpawner([process])
 
     spawner.start()
     assert spawner.wait_for_spawn(timeout=10.0)
@@ -730,7 +744,7 @@ def test_worker_spawner_exits_after_spawn_batch() -> None:
 def test_worker_spawner_propagates_spawn_failure() -> None:
     process = MagicMock()
     process.start.side_effect = RuntimeError("spawn failed")
-    spawner = executor_module._WorkerProcessSpawner([process])
+    spawner = launch_module._WorkerProcessSpawner([process])
 
     spawner.start()
     with pytest.raises(RuntimeError, match="spawn failed"):
@@ -755,7 +769,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
         first_process.pid = 123
 
     first_process.start.side_effect = start_first_process
-    spawner = executor_module._WorkerProcessSpawner([first_process, second_process])
+    spawner = launch_module._WorkerProcessSpawner([first_process, second_process])
     spawner.start()
     assert start_entered.wait(timeout=10.0)
 
@@ -766,9 +780,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
-    client.worker_processes = [first_process, second_process]
-    client._worker_spawner = spawner
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [first_process, second_process], spawner)
 
     shutdown_thread = threading.Thread(target=client.shutdown)
     shutdown_thread.start()
@@ -784,7 +796,7 @@ def test_shutdown_waits_for_spawn_batch_before_reaping() -> None:
 
     first_process.start.assert_called_once_with()
     second_process.start.assert_not_called()
-    first_process.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+    first_process.join.assert_called_once_with(timeout=launch_module.WORKER_TIMEOUT)
     second_process.join.assert_not_called()
 
 
@@ -804,7 +816,7 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
         in_flight_process.pid = 456
 
     in_flight_process.start.side_effect = block_in_process_start
-    spawner = executor_module._WorkerProcessSpawner([started_process, in_flight_process])
+    spawner = launch_module._WorkerProcessSpawner([started_process, in_flight_process])
     spawner.start()
     assert spawn_blocked.wait(timeout=10.0)
 
@@ -815,13 +827,11 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
     client.pending_requests = MagicMock()
     client.background_thread = MagicMock()
     client.background_thread.is_alive.return_value = False
-    client.worker_processes = [started_process, in_flight_process]
-    client._worker_spawner = spawner
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [started_process, in_flight_process], spawner)
 
     try:
         with (
-            patch.object(executor_module, "WORKER_SPAWN_SHUTDOWN_TIMEOUT", 0.05),
+            patch.object(launch_module, "WORKER_SPAWN_SHUTDOWN_TIMEOUT", 0.05),
             patch.object(executor_module, "THREAD_TIMEOUT", 0.05),
             patch.object(executor_module.logger, "error") as log_error,
         ):
@@ -830,7 +840,7 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
             elapsed = time.monotonic() - start_time
 
         assert elapsed < 1.0
-        started_process.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+        started_process.join.assert_called_once_with(timeout=launch_module.WORKER_TIMEOUT)
         in_flight_process.join.assert_not_called()
         assert any(
             "spawn batch did not complete" in call.args[0] for call in log_error.call_args_list
@@ -840,7 +850,7 @@ def test_shutdown_bounds_inflight_spawn_and_spawner_reaps_late_worker() -> None:
         spawner._thread.join(timeout=10.0)
 
     assert not spawner._thread.is_alive()
-    in_flight_process.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+    in_flight_process.join.assert_called_once_with(timeout=launch_module.WORKER_TIMEOUT)
 
 
 def test_shutdown_skips_registered_process_that_never_started() -> None:
@@ -853,8 +863,7 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
     client.background_thread.is_alive.return_value = False
     worker = MagicMock()
     worker.pid = None
-    client.worker_processes = [worker]
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [worker])
 
     client.shutdown()
 
@@ -870,10 +879,7 @@ def test_worker_death_during_request_send_is_contained() -> None:
     live_worker = MagicMock()
     live_worker.pid = 456
     live_worker.is_alive.return_value = True
-    client.worker_processes = [dead_worker, live_worker]
-    client._worker_spawner = MagicMock()
-    client._ext_worker_thread = None
-    client._monitor_worker_liveness = True
+    spawner = _install_spawn_workers(client, [dead_worker, live_worker], MagicMock())
     client._worker_failure = None
     client._shutdown_started = False
     client.shutdown_event = threading.Event()
@@ -896,7 +902,7 @@ def test_worker_death_during_request_send_is_contained() -> None:
     request.refs_from_shm.assert_called_once_with()
     dead_worker.kill.assert_not_called()
     live_worker.kill.assert_called_once_with()
-    client._worker_spawner.reap_started_processes.assert_called_once_with()
+    spawner.reap_started_processes.assert_called_once_with()
     assert client.shutdown_event.is_set()
     client.response_event.set.assert_called_once_with()
     client._iter_stats.record_request_started.assert_not_called()
@@ -910,9 +916,7 @@ def test_worker_liveness_check_does_not_abort_worker_group() -> None:
     dead_worker.is_alive.return_value = False
     live_worker = MagicMock()
     live_worker.is_alive.return_value = True
-    client.worker_processes = [dead_worker, live_worker]
-    client._ext_worker_thread = None
-    client._monitor_worker_liveness = True
+    _install_spawn_workers(client, [dead_worker, live_worker])
     client._worker_failure = None
     client._shutdown_started = False
 
@@ -928,7 +932,7 @@ def test_worker_liveness_check_does_not_abort_worker_group() -> None:
 
 @pytest.mark.skipif(sys.platform != "linux", reason="zombie state is observed through /proc")
 def test_worker_failure_reaps_dead_and_contained_processes() -> None:
-    context = executor_module._get_mp_context("spawn")
+    context = launch_module._get_mp_context("spawn")
     dead_worker = context.Process(target=_exit_immediately, args=(7,))
     live_worker = context.Process(target=_pause)
     dead_worker.start()
@@ -947,10 +951,7 @@ def test_worker_failure_reaps_dead_and_contained_processes() -> None:
         assert _process_state(dead_worker.pid) == "Z"
 
         client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
-        client.worker_processes = [dead_worker, live_worker]
-        client._worker_spawner = executor_module._WorkerProcessSpawner(client.worker_processes)
-        client._ext_worker_thread = None
-        client._monitor_worker_liveness = True
+        _install_spawn_workers(client, [dead_worker, live_worker])
         client._worker_failure = None
         client._shutdown_started = False
         client._request_to_send = None
@@ -988,10 +989,7 @@ def test_worker_failure_shutdown_does_not_wait_for_thread_timeout() -> None:
     dead_worker.pid = 123
     dead_worker.exitcode = -signal.SIGKILL
     dead_worker.is_alive.return_value = False
-    client.worker_processes = [dead_worker]
-    client._worker_spawner = MagicMock()
-    client._ext_worker_thread = None
-    client._monitor_worker_liveness = True
+    _install_spawn_workers(client, [dead_worker], MagicMock())
     client._worker_failure = None
     client._shutdown_lock = threading.Lock()
     client._shutdown_started = False
@@ -1132,15 +1130,14 @@ def test_shutdown_is_idempotent() -> None:
     worker = MagicMock()
     worker.pid = 123
     worker.is_alive.return_value = False
-    client.worker_processes = [worker]
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [worker])
 
     client.shutdown()
     client.shutdown()
 
     client.pending_requests.put.assert_called_once_with(None)
     client.background_thread.join.assert_called_once_with(timeout=executor_module.THREAD_TIMEOUT)
-    worker.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+    worker.join.assert_called_once_with(timeout=launch_module.WORKER_TIMEOUT)
 
 
 def test_concurrent_shutdown_waits_for_active_reap() -> None:
@@ -1179,9 +1176,7 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     worker = MagicMock()
     worker.pid = 123
     worker.is_alive.return_value = False
-    client.worker_processes = [worker]
-    client._worker_spawner = None
-    client._ext_worker_thread = None
+    _install_spawn_workers(client, [worker])
 
     first_shutdown = threading.Thread(target=client.shutdown)
     second_shutdown = threading.Thread(target=client.shutdown)
@@ -1200,7 +1195,7 @@ def test_concurrent_shutdown_waits_for_active_reap() -> None:
     assert not second_shutdown.is_alive()
     assert client._shutdown_complete.is_set()
     client.pending_requests.put.assert_called_once_with(None)
-    worker.join.assert_called_once_with(timeout=executor_module.WORKER_TIMEOUT)
+    worker.join.assert_called_once_with(timeout=launch_module.WORKER_TIMEOUT)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="signal delivery behavior is POSIX-specific")
