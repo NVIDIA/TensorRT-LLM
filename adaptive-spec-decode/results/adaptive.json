@@ -1,0 +1,122 @@
+{
+  "adaptive_results": [
+    {
+      "id": 0,
+      "type": "easy",
+      "tokens": 200,
+      "tok_per_sec": 23.05,
+      "chosen_k": 5,
+      "strategy": "warmup",
+      "acceptance_rate": 0.59,
+      "reason": "Warmup phase (step 0)"
+    },
+    {
+      "id": 1,
+      "type": "easy",
+      "tokens": 193,
+      "tok_per_sec": 28.28,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.653,
+      "reason": "rate=0.59, trend=unknown, -> moderate (k=5)"
+    },
+    {
+      "id": 2,
+      "type": "easy",
+      "tokens": 93,
+      "tok_per_sec": 17.81,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.637,
+      "reason": "rate=0.65, trend=unknown, -> moderate (k=5)"
+    },
+    {
+      "id": 3,
+      "type": "easy",
+      "tokens": 193,
+      "tok_per_sec": 16.64,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.566,
+      "reason": "rate=0.64, trend=stable, -> moderate (k=5)"
+    },
+    {
+      "id": 4,
+      "type": "medium",
+      "tokens": 200,
+      "tok_per_sec": 17.48,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.576,
+      "reason": "rate=0.57, trend=degrading, -> moderate (k=5)"
+    },
+    {
+      "id": 5,
+      "type": "medium",
+      "tokens": 200,
+      "tok_per_sec": 19.09,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.583,
+      "reason": "rate=0.58, trend=degrading, -> moderate (k=5)"
+    },
+    {
+      "id": 6,
+      "type": "hard",
+      "tokens": 200,
+      "tok_per_sec": 15.12,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.528,
+      "reason": "rate=0.58, trend=stable, -> moderate (k=5)"
+    },
+    {
+      "id": 7,
+      "type": "hard",
+      "tokens": 200,
+      "tok_per_sec": 14.93,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.49,
+      "reason": "rate=0.53, trend=stable, -> moderate (k=5)"
+    },
+    {
+      "id": 8,
+      "type": "hard",
+      "tokens": 200,
+      "tok_per_sec": 20.48,
+      "chosen_k": 1,
+      "strategy": "conservative",
+      "acceptance_rate": 0.543,
+      "reason": "rate=0.49, trend=degrading, -> conservative (k=1)"
+    },
+    {
+      "id": 9,
+      "type": "hard",
+      "tokens": 200,
+      "tok_per_sec": 15.19,
+      "chosen_k": 5,
+      "strategy": "moderate",
+      "acceptance_rate": 0.5,
+      "reason": "rate=0.54, trend=stable, -> moderate (k=5)"
+    }
+  ],
+  "controller_report": {
+    "total_decisions": 9,
+    "strategy_distribution": {
+      "moderate": 8,
+      "conservative": 1
+    },
+    "avg_draft_length": 4.555555555555555,
+    "final_acceptance_rate": 0.50001640453
+  },
+  "summary": {
+    "vanilla_avg": 27.522000000000002,
+    "spec_k3_avg": 21.797,
+    "spec_k5_avg": 18.419,
+    "spec_k7_avg": 17.187,
+    "adaptive_avg": 18.807,
+    "speedup_vs_k7": 1.0942572874847267,
+    "speedup_vs_k5": 1.0210652044084911
+  }
+}
