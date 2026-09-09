@@ -7,8 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend import interface as attention_backend_interface
-from tensorrt_llm._torch.attention_backend import utils as attention_backend_utils
+from tensorrt_llm._torch.attention.backends import interface as attention_backend_interface
+from tensorrt_llm._torch.attention.backends import utils as attention_backend_utils
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 

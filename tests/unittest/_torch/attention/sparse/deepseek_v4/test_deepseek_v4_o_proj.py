@@ -24,13 +24,13 @@ import torch
 from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m0
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig

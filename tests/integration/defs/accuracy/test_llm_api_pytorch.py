@@ -16,10 +16,12 @@ import asyncio
 import json
 import os
 import sys
+from typing import Optional
 from unittest import mock
 
 import pytest
 import torch
+import torch._inductor.config as inductor_config
 from datasets import load_dataset
 from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
@@ -50,7 +52,8 @@ from ..conftest import (check_device_contain, get_device_count,
                         skip_pre_blackwell, skip_pre_hopper, skip_ray, skip_x86)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2, assert_acceptance_length)
+                            LongBenchV1, LongBenchV2, assert_acceptance_length,
+                            compute_acceptance_length)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -78,6 +81,31 @@ def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
                         patched_start_mpi_pool)
 
 
+def _count_prims_ts_phase_calls(mocker):
+    """Count PrimTS phase launches while keeping the real kernels installed."""
+    from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+    calls = {
+        "context": 0,
+        "generation": 0,
+        "mla_generation": 0,
+    }
+
+    def patch_method(method_name, counter_name):
+        original = getattr(PrimsTSFmha, method_name)
+
+        def counted(self, params):
+            calls[counter_name] += 1
+            return original(self, params)
+
+        mocker.patch.object(PrimsTSFmha, method_name, counted)
+
+    patch_method("run_context", "context")
+    patch_method("run_generation", "generation")
+    patch_method("run_mla_generation", "mla_generation")
+    return calls
+
+
 # MPI session reuse cannot safely reset Userbuffers between Engines. Tests
 # using this helper must keep ``torch_compile=True`` in their node id; tests
 # with unconditional compile configs must keep ``piecewise_cuda_graph`` in
@@ -102,23 +130,6 @@ def _latest_kv_cache_stats(llm):
     ]
     assert entries, "No kvCacheStats reported; is enable_iter_perf_stats set?"
     return entries[-1]
-
-
-def _compute_acceptance_length(llm) -> float:
-    """Mean acceptance length over speculative iterations.
-
-    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
-    """
-    stats = llm.get_stats(timeout=2)
-    spec_iters = [
-        stat['specDecodingStats'] for stat in stats
-        if stat.get('specDecodingStats')
-        and stat['specDecodingStats']['numDraftTokens'] > 0
-    ]
-    assert spec_iters, "No iterations with speculative decoding stats"
-    accepted = sum(s['numAcceptedTokens'] for s in spec_iters)
-    reqs = sum(s['numRequestsWithDraftTokens'] for s in spec_iters)
-    return (accepted + reqs) / reqs
 
 
 def _assert_non_greedy_cuda_graph_matches_eager(build_llm_kwargs,
@@ -499,7 +510,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -623,7 +634,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_pard acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_pard",
                                      acceptance_length)
@@ -757,7 +768,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_dflash",
@@ -824,7 +835,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_ngram acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestLlama3_1_8BInstruct::test_ngram",
@@ -859,7 +870,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_suffix_automaton enable_global_pool={enable_global_pool} "
                 f"acceptance_length = {acceptance_length:.3f}")
@@ -965,7 +976,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_draft_target_dynamic_draft_len "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -1211,359 +1222,6 @@ class TestMinistral8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip("FP8 pre-quantized Ministral-8B model not available")
 
 
-@skip_post_blackwell
-@skip_pre_hopper
-class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-27b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-27b-it/"
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            free_gpu_memory_fraction=0.5,
-        )
-        # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
-        # So, testing with it here.
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None,
-                 max_batch_size=128,
-                 max_seq_len=4096) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_fp8_prequantized(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        dtype="fp8")
-        # Note: This has only the LLM part quantized. Vision part is in bfloat16.
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config,
-                 attn_backend="FLASHINFER",
-                 cuda_graph_config=None,
-                 max_seq_len=4096) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
-@skip_pre_hopper
-class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "google/gemma-3-1b-it"
-    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
-
-    # NOTE: Disable block reuse for SWA window model.
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
-
-    def test_auto_dtype(self):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-        )
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @parametrize_with_ids("torch_compile", [False, True])
-    def test_fp8_prequantized(self, torch_compile):
-        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        enable_partial_reuse=False,
-                                        dtype="fp8")
-        torch_compile_config = _get_default_torch_compile_config(torch_compile)
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config,
-                 torch_compile_config=torch_compile_config) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_fp8_vswa_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        with LLM(prequantized_model_path,
-                 kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.parametrize("backend", ["xgrammar"])
-    def test_fp8_guided_decoding_vswa_reuse(self, backend: str, mocker):
-        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
-        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-        cuda_graph_config = CudaGraphConfig(enable_padding=True)
-        llm = LLM(prequantized_model_path,
-                  guided_decoding_backend=backend,
-                  kv_cache_config=kv_cache_config,
-                  cuda_graph_config=cuda_graph_config)
-        with llm:
-            task = JsonModeEval(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse_low_memory_available(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 disable_overlap_scheduler=True) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 disable_overlap_scheduler=True) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_low_memory_available_partial_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            enable_partial_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            free_gpu_memory_fraction=0.1,
-        )
-
-        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_reuse_kv_cache_stats(self):
-        """Mirror of test_auto_dtype_vswa_reuse that collects per-iteration stats.
-
-        Collects per-iteration KV cache statistics and writes them to a JSON
-        file for offline visualization with
-        ``scripts/visualize_kv_cache_stats.py``.
-        """
-        import json
-        import time
-        from pathlib import Path
-
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-            iteration_stats_interval=1,
-        )
-
-        all_stats = []
-
-        def drain_stats(llm, phase_label):
-            """Drain the stats queue and tag each entry.
-
-            Tags each entry with wall-clock time and a human-readable phase
-            label.
-            """
-            stats = llm.get_stats(timeout=2)
-            ts = time.time()
-            for entry in stats:
-                entry["_collectedAt"] = ts
-                entry["_phase"] = phase_label
-            all_stats.extend(stats)
-
-        with LLM(
-                self.MODEL_PATH,
-                kv_cache_config=kv_cache_config,
-                max_stats_len=-1,
-                enable_iter_perf_stats=True,
-        ) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            drain_stats(llm, "GSM8K")
-
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            drain_stats(llm, "MMLU")
-
-        # Write collected stats to JSON
-        out_dir = Path(
-            os.environ.get(
-                "KV_CACHE_STATS_OUTPUT_DIR",
-                "kv_cache_stats_output",
-            ))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"kv_cache_stats_{timestamp}.json"
-
-        payload = {
-            "model": self.MODEL_NAME,
-            "kv_cache_config": {
-                "enable_block_reuse":
-                kv_cache_config.enable_block_reuse,
-                "max_attention_window":
-                kv_cache_config.max_attention_window,
-                "iteration_stats_interval":
-                kv_cache_config.iteration_stats_interval,
-            },
-            "num_entries": len(all_stats),
-            "stats": all_stats,
-        }
-        out_path.write_text(json.dumps(payload, indent=2))
-        print(f"\n[kv_cache_stats] Wrote {len(all_stats)} entries to "
-              f"{out_path}")
-
-    def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False,
-            enable_partial_reuse=False,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        # chunked prefill case or more features
-        extra_llm_config = dict(
-            enable_chunked_prefill=True,
-            max_num_tokens=1024,
-        )
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 **extra_llm_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    def test_auto_dtype_vswa_chunked_prefill_reuse(self):
-        # NOTE: Test with VSWA kv cache config.
-        kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
-            max_attention_window=[512, 512, 512, 512, 512, 32768],
-        )
-
-        # chunked prefill case or more features
-        extra_llm_config = dict(
-            enable_chunked_prefill=True,
-            max_num_tokens=1024,
-        )
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_cache_config,
-                 **extra_llm_config) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 # This class has extensively parameterized test methods, which yield totally 200 test cases.
 # This is because this model requires high test coverage over the feature combinations.
 # Normally we should not parameterize test methods so extensively -- just test on the typical/important feature combinations.
@@ -1571,6 +1229,43 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_prims_ts_bfloat16(self, mocker):
+        if get_sm_version() not in (100, 103):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            "TLLM_FMHA_LIBS": "+prims_ts",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=False,
+        )
+        # Keep the TP=1 worker in this process so the call counter observes the
+        # real PrimTS launch. Compile Inductor kernels synchronously because its
+        # process-global async reader thread otherwise outlives this test and is
+        # reported as a leak; persistent compiler caches remain enabled.
+        with (inductor_config.patch(compile_threads=1),
+              mock.patch.dict(os.environ, env)):
+            with LLM(self.MODEL_PATH,
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     enable_chunked_prefill=False,
+                     enable_attention_dp=False,
+                     cuda_graph_config=None,
+                     speculative_config=None,
+                     max_batch_size=1350) as llm:
+                calls.update({name: 0 for name in calls})
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(llm)
+
+        assert calls["mla_generation"] > 0
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
@@ -1612,7 +1307,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             if mtp_nextn > 0:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print(f"[AL] test_bfloat16 mtp_nextn={mtp_nextn} "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(
@@ -4253,7 +3948,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
             assert score >= acc_params.ref_accuracy, (
                 f"GSM8K accuracy {score:.3f} is below recorded reference "
                 f"{acc_params.ref_accuracy:.3f}")
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_gsm8k_dep8_megamoe_deepgemm "
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
@@ -4640,107 +4335,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-@pytest.mark.timeout(10800)
-class TestKimiK3(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K3"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(16)
-    # The 16-GPU K3 recipes are qualified on GB300 (one NVL72 domain) only:
-    # on 2-node 180-190 GiB parts (B200/GB200, InfiniBand between nodes) the
-    # EP16 MoE-comm bring-up hangs and the KV-budget assumptions do not hold,
-    # so gate on GB300-class device memory. B300 clears this memory gate but
-    # pairs 8-GPU nodes over InfiniBand (same non-NVL72 topology) — do not
-    # schedule these tests on B300; that exclusion is enforced by QA's
-    # platform selection, not by this marker.
-    @pytest.mark.skip_less_device_memory(200000)
-    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
-    def test_w4a16_mxfp4(self, mode: str,
-                         monkeypatch: pytest.MonkeyPatch) -> None:
-        """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
-
-        No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
-        multinode pipeline (qualified on 4x4 GB300 nodes). Each mode mirrors
-        the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
-        - keep them in sync when editing either. The `sa` leg additionally
-        records spec-dec acceptance: AL/AR lines in the eval log (via
-        TLLM_EVAL_SPEC_STATS) and an iteration-stats AL asserted against
-        references/acceptance_length.yaml.
-        """
-        kv_cache_kwargs = dict(
-            enable_block_reuse=False,
-            free_gpu_memory_fraction=0.25,
-            # tokens_per_block=64 keeps the MLA generation path on the
-            # flashinfer trtllm-gen kernel (K3 has 96 query heads).
-            tokens_per_block=64,
-        )
-        llm_kwargs = dict(
-            tensor_parallel_size=16,
-            moe_expert_parallel_size=16,
-            enable_attention_dp=True,
-            max_batch_size=32,
-            max_num_tokens=8192,
-            max_seq_len=8192,
-            trust_remote_code=True,
-            enable_chunked_prefill=True,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True,
-                                              max_batch_size=32),
-            moe_config=MoeConfig(max_num_tokens=33024,
-                                 use_low_precision_moe_combine=True),
-        )
-        if mode == "reuse":
-            kv_cache_kwargs["enable_block_reuse"] = True
-            # Hybrid models expose reusable prefixes only at KDA state
-            # snapshot boundaries; without a snapshot cadence, block reuse
-            # silently never engages.
-            kv_cache_kwargs["mamba_state_config"] = MambaStateConfig(
-                periodic_snapshot_interval=256)
-        elif mode == "sa":
-            llm_kwargs.update(
-                max_batch_size=8,
-                disable_overlap_scheduler=True,
-                enable_chunked_prefill=False,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
-                speculative_config=SADecodingConfig(max_draft_len=2),
-                # AL capture needs per-iteration spec-decoding stats.
-                enable_iter_perf_stats=True,
-                max_stats_len=-1,
-            )
-            # Log corpus-aggregate AL and AR at eval end ("Spec-dec stats:"
-            # lines) — QA records acceptance from the test log (TRTLLM-15036).
-            monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
-
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=KvCacheConfig(**kv_cache_kwargs),
-                 **llm_kwargs) as llm:
-            # Reference-key contract: the K3 checkpoint carries its
-            # quantization as nested text_config.quantization_config
-            # (compressed-tensors MXFP4 experts), which the LLM-args layer
-            # does not surface — unlike modelopt-style hf_quant_config.json
-            # checkpoints — so the reference matcher sees quant_algo=None
-            # and the references/gsm8k.yaml entries carry no quant_algo key.
-            # If this fires, the args-level resolution changed: update the
-            # yaml keys together with this assert.
-            assert llm.args.quant_config.quant_algo is None
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            if mode == "sa":
-                acceptance_length = _compute_acceptance_length(llm)
-                print(f"[AL] TestKimiK3::test_w4a16_mxfp4[sa] "
-                      f"acceptance_length = {acceptance_length:.3f}")
-                # ref_al/min_al live in references/acceptance_length.yaml.
-                # The reference was measured on the same workload but
-                # through the lm-eval-route estimator, whose weighting may
-                # not match this iteration-stats one exactly — so min_al is
-                # set as a loose acceptance-collapse tripwire rather than
-                # the populate-path default. Tighten both once this test's
-                # own runs establish a baseline.
-                assert_acceptance_length("TestKimiK3::test_w4a16_mxfp4",
-                                         acceptance_length)
-
-
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
@@ -4770,7 +4364,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
                  enable_iter_perf_stats=True) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_eagle3 acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_4B::test_eagle3",
@@ -4863,6 +4457,34 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_blackwell
+    def test_prims_ts_bfloat16(self, mocker):
+        if get_sm_version() not in (100, 103):
+            pytest.skip("PrimTS requires SM100 or SM103")
+
+        calls = _count_prims_ts_phase_calls(mocker)
+        env = {
+            "TLLM_FMHA_LIBS": "+prims_ts",
+            "TLLM_WORKER_USE_SINGLE_PROCESS": "1",
+        }
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.75,
+            tokens_per_block=32,
+            use_kv_cache_manager_v2=True,
+        )
+        with mock.patch.dict(os.environ, env):
+            with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
+                     attn_backend="TRTLLM",
+                     kv_cache_config=kv_cache_config,
+                     disable_overlap_scheduler=True,
+                     cuda_graph_config=None) as llm:
+                calls.update({name: 0 for name in calls})
+                task = CnnDailymail(self.MODEL_NAME)
+                task.evaluate(llm)
+
+        assert calls["context"] > 0
+        assert calls["generation"] > 0
 
     @parametrize_with_ids(
         "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
@@ -5005,7 +4627,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               apply_chat_template=True,
                               chat_template_kwargs={"enable_thinking": False},
                           ))
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_dspark[{attention_backend}] acceptance_length "
                   f"= {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_8B::test_dspark",
@@ -5998,7 +5620,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestGPTOSS::test_dflash",
@@ -6974,7 +6596,7 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            acceptance_length = _compute_acceptance_length(llm)
+            acceptance_length = compute_acceptance_length(llm)
             print(
                 f"[AL] test_dflash acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_5_4B::test_dflash",
@@ -7580,6 +7202,161 @@ class TestQwen3_8_2_4T_A95B(LlmapiAccuracyTestHarness):
                         attention_dp=True,
                         moe_backend="CUTEDSL",
                         max_draft_len=None,
+                        mocker=mocker)
+
+
+@pytest.mark.timeout(28800)
+class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
+    """Qwen3.8-Flash-Next: Gated-DeltaNet + QSA hybrid with MoE, PLE, and MTP3."""
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MAX_NUM_TOKENS = 8192
+    MAX_BATCH_SIZE = 16
+    GSM8K_MAX_OUTPUT_LEN = 512
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        system_prompt=("Use at most three short reasoning sentences, then "
+                       "end with `#### NUMBER`. Do not restate the problem."),
+        chat_template_kwargs=dict(enable_thinking=True,
+                                  reasoning_effort="xhigh"),
+    )
+
+    MMLU_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=("Answer with a single letter: A, B, C, or D. "
+                       "Output only that letter and nothing else."),
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+
+    def _build_llm(self,
+                   model_path: str,
+                   tensor_parallel_size: int,
+                   moe_backend: str,
+                   max_draft_len: Optional[int],
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False) -> LLM:
+        """Construct the engine shared by both evaluation tasks."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False,
+                                        mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(max_batch_size=self.MAX_BATCH_SIZE,
+                                            enable_padding=True)
+        mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
+            max_draft_len=max_draft_len))
+        return LLM(model_path,
+                   trust_remote_code=True,
+                   tensor_parallel_size=tensor_parallel_size,
+                   moe_expert_parallel_size=moe_expert_parallel_size,
+                   enable_attention_dp=enable_attention_dp,
+                   max_num_tokens=self.MAX_NUM_TOKENS,
+                   enable_chunked_prefill=True,
+                   max_batch_size=self.MAX_BATCH_SIZE,
+                   kv_cache_config=kv_cache_config,
+                   cuda_graph_config=cuda_graph_config,
+                   moe_config=MoeConfig(backend=moe_backend),
+                   speculative_config=mtp_config)
+
+    def _run_evals(self,
+                   model_path: str,
+                   tensor_parallel_size: int,
+                   moe_backend: str,
+                   max_draft_len: Optional[int],
+                   expected_quant_algo: Optional[QuantAlgo],
+                   monkeypatch: pytest.MonkeyPatch,
+                   mocker,
+                   moe_expert_parallel_size: int = 1,
+                   enable_attention_dp: bool = False) -> None:
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
+
+        with self._build_llm(model_path,
+                             tensor_parallel_size,
+                             moe_backend,
+                             max_draft_len,
+                             moe_expert_parallel_size=moe_expert_parallel_size,
+                             enable_attention_dp=enable_attention_dp) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_bf16_tep4_cutlass(self, monkeypatch: pytest.MonkeyPatch,
+                               mocker) -> None:
+        """BF16 TEP4, no MTP, PLE offloaded to pinned host memory."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next",
+                        tensor_parallel_size=4,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=None,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(82000)
+    @pytest.mark.skip_less_host_memory(98304)
+    def test_fp8_adp4_mtp3_trtllm_ple_offload(self,
+                                              monkeypatch: pytest.MonkeyPatch,
+                                              mocker) -> None:
+        """Block-FP8 on four GPUs with attention DP, MTP3 and PLE offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-FP8",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_mtp3_trtllm_ple_offload(self,
+                                                monkeypatch: pytest.MonkeyPatch,
+                                                mocker) -> None:
+        """NVFP4 on four GPUs with attention DP, MTP3 and PLE offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="TRTLLM",
+                        max_draft_len=3,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(100000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_1gpu_cutedsl_ple_offload(self,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            mocker) -> None:
+        """NVFP4 on one GPU without MTP and the PLE table offloaded to host.
+
+        CuteDSL serves NVFP4 but not the FP8 block scales of the MTP layer's
+        experts, so this checkpoint only fits the backend without MTP.
+        """
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=1,
+                        moe_backend="CUTEDSL",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
                         mocker=mocker)
 
 
@@ -8198,7 +7975,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
             if use_mtp:
-                acceptance_length = _compute_acceptance_length(llm)
+                acceptance_length = compute_acceptance_length(llm)
                 print("[AL] test_nvfp4_4gpus_block_reuse "
                       f"acceptance_length = {acceptance_length:.3f}")
                 assert_acceptance_length(

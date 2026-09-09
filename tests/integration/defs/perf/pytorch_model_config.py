@@ -89,6 +89,28 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # Kimi K3 TEP8 serving recipe.
+        {
+            'patterns': ['kimi_k3-serve-pytorch'],
+            'config': {
+                'trust_remote_code': True,
+                'max_seq_len': 9344,
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': False,
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'dtype': 'auto',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.25,
+                    'tokens_per_block': 64,
+                },
+                'stream_interval': 10,
+            }
+        },
         # DeepSeek V4 Flash uses TRTLLM for MXFP4 routed experts.
         {
             'patterns': ['deepseek_v4_flash-bench'],
@@ -311,6 +333,28 @@ def get_model_yaml_config(model_label: str,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
+                },
+            }
+        },
+        # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
+        {
+            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'config': {
+                'trust_remote_code': True,
+                'moe_config': {
+                    'backend': 'CUTLASS',
+                },
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                },
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'dtype': 'fp8',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 1,
                 },
             }
         },
