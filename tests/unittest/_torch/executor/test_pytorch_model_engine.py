@@ -1528,6 +1528,55 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             (fixed_slot_output[511:512], fixed_slot_output[:400]))
         torch.testing.assert_close(restored_output, expected_output)
 
+    def test_warmup_builds_dsa_attn_metadata_when_no_forward_ran(self) -> None:
+        """The DSA top-K pre-compile hooks read attn_metadata; when every
+        warmup forward was skipped it is built on demand so the engines still
+        compile before serving."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import \
+            DSAtrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(
+            Metadata=DSAtrtllmAttentionMetadata)
+        engine.kv_cache_manager_key = "kv"
+        engine.original_max_draft_len = 2
+        engine._cuda_graph_batch_sizes = [8]
+        engine._get_draft_kv_cache_manager = Mock(return_value=None)
+        metadata = Mock(spec=DSAtrtllmAttentionMetadata)
+
+        def build(kv_cache_manager, draft_kv_cache_manager):
+            engine.attn_metadata = metadata
+            return metadata
+
+        engine._set_up_attn_metadata = Mock(side_effect=build)
+        kv_cache_manager = Mock()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = kv_cache_manager
+
+        engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_called_once_with(
+            kv_cache_manager, None)
+        metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
+        metadata.warmup_selfsampling_topk.assert_called_once_with(
+            3, batch_sizes=[8])
+
+    def test_warmup_does_not_build_metadata_for_non_dsa_backend(self) -> None:
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(Metadata=TrtllmAttentionMetadata)
+        engine._set_up_attn_metadata = Mock()
+
+        engine._ensure_dsa_attn_metadata_for_warmup(Mock())
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_not_called()
+
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
         engine.model = DummyLegacyMultimodalIndexModel()
