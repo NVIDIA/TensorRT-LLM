@@ -37,6 +37,12 @@ __all__ = [
 # touches the PyTorch model zoo should not pay for it.
 _MODELING_UTILS_MODULE = "tensorrt_llm._torch.models.modeling_utils"
 
+# Probed (not imported) in shutdown() so a non-MegaMoE run does not pull in
+# the MoE stack just to release an empty cache. Must stay in sync with the
+# real module path -- a mismatch silently degrades the release to a no-op.
+_MEGA_MOE_DEEPGEMM_MODULE = (
+    "tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm")
+
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
@@ -127,6 +133,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     and self.checkpoint_loader is not None):
                 self.checkpoint_loader.cleanup()
                 self.checkpoint_loader = None
+
+        # MegaMoE's NVLink symmetric-memory activation workspaces are
+        # rendezvoused over the EP group, so they must go before the
+        # destroy_process_group() below. Never let a failure here escape:
+        # doing_shutdown is already set, so a retry would no-op, and skipping
+        # the teardown below would leave NCCL communicators alive -- turning a
+        # MegaMoE-only failure into a worker teardown hang.
+        mega_moe = sys.modules.get(_MEGA_MOE_DEEPGEMM_MODULE)
+        if mega_moe is not None:
+            try:
+                mega_moe.release_symm_buffer_cache()
+            except Exception as e:
+                logger.error(
+                    f"Failed to release MegaMoE symm buffers on shutdown: {e}")
 
         # Destroy torch distributed process groups so that NCCL communicators
         # are torn down cleanly before MPI session shutdown and process exit.

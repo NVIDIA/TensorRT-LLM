@@ -633,8 +633,9 @@ def _run_reusable_video_lpips_eval(sample_id, reference_path, generated_path, sc
     return score
 
 
-def _assert_lpips_below_threshold(score, threshold):
-    assert score < threshold, f"LPIPS too high: {score:.6f} (expected < {threshold:.6f})"
+def _assert_lpips_below_threshold(score, threshold, label=""):
+    context = f" [{label}]" if label else ""
+    assert score < threshold, f"LPIPS too high{context}: {score:.6f} (expected < {threshold:.6f})"
 
 
 def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_path, artifact_name):

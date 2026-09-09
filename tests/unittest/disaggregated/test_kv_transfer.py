@@ -350,7 +350,7 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     req.prepopulated_prompt_len = 0
     req.py_last_context_chunk = (11 * tokens_per_block, 13 * tokens_per_block)
     req.context_remaining_length = 3 * tokens_per_block
-    req.is_generation_only_request.return_value = False
+    req.is_generation_only_request = False
 
     kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
 

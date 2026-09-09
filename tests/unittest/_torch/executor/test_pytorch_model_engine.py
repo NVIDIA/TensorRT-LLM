@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, EncoderCUDAGraphRunner, EncoderCUDAGraphRunnerConfig,
-    KeyType, _restore_spec_decode_capture_state,
+    KeyType, SampleType, _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
@@ -211,7 +211,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_draft_tokens=[],
         py_is_first_draft=False,
         is_context_only_request=False,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         py_disaggregated_params=None,
         py_multimodal_data=None,
         py_mm_encoder_event=None,
@@ -256,6 +256,7 @@ def _make_forward_only_engine(
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
+    engine._stage_in_graph_sampling = None
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
@@ -474,7 +475,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)
-        context.is_generation_only_request = lambda: True
+        context.is_generation_only_request = True
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [context]
         graph_batch, promoted_ids = _make_single_token_context_graph_batch(
@@ -651,6 +652,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = True
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -677,6 +679,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_aggregates_encoder_tokens(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner.max_beam_width = 1
         runner._get_seq_len_mode.return_value = False
         context = _make_request_stub(1)
@@ -701,6 +704,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         first_context = _make_request_stub(1)
         first_context.encoder_output_len = 7
@@ -747,6 +751,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_includes_peft_cache_dtype(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -804,6 +809,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_graph_key_includes_lora_variant(self) -> None:
         runner = Mock()
         runner.config = SimpleNamespace(is_draft_model=False)
+        runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -885,7 +891,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids, None, False)
+                                                     promoted_ids, None, False,
+                                                     None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -1520,6 +1527,55 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         expected_output = torch.cat(
             (fixed_slot_output[511:512], fixed_slot_output[:400]))
         torch.testing.assert_close(restored_output, expected_output)
+
+    def test_warmup_builds_dsa_attn_metadata_when_no_forward_ran(self) -> None:
+        """The DSA top-K pre-compile hooks read attn_metadata; when every
+        warmup forward was skipped it is built on demand so the engines still
+        compile before serving."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import \
+            DSAtrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(
+            Metadata=DSAtrtllmAttentionMetadata)
+        engine.kv_cache_manager_key = "kv"
+        engine.original_max_draft_len = 2
+        engine._cuda_graph_batch_sizes = [8]
+        engine._get_draft_kv_cache_manager = Mock(return_value=None)
+        metadata = Mock(spec=DSAtrtllmAttentionMetadata)
+
+        def build(kv_cache_manager, draft_kv_cache_manager):
+            engine.attn_metadata = metadata
+            return metadata
+
+        engine._set_up_attn_metadata = Mock(side_effect=build)
+        kv_cache_manager = Mock()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.return_value = kv_cache_manager
+
+        engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_called_once_with(
+            kv_cache_manager, None)
+        metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
+        metadata.warmup_selfsampling_topk.assert_called_once_with(
+            3, batch_sizes=[8])
+
+    def test_warmup_does_not_build_metadata_for_non_dsa_backend(self) -> None:
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.attn_metadata = None
+        engine.attn_backend = SimpleNamespace(Metadata=TrtllmAttentionMetadata)
+        engine._set_up_attn_metadata = Mock()
+
+        engine._ensure_dsa_attn_metadata_for_warmup(Mock())
+        engine._warmup_cute_dsl_radix_topk()
+
+        engine._set_up_attn_metadata.assert_not_called()
 
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(PyTorchModelEngine)

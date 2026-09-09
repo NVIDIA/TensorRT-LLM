@@ -5,21 +5,22 @@
 #         --task path/to/your/task.yaml \
 #         --workspace workspace/perf-optimize/<model-name>
 #
-# Required: the two source paths below. The workflow refuses to start if
-# either is missing or does not point at an existing path.
+# Required paths. Without `cluster_ssh`, both belong to the machine running
+# the CLI. With `cluster_ssh`, the checkpoint is remote but the TRT-LLM
+# checkout remains local.
 #
 # NOTE: perf-optimize MUTATES the TRT-LLM checkout — it must be a git
 # repo with a clean worktree; work happens on a dedicated
 # perf-optimize/<workspace>-<timestamp> branch (one commit per accepted
-# optimization). Source-level (`approach: code`) optimizations only take
-# effect when the checkout is the installed tensorrt_llm package
-# (editable install).
+# optimization). In local execution, code changes require an editable
+# install; in remote execution, agents sync the changed source into each job.
 
-checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>
-trtllm_repo_path: /path/to/TensorRT-LLM
+checkpoint_path:  /path/to/checkpoints/<ModelName>-<Variant>  # remote when using SSH
+trtllm_repo_path: /path/to/TensorRT-LLM                       # always local
 # Optional: the starting server tuning. It seeds the workspace's live
 # tuning config (tuning/extra_llm_api_options.yaml), which the optimizer
-# then evolves; omit to start from an empty ({}) config.
+# then evolves; this path is always local. Omit to start from an empty ({})
+# config.
 # extra_llm_api_options: /path/to/extra_llm_api_options.yaml
 
 # Optional: the benchmark operating point(s) driven by
@@ -50,26 +51,50 @@ benchmark:
 
 # Optional: which profilers the Analyzer runs each round, and the
 # steady-state iteration window that gates them (TLLM_PROFILE_START_STOP
-# for nsys/torch; ncu arms on the same window via --profile-from-start
-# off). ncu is the bounded per-kernel deep dive on the top nsys kernels,
-# interpreted with the perf-nsight-compute-analysis skill. A round profiles
+# for nsys; ncu arms on the same window via --profile-from-start
+# off). The nsys timeline is decomposed with the
+# internal-perf-nsight-system-analysis skill (per-iteration time, busy/idle rungs,
+# compute-absent causes); ncu is the bounded per-kernel deep dive on the
+# top nsys kernels, interpreted with the perf-nsight-compute-analysis
+# skill. A round profiles
 # after an accept or a reverted code attempt that may have changed ignored
 # build output; otherwise the next one re-plans from current evidence. Drop
-# torch/ncu to trim what profiling rounds cost.
+# ncu to trim what profiling rounds cost.
 profile:
-  methods: [nsys, torch, ncu]
+  methods: [nsys, ncu]
   nsys_iter_range: "100-150"
+  # Which ranks nsys captures. Default [0] — the historical single-wrap
+  # behaviour, and all a bare `trtllm-serve` can give: at world size > 1 it
+  # creates its workers with MPI.COMM_SELF.Spawn and nsys does not follow
+  # spawned processes. Several ranks need one wrap per rank inside the
+  # launcher (the Slurm `trtllm-llmapi-launch` shape), and buy the skill's
+  # rank-jitter step: mean jitter wait per iteration, the busy spread, the
+  # imbalance operator, and the pinned-vs-rotating straggler verdict — the
+  # only evidence that says the job waits on a slow rank rather than on the
+  # network. Wrap only the ranks you list: a rank slowed by its own profiler
+  # shows up as jitter the others wait on. One representative per part of
+  # the parallelism is enough; capturing all 8 costs 8 exports.
+  # profile_ranks: [0, 4]
   # Optional: the per-kernel coverage contract. When present (an empty
   # mapping enables the defaults shown), the analyzer's ncu dive covers
   # EVERY kernel at/above min_share_pct of GPU time (extending down the
   # kern_sum until coverage_target_pct is reached, over bounded capture
   # passes), and each profiling round writes a schema-validated
-  # kernel_ledger.yaml answering two questions per kernel — can it be
-  # made faster? can it be fused with its neighbors? — each with a
-  # roadmap item or an evidence-backed dismissal. The orchestrator
-  # aborts the round on an incomplete ledger (a replan-only round runs
-  # no ncu and is waived), so the campaign cannot end with a kernel
-  # whose optimization/fusion possibility was never considered. Costs
+  # kernel_ledger.yaml answering four questions per kernel — can it be
+  # eliminated? can it be made faster? can it be fused with its
+  # neighbors? can it be overlapped with independent work on another
+  # stream? — each with a roadmap item or an evidence-backed dismissal.
+  # They are ordered by how much they presuppose: elimination assumes
+  # only that the kernel runs today (and recovers its whole share, not a
+  # fraction), faster/fusion assume the work is necessary AND that the
+  # kernel runs alone, overlap drops the alone assumption. The
+  # ledger also records the window's gpu_busy_pct, which converts every
+  # kernel's share of GPU time into the share of WALL CLOCK the noise
+  # floor actually judges. The orchestrator aborts the round on an
+  # incomplete ledger (a replan-only round runs no ncu and is waived),
+  # so the campaign cannot end with a kernel whose
+  # elimination/optimization/fusion/overlap possibility was never
+  # considered. Costs
   # extra profiling time per round that profiles; requires nsys+ncu in
   # methods.
   # kernel_coverage:
@@ -135,10 +160,14 @@ profile:
 
 # Optional: include this section only when the servers + benchmarks must
 # run through Slurm (otherwise everything runs locally on the current
-# node). When present, both fields are required.
+# node). `cluster_ssh` makes only the Slurm jobs remote; source editing,
+# Git, workflow state, and retained artifacts stay local. The run root is
+# optional and defaults to ~/agent_flow_workspace/<workspace-name> remotely.
 # slurm-environment:
 #   slurm_partition: <partition>
-#   docker_image: /path/to/trtllm-pytorch-<version>.sqsh
+#   docker_image: /remote/path/to/trtllm-pytorch-<version>.sqsh
+#   cluster_ssh: user@login-host       # enables remote execution
+#   remote_run_root: /remote/path/to/perf-optimize/my-campaign
 
 # Optional: the one-shot analytical SOL-projection stage between the
 # baseline benchmark and round 1 (benchmarker -> projector ->

@@ -24,7 +24,6 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestUtils.h"
