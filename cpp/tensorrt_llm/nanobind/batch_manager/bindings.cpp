@@ -487,8 +487,6 @@ void initBindings(nb::module_& m)
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
             nb::arg("enable_kv_cache_reuse") = false)
-        .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
-            nb::arg("mpi_world_rank") = 0)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)

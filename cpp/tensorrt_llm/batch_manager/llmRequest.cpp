@@ -52,17 +52,6 @@ runtime::SizeType32 GenericLlmRequest<TTensor, TStream>::getBeamWidthByIter(bool
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-std::optional<executor::Response> LlmRequest::createResponse(bool useFastLogits, int32_t mpiWorldRank)
-{
-    auto requestId = isChild() ? mParentRequestId : mRequestId;
-    auto result = createResult(useFastLogits, mpiWorldRank);
-    if (result.has_value())
-    {
-        return executor::Response(requestId, result.value(), mClientId);
-    }
-    return std::nullopt;
-}
-
 void LlmRequest::createSerializedResult(
     std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
 {

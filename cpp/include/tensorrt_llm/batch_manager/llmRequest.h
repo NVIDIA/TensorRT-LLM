@@ -2468,11 +2468,6 @@ public:
     LlmRequest(LlmRequest&& request) = default;
     LlmRequest(LlmRequest const& request) = default;
 
-    /// @brief  Create a Response from the current state of the request
-    /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
-    /// @return An optional Response
-    std::optional<executor::Response> createResponse(bool useFastLogits = false, int32_t mpiWorldRank = 0);
-
     std::optional<executor::Result> createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0);
 
     void createSerializedResult(
