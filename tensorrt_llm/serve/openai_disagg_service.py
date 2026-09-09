@@ -147,6 +147,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             AnthropicCountTokensResponse,
             server,
         )
+
     @staticmethod
     def _align_to_blocks(token_ids: list, block_size: int) -> list:
         """Drop the ragged tail so every requested block is a whole one.
