@@ -702,6 +702,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         audio_hidden_states: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor],
         timestep: torch.Tensor,
+        conditioning_timesteps: torch.Tensor,
         timestep_indices: torch.Tensor,
         token_tags: torch.Tensor,
         position_ids: Optional[torch.Tensor],
@@ -712,6 +713,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         return_dict: bool = True,
         static_context: Optional[MiniMaxH3StaticContext] = None,
     ) -> MiniMaxH3TransformerOutput | tuple[torch.Tensor, torch.Tensor]:
+        """Predict packed velocities using native conditioning and normalized attention time.
+
+        ``conditioning_timesteps`` is the unique H3 time table for AdaLN;
+        ``timestep`` is descending noise in [0, 1] for attention/graph scheduling.
+        """
         del attention_kwargs
         if position_ids is None:
             if static_context is None:
@@ -719,7 +725,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             sequence_length = static_context.sequence_length
         else:
             sequence_length = position_ids.shape[0]
-            self._validate_layout(position_ids, token_tags, timestep_indices, timestep)
+            self._validate_layout(
+                position_ids, token_tags, timestep_indices, conditioning_timesteps
+            )
 
         if static_context is None:
             if encoder_hidden_states is None or position_ids is None:
@@ -755,7 +763,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             1, audio_indices, audio_embeds.to(text_embeds.dtype)
         )
 
-        temb = self.time_proj(timestep)
+        temb = self.time_proj(conditioning_timesteps)
         temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
         key_padding_mask = None

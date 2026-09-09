@@ -749,21 +749,30 @@ class MiniMaxH3Pipeline(BasePipeline):
             prompt_embeds,
             position_ids,
         )
-        timer.mark_denoise_start()
+        condition_rows = layout.num_condition_video_rows
+        condition_prefix = latents[:condition_rows][None]
+        # H3's native time increases toward clean. Attention and graph-phase
+        # scheduling use descending normalized noise, protecting both streams.
+        attention_timesteps = 1.0 - torch.minimum(
+            self.scheduler.timesteps, self.audio_scheduler.timesteps
+        )
 
-        # H3 uses distinct video/audio timesteps; BasePipeline.denoise currently
-        # passes the primary timestep to every stream's scheduler.
-        denoise_start = time.time()
-        total_steps = len(self.scheduler.timesteps)
-        logger.info(f"Denoising [video, audio]: {total_steps} steps")
-        for index, video_timestep in self._profile_denoise_steps(self.scheduler.timesteps):
-            step_start = time.time()
+        def forward_fn(
+            video_latents: torch.Tensor,
+            extra_stream_latents: dict[str, torch.Tensor],
+            index: int,
+            timestep: torch.Tensor,
+            encoder_hidden_states: torch.Tensor,
+            extra_tensors: dict[str, torch.Tensor],
+        ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            del timestep, encoder_hidden_states, extra_tensors
             unique_timesteps, timestep_indices = row_timestep_plan[index]
             video_velocity, audio_velocity = self.transformer(
-                hidden_states=latents[None],
-                audio_hidden_states=audio_latents[None],
+                hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
+                audio_hidden_states=extra_stream_latents["audio"],
                 encoder_hidden_states=None,
-                timestep=unique_timesteps,
+                timestep=attention_timesteps[index : index + 1],
+                conditioning_timesteps=unique_timesteps,
                 timestep_indices=timestep_indices,
                 token_tags=token_tags,
                 position_ids=None,
@@ -778,31 +787,22 @@ class MiniMaxH3Pipeline(BasePipeline):
             # video with silent audio.  The cause was never reproduced, so fail
             # loudly at the step that produced it instead of shipping the
             # corruption downstream.
-            condition_rows = layout.num_condition_video_rows
             _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
             _check_denoise_step(audio_velocity, "audio", index)
-            latents[condition_rows:] = self.scheduler.step(
-                video_velocity[0, condition_rows:].float(),
-                video_timestep,
-                latents[condition_rows:],
-                return_dict=False,
-            )[0]
-            audio_latents[:] = self.audio_scheduler.step(
-                audio_velocity[0].float(),
-                self.audio_scheduler.timesteps[index],
-                audio_latents,
-                return_dict=False,
-            )[0]
-            step_time = time.time() - step_start
-            average_time = (time.time() - denoise_start) / (index + 1)
-            logger.info(
-                f"Step {index + 1}/{total_steps} | {step_time:.2f}s | "
-                f"Avg={average_time:.2f}s/step "
-                f"ETA={average_time * (total_steps - index - 1):.1f}s"
-            )
+            return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 
-        denoise_time = time.time() - denoise_start
-        logger.info(f"Denoising done: {denoise_time:.2f}s ({denoise_time / total_steps:.2f}s/step)")
+        timer.mark_denoise_start()
+        generated_latents, extra_latents = self.denoise(
+            latents=latents[condition_rows:][None],
+            scheduler=self.scheduler,
+            prompt_embeds=prompt_embeds,
+            guidance_scale=1.0,
+            forward_fn=forward_fn,
+            extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
+            extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
+        )
+        latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
+        audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
         video = self._decode_video(
             latents,

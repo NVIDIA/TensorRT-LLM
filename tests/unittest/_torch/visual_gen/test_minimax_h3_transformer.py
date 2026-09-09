@@ -365,7 +365,8 @@ def _diffusers_golden_inputs(device: torch.device | str = "cpu") -> dict[str, to
         "hidden_states": torch.tensor([[[-0.75, -0.25], [0.25, 0.75]]], device=device),
         "audio_hidden_states": torch.tensor([[[-0.5, 0.125, 0.875]]], device=device),
         "encoder_hidden_states": torch.tensor([[[0.1, -0.2, 0.3, -0.4, 0.5]]], device=device),
-        "timestep": torch.tensor([0.0, 0.75], device=device),
+        "timestep": torch.tensor([1.0], device=device),
+        "conditioning_timesteps": torch.tensor([0.0, 0.75], device=device),
         "timestep_indices": torch.tensor([0, 1, 1, 0], device=device),
         "token_tags": torch.tensor([1, 0, 2, 0], device=device),
         "position_ids": torch.tensor([[0, 0, 0], [1, 0, 0], [1, 1, 0], [2, 0, 1]], device=device),
@@ -380,7 +381,8 @@ def _model_inputs(device: torch.device | str = "cpu") -> dict[str, torch.Tensor]
         "hidden_states": torch.randn(1, 2, 2, device=device),
         "audio_hidden_states": torch.randn(1, 1, 3, device=device),
         "encoder_hidden_states": torch.randn(1, 1, 5, device=device),
-        "timestep": torch.tensor([0.0, 0.75], device=device),
+        "timestep": torch.tensor([1.0], device=device),
+        "conditioning_timesteps": torch.tensor([0.0, 0.75], device=device),
         "timestep_indices": torch.tensor([0, 1, 1, 0], device=device),
         "token_tags": torch.tensor([1, 0, 2, 0], device=device),
         "position_ids": torch.tensor(
@@ -535,7 +537,7 @@ def _reference_one_layer_forward(
     packed_hidden_states[:, inputs["video_indices"]] = video_embeds
     packed_hidden_states[:, inputs["audio_indices"]] = audio_embeds
 
-    temb = _reference_timestep_embedding(model, inputs["timestep"])
+    temb = _reference_timestep_embedding(model, inputs["conditioning_timesteps"])
     adaln_indices = inputs["timestep_indices"] * h3.MINIMAX_H3_MODALITY_NUM + inputs[
         "token_tags"
     ].clamp(min=0)
@@ -700,6 +702,7 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.adaln_indices: torch.Tensor | None = None
+            self.attention_timestep: torch.Tensor | None = None
 
         def forward(
             self,
@@ -710,8 +713,9 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
         ) -> torch.Tensor:
-            del temb, rotary_emb, key_padding_mask, timestep
+            del temb, rotary_emb, key_padding_mask
             self.adaln_indices = adaln_indices.clone()
+            self.attention_timestep = timestep.clone()
             return hidden_states
 
     capture_block = _CaptureBlock()
@@ -722,6 +726,7 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
     torch.testing.assert_close(
         capture_block.adaln_indices, torch.tensor([1, 3, 5, 0], device="cuda")
     )
+    torch.testing.assert_close(capture_block.attention_timestep, torch.tensor([1.0], device="cuda"))
 
 
 @requires_cuda
@@ -1145,7 +1150,9 @@ def test_pinned_diffusers_golden_matches_live_hf_reference() -> None:
     _copy_golden_parameters_to_hf(reference, target)
     inputs = {name: tensor.to("cuda") for name, tensor in _diffusers_golden_inputs().items()}
 
-    expected = reference(**inputs)
+    reference_inputs = dict(inputs)
+    reference_inputs["timestep"] = reference_inputs.pop("conditioning_timesteps")
+    expected = reference(**reference_inputs)
     actual = target(**inputs)
     golden_video = torch.tensor(
         [[[-0.1232801974, -0.1542745978], [-0.0780100822, 0.0215485524]]],

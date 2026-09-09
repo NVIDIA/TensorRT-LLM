@@ -47,6 +47,7 @@ class _FakeMiniMaxH3Transformer:
         self.static_context_calls = 0
         self.forward_calls = 0
         self.inference_modes: list[bool] = []
+        self.attention_timesteps: list[torch.Tensor] = []
 
     def eval(self) -> "_FakeMiniMaxH3Transformer":
         self.training = False
@@ -68,7 +69,7 @@ class _FakeMiniMaxH3Transformer:
         static_context: tuple[torch.Tensor, torch.Tensor],
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del kwargs
+        self.attention_timesteps.append(kwargs["timestep"].clone())
         assert static_context is not None
         self.forward_calls += 1
         self.inference_modes.append(torch.is_inference_mode_enabled())
@@ -83,6 +84,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         # BasePipeline.__init__ is bypassed here, so set the backing attribute
         # that BasePipeline.device reads.
         self._device = torch.device("cpu")
+        self.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
         self.transformer = _FakeMiniMaxH3Transformer()
         self.vae = SimpleNamespace(
             config=SimpleNamespace(latent_channels=2),
@@ -149,6 +151,32 @@ def test_pipeline_reuses_static_context_across_joint_denoise_steps() -> None:
     assert output.audio.shape[0:2] == (1, 2)
     assert output.audio_sample_rate == 32000
     assert output.frame_rate == 24.0
+    actual_times = torch.cat(pipeline.transformer.attention_timesteps)
+    expected_times = 1.0 - torch.minimum(
+        pipeline.scheduler.timesteps, pipeline.audio_scheduler.timesteps
+    )
+    torch.testing.assert_close(actual_times, expected_times)
+    assert bool(((actual_times >= 0) & (actual_times <= 1)).all())
+    assert bool((actual_times[1:] <= actual_times[:-1]).all())
+
+
+def test_shared_denoise_refreshes_cache_state_per_request() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    refreshed = []
+    pipeline.cache_accelerator = SimpleNamespace(
+        is_enabled=lambda: True, refresh=refreshed.append, get_stats=lambda: None
+    )
+    for _ in range(2):
+        pipeline.forward(
+            prompt="test",
+            seed=42,
+            height=32,
+            width=32,
+            num_frames=124,
+            frame_rate=24.0,
+            num_inference_steps=4,
+        )
+    assert refreshed == [3, 3]
 
 
 def test_pipeline_runs_generation_in_inference_mode() -> None:
@@ -165,6 +193,120 @@ def test_pipeline_runs_generation_in_inference_mode() -> None:
     )
 
     assert pipeline.transformer.inference_modes == [True]
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_shared_denoise_stream_schedules(override: bool) -> None:
+    """L2/T1: paired scheduler latents vs a manual loop, with per-stream time overrides."""
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+
+    class Scheduler:
+        def __init__(self, timesteps: torch.Tensor) -> None:
+            self.timesteps = timesteps
+            self.seen: list[float] = []
+
+        def step(self, noise: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, **kwargs):
+            self.seen.append(float(t))
+            return (latents - t * noise,)
+
+    times = torch.tensor([0.9, 0.6, 0.2])
+    audio_times = torch.tensor([0.8, 0.4, 0.1]) if override else times
+    video_scheduler, audio_scheduler = Scheduler(times), Scheduler(audio_times)
+    initial = torch.arange(1, 9, dtype=torch.float32).reshape(1, 4, 2)
+    indices = []
+
+    def predict(video, extra, index, timestep, embeds, extras):
+        indices.append(index)
+        return video * 0.1, {"audio": extra["audio"] * 0.2}
+
+    video, extra = pipeline.denoise(
+        initial.clone(),
+        video_scheduler,
+        torch.ones(1, 2, 4),
+        1.0,
+        predict,
+        extra_streams={"audio": (initial.clone(), audio_scheduler)},
+        extra_stream_timesteps={"audio": audio_times} if override else None,
+    )
+    expected_video, expected_audio = initial.clone(), initial.clone()
+    for t, audio_t in zip(times, audio_times):
+        expected_video = expected_video - t * (expected_video * 0.1)
+        expected_audio = expected_audio - audio_t * (expected_audio * 0.2)
+    assert indices == [0, 1, 2]
+    assert video_scheduler.seen == times.tolist()
+    assert audio_scheduler.seen == audio_times.tolist()
+    for actual, expected in ((video, expected_video), (extra["audio"], expected_audio)):
+        relative_l2 = (actual - expected).norm() / expected.norm()
+        cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+        max_error = (actual - expected).abs().max()
+        print(f"scheduler T1: relative_l2={relative_l2}, cosine={cosine}, max_abs={max_error}")
+        torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+        assert relative_l2 <= 1e-2 and cosine >= 0.9999
+
+
+@pytest.mark.parametrize(
+    "schedule", [{"missing": torch.ones(3)}, {"audio": torch.ones(2)}, {"audio": torch.ones(3, 1)}]
+)
+def test_shared_denoise_rejects_invalid_stream_schedule(schedule) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.scheduler.set_timesteps(4)
+    with pytest.raises(ValueError, match="schedule"):
+        pipeline.denoise(
+            torch.ones(1, 4, 2),
+            pipeline.scheduler,
+            torch.ones(1, 2, 4),
+            1.0,
+            lambda *args: pytest.fail("Invalid schedule reached the transformer"),
+            extra_streams={"audio": (torch.ones(1, 4, 3), pipeline.audio_scheduler)},
+            extra_stream_timesteps=schedule,
+        )
+
+
+def test_h3_shared_loop_matches_native_scheduler_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L2/T1: both H3 latent streams vs the former unbatched native scheduler rollout."""
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    original_denoise = pipeline.denoise
+    checked = []
+
+    def compare_rollout(**kwargs):
+        video = kwargs["latents"][0].clone()
+        audio = kwargs["extra_streams"]["audio"][0][0].clone()
+        video_scheduler = MiniMaxH3Scheduler(shift=12.0)
+        audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+        video_scheduler.set_timesteps(4)
+        audio_scheduler.set_timesteps(4)
+        # The fake joint transformer emits ones; use the exact same initial latents.
+        for video_t, audio_t in zip(video_scheduler.timesteps, audio_scheduler.timesteps):
+            video = video_scheduler.step(torch.ones_like(video), video_t, video, return_dict=False)[
+                0
+            ]
+            audio = audio_scheduler.step(torch.ones_like(audio), audio_t, audio, return_dict=False)[
+                0
+            ]
+        actual_video, actual_extra = original_denoise(**kwargs)
+        for actual, expected in ((actual_video[0], video), (actual_extra["audio"][0], audio)):
+            relative_l2 = (actual - expected).norm() / expected.norm()
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.flatten(), expected.flatten(), dim=0
+            )
+            max_error = (actual - expected).abs().max()
+            print(f"H3 rollout T1: relative_l2={relative_l2}, cosine={cosine}, max_abs={max_error}")
+            torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+            assert relative_l2 <= 1e-2 and cosine >= 0.9999
+        checked.append(True)
+        return actual_video, actual_extra
+
+    monkeypatch.setattr(pipeline, "denoise", compare_rollout)
+    pipeline.forward(
+        prompt="test",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=4,
+    )
+    assert checked == [True]
 
 
 def test_request_generator_preserves_released_cpu_rng_contract() -> None:
