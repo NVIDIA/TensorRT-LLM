@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
+import inspect
 import math
 import os
 import sys
@@ -2909,6 +2910,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 # prompt_len - 1, because augmentation can change the length
                 # for multimodal requests.
                 num_lookup_tokens = len(tokens) if tokens is not None else None
+                locality_domain_id = self._request_locality_domain_id(req)
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2920,9 +2922,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     )
                     - 1,
+                    locality_domain_id=locality_domain_id,
                 )
                 if kv_cache is None:
                     return None
+                assert getattr(kv_cache, "locality_domain_id", None) == locality_domain_id
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -3880,7 +3884,12 @@ class KVCacheManagerV2(BaseResourceManager):
         encoder_output_lens: Optional[List[int]] = None,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
         capture_sampling_params: Optional[SamplingParams] = None,
+        locality_domain_ids: Optional[List[int | None]] = None,
     ):
+        if locality_domain_ids is not None:
+            assert len(locality_domain_ids) == len(request_ids), (
+                "locality_domain_ids must have the same length as request_ids"
+            )
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
@@ -3932,6 +3941,11 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             input_tokens = [1 for _ in range(token_num)]
+            request_locality_domain_id = (
+                self.pick_locality_domain(req_id)
+                if locality_domain_ids is None or locality_domain_ids[i] is None
+                else locality_domain_ids[i]
+            )
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
@@ -3939,6 +3953,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 sampling_config=sampling_params._get_sampling_config(),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
+                locality_domain_id=request_locality_domain_id,
                 encoder_output_len=encoder_output_len,
             )
             req.is_dummy_request = True
@@ -3948,8 +3963,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 # writes to the radix tree, so the choice of branch does not
                 # affect committed state. ``cache_salt`` is left defaulted
                 # to None to avoid coupling synthetic data to any salted branch.
+                locality_domain_id = self._request_locality_domain_id(req)
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                    req.py_request_id,
+                    req.lora_task_id,
+                    input_tokens,
+                    is_dummy=req.is_dummy,
+                    locality_domain_id=locality_domain_id,
                 )
                 # Saturated IndexMapper (e.g. disagg gen trans in progress)
                 # returns None; retry next iter.
@@ -3973,8 +3993,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
+                    draft_locality_domain_id = draft_kv_cache_manager._request_locality_domain_id(
+                        req
+                    )
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                        req.py_request_id,
+                        req.lora_task_id,
+                        input_tokens,
+                        is_dummy=req.is_dummy,
+                        locality_domain_id=draft_locality_domain_id,
                     )
                     # Dummy path: see comment above, no salt.
                     if draft_kv_cache is None:
@@ -4587,10 +4614,23 @@ class KVCacheManagerV2(BaseResourceManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
+        locality_domain_id: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
+        if self.num_locality_domains > 1:
+            assert locality_domain_id is not None, (
+                "Localized KV cache managers require a concrete locality_domain_id"
+            )
+            assert 0 <= locality_domain_id < self.num_locality_domains, (
+                f"locality_domain_id must be in [0, {self.num_locality_domains}), "
+                f"got {locality_domain_id}"
+            )
+        else:
+            assert locality_domain_id is None, (
+                "Non-localized KV cache managers require locality_domain_id=None"
+            )
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
                 "No free IndexMapper slots for request %s "
@@ -4603,12 +4643,25 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
+        # Always pass id/enable_request_stats/expected_prompt_length. Filtering the
+        # whole kwargs dict through inspect.signature is unsafe for nanobind: some
+        # signatures expose only *args/**kwargs, which would drop `id` and leave the
+        # cache with an auto-assigned id that no longer matches dirty-stats lookups.
+        create_kwargs = {
+            "id": request_id,
+            "enable_request_stats": enable_request_stats,
+            "expected_prompt_length": expected_prompt_length,
+        }
+        try:
+            create_params = inspect.signature(self.impl.create_kv_cache).parameters
+        except (TypeError, ValueError):
+            create_params = {}
+        if "locality_domain_id" in create_params:
+            create_kwargs["locality_domain_id"] = locality_domain_id
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            _make_reuse_scope(lora_task_id, salt_int, locality_domain_id),
             input_tokens,
-            id=request_id,
-            enable_request_stats=enable_request_stats,
-            expected_prompt_length=expected_prompt_length,
+            **create_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
