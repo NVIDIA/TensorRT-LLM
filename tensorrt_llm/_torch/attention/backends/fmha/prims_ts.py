@@ -79,6 +79,9 @@ class PrimsTSFmha(PhasedFmha):
         self._context_wrappers: dict[int, "BatchPrefillPagedTSWrapper"] = {}
         self._decode_wrappers: dict[int, "BatchDecodePagedTSWrapper"] = {}
         self._mla_decode_wrappers: dict[int, "BatchMLADecodePagedTSWrapper"] = {}
+        # Dense MLA's quantization scales are fixed for this layer/model. PrimTS
+        # takes host scalars, so read them once during eager warmup, not capture.
+        self._mla_fp8_scales: tuple[float, float] | None = None
         # Decode plans retain views into the shared workspace and are invalidated
         # whenever its underlying allocation changes.
         self._workspace_allocation: Optional[tuple[object, ...]] = None
@@ -288,8 +291,12 @@ class PrimsTSFmha(PhasedFmha):
             quant_mode = QuantMode(attn.quant_mode)
         except (TypeError, ValueError):
             return False, "invalid KV-cache quantization mode."
-        if quant_mode.has_kv_cache_quant():
-            return False, "quantized KV cache is not supported by the initial adapter."
+        is_mla = attn.is_mla_enable
+        is_fp8_mla = is_mla and quant_mode.has_fp8_kv_cache()
+        if quant_mode.has_kv_cache_quant() and (
+            not is_fp8_mla or quant_mode.has_int8_kv_cache() or quant_mode.has_fp4_kv_cache()
+        ):
+            return False, "quantized KV cache is supported only for FP8 MLA decode."
 
         input_type = fwd.attention_input_type
         if input_type not in (
@@ -315,7 +322,6 @@ class PrimsTSFmha(PhasedFmha):
             )
         if attn.num_heads <= 0 or attn.num_kv_heads <= 0:
             return False, "query and KV head counts must be positive."
-        is_mla = attn.is_mla_enable
         if is_mla:
             if attn.num_kv_heads != 1:
                 return False, "MLA decode requires one logical KV head."
@@ -330,7 +336,9 @@ class PrimsTSFmha(PhasedFmha):
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
         cache_dtype = binding_to_torch_dtype(meta.kv_cache_manager.dtype)
-        if cache_dtype != q.dtype:
+        if is_fp8_mla and cache_dtype != torch.float8_e4m3fn:
+            return False, "FP8 MLA decode requires an FP8 E4M3 KV cache."
+        if not is_fp8_mla and cache_dtype != q.dtype:
             return False, f"query and KV-cache dtypes must match, got {q.dtype} and {cache_dtype}."
         if output.dtype != q.dtype:
             return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
@@ -341,7 +349,7 @@ class PrimsTSFmha(PhasedFmha):
             if has_context or input_type != AttentionInputType.generation_only:
                 return False, "MLA is supported only for generation-only requests."
             if q.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
-                return False, "MLA decode requires BF16 query, cache, and output."
+                return False, "MLA decode requires BF16 query input and output."
             if attn.kv_lora_rank != 512 or attn.qk_rope_head_dim != 64:
                 return False, (
                     "MLA decode requires kv_lora_rank=512 and qk_rope_head_dim=64, got "
@@ -356,6 +364,17 @@ class PrimsTSFmha(PhasedFmha):
                 return False, f"MLA query width must be {expected_width}, got {q.shape[1]}."
             if output.numel() != q.shape[0] * attn.num_heads * attn.kv_lora_rank:
                 return False, "MLA output has an incompatible extent."
+            if is_fp8_mla:
+                # The automatic 1CTA policy for <=64 query rows has no profile
+                # below 128 KV tokens. This is the plan's page-table capacity,
+                # not the live request length; short requests remain supported.
+                if attn.num_heads <= 64 and (
+                    meta.kv_cache_block_offsets.shape[-1] * tokens_per_block < 128
+                ):
+                    return False, "FP8 MLA with <=64 heads requires a paged KV capacity >=128."
+                error = self._mla_fp8_input_error(q, fwd)
+                if error is not None:
+                    return False, error
         else:
             expected_width = (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim
             if q.shape[1] != expected_width:
@@ -411,6 +430,60 @@ class PrimsTSFmha(PhasedFmha):
         ):
             return False, "the K-to-V page displacement could not be resolved."
         return True, ""
+
+    @staticmethod
+    def _mla_fp8_input_error(q: torch.Tensor, fwd: AttentionForwardArgs) -> str | None:
+        """Check the preprocessing buffers without reading device values."""
+        quant_q = fwd.quant_q_buffer
+        if quant_q is None:
+            return "FP8 MLA decode requires quant_q_buffer from MLA preprocessing."
+        if (
+            quant_q.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or quant_q.device != q.device
+            or not quant_q.is_contiguous()
+            or quant_q.numel() < q.numel()
+        ):
+            return (
+                "FP8 MLA quant_q_buffer must be contiguous uint8 or FP8 E4M3 on the "
+                "query device, with at least one element per query element."
+            )
+        for name, scale in (
+            ("mla_bmm1_scale", fwd.mla_bmm1_scale),
+            ("mla_bmm2_scale", fwd.mla_bmm2_scale),
+        ):
+            if (
+                scale is None
+                or scale.dtype != torch.float32
+                or scale.device != q.device
+                or not scale.is_contiguous()
+                or scale.numel() < 1
+            ):
+                return (
+                    f"FP8 MLA {name} must contain a contiguous float32 value on the query device."
+                )
+        return None
+
+    def _get_mla_fp8_inputs(
+        self, q: torch.Tensor, fwd: AttentionForwardArgs
+    ) -> tuple[torch.Tensor, float, float]:
+        error = self._mla_fp8_input_error(q, fwd)
+        if error is not None:
+            raise RuntimeError(error)
+        if self._mla_fp8_scales is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "PrimTS FP8 MLA scales must be cached before CUDA graph capture."
+                )
+            # The producer stores the regular BMM1 scale at index 0, and its
+            # log2 version at index 1. PrimTS expects the regular scale.
+            bmm1_scale = float(fwd.mla_bmm1_scale.view(-1)[0].item())
+            bmm2_scale = float(fwd.mla_bmm2_scale.view(-1)[0].item())
+            if not all(math.isfinite(scale) and scale > 0 for scale in (bmm1_scale, bmm2_scale)):
+                raise RuntimeError("PrimTS FP8 MLA scales must be finite and positive.")
+            self._mla_fp8_scales = (bmm1_scale, bmm2_scale)
+        # Reinterpret the producer's bytes; do not quantize the BF16 query again.
+        query = fwd.quant_q_buffer.view(-1)[: q.numel()].view(torch.float8_e4m3fn)
+        return query, *self._mla_fp8_scales
 
     @staticmethod
     def _get_fixed_block_tables(
@@ -699,6 +772,11 @@ class PrimsTSFmha(PhasedFmha):
                 get_prims_ts_batch_mla_decode_workspace_size,
             )
 
+            kernel_dtype = (
+                torch.float8_e4m3fn
+                if QuantMode(self.attn.quant_mode).has_fp8_kv_cache()
+                else q.dtype
+            )
             required_bytes = get_prims_ts_batch_mla_decode_workspace_size(
                 batch_size,
                 self.attn.num_heads,
@@ -707,8 +785,8 @@ class PrimsTSFmha(PhasedFmha):
                 int(metadata.tokens_per_block),
                 max_seq_len,
                 max_seq_len_q=seq_len_q,
-                q_dtype=q.dtype,
-                kv_dtype=q.dtype,
+                q_dtype=kernel_dtype,
+                kv_dtype=kernel_dtype,
                 out_dtype=forward_args.output.dtype,
                 mask_type=mask_type,
                 device=q.device,
@@ -1142,7 +1220,15 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError("TRT-LLM did not return PrimTS MLA KV metadata.")
         fixed_block_tables = self._get_fixed_block_tables(block_tables, batch_size)
         seq_len_q = params.input_seq_length
-        query = params.qkv_input.view(
+        if QuantMode(attn.quant_mode).has_fp8_kv_cache():
+            query, bmm1_scale, bmm2_scale = self._get_mla_fp8_inputs(params.qkv_input, params.fwd)
+        else:
+            query = params.qkv_input
+            bmm1_scale = 1.0 / (
+                attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
+            )
+            bmm2_scale = 1.0
+        query = query.view(
             batch_size,
             seq_len_q,
             attn.num_heads,
@@ -1155,9 +1241,6 @@ class PrimsTSFmha(PhasedFmha):
             int(attn.kv_lora_rank),
         )
         max_seq_len = int(block_tables.shape[-1]) * params.tokens_per_block
-        bmm1_scale = 1.0 / (
-            attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
-        )
         mask_type = self._get_prims_mask_type(params.fwd)
         seq_lens = self._get_sequence_lengths(
             params.sequence_lengths,
@@ -1185,7 +1268,7 @@ class PrimsTSFmha(PhasedFmha):
             seq_lens=seq_lens,
             out=output,
             bmm1_scale=bmm1_scale,
-            bmm2_scale=1.0,
+            bmm2_scale=bmm2_scale,
             validate=False,
         )
 
