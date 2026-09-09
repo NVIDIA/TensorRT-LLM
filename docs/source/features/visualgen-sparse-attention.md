@@ -21,7 +21,7 @@ Sparse attention in VisualGen is configured through `VisualGenArgs.attention_con
 | `algorithm` | Config class | Status |
 |---|---|---|
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Supported |
-| VSA | TBD | TODO |
+| `vsa` | `VideoSparseAttentionConfig` | Supported (CUTEDSL) |
 | `sol_attn` | `SolAttentionConfig` | Supported (CUTEDSL, sm100/sm103) |
 
 ### Sol-Attn
@@ -124,7 +124,7 @@ User configuration is supplied through Python or YAML and controls how the check
 
 `threshold_scale_factor` and `target_sparsity` are alternatives: if both are present, `threshold_scale_factor` takes precedence and the calibration formula is not used. User-provided `target_sparsity` and `disabled_until_timestep` override checkpoint defaults. Checkpoint `ignore` patterns always disable Skip Softmax Attention for matching layers.
 
-Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn each replace the dense CuTeDSL path and are therefore mutually exclusive with quantized attention.
+Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA and Sol-Attn are currently the two supported sparse-attention algorithms, both available only through the CuTeDSL attention backend; quantized attention is not yet supported or enabled with either mode.
 
 #### Mapping `disabled_until_timestep` to Actual Denoising Steps
 

@@ -253,11 +253,13 @@ class SolAttention(AttentionBackend):
         """Whether the sparse kernel applies to this particular call.
 
         Everything false here is delegated to ``_inner``. Deciding it from the
-        tensors, per call, is deliberate: ``qkv_mode`` describes how Q/K/V are
-        *projected*, not whether K/V come from another sequence, so a
-        construction-time rule keyed on ``SEPARATE_QKV`` mistakes self-attention
-        for cross-attention wherever that mode is chosen for other reasons --
-        Qwen-Image always, and WAN's ``attn1`` under async Ulysses.
+        tensors, per call, is deliberate, and it is why ``modules/attention.py``
+        has no ``SEPARATE_QKV`` rule for Sol-Attn: ``qkv_mode`` describes how
+        Q/K/V are *projected*, not whether K/V come from another sequence, so a
+        construction-time rule keyed on it mistakes self-attention for
+        cross-attention wherever that mode is chosen for other reasons --
+        Qwen-Image always, and WAN's ``attn1`` under async Ulysses -- silently
+        costing those modules their configured backend.
         """
         # Cross-attention: K/V come from another sequence. Sol-Attn's routing
         # assumes one self-attending sequence.
