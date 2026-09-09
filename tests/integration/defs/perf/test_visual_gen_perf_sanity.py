@@ -448,9 +448,9 @@ class VisualGenPerfSanityTestConfig:
             model_path,
             "--backend",
             str(client_config["backend"]),
-            # Keep the media on the wire, so e2e_latency covers the transfer.
+            # Keeps the media off the wire, so a gated series is not part transfer.
             "--response-format",
-            "file" if str(client_config["backend"]) == "openai-videos" else "b64_json",
+            "path",
             "--host",
             host,
             "--port",
@@ -478,7 +478,7 @@ class VisualGenPerfSanityTestConfig:
         for key, flag in optional_arg_map.items():
             self._append_optional_arg(command, client_config, key, flag)
 
-        # server_gen backs the d_*_generation gate and is emitted only when detailed.
+        # Keeps the server-phase breakdown and the per-request rows in the artifact.
         command.append("--save-detailed")
         if client_config.get("no_test_input", False):
             command.append("--no-test-input")
@@ -568,6 +568,7 @@ class VisualGenPerfSanityTestConfig:
         result_path: str,
     ) -> None:
         """Validate the saved benchmark JSON before it is used as the source of truth."""
+        is_video = str(result_data.get("backend")) == "openai-videos"
         required_keys = [
             "backend",
             "model",
@@ -577,6 +578,8 @@ class VisualGenPerfSanityTestConfig:
             "e2e_latency",
             "timings",
         ]
+        if is_video:
+            required_keys.append("gen_latency")
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:
             raise ValueError(f"Missing keys in benchmark result {result_path}: {missing_keys}")
@@ -608,10 +611,10 @@ class VisualGenPerfSanityTestConfig:
                 f"completed={completed_requests}, total={total_requests}"
             )
 
-        series = {
-            "e2e_latency": result_data["e2e_latency"],
-            "server_gen": result_data["timings"]["server_gen"],
-        }
+        # The image route has no separate generation series: its whole request is one.
+        series = {"e2e_latency": result_data["e2e_latency"]}
+        if is_video:
+            series["gen_latency"] = result_data["gen_latency"]
         for name, stats in series.items():
             for percentile in ("p90", "p99"):
                 if percentile not in stats.get("percentiles", {}):

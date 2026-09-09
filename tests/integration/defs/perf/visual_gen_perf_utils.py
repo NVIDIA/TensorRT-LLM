@@ -65,26 +65,26 @@ MATCH_KEYS = [
 ]
 
 
-def result_metric_paths() -> dict[str, str]:
-    """Where each gated metric lives in the result JSON.
+def result_metric_paths(backend: str) -> dict[str, str]:
+    """Where each gated metric lives in the result JSON, per route.
 
-    The latency series is ``e2e_latency`` on every route: it is the whole
-    request, which is what the gate is named for and what the pre-async video
-    route already reported. The generation series reads the Server-Timing
-    "generation" header rather than any client-side stopwatch, so it measures
-    engine wall clock without network or polling granularity, and it is the
-    series a regression is gated on. That header lives under --save-detailed.
+    Both series are client-side wall clock, so what they measure is what a
+    caller of the server waits for. The latency series is the whole request.
+    The generation series ends once generation is done: the video route
+    reports that separately as ``gen_latency``, and the image route, being a
+    single leg, cannot tell it apart from the whole request.
     """
+    generation = "gen_latency" if backend == "openai-videos" else "e2e_latency"
     return {
         "d_request_throughput": "request_throughput",
         "d_mean_latency": "e2e_latency.mean",
         "d_median_latency": "e2e_latency.median",
         "d_p90_latency": "e2e_latency.percentiles.p90",
         "d_p99_latency": "e2e_latency.percentiles.p99",
-        "d_mean_generation": "timings.server_gen.mean",
-        "d_median_generation": "timings.server_gen.median",
-        "d_p90_generation": "timings.server_gen.percentiles.p90",
-        "d_p99_generation": "timings.server_gen.percentiles.p99",
+        "d_mean_generation": f"{generation}.mean",
+        "d_median_generation": f"{generation}.median",
+        "d_p90_generation": f"{generation}.percentiles.p90",
+        "d_p99_generation": f"{generation}.percentiles.p99",
     }
 
 
@@ -136,7 +136,7 @@ def extract_visual_gen_metrics(result_data: dict[str, Any]) -> dict[str, float]:
     metrics: dict[str, float] = {}
     missing_paths: list[str] = []
 
-    for metric_name, path in result_metric_paths().items():
+    for metric_name, path in result_metric_paths(str(result_data.get("backend", ""))).items():
         value = _get_nested_value(result_data, path)
         if value is None:
             missing_paths.append(path)
