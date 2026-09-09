@@ -754,7 +754,18 @@ def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("with_idx", [True, False])
 @pytest.mark.parametrize(
-    "input_case", ["supported", "empty", "strided", "short_k", "short_v", "short_idx", "v_shape"]
+    "input_case",
+    [
+        "supported",
+        "empty",
+        "strided",
+        "short_k",
+        "short_v",
+        "short_idx",
+        "v_shape",
+        "cpu_v",
+        "cpu_slots",
+    ],
 )
 def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx, input_case):
     """The fused per-layer cache scatter must match the legacy write_kv_slots
@@ -803,6 +814,10 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx, in
         idx_k = idx_k[:-1]
     elif input_case == "v_shape":
         v_cache = v_cache[:, :, :-1, :]
+    elif input_case == "cpu_v":
+        v = v.cpu()
+    elif input_case == "cpu_slots":
+        slots = slots.cpu()
     else:
         _reference_scatter_write(
             ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k

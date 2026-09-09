@@ -88,7 +88,7 @@ def fused_write_layer_caches(
     idx_k: Optional[torch.Tensor],
 ) -> bool:
     """Fused single-launch write of new-token K/V (+index-K) into paged HND
-    caches. Returns False when a layout precondition fails, so the caller can
+    caches. Returns False when a layout or device precondition fails, so the caller can
     keep the legacy per-cache writes.
 
     `k_cache`/`v_cache` are [num_pages, num_kv_heads, tokens_per_block,
@@ -96,7 +96,9 @@ def fused_write_layer_caches(
     `k`/`v` are the layer's new-token values as [T, H*D] row views;
     `idx_k` is [T, D]. Their inner dimension must be contiguous.
     """
-    if not (k.is_cuda and k_cache.is_cuda):
+    if not k_cache.is_cuda or any(
+        tensor.device != k_cache.device for tensor in (k, v, v_cache, out_cache_loc)
+    ):
         return False
     if k_cache.dim() != 4 or v_cache.dim() != 4:
         return False
@@ -119,6 +121,8 @@ def fused_write_layer_caches(
     ic_stride_tok = 0
     if has_idx:
         if idx_cache is None or idx_cache.dim() != 4 or idx_cache.stride(-1) != 1:
+            return False
+        if idx_k.device != k_cache.device or idx_cache.device != k_cache.device:
             return False
         if int(idx_cache.shape[1]) != 1 or int(idx_cache.shape[3]) != head_dim:
             return False
