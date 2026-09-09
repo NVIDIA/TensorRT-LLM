@@ -161,15 +161,18 @@ Jenkins REST lastBuild                          → newest build number N
 for b in N .. N-49:                              (_MAX_PROBE)
    ranged GET both architecture tarballs        → skip b unless both exist
    GET build_info.txt, parse `commit=`           → sha; skip when absent
-   compare <sha>...<PR base>                     → retain ancestors and exact matches
-   retain distance to the PR base
-rank by (distance ascending, build descending)
+   first complete pair with a known sha          → latest coverage DB
+   compare <sha>...<PR base>                     → record topology and absolute distance
+fetch PR head, base, and latest DB into a temporary bare repository
+apply `git diff <PR base> <PR head>` to the DB revision with `git apply --3way`
+   clean                                          → continue
+   conflict / unavailable revision                → decline Tier 2
 ```
 
-Requiring the pair prevents the selector from narrowing only one CPU architecture. Ranking is by
-**revision, not build number**: a post-merge build can be a re-run of an older commit, so the
-highest build number is not necessarily the closest safe revision. Build number only breaks ties.
-An exact PR-base match is allowed and wins with distance zero.
+Requiring the pair prevents the selector from narrowing only one CPU architecture. Builds are
+probed newest first, and the first complete pair with commit metadata is the only DB considered.
+The selector does not substitute an older DB merely because it is closer to the PR base or because
+the latest DB conflicts with the PR diff.
 
 ### 8.2 Measuring the lag (reporting)
 
@@ -181,10 +184,11 @@ Since every candidate revision is a commit that already merged to `main`, it can
 *behind* the tip: `behind_by` stays 0 and the lag is non-negative. A non-zero `behind_by` would
 mean the revision is no longer on `main` at all (history rewritten).
 
-There is no local-git path. The CI checkout is `depth: 1, noTags: true` with a single-SHA refspec
-(`trtllm_utils.checkoutSpec`), so no candidate revision is ever in the object store; a git
-measurement would also answer against whatever ref it was given, and a merely stale ref returns a
-*smaller* number rather than an error.
+There is no local-git path for measuring lag. The CI checkout is `depth: 1, noTags: true` with a
+single-SHA refspec (`trtllm_utils.checkoutSpec`), so the coverage revision is not available there.
+The conflict check creates a temporary bare repository, fetches the checked-out PR head locally
+and the public main revisions from GitHub, then uses an isolated index. It never changes the CI
+checkout or its index.
 
 The compare API answers unless the revision has not reached the public mirror yet (404) or the
 token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is
@@ -195,26 +199,28 @@ The token comes from the `github-cred-trtllm-ci` credential — the one `getGith
 already uses — bound around the `--print-selection` call in `_cbtsCoverageAudit` and read from
 `GITHUB_API_TOKEN`.
 
-This number reports overall freshness. It is **not** what the gate decides on.
+This number reports overall freshness. It does not select the DB.
 
 ### 8.2b Measuring the drift (gating)
 
-The PR base is `merge_base_commit.sha` from `main...<PR head>`. Each candidate is compared as
-`<db sha>...<PR base>` and is eligible only when GitHub reports `ahead` (the PR base is ahead of the
-DB) or `identical`. `behind`, `diverged`, and unknown relations are rejected before download, so a
-coverage DB is never newer than the PR base.
+The PR base is `merge_base_commit.sha` from `main...<PR head>`. The latest DB is compared as
+`<db sha>...<PR base>`, and drift is `ahead_by + behind_by`: an absolute distance used only by the
+freshness gate and telemetry. `ahead`, `behind`, and `identical` describe valid positions on main;
+diverged and unknown relations decline Tier 2.
 
-For eligible candidates, drift is their plain ancestor distance to the PR base. The closest one
-wins, and `--coverage-max-drift` applies a second fail-closed bound: beyond 30 commits Tier 2
-declines and the PR runs in full.
+The latest DB must accept the complete binary PR diff from base to head via a three-way `git apply`
+with no conflicts. Conflict, fetch failure, or an unconstructable diff declines Tier 2 before the
+large DB artifacts are downloaded. If it passes, `--coverage-max-drift` applies a second fail-closed
+bound: beyond 30 commits Tier 2 declines and the PR runs in full.
 
 
 ### 8.3 What happens with the result
 
-`--prepare DIR` does the whole fetch in one call: resolve the PR base, select a complete pair,
-stream both tarballs down, unpack their identically named SQLite files separately, and union them
-with `compact_db.merge_databases`. It writes the selection JSON beside the merged SQLite as
-`cbts_coverage_db.json` and prints `{path, meta}`. Groovy is left with the two things only it can do
+`--prepare DIR` does the whole fetch in one call: resolve the PR base, select the latest complete
+pair, validate the PR diff, stream both tarballs down, unpack their identically named SQLite files
+separately, and union them with `compact_db.merge_databases`. It writes the selection JSON beside
+the merged SQLite as `cbts_coverage_db.json` and prints `{path, meta}`. Groovy is left with the two
+things only it can do
 — bind the credential and run `coverage_audit.py` over the result — and any failure anywhere is
 caught and non-fatal: no prepared DB is returned, Tier 2 never runs, and the PR gets a full run.
 
