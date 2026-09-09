@@ -29,6 +29,7 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
+from tensorrt_llm.usage.config import TelemetryField
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
 
 pytestmark = pytest.mark.cpu_only
@@ -58,7 +59,7 @@ def _loads_payloads(args) -> tuple[dict, dict]:
 def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
     # Renamed from ..._uses_strict_opt_in_...: under auto-enroll, unmarked
     # type-safe ints (safe_unmarked, nested.unmarked) are now captured; bare
-    # str / Union[str,Path] without an approved allowlist remain uncapturable.
+    # str / Union[str,Path] without an explicit allowlist remain uncapturable.
     config, meta = _loads_payloads(_ExampleConfig())
 
     assert config == {
@@ -79,82 +80,56 @@ def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
     assert meta["payload_truncated"] is False
 
 
-def test_collect_llm_api_config_allows_approved_string_converters_only():
+def test_collect_llm_api_config_allows_only_explicit_categorical_values():
     # The union_backend / union_path fixtures below are Union[str, Path] solely
     # to exercise the value-fail-closed allowlist seam: union_path defaults to a
-    # Path, which is dropped because it is not an allowlisted scalar, while
-    # union_backend's allowlisted str is captured. No production telemetry field
+    # Path, which is dropped because it is not an allowed scalar, while
+    # union_backend's allowed str is captured. No production telemetry field
     # is Union[str, Path]; the only real Union allowlist fields are
     # Union[str, Enum] (load_format). See CR-E (declined).
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["pytorch", "tensorrt"],
-            },
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
         )
         unsafe_backend: Optional[str] = Field(
             default="file:///customer/private",
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["pytorch", "tensorrt"],
-            },
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
         )
         unconverted: Optional[str] = Field(
             default="arbitrary-user-string", telemetry={"kind": "categorical"}
         )
         union_backend: Union[str, Path] = Field(
             default="tensorrt",
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["pytorch", "tensorrt"],
-            },
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
         )
         union_path: Union[str, Path] = Field(
             default=Path("/customer/private"),
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["pytorch", "tensorrt"],
-            },
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
         )
 
     config, meta = _loads_payloads(_StringConfig())
 
     assert config == {"backend": "pytorch", "union_backend": "tensorrt"}
     assert meta["captured_field_count"] == 2
-    # unconverted (kind=categorical, no converter) is not capturable -> not in
-    # manifest; unsafe_backend + union_path resolve but fail the allowlist sanitizer.
+    # unconverted has no allowed values and is not capturable; unsafe_backend and
+    # union_path resolve but fail the explicit-value policy.
     assert meta["capturable_field_count"] == 4
     assert meta["excluded_field_count"] == 2
     assert meta["unsafe_excluded"] is True
 
 
-def test_sanitize_allowlist_is_value_fail_closed_for_non_scalars():
-    """The allowlist only emits scalars, even if a non-scalar is allowlisted.
-
-    Documents the CR-E decision (declined): the sanitizer is value-fail-closed,
-    so a Path or arbitrary object cannot leak through the allowlist converter
-    even if it were placed in allowed_values. _sanitize_allowlist returns a
-    candidate only when it is BOTH in allowed_values AND a scalar
-    (bool/int/float/str) or None. Excluding Union-with-Any/Path from allowlist
-    eligibility at the type level is therefore unnecessary for safety, and a
-    coarse rule would also break legitimate Union[str, Enum] allowlist fields
-    such as load_format (verified captured elsewhere).
-    """
-    from tensorrt_llm.usage import llmapi_config
+def test_non_scalar_allowed_value_fails_manifest_build_loudly():
+    """Explicit domains accept only finite JSON scalars."""
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
 
     secret = Path("/customer/secret")
-    metadata = {"converter": "allowlist", "allowed_values": [secret]}
-    # A Path placed in the allowlist is still rejected: not a scalar.
-    assert llmapi_config._sanitize_allowlist(secret, metadata) == (False, None)
-    # An allowlisted scalar is captured.
-    str_metadata = {"converter": "allowlist", "allowed_values": ["pytorch"]}
-    assert llmapi_config._sanitize_allowlist("pytorch", str_metadata) == (True, "pytorch")
+
+    class _InvalidDomainConfig(StrictBaseModel):
+        value: Any = Field(default=secret, telemetry=TelemetryField.categorical(secret))
+
+    with pytest.raises(ValueError, match="finite JSON scalars"):
+        build_capture_manifest(_InvalidDomainConfig)
 
 
 def test_collect_llm_api_config_walks_only_declared_pydantic_fields():
@@ -180,11 +155,7 @@ def test_collect_llm_api_config_rejects_unsafe_annotations_even_for_safe_values(
         raw_dict: dict[str, Any] = Field(default_factory=dict, telemetry={"kind": "value"})
         converted_any: Any = Field(
             default="known",
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["known"],
-            },
+            telemetry=TelemetryField.categorical("known"),
         )
 
     config, meta = _loads_payloads(_UnsafeAnnotationConfig())
@@ -295,6 +266,143 @@ def test_collect_llm_api_config_keeps_bool_values_boolean():
 
     assert config["enabled"] is True
     assert type(config["enabled"]) is bool
+
+
+def test_float_policy_normalizes_integer_defaults_but_rejects_bool():
+    class _FloatConfig(StrictBaseModel):
+        value: float = 0
+
+    config, meta = _loads_payloads(_FloatConfig())
+    assert config == {"value": 0.0}
+    assert meta["unsafe_excluded"] is False
+
+    invalid = _FloatConfig.model_construct(value=True)
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_bool_literal_union_composes_branches_without_filtering_bool():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    for value in (True, False, "auto"):
+        config, meta = _loads_payloads(KvCacheConfig(use_kv_cache_manager_v2=value))
+        assert config["use_kv_cache_manager_v2"] == value
+        assert meta["unsafe_excluded"] is False
+
+    invalid = KvCacheConfig()
+    invalid.use_kv_cache_manager_v2 = "private-value"
+    config, meta = _loads_payloads(invalid)
+    assert "use_kv_cache_manager_v2" not in config
+    assert meta["unsafe_excluded"] is True
+
+    entry = next(
+        item
+        for item in build_capture_manifest(KvCacheConfig)
+        if item.path == "use_kv_cache_manager_v2"
+    )
+    assert entry.kind == "categorical"
+    assert entry.capture_types == ("bool", "literal")
+    assert entry.allowed_values == ("auto",)
+
+
+def test_int_literal_union_preserves_typed_branch_distinctions():
+    class _IntOrAutoConfig(StrictBaseModel):
+        value: int | Literal["auto"] = "auto"
+
+    for value in (128, "auto"):
+        config, meta = _loads_payloads(_IntOrAutoConfig(value=value))
+        assert config["value"] == value
+        assert meta["unsafe_excluded"] is False
+
+    for value in ("private-value", True):
+        invalid = _IntOrAutoConfig.model_construct(value=value)
+        config, meta = _loads_payloads(invalid)
+        assert "value" not in config
+        assert meta["unsafe_excluded"] is True
+
+
+def test_literal_mamba_cache_dtype_needs_no_explicit_allowlist():
+    allowed = ("auto", "float16", "bfloat16", "float32")
+    for value in allowed:
+        config, meta = _loads_payloads(KvCacheConfig(mamba_ssm_cache_dtype=value))
+        assert config["mamba_ssm_cache_dtype"] == value
+        assert meta["unsafe_excluded"] is False
+
+    invalid = KvCacheConfig()
+    invalid.mamba_ssm_cache_dtype = "private-value"
+    config, meta = _loads_payloads(invalid)
+    assert "mamba_ssm_cache_dtype" not in config
+    assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_applies_only_to_unsafe_union_branch():
+    class _MixedConfig(StrictBaseModel):
+        value: int | str = Field(
+            default="auto",
+            telemetry=TelemetryField.categorical("auto"),
+        )
+
+    for value in (128, "auto"):
+        config, meta = _loads_payloads(_MixedConfig(value=value))
+        assert config["value"] == value
+        assert meta["unsafe_excluded"] is False
+
+    for value in ("private-value", True):
+        invalid = _MixedConfig.model_construct(value=value)
+        config, meta = _loads_payloads(invalid)
+        assert "value" not in config
+        assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_membership_is_type_exact():
+    class _NumericDomainConfig(StrictBaseModel):
+        value: Any = Field(default=1, telemetry=TelemetryField.categorical(1))
+
+    config, _ = _loads_payloads(_NumericDomainConfig())
+    assert config == {"value": 1}
+
+    invalid = _NumericDomainConfig(value=True)
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_explicit_allowlist_cannot_broaden_a_safe_annotation():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    class _LiteralConfig(StrictBaseModel):
+        value: Literal["auto"] = Field(
+            default="auto",
+            telemetry=TelemetryField.categorical("private-value"),
+        )
+
+    with pytest.raises(ValueError, match="unsafe scalar annotation branch"):
+        build_capture_manifest(_LiteralConfig)
+
+
+def test_nested_union_sequence_is_sanitized_branch_by_branch():
+    class _NestedUnionConfig(StrictBaseModel):
+        values: Optional[list[int | Literal["auto"]]] = None
+
+    config, meta = _loads_payloads(_NestedUnionConfig(values=[128, "auto"]))
+    assert config == {"values": [128, "auto"]}
+    assert meta["unsafe_excluded"] is False
+
+    invalid = _NestedUnionConfig.model_construct(values=[True])
+    config, meta = _loads_payloads(invalid)
+    assert config == {}
+    assert meta["unsafe_excluded"] is True
+
+
+def test_homogeneous_tuple_and_set_sequences_remain_capturable():
+    class _SequenceConfig(StrictBaseModel):
+        sizes: tuple[int, ...] = (3, 1)
+        modes: set[Literal["auto", "manual"]] = {"manual", "auto"}
+
+    config, meta = _loads_payloads(_SequenceConfig())
+    assert config == {"modes": ["auto", "manual"], "sizes": [3, 1]}
+    assert meta["unsafe_excluded"] is False
 
 
 def test_collect_llm_api_config_rejects_non_finite_floats():
@@ -430,7 +538,7 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
     meta = rc._failure_meta(args_class="X")
     assert meta["capture_version"] == "2"
     assert meta["api_contract_version"] == "0.2.0"
-    assert meta["field_policy_version"] == "2"
+    assert meta["field_policy_version"] == "3"
     assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
     assert meta["payload_truncated"] is False
     # The pre-migration keys must be gone from the new contract; assert by literal
@@ -446,8 +554,9 @@ def test_collect_llm_api_config_rejects_heterogeneous_tuples():
     config, meta = _loads_payloads(_TupleConfig())
 
     assert config == {}
-    assert meta["excluded_field_count"] == 1
-    assert meta["unsafe_excluded"] is True
+    assert meta["capturable_field_count"] == 0
+    assert meta["excluded_field_count"] == 0
+    assert meta["unsafe_excluded"] is False
 
 
 def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
@@ -470,7 +579,6 @@ def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
             default="x",
             telemetry={
                 "kind": "value",
-                "converter": "allowlist",
                 "allowed_values": ["x", "y"],
             },
         )
@@ -586,7 +694,7 @@ def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
         "original": True,
         "returned": True,
         "status": "beta",
-        "telemetry": {"kind": "value"},
+        "telemetry": {},
     }
 
     class _CallableExtraConfig(StrictBaseModel):
@@ -612,11 +720,7 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     class _C(StrictBaseModel):
         backend: Optional[str] = Field(
             default=None,
-            telemetry={
-                "kind": "categorical",
-                "converter": "allowlist",
-                "allowed_values": ["pytorch", "tensorrt"],
-            },
+            telemetry=TelemetryField.categorical("pytorch", "tensorrt"),
         )
 
     config, meta = _loads_payloads(_C())
@@ -757,19 +861,45 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     """The sparse-attention discriminator algorithm is captured for every arm.
 
-    algorithm identifies the active sparse algorithm (rocket, dsa, skip_softmax).
-    Marking it on only one arm drops it for the others at runtime even though the
-    doc-gen union-collapse advertises sparse_attention_config.algorithm.
+    The collapsed manifest path retains the policy for each concrete model arm;
+    adding an arm needs only its real Literal discriminator annotation.
     """
     from tensorrt_llm.llmapi.llm_args import (
         DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+        MiniMaxM3SparseAttentionConfig,
+        QSASparseAttentionConfig,
         RocketSparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
     )
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
 
-    assert _walk_captured_keys(RocketSparseAttentionConfig()) >= {"algorithm"}
-    assert _walk_captured_keys(DeepSeekSparseAttentionConfig()) >= {"algorithm"}
-    assert _walk_captured_keys(SkipSoftmaxAttentionConfig()) >= {"algorithm"}
+    configs = (
+        QSASparseAttentionConfig(),
+        DeepSeekSparseAttentionConfig(),
+        DeepSeekV4SparseAttentionConfig(),
+        RocketSparseAttentionConfig(),
+        SkipSoftmaxAttentionConfig(),
+        MiniMaxM3SparseAttentionConfig(),
+    )
+    expected = {config.algorithm for config in configs}
+    entry = next(
+        item
+        for item in build_capture_manifest(TorchLlmArgs)
+        if item.path == "sparse_attention_config.algorithm"
+    )
+    assert set(entry.allowed_values) == expected
+    assert entry.capture_types == ("literal",)
+
+    for sparse_config in configs:
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            sparse_attention_config=sparse_config,
+        )
+        captured, meta = _loads_payloads(args)
+        assert captured["sparse_attention_config.algorithm"] == sparse_config.algorithm
+        assert meta["unsafe_excluded"] is False
 
 
 def test_background_reporter_keeps_initial_report_when_config_capture_fails(

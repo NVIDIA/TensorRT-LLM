@@ -154,7 +154,5 @@ class TestTelemetryFieldCategorical:
         field = TelemetryField.categorical("a", "b")
 
         assert field.as_json_schema_extra() == {
-            "kind": "categorical",
-            "converter": "allowlist",
             "allowed_values": ["a", "b"],
         }

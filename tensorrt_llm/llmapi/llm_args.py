@@ -110,8 +110,9 @@ def Field(default: Any = ...,
             - "prototype": Not yet stable and subject to breaking changes; intended for experimentation only.
         telemetry: Optional field-local telemetry override for LLM API config
             capture. Type-safe fields (categorical/numeric) auto-enroll; pass
-            telemetry=TelemetryField.categorical(...) to opt a free-form str/Any field
-            in via an allowlist, or telemetry=False to opt a type-safe field out.
+            telemetry=TelemetryField.categorical(...) to opt an otherwise unsafe
+            categorical branch in with exact allowed values, or telemetry=False
+            to opt a type-safe field out.
         **kwargs: All other arguments passed to the original Pydantic Field
 
     Returns:
@@ -134,7 +135,7 @@ def Field(default: Any = ...,
             if isinstance(telemetry, TelemetryField):
                 telemetry_metadata = telemetry.as_json_schema_extra()
             elif telemetry is True:
-                telemetry_metadata = {"kind": "value"}
+                telemetry_metadata = {}
             elif isinstance(telemetry, dict):
                 telemetry_metadata = dict(telemetry)
             else:
@@ -3877,17 +3878,11 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return False
 
 
-_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY = TelemetryField.categorical(
-    "quantization_for_cold_page", "triattention")
-
-
 class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     """Quantize Host and Disk KV pages without changing the active GPU cache."""
 
     algorithm: Literal["quantization_for_cold_page"] = Field(
-        default="quantization_for_cold_page",
-        telemetry=False,
-    )
+        default="quantization_for_cold_page")
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
@@ -3918,10 +3913,7 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
 
     changes_physical_kv_length: ClassVar[bool] = True
 
-    algorithm: Literal["triattention"] = Field(
-        default="triattention",
-        telemetry=_KV_CACHE_COMPRESSION_ALGORITHM_TELEMETRY,
-    )
+    algorithm: Literal["triattention"] = Field(default="triattention")
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
         description=
@@ -5752,9 +5744,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=PrefillCudaGraphBackend.DISABLED,
         description="CUDA graph implementation used for prefill requests. "
         "Defaults to disabled.",
-        status="prototype",
-        telemetry=TelemetryField.categorical("disabled", "piecewise",
-                                             "breakable"))
+        status="prototype")
 
     prefill_capture_num_tokens: Optional[List[int]] = Field(
         default=None,
