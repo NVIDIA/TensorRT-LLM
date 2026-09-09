@@ -21,7 +21,7 @@ point the generic path calls.
 from __future__ import annotations
 
 import functools
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 
@@ -96,7 +96,25 @@ def _workspace_buffer(size: int, reserve: bool) -> torch.Tensor:
     )
 
 
-def reserve_dense_decode_workspace(
+class DenseDecodeWorkspaceLayout(NamedTuple):
+    """Byte layout of the scratch one dense decode call needs.
+
+    The trtllm-gen slab sits at the front of the buffer and the multi-CTA KV
+    counters behind it, so a caller with one byte buffer can serve both.
+    """
+
+    workspace_bytes: int
+    # Aligned start of the counter block.
+    counter_offset: int
+    total_bytes: int
+
+
+# The alignment torch's own allocations start at, so a counter view taken at
+# this offset is as aligned as a standalone buffer would be.
+_COUNTER_OFFSET_ALIGNMENT = 256
+
+
+def dense_decode_workspace_layout(
     *,
     q_dtype: torch.dtype,
     num_heads: int,
@@ -104,20 +122,51 @@ def reserve_dense_decode_workspace(
     num_kv_heads: int,
     max_num_requests: int,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Take the scratch slab and the zeroed KV counters, ahead of the kernel.
+) -> DenseDecodeWorkspaceLayout:
+    """Lay out the scratch a dense decode call needs inside one buffer.
 
-    Both are sized by the head geometry and the request bound alone, none of
-    which move during a run, so a caller that knows those before the phase runs
-    can settle the allocation there. Returns them with their combined byte
-    size, which the caller can compare across steps to catch a slab that grew
-    after a CUDA graph captured it.
+    Both parts are sized by the head geometry and the request bound alone,
+    none of which move during a run, so a caller that knows those before the
+    phase runs can size its buffer there. See split_dense_decode_workspace for
+    the views this describes.
     """
-    reserve = torch.cuda.is_current_stream_capturing()
-    workspace_size = _workspace(q_dtype, num_heads, head_dim, num_kv_heads)
-    workspace = _workspace_buffer(workspace_size, reserve)
-    counters = _counter_buffer(device, num_heads, max_num_requests, reserve)
-    return workspace, counters, workspace_size + int(counters.numel())
+    workspace_bytes = _workspace(q_dtype, num_heads, head_dim, num_kv_heads)
+    counter_bytes = _counter_size(num_heads, max_num_requests, _device_index(device))
+    counter_offset = (
+        (workspace_bytes + _COUNTER_OFFSET_ALIGNMENT - 1)
+        // _COUNTER_OFFSET_ALIGNMENT
+        * _COUNTER_OFFSET_ALIGNMENT
+    )
+    return DenseDecodeWorkspaceLayout(
+        workspace_bytes=workspace_bytes,
+        counter_offset=counter_offset,
+        total_bytes=counter_offset + counter_bytes,
+    )
+
+
+def split_dense_decode_workspace(
+    buffer: torch.Tensor, layout: DenseDecodeWorkspaceLayout
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Take the slab and the zeroed KV counters out of one byte buffer.
+
+    The counters are zeroed on every call because the buffer is shared with
+    the other FMHA libraries, any of which may have written it.
+    """
+    if buffer.dim() != 1 or buffer.element_size() != 1:
+        raise ValueError(
+            "MiniMax-M3 dense decode scratch must come from a flat byte buffer; "
+            f"got {tuple(buffer.shape)} of {buffer.dtype}."
+        )
+    if int(buffer.numel()) < layout.total_bytes:
+        raise ValueError(
+            f"MiniMax-M3 dense decode was handed a {int(buffer.numel())}-byte "
+            f"buffer, but this call needs {layout.total_bytes}. It was sized "
+            "from a different head geometry than the kernel sees."
+        )
+    workspace_bytes = buffer.view(torch.uint8)
+    counters = workspace_bytes[layout.counter_offset : layout.total_bytes]
+    counters.zero_()
+    return workspace_bytes[: layout.workspace_bytes], counters
 
 
 def subpage_block_table(
@@ -195,11 +244,11 @@ def minimax_m3_trtllm_gen_dense_decode(
     staged, used when staged_subpages_per_slot matches this layer's factor and
     expanded here otherwise; see subpage_block_table.
 
-    workspace and counters are the scratch a caller already reserved (see
-    reserve_dense_decode_workspace); both are taken from the arena here when a
-    caller has not, as the standalone kernel tests do. A supplied buffer is
-    checked against the size this call needs, since the caller reserves it from
-    a geometry it derives for itself.
+    workspace and counters are the scratch a caller already carved out of its
+    own buffer (see split_dense_decode_workspace); both are taken from the
+    arena here when a caller has not, as the standalone kernel tests do. A
+    supplied buffer is checked against the size this call needs, since the
+    caller sizes it from a geometry it derives for itself.
     """
     import flashinfer
 
@@ -291,10 +340,12 @@ def dense_decode_unsupported_reason(kv_cache_manager, head_dim: int) -> Optional
 
 
 __all__ = [
+    "DenseDecodeWorkspaceLayout",
     "dense_decode_unsupported_reason",
+    "dense_decode_workspace_layout",
     "flashinfer_available",
     "minimax_m3_trtllm_gen_dense_decode",
-    "reserve_dense_decode_workspace",
+    "split_dense_decode_workspace",
     "subpage_block_table",
     "uniform_subpages_per_slot",
     "write_subpage_block_table",

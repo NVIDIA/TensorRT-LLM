@@ -16,14 +16,17 @@ _validate_decode_kernel_support settle the geometry once per run.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from ..sparse.minimax_m3_kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_phase_kv
 from ..sparse.minimax_m3_kernels.trtllm_gen_dense_decode import (
+    DenseDecodeWorkspaceLayout,
+    dense_decode_workspace_layout,
     minimax_m3_trtllm_gen_dense_decode,
-    reserve_dense_decode_workspace,
+    split_dense_decode_workspace,
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
@@ -46,12 +49,9 @@ class MsaDecodeFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
-        # The trtllm-gen scratch this layer last took from the shared arena,
-        # with its byte size so prepare_workspace can tell a first allocation
-        # from a growth it cannot honor under capture.
-        self._dense_workspace_bytes: int = 0
-        self._dense_workspace: Optional[torch.Tensor] = None
-        self._dense_counters: Optional[torch.Tensor] = None
+        # Where this layer's trtllm-gen scratch sits inside the shared
+        # attention workspace, settled by prepare_workspace each step.
+        self._dense_layout: Optional[DenseDecodeWorkspaceLayout] = None
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -87,25 +87,26 @@ class MsaDecodeFmha(PhasedFmha):
             # A sparse layer; the Triton kernel takes its split-K scratch from
             # the arena itself, sized by the grid it just chose.
             return
-        self._reserve_dense_workspace(q, metadata)
+        self._reserve_dense_workspace(q, metadata, workspace)
 
     def _reserve_dense_workspace(
         self,
         q: torch.Tensor,
         metadata: "TrtllmAttentionMetadata",
+        workspace: torch.Tensor,
     ) -> None:
-        """Take this layer's trtllm-gen scratch before the phase runs.
+        """Size the shared attention workspace for this layer's trtllm-gen scratch.
 
-        The slab is a fixed size for a given dtype and head geometry, so it is
-        settled once per layer per step rather than inside the kernel call.
-        Growing it mid-capture would allocate into the graph's pool behind the
-        recorded kernels, so that is refused.
+        Taking the scratch from the workspace every FMHA library shares is what
+        puts it in a captured graph's memory pool. Growing that workspace
+        mid-capture would allocate behind the recorded kernels, so it is
+        refused.
         """
         # The manager has the pool: _validate_decode_kernel_support refused the
         # run without it, so no phase would have reached here.
         kv_pool, _ = metadata.kv_cache_manager.get_kv_subpage_pool(self.attn.layer_idx, "HND")
         q_dtype = torch.float8_e4m3fn if kv_pool.dtype == torch.float8_e4m3fn else q.dtype
-        workspace, counters, total_bytes = reserve_dense_decode_workspace(
+        layout = dense_decode_workspace_layout(
             q_dtype=q_dtype,
             num_heads=self.attn.num_heads,
             head_dim=self.attn.head_dim,
@@ -113,20 +114,17 @@ class MsaDecodeFmha(PhasedFmha):
             max_num_requests=int(metadata.max_num_requests),
             device=q.device,
         )
-        if (
-            self._dense_workspace_bytes
-            and total_bytes > self._dense_workspace_bytes
-            and torch.cuda.is_current_stream_capturing()
-        ):
-            raise RuntimeError(
-                "MiniMax-M3 dense decode needs a larger trtllm-gen workspace "
-                f"({total_bytes} bytes) than the {self._dense_workspace_bytes} it "
-                "took before this CUDA graph was captured. The slab is sized by "
-                "the head geometry alone, so this should not move."
-            )
-        self._dense_workspace_bytes = total_bytes
-        self._dense_workspace = workspace
-        self._dense_counters = counters
+        current_bytes = workspace.numel() * workspace.element_size()
+        if current_bytes < layout.total_bytes:
+            if metadata.is_cuda_graph and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "The attention CUDA graph workspace holds "
+                    f"{current_bytes} bytes, fewer than the {layout.total_bytes} "
+                    "MiniMax-M3 dense decode needs. The scratch is sized by the "
+                    "head geometry alone, so this should not move."
+                )
+            workspace.resize_((math.ceil(layout.total_bytes / workspace.element_size()),))
+        self._dense_layout = layout
 
     def run_generation(self, params: FmhaParams) -> None:
         metadata = params.meta
@@ -212,6 +210,12 @@ class MsaDecodeFmha(PhasedFmha):
         staged_table, staged_factor = metadata.msa_subpage_rows(
             row_first, row_first + metadata.num_generations
         )
+        if self._dense_layout is None:
+            raise RuntimeError(
+                "MiniMax-M3 dense decode ran before prepare_workspace sized its "
+                "scratch out of the shared attention workspace."
+            )
+        workspace, counters = split_dense_decode_workspace(params.workspace, self._dense_layout)
         minimax_m3_trtllm_gen_dense_decode(
             params.attention_input.view(num_tokens, attn.num_heads, head_dim),
             metadata.kv_cache_manager,
@@ -225,8 +229,8 @@ class MsaDecodeFmha(PhasedFmha):
             max_num_requests=int(metadata.max_num_requests),
             staged_subpage_table=staged_table,
             staged_subpages_per_slot=staged_factor,
-            workspace=self._dense_workspace,
-            counters=self._dense_counters,
+            workspace=workspace,
+            counters=counters,
         )
 
 
