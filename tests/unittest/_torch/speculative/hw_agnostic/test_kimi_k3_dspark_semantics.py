@@ -19,6 +19,7 @@ Confidence-scheduled verification is MR B: here we only check that
 confidence_proj weights load without being used.
 """
 
+import math
 import re
 from types import SimpleNamespace
 
@@ -33,6 +34,32 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_step_bias,
 )
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
+
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="drafter module construction needs CUDA"
+)
+
+
+def _has_absorbed_mla_kernel() -> bool:
+    """SM100-family only: trtllm-gen has no absorbed-MLA decode below it.
+
+    This directory is mapped to the CPU and H100 stages, so a plain
+    torch.cuda.is_available() gate sends the paged variant to sm90, where the
+    kernel does not exist -- it either raises inside flashinfer or falls back
+    to eager and trips the branch assertion. Either way the failure is about
+    the stage, not the code.
+    """
+    if not torch.cuda.is_available():
+        return False
+    from tensorrt_llm._utils import is_sm_100f
+
+    return is_sm_100f()
+
+
+needs_absorbed_mla = pytest.mark.skipif(
+    not _has_absorbed_mla_kernel(),
+    reason="paged absorbed-MLA decode needs an SM100-family GPU",
+)
 
 # ---------------------------------------------------------------------------
 # Reference oracle: line-for-line port of DeepSpec VanillaMarkov
@@ -442,6 +469,7 @@ def test_published_drafter_spelling_activates_the_heads():
 
 
 @needs_gpu
+@needs_cuda
 def test_head_weights_without_a_resolvable_rank_raise():
     """The inverse of the missing-weights check.
 
@@ -638,3 +666,693 @@ def test_plain_dflash_block_decode_matches_full_attention_oracle():
     )
     diff = (out - oracle).abs().max().item()
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
+
+
+# ---------------------------------------------------------------------------
+# MLA-backboned DSpark drafter (Inferact/Kimi-K3-DSpark shape).
+#
+# The GQA block decode cannot express it: there is no per-head K/V to fuse, and
+# the cache holds one MLA latent per token instead of a K and a V half. What
+# can break silently here is the absorption and the YaRN rope the drafter was
+# distilled under, so both are checked against references written in the
+# un-absorbed / HF form rather than against the same math again.
+# ---------------------------------------------------------------------------
+
+MLA_HIDDEN = 64
+MLA_INTERMEDIATE = 32
+MLA_HEADS = 4
+MLA_Q_LORA = 16
+# Real MLA head geometry, even though everything else here is tiny. Shrinking
+# these silently disables both kernel paths: flashinfer's MLA templates are
+# specialised on (kv_lora, rope) = (512, 64) and fail to compile at 16/4, and
+# the fused RMSNorm/RoPE op requires rope_dim/2 % 32 == 0. With the old toy
+# dims every "kernel" variant fell back to eager and the test proved nothing.
+MLA_KV_LORA = 512
+MLA_NOPE = 128
+MLA_ROPE = 64
+MLA_V_DIM = 128
+MLA_LAYERS = 2
+MLA_BLOCK = 3
+MLA_LATENT = MLA_KV_LORA + MLA_ROPE
+MLA_THETA = 50000.0
+MLA_FACTOR = 4.0
+MLA_ORIG_MAX = 64
+
+
+def _tiny_mla_config():
+    """Tiny MLA drafter config in the published (TorchSpec) spelling.
+
+    Mirrors Inferact/Kimi-K3-DSpark: an architecture label no registry knows,
+    ``model_type`` "k3_dspark", head switches and ``target_layer_ids`` at the
+    top level, and YaRN under the transformers-v5 ``rope_parameters`` key.
+    """
+    from transformers import PretrainedConfig
+
+    cfg = PretrainedConfig(
+        architectures=["K3DSparkModel"],
+        model_type="k3_dspark",
+        hidden_size=MLA_HIDDEN,
+        intermediate_size=MLA_INTERMEDIATE,
+        num_hidden_layers=MLA_LAYERS,
+        num_attention_heads=MLA_HEADS,
+        num_key_value_heads=MLA_HEADS,
+        q_lora_rank=MLA_Q_LORA,
+        kv_lora_rank=MLA_KV_LORA,
+        qk_nope_head_dim=MLA_NOPE,
+        qk_rope_head_dim=MLA_ROPE,
+        v_head_dim=MLA_V_DIM,
+        vocab_size=VOCAB,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=256,
+        rope_theta=MLA_THETA,
+        block_size=MLA_BLOCK,
+        mask_token_id=VOCAB - 3,
+        target_layer_ids=[0, 1],
+        markov_rank=RANK,
+        markov_head_type="vanilla",
+        enable_confidence_head=True,
+        confidence_head_with_markov=True,
+        tie_word_embeddings=False,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": MLA_FACTOR,
+            "original_max_position_embeddings": MLA_ORIG_MAX,
+            "rope_theta": MLA_THETA,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        },
+    )
+    cfg.dflash_config = {"mask_token_id": VOCAB - 3, "target_layer_ids": [0, 1]}
+    cfg.torch_dtype = torch.bfloat16
+    return cfg
+
+
+def _tiny_mla_weights(seed=11):
+    g = torch.Generator().manual_seed(seed)
+
+    def rnd(*shape):
+        return (torch.randn(*shape, generator=g) * 0.05).to(torch.bfloat16)
+
+    qk_head_dim = MLA_NOPE + MLA_ROPE
+    w = {
+        # TorchSpec spellings, deliberately not SpecForge's fc/hidden_norm/norm.
+        "context_proj.weight": rnd(MLA_HIDDEN, MLA_HIDDEN * NUM_CAPTURE),
+        "context_norm.weight": rnd(MLA_HIDDEN).abs() + 1.0,
+        "final_norm.weight": rnd(MLA_HIDDEN).abs() + 1.0,
+        "embed_tokens.weight": rnd(VOCAB, MLA_HIDDEN),
+        "markov_head.markov_w1.weight": rnd(VOCAB, RANK),
+        "markov_head.markov_w2.weight": rnd(VOCAB, RANK),
+        "confidence_head.proj.weight": rnd(1, MLA_HIDDEN + RANK),
+        "confidence_head.proj.bias": rnd(1),
+    }
+    for i in range(MLA_LAYERS):
+        p = f"layers.{i}."
+        w[p + "input_layernorm.weight"] = rnd(MLA_HIDDEN).abs() + 1.0
+        w[p + "post_attention_layernorm.weight"] = rnd(MLA_HIDDEN).abs() + 1.0
+        w[p + "self_attn.q_a_proj.weight"] = rnd(MLA_Q_LORA, MLA_HIDDEN)
+        w[p + "self_attn.q_a_layernorm.weight"] = rnd(MLA_Q_LORA).abs() + 1.0
+        w[p + "self_attn.q_b_proj.weight"] = rnd(MLA_HEADS * qk_head_dim, MLA_Q_LORA)
+        w[p + "self_attn.kv_a_proj_with_mqa.weight"] = rnd(MLA_LATENT, MLA_HIDDEN)
+        w[p + "self_attn.kv_a_layernorm.weight"] = rnd(MLA_KV_LORA).abs() + 1.0
+        w[p + "self_attn.kv_b_proj.weight"] = rnd(MLA_HEADS * (MLA_NOPE + MLA_V_DIM), MLA_KV_LORA)
+        w[p + "self_attn.o_proj.weight"] = rnd(MLA_HIDDEN, MLA_HEADS * MLA_V_DIM)
+        w[p + "mlp.gate_proj.weight"] = rnd(MLA_INTERMEDIATE, MLA_HIDDEN)
+        w[p + "mlp.up_proj.weight"] = rnd(MLA_INTERMEDIATE, MLA_HIDDEN)
+        w[p + "mlp.down_proj.weight"] = rnd(MLA_HIDDEN, MLA_INTERMEDIATE)
+    return w
+
+
+def _build_mla_drafter(weights, *, dflash_attention_backend="VANILLA"):
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="TRTLLM")
+    drafter = MLADSparkForCausalLM(
+        model_config, dflash_attention_backend=dflash_attention_backend
+    ).to("cuda")
+    drafter.load_weights(dict(weights))
+    return drafter
+
+
+def _hf_yarn_reference(dim, base, factor, original_max, max_pos, beta_fast=32.0, beta_slow=1.0):
+    """Line-for-line port of HF ``DeepseekV3YarnRotaryEmbedding`` (mscale 1)."""
+
+    def find_dim(num_rotations):
+        return (dim * math.log(original_max / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+    low = max(math.floor(find_dim(beta_fast)), 0)
+    high = min(math.ceil(find_dim(beta_slow)), dim - 1)
+    if low == high:
+        high += 0.001
+    freq_extra = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    freq_inter = 1.0 / (factor * base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    ramp = torch.clamp((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1)
+    inv_freq = freq_inter * ramp + freq_extra * (1 - ramp)
+    freqs = torch.outer(torch.arange(max_pos, dtype=torch.float32), inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    return emb.cos(), emb.sin()
+
+
+def _hf_apply_rope(x, cos, sin):
+    """HF ``DeepseekV3`` rope: de-interleave, then the half-split rotation."""
+    d = x.shape[-1]
+    x = x.reshape(*x.shape[:-1], d // 2, 2).transpose(-1, -2).reshape(*x.shape[:-1], d)
+    x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
+def test_mla_dspark_yarn_rope_matches_hf_reference():
+    """The drafter's YaRN table and rotation are HF DeepSeek's.
+
+    Both published MLA drafters are distilled under HF/vLLM numerics. Routing
+    through ``RopeParams`` instead picks up the fused MLA kernel's
+    ``duplicate_data`` / GPT-J packing convention, which rotates differently and
+    costs acceptance with nothing raised.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        apply_dspark_mla_rope,
+        build_dspark_mla_yarn_rope,
+    )
+
+    dim, max_pos = 8, 32
+    cos, sin = build_dspark_mla_yarn_rope(
+        dim=dim,
+        base=MLA_THETA,
+        scaling_factor=MLA_FACTOR,
+        original_max_position_embeddings=MLA_ORIG_MAX,
+        max_position_embeddings=max_pos,
+        beta_fast=32.0,
+        beta_slow=1.0,
+        mscale=1.0,
+        mscale_all_dim=1.0,
+        device="cpu",
+    )
+    ref_cos, ref_sin = _hf_yarn_reference(dim, MLA_THETA, MLA_FACTOR, MLA_ORIG_MAX, max_pos)
+    torch.testing.assert_close(cos, ref_cos)
+    torch.testing.assert_close(sin, ref_sin)
+
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(5, 3, dim, generator=g)
+    pos = torch.tensor([0, 7, 31])
+    torch.testing.assert_close(
+        apply_dspark_mla_rope(x, cos[pos], sin[pos]),
+        _hf_apply_rope(x, ref_cos[pos], ref_sin[pos]),
+    )
+
+
+def _oracle_mla_block_decode(weights, captured, noise_embed, *, swap_kv_b=False):
+    """fp32 eager MLA block decode, written in the UN-ABSORBED form.
+
+    The drafter attends the stored latent directly (``q_nope`` folded through
+    ``kv_b_proj``'s K half); this expands the latent into per-head K/V and runs
+    plain attention instead, so agreement is evidence about the absorption
+    rather than a restatement of it. ``swap_kv_b`` is the negative control:
+    exchanging the K and V halves must break parity.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import apply_dspark_mla_rope
+
+    w = {k: v.float() for k, v in weights.items()}
+    ctx, blk = captured.shape[0], noise_embed.shape[0]
+    ctx_pos = torch.arange(ctx, dtype=torch.long)
+    q_pos = torch.arange(ctx, ctx + blk, dtype=torch.long)
+    cos, sin = _hf_yarn_reference(
+        MLA_ROPE, MLA_THETA, MLA_FACTOR, MLA_ORIG_MAX, MLA_ORIG_MAX * int(MLA_FACTOR)
+    )
+    scale = _yarn_mscale_sq() / (MLA_NOPE + MLA_ROPE) ** 0.5
+
+    # Context features: context_norm(context_proj(captured)); constant across
+    # layers and NOT passed through input_layernorm (the DFlash contract).
+    ctx_feat = _rms(captured.float() @ w["context_proj.weight"].T, w["context_norm.weight"])
+
+    hs = noise_embed.float()
+    for i in range(MLA_LAYERS):
+        p = f"layers.{i}."
+        h = _rms(hs, w[p + "input_layernorm.weight"])
+
+        q = _rms(h @ w[p + "self_attn.q_a_proj.weight"].T, w[p + "self_attn.q_a_layernorm.weight"])
+        q = (q @ w[p + "self_attn.q_b_proj.weight"].T).view(blk, MLA_HEADS, MLA_NOPE + MLA_ROPE)
+        q_nope, q_rope = q.split([MLA_NOPE, MLA_ROPE], dim=-1)
+        q_rope = apply_dspark_mla_rope(q_rope, cos[q_pos].unsqueeze(1), sin[q_pos].unsqueeze(1))
+
+        def latent_of(x, pos):
+            lat = x @ w[p + "self_attn.kv_a_proj_with_mqa.weight"].T
+            return torch.cat(
+                [
+                    _rms(lat[..., :MLA_KV_LORA], w[p + "self_attn.kv_a_layernorm.weight"]),
+                    apply_dspark_mla_rope(lat[..., MLA_KV_LORA:], cos[pos], sin[pos]),
+                ],
+                dim=-1,
+            )
+
+        kv = torch.cat([latent_of(ctx_feat, ctx_pos), latent_of(h, q_pos)], dim=0)
+        kv_b = w[p + "self_attn.kv_b_proj.weight"].view(
+            MLA_HEADS, MLA_NOPE + MLA_V_DIM, MLA_KV_LORA
+        )
+        k_b, v_b = kv_b[:, :MLA_NOPE], kv_b[:, MLA_NOPE:]
+        if swap_kv_b:
+            k_b, v_b = v_b, k_b
+        c_kv, k_pe = kv[:, :MLA_KV_LORA], kv[:, MLA_KV_LORA:]
+        k = torch.cat(
+            [
+                torch.einsum("tc,hdc->thd", c_kv, k_b),
+                k_pe.unsqueeze(1).expand(-1, MLA_HEADS, -1),
+            ],
+            dim=-1,
+        )
+        v = torch.einsum("tc,hvc->thv", c_kv, v_b)
+
+        scores = torch.einsum("qhd,khd->hqk", torch.cat([q_nope, q_rope], -1), k) * scale
+        attn = torch.softmax(scores, dim=-1)
+        o = torch.einsum("hqk,khv->qhv", attn, v).reshape(blk, MLA_HEADS * MLA_V_DIM)
+
+        hs = hs + o @ w[p + "self_attn.o_proj.weight"].T
+        h2 = _rms(hs, w[p + "post_attention_layernorm.weight"])
+        gate = h2 @ w[p + "mlp.gate_proj.weight"].T
+        up = h2 @ w[p + "mlp.up_proj.weight"].T
+        hs = hs + (F.silu(gate) * up) @ w[p + "mlp.down_proj.weight"].T
+    return _rms(hs, w["final_norm.weight"])
+
+
+def _yarn_mscale_sq():
+    m = 0.1 * 1.0 * math.log(MLA_FACTOR) + 1.0
+    return m * m
+
+
+# trtllm-gen accepts only 32 or 64 (production uses 64); the wrapper path is
+# looser, so a smaller value silently tests one variant and not the other.
+MLA_PAGE = 32
+
+
+def _run_mla_block_decode(drafter, captured, noise_embed, paged=False):
+    """Drive one block decode, optionally through the paged cache.
+
+    ``paged=False`` keeps the dense arena the eager reference path uses.
+    ``paged=True`` hands ``dflash_forward`` a page table, which is what selects
+    the kernel paths -- without it ``use_kernel`` is False and every kernel
+    variant silently falls back to the same eager branch.
+    """
+    dev = "cuda"
+    proj = drafter.project_target_hidden(captured.to(dev, torch.bfloat16))
+    ctx_pos = torch.arange(CTX_LEN, device=dev)
+    latent, v = drafter.precompute_context_kv(proj, ctx_pos)
+    assert v is None, "an MLA drafter stores no V half"
+    assert latent.shape == (CTX_LEN, MLA_LAYERS, 1, MLA_LATENT)
+
+    kwargs = dict(
+        noise_embedding=noise_embed.to(dev, torch.bfloat16).unsqueeze(0),
+        query_positions=torch.arange(CTX_LEN, CTX_LEN + MLA_BLOCK, device=dev).unsqueeze(0),
+        num_ctx_per_req=torch.tensor([CTX_LEN], device=dev),
+        ctx_v_cache=None,
+        ctx_cache_batch_idx=torch.tensor([0], device=dev),
+    )
+    if not paged:
+        pool = torch.zeros(
+            1, MLA_LAYERS, CTX_LEN + MLA_BLOCK, 1, MLA_LATENT, dtype=torch.bfloat16, device=dev
+        )
+        pool[0, :, :CTX_LEN] = latent.permute(1, 0, 2, 3)
+        out = drafter.dflash_forward(ctx_k_cache=pool, **kwargs)
+        return out.float().cpu()
+
+    # [pages, kv_factor=1, nkv=1, page_size, head_dim] per layer, plus a block's
+    # worth of slack: the manager reserves it, and the non-causal path writes
+    # the draft block into it.
+    npages = -(-(CTX_LEN + MLA_BLOCK) // MLA_PAGE)
+    pool = [
+        torch.zeros(npages, 1, 1, MLA_PAGE, MLA_LATENT, dtype=torch.bfloat16, device=dev)
+        for _ in range(MLA_LAYERS)
+    ]
+    rows, cols = ctx_pos // MLA_PAGE, ctx_pos % MLA_PAGE
+    for layer_idx in range(MLA_LAYERS):
+        pool[layer_idx][rows, 0, 0, cols] = latent[:, layer_idx, 0]
+    page_table = torch.arange(npages, device=dev, dtype=torch.int32).unsqueeze(0)
+    out = drafter.dflash_forward(
+        ctx_k_cache=pool[0], ctx_kv_cache=pool, ctx_page_table=page_table, **kwargs
+    )
+    return out.float().cpu()
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "paged",
+    [False, pytest.param(True, marks=needs_absorbed_mla)],
+    ids=["eager", "kernel_fixup"],
+)
+def test_mla_dspark_block_decode_matches_unabsorbed_oracle(monkeypatch, paged):
+    """Absorbed block decode == un-absorbed eager MLA, and the halves are not
+    interchangeable (the negative control keeps this from being a tautology).
+
+    The paged variant writes the draft block into the pool and reads it back
+    through the kernel, so a bug in that write shows up here as a parity
+    failure rather than as lower acceptance length.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    # Count the builder instead of trusting the parametrisation: the paged
+    # variant has to enter the kernel branch, and a fixture that quietly falls
+    # back to eager is exactly how this test used to pass without testing
+    # anything (no page table, then MLA dims and a page size both kernels
+    # reject).
+    calls = {"fixup": 0}
+    _original = md._build_mla_block_fixup
+
+    def _counted(*a, **kw):
+        calls["fixup"] += 1
+        return _original(*a, **kw)
+
+    monkeypatch.setattr(md, "_build_mla_block_fixup", _counted)
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+
+    g = torch.Generator().manual_seed(42)
+    captured = torch.randn(CTX_LEN, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5
+    noise_embed = torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5
+
+    out = _run_mla_block_decode(drafter, captured, noise_embed, paged=paged)
+    captured_q, noise_q = captured.to(torch.bfloat16), noise_embed.to(torch.bfloat16)
+    oracle = _oracle_mla_block_decode(weights, captured_q, noise_q)
+    swapped = _oracle_mla_block_decode(weights, captured_q, noise_q, swap_kv_b=True)
+
+    assert calls == {"fixup": 1 if paged else 0}, f"paged={paged} took the wrong branch: {calls}"
+
+    diff = (out - oracle).abs().max().item()
+    diff_swapped = (out - swapped).abs().max().item()
+    assert diff < 0.02, f"MLA parity failed: max abs diff {diff}"
+    assert diff_swapped > 4 * max(diff, 1e-4), (
+        f"negative control failed: kv_b K/V halves swapped is too close "
+        f"({diff_swapped} vs {diff}) -- the absorption may not be exercised"
+    )
+
+
+@needs_cuda
+def test_mla_dspark_loads_the_torchspec_spelling_and_keeps_its_embedding():
+    """Loads unconverted, and does not adopt the target's embedding.
+
+    Two silent failures guarded here: the TorchSpec capture projection is
+    ``context_proj`` / ``context_norm`` / ``final_norm`` where the DFlash base
+    expects ``fc`` / ``hidden_norm`` / ``norm``, and the drafter ships a trained
+    ``embed_tokens`` whose values differ from the target's, so taking the
+    target's would feed the block decode embeddings it was not distilled on.
+    """
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+
+    assert drafter._dspark_shift_label
+    assert drafter.has_markov_head
+    assert drafter._kv_factor == 1, "the MLA cache stores one latent, not K and V"
+    assert (drafter._num_kv_heads, drafter._head_dim) == (1, MLA_LATENT)
+    torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
+    torch.testing.assert_close(
+        drafter.fc.weight.cpu().float(), weights["context_proj.weight"].float()
+    )
+
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=torch.nn.Embedding(VOCAB, MLA_HIDDEN)),
+        lm_head=torch.nn.Linear(MLA_HIDDEN, VOCAB, bias=False),
+    )
+    drafter.load_weights_from_target_model(target)
+    assert drafter.lm_head is target.lm_head
+    torch.testing.assert_close(
+        drafter.model.embed_tokens.weight.cpu().float(), weights["embed_tokens.weight"].float()
+    )
+
+
+@needs_cuda
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+def test_mla_dspark_ignores_the_worker_attention_backend(backend):
+    """The MLA drafter runs _mla_paged_attention, so the field selects nothing.
+
+    Both values must construct, and neither worker op set may be loaded --
+    otherwise a drafter that never calls them drags in an optional dependency,
+    and the worker's per-backend shape checks (which the absorbed 64:1 /
+    head_dim 576 shape fails) would bind on a path that does not use them.
+    """
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend=backend)
+    drafter = MLADSparkForCausalLM(model_config, dflash_attention_backend=backend)
+    assert drafter._uses_worker_attention_backend is False
+    assert drafter.dflash_attention_backend == backend
+    assert drafter._dflash_flash_attention is None
+    assert drafter._dflash_trtllm_gen_ops is None
+
+
+@needs_cuda
+def test_mla_dspark_still_rejects_an_unknown_backend():
+    """Dropping the VANILLA-only guard must not drop the typo check."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
+    with pytest.raises(ValueError, match="must be VANILLA or TRTLLM"):
+        MLADSparkForCausalLM(model_config, dflash_attention_backend="FLASHINFER")
+
+
+def test_mla_dspark_rope_conventions_agree_on_scores():
+    """The drafter's adjacent-pair RoPE must be the HF one up to a lane swap.
+
+    The block decode moved off the HF layout onto the layout the fused
+    RMSNorm/RoPE kernel consumes. That is only sound because the permutation
+    cancels inside q_rope . k_rope -- and only if EVERY producer switches. The
+    negative control is the half-migrated state, which is silent in accuracy and
+    shows up solely as lower acceptance length.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        apply_dspark_rotary_batched,
+        build_dspark_mla_yarn_freqs_cis,
+        build_dspark_mla_yarn_rope,
+    )
+
+    torch.manual_seed(0)
+    dim, batch, blk, heads = 64, 3, 8, 4
+    params = dict(
+        dim=dim,
+        base=50000.0,
+        scaling_factor=32.0,
+        original_max_position_embeddings=32768,
+        max_position_embeddings=256,
+        beta_fast=32.0,
+        beta_slow=1.0,
+        mscale=1.0,
+        mscale_all_dim=1.0,
+        device="cpu",
+    )
+    cos, sin = build_dspark_mla_yarn_rope(**params)
+    freqs = build_dspark_mla_yarn_freqs_cis(**params)
+
+    pos = torch.arange(blk)
+    q = torch.randn(batch, blk, heads, dim)
+    k = torch.randn(batch, blk, dim)
+    fc = freqs[pos].unsqueeze(0).expand(batch, blk, dim // 2)
+
+    hf_q = _hf_apply_rope(q, cos[pos].view(1, blk, 1, dim), sin[pos].view(1, blk, 1, dim))
+    hf_k = _hf_apply_rope(k, cos[pos].view(1, blk, dim), sin[pos].view(1, blk, dim))
+    ap_q = apply_dspark_rotary_batched(q, fc)
+    ap_k = apply_dspark_rotary_batched(k, fc)
+
+    perm = torch.empty(dim, dtype=torch.long)
+    perm[: dim // 2] = torch.arange(0, dim, 2)
+    perm[dim // 2 :] = torch.arange(1, dim, 2)
+    torch.testing.assert_close(hf_q, ap_q[..., perm], atol=1e-5, rtol=1e-5)
+
+    hf_score = torch.einsum("bshd,bsd->bsh", hf_q, hf_k)
+    ap_score = torch.einsum("bshd,bsd->bsh", ap_q, ap_k)
+    torch.testing.assert_close(hf_score, ap_score, atol=1e-4, rtol=1e-4)
+
+    # Negative control: only q migrated.
+    mixed = torch.einsum("bshd,bsd->bsh", ap_q, hf_k)
+    assert (mixed - hf_score).abs().max() > 1e-2, (
+        "mixing the two RoPE conventions must change the scores; if it does not, "
+        "this test cannot catch a half-finished migration"
+    )
+
+
+def test_mla_block_fixup_stays_inside_the_allocation():
+    """A context that fills its allocation must still leave the block room.
+
+    dflash.py truncates ctx_len to what the draft KV manager allocated, but the
+    MLA path then writes the block's own latents at ctx_len..ctx_len+block_size.
+    Stopping at exactly `allocated` puts the first block position on the first
+    unallocated page, whose block-table entry _refresh_ctx_block_tables clamped
+    from a negative placeholder to 0 -- another request's block. Silent
+    cross-request corruption, not a fault, so only an explicit bound catches it.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+
+    page_size, block_size, allocated_pages = 8, 3, 2
+    allocated = allocated_pages * page_size
+    # Entries past the allocation are the clamped placeholders: physical 0.
+    page_tables = torch.tensor([[41, 42, 0, 0]])
+    ctx_len = torch.tensor([max(allocated - block_size, 0)])
+
+    fixup = _build_mla_block_fixup(ctx_len, page_tables, block_size, page_size)
+
+    allocated_ids = page_tables[0, :allocated_pages].tolist()
+    assert set(fixup.pages.flatten().tolist()) <= set(allocated_ids)
+    assert int(fixup.seq_lens_i32[0]) <= allocated
+
+
+def test_mla_rope_table_follows_runtime_max_seq_len():
+    """The position table is sized by what is served, not what is advertised.
+
+    K3 declares max_position_embeddings = 1,048,576; at complex64 that table is
+    ~256 MiB per rank, built through full-size fp32 cos/sin. The served
+    max_seq_len is what the context cache is bounded by, so the table follows
+    it. Only the length moves -- YaRN's correction range is computed from
+    original_max_position_embeddings.
+    """
+    from tensorrt_llm._torch.models.modeling_dspark import _resolve_dspark_mla_rope_params
+
+    cfg = _tiny_mla_config()
+    cfg.max_position_embeddings = 1 << 20
+
+    advertised = _resolve_dspark_mla_rope_params(cfg)
+    served = _resolve_dspark_mla_rope_params(cfg, SimpleNamespace(max_seq_len=4096))
+
+    assert advertised["max_positions"] == 1 << 20
+    assert served["max_positions"] == 4096
+    # the YaRN inputs that decide the rotation must not move with it
+    for key in ("theta", "scaling_factor", "original_max_positions", "beta_fast", "beta_slow"):
+        assert advertised[key] == served[key]
+
+
+@pytest.mark.parametrize(
+    "max_ctx,checkpoint_block_size,max_draft_len",
+    [
+        (8205, None, 7),  # the shipped recipe: no block_size, fallback K+1 = 8
+        (8205, 7, 7),  # a checkpoint declaring a window NARROWER than the verify group
+        (4104, 16, 3),  # ... and one declaring a WIDER window
+        (1026, 2, 1),
+    ],
+)
+def test_dflash_position_ceiling_covers_both_index_paths(
+    max_ctx, checkpoint_block_size, max_draft_len
+):
+    """The published ceiling must exceed every index the forward can produce.
+
+    Two independent position sets read the same table, and they do not have the
+    same reach: the block decode runs to ctx_len + block_size - 1 while the
+    context path runs to ctx_len + max_draft_len. Sizing for either one alone is
+    short whenever the other is wider, which is why the ceiling takes a max.
+
+    max_ctx here is the RUNTIME value (attn_metadata.max_seq_len, what ctx_len
+    is clamped to), not model_config.max_seq_len -- 8205 is the measured value
+    for a configured 8192 with max_draft_len 7.
+    """
+    from tensorrt_llm._torch.speculative.dflash import dflash_position_ceiling
+
+    block_size = checkpoint_block_size or (max_draft_len + 1)
+    ceiling = dflash_position_ceiling(max_ctx, block_size, max_draft_len)
+
+    # dflash.py: query_position_ids = clamp(ctx_len + num_accepted) + j
+    worst_block = max_ctx + block_size - 1
+    # dflash.py: ctx_position_ids = ctx_len + [0, max_draft_len]
+    worst_ctx = max_ctx + max_draft_len
+
+    assert ceiling > worst_block, (
+        f"ceiling {ceiling} does not cover block decode index {worst_block} "
+        f"(max_ctx {max_ctx}, block_size {block_size})"
+    )
+    assert ceiling > worst_ctx, (
+        f"ceiling {ceiling} does not cover context index {worst_ctx} "
+        f"(max_ctx {max_ctx}, max_draft_len {max_draft_len})"
+    )
+    # and no more than one position of slack, so it cannot quietly grow
+    assert ceiling == max(worst_block, worst_ctx) + 1
+
+
+@needs_cuda
+def test_mla_rope_table_prefers_the_runtime_ceiling_over_the_config_cap():
+    """A worker-published ceiling replaces the config-derived cap outright.
+
+    Not max() of the two: with max_seq_len unset the config cap is the
+    checkpoint's advertised max_position_embeddings (1,048,576 for K3), and
+    taking the larger would rebuild exactly the ~256 MiB table the cap exists to
+    avoid. Exercises the real _mla_freqs_cis, so it also pins that the table is
+    still lazy enough to see an attribute set after construction.
+    """
+    drafter = _build_mla_drafter(_tiny_mla_weights())
+    # construction-time cap: the plain config value, no lookahead baked in
+    assert drafter._mla_rope_params["max_positions"] == _tiny_mla_config().max_position_embeddings
+
+    drafter._runtime_position_ceiling = 8213
+    table = drafter._mla_freqs_cis(torch.device("cuda"))
+    assert table.shape[0] == 8213, (
+        f"table has {table.shape[0]} positions, expected the published ceiling 8213"
+    )
+
+
+@needs_cuda
+def test_mla_drafter_rejects_a_checkpoint_missing_backbone_weights():
+    """Only lm_head may be absent; a truncated backbone must not load quietly.
+
+    The generic loader skips a module whose whole subtree filters to nothing,
+    so allow_partial_loading=False would not catch this either -- the check has
+    to come from the drafter's own module tree.
+    """
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+
+    # A whole module, not one tensor: the check is module-granular on purpose,
+    # since a fused module (gate_up_proj) is stored unfused and dropping half of
+    # it is a parameter-level gap the loader's own naming cannot distinguish.
+    # Derive the prefix from the fixture rather than spelling it: DFlash
+    # checkpoints name layers without the `model.` prefix, so a hardcoded key
+    # silently matches nothing and the test passes by not truncating anything.
+    victim = next(k for k in weights if k.endswith("self_attn.o_proj.weight"))
+    truncated = {k: v for k, v in weights.items() if k != victim}
+    assert len(truncated) == len(weights) - 1
+
+    with pytest.raises(ValueError, match="WEIGHTS_SHARED_WITH_TARGET"):
+        drafter.load_weights(truncated)
+
+
+@needs_cuda
+@pytest.mark.parametrize("victim", ["context_proj.weight", "context_norm.weight"])
+def test_mla_drafter_requires_the_wrapper_owned_tensors(victim):
+    """fc / hidden_norm are built FROM the checkpoint, so no module walk sees them.
+
+    They live on the wrapper, not on draft_model_full, and the extraction is
+    `if <name> in remapped`. Without an explicit requirement a checkpoint that
+    omits them loads clean and the drafter runs with no capture projection:
+    has_target_features stays False, _ctx_len never advances, and it drafts
+    from an empty context for the life of the process.
+    """
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+
+    assert victim in weights, "fixture no longer ships the TorchSpec spelling"
+    truncated = {k: v for k, v in weights.items() if k != victim}
+
+    with pytest.raises(ValueError, match="wrapper owns"):
+        drafter.load_weights(truncated)
+
+
+@needs_cuda
+def test_mla_drafter_rejects_a_partial_fused_component_set():
+    """One of q/k/v present is not the module being present.
+
+    The fused load path accepts a subset under allow_partial_loading and
+    leaves the absent shards at torch.empty -- uninitialised device memory,
+    not zeros -- so the check has to require every component, not any.
+    """
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+
+    # gate_proj/up_proj, NOT an unfused module: the checkpoint stores them
+    # separately and the module tree names them once as mlp.gate_up_proj, so
+    # dropping one is the only way to reach the fused branch of _supplied.
+    # (kv_b_proj would exercise the plain _has path and duplicate the
+    # missing-backbone test above.)
+    victim = next(k for k in weights if k.endswith("mlp.gate_proj.weight"))
+    assert any(k.endswith("mlp.up_proj.weight") for k in weights), (
+        "the surviving half of the fused pair must be present, or this is not "
+        "testing the fused branch"
+    )
+    truncated = {k: v for k, v in weights.items() if k != victim}
+
+    with pytest.raises(ValueError, match="WEIGHTS_SHARED_WITH_TARGET"):
+        drafter.load_weights(truncated)
