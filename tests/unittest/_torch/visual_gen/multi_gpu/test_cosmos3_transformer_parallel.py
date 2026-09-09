@@ -181,11 +181,6 @@ ATOL = 1e-2
             "CUTEDSL",
         ),
         (
-            "CUTEDSL",
-            SimpleNamespace(ulysses_size=2, attn2d_row_size=1, attn2d_col_size=1),
-            "VANILLA",
-        ),
-        (
             "FA4",
             SimpleNamespace(ulysses_size=2, attn2d_row_size=2, attn2d_col_size=2),
             "FA4",
@@ -198,35 +193,33 @@ def test_cosmos3_cross_attention_backend_resolution(backend, mapping, expected):
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
 @pytest.mark.parametrize("ulysses_size", [1, 2])
-def test_cosmos3_cross_attention_falls_back_from_cute_dsl_with_attention2d(ulysses_size):
+def test_cosmos3_cross_attention_rejects_cute_dsl_with_attention2d(ulysses_size):
     mapping = SimpleNamespace(
         ulysses_size=ulysses_size,
         attn2d_row_size=2,
         attn2d_col_size=2,
     )
-    assert _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping) == "FA4"
+    with pytest.raises(ValueError, match="Use attention backend FA4"):
+        _resolve_cosmos3_cross_attention_backend("CUTEDSL", mapping)
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
-def test_cute_dsl_ulysses_backend_fallback(monkeypatch):
+def test_cute_dsl_ulysses_backend_rejected():
     config = _make_model_config(
         _COSMOS3_TEST_CONFIG,
         ulysses_size=2,
         backend="CUTEDSL",
     )
-    monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    with pytest.raises(ValueError, match="Use attention backend VANILLA or FA4"):
+        Cosmos3CrossAttention(
+            hidden_size=_COSMOS3_TEST_CONFIG["hidden_size"],
+            num_attention_heads=_COSMOS3_TEST_CONFIG["num_attention_heads"],
+            num_key_value_heads=_COSMOS3_TEST_CONFIG["num_key_value_heads"],
+            head_dim=_COSMOS3_TEST_CONFIG["head_dim"],
+            model_config=config,
+            recipe=QWEN3_RECIPE,
+        )
 
-    cross_attention = Cosmos3CrossAttention(
-        hidden_size=_COSMOS3_TEST_CONFIG["hidden_size"],
-        num_attention_heads=_COSMOS3_TEST_CONFIG["num_attention_heads"],
-        num_key_value_heads=_COSMOS3_TEST_CONFIG["num_key_value_heads"],
-        head_dim=_COSMOS3_TEST_CONFIG["head_dim"],
-        model_config=config,
-        recipe=QWEN3_RECIPE,
-    )
-
-    assert cross_attention.attn_backend == "VANILLA"
     assert config.attention.backend == "CUTEDSL"
 
 
