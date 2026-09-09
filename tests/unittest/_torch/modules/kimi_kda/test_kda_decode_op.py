@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 pytest.importorskip("fla")
 
@@ -551,51 +550,28 @@ def test_decode_reads_row_strided_projection_slices(num_heads: int) -> None:
     torch.testing.assert_close(strided_conv_pool[0], initial_conv_pool[0], rtol=0, atol=0)
 
 
-def _profile_decode_kernel(kwargs: dict) -> str:
-    _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        _kda_decode.run_kda_decode_fusion_cuda(**kwargs)
-        torch.cuda.synchronize()
-
-    kernel_names = [
-        event.key
-        for event in prof.key_averages()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-    selected_kernels = [
-        kernel_name for kernel_name in kernel_names if "kda_decode_native_kernel" in kernel_name
-    ]
-    assert len(selected_kernels) == 1, kernel_names
-    return selected_kernels[0]
-
-
 @torch.no_grad()
 @pytest.mark.parametrize(
-    ("num_heads", "indexed_state", "expected_schedule"),
+    ("num_heads", "indexed_state"),
     [
-        (2, False, 3),
-        (96, True, 1),
+        (2, False),
+        (96, True),
     ],
 )
-def test_blackwell_selector_is_cuda_graph_safe(
+def test_kda_decode_is_cuda_graph_safe(
     num_heads: int,
     indexed_state: bool,
-    expected_schedule: int,
 ) -> None:
     args = _make_direct_decode_args(
         1,
         num_heads,
         indexed_state=indexed_state,
     )
-    kernel_name = _profile_decode_kernel(args)
-    assert any(
-        marker in kernel_name
-        for marker in (
-            f"KernelSchedule){expected_schedule}",
-            f"KernelScheduleE{expected_schedule}",
-        )
-    ), kernel_name
+    expected_args = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in args.items()
+    }
+    expected_output = _kda_decode.run_kda_decode_fusion_cuda(**expected_args)
 
     graph = torch.cuda.CUDAGraph()
     torch.cuda.synchronize()
@@ -604,4 +580,5 @@ def test_blackwell_selector_is_cuda_graph_safe(
     graph.replay()
     torch.cuda.synchronize()
     assert captured_output is args["out"]
-    assert torch.isfinite(captured_output).all()
+    torch.testing.assert_close(captured_output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(args["state"], expected_args["state"], rtol=0, atol=0)
