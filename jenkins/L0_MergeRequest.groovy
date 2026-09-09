@@ -749,7 +749,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 }
                 rawDataList.find { rawData ->
                     if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
-                        result = rawData.get("patch")
+                        result = rawData.get("patch") ?: ""
                         return true
                     }
                     return false
@@ -769,7 +769,7 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
                 rawDataList.each { rawData ->
                     [rawData.get("filename"), rawData.get("previous_filename")]
                         .findAll { it }
-                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") }
+                        .each { changedFilePath -> result[changedFilePath] = rawData.get("patch") ?: "" }
                 }
             }
             if (!rawDataList) { break }
@@ -781,20 +781,42 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
     def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
     def headCommit = env.gitlabCommit?.toString()
+    if (!(wrapperBuildNumber ==~ /\d+/)) {
+        pipeline.error("Cannot use internal Git mirror fallback: missing or invalid wrapper build number.")
+    }
+    if (!(headCommit ==~ /[0-9a-fA-F]{40}/)) {
+        pipeline.error("Cannot use internal Git mirror fallback: missing or invalid PR head commit.")
+    }
     def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
-    withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
-        pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin ${baseRef}"
+    pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
+        withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
+            pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin \"\${GIT_DIFF_BASE_REF}\""
+        }
     }
     def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
     pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
 
-    def nameStatus = pipeline.sh(
-        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
+    def encodedNameStatus = pipeline.sh(
+        script: """
+            name_status_file=\$(mktemp)
+            trap 'rm -f "\${name_status_file}"' EXIT
+            git -C ${LLM_ROOT} diff --name-status --find-renames -z ${baseCommit} ${headCommit} > "\${name_status_file}"
+            base64 < "\${name_status_file}"
+        """,
         returnStdout: true
-    )
-    def changedFiles = nameStatus.readLines().collect { line ->
-        def fields = line.split('\t', -1)
-        [status: fields[0], paths: fields.drop(1).findAll { it }]
+    ).readLines().join()
+    def fields = new String(encodedNameStatus.decodeBase64(), "UTF-8")
+        .tokenize(Character.toString((char) 0))
+    def changedFiles = []
+    def fieldIndex = 0
+    while (fieldIndex < fields.size()) {
+        def status = fields[fieldIndex++]
+        def pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1
+        if (fieldIndex + pathCount > fields.size()) {
+            pipeline.error("Malformed internal Git mirror name-status record.")
+        }
+        changedFiles << [status: status, paths: fields.subList(fieldIndex, fieldIndex + pathCount).toList()]
+        fieldIndex += pathCount
     }
     if (function == "getChangedFileList") {
         return changedFiles.collectMany { changedFile ->
@@ -848,8 +870,11 @@ def getGithubMRChangedFileWithFallback(pipeline, globalVars, function, filePath=
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        pipeline.echo("GitHub PR files API failed; falling back to the internal Git mirror. Error: ${e.toString()}")
-        return getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] GitHub PR files API failed for ${function}; " +
+                      "trying the internal Git mirror. Error: ${e.toString()}")
+        def result = getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath, filePaths)
+        pipeline.echo("WARNING: [PR_DIFF_FALLBACK] Internal Git mirror fallback succeeded for ${function}.")
+        return result
     }
 }
 
@@ -915,24 +940,31 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
+    def changedFileList = []
     try {
-        def changedFileList = []
         if (githubPrApiUrl != null) {
             changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
             changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
-        def changedFileListStr = changedFileList.join(",\n")
-        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
-        globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
-        return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
+        if (githubPrApiUrl != null) {
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                error "Failed to get the changed-file list from both the GitHub API and internal Git mirror. " +
+                      "Continuing with an empty list. Error: ${e.toString()}"
+            }
+        } else {
+            pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
+        }
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
+    def changedFileListStr = changedFileList.join(",\n")
+    pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+    globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
+    return globalVars[CACHED_CHANGED_FILE_LIST]
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
