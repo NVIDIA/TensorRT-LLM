@@ -1586,8 +1586,6 @@ class PyTorchModelEngine(ModelEngine):
                 self._get_full_general_warmup_requests(resource_manager))
             # Currently graph has not been captured, disable cuda graph for this warmup.
             with self.no_cuda_graph():
-                # Per-forward eligibility selects compiled execution for
-                # piecewise graph shapes and eager execution for graph misses.
                 self._general_warmup(resource_manager, warmup_requests_configs)
                 # Release C++ MoE workspace buffers so the autotuner can
                 # reclaim the memory.  They will be re-allocated on next use.
@@ -7292,12 +7290,13 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event.record()
 
             breakable_runner = self.breakable_cuda_graph_runner
-            # _prepare_inputs records the group-uniform prefill graph decision.
-            # An ordinary CUDA graph takes precedence; its capture must use the
-            # eager decoder when compilation is restricted to piecewise graphs.
+
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
                 def forward_step():
+                    # _prepare_inputs records the group-uniform prefill graph decision.
+                    # An ordinary CUDA graph takes precedence; its capture must use the
+                    # eager decoder when compilation is restricted to piecewise graphs.
                     with self._maybe_bypass_torch_compile(
                             can_run_graph=can_run_graph,
                     ), MoeLoadBalancerIterContext(moe_load_balancer):
