@@ -18,6 +18,12 @@ name: New Contributor PR Rate Limit
 on:
   pull_request_target:
     types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to reevaluate after a failed moderation run
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,30 +33,38 @@ permissions:
 # Serialize retries for one PR, not all submissions by an author: a shared
 # author group can discard pending runs during the very burst we must handle.
 concurrency:
-  group: pr-rate-limit-${{ github.event.pull_request.number }}
+  group: pr-rate-limit-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
   rate-limit:
-    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event_name != 'workflow_dispatch' ||
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       # No checkout or execution of PR code in this privileged workflow.
       # Administrators can set PR_RATE_LIMIT_DRY_RUN=true to disable writes.
       # PR_RATE_LIMIT_EXEMPT_USERS is a comma-separated list of trusted logins.
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           DRY_RUN: ${{ vars.PR_RATE_LIMIT_DRY_RUN }}
           EXEMPT_USERS: ${{ vars.PR_RATE_LIMIT_EXEMPT_USERS }}
         with:
           script: |
-            const LIMIT = 5;
+            const SUBMISSION_LIMIT = 5;
+            const OPEN_LIMIT = 5;
             const WINDOW_MS = 24 * 60 * 60 * 1000;
             const EXEMPT_LABEL = 'pr-rate-limit-exempt';
-            const MARKER = '<!-- new-contributor-pr-rate-limit:v1 -->';
+            const MARKER = '<!-- new-contributor-pr-rate-limit:v2 -->';
             const { owner, repo } = context.repo;
-            const pull_number = context.payload.pull_request.number;
+            const rawNumber = String(context.payload.pull_request?.number ?? context.payload.inputs?.pr_number ?? '');
+            const pull_number = Number(rawNumber);
+            if (!/^[1-9][0-9]*$/.test(rawNumber) || !Number.isSafeInteger(pull_number)) {
+              throw new Error('A positive integer PR number is required; no moderation performed.');
+            }
             const now = Date.now();
             const getPull = async (number) => (await github.rest.pulls.get({
               owner, repo, pull_number: number,
@@ -60,9 +74,8 @@ jobs:
             if (!Number.isFinite(created) || created > now) {
               throw new Error('Invalid pull request creation time; no moderation performed.');
             }
-            // Reopening does not constitute a new submission. Once the original
-            // submission is 24 hours old, the contributor may reopen it for review.
-            if (pull.state !== 'open' || now >= created + WINDOW_MS) return;
+            // The submission cooldown expires, but the open-PR limit never ages out.
+            if (pull.state !== 'open') return;
             const login = pull.user.login;
             const exemptUsers = (process.env.EXEMPT_USERS || '').split(',')
               .map((value) => value.trim().toLowerCase()).filter(Boolean);
@@ -76,19 +89,21 @@ jobs:
             // The creator-filtered issues API includes PRs in every state, without
             // relying on the eventually consistent search index. Complete the listing
             // before making any changes. Excessive history or API failures abort safely.
-            const history = new Map();
-            let complete = false;
-            for (let page = 1; page <= 20; page += 1) {
-              const { data } = await github.rest.issues.listForRepo({
-                owner, repo, creator: login, state: 'all', sort: 'created',
-                direction: 'desc', per_page: 100, page,
-              });
-              for (const item of data) {
-                if (item.pull_request && item.user.id === pull.user.id) history.set(item.number, item);
+            const readHistory = async (state) => {
+              const items = new Map();
+              for (let page = 1; page <= 20; page += 1) {
+                const { data } = await github.rest.issues.listForRepo({
+                  owner, repo, creator: login, state, sort: 'created',
+                  direction: 'desc', per_page: 100, page,
+                });
+                for (const item of data) {
+                  if (item.pull_request && item.user.id === pull.user.id) items.set(item.number, item);
+                }
+                if (data.length < 100) return items;
               }
-              if (data.length < 100) { complete = true; break; }
-            }
-            if (!complete) throw new Error('Contributor history exceeded 2000 items; no moderation performed.');
+              throw new Error('Contributor history could not be completed within 20 pages; no moderation performed.');
+            };
+            const history = await readHistory('all');
             // Include the triggering PR even if its listing has not caught up yet.
             history.set(pull.number, pull);
             const preceding = [...history.values()].filter((item) => {
@@ -97,7 +112,9 @@ jobs:
               return time > created - WINDOW_MS &&
                 (time < created || (time === created && item.number <= pull.number));
             });
-            if (preceding.length <= LIMIT) return;
+            const exceedsSubmissions = () => preceding.length > SUBMISSION_LIMIT && Date.now() < created + WINDOW_MS;
+            let openCount = [...history.values()].filter((item) => item.state === 'open').length;
+            if (!exceedsSubmissions() && openCount <= OPEN_LIMIT) return;
             // A closed PR is not necessarily a contribution: require an actual merge.
             // Check history directly rather than trusting author_association or a
             // search result that may not yet include a recent merge.
@@ -107,25 +124,38 @@ jobs:
                 if (previous.merged_at) return;
               }
             }
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pull_number, per_page: 100,
+            });
+            // Refresh capacity before writing: another PR may have closed meanwhile.
+            const openHistory = await readHistory('open');
+            const current = await getPull(pull_number);
+            if (current.state !== 'open' || hasExemptLabel(current)) return;
+            openHistory.set(current.number, current);
+            openCount = [...openHistory.values()].filter((item) => item.state === 'open').length;
+            const submissionExceeded = exceedsSubmissions();
+            if (!submissionExceeded && openCount <= OPEN_LIMIT) return;
+            const reasons = [];
+            if (submissionExceeded) reasons.push('you submitted ' + preceding.length +
+              ' PRs in the 24-hour window ending with this submission (limit: ' + SUBMISSION_LIMIT + ')');
+            if (openCount > OPEN_LIMIT) reasons.push('you currently have ' + openCount +
+              ' open PRs, including this one (limit: ' + OPEN_LIMIT + ')');
             const body = [
-              'You submitted ' + preceding.length + ' PRs in the 24-hour window ending with this submission. ' +
-                'Contributors with no merged PRs in this repository are limited to ' + LIMIT + ' submissions per rolling 24 hours, including drafts and closed PRs.',
-              'Closing this PR because it exceeds that limit. Please consolidate related changes into coherent, validated PRs. ' +
-                'You may reopen this PR after ' + new Date(created + WINDOW_MS).toISOString() +
-                ', or ask a maintainer for an exception.',
+              'Closing this PR because ' + reasons.join('; ') + '.',
+              'Contributors with no merged PRs in this repository may submit up to ' + SUBMISSION_LIMIT +
+                ' PRs per rolling 24 hours and keep up to ' + OPEN_LIMIT + ' PRs open, including drafts. ' +
+                'Closed PRs still count toward the submission limit.',
+              (submissionExceeded ? 'The submission cooldown ends at ' + new Date(created + WINDOW_MS).toISOString() + '. ' : '') +
+                'You may reopen this PR only when fewer than ' + OPEN_LIMIT + ' of your other PRs are open' +
+                (submissionExceeded ? ' and the submission cooldown has ended' : '') + '. ' +
+                'Please consolidate related changes into coherent, validated PRs, or ask a maintainer for an exception.',
               MARKER,
             ].join('\n\n');
-            core.info('PR #' + pull_number + ': ' + preceding.length + ' submissions; limit ' + LIMIT);
+            core.info('PR #' + pull_number + ': ' + reasons.join('; '));
             if (process.env.DRY_RUN === 'true') {
               core.info('Dry run: would comment and close.');
               return;
             }
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number: pull_number, per_page: 100,
-            });
-            // Recheck after pagination, immediately before writing.
-            const current = await getPull(pull_number);
-            if (current.state !== 'open' || hasExemptLabel(current) || Date.now() >= created + WINDOW_MS) return;
             if (!comments.some((comment) => comment.user?.login === 'github-actions[bot]' && comment.body?.includes(MARKER))) {
               // Do not blindly retry a comment write: a timeout may follow a successful
               // write. A rerun reconciles against the bot-authored marker above.

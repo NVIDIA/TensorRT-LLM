@@ -120,16 +120,26 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 
 ### Submission rate for new contributors
 
-Contributors with no merged PRs in this repository may submit up to five PRs per rolling 24 hours.
-Drafts and closed PRs count toward this limit. Please consolidate related changes into coherent,
-validated PRs. Excess submissions receive an explanation and are automatically closed after creation.
-The comment gives a time, 24 hours after that PR's creation, when it may be reopened for review.
+Contributors with no merged PRs in this repository may submit up to five PRs per rolling 24 hours
+and keep up to five PRs open at a time. Drafts count toward both limits; closed PRs still count
+as submissions. Please consolidate related changes into coherent, validated PRs. Excess submissions
+or reopenings are automatically closed after creation or reopening. The initial explanation includes
+the observed counts; later retries reuse that comment, so its counts describe the original evaluation. An excess submission has a cooldown of 24 hours from its creation. After that cooldown,
+reopening still requires fewer than five other open PRs; waiting does not exempt an open backlog.
+Concurrent submissions or reopenings may be closed while the observed open count exceeds five.
 
 Users with write access and bot accounts are exempt. Maintainers can apply `pr-rate-limit-exempt`
 to an individual PR before reopening it. Administrators can exempt trusted contributors through the
 comma-separated `PR_RATE_LIMIT_EXEMPT_USERS` repository variable, or set `PR_RATE_LIMIT_DRY_RUN=true`
 to log decisions without commenting or closing. The workflow does not prevent independently triggered
 CI jobs from starting. If GitHub history cannot be read completely, it fails without closing the PR.
+
+Maintainers should monitor failed **New Contributor PR Rate Limit** runs in the Actions tab and retry
+after resolving the reported API or history error. Re-run the failed job, or choose **Run workflow** on
+the default branch and enter the affected PR number. Manual recovery uses the same exemptions, dry-run
+setting and limits, and reuses an existing bot comment before retrying closure. The open-PR limit still
+applies after 24 hours. Recovery is manual; there is no scheduled sweep or guarantee of an instantaneous
+cap while jobs are pending or GitHub is unavailable.
 
 ### Inactive pull requests
 
