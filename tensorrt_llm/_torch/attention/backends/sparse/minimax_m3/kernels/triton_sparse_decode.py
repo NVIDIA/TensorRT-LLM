@@ -325,6 +325,14 @@ def minimax_m3_sparse_attn_decode(
             f"MiniMax-M3 sparse decode requires page_size={SPARSE_BLOCK_SIZE}; "
             f"got {int(k_paged.shape[2])}."
         )
+    if num_heads % num_kv_heads:
+        # The kernel covers heads pid_kh * gqa_group_size + [0, group), so a
+        # head count that is not a whole number of groups leaves the tail heads
+        # unwritten and the merge kernel reads uninitialized partials.
+        raise ValueError(
+            f"MiniMax-M3 sparse decode requires num_heads ({num_heads}) to be a "
+            f"multiple of num_kv_heads ({num_kv_heads})."
+        )
     max_topk = int(topk_idx.shape[-1])
     gqa_group_size = num_heads // num_kv_heads
     use_scale = k_paged.dtype in _FP8_DTYPES and kv_scale is not None
