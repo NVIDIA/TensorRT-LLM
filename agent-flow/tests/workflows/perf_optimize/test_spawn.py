@@ -90,3 +90,38 @@ def test_every_campaign_is_waited_on_even_after_one_fails():
     ]
     assert spawn.wait_all([(launches[0], a), (launches[1], b)]) == {"ctx": 1, "gen": 0}
     assert a.waited and b.waited
+
+
+def test_a_design_that_could_not_start_says_why(tmp_path, monkeypatch):
+    """A campaign reports through its workspace; a failed design has none.
+
+    Discarding the pipe left the caller with a later refusal saying the
+    design was never established -- pointing at the design rather than at
+    whatever stopped it. The first real run of this function returned 1
+    because the agent's credentials had expired, and the message saying so
+    went to /dev/null.
+    """
+    import subprocess as sp
+
+    class Done:
+        returncode = 1
+        stdout = ""
+        stderr = "Anthropic profile login expired - Run /login to use your account\n"
+
+    monkeypatch.setattr(sp, "run", lambda *a, **k: Done())
+    with pytest.raises(disagg_sol.DisaggSolError, match="login expired"):
+        spawn.design("do the design", cwd=tmp_path)
+
+
+def test_the_design_agent_s_output_is_kept_when_a_log_is_named(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    class Done:
+        returncode = 0
+        stdout = "phase 0 done\n"
+        stderr = ""
+
+    monkeypatch.setattr(sp, "run", lambda *a, **k: Done())
+    log = tmp_path / "logs" / "design.log"
+    assert spawn.design("go", cwd=tmp_path, log=log) == 0
+    assert "phase 0 done" in log.read_text()
