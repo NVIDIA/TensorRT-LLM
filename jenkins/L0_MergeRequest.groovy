@@ -678,7 +678,7 @@ def launchTestListCheck(pipeline, globalVars)
 
             def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
             sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
-               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --check-duplicate-waives"
+               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
         }
     })
 }
