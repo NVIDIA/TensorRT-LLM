@@ -3471,65 +3471,6 @@ class TestInitRatioConfig(unittest.TestCase):
             commit_min_snapshot=True,
         )
 
-    def test_fixed_ssm_pool_preserves_state_capacity_when_quota_grows(self):
-        """Surplus quota grows attention, including after resize and rebalance."""
-        for utilization in (0.97, 0.5):
-            for typical_length in (1, 8194):
-                with self.subTest(utilization=utilization, typical_length=typical_length):
-                    cfg = self._make_hybrid_config(gpu_quota=256 << 20)
-                    cfg.fixed_ssm_pool = True
-                    cfg.max_util_for_resume = utilization
-                    cfg.constraints = [BatchDesc([KVCacheDesc(0, 0)] * 4)]
-                    cfg.typical_step = BatchDesc([KVCacheDesc(typical_length, 0)] * 4)
-                    manager = KVCacheManager(cfg)
-                    try:
-                        ssm_lc = _introspection.ssm_life_cycle_id(manager)
-                        assert ssm_lc is not None
-                        ssm_pg = _introspection.pool_group_index(manager, ssm_lc)
-                        attn_pg = 1 - ssm_pg
-                        before = _introspection.storage_statistics(manager, GPU_LEVEL)
-                        self.assertGreaterEqual(before[ssm_pg].total * utilization, 4)
-                        self.assertTrue(manager.resize(GPU_LEVEL, 512 << 20))
-                        after = _introspection.storage_statistics(manager, GPU_LEVEL)
-                        self.assertEqual(after[ssm_pg].total, before[ssm_pg].total)
-                        self.assertGreater(after[attn_pg].total, before[attn_pg].total)
-
-                        _introspection.force_rebalance_precondition(manager, skew=2.0)
-                        manager.adjust()
-                        rebalanced = _introspection.storage_statistics(manager, GPU_LEVEL)
-                        self.assertEqual(rebalanced[ssm_pg].total, before[ssm_pg].total)
-                        self.assertEqual(rebalanced[attn_pg].total, after[attn_pg].total)
-                    finally:
-                        manager.shutdown()
-
-    def test_explicit_pool_ratio_overrides_fixed_ssm_policy(self):
-        allocations = []
-        for fixed in (False, True):
-            cfg = self._make_hybrid_config(gpu_quota=256 << 20)
-            cfg.fixed_ssm_pool = fixed
-            cfg.initial_pool_ratio = [0.75, 0.25]
-            manager = KVCacheManager(cfg)
-            try:
-                allocations.append([s.total for s in _introspection.storage_statistics(manager)])
-            finally:
-                manager.shutdown()
-        self.assertEqual(allocations[0], allocations[1])
-
-    def test_fixed_ssm_pool_preserves_cold_tier_sizing(self):
-        allocations = []
-        for fixed in (False, True):
-            cfg = self._make_hybrid_config(gpu_quota=256 << 20)
-            cfg.cache_tiers = [*cfg.cache_tiers, HostCacheTierConfig(quota=128 << 20)]
-            cfg.fixed_ssm_pool = fixed
-            cfg.constraints = [BatchDesc([KVCacheDesc(0, 0)] * 4)]
-            cfg.typical_step = BatchDesc([KVCacheDesc(128, 127)] * 4)
-            manager = KVCacheManager(cfg)
-            try:
-                allocations.append([s.total for s in _introspection.storage_statistics(manager, 1)])
-            finally:
-                manager.shutdown()
-        self.assertEqual(allocations[0], allocations[1])
-
     def test_default_init_ratio(self):
         """Without typical_step or constraints, uses hardcoded fallback."""
         cfg = self._make_config()

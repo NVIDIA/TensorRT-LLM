@@ -913,6 +913,8 @@ class Runner:
             * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
             enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+            # Every dummy request uses max_seq_len tokens, so this is the actual average.
+            avg_seq_len=max_seq_len,
             use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)

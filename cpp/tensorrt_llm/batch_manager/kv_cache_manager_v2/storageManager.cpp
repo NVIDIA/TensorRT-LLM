@@ -229,7 +229,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume, bool fixedSsmPool)
+    float maxUtilForResume)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
@@ -290,17 +290,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
-    if (fixedSsmPool && !initialPoolRatio.has_value())
-    {
-        auto const ssmId = mLifeCycles.ssmLifeCycleId();
-        if (ssmId.has_value() && numLifeCycles() > LifeCycleId{1})
-        {
-            auto const pg = getPoolGroupIndex(kHotLevel, *ssmId);
-            if (std::count(hotLifeCycleGrouping.begin(), hotLifeCycleGrouping.end(), pg) == 1)
-                mFixedSsmPoolGroup = pg;
-        }
-    }
-
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
     // those weights while accounting for the cold representation's page sizes.
     TypedVec<LifeCycleId, float> lifeCycleRatio;
@@ -342,7 +331,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         lifeCycleRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }
 
-    auto const hotRatio = allocationRatio(kHotLevel, toPoolGroupRatio(kHotLevel, lifeCycleRatio));
+    auto const hotRatio = toPoolGroupRatio(kHotLevel, lifeCycleRatio);
 
     mLevels.reserve(config.cacheTiers.size());
 
@@ -1625,7 +1614,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota)
             + " is insufficient for min_slots constraints (requires at least " + std::to_string(minQuota) + ")");
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(allocationRatio(level, ratioList), minSlots, quota);
+    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1954,21 +1943,12 @@ size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIn
 // constrainPoolGroupRatio
 // ---------------------------------------------------------------------------
 
-TypedVec<PoolGroupIndex, float> StorageManager::allocationRatio(
-    CacheLevel level, TypedVec<PoolGroupIndex, float> ratio) const
-{
-    // A zero growth weight pins this group at the existing resume-safe, grain-rounded floor.
-    if (level == kHotLevel && mFixedSsmPoolGroup.has_value())
-        ratio[*mFixedSsmPoolGroup] = 0.0F;
-    return ratio;
-}
-
 TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
     size_t granularity = gpuStorage.poolSizeGranularity();
-    auto slotCountList = gpuStorage.computeSlotCountList(allocationRatio(kHotLevel, ratio), mMinSlots);
+    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);
     return normalizeToRatio(numBytes);
 }

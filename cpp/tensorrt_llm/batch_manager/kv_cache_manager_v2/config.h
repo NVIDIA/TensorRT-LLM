@@ -290,8 +290,6 @@ struct KVCacheManagerConfig
     // One normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
     // layer-group slot-count proportions while accounting for cold page sizes.
     std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
-    // Keep the hot SSM pool at its constraint floor; give surplus quota to attention.
-    bool fixedSsmPool = false;
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing

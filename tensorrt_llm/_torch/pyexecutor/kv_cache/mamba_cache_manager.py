@@ -49,7 +49,6 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
-                                                      AttentionLayerConfig,
                                                       BatchDesc, BufferConfig,
                                                       DataRole, KVCacheDesc)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -3824,21 +3823,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_typical_request_capacity(
         self,
         kv_cache_config: KvCacheConfig,
-        *,
-        warn_on_fallback: bool = True,
     ) -> int:
         if kv_cache_config.avg_seq_len is not None:
             return kv_cache_config.avg_seq_len
 
         fallback_capacity = max(1, self.max_seq_len // 2)
-        if warn_on_fallback:
-            logger.warning(
-                "'kv_cache_config.avg_seq_len' is not set for a hybrid Mamba "
-                "model using KV cache manager V2. Falling back to "
-                f"max_seq_len / 2={fallback_capacity} for cache-pool sizing. Set "
-                "'kv_cache_config.avg_seq_len' in the YAML configuration to the "
-                "workload's average total sequence length for an accurate KV/SSM "
-                "pool ratio.")
+        logger.warning(
+            "'kv_cache_config.avg_seq_len' is not set for a hybrid Mamba "
+            "model using KV cache manager V2. Falling back to "
+            f"max_seq_len / 2={fallback_capacity} for cache-pool sizing. Set "
+            "'kv_cache_config.avg_seq_len' in the YAML configuration to the "
+            "workload's average total sequence length for an accurate KV/SSM "
+            "pool ratio.")
         return fallback_capacity
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
@@ -3931,24 +3927,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             ) for batch in config.constraints
         ]
 
-        attention_layers = [
-            layer for layer in layers if isinstance(layer, AttentionLayerConfig)
-        ]
-        # Without reuse, recurrent states have a fixed live/dummy-slot cost.
-        # Full attention consumes the remaining budget independently of average
-        # request length. Windowed attention retains workload-based sizing.
-        fixed_ssm_pool = (not kv_cache_config.enable_block_reuse
-                          and config.initial_pool_ratio is None and any(
-                              isinstance(layer, SsmLayerConfig)
-                              for layer in layers) and bool(attention_layers)
-                          and all(layer.sliding_window_size is None
-                                  for layer in attention_layers))
-        # Preserve the workload-based cold-tier split. The hot allocator ignores
-        # the SSM growth weight when fixed_ssm_pool is enabled.
         typical_step = config.typical_step
         if config.initial_pool_ratio is None:
             typical_capacity = self._get_typical_request_capacity(
-                kv_cache_config, warn_on_fallback=not fixed_ssm_pool)
+                kv_cache_config)
             request_descs = self._typical_request_descs(typical_capacity,
                                                         kv_cache_config)
             typical_step = BatchDesc(request_descs *
@@ -3978,7 +3960,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,
-            fixed_ssm_pool=fixed_ssm_pool,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.

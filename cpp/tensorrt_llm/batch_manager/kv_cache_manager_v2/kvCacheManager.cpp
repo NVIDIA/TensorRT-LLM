@@ -118,7 +118,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
-        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.fixedSsmPool);
+        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();

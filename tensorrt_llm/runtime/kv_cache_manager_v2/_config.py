@@ -270,13 +270,6 @@ class KVCacheManagerConfig:
     flag is carried for API/behavior parity with the C++ backend but changes no hashing.)
     """
 
-    fixed_ssm_pool: bool = False
-    """
-    Keep an exclusive hot SSM pool at its grain-rounded constraint floor and
-    give remaining quota to attention pools. Explicit initial_pool_ratio wins;
-    pure SSM configurations and cold tiers retain their existing allocation.
-    """
-
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self.swa_scratch_reuse is not None

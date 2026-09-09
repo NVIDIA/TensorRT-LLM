@@ -132,7 +132,7 @@ public:
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
-        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f, bool fixedSsmPool = false);
+        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -345,7 +345,6 @@ private:
         TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
     size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
         size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
-    TypedVec<PoolGroupIndex, float> allocationRatio(CacheLevel level, TypedVec<PoolGroupIndex, float> ratio) const;
 
     // Internal helpers.
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
@@ -420,7 +419,6 @@ private:
 
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
-    std::optional<PoolGroupIndex> mFixedSsmPoolGroup;
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
