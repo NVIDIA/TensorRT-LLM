@@ -74,6 +74,19 @@ Placement follows the existing conversation routers' behavior. Affinity is best
 effort: a saturated ADP rank can overflow to another rank, and affinity bindings can
 be evicted. Cache reuse depends on matching prompt prefixes and cache availability.
 
+## Gateway trust boundary
+
+The parent-session header is routing input, not proof of a parent-child relationship.
+TensorRT-LLM does not authenticate that relationship: a client that can set the
+configured header can request affinity to another session's instance and ADP rank.
+
+Deployments accepting untrusted requests should place a gateway before
+`trtllm-serve`. The gateway should prune client-supplied copies of the configured
+parent-session header and the internal `x-trtllm-subagent-affinity-id` header,
+then set the parent-session header only for authorized sub-agent requests.
+Keep worker endpoints behind this trusted boundary as well. Each agent's own
+session ID should continue to identify its independent conversation.
+
 ## How it works
 
 The disagg edge reads the configured parent header into an internal routing key.

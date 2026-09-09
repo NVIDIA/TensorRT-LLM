@@ -29,8 +29,11 @@ from tensorrt_llm.llmapi.disagg_utils import (
     MinimalInstances,
     ServerRole,
 )
+from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -324,6 +327,68 @@ def test_subagent_affinity_id_excluded_from_wire():
     request = CompletionRequest(model="m", prompt="hi", conversation_params=params)
     wire = request.model_dump(mode="json", exclude_unset=True)
     assert "subagent_affinity_id" not in wire["conversation_params"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+@pytest.mark.parametrize("scope", ["context", "both"])
+async def test_subagent_body_id_and_affinity_at_router_dispatch(
+    monkeypatch: pytest.MonkeyPatch, schedule_style: str, scope: str
+) -> None:
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._subagent_affinity_scope = scope
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        conversation_params=ConversationParams(conversation_id="body-child"),
+    )
+    OpenAIDisaggServer._extract_conversation_id(
+        request,
+        SimpleNamespace(headers={"x-session-id": "header-child", "x-parent-id": "parent"}),
+        "x-parent-id",
+    )
+    observed: dict[str, tuple[str, str]] = {}
+
+    async def select_context(req, **kwargs):
+        # Snapshot values at dispatch: generation subsequently mutates the request.
+        observed["context"] = (req.conversation_params.conversation_id, get_request_routing_id(req))
+        return "ctx:9000", {"server_info": {}}
+
+    async def select_generation(req, **kwargs):
+        observed["generation"] = (
+            req.conversation_params.conversation_id,
+            get_request_routing_id(req),
+        )
+        return "gen:9001", {"server_info": {}}
+
+    async def context_response(*args, **kwargs):
+        yield _make_chat_response("length").model_dump()
+
+    async def generation_response(*args, **kwargs):
+        yield _make_chat_response("stop").model_dump()
+
+    service._ctx_router.get_next_server.side_effect = select_context
+    service._gen_router.get_next_server.side_effect = select_generation
+    # Keep client-side router selection, mocking only the HTTP exchange.
+    service._ctx_client = OpenAIHttpClient(
+        service._ctx_router, ServerRole.CONTEXT, session=mock.Mock()
+    )
+    service._gen_client = OpenAIHttpClient(
+        service._gen_router, ServerRole.GENERATION, session=mock.Mock()
+    )
+    monkeypatch.setattr(service._ctx_client, "_post_with_retry", context_response)
+    monkeypatch.setattr(service._gen_client, "_post_with_retry", generation_response)
+
+    await service._send_disagg_request(request)
+
+    service._ctx_router.get_next_server.assert_awaited_once()
+    service._gen_router.get_next_server.assert_awaited_once()
+    assert observed == {
+        "context": ("body-child", "parent"),
+        "generation": ("body-child", "parent" if scope == "both" else "body-child"),
+    }
 
 
 @pytest.mark.asyncio
