@@ -197,6 +197,20 @@ def test_rejects_mismatched_inputs():
         swiglu_2in(gate, torch.randn(8, 16, dtype=torch.bfloat16))
 
 
+def test_quant_scale_without_quant_type_raises():
+    """A scale with no output dtype must fail loudly.
+
+    Deliberately a raise rather than an assert, and deliberately checked: under
+    `python -O` assert statements are not emitted at all, and the kernel would
+    then apply the scale while allocating gate.dtype, returning scaled values in
+    an unquantized tensor. Rejected before any device work, so no GPU needed.
+    """
+    gate = torch.randn(8, 16, dtype=torch.bfloat16)
+    up = torch.randn(8, 16, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="quant_type is required"):
+        swiglu_2in(gate, up, quant_scale=torch.tensor(1.0))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_rejects_non_contiguous():
     """The kernel indexes flat runs, so a strided view must be rejected.

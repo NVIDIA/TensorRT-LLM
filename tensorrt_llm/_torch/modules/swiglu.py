@@ -132,7 +132,12 @@ def swiglu_2in(gate,
     materializing the concatenation.
     """
     if quant_scale is not None:
-        assert quant_type is not None
+        if quant_type is None:
+            # Not an assert: stripped under -O this would not raise but would
+            # let the kernel apply the scale while writing gate.dtype, i.e.
+            # scaled values in an unquantized tensor.
+            raise ValueError(
+                "swiglu_2in: quant_type is required when quant_scale is given")
         return torch.ops.trtllm.silu_and_mul_2in(
             gate,
             up,
