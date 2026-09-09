@@ -37,7 +37,13 @@ from ..conftest import (
     skip_pre_blackwell,
     skip_pre_hopper,
 )
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VideoMME, VoxPopuli
+from .accuracy_core import (
+    MMMU,
+    LlmapiAccuracyTestHarness,
+    VideoMME,
+    VoxPopuli,
+    assert_acceptance_length_for_llm,
+)
 
 
 class TestExaone4_5_33B(LlmapiAccuracyTestHarness):
@@ -153,6 +159,8 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 mtp_eagle_one_model=True,
                 speculative_model=self.MTP_MODEL_PATH,
             ),
+            max_stats_len=-1,
+            enable_iter_perf_stats=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             task = MMMU(self.MODEL_NAME)
@@ -160,6 +168,10 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 llm,
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+            assert_acceptance_length_for_llm(
+                "TestGemma4_26B_A4B::test_nvfp4",
+                llm,
             )
 
     def test_nvfp4_no_mtp(self):
