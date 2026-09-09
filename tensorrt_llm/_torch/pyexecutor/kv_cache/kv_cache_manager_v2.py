@@ -133,12 +133,20 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 # mamba2 metadata tests the range
 # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - max_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``.
 # The guard sits a full window below that range, with a margin far larger than
-# any supported ``max_draft_len``. ``_GUARD_PAGE_REQUEST_ID`` and the reserved
-# set are derived from ``CUDA_GRAPH_DUMMY_REQUEST_ID`` at the bottom of this
-# module: importing ``cuda_graph_runner`` here at module top is a circular
-# import (it transitively imports ``KVCacheManagerV2``), so the derivation is
-# deferred until after this module's classes are defined.
+# any supported ``max_draft_len``.
 _CUDA_GRAPH_DUMMY_RESERVED_WINDOW = 1 << 20
+
+# CUDA_GRAPH_DUMMY_REQUEST_ID is owned by cuda_graph_runner, but importing that
+# module here -- even at module bottom -- is a circular import: cuda_graph_runner
+# pulls in attention.backends.trtllm, and attention.backends.interface imports
+# KVCacheManagerV2 from this module, so the cycle deadlocks when interface.py is
+# the import entry point. Mirror the literal; the unit test guards against drift.
+CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1  # keep in sync with cuda_graph_runner.py
+
+_GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVED_WINDOW
+# Caches the manager holds for itself rather than for a request. Anything that
+# reasons about "no request is active" has to exclude these.
+_RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
@@ -4639,17 +4647,3 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
-
-
-# Deferred to module end: importing cuda_graph_runner at module top is a
-# circular import (it transitively imports KVCacheManagerV2, which this module
-# defines). By the time this runs the classes above are defined, so the back
-# import resolves. Deriving the guard id from CUDA_GRAPH_DUMMY_REQUEST_ID keeps
-# it in step with the CUDA-graph dummy range instead of hardcoding a second
-# magic number (see the module-top comment on _CUDA_GRAPH_DUMMY_RESERVED_WINDOW).
-from ..cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID  # noqa: E402
-
-_GUARD_PAGE_REQUEST_ID = CUDA_GRAPH_DUMMY_REQUEST_ID - _CUDA_GRAPH_DUMMY_RESERVED_WINDOW
-# Caches the manager holds for itself rather than for a request. Anything that
-# reasons about "no request is active" has to exclude these.
-_RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
