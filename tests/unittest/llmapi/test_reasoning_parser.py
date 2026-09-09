@@ -163,6 +163,60 @@ def test_deepseek_v4_reasoning_parser_streams_when_thinking():
             for result in results] == ["hid", "den", ""]
 
 
+def test_xingchen4_reasoning_parser_registered():
+    assert "xingchen4" in ReasoningParserFactory.keys()
+    assert MODEL_TYPE_TO_REASONING_PARSER["xingchen4"] == "xingchen4"
+
+
+@pytest.mark.parametrize("chat_template_kwargs",
+                         [None, {
+                             "thinking": True
+                         }, {
+                             "enable_thinking": True
+                         }])
+def test_xingchen4_reasoning_parser_extracts_when_thinking(
+        chat_template_kwargs: dict):
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "xingchen4", chat_template_kwargs)
+
+    result = reasoning_parser.parse(f"hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
+
+
+def test_xingchen4_reasoning_parser_strips_leading_start_tag():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "xingchen4")
+
+    result = reasoning_parser.parse(f"{R1_START}hidden{R1_END}visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == "hidden"
+
+
+def test_xingchen4_reasoning_parser_identity_when_not_thinking():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "xingchen4", {"thinking": False})
+
+    result = reasoning_parser.parse("visible")
+
+    assert result.content == "visible"
+    assert result.reasoning_content == ""
+
+
+def test_xingchen4_reasoning_parser_streams_when_thinking():
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "xingchen4")
+
+    deltas = ["hid", f"den{R1_END}visible", " tail"]
+    results = [reasoning_parser.parse_delta(delta) for delta in deltas]
+
+    assert [result.content for result in results] == ["", "visible", " tail"]
+    assert [result.reasoning_content
+            for result in results] == ["hid", "den", ""]
+
+
 TOOL_START = "<|tool_calls_section_begin|>"
 
 
