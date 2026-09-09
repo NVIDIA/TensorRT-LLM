@@ -201,3 +201,48 @@ def test_fused_dspark_rmsnorm_rope_compiles_once_across_batches():
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
     assert cache_info.misses == 1
     assert cache_info.hits == 1
+
+
+@pytest.mark.parametrize("split_norm", [False, True])
+def test_fused_dspark_rmsnorm_rope_norm_dim(split_norm):
+    """norm_dim bounds the RMS reduction; the default must not move DSv4.
+
+    split_norm=False is the DSv4 regression gate (whole-row RMS, weight over the
+    whole row). split_norm=True is what DeepSeek-style MLA needs: normalize the
+    latent, leave k_pe raw.
+
+    Driven through ``_rmsnorm_rope_batched`` rather than the custom op, because
+    the plumbing under test is the dispatcher's -- it has to forward norm_dim to
+    the support predicate and to the kernel. The predicate is asserted first so
+    a fused path that silently stopped applying never reads as a pass; that is
+    what made the original home of this test (hw_agnostic, mapped to CPU and
+    H100 only) vacuous, since is_sm_100f() is false there.
+    """
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import _rmsnorm, _rmsnorm_rope_batched
+
+    torch.manual_seed(0)
+    hidden, rope_dim, rows = 576, 64, 16
+    nope = hidden - rope_dim
+    norm_dim = nope if split_norm else hidden
+    eps = 1e-5
+    x = torch.randn(1, rows, hidden, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(norm_dim, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    ang = torch.rand(1, rows, rope_dim // 2, device="cuda", dtype=torch.float32) * 6.28
+    freqs = torch.complex(ang.cos(), ang.sin())
+
+    freqs_real = torch.view_as_real(freqs).reshape(-1, freqs.shape[-1], 2)
+    assert is_fused_dspark_rmsnorm_rope_supported(x, w, freqs_real, 1, rope_dim, norm_dim)
+
+    got = _rmsnorm_rope_batched(x, w, eps, rope_dim, freqs, norm_dim=norm_dim)
+
+    head = x[..., :norm_dim]
+    normed = _rmsnorm(head, w, eps)
+    ref = torch.cat([normed, x[..., norm_dim:]], dim=-1) if split_norm else normed
+    xc = torch.view_as_complex(ref[..., nope:].float().unflatten(-1, (-1, 2)))
+    rot = torch.view_as_real(xc * freqs.view(1, rows, 1, rope_dim // 2).squeeze(2)).flatten(-2)
+    ref = torch.cat([ref[..., :nope], rot.to(ref.dtype)], dim=-1)
+
+    torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
