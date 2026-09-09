@@ -73,9 +73,16 @@ def _resolve_cosmos3_cross_attention_backend(
 
     attn2d_size = visual_gen_mapping.attn2d_row_size * visual_gen_mapping.attn2d_col_size
     if attn2d_size > 1:
-        return "FA4"
+        raise ValueError(
+            "Cosmos3 cross-attention with Attention2D does not support the "
+            "CUTEDSL backend for unequal text lengths. Use attention backend FA4."
+        )
     if visual_gen_mapping.ulysses_size > 1:
-        return "VANILLA"
+        raise ValueError(
+            "Cosmos3 cross-attention with Ulysses does not support the "
+            "CUTEDSL backend for unequal text lengths. Use attention backend "
+            "VANILLA or FA4."
+        )
     return backend
 
 
@@ -666,13 +673,10 @@ class Cosmos3CrossAttention(Attention):
             model_config.attention.backend = resolved_backend
             # Warn once per (module class, requested, resolved) triple so the
             # fallback is visible without per-module-instance log spam.
-            if original_backend == "CUTEDSL":
-                reason = "is disabled for unequal-length sequence-parallel text conditioning"
-            else:
-                reason = "is not supported for Cosmos3 cross-attention"
             logger.warning_once(
                 f"{type(self).__name__}: requested attention backend {original_backend} "
-                f"{reason}; falling back to {resolved_backend}.",
+                f"is not supported for Cosmos3 cross-attention; "
+                f"falling back to {resolved_backend}.",
                 key=(type(self).__name__, original_backend, resolved_backend),
             )
 
