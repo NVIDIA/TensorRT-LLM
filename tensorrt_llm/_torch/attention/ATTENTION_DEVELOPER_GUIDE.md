@@ -353,20 +353,6 @@ request checks. For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
-PrimTS supports dense, single-token MLA decode with BF16 or FP8 E4M3 KV cache
-on SM100/SM103 (latent dimension 512, RoPE dimension 64, up to 128 local query
-heads). The FP8 path consumes `quant_q_buffer` and the BMM scales produced by
-MLA preprocessing, while the module-facing query and output remain BF16.
-These scales are layer/model-static: the adapter caches their host values
-during eager warmup before CUDA graph capture. Wrapper plans and workspace
-sizing use the FP8 kernel-input dtype. Context MLA, speculative/sparse MLA,
-quantized output, and quantized KV cache for standard attention remain outside
-this adapter's supported paths; other FMHA libraries handle those cases.
-For FP8 MLA with at most 64 local heads, the paged-KV capacity must be at least
-128 tokens to satisfy the vendored 1-CTA planner; live KV lengths may be shorter.
-This does not change the default FMHA priorities. To exercise PrimTS decode
-with regular context fallback, use `TLLM_FMHA_LIBS=prims_ts,fallback`.
-
 The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
