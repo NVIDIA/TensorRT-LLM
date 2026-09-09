@@ -13,6 +13,7 @@ Piecewise CUDA Graph is a technique that runs cudagraph-unsupported components (
     - [Piecewise CUDA Graph & Generation Only CUDA Graph](#piecewise-cuda-graph--generation-only-cuda-graph)
     - [Piecewise CUDA Graph Padding](#piecewise-cuda-graph-padding)
     - [Performance Tuning](#performance-tuning)
+    - [Torch Compile Optimizations](#torch-compile-optimizations)
   - [Known Issue](#known-issue)
   - [Development Guide](#development-guide)
     - [Background Knowledge](#background-knowledge)
@@ -112,6 +113,24 @@ Guidelines for `capture_num_tokens`:
 - Manage trade-offs: more capture points reduce padding but increase memory use and can lower max concurrency; fewer points save memory but increase padding and compute cost.
 
 Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the context (prefill) phase, primarily due to the attention operator’s substantial host-side overhead.
+
+### Torch Compile Optimizations
+
+Enabling `prefill_cuda_graph_backend: piecewise` also enables `torch.compile`. By default, decoder forwards are routed through the compiled callable, including autotuning and auxiliary warmups as well as context, mixed, and generation-only batches. For some models, running these forwards through the compiled callable can improve performance through optimizations such as kernel fusion. In other cases, most of the benefit comes from applying piecewise CUDA graphs to context and mixed batches only.
+
+The `compile_only_piecewise_graphs` option restricts compilation to forwards that are eligible for piecewise CUDA graphs, including the corresponding specialization warmup and capture forwards:
+
+```yaml
+prefill_cuda_graph_backend: piecewise
+torch_compile_config:
+  compile_only_piecewise_graphs: true
+```
+
+With this option enabled, ineligible context and mixed forwards use the eager decoder. Ordinary CUDA graphs are also captured from the eager decoder and subsequently replayed as CUDA graphs. Auxiliary kernel and memory-pool warmups bypass `torch.compile`. Avoiding unnecessary tracing and compilation can significantly reduce startup time.
+
+The `compile_only_piecewise_graphs` option was validated with a Qwen3 8B FP8 model, where no performance impact was measured in the tested TP1 and TP2 configurations. However, performance and numerical behavior can be model- and configuration-dependent, so these should be evaluated on a case-by-case basis before deployment.
+This option requires `prefill_cuda_graph_backend: piecewise`, does not support attention DP, and currently supports only models derived from `DecoderModelForCausalLM`.
+
 
 ## Known Issue
 
