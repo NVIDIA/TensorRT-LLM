@@ -577,6 +577,11 @@ def _capture_qwen3_hybrid_manager_ctor(monkeypatch, manager_base, pretrained_con
 
 
 def _qwen3_hybrid_pretrained_config(*, vocab_size=None, text_vocab_size=None):
+    """Minimal Qwen3 hybrid text config, with vocab_size placed either on the
+    config itself or on a nested text_config as composite VLM configs do.
+
+    Both keywords default to None so the field can also be left off entirely.
+    """
     config = SimpleNamespace(
         architectures=["Qwen3_5ForCausalLM"],
         num_hidden_layers=2,
