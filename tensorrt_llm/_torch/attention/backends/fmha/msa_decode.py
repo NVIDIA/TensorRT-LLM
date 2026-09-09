@@ -200,6 +200,12 @@ class MsaDecodeFmha(PhasedFmha):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> None:
+        """Attend the full page table on trtllm-gen, for a dense M3 layer.
+
+        This is the kernel FlashInferTrtllmGenFmha runs, called directly rather
+        than through that library, which cannot address M3's pool. See the
+        trtllm_gen_dense_decode module docstring for why.
+        """
         attn = params.attn
         metadata = params.meta
         head_dim = attn.head_dim
