@@ -50,7 +50,10 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
 # ``thop.attention`` kwargs hard-wired to a literal at the call site (no
 # rich object owns them). Sync test enforces both the kwarg name and the
 # literal value.
-_THOP_LITERALS: dict = {}
+_THOP_LITERALS: dict = {
+    # Non-localized fallback path; locality-domain FMHA passes an explicit id.
+    "locality_domain_id": -1,
+}
 
 
 class FallbackFmha(Fmha):
@@ -207,6 +210,7 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
+            locality_domain_id=-1,
             skip_softmax_stat=attn.skip_softmax_stat,
             skip_correction_threshold=attn.skip_correction_threshold,
             # --- Sparse runtime parameters ---
