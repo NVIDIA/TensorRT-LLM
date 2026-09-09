@@ -372,10 +372,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     __nv_bfloat16* __restrict__ cs_q, __nv_bfloat16* __restrict__ cs_k, __nv_bfloat16* __restrict__ cs_v,
     float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
     __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
-    float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices,
-    float* __restrict__ state, int64_t state_slot_stride, int64_t conv_state_slot_stride,
-    __nv_bfloat16* __restrict__ out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps,
-    KdaDecodeIoLayout layout)
+    float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices, float* __restrict__ state,
+    int64_t state_slot_stride, int64_t conv_state_slot_stride, __nv_bfloat16* __restrict__ out, int B, int H, int HV,
+    float lower_bound, float scale, float onorm_eps, KdaDecodeIoLayout layout)
 {
     int const tid = threadIdx.x;
     int const lane = tid & 31;
@@ -905,10 +904,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     __nv_bfloat16* __restrict__ cs_q, __nv_bfloat16* __restrict__ cs_k, __nv_bfloat16* __restrict__ cs_v,
     float const* __restrict__ a_log, __nv_bfloat16 const* __restrict__ g, float const* __restrict__ dt_bias,
     __nv_bfloat16 const* __restrict__ beta, __nv_bfloat16 const* __restrict__ onorm_g,
-    float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices,
-    float* __restrict__ state, int64_t state_slot_stride, int64_t conv_state_slot_stride,
-    __nv_bfloat16* __restrict__ out, int B, int H, int HV, float lower_bound, float scale, float onorm_eps,
-    KdaDecodeIoLayout layout)
+    float const* __restrict__ onorm_weight, int const* __restrict__ ssm_state_indices, float* __restrict__ state,
+    int64_t state_slot_stride, int64_t conv_state_slot_stride, __nv_bfloat16* __restrict__ out, int B, int H, int HV,
+    float lower_bound, float scale, float onorm_eps, KdaDecodeIoLayout layout)
 {
     int const tid = threadIdx.x;
     int const lane = tid & 31;
