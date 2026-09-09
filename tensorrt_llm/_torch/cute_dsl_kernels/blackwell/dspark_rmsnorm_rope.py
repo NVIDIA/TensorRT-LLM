@@ -26,6 +26,7 @@ class DSparkRMSNormRoPEKernel:
         apply_weight: bool,
         apply_rmsnorm: bool,
         inverse_rope: bool,
+        norm_dim: int | None = None,
     ):
         if hidden_dim % self.num_threads != 0:
             raise ValueError(
@@ -44,6 +45,22 @@ class DSparkRMSNormRoPEKernel:
         self.apply_weight = apply_weight
         self.apply_rmsnorm = apply_rmsnorm
         self.inverse_rope = inverse_rope
+        # Which prefix the RMS is taken over, and how far the norm scale and the
+        # weight reach. DSpark normalizes the whole row (the default, bit-identical
+        # to before this knob existed); DeepSeek-style MLA normalizes only the
+        # kv_lora_rank latent and leaves k_pe raw, which is nope_dim here.
+        self.norm_dim = hidden_dim if norm_dim is None else norm_dim
+        if self.norm_dim not in (hidden_dim, self.nope_dim):
+            raise ValueError(
+                f"norm_dim must be hidden_dim ({hidden_dim}) or nope_dim "
+                f"({self.nope_dim}); got {self.norm_dim}"
+            )
+        self.norm_covers_rope = self.norm_dim == hidden_dim
+        if self.norm_dim % self.num_threads != 0:
+            raise ValueError(
+                f"norm_dim must be divisible by {self.num_threads}; got {self.norm_dim}"
+            )
+        self.norm_elements_per_thread = self.norm_dim // self.num_threads
         if self.nope_dim % self.num_threads != 0:
             raise ValueError(
                 f"nope_dim must be divisible by {self.num_threads}; got {self.nope_dim}"
@@ -85,12 +102,12 @@ class DSparkRMSNormRoPEKernel:
         inverse_rms = cutlass.Float32(1.0)
         if cutlass.const_expr(self.apply_rmsnorm):
             sum_sq = cutlass.Float32(0.0)
-            for item in cutlass.range_constexpr(self.elements_per_thread):
+            for item in cutlass.range_constexpr(self.norm_elements_per_thread):
                 dim = tidx + item * self.num_threads
                 value = cutlass.Float32(x[row, dim])
                 sum_sq += value * value
             sum_sq = cute.arch.warp_reduction_sum(sum_sq)
-            inverse_rms = cute.math.rsqrt(sum_sq / self.hidden_dim + self.eps)
+            inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
 
         for item in cutlass.range_constexpr(self.nope_elements_per_thread):
             dim = tidx + item * self.num_threads
@@ -105,11 +122,16 @@ class DSparkRMSNormRoPEKernel:
                 pair = tidx + item * self.num_threads
                 real_dim = self.nope_dim + pair * 2
                 imag_dim = real_dim + 1
-                real = cutlass.Float32(x[row, real_dim]) * inverse_rms
-                imag = cutlass.Float32(x[row, imag_dim]) * inverse_rms
-                if cutlass.const_expr(self.apply_weight):
-                    real *= cutlass.Float32(weight[real_dim])
-                    imag *= cutlass.Float32(weight[imag_dim])
+                real = cutlass.Float32(x[row, real_dim])
+                imag = cutlass.Float32(x[row, imag_dim])
+                # Outside norm_dim the rope lanes are passed through raw: no RMS
+                # scale, no weight. weight is only norm_dim long in that case.
+                if cutlass.const_expr(self.norm_covers_rope):
+                    real *= inverse_rms
+                    imag *= inverse_rms
+                    if cutlass.const_expr(self.apply_weight):
+                        real *= cutlass.Float32(weight[real_dim])
+                        imag *= cutlass.Float32(weight[imag_dim])
                 cos = cutlass.Float32(freqs[freq_row, pair, 0])
                 sin = cutlass.Float32(freqs[freq_row, pair, 1])
                 if cutlass.const_expr(self.inverse_rope):

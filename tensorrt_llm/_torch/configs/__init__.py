@@ -23,6 +23,7 @@ from tensorrt_llm._torch.configs.gemma4 import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
+from tensorrt_llm._torch.configs.k3_dspark import K3DsparkConfig
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
@@ -67,6 +68,9 @@ def _register_custom_configs_with_transformers() -> None:
         # sub-configs and multimodal is not disabled, and otherwise flattens to
         # the text config. Registering both here lets AutoConfig / AutoTokenizer
         # resolve them without trust_remote_code.
+        # The MLA DSpark drafter checkpoint ships no auto_map, so AutoConfig
+        # cannot resolve its model_type on its own.
+        "k3_dspark": K3DsparkConfig,
         "kimi_k3": KimiK3Config,
         "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
@@ -104,6 +108,7 @@ __all__ = [
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "K3DsparkConfig",
     "KimiK3Config",
     "KimiK3VisionConfig",
     "KimiLinearConfig",
