@@ -448,13 +448,15 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        # Disaggregated attention-DP can backfill a batch before the overlap
-        # scheduler releases the previous batch's terminal sequence slots.
-        from ._util import (compute_max_num_sequences,
+        # Both reasons the pool must exceed one forward batch are known from
+        # the runtime topology, before the model loads.
+        from ._util import (compute_max_num_sequences, is_disagg_enabled,
                             should_enable_adp_dummy_fixes,
                             should_enable_disagg_adp_overlap_headroom,
                             should_enable_non_overlap_adp_forward_intent,
                             should_enable_scheduler_aware_adp_dummy)
+        self._is_disagg = is_disagg_enabled(
+            getattr(llm_args, "cache_transceiver_config", None))
         self._enable_disagg_adp_overlap_headroom = (
             should_enable_disagg_adp_overlap_headroom(
                 mapping, llm_args.cache_transceiver_config,
@@ -465,6 +467,7 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_disagg_adp_overlap_headroom,
+            is_disagg=self._is_disagg,
         )
         self.dist = dist
         if dist is not None:
@@ -1132,8 +1135,7 @@ class PyTorchModelEngine(ModelEngine):
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
             spec_config=self.spec_config,
             is_draft_model=self.is_draft_model,
-            num_seq_slots=(self.max_num_seq_slots if
-                           self._enable_disagg_adp_overlap_headroom else None),
+            num_seq_slots=self.max_num_seq_slots,
             original_max_draft_len=self.original_max_draft_len,
             original_max_total_draft_tokens=(
                 self.original_max_total_draft_tokens),
@@ -3709,11 +3711,9 @@ class PyTorchModelEngine(ModelEngine):
     def _set_up_spec_metadata(
             self, spec_resource_manager: Optional[BaseResourceManager]):
         spec_config = self.spec_config if self.enable_spec_decode else None
-        # The disaggregated attention-DP overlap path opts into larger metadata
-        # buffers. Passing None preserves the established max_num_requests
-        # fallback for other configurations, including PP.
-        num_seq_slots = (self.max_num_seq_slots
-                         if self._enable_disagg_adp_overlap_headroom else None)
+        # Slot-indexed metadata buffers must span the whole pool, whatever
+        # sizes it.
+        num_seq_slots = self.max_num_seq_slots
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
