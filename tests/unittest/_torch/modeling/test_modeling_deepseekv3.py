@@ -30,6 +30,8 @@ from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 EXPERTS_KEY = "model.layers.{}.mlp.experts"
 
 
