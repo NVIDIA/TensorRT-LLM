@@ -885,6 +885,11 @@ def _dsv4_kernel(
         # would have fetched with cp.async.  The SCALE plane keeps the original
         # 16-lane-per-page decomposition and all 64 per-thread arrivals.
         pgw = 2 * (warp_idx - 12)
+        bsl0 = I32(0)
+        if cutlass.const_expr(NLOC <= RBT):
+            bsl0 = ntl - 1
+        pg0 = cute.arch.make_warp_uniform(sBT[bsl0 * 4 + pgw])
+        pg1 = cute.arch.make_warp_uniform(sBT[bsl0 * 4 + pgw + 1])
         for j in cutlass.range(ntl, unroll=1):
             i = crk + (ntl - 1 - j) * CSd
             s = j % STAGES
@@ -916,11 +921,15 @@ def _dsv4_kernel(
                     if tkt == 0:
                         _pfl2(base + 2048)
             # scale plane keeps the per-half-warp page; data plane is per warp
-            bsl = j & (RBT - 1)
+            # ids of tile j are already in pg0/pg1; fetch tile j+1's now, overlapping this tile's issue
+            jn = j + 1
+            if jn >= ntl:
+                jn = j
+            bsn = jn & (RBT - 1)
             if cutlass.const_expr(NLOC <= RBT):
-                bsl = ntl - 1 - j
-            pg0 = cute.arch.make_warp_uniform(sBT[bsl * 4 + pgw])
-            pg1 = cute.arch.make_warp_uniform(sBT[bsl * 4 + pgw + 1])
+                bsn = ntl - 1 - jn
+            pg0n = cute.arch.make_warp_uniform(sBT[bsn * 4 + pgw])
+            pg1n = cute.arch.make_warp_uniform(sBT[bsn * 4 + pgw + 1])
             pg = pg0
             if pgt != pgw:
                 pg = pg1
@@ -955,6 +964,8 @@ def _dsv4_kernel(
                 dsf = cute.make_tensor(sSFA_raw + (s * 128 + tk * 4 + pgt), cute.make_layout(1))
                 cute.copy(g2s_u32, gsf, dsf)
             cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + s)
+            pg0 = pg0n
+            pg1 = pg1n
 
     # ---------------- mma warp ----------------
     elif warp_idx == M_WARP:
