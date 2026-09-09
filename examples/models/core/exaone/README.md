@@ -211,7 +211,7 @@ First, clone the [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) re
 
 ```bash
 git clone https://github.com/NVIDIA/Model-Optimizer
-cd Model-Optimizer/examples/llm_ptq
+cd Model-Optimizer/examples/hf_ptq
 ```
 
 For more information, please refer to the official [Model Optimizer documentation](https://github.com/NVIDIA/Model-Optimizer).
@@ -221,7 +221,7 @@ For more information, please refer to the official [Model Optimizer documentatio
 FP8 quantization provides a good balance between model accuracy and inference performance. To quantize a model to FP8 format:
 
 ```bash
-python3 hf_ptq.py --model $HF_MODEL_DIR --quant fp8 --export_fmt hf
+python3 hf_ptq.py --model $HF_MODEL_DIR --quant fp8
 ```
 
 #### NVFP4 Quantization
@@ -229,7 +229,7 @@ python3 hf_ptq.py --model $HF_MODEL_DIR --quant fp8 --export_fmt hf
 NVFP4 (4-bit floating point) quantization enables memory-efficient inference with reduced GPU memory footprint. To quantize a model to NVFP4 format:
 
 ```bash
-python3 hf_ptq.py --model $HF_MODEL_DIR --quant nvfp4 --export_fmt hf
+python3 hf_ptq.py --model $HF_MODEL_DIR --quant nvfp4
 ```
 
 ## Running the TensorRT LLM Server
@@ -596,12 +596,12 @@ To address this issue, provide enough data samples during calibration by increas
 
 **FP8 Quantization:**
 ```bash
-cd Model-Optimizer/examples/llm_ptq
-python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant fp8 --export_fmt hf --calib_size 8192 --calib_seq 1024
+cd Model-Optimizer/examples/hf_ptq
+python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant fp8 --calib_size 8192 --calib_seq 1024
 ```
 
 **NVFP4 Quantization:**
 ```bash
-cd Model-Optimizer/examples/llm_ptq
-python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant nvfp4 --export_fmt hf --calib_size 8192 --calib_seq 1024
+cd Model-Optimizer/examples/hf_ptq
+python3 hf_ptq.py --model hf_models/$MODEL_NAME --quant nvfp4 --calib_size 8192 --calib_seq 1024
 ```
