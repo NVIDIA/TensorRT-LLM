@@ -416,6 +416,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_1gpu[cutlass-one_model] TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-no_overlap_scheduler]
@@ -487,6 +488,7 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-aut
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[trtllm-fp8]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-fp8]
+accuracy/test_llm_api_pytorch.py::TestGlm4MoeSpeculativeDecoding::test_glm4_moe_mtp TIMEOUT (120)
 accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[dep8]
 accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[ep8]
 accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8]
@@ -600,6 +602,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_dynamic_
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard_sa_global_pool
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_suffix_automaton_dynamic_draft_len
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[dynamic] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM2::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM2_5::test_4gpus[attention_dp=False-cuda_graph=True-overlap_scheduler=True-tp_size=4-ep_size=4]
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_auto_dtype[tp_size=8-ep_size=8] TIMEOUT (180)
@@ -674,6 +678,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_tr
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass]
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_trtllm_eagle3]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[dynamic] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_eagle3_accuracy[linear] TIMEOUT (60)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8[latency-torch_compile=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=False]
@@ -756,6 +762,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trt
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_1gpu_cutedsl_ple_offload
 accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_nvfp4_adp4_mtp3_trtllm_ple_offload
 accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestStep3p7SpeculativeDecoding::test_step3p7_mtp TIMEOUT (60)
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_cuda_graph_matches_eager_logits[tinyllama-1.1b]
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]
 accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[tinyllama-1.1b]
