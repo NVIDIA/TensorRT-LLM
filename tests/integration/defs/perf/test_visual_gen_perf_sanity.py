@@ -523,7 +523,7 @@ class VisualGenPerfSanityTestConfig:
         per_request = {}
         if extra_body is not None:
             extra = json.loads(extra_body) if isinstance(extra_body, str) else dict(extra_body)
-            for key in ("image_reference", "video_reference"):
+            for key in ("image_reference", "video_reference", "audio_reference"):
                 if key in extra:
                     per_request[key] = extra.pop(key)
             if extra:

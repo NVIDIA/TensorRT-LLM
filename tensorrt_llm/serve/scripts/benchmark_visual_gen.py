@@ -25,7 +25,7 @@ On the client side, run:
 
 Generation parameters live in the ``--workload`` document rather than on the CLI.
 Its format and the metrics reported are documented in
-``BENCHMARKING_VISUAL_GEN_SERVER.md``, beside this file.
+``BENCHMARKING_VISUAL_GEN.md``, beside this file.
 """
 
 import argparse
@@ -1437,6 +1437,27 @@ def build_visual_gen_result(
     return result.model_dump(exclude=absent)
 
 
+def _apply_metadata(result: dict[str, Any], metadata: Optional[list[str]]) -> None:
+    """Add each ``KEY=VALUE`` to ``result``, refusing to restate one of its own.
+
+    The run's own fields are past validation by the time this writes, and the
+    partial-run check reads ``completed`` and ``total_requests`` back out of
+    this dict, so an overwrite would both falsify the saved result and decide
+    whether the run reports its own failure.
+    """
+    for item in metadata or []:
+        if "=" not in item:
+            raise ValueError("Invalid metadata format. Please use KEY=VALUE format.")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key in result:
+            raise ValueError(
+                f"--metadata {key}=... would overwrite the run's own {key!r}. "
+                "Metadata annotates a result; it cannot restate one."
+            )
+        result[key] = value.strip()
+
+
 def print_visual_gen_results(result: dict[str, Any], selected_percentiles: list[float]) -> None:
     is_video = result["backend"] == VIDEO_BACKEND
     failed = result["total_requests"] - result["completed"]
@@ -1799,11 +1820,7 @@ def main(args: argparse.Namespace):
     print_visual_gen_results(result, selected_percentiles)
 
     if args.save_result:
-        for item in args.metadata or []:
-            if "=" not in item:
-                raise ValueError("Invalid metadata format. Please use KEY=VALUE format.")
-            key, value = item.split("=", 1)
-            result[key.strip()] = value.strip()
+        _apply_metadata(result, args.metadata)
 
         base_model = model.rstrip("/").split("/")[-1]
         max_concurrency_str = (

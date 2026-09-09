@@ -27,6 +27,7 @@ from tensorrt_llm.serve.scripts.benchmark_visual_gen import (
     SERVER_TIMING_FIELDS,
     VisualGenBenchResult,
     VisualGenRequestRecord,
+    _apply_metadata,
     _make_record,
     _output_rate,
     _paced,
@@ -513,3 +514,21 @@ def test_every_result_field_carries_a_description():
     for model in (VisualGenBenchResult, VisualGenRequestRecord):
         undocumented = [name for name, spec in model.model_fields.items() if not spec.description]
         assert not undocumented, f"{model.__name__}: {undocumented}"
+
+
+def test_metadata_cannot_restate_a_result_field():
+    """The partial-run check reads completed and total_requests back out of this
+    dict, so overwriting both would report a failed run as a clean one."""
+    result = {"completed": 7, "total_requests": 8}
+
+    with pytest.raises(ValueError, match="would overwrite the run's own 'completed'"):
+        _apply_metadata(result, ["completed=8", "total_requests=8"])
+
+    assert result["completed"] == 7
+
+
+def test_metadata_annotates_the_result():
+    result = {"completed": 8}
+    _apply_metadata(result, ["version=0.3.3", " tp = 1 "])
+
+    assert result == {"completed": 8, "version": "0.3.3", "tp": "1"}

@@ -1,4 +1,4 @@
-# Benchmarking a VisualGen server
+# Benchmarking VisualGen
 
 `tensorrt_llm.serve.scripts.benchmark_visual_gen` drives a running `trtllm-serve` VisualGen
 server over its OpenAI-compatible endpoints and reports latency and throughput.
@@ -103,14 +103,46 @@ requests — **one sample per request**.
 
 ### Latency breakdown
 
-```
-gen_latency = server_gen  + network + client_poll_interval
-e2e_latency = gen_latency + server_media_encode + client_fetch_result
+```mermaid
+sequenceDiagram
+    participant C as benchmark_visual_gen<br/>(client)
+    participant S as trtllm-serve
+
+    Note over C: load --workload: merge common_params, read every path
+
+    alt image backend
+        C->>S: POST /v1/images/generations | /v1/images/edits
+        S-->>C: 200 + body + Server-Timing
+        Note right of S: e2e_latency only
+    else video backend
+        C->>S: POST /v1/videos
+        Note right of S: 202 + job id
+        C->>S: GET /v1/videos/{id}
+        Note right of S: every --poll-interval
+        S-->>C: status: postprocessing
+        Note right of S: ends gen_latency
+        S-->>C: status: completed
+        C->>S: GET /v1/videos/{id}/content
+        S-->>C: 200 + media + Server-Timing
+        Note right of S: ends e2e_latency
+    end
+
+    Note over C: --output-media-dir writes outside the concurrency slot
+    Note over C: aggregate; exit non-zero if any request failed
 ```
 
-`e2e_latency` and `gen_latency` are client-measured and `server_gen` comes from the
-`Server-Timing` header; the other terms name spans nothing measures on its own, and their
-prefix says which side spends them.
+```math
+\texttt{client\_gen} = \texttt{server\_gen} + \texttt{network} + \texttt{client\_poll\_interval}
+```
+
+```math
+\texttt{client\_e2e} = \texttt{client\_gen} + \texttt{server\_media\_encode} + \texttt{client\_fetch\_result}
+```
+
+Those are per-request fields, which `--save-detailed` writes under `requests`; the run aggregates
+`client_gen` as `gen_latency` and `client_e2e` as `e2e_latency`. Both are client-measured, and
+`server_gen` comes from the `Server-Timing` header; the other terms name spans nothing measures on
+its own, and their prefix says which side spends them.
 
 Under `--response-format path` the fetch returns a path rather than the bytes, so
 `e2e_latency` minus `gen_latency` is essentially `server_media_encode`. The two being equal
