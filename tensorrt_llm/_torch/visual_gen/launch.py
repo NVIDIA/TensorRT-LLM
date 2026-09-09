@@ -20,15 +20,21 @@ uniform :class:`WorkerHandle`, so neither ``VisualGen`` nor
 ``DiffusionRemoteClient`` branches on the launch environment.
 """
 
+import asyncio
 import os
 import socket
 import threading
+import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import torch.multiprocessing as mp
 
+from tensorrt_llm.executor.utils import create_mpi_comm_session, get_spawn_proxy_process_env
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -47,12 +53,23 @@ _Thread = threading.Thread
 _get_mp_context = mp.get_context
 _get_process_id = os.getpid
 
+# Default ``torch.distributed`` process-group timeout (seconds) for MGMN
+# workers. Paired with TORCH_NCCL_ASYNC_ERROR_HANDLING it bounds how long a
+# surviving rank blocks in a collective whose peers died, while staying
+# generous enough for slow model-load barriers. Overridable per run via
+# TLLM_VG_MGMN_PG_TIMEOUT_SEC.
+MGMN_PG_TIMEOUT_SEC = 1800
+
+# Minimum interval (seconds) between MGMN worker-death polls.
+MGMN_ERROR_POLL_INTERVAL = 1.0
+
 
 class LaunchMode(str, Enum):
     """How the current process's worker ranks are brought up."""
 
     SPAWN = "spawn"
     EXTERNAL = "external"
+    MGMN = "mgmn"
 
 
 @dataclass(frozen=True)
@@ -60,8 +77,12 @@ class LaunchPlan:
     """Resolved launch topology for one VisualGen run.
 
     ``rank``/``local_rank`` describe the process that resolved the plan. In
-    SPAWN mode that process is the client, which is rank 0 by construction; in
-    EXTERNAL mode it is whichever launcher rank is running.
+    SPAWN and MGMN modes that process is the client, which is rank 0 by
+    construction; in EXTERNAL mode it is whichever launcher rank is running.
+
+    ``master_addr``/``master_port`` are ``None`` in MGMN mode only: the
+    launcher strips the client's MPI environment, so the rendezvous is
+    resolved by the worker ranks themselves and agreed over MPI.
     """
 
     mode: LaunchMode
@@ -69,8 +90,8 @@ class LaunchPlan:
     rank: int
     local_rank: int
     ipc_host: str
-    master_addr: str
-    master_port: int
+    master_addr: Optional[str] = None
+    master_port: Optional[int] = None
 
 
 def find_free_port() -> int:
@@ -138,10 +159,36 @@ def _detect_external_launch() -> Optional[tuple]:
 def resolve_launch_plan(n_workers: int) -> LaunchPlan:
     """Resolve the launch mode and topology for a run of ``n_workers`` ranks.
 
-    Raises ``ValueError`` when the launcher's world size disagrees with
+    Raises ``ValueError`` when a launcher's world size disagrees with
     ``n_workers``. Resolve once per run: in SPAWN mode this picks the
     rendezvous port, so two calls yield two different plans.
     """
+    # MGMN is checked first: trtllm-llmapi-launch strips SLURM_*/OMPI_* from
+    # the wrapped program but not a stale RANK/WORLD_SIZE pair, which
+    # _detect_external_launch() would misread as a torchrun launch.
+    if get_spawn_proxy_process_env():
+        mpi_world_size = get_mpi_world_size()
+        if mpi_world_size != n_workers:
+            raise ValueError(
+                f"MGMN launcher world size ({mpi_world_size}) does not match "
+                f"n_workers ({n_workers}). Launch exactly n_workers MPI ranks, "
+                f"e.g. `mpirun -n {n_workers} trtllm-llmapi-launch <program>` or "
+                f"`srun --mpi=pmix --ntasks={n_workers} ... "
+                f"trtllm-llmapi-launch <program>`."
+            )
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            logger.info(
+                "VisualGen: MGMN launcher detected; ignoring stale "
+                "RANK/WORLD_SIZE environment variables"
+            )
+        return LaunchPlan(
+            mode=LaunchMode.MGMN,
+            world_size=n_workers,
+            rank=0,
+            local_rank=0,
+            ipc_host=get_ip_address(),
+        )
+
     ext = _detect_external_launch()
     if ext is not None:
         rank, local_rank, world_size, master_addr, master_port = ext
@@ -176,9 +223,16 @@ def is_external_worker_rank() -> bool:
     """Whether this process is a non-leader rank of an external (SPMD) launch.
 
     Such a rank must become a worker rather than bind the HTTP port, or every
-    rank on a multi-GPU node races the same port. Answers the question without
-    resolving a full plan, which must happen only once per run.
+    rank on a multi-GPU node races the same port. Always False under the MGMN
+    launcher, which runs user code on rank 0 only — checked first because the
+    launcher leaves a stale RANK/WORLD_SIZE pair behind that the external-launch
+    detector would misread.
+
+    Answers the question without resolving a full plan, which must happen only
+    once per run.
     """
+    if get_spawn_proxy_process_env():
+        return False
     ext = _detect_external_launch()
     return ext is not None and ext[0] != 0
 
@@ -302,20 +356,123 @@ class _WorkerProcessSpawner:
                 self.reap_started_processes()
 
 
-class WorkerHandle:
-    """The launched worker ranks of one run, as the client observes them."""
+def run_diffusion_worker_mgmn(
+    world_size: int,
+    request_queue_addr: str,
+    response_queue_addr: str,
+    visual_gen_args: "VisualGenArgs",
+    req_hmac_key: Optional[bytes] = None,
+    resp_hmac_key: Optional[bytes] = None,
+    log_level: str = "info",
+):
+    """Entry point for MGMN (``trtllm-llmapi-launch``) workers.
 
+    Dispatched once via ``MpiSession.submit`` and executed on every
+    pre-spawned MPI rank: ranks >= 1 inside the launcher's persistent
+    ``mgmn_worker_node`` processes, rank 0 inside the MGMN leader process on
+    the client's node. Rank/topology discovery uses raw mpi4py rather than
+    the ``_utils`` helpers, which honor ``TLLM_DISABLE_MPI`` and would
+    silently return wrong values if that env leaked into the persistent rank
+    process.
+    """
+    from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
+
+    # Set log level before any other work so the MGMN preamble is visible.
+    logger.set_level(log_level)
+
+    # Never trust inherited state: a leaked TLLM_DISABLE_MPI=1 (from the user
+    # environment or a previous task in this persistent rank process) would
+    # corrupt rank resolution for any MPI-gated helper sharing the process.
+    os.environ.pop("TLLM_DISABLE_MPI", None)
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    if comm.Get_size() != world_size:
+        raise RuntimeError(
+            f"MPI world size ({comm.Get_size()}) does not match "
+            f"parallel_config.n_workers ({world_size}). Launch exactly "
+            f"n_workers MPI ranks under trtllm-llmapi-launch."
+        )
+    local_comm = comm.Split_type(MPI.COMM_TYPE_SHARED)
+    local_rank = local_comm.Get_rank()
+
+    # Deterministic, launcher-agnostic node id consumed by
+    # mapping._get_host_id via GROUP_RANK: the first-occurrence index of this
+    # rank's processor name among the unique names. Identical on every rank
+    # because the allgather result is.
+    names = comm.allgather(MPI.Get_processor_name())
+    host_id = sorted(set(names), key=names.index).index(names[rank])
+    os.environ["GROUP_RANK"] = str(host_id)
+
+    # torch rendezvous: rank-0-authoritative, agreed over an UNCONDITIONAL
+    # bcast. Every rank participates regardless of its own env, so a
+    # MASTER_ADDR/MASTER_PORT present on only some ranks can neither diverge
+    # the collective nor fork the value; rank 0's env override wins. The
+    # address is by construction resolved on (and reachable as) the rank-0
+    # worker's host, and the port is bound-tested on that same host.
+    root_addr = (os.environ.get("MASTER_ADDR") or socket.getfqdn()) if rank == 0 else None
+    master_addr = comm.bcast(root_addr, root=0)
+    root_port = (int(os.environ.get("MASTER_PORT") or find_free_port())) if rank == 0 else None
+    master_port = comm.bcast(root_port, root=0)
+
+    # Surviving ranks must not block forever in collectives whose peers died:
+    # abort NCCL collectives on async errors, paired with the bounded
+    # process-group timeout passed below.
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    pg_timeout = timedelta(
+        seconds=int(os.environ.get("TLLM_VG_MGMN_PG_TIMEOUT_SEC", str(MGMN_PG_TIMEOUT_SEC)))
+    )
+
+    logger.info(
+        f"MGMN worker rank {rank}/{world_size} (local_rank {local_rank}, "
+        f"host_id {host_id}): rendezvous {master_addr}:{master_port}"
+    )
+
+    run_diffusion_worker(
+        rank=rank,
+        world_size=world_size,
+        master_addr=master_addr,
+        master_port=master_port,
+        request_queue_addr=request_queue_addr if rank == 0 else None,
+        response_queue_addr=response_queue_addr if rank == 0 else None,
+        visual_gen_args=visual_gen_args,
+        log_level=log_level,
+        req_hmac_key=req_hmac_key if rank == 0 else None,
+        resp_hmac_key=resp_hmac_key if rank == 0 else None,
+        local_rank=local_rank,
+        disable_mpi_env=False,
+        pg_timeout=pg_timeout,
+    )
+
+
+class WorkerHandle(ABC):
+    """The launched worker ranks of one run, as the client observes them.
+
+    Every method is abstract even where a mode has nothing to do, so that
+    "this mode needs no cleanup here" is a decision each handle writes down
+    rather than one it inherits by accident.
+    """
+
+    #: True when the client can neither kill these workers nor outlive them,
+    #: so the only way to stop them is to send them the shutdown signal.
+    must_be_signaled_to_exit = False
+
+    @abstractmethod
     def liveness_failure(self) -> Optional[str]:
         """A message naming a worker that exited, or ``None``."""
-        return None
 
+    @abstractmethod
     def abort(self) -> None:
         """Kill and reap the group after a terminal failure."""
 
+    @abstractmethod
     def begin_shutdown(self) -> None:
         """Stop bringing further workers up. Bounded; runs before the client's
         coordinator thread is joined."""
 
+    @abstractmethod
     def shutdown(self) -> None:
         """Release the workers. Must be safe to call more than once."""
 
@@ -371,9 +528,72 @@ class _ExternalRank0Worker(WorkerHandle):
             return None
         return "DiffusionClient: external-launch worker thread exited"
 
+    def abort(self) -> None:
+        # This worker is a daemon thread of the client process and goes with
+        # it; the external launcher owns the sibling ranks.
+        return
+
+    def begin_shutdown(self) -> None:
+        # The thread is already running: there is no spawn batch to cancel.
+        return
+
     def shutdown(self) -> None:
         if self._thread.is_alive():
             self._thread.join(timeout=WORKER_TIMEOUT)
+
+
+class _MgmnWorkers(WorkerHandle):
+    # The workers live in launcher-owned processes with no handle to kill, and
+    # the rank-0 worker blocks in a request recv that has no timeout.
+    must_be_signaled_to_exit = True
+
+    def __init__(self, session: Any):
+        self.session = session
+        self._failure: Optional[str] = None
+        self._last_poll = 0.0
+
+    def liveness_failure(self) -> Optional[str]:
+        """Poll the MGMN session for a worker death forwarded by the leader.
+
+        ``RemoteMpiCommSessionClient.submit`` returns no futures, so worker
+        exceptions reach the client only as ``RemoteWorkerDeath`` messages on
+        the session's control socket. The client polls this on every pass of
+        its coordinator loop, so the socket read is rate-limited. Sticky: once
+        observed, the failure stays.
+        """
+        if self._failure is not None:
+            return self._failure
+        now = time.monotonic()
+        if now - self._last_poll < MGMN_ERROR_POLL_INTERVAL:
+            return None
+        self._last_poll = now
+        check = getattr(self.session, "check_worker_error", None)
+        if check is None:
+            return None
+        try:
+            error = check()
+        except Exception as exc:  # noqa: BLE001 - the watchdog must not die
+            logger.debug(f"DiffusionClient: check_worker_error failed (ignored): {exc!r}")
+            return None
+        if error is not None:
+            self._failure = f"DiffusionClient: MGMN worker death reported: {error!r}"
+        return self._failure
+
+    def abort(self) -> None:
+        # These workers have no handle to kill, which is why the client signals
+        # them instead -- see must_be_signaled_to_exit.
+        return
+
+    def begin_shutdown(self) -> None:
+        # submit() is fire-and-forget: there is no spawn batch to cancel.
+        return
+
+    def shutdown(self) -> None:
+        # The session is owned by the launcher and shared process-wide;
+        # RemoteMpiCommSessionClient.shutdown() is a documented no-op that
+        # never touches the session socket, so calling it off the event-loop
+        # thread that owns all session I/O is safe.
+        self.session.shutdown()
 
 
 def start_workers(
@@ -381,12 +601,21 @@ def start_workers(
     *,
     worker_fn: Callable,
     worker_kwargs: Dict[str, Any],
+    event_loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> WorkerHandle:
     """Bring up the worker ranks for ``plan``.
 
     ``worker_kwargs`` carries the mode-independent worker arguments (IPC
     addresses, args, HMAC keys, log level); this function adds the topology.
+
+    ``event_loop`` is the client's coordinator loop, required in MGMN mode:
+    the launcher session it dispatches on owns a socket that only that thread
+    may touch.
     """
+    if plan.mode is LaunchMode.MGMN:
+        if event_loop is None:
+            raise ValueError("start_workers() requires event_loop in MGMN mode")
+        return _start_mgmn_workers(plan, worker_kwargs, event_loop)
     if plan.mode is LaunchMode.SPAWN:
         return _start_spawn_workers(plan, worker_fn, worker_kwargs)
     return _start_external_rank0_worker(plan, worker_fn, worker_kwargs)
@@ -447,3 +676,30 @@ def _start_external_rank0_worker(
     )
     thread.start()
     return _ExternalRank0Worker(thread)
+
+
+def _start_mgmn_workers(
+    plan: LaunchPlan,
+    worker_kwargs: Dict[str, Any],
+    event_loop: asyncio.AbstractEventLoop,
+) -> WorkerHandle:
+    logger.info(f"DiffusionClient: Dispatching {plan.world_size} MGMN workers")
+
+    handle: Dict[str, WorkerHandle] = {}
+
+    # The session wraps a single ZMQ PAIR socket that is not thread-safe, so
+    # it is created and used only on the background event-loop thread — this
+    # dispatch and the later liveness_failure() polls alike. submit() is
+    # fire-and-forget (returns no futures); readiness is signaled by the
+    # workers' READY handshake and death by a forwarded RemoteWorkerDeath.
+    async def _dispatch():
+        session = create_mpi_comm_session(plan.world_size)
+        session.submit(
+            run_diffusion_worker_mgmn,
+            **worker_kwargs,
+            world_size=plan.world_size,
+        )
+        handle["h"] = _MgmnWorkers(session)
+
+    asyncio.run_coroutine_threadsafe(_dispatch(), event_loop).result()
+    return handle["h"]

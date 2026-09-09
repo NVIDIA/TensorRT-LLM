@@ -8,7 +8,7 @@ import traceback
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 import torch
@@ -605,12 +605,23 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    disable_mpi_env: bool = True,
+    pg_timeout: Optional[timedelta] = None,
 ):
     """Entry point for worker process.
 
     ``in_client_process``: True only when this worker runs inside the client
     process. Declared by the launch site — never derive it from the
     environment here, the env writes below make every worker look external.
+
+    ``disable_mpi_env``: when True, sets ``TLLM_DISABLE_MPI=1`` so shared
+    TRT-LLM helpers resolve ranks via torch.distributed instead of MPI.
+    MGMN workers pass False: they run inside persistent MPI rank processes
+    where that env write would corrupt rank resolution for anything sharing
+    the process.
+
+    ``pg_timeout``: explicit ``torch.distributed`` process-group timeout;
+    ``None`` keeps the PyTorch default.
     """
     # This native watchdog starts before CUDA, distributed, or model
     # initialization and does not depend on the Python GIL. It follows the
@@ -631,7 +642,8 @@ def run_diffusion_worker(
         logger.set_level(log_level)
 
         # Setup distributed env — use PyTorch distributed, not MPI
-        os.environ["TLLM_DISABLE_MPI"] = "1"
+        if disable_mpi_env:
+            os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(rank)
@@ -662,6 +674,7 @@ def run_diffusion_worker(
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
+            timeout=pg_timeout,
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -787,6 +800,7 @@ class DiffusionRemoteClient:
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                 },
+                event_loop=self._event_loop,
             )
 
             self._wait_ready()
@@ -1131,9 +1145,31 @@ class DiffusionRemoteClient:
         self.response_event.set()
 
         try:
+            if self._workers.must_be_signaled_to_exit:
+                self._signal_workers_to_exit()
             self._workers.abort()
         finally:
             self._discard_unsent_request(request_to_discard)
+
+    def _signal_workers_to_exit(self) -> None:
+        """Ask a worker group this client cannot kill to stop itself.
+
+        Best-effort and non-blocking: the rank-0 worker may be the one that
+        died, leaving the request socket without a peer. Reaching it only ends
+        its request recv — a surviving rank still tears its process group down
+        against dead peers, so exit stays bounded by the group timeout.
+        """
+        if self.requests_ipc is None:
+            return
+        try:
+            self.requests_ipc.put_nowait(None)
+        except zmq.Again:
+            logger.info(
+                "DiffusionClient: request socket has no peer; the rank-0 worker "
+                "cannot be signaled and must be reaped by the launcher"
+            )
+        except Exception as e:
+            logger.warning(f"DiffusionClient: Failed to signal the worker group: {e}")
 
     def shutdown(self):
         """Shutdown client and workers."""
