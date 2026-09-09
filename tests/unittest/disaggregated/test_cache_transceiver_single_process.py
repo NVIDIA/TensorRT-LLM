@@ -20,6 +20,7 @@ in a single process. Validates KV cache transfer correctness across different
 TP/PP/DP/MLA/sliding-window configurations for both V1 and V2 cache managers.
 """
 
+import gc
 import os
 import threading
 import uuid
@@ -1263,6 +1264,11 @@ def run_transfer_test(
         gen_tp, gen_pp, gen_enable_dp, gen_managers, config, is_mla, cp_size=gen_cp
     )
 
+    # Defined before the try so the finally-block teardown can always close them,
+    # even if setup raises before any sequence is added.
+    ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
+    gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
+
     try:
         ctx_info_endpoint = ctx_tcs[0]._context_info_endpoint
 
@@ -1271,8 +1277,6 @@ def run_transfer_test(
         gen_handle_map: Dict[int, List] = {r: [] for r in range(gen_world)}
         ctx_request_ids: List[int] = []
         gen_request_ids: List[int] = []
-        ctx_kv_caches: Dict[int, List] = {r: [] for r in range(ctx_world)}
-        gen_kv_caches: Dict[int, List] = {r: [] for r in range(gen_world)}
 
         sampling_params = SamplingParams()
 
@@ -1437,22 +1441,48 @@ def run_transfer_test(
                 num_layers=num_layers,
             )
 
-        # 9. Cleanup
+    finally:
+        # Teardown must run on the failure path too, in this order:
+        #   drain GPU work -> close kv caches -> shutdown transceivers.
+        # If verify raises, skipping the drain/close and tearing down the NIXL
+        # agents while registered memory / in-flight transfers are still live
+        # makes the C++ side abort during GC and leaves the messenger/task-queue
+        # listener threads hanging (process never exits). Each step is guarded so
+        # a teardown error cannot mask the real test failure.
         if use_v2:
-            torch.cuda.current_stream().synchronize()
+            try:
+                torch.cuda.current_stream().synchronize()
+            except Exception:
+                pass
             for rank in range(ctx_world):
                 for kv in ctx_kv_caches[rank]:
-                    kv.close()
+                    try:
+                        kv.close()
+                    except Exception:
+                        pass
             for rank in range(gen_world):
                 for kv in gen_kv_caches[rank]:
-                    kv.close()
-
-    finally:
+                    try:
+                        kv.close()
+                    except Exception:
+                        pass
         for tc in ctx_tcs + gen_tcs:
             try:
                 tc.shutdown()
             except Exception:
                 pass
+        # On the failure path pytest keeps the traceback alive, which pins this
+        # frame's locals (ctx_tcs/gen_tcs) and defers finalizing their NIXL C++
+        # agents to a later GC -- which then lands inside the *next* test's NIXL
+        # init and aborts the process. Drop the references and collect now so the
+        # C++ teardown happens deterministically here, within this test.
+        tc = None
+        ctx_tcs = gen_tcs = None
+        try:
+            gc.collect()
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
