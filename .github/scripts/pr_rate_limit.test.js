@@ -16,8 +16,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { test } = require('node:test');
 const workflow = fs.readFileSync(`${__dirname}/../workflows/pr-rate-limit.yml`, 'utf8');
-const script = workflow.split('          script: |\n')[1]
-  .split('\n').map((line) => line.replace(/^ {12}/, '')).join('\n');
+function extractScript(source) {
+  const parts = source.split('          script: |\n');
+  assert.equal(parts.length, 2, 'Expected exactly one inline script block');
+  const lines = parts[1].split('\n');
+  const end = lines.findIndex((line) => line.trim() && !line.startsWith('            '));
+  return lines.slice(0, end < 0 ? lines.length : end)
+    .map((line) => line.replace(/^ {12}/, '')).join('\n');
+}
+const script = extractScript(workflow);
 const execute = new (Object.getPrototypeOf(async function () {}).constructor)(
   'github', 'context', 'core', 'process', 'Date', script,
 );
@@ -32,6 +39,7 @@ async function run(options = {}) {
   const current = options.current || pr(6);
   const writes = options.writes || [];
   const calls = [];
+  const warnings = [];
   const github = { rest: {
     pulls: {
       get: async ({ pull_number }) => {
@@ -47,7 +55,7 @@ async function run(options = {}) {
       },
     },
     repos: { getCollaboratorPermissionLevel: async () => {
-      if (options.permissionError) throw new Error('permission failed');
+      if (options.permissionError) throw Object.assign(new Error('permission failed'), { status: options.permissionStatus });
       return { data: { permission: options.permission || 'read', user: { permissions: { push: options.push } } } };
     } },
     issues: {
@@ -73,46 +81,39 @@ async function run(options = {}) {
     return options.comments || [];
   } };
   const context = { repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' }, payload: options.payload || { pull_request: current } };
-  await execute(github, context, { info: () => {} }, { env: options.env || {} },
+  await execute(github, context, { info: () => {}, warning: (message) => warnings.push(message) }, { env: options.env || {} },
     class extends Date { static now() { return now; } });
-  return { writes, calls };
+  return { writes, calls, warnings };
 }
 test('first five pass; sixth receives explanation before closure', async () => {
   for (let n = 1; n <= 5; n++) assert.deepEqual((await run({ current: pr(n), history: Array.from({ length: n }, (_, i) => pr(i + 1)) })).writes, []);
   const { writes } = await run();
   assert.deepEqual(writes.map((w) => w.kind), ['comment', 'close']);
-  assert.match(writes[0].body, /submitted 6 PRs/);
+  assert.match(writes[0].body, /currently have 6 open PRs/);
   assert.match(writes[0].body, /no merged PRs/);
-  assert.match(writes[0].body, /2026-09-10T11:00:06.000Z/);
+  assert.match(writes[0].body, /wait until your existing PRs are reviewed or merged/);
+  assert.doesNotMatch(writes[0].body, /24|cooldown|consolidate|rolling/);
   assert.equal(writes[1].state, 'closed');
 });
-test('counts drafts and closed unmerged PRs, but not ordinary issues or another author', async () => {
-  const history = Array.from({ length: 5 }, (_, i) => pr(i + 1, { draft: true, state: 'closed' }));
-  history.push(pr(0, { pull_request: undefined }), pr(-1, { user: { id: 99 } }));
+test('counts drafts but excludes closed PRs, ordinary issues and another author', async () => {
+  const history = Array.from({ length: 5 }, (_, i) => pr(i + 1, { draft: true }));
+  history.push(pr(-2, { state: 'closed' }), pr(0, { pull_request: undefined }), pr(-1, { user: { id: 99 } }));
   assert.equal((await run({ history })).writes.length, 2);
 });
-test('submission window excludes its lower boundary and later PRs', async () => {
-  const current = pr(6);
-  const boundary = new Date(Date.parse(current.created_at) - 24 * hour).toISOString();
-  const history = [pr(1, { created_at: boundary }), ...[2, 3, 4, 5].map((n) => pr(n)), pr(7)]
-    .map((item) => ({ ...item, state: 'closed' }));
-  assert.deepEqual((await run({ current, history })).writes, []);
-});
-test('submission quota orders same-second bursts by PR number', async () => {
-  const history = Array.from({ length: 10 }, (_, i) => pr(i + 1, { created_at: pr(1).created_at, state: 'closed' }));
-  assert.deepEqual((await run({ current: { ...history[4], state: 'open' }, history })).writes, []);
-  assert.equal((await run({ current: { ...history[5], state: 'open' }, history })).writes.length, 2);
-});
+
+
 test('history pagination and duplicate entries do not change quota', async () => {
   const first = Array.from({ length: 100 }, () => pr(1));
   const { writes } = await run({ pages: [first, [pr(2), pr(3), pr(4), pr(5)]] });
   assert.equal(writes.length, 2);
-  assert.match(writes[0].body, /submitted 6 PRs/);
+  assert.match(writes[0].body, /currently have 6 open PRs/);
 });
 test('actual merged history exempts; author association alone does not', async () => {
   const history = Array.from({ length: 6 }, (_, i) => pr(i + 1));
-  history.push(pr(0, { state: 'closed' }));
-  assert.deepEqual((await run({ history, merged: true })).writes, []);
+  history.push(pr(0, { state: 'closed', pull_request: { merged_at: '2026-09-08T00:00:00Z' } }));
+  const result = await run({ history });
+  assert.deepEqual(result.writes, []);
+  assert.deepEqual(result.calls, [6]);
   assert.equal((await run({ current: pr(6, { author_association: 'CONTRIBUTOR' }) })).writes.length, 2);
 });
 test('maintainers, bots, allowlisted users and labeled PRs are exempt', async () => {
@@ -129,23 +130,17 @@ test('dry run, closed PRs, and exemptions added during evaluation make no writes
   assert.deepEqual((await run({ recheck: pr(6, { labels: [{ name: 'pr-rate-limit-exempt' }] }) })).writes, []);
   assert.deepEqual((await run({ recheck: pr(6, { state: 'closed' }) })).writes, []);
 });
-test('reopening after cooldown requires capacity; submission cooldown still applies before it', async () => {
-  assert.deepEqual((await run({ current: pr(6, { created_at: new Date(now - 24 * hour).toISOString() }), history: [] })).writes, []);
-  assert.equal((await run()).writes.length, 2);
-});
+
 test('reruns reuse only bot-authored comments and retry closure', async () => {
   const body = '<!-- new-contributor-pr-rate-limit:v2 -->';
   const trusted = { user: { login: 'github-actions[bot]' }, body };
   assert.deepEqual((await run({ comments: [trusted] })).writes.map((w) => w.kind), ['close']);
   assert.equal((await run({ comments: [{ user: { login: 'new-user' }, body }] })).writes.length, 2);
 });
-test('API failures, incomplete history and invalid timestamps abort without moderation', async () => {
+test('unexpected API failures abort without moderation', async () => {
   for (const options of [{ readError: true }, { historyError: true }, { commentError: true },
     { permissionError: true }, { commentsError: true }, { openHistoryError: true },
-    { pages: [Array.from({ length: 100 }, () => pr(1))], failedPage: 2 },
-    { history: [pr(1, { created_at: 'invalid' })] },
-    { current: pr(6, { created_at: 'invalid' }) },
-    { pages: Array.from({ length: 20 }, () => Array.from({ length: 100 }, () => pr(1))) }]) {
+    { pages: [Array.from({ length: 100 }, () => pr(1))], failedPage: 2 }]) {
     const writes = [];
     await assert.rejects(run({ ...options, writes }));
     assert.deepEqual(writes, []);
@@ -177,7 +172,7 @@ test('manual recovery evaluates the requested PR and rejects invalid input befor
   await assert.rejects(run({ payload: {}, readError: true }), /positive integer PR number/);
 });
 
-test('manual recovery preserves dry run, exemptions, cooldown and comment reconciliation', async () => {
+test('manual recovery preserves dry run, exemptions, capacity and comment reconciliation', async () => {
   const payload = { inputs: { pr_number: '6' } };
   assert.deepEqual((await run({ payload, env: { DRY_RUN: 'true' } })).writes, []);
   assert.deepEqual((await run({ payload, permission: 'write' })).writes, []);
@@ -193,7 +188,7 @@ test('privileged action is pinned and manual runs are restricted to the default 
   assert.ok(workflow.includes("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"));
 });
 
-test('open-PR limit prevents reopening a backlog after the submission cooldown', async () => {
+test('open-PR limit prevents reopening an old backlog', async () => {
   const current = pr(6, { created_at: new Date(now - 48 * hour).toISOString() });
   const history = Array.from({ length: 5 }, (_, i) => pr(i + 1, { draft: true }));
   const { writes } = await run({ current, history });
@@ -222,4 +217,36 @@ test('a reopened backlog of old PRs stays subject to the open cap during manual 
   const { writes } = await run({ current, pages: [history, []], openHistory: history, payload: { inputs: { pr_number: '100' } } });
   assert.match(writes[0].body, /currently have 100 open PRs/);
   assert.equal(writes[1].pull_number, 100);
+});
+
+test('closed submissions never consume capacity, regardless of timestamps', async () => {
+  const history = Array.from({ length: 30 }, (_, i) => pr(i + 1, { state: 'closed', created_at: 'invalid' }));
+  assert.deepEqual((await run({ history })).writes, []);
+});
+test('permission denials and incomplete history warn and skip', async () => {
+  for (const options of [
+    { permissionError: true, permissionStatus: 403 },
+    { permissionError: true, permissionStatus: 404 },
+    { pages: Array.from({ length: 20 }, () => Array.from({ length: 100 }, () => pr(1))) },
+  ]) {
+    const result = await run(options);
+    assert.deepEqual(result.writes, []);
+    assert.equal(result.warnings.length, 1);
+  }
+});
+test('configured open cap is enforced and invalid configuration skips all API calls', async () => {
+  assert.deepEqual((await run({ env: { MAX_OPEN: '6' } })).writes, []);
+  const { writes } = await run({ env: { MAX_OPEN: '3' } });
+  assert.match(writes[0].body, /limit: 3/);
+  for (const value of ['0', '-1', '1.5', 'bad', 'Infinity', '9007199254740992']) {
+    const result = await run({ env: { MAX_OPEN: value } });
+    assert.deepEqual(result.calls, []);
+    assert.deepEqual(result.writes, []);
+    assert.equal(result.warnings.length, 1);
+  }
+});
+test('script extraction stops at a subsequent step and rejects ambiguous blocks', () => {
+  assert.equal(extractScript(workflow + '\n      - run: echo later\n'), script);
+  assert.throws(() => extractScript(''), /exactly one/);
+  assert.throws(() => extractScript(workflow + '          script: |\n'), /exactly one/);
 });

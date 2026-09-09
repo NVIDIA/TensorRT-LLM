@@ -52,11 +52,14 @@ jobs:
         env:
           DRY_RUN: ${{ vars.PR_RATE_LIMIT_DRY_RUN }}
           EXEMPT_USERS: ${{ vars.PR_RATE_LIMIT_EXEMPT_USERS }}
+          MAX_OPEN: ${{ vars.PR_RATE_LIMIT_MAX_OPEN }}
         with:
           script: |
-            const SUBMISSION_LIMIT = 5;
-            const OPEN_LIMIT = 5;
-            const WINDOW_MS = 24 * 60 * 60 * 1000;
+            const OPEN_LIMIT = Number(process.env.MAX_OPEN?.trim() || '5');
+            if (!Number.isSafeInteger(OPEN_LIMIT) || OPEN_LIMIT < 1) {
+              core.warning('Invalid PR_RATE_LIMIT_MAX_OPEN; no moderation performed.');
+              return;
+            }
             const EXEMPT_LABEL = 'pr-rate-limit-exempt';
             const MARKER = '<!-- new-contributor-pr-rate-limit:v2 -->';
             const { owner, repo } = context.repo;
@@ -65,25 +68,27 @@ jobs:
             if (!/^[1-9][0-9]*$/.test(rawNumber) || !Number.isSafeInteger(pull_number)) {
               throw new Error('A positive integer PR number is required; no moderation performed.');
             }
-            const now = Date.now();
             const getPull = async (number) => (await github.rest.pulls.get({
               owner, repo, pull_number: number,
             })).data;
             const pull = await getPull(pull_number);
-            const created = Date.parse(pull.created_at);
-            if (!Number.isFinite(created) || created > now) {
-              throw new Error('Invalid pull request creation time; no moderation performed.');
-            }
-            // The submission cooldown expires, but the open-PR limit never ages out.
+            // The open-PR cap applies regardless of creation time or reopening age.
             if (pull.state !== 'open') return;
             const login = pull.user.login;
             const exemptUsers = (process.env.EXEMPT_USERS || '').split(',')
               .map((value) => value.trim().toLowerCase()).filter(Boolean);
             const hasExemptLabel = (pr) => pr.labels.some((label) => label.name === EXEMPT_LABEL);
             if (pull.user.type === 'Bot' || exemptUsers.includes(login.toLowerCase()) || hasExemptLabel(pull)) return;
-            const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner, repo, username: login,
-            });
+            let permission;
+            try {
+              ({ data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner, repo, username: login,
+              }));
+            } catch (error) {
+              if (![403, 404].includes(error.status)) throw error;
+              core.warning('Cannot determine contributor permissions (' + error.status + '); no moderation performed.');
+              return;
+            }
             if (permission.user?.permissions?.push || ['admin', 'write', 'maintain'].includes(permission.permission)) return;
 
             // The creator-filtered issues API includes PRs in every state, without
@@ -101,57 +106,42 @@ jobs:
                 }
                 if (data.length < 100) return items;
               }
-              throw new Error('Contributor history could not be completed within 20 pages; no moderation performed.');
+              core.warning('Contributor history could not be completed within 20 pages; no moderation performed.');
+              return null;
             };
             const history = await readHistory('all');
+            if (!history) return;
             // Include the triggering PR even if its listing has not caught up yet.
             history.set(pull.number, pull);
-            const preceding = [...history.values()].filter((item) => {
-              const time = Date.parse(item.created_at);
-              if (!Number.isFinite(time)) throw new Error('Invalid history timestamp; no moderation performed.');
-              return time > created - WINDOW_MS &&
-                (time < created || (time === created && item.number <= pull.number));
-            });
-            const exceedsSubmissions = () => preceding.length > SUBMISSION_LIMIT && Date.now() < created + WINDOW_MS;
             let openCount = [...history.values()].filter((item) => item.state === 'open').length;
-            if (!exceedsSubmissions() && openCount <= OPEN_LIMIT) return;
+            if (openCount <= OPEN_LIMIT) return;
             // A closed PR is not necessarily a contribution: require an actual merge.
             // Check history directly rather than trusting author_association or a
             // search result that may not yet include a recent merge.
-            for (const item of history.values()) {
-              if (item.state === 'closed') {
-                const previous = await getPull(item.number);
-                if (previous.merged_at) return;
-              }
-            }
+            if ([...history.values()].some((item) => item.pull_request?.merged_at)) return;
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: pull_number, per_page: 100,
             });
             // Refresh capacity before writing: another PR may have closed meanwhile.
             const openHistory = await readHistory('open');
+            if (!openHistory) return;
             const current = await getPull(pull_number);
             if (current.state !== 'open' || hasExemptLabel(current)) return;
             openHistory.set(current.number, current);
             openCount = [...openHistory.values()].filter((item) => item.state === 'open').length;
-            const submissionExceeded = exceedsSubmissions();
-            if (!submissionExceeded && openCount <= OPEN_LIMIT) return;
-            const reasons = [];
-            if (submissionExceeded) reasons.push('you submitted ' + preceding.length +
-              ' PRs in the 24-hour window ending with this submission (limit: ' + SUBMISSION_LIMIT + ')');
-            if (openCount > OPEN_LIMIT) reasons.push('you currently have ' + openCount +
-              ' open PRs, including this one (limit: ' + OPEN_LIMIT + ')');
+            if (openCount <= OPEN_LIMIT) return;
+            const reason = 'you currently have ' + openCount +
+              ' open PRs, including this one (limit: ' + OPEN_LIMIT + ')';
             const body = [
-              'Closing this PR because ' + reasons.join('; ') + '.',
-              'Contributors with no merged PRs in this repository may submit up to ' + SUBMISSION_LIMIT +
-                ' PRs per rolling 24 hours and keep up to ' + OPEN_LIMIT + ' PRs open, including drafts. ' +
-                'Closed PRs still count toward the submission limit.',
-              (submissionExceeded ? 'The submission cooldown ends at ' + new Date(created + WINDOW_MS).toISOString() + '. ' : '') +
-                'You may ask a maintainer to reopen this PR when fewer than ' + OPEN_LIMIT + ' of your other PRs are open' +
-                (submissionExceeded ? ' and the submission cooldown has ended' : '') + '. ' +
-                'Please consolidate related changes into coherent, validated PRs, or ask a maintainer for an exception.',
+              'Closing this PR because ' + reason + '.',
+              'Contributors with no merged PRs in this repository may keep up to ' + OPEN_LIMIT + ' PRs open, including drafts.',
+              'Please wait until your existing PRs are reviewed or merged before opening more. ' +
+                'Reviewed PRs still count while open. ' +
+                'You may ask a maintainer to reopen this PR when fewer than ' + OPEN_LIMIT + ' of your other PRs are open, ' +
+                'or ask a maintainer for an exception.',
               MARKER,
             ].join('\n\n');
-            core.info('PR #' + pull_number + ': ' + reasons.join('; '));
+            core.info('PR #' + pull_number + ': ' + reason);
             if (process.env.DRY_RUN === 'true') {
               core.info('Dry run: would comment and close.');
               return;
