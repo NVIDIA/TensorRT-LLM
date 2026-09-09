@@ -106,3 +106,36 @@ def test_nvfp4_conv3d_reference(
     )
 
     assert runtime_us is not None and math.isfinite(runtime_us) and runtime_us > 0
+
+
+def test_nvfp4_conv3d_residual_temporal_boundary_reference() -> None:
+    """Cover the A14B shape that exposed a residual epilogue boundary bug."""
+    _require_supported_gpu()
+
+    runtime_us = run(
+        ncdhw=(1, 192, 3, 360, 640),
+        ktrs=(192, 3, 3, 3),
+        stride_dhw=(1, 1, 1),
+        upper_pad_dhw=(0, 1, 1),
+        lower_pad_dhw=(0, 1, 1),
+        dil_dhw=(1, 1, 1),
+        ab_dtype=cutlass.Float4E2M1FN,
+        d_dtype=cutlass.BFloat16,
+        c_dtype=cutlass.BFloat16,
+        acc_dtype=cutlass.Float32,
+        sf_dtype=cutlass.Float8E4M3FN,
+        sf_vec_size=16,
+        cta_tile_k=256,
+        mma_tiler_mn=(256, 192),
+        preferred_cluster_shape_mn=(2, 1),
+        fallback_cluster_shape_mn=(2, 1),
+        use_2cta_instrs=True,
+        use_bias=True,
+        beta=1.0,
+        tolerance=1e-2,
+        warmup_iterations=1,
+        iterations=1,
+        skip_ref_check=False,
+    )
+
+    assert runtime_us is not None and math.isfinite(runtime_us) and runtime_us > 0
