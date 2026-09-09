@@ -542,15 +542,30 @@ void XqaDispatcher::runImpl(
         tllmRunnerParams.stream = params.stream;
         tllmRunnerParams.mSfStartTokenIdx = params.start_token_idx_sf;
         tllmRunnerParams.mIsSpecDecTree = isSpecDecTree;
-        tllmRunnerParams.mMaskType = tllmRunnerParams.mIsSpecDecTree
-            ? (usesSlidingWindow ? TrtllmGenAttentionMaskType::SlidingWindowCustom : TrtllmGenAttentionMaskType::Custom)
-            : (usesSlidingWindow || usesChunkedAttention ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
-                                                         : TrtllmGenAttentionMaskType::Causal);
-        if (!tllmRunnerParams.mIsSpecDecTree && usesChunkedAttention)
+        if (isSpecDecTree)
+        {
+            if (usesSlidingWindow)
+            {
+                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
+            }
+            else
+            {
+                tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Custom;
+            }
+        }
+        else if (usesChunkedAttention)
         {
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             tllmRunnerParams.mLeftSlidingWindow = -1;
             tllmRunnerParams.mRightSlidingWindow = -1;
+        }
+        else if (usesSlidingWindow)
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
+        }
+        else
+        {
+            tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
         tllmRunnerParams.mLayerIdx = params.layer_idx;
         tllmRunnerParams.seqLensQPtr = params.spec_decoding_generation_lengths;
