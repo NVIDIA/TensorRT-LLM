@@ -2128,7 +2128,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
-        from ..custom_ops.torch_custom_ops import MXFP8GemmRunner
+        from ..custom_ops.torch_custom_ops import (
+            IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE, MXFP8GemmRunner)
         from ..modules.linear import (MXFP8LinearMethod,
                                       flashinfer_mxfp8_autotune)
 
@@ -2159,8 +2160,13 @@ class PyTorchModelEngine(ModelEngine):
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
                         False) for module in self.model.modules()))
         if use_mxfp8_flashinfer_graph_default:
+            # CuTeDSL is the alternative backend; PP has no graph-pass handoff.
+            tune_with_cute_dsl = (IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+                                  and not self.mapping.has_pp())
             for quant_method in mxfp8_methods:
                 quant_method.enable_flashinfer_auto()
+                quant_method.tune_decode_graph_backends = (
+                    tune_with_cute_dsl and quant_method.uses_flashinfer)
         flashinfer_mxfp8_methods = [
             method for method in mxfp8_methods
             if method.needs_flashinfer_autotune
