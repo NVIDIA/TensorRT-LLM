@@ -2742,7 +2742,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
 
-        branch_caches: dict[str, tuple[Any, Any, torch.Tensor | None, bool | None]] = {}
+        branch_caches: dict[
+            str,
+            tuple[Any, Any, torch.Tensor | None, list[int] | None, bool | None],
+        ] = {}
 
         def run_branch(
             cache_key: str,
@@ -2756,8 +2759,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
                 self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
                 self.transformer.cached_text_lengths_uniform,
-            ) = branch_caches.get(cache_key, (None, None, None, None))
+            ) = branch_caches.get(cache_key, (None, None, None, None, None))
             result = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
@@ -2772,6 +2776,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
                 self.transformer.cached_real_text_lens,
+                self.transformer.cached_real_text_lens_host,
                 self.transformer.cached_text_lengths_uniform,
             )
             if result.video is None:

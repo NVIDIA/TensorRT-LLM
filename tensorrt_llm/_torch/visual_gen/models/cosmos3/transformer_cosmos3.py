@@ -710,7 +710,6 @@ class Cosmos3CrossAttention(Attention):
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
         return self.norm_q(q), self.norm_k(k)
 
-    @torch.compiler.disable
     def _forward_with_text_prefixes(
         self,
         q: torch.Tensor,
@@ -718,18 +717,15 @@ class Cosmos3CrossAttention(Attention):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
-        real_text_lens: torch.Tensor,
+        real_text_lens: list[int],
         timestep: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Run the unsharded batch with each sample's exact text prefix."""
-        if real_text_lens.device.type != "cpu":
-            raise ValueError("Cosmos3 text lengths must be cached on the CPU.")
-        if real_text_lens.ndim != 1 or real_text_lens.shape[0] != q.shape[0]:
+        if len(real_text_lens) != q.shape[0]:
             raise ValueError(
-                f"Expected {q.shape[0]} Cosmos3 text lengths, got "
-                f"shape {tuple(real_text_lens.shape)}."
+                f"Expected {q.shape[0]} Cosmos3 text lengths, got {len(real_text_lens)}."
             )
-        text_lens = [int(length) for length in real_text_lens.tolist()]
+        text_lens = [int(length) for length in real_text_lens]
         if any(not 0 <= length <= k_und.shape[1] for length in text_lens):
             raise ValueError(
                 f"Cosmos3 text lengths must be in [0, {k_und.shape[1]}], got {text_lens}."
@@ -785,7 +781,7 @@ class Cosmos3CrossAttention(Attention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         timestep=None,
-        real_text_lens: Optional[torch.Tensor] = None,
+        real_text_lens: Optional[torch.Tensor | list[int]] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """
@@ -988,7 +984,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
         timestep=None,
-        real_text_lens: Optional[torch.Tensor] = None,
+        real_text_lens: Optional[torch.Tensor | list[int]] = None,
         global_generated_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1299,6 +1295,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         self.cached_kv = None
         self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
         self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
@@ -1589,6 +1586,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def reset_cache(self):
         self.cached_kv = None
         self.cached_real_text_lens = None
+        self.cached_real_text_lens_host = None
         self.cached_text_lengths_uniform = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
@@ -1704,6 +1702,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         if self.cached_kv is None:
             self.cached_real_text_lens = text_mask.sum(dim=1).to(device="cpu", dtype=torch.int32)
             real_text_lens_host = [int(length) for length in self.cached_real_text_lens.tolist()]
+            self.cached_real_text_lens_host = real_text_lens_host
             self.cached_text_lengths_uniform = bool(real_text_lens_host) and all(
                 length == real_text_lens_host[0] for length in real_text_lens_host
             )
@@ -1734,12 +1733,21 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         if self.cached_real_text_lens is None:
             raise RuntimeError("Cosmos3 text lengths are missing from the K/V cache.")
+        if self.cached_real_text_lens_host is None:
+            raise RuntimeError("Cosmos3 host text lengths are missing from the K/V cache.")
         if self.cached_text_lengths_uniform is None:
             raise RuntimeError("Cosmos3 text-length uniformity is missing from the K/V cache.")
         real_text_lens = self.cached_real_text_lens
         # The text cache is already trimmed to this shared length, so both
         # unsharded and sequence-parallel paths can stay fully compiled.
-        layer_text_lens = None if self.cached_text_lengths_uniform else real_text_lens
+        if self.cached_text_lengths_uniform:
+            layer_text_lens = None
+        elif self.sharder.is_active:
+            layer_text_lens = real_text_lens
+        else:
+            # Keep the unsharded per-sample loop traceable under fullgraph=True,
+            # matching the pre-fix behavior without per-step device syncs.
+            layer_text_lens = self.cached_real_text_lens_host
 
         # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
