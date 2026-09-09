@@ -1,0 +1,33 @@
+diff --git a/ompi/request/req_wait.c b/ompi/request/req_wait.c
+--- a/ompi/request/req_wait.c
++++ b/ompi/request/req_wait.c
+@@ -94,3 +94,4 @@ int ompi_request_default_wait_any(size_t count,
+     WAIT_SYNC_INIT(&sync, 1);
+-
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
++
+     num_requests_null_inactive = 0;
+@@ -206,2 +207,3 @@ int ompi_request_default_wait_all(size_t count,
+     WAIT_SYNC_INIT(&sync, count);
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
+     rptr = requests;
+@@ -394,3 +396,4 @@ int ompi_request_default_wait_some(size_t count,
+     WAIT_SYNC_INIT(&sync, 1);
+-
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
++
+     *outcount = 0;
+diff --git a/ompi/request/request.h b/ompi/request/request.h
+--- a/ompi/request/request.h
++++ b/ompi/request/request.h
+@@ -425,3 +425,4 @@ static inline void ompi_request_wait_completion(ompi_request_t *req)
+             WAIT_SYNC_INIT(&sync, 1);
+-
++            opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
++
+             if (OPAL_ATOMIC_COMPARE_EXCHANGE_STRONG_PTR(&req->req_complete, &_tmp_ptr, &sync)) {
+@@ -474,3 +475,4 @@ static inline int ompi_request_complete(ompi_request_t* request, bool with_signal)
+                 ompi_wait_sync_t *tmp_sync = (ompi_wait_sync_t *) OPAL_ATOMIC_SWAP_PTR(&request->req_complete,
+                                                                                        REQUEST_COMPLETED);
++                opal_atomic_rmb();  /* acquire: pair with wmb before CAS to see sync struct contents */
+                 /* In the case where another thread concurrently changed the request to REQUEST_PENDING */
