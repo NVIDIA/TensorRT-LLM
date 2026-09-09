@@ -83,7 +83,8 @@ Config files are stored in `configs/` subdirectory and define runtime parameters
 ```yaml
 # Custom settings for my model
 max_batch_size: 2048
-kv_cache_free_gpu_memory_fraction: 0.95
+kv_cache_config:
+  free_gpu_memory_fraction: 0.95
 cuda_graph_config:
   enable_padding: true
 ```
