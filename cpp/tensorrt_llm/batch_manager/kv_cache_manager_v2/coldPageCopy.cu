@@ -111,7 +111,9 @@ void copyPageIndicesToDevice(CUdeviceptr dst, PageIndexPair const* src, size_t n
     attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL;
     attributes.srcLocHint.type = CU_MEM_LOCATION_TYPE_HOST;
     attributes.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
+    // Do not set CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE: it breaks the
+    // CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL semantics above (driver bug nvbugs 6718200).
+    attributes.flags = 0;
     size_t firstCopy = 0;
 #if CUDA_VERSION < 13000
     size_t failIdx = std::numeric_limits<size_t>::max();

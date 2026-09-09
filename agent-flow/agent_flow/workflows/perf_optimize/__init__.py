@@ -8,27 +8,27 @@ speed-of-light ceiling — ``sol_projection.md``, per the
 reporter turns into a headroom-captured story), then iterates
 optimization rounds — the
 analyzer profiles the current build and ranks candidate optimizations
-into ``roadmap.yaml`` by expected perf benefit; the optimizer applies the
-top pending item (serving config and/or TRT-LLM source on a dedicated
-git branch); the evaluator gates each attempt on code quality,
+into ``roadmap.yaml`` by expected perf benefit; isolated optimizer/evaluator
+pairs run the top pending items serially or concurrently; each evaluator gates attempts on code quality,
 functionality, and measured gain vs expectation with a three-way
 verdict (APPROVE / REJECT / PUSH_BACK), capturing an accept-evidence
-nsys profile on each accept. The loop runs the configured round budget
+nsys profile on each candidate-ready result. Parallel mode uses an Integrator;
+serial mode accepts each approved candidate directly. The loop runs the configured round budget
 (no agent decides when to stop; the orchestrator breaks early only when
 the roadmap is exhausted or the optional improvement target is met),
 stateless QA independently re-measures the final accepted state once —
 and finally a reporter synthesizes the expected-vs-measured story into
-``optimization_report.md`` / ``.html``. All seven roles run on the
+``optimization_report.md`` / ``.html``. All eight roles run on the
 Claude Code backend.
 
 Public surface:
 
 - :class:`PerfOptimizeWorkflow` — the orchestrator for the
-  benchmarker -> (projector) -> [analyzer -> (optimizer <-> evaluator)
-  x items] x rounds -> qa (final verification) -> reporter loop.
+  benchmarker -> (projector) -> [analyzer -> serial/parallel
+  (optimizer <-> evaluator) items -> optional integrator] x rounds -> qa -> reporter loop.
 - :class:`PromptBundle`, :data:`DEFAULT_PROMPTS`, and
   :func:`build_perf_optimize_prompts` — prompt bundle and helpers for
-  the workflow's seven agents.
+  the workflow's eight agents.
 - ``STAGE_*`` constants — stage identifiers used by the checkpoint schema
   (``<workspace>/.perf_optimize_state.json``).
 """
@@ -40,7 +40,9 @@ from .state import (
     STAGE_ANALYZER,
     STAGE_BENCHMARKER,
     STAGE_EVALUATOR,
+    STAGE_INTEGRATOR,
     STAGE_OPTIMIZER,
+    STAGE_OPTIMIZER_EVALUATOR,
     STAGE_PROJECTOR,
     STAGE_QA,
     STAGE_REPORTER,
@@ -53,7 +55,9 @@ __all__ = [
     "STAGE_ANALYZER",
     "STAGE_BENCHMARKER",
     "STAGE_EVALUATOR",
+    "STAGE_INTEGRATOR",
     "STAGE_OPTIMIZER",
+    "STAGE_OPTIMIZER_EVALUATOR",
     "STAGE_PROJECTOR",
     "STAGE_QA",
     "STAGE_REPORTER",

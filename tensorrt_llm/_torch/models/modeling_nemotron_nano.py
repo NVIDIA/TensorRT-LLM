@@ -52,8 +52,9 @@ from ...inputs import (
 )
 from ...logger import logger
 from ...sampling_params import SamplingParams
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
     EncoderGroup,
@@ -68,12 +69,17 @@ from .modeling_multimodal_utils import (
     get_multimodal_embeddings,
     has_raw_multimodal_payload,
 )
+from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_parakeet import ParakeetExtractor, ProjectedParakeet
 from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
+    from tensorrt_llm.llmapi.llm_args import (
+        MultimodalConfig,
+        MultimodalEncoderCudaGraphConfig,
+        TorchLlmArgs,
+    )
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
@@ -2831,7 +2837,7 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         self.sound_context_token_id = getattr(config, "sound_context_token_id", None)
         self.post_config()
         # Expose the in-vocab context tokens to the model engine so
-        # ``_prepare_multimodal_indices`` selects the torch.isin predicate
+        # ``runners.prepare_multimodal_indices`` selects the torch.isin predicate
         # instead of the OOV fallback. Without this, the executor produces
         # empty mm_token_indices (img/sound IDs are < vocab_size), and the
         # propagated indices then trip the count-equality check inside
@@ -2906,11 +2912,18 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             weights.mark_consumed("language_model")
 
     @property
-    def vocab_size_padded(self) -> int:
-        return self.llm.vocab_size_padded
+    def language_model(self) -> torch.nn.Module:
+        # `MultimodalModelMixin` routes `vocab_size_padded`,
+        # `infer_max_seq_len` and `set_guided_decoder` through this property,
+        # and its base implementation raises.
+        return self.llm
 
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        # `ModelLoader` reads this hook off the resolved outer model class
+        # (this VL wrapper), not the inner decoder, so delegate to keep block
+        # reuse opt-in until a Mamba state snapshot policy is configured.
+        return NemotronHForCausalLM.get_model_defaults(llm_args)
 
     def post_config(self):
         # use llm.config as config for pytorch model engine
@@ -3332,6 +3345,8 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         input_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -3408,6 +3423,11 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
 
             mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
+        # `fuse_input_embeds` returns input_ids=None whenever it produced fused
+        # embeddings, so the MTP drafter downstream would lose the prompt
+        # tokens. Keep the pre-fusion ids and hand them over as
+        # `orig_input_ids`, which SpecDecOneEngineForCausalLM falls back to.
+        raw_input_ids = input_ids
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
@@ -3424,9 +3444,16 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             lora_params=kwargs.get("lora_params", None),
+            spec_metadata=spec_metadata,
+            resource_manager=resource_manager,
+            orig_input_ids=raw_input_ids,
         )
 
-        logger.debug(f"output shape: {output_prob.shape}")
+        # One-model MTP returns the spec worker's dict (accepted tokens plus the
+        # next draft tokens) rather than logits. The engine already branches on
+        # that; only this log assumed a tensor.
+        if isinstance(output_prob, torch.Tensor):
+            logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
     @staticmethod

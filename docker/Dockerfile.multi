@@ -77,7 +77,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install -r /tmp/constraints.txt "nvidia-cutlass-dsl[cu13]==4.6.2" && \
+    pip3 install -r /tmp/constraints.txt "nvidia-cutlass-dsl[cu13]==4.7.0" && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd

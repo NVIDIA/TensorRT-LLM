@@ -889,11 +889,12 @@ def main(args: argparse.Namespace):
         )
 
     elif args.dataset_name == "trtllm_custom":
-        input_requests = CustomDataset(dataset_path=args.dataset_path,
-                                       random_seed=args.seed).sample(
-                                           num_requests=args.num_prompts,
-                                           tokenizer=tokenizer,
-                                       )
+        input_requests = CustomDataset(
+            dataset_path=args.dataset_path, random_seed=args.seed).sample(
+                num_requests=args.num_prompts,
+                tokenizer=tokenizer,
+                output_len=args.trtllm_custom_output_len,
+            )
 
     else:
 
@@ -1445,6 +1446,16 @@ if __name__ == "__main__":
         default=None,
         help="Output length for each request. Overrides the output lengths "
         "from the sampled HF dataset.",
+    )
+
+    trtllm_custom_group = parser.add_argument_group(
+        "trtllm_custom dataset options")
+    trtllm_custom_group.add_argument(
+        "--trtllm-custom-output-len",
+        type=int,
+        default=None,
+        help="Output length for each request. Overrides the per-sample "
+        "\"max_tokens\" from the trtllm_custom dataset.",
     )
 
     sampling_group = parser.add_argument_group("sampling parameters")

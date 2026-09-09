@@ -198,11 +198,6 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
 
   // The array to hold the 16 FP8 results.
   uint32_t dst[4];
-
-  // The public release uses the portable cvt-based path unconditionally; the fused
-  // single-instruction dequant fast path is internal / not exposed in public PTX.
-#if defined(TLLM_PUBLIC_RELEASE) ||                                                                \
-  !(__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
   // Convert SF from e4m3 to fp16x2 by packing the byte twice, then converting.
   uint16_t sfPacked = uint16_t(sf.storage) * 256u + uint16_t(sf.storage);
   uint32_t sfFp16x2;
@@ -235,8 +230,6 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
                  : "=r"(dst[ii * 2 + 0]), "=r"(dst[ii * 2 + 1])
                  : "r"(srcWords[ii]), "r"(sfFp16x2));
   }
-#else
-#endif
 
   return reinterpret_cast<cute::uint128_t&>(dst);
 }

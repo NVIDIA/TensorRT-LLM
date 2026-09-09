@@ -20,16 +20,6 @@
 namespace tensorrt_llm::executor
 {
 
-SpeculativeDecodingConfig::SpeculativeDecodingConfig(bool inFastLogits)
-    : fastLogits(inFastLogits)
-{
-}
-
-bool SpeculativeDecodingConfig::operator==(SpeculativeDecodingConfig const& other) const
-{
-    return fastLogits == other.fastLogits;
-}
-
 Tensor SpeculativeDecodingFastLogitsInfo::toTensor() const
 {
     size_t const numLogitsNeeded = (sizeof(*this) + 1) / sizeof(float);

@@ -6,7 +6,7 @@ import torch
 from transformers import LlamaConfig
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.debug.debug_hook import (DebuggerContext, Filter,
                                                   debug_mode,
                                                   get_current_debug_ctx)

@@ -73,8 +73,8 @@ namespace kernels
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
 {
-    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103))
-        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103)))
+    if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_107))
+        || (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_107)))
     {
         return true;
     }
@@ -83,13 +83,21 @@ constexpr bool isFamilySpecificSMPair(int sm1, int sm2)
 
 constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 {
-    if (gpuSM == kSM_103)
+    if (gpuSM == kSM_107)
+    {
+        return kernelSM == kSM_100f || kernelSM == kSM_107;
+    }
+    else if (gpuSM == kSM_103)
     {
         return kernelSM == kSM_100f || kernelSM == kSM_103;
     }
     else if (gpuSM == kSM_100)
     {
         return kernelSM == kSM_100f || kernelSM == kSM_100;
+    }
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
+    {
+        return kernelSM == kSM_100f;
     }
 
     return gpuSM == kernelSM;
@@ -196,7 +204,15 @@ public:
                 KernelInfo funcInfo;
                 funcInfo.mMetaInfoIndex = i;
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-                if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13040
+                if (kernelMeta.mSharedMemBytes + 1024 > 228 * 1024)
+                {
+                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+                }
+                else
+#endif
+                    if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
                     auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
                         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
@@ -240,7 +256,14 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
-        // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
+#ifdef TLLM_RUBIN_FEATURES
+        // Spcompress kernels must use precompiled cubins.
+        if (options.mUsesSpcompress)
+        {
+            return false;
+        }
+#endif // TLLM_RUBIN_FEATURES
+       // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
             return true;
@@ -264,6 +287,15 @@ public:
             return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
         }
 
+        // Keep this in sync with the BMM2-N constraints in MmaTraits. Reject unsupported dimensions before
+        // constructing KernelTraits so callers can fall back to another attention backend instead of aborting.
+        bool const isHeadDimVSupported = params.mHeadDimV == 32 || params.mHeadDimV == 64 || params.mHeadDimV == 80
+            || params.mHeadDimV == 128 || (params.mHeadDimV > 0 && params.mHeadDimV % 128 == 0);
+        if (!isHeadDimVSupported)
+        {
+            return std::make_pair(false, "HeadDimV must be 32, 64, 80, 128, or a multiple of 128");
+        }
+
         if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
             || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
         {
@@ -279,8 +311,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -377,8 +409,8 @@ private:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
@@ -478,6 +510,15 @@ public:
         {
             return;
         }
+
+        // Keep the additional fail-fast validation Rubin-only so other architectures retain their existing behavior.
+        // The output and scale-buffer shape are already validated by the Python caller; the inverse-RoPE cache has no
+        // equivalent guard before reaching this ABI boundary.
+        if (mSM == kSM_107 && params.mDsv4EpilogueFusion.enabled)
+        {
+            TLLM_CHECK_WITH_INFO(params.mDsv4EpilogueFusion.cosSinCache != nullptr,
+                "SM107 DSV4 FMHA epilogue fusion requires a non-null inverse-RoPE cos/sin cache.");
+        }
         runJITWarmupGridIfRequested(params);
 
         int32_t ctaDim = 512;
@@ -486,8 +527,8 @@ public:
         parseOptionsFromRunnerParams(params, options);
         options.mCudaArch = intToCudaArch(mSM);
 
-        FmhaAutoTuner autoTuner(options, optionsFromArgs, params.mMultiProcessorCount);
-        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        std::tie(options, optionsFromArgs, ctaDim)
+            = selectKernelWithCgaSmemReductionLimit(options, optionsFromArgs, params.mMultiProcessorCount);
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -535,14 +576,24 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
+        fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
 
         if (shouldUseNvrtc(options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
+            FmhaOptions nvrtcOptions = options;
+#ifdef TLLM_RUBIN_FEATURES
+            // On Rubin, compile non-spcompress NVRTC kernels with Sm100f target for compatibility.
+            if (tg::isArchRubin(options.mCudaArch) && !options.mUsesSpcompress)
+            {
+                nvrtcOptions.mCudaArch = tg::CudaArch::Sm100f;
+            }
+#endif // TLLM_RUBIN_FEATURES
+
             FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = options;
+            fmhaConfig.mOptions = nvrtcOptions;
             std::ostringstream sstream;
-            populateJsonConfig(options, sstream);
+            populateJsonConfig(nvrtcOptions, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
             fmhaConfig.mExecPath = getExecPath().c_str();
@@ -612,10 +663,47 @@ public:
     }
 
 private:
+    std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelWithCgaSmemReductionLimit(
+        FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
+    {
+        if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
+        {
+            constexpr int kMaxCgaClusterDimX = 16;
+            constexpr int kMinPreSelectCgaClusterDimX = 2;
+            // selectKernel may promote this candidate to CgaSmemReduction and call computeNumCtas
+            // before returning the selected options. Keep the candidate legal for both 1-CTA and
+            // 2-CTA FMHA kernels; the exact selected clusterDimX is applied below.
+            options.mMaxNumCtasPerSeqKv = std::min(options.mMaxNumCtasPerSeqKv,
+                kMaxCgaClusterDimX / std::max(options.mClusterDimX, kMinPreSelectCgaClusterDimX));
+        }
+
+        int32_t ctaDim = 512;
+        FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
+        std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        limitCgaSmemReductionCtasKv(options);
+        return {options, optionsFromArgs, ctaDim};
+    }
+
+    void limitCgaSmemReductionCtasKv(FmhaOptions& options) const
+    {
+        if (!isCgaSmemReduction(options.mMultiCtasKvMode))
+        {
+            return;
+        }
+        constexpr int kMaxCgaClusterDimX = 16;
+        if (options.mClusterDimX * options.mMaxNumCtasPerSeqKv > kMaxCgaClusterDimX)
+        {
+            TLLM_LOG_WARNING(
+                "CGA reduction is not supported when numCtasPerSeqKv * clusterDimX > 16. Set mMaxNumCtasPerSeqKv to "
+                "16 / clusterDimX");
+            options.mMaxNumCtasPerSeqKv = kMaxCgaClusterDimX / options.mClusterDimX;
+        }
+    }
+
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
         bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool groupsHeadsQ,
-        bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv) const
+        bool groupsTokensHeadsQ, int numInstsQ, int numInstsKv, bool fp16Softmax, bool usesSpcompress) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -653,6 +741,8 @@ private:
         // Bit 59 - 59: groupsTokensHeadsQ.
         // Bit 60 - 60: (numInstsQ == 2). Distinguishes Q128Kv256 vs Q256Kv128 cubins that share tile sizes.
         // Bit 61 - 61: (numInstsKv == 2).
+        // Bit 62 - 62: fp16Softmax. Distinguishes fp16-softmax Sm107a cubins from their bf16-softmax siblings.
+        // Bit 63 - 63: usesSpcompress. Distinguishes 2:4 activation-sparsity Sm107a cubins from dense siblings.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -663,7 +753,8 @@ private:
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
             | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(groupsHeadsQ) << 58)
             | (static_cast<uint64_t>(groupsTokensHeadsQ) << 59) | (static_cast<uint64_t>(numInstsQ == 2) << 60)
-            | (static_cast<uint64_t>(numInstsKv == 2) << 61);
+            | (static_cast<uint64_t>(numInstsKv == 2) << 61) | (static_cast<uint64_t>(fp16Softmax) << 62)
+            | (static_cast<uint64_t>(usesSpcompress) << 63);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -678,7 +769,7 @@ private:
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
             kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mGroupsHeadsQ,
-            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv);
+            kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -714,6 +805,18 @@ private:
                                                  : "plain");
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
+
+        // The fp16-softmax and 2:4 activation-sparsity variants are Rubin-only kernel selectors; the
+        // FmhaOptions fields carrying them exist only under TLLM_RUBIN_FEATURES. They must be hashed
+        // consistently with hashID(KernelMeta) so the Sm107a plain/fp16/spcompress siblings dispatch to
+        // distinct cubins (and register without hashId collisions).
+#ifdef TLLM_RUBIN_FEATURES
+        bool const fp16Softmax = options.mEnablesFp16Softmax;
+        bool const usesSpcompress = options.mUsesSpcompress;
+#else
+        bool const fp16Softmax = false;
+        bool const usesSpcompress = false;
+#endif
         return std::make_pair(
             hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
                 static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
@@ -722,7 +825,7 @@ private:
                 static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                 static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
                 static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
-                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv),
+                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax, usesSpcompress),
             info);
     }
 
@@ -1283,7 +1386,8 @@ private:
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
                 selectKernelParams.mSkipsSoftmaxWhenPossible, /* groupsHeadsQ */ false,
-                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1),
+                /* groupsTokensHeadsQ */ false, /* numInstsQ */ 1, /* numInstsKv */ 1, selectKernelParams.mFp16Softmax,
+                selectKernelParams.mUsesSpcompress),
             info);
     }
 
@@ -1294,6 +1398,9 @@ private:
         case 90: return tg::CudaArch::Sm90a;
         case 100: return tg::CudaArch::Sm100a;
         case 103: return tg::CudaArch::Sm103a;
+#ifdef TLLM_RUBIN_FEATURES
+        case 107: return tg::CudaArch::Sm107a;
+#endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return tg::CudaArch::Sm100a;
         }
     }
@@ -1306,6 +1413,9 @@ private:
         case tg::CudaArch::Sm100a: return 100;
         case tg::CudaArch::Sm100f: return 100;
         case tg::CudaArch::Sm103a: return 103;
+#ifdef TLLM_RUBIN_FEATURES
+        case tg::CudaArch::Sm107a: return 107;
+#endif // TLLM_RUBIN_FEATURES
         default: assert(false && "Unsupported CUDA architecture"); return 100;
         }
     }

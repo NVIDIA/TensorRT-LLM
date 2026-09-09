@@ -71,11 +71,18 @@ import socket
 import sys
 import time
 
-CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-if CUR_DIR not in sys.path:
+__extra_import_path__ = ["."]
+try:
+    import precheck_config as pcfg
+except ModuleNotFoundError as exc:
+    if exc.name != "precheck_config":
+        raise
+    # Run as a standalone script (`python run_precheck.py`), add path ourselves.
+    # Not doing it unconditionally, to avoid polluting sys.path of the pytest
+    # process, which may interfere with other tests.
+    CUR_DIR = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, CUR_DIR)
-
-import precheck_config as pcfg  # noqa: E402
+    import precheck_config as pcfg
 
 # Request-id scheme: rids must be unique across the whole precheck AND
 # dense within a (ctx, gen) session -- the C++ transceiver derives its
@@ -228,14 +235,14 @@ def load_internal_apis():
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm import DisaggregatedParams
-    from tensorrt_llm._torch.distributed import Distributed
-    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+    from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
         create_kv_cache_transceiver,
         maybe_enable_fabric_memory_for_python_transceiver,
     )
+    from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.llm_request import (
         LlmRequest,
         LlmRequestState,

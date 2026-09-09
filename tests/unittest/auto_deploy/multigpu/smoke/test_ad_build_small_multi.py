@@ -15,6 +15,8 @@
 """Testing build_and_run_ad end2end."""
 
 import pytest
+
+__extra_import_path__ = ["~/examples/auto_deploy"]
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 

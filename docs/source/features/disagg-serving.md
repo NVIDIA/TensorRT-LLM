@@ -337,6 +337,8 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
 
+* `TRTLLM_GPU_KEEPALIVE`: If set to `1`, a generation worker that is waiting at the benchmark fill gate (`TLLM_BENCHMARK_REQ_QUEUES_SIZE`) keeps a resident warp on every SM in ~100 ms chunks instead of idling through the wait, so GPU-activity metrics do not read idle while the context tier fills it. The work is drained when the gate opens and never overlaps a forward pass. The default value is `0`.
+
 There are some other useful environment variables that may help when encountering failures or performance issues.
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: TensorRT-LLM now initializes common NCCL communicators with graph

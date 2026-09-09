@@ -26,22 +26,22 @@ import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
     DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import \
     forward_context_sparse_attn as forward_context_deepseek_v4_mla
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import \
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import \
     forward_generation_sparse_attn as forward_generation_deepseek_v4_mla
-from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
-                                                              DSACacheManager)
-from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
+from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+    HAS_FAST_HADAMARD, DSACacheManager)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.module import \
     _forward_dsa_attn
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
@@ -60,6 +60,8 @@ from .deepseek_v4.test_compressor_module import \
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 try:
+    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
+
     HAS_FLASH_MLA = True
 except ImportError:
     HAS_FLASH_MLA = False
@@ -178,6 +180,68 @@ UNIFIED_TEST_PARAMS.append(
         DSV4_KV_CACHE_DTYPES[0],
         "deepseek_v4",
         id=f"deepseek_v4-{DSV4_KV_CACHE_DTYPES[0]}-large_mixed_deepseek_v4"))
+
+# FlashMLA sparse MLA kernel contract.
+
+
+@pytest.mark.skipif(not HAS_FLASH_MLA, reason="FlashMLA not available")
+@pytest.mark.skipif(get_sm_version() < 90,
+                    reason="FlashMLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize(
+    "seq_len_q,seq_len_kv,topk",
+    [
+        (62, 128, 128),
+        (128, 256, 128),
+        (128, 512, 256),
+    ],
+)
+def test_flash_mla_sparse_fwd(seq_len_q, seq_len_kv, topk):
+    """Validate the direct FlashMLA sparse-forward output contract."""
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    batch_size = 1
+    num_heads_q = 128
+    num_heads_kv = 1
+    head_dim_qk = 576
+    head_dim_v = 512
+
+    q = (torch.randn(batch_size,
+                     seq_len_q,
+                     num_heads_q,
+                     head_dim_qk,
+                     dtype=torch.bfloat16,
+                     device="cuda") / 10.0)
+    q.clamp_(-10, 10)
+    kv = (torch.randn(batch_size,
+                      seq_len_kv,
+                      num_heads_kv,
+                      head_dim_qk,
+                      dtype=torch.bfloat16,
+                      device="cuda") / 10.0)
+    kv.clamp_(-10, 10)
+    indices = torch.randint(0,
+                            seq_len_kv,
+                            (batch_size, seq_len_q, num_heads_kv, topk),
+                            dtype=torch.int32,
+                            device="cuda")
+
+    output, max_logits, lse = flash_mla_sparse_fwd(
+        q.squeeze(0),
+        kv.squeeze(0),
+        indices.squeeze(0),
+        sm_scale=1.0 / math.sqrt(head_dim_qk),
+    )
+
+    assert output.shape == (seq_len_q, num_heads_q, head_dim_v)
+    assert output.dtype == torch.bfloat16
+    assert max_logits.shape == (seq_len_q, num_heads_q)
+    assert max_logits.dtype == torch.float32
+    assert lse.shape == (seq_len_q, num_heads_q)
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(max_logits).all()
+    assert torch.isfinite(lse).all()
 
 
 def apply_rotary_emb(x: torch.Tensor,
@@ -2349,7 +2413,7 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     """
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import \
         module as deepseek_v4_module
 
     original_fwd = deepseek_v4_module.forward_context_sparse_attn

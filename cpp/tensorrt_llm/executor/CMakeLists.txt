@@ -25,9 +25,7 @@ set(SRCS
     cache_transmission/cacheSplitConcat.cu
     cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
-    debugConfig.cpp
     decodingConfig.cpp
-    executorConfig.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
@@ -35,11 +33,8 @@ set(SRCS
     jsonSerialization.cpp
     kvCacheConfig.cpp
     kvCacheRetentionConfig.cpp
-    logitsPostProcessorConfig.cpp
     loraConfig.cpp
-    orchestratorConfig.cpp
     outputConfig.cpp
-    parallelConfig.cpp
     peftCacheConfig.cpp
     promptTuningConfig.cpp
     mropeConfig.cpp

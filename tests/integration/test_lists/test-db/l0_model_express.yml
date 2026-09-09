@@ -22,6 +22,7 @@ l0_model_express:
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen2-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[qwen3-bf16-tp1]
   - model_express/test_model_express.py::test_mx_donor_receiver[mistral-bf16-tp1]
+  - unittest/_torch/weight_sharing/test_mx_source_identity_gate.py
 - condition:
     ranges:
       system_gpu_count:

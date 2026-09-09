@@ -188,7 +188,7 @@ def test_fresh_run_executes_stages_in_order(tmp_path):
     assert "serve" not in resolved
     assert resolved["sol"] == {"enabled": True}
     assert resolved["benchmark"]["random_input_len"] == 1024
-    assert resolved["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert resolved["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_fresh_run_with_sol_hint_runs_projector(tmp_path):
@@ -729,6 +729,30 @@ def test_analyzer_prompt_mentions_projection_only_when_enabled(tmp_path):
         assert marker in with_sol, marker
 
 
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    try:
+        _write_ws_task(ws, sol=False)
+        without = _capture_prompt(workflow, "analyzer", "_run_analyzer")
+        _write_ws_task(ws, sol=True)
+        with_sol = _capture_prompt(workflow, "analyzer", "_run_analyzer")
+    finally:
+        workflow.close()
+
+    # Not SOL-gated: every analyzer turn decomposes the timeline it just
+    # captured, and the driving prompt names the workspace path so the
+    # products land next to the other traces.
+    for prompt in (without, with_sol):
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{ws}/nsys_analysis" in prompt
+        assert "nsys_analysis/" in prompt
+        # The section is reported from the pipeline, not the stats table.
+        assert "not from the `nsys stats` table alone" in prompt
+
+
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -749,7 +773,7 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
         assert "server_ncu.ncu-rep" in prompt
         assert "ncu kernel analysis" in prompt
-        assert "default all three" in prompt
+        assert "default both" in prompt
 
 
 def test_reporter_prompt_mentions_projection_only_when_enabled(tmp_path):

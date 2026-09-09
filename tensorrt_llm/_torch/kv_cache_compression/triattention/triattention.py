@@ -29,6 +29,7 @@ import torch
 import triton
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     copy_batch_block_offsets_to_device,
@@ -37,7 +38,6 @@ from tensorrt_llm.logger import logger
 
 from ...distributed import allgather
 from ...modules.top_k import TopK, TopKImplementation
-from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from ...pyexecutor.llm_request import LlmRequestState
 from ...pyexecutor.resource_manager import KVCacheCompressionManager
 from ...utils import next_positive_power_of_2

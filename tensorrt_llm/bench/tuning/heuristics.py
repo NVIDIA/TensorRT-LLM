@@ -74,7 +74,7 @@ def calc_engine_setting(
     if model_config.is_mla():
         # MLA stores a single compressed KV entry per token:
         # head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1.
-        # Mirrors tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and
+        # Mirrors tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py and
         # resource_manager.py, so the bench heuristic agrees with the runtime.
         mla_head_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
         gb_per_token = (

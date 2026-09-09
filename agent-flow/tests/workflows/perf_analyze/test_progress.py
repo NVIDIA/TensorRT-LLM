@@ -73,7 +73,7 @@ def test_tool_handlers_route_entries_with_correct_shape(tmp_path):
     ctx.current_step = 2
     _call(tools["projector"][0].handler, {"summary": "SOL projection + gap"})
     ctx.current_step = 3
-    _call(tools["analyzer"][0].handler, {"summary": "nsys + torch traces"})
+    _call(tools["analyzer"][0].handler, {"summary": "nsys + ncu traces"})
     ctx.current_step = 4
     _call(tools["reporter"][0].handler, {"summary": "memory-bound verdict"})
 

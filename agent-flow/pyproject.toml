@@ -31,6 +31,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["agent_flow*"]
 
+# Prompt assets read at runtime (the analyzer copies the TRT-LLM kernel
+# taxonomy into its workspace), so they must survive a non-editable install.
+[tool.setuptools.package-data]
+"agent_flow.workflows.perf_analyze" = ["assets/*.json"]
+
 ####################################################################################################
 ###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################
 ####################################################################################################

@@ -480,7 +480,12 @@ class KVCacheManager:
     def _match_reuse(
         self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
     ) -> ReuseMatch:
-        return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
+        return self._radix_tree.match(
+            reuse_scope,
+            input_tokens,
+            self.enable_partial_match,
+            self.init_config.reuse_match_backoff,
+        )
 
     def probe_reuse(
         self,

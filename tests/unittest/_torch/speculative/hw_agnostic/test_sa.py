@@ -1,17 +1,13 @@
-import os
-import sys
 import unittest
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
 
 
 def get_perf_metrics(result):
@@ -267,6 +263,7 @@ class _FakeSARequest:
         assert beam == 0
         return list(self._tokens)
 
+    @property
     def is_generation_only_request(self) -> bool:
         return self._generation_only
 
@@ -449,7 +446,9 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3
 
     def _make_manager(self, use_kda_replay=True):
-        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import PythonMambaCacheManager
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            PythonMambaCacheManager,
+        )
 
         L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M, self.NHEADS)
         committed = W - 1

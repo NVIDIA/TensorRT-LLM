@@ -22,7 +22,16 @@ from typing import Any, Mapping, Optional, Protocol
 # ``request.conversation_params`` only when the body omits it. Routers then read
 # ``conversation_params.conversation_id`` to keep later turns of the same
 # conversation on the same backend when sticky conversation routing is enabled.
+#
+# The Claude Code headers are listed first because a client that sends one also
+# sends nothing else on this list; ordering them ahead of the generic names
+# keeps the common case a single lookup. They mirror the set the Anthropic
+# adapter already reads for audit records, so the Messages API gets the same
+# conversation identity the audit log records rather than a second notion of a
+# session.
 CONVERSATION_ID_HEADERS = (
+    "x-claude-code-session-id",
+    "x-claude-session-id",
     "x-session-id",
     "x-correlation-id",
     "x-session-affinity",

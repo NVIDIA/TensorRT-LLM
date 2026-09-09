@@ -20,15 +20,16 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm._torch.distributed import Distributed
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
+    MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig

@@ -220,7 +220,10 @@ def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path
     try:
         with torch.no_grad():
             result = pipeline.forward(
-                image=str(input_path),
+                # forward() takes an encoded reference, not a path: the serve path
+                # resolves MediaRef to bytes on the coordinator, so direct callers
+                # read the file themselves.
+                image=input_path.read_bytes(),
                 prompt=QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
                 negative_prompt=QWEN_IMAGE_LAYERED_LPIPS_NEGATIVE_PROMPT,
                 num_inference_steps=QWEN_IMAGE_LAYERED_LPIPS_NUM_INFERENCE_STEPS,

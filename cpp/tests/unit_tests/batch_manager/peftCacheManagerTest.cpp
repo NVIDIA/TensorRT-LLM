@@ -28,7 +28,6 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/loraModule.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
@@ -123,7 +122,7 @@ protected:
 
 TEST_F(PeftCacheManagerTest, addRequestPeftMissingTask)
 {
-    SamplingConfig sampleConfig;
+    tensorrt_llm::executor::SamplingConfig sampleConfig;
     // inSamplingConfig.temperature = std::vector{2.0f};
     uint64_t requestId = 0;
     auto maxNewTokens = 4;
@@ -145,7 +144,7 @@ TEST_F(PeftCacheManagerTest, addRequestPeftMissingTask)
 
 TEST_F(PeftCacheManagerTest, unsupportedAdapterDataTypeDoesNotConfigureCache)
 {
-    SamplingConfig samplingConfig;
+    tensorrt_llm::executor::SamplingConfig samplingConfig;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     TensorPtr int8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kINT8);
     auto int8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
@@ -168,7 +167,7 @@ TEST_F(PeftCacheManagerTest, unsupportedAdapterDataTypeDoesNotConfigureCache)
 #if defined(ENABLE_FP8)
 TEST_F(PeftCacheManagerTest, invalidAdapterDoesNotConfigureCacheDataType)
 {
-    SamplingConfig samplingConfig;
+    tensorrt_llm::executor::SamplingConfig samplingConfig;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
     auto invalidRequest = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
@@ -189,7 +188,7 @@ TEST_F(PeftCacheManagerTest, invalidAdapterDoesNotConfigureCacheDataType)
 
 TEST_F(PeftCacheManagerTest, adapterSelectsHomogeneousCacheDataType)
 {
-    SamplingConfig samplingConfig;
+    tensorrt_llm::executor::SamplingConfig samplingConfig;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
     auto fp8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
@@ -270,7 +269,7 @@ TEST_F(PeftCacheManagerTest, adapterDataTypeRecalculatesDeviceByteBudgetPageCapa
 
 TEST_F(PeftCacheManagerTest, putGet)
 {
-    SamplingConfig sampleConfig;
+    tensorrt_llm::executor::SamplingConfig sampleConfig;
     // inSamplingConfig.temperature = std::vector{2.0f};
     uint64_t requestId = 0;
     auto maxNewTokens = 4;
@@ -318,7 +317,7 @@ TEST_F(PeftCacheManagerTest, putGet)
 
 TEST_F(PeftCacheManagerTest, putToCapacity)
 {
-    SamplingConfig sampleConfig;
+    tensorrt_llm::executor::SamplingConfig sampleConfig;
     uint64_t requestId = 0;
     auto maxNewTokens = 4;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
@@ -399,7 +398,7 @@ TEST_F(PeftCacheManagerTest, putToCapacity)
 
 TEST_F(PeftCacheManagerTest, gptManagerSim)
 {
-    SamplingConfig sampleConfig;
+    tensorrt_llm::executor::SamplingConfig sampleConfig;
     auto maxNewTokens = 4;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
 
@@ -557,7 +556,7 @@ TEST_F(PeftCacheManagerTest, updateTaskState)
     EXPECT_TRUE(mPeftManager->getActiveTasks().at(0).count(1));
     ASSERT_TRUE(mPeftManager->getPausedTasks().empty());
 
-    SamplingConfig sampleConfig;
+    tensorrt_llm::executor::SamplingConfig sampleConfig;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     auto llmRequest = std::make_shared<LlmRequest>(12345, 4, tokens, sampleConfig, false);
     auto llmRequest2 = std::make_shared<LlmRequest>(54321, 4, tokens, sampleConfig, false);

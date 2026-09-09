@@ -204,6 +204,12 @@ When offloading is enabled, the client can prevent specific blocks from being of
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
+KV cache compression can reduce the storage and transfer cost of offloaded
+Pages, or reduce the amount of KV retained by an algorithm. Compression is
+configured separately from `KvCacheConfig`; see
+[KV Cache Compression](kv-cache-compression.md) for the available methods and
+their activation points.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.

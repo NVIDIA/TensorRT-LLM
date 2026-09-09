@@ -35,10 +35,10 @@ match on the packed FP4 bytes, mirroring ``test_fused_activation_quant.py``.
 
 import pytest
 import torch
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.utils import ceil_div, pad_up, unswizzle_sf
-from tests.unittest.utils.util import getSMVersion
 
 
 def fused_add_rmsnorm_fp4_quantize_available():

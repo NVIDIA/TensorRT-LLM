@@ -195,7 +195,11 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    elif moe_cls == DeepGemmFusedMoE:
+    # ``DeepGemmFusedMoE`` is an alias onto the registered implementation, so
+    # this matches that one class today. ``issubclass`` rather than ``==`` so
+    # that splitting an abstract parent back out, once a second quantization
+    # format needs one, does not require a new branch here.
+    elif issubclass(moe_cls, DeepGemmFusedMoE):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -241,7 +245,9 @@ def create_moe_backend(
             init_load_balancer=init_load_balancer,
             activation=activation,
         )
-    elif moe_cls in (MegaMoEDeepGemm, MegaMoECuteDsl):
+    # ``issubclass`` for the same reason as the DeepGEMM branch above;
+    # ``MegaMoEDeepGemm`` is likewise an alias onto the registered class.
+    elif issubclass(moe_cls, (MegaMoEDeepGemm, MegaMoECuteDsl)):
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,

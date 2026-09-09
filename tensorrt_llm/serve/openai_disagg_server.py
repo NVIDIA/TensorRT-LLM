@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import json
 import signal
 import socket
 import traceback
@@ -26,6 +27,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
@@ -34,6 +36,14 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
+from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
+                                                  AnthropicResponseError,
+                                                  anthropic_error_response,
+                                                  convert_anthropic_request,
+                                                  convert_chat_response,
+                                                  reframe_openai_stream)
+from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
+                                                   AnthropicMessagesRequest)
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -44,8 +54,9 @@ from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
-    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
-    UCompletionResponse, ensure_request_chat_template_allowed)
+    ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -136,6 +147,33 @@ class RawRequestResponseHooks(ResponseHooks):
                 self.gen_metrics,
                 disagg_request_id=self.disagg_request_id,
             ))
+
+
+def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
+    """Recover the worker's own error text without leaking the worker.
+
+    str(ClientResponseError) embeds the full upstream URL, so returning it
+    verbatim tells every client the internal host and port of a context worker.
+    The worker is itself an Anthropic-shaped server, so its body is usually an
+    error envelope; lifting the inner message out also avoids handing the
+    client an envelope nested inside an envelope, which no SDK will unwrap.
+    """
+    raw = error.message or ""
+    start = raw.find("{")
+    if start != -1:
+        try:
+            payload = json.loads(raw[start:])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            inner = payload.get("error")
+            if isinstance(inner, dict) and inner.get("message"):
+                return str(inner["message"])
+            if payload.get("message"):
+                return str(payload["message"])
+    # Not a body this server recognises. Report the status only: anything else
+    # in `raw` may still carry the upstream URL.
+    return f"context worker rejected the request with status {error.status}"
 
 
 class OpenAIDisaggServer:
@@ -231,6 +269,11 @@ class OpenAIDisaggServer:
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
+            # Anthropic clients parse the error envelope, so every /v1/messages
+            # route must fail in that shape rather than the generic one below.
+            if request.url.path.startswith("/v1/messages"):
+                return anthropic_error_response(str(exc),
+                                                "invalid_request_error", 400)
             self._val_err_n += 1
             if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
                 try:
@@ -265,6 +308,8 @@ class OpenAIDisaggServer:
         # so /health and /cluster_info hook straight to self._coordinator.
         self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
+        self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -349,6 +394,72 @@ class OpenAIDisaggServer:
                 self._handle_exception(e)
         return wrapper
 
+    async def anthropic_messages(self, request: AnthropicMessagesRequest,
+                                 raw_request: Request) -> Response:
+        """Serve Anthropic Messages through the disaggregated chat pipeline."""
+        try:
+            chat_request = convert_anthropic_request(request)
+        except (AnthropicRequestError, ValidationError) as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+
+        try:
+            openai_response = await self._wrap_entry_point(
+                self._service.openai_chat_completion)(chat_request, raw_request)
+        except HTTPException as e:
+            error_type = ("invalid_request_error"
+                          if 400 <= e.status_code < 500 else "api_error")
+            return anthropic_error_response(str(e.detail), error_type,
+                                            e.status_code)
+
+        if isinstance(openai_response, StreamingResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(openai_response.body_iterator,
+                                              model=request.model),
+                media_type="text/event-stream",
+            )
+
+        status = getattr(openai_response, "status_code", 500)
+        if status != 200:
+            try:
+                payload = json.loads(openai_response.body)
+                message = (payload.get("message") or payload.get("detail")
+                           or payload.get("error") or json.dumps(payload))
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                message = "Internal server error"
+            error_type = ("invalid_request_error"
+                          if 400 <= status < 500 else "api_error")
+            return anthropic_error_response(str(message), error_type, status)
+
+        try:
+            chat_response = ChatCompletionResponse(
+                **json.loads(openai_response.body))
+            anthropic_response = convert_chat_response(chat_response)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error(
+                "Invalid response from OpenAI chat pipeline:\n"
+                f"{traceback.format_exc()}")
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        return JSONResponse(content=anthropic_response.model_dump(
+            exclude_none=True))
+
+    async def anthropic_count_tokens(
+            self, request: AnthropicCountTokensRequest) -> Response:
+        """Count Anthropic input tokens on a context worker."""
+        try:
+            response = await self._service.anthropic_count_tokens(request)
+        except aiohttp.ClientResponseError as error:
+            error_type = ("invalid_request_error"
+                          if 400 <= error.status < 500 else "api_error")
+            return anthropic_error_response(_upstream_error_message(error),
+                                            error_type, error.status or 500)
+        except (RuntimeError, ValueError) as error:
+            # Raised when the cluster is not ready or has no context worker;
+            # 503 tells the caller to retry rather than to fix the request.
+            return anthropic_error_response(str(error), "api_error", 503)
+        return JSONResponse(content=response.model_dump())
+
     def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
@@ -360,6 +471,21 @@ class OpenAIDisaggServer:
                     exit_code_known=False,
                 ))
             signal.raise_signal(signal.SIGINT)
+        elif isinstance(exception, aiohttp.ClientResponseError):
+            self._perf_metrics_collector.http_exceptions.inc()
+            status = exception.status or 502
+            logger.error(
+                f"Upstream HTTP error {status} {exception.message}: ",
+                traceback.format_exc())
+            # exception.message is the worker's raw response body (up to 2048
+            # chars, built in openai_client.post_json/_send_request). Forwarding
+            # it verbatim publishes the worker's URL and internals to every
+            # caller, so it goes through the same unwrapping the Anthropic
+            # route uses. This branch is shared with /v1/completions and
+            # /v1/chat/completions, so those get the same treatment.
+            raise HTTPException(
+                status_code=status,
+                detail=_upstream_error_message(exception)) from exception
         elif isinstance(exception, HTTPException):
             self._perf_metrics_collector.http_exceptions.inc()
             logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())

@@ -29,8 +29,8 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 

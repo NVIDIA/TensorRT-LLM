@@ -139,3 +139,13 @@ TRTLLM_USE_PRECOMPILED=1 pip install -e .
 ```
 
 This downloads a precompiled wheel matching the version in `tensorrt_llm/version.py` and extracts its compiled libraries into your working directory. Override the version with `TRTLLM_USE_PRECOMPILED=x.y.z` or specify a custom URL/path with `TRTLLM_PRECOMPILED_LOCATION`.
+
+#### Sharing one build tree between checkouts
+
+`TRTLLM_PRECOMPILED_LOCATION` also accepts a local directory in git-clone layout, which lets a second checkout reuse a build you already have instead of downloading a wheel. By default the compiled artifacts are copied into the checkout, so each one holds its own multi-gigabyte copy. Add `TRTLLM_PRECOMPILED_LINK=1` to symlink them instead:
+
+```bash
+TRTLLM_PRECOMPILED_LINK=1 TRTLLM_PRECOMPILED_LOCATION=/path/to/built/checkout pip install -e .
+```
+
+Use this when several checkouts (for example git worktrees carrying Python-only changes) share a single built tree: nothing is duplicated, and rebuilding the shared tree updates every checkout at once. An existing `3rdparty/fmha_sm100` symlink is left in place rather than replaced, so a checkout that already shares a build tree keeps its links. The flag only applies to a local directory; it is an error to combine it with a wheel or a URL. All checkouts must stay on a commit whose C++ sources match the shared build, since the reused artifacts are not rebuilt. When the source is a local directory, the install prints a warning if the two checkouts are on different commits and any of `cpp/`, `3rdparty/`, `setup.py`, `scripts/build_wheel.py` or `requirements.txt` differ between them, naming the two commits and the first few differing files. It is only a warning, and it applies to both copy and link mode: the artifacts are equally stale either way. Like the rest of this path's output it comes from `setup.py`, which pip shows only with `pip install -v`. If an import fails afterwards with a message about rebuilding, that skew is the first thing to check.

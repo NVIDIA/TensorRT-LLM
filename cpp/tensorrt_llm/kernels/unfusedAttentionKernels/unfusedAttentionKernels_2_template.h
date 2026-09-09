@@ -189,6 +189,39 @@ inline __device__ type_out* reinterpret_ptr(void* ptr, size_t offset)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename T, typename TCache, typename TVec, bool GEN_PHASE, typename KVCacheBuffer>
+inline __device__ void zeroPagedVCacheTail(QKVPreprocessingParams<T, KVCacheBuffer> const& params, int batchIdx,
+    int tokenIdxInKvCache, int cacheSeqLen, int kvHeadIdx, int vecsPerHead, int channelIdx, bool isUniqueTokenWriter)
+{
+    // Context owns the last physical page exclusively. Clear unused V rows because paged FMHA loads full pages and
+    // masked zero probabilities can still propagate NaNs through BMM2.
+    if constexpr (!GEN_PHASE && std::is_same_v<KVCacheBuffer, KVBlockArray> && std::is_same_v<T, TCache>)
+    {
+        if (params.generation_phase || !isUniqueTokenWriter || cacheSeqLen <= 0 || tokenIdxInKvCache != cacheSeqLen - 1)
+        {
+            return;
+        }
+
+        int const tokensPerBlock = params.kv_cache_buffer.mTokensPerBlock;
+        int const validTokensInLastBlock = params.kv_cache_buffer.getLocalIdx(cacheSeqLen - 1) + 1;
+        if (validTokensInLastBlock >= tokensPerBlock)
+        {
+            return;
+        }
+
+        auto* vBlock = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batchIdx, cacheSeqLen - 1));
+        auto* vBlockVec = reinterpret_cast<TVec*>(vBlock);
+        TVec const zero{};
+        for (int tokenInBlock = validTokensInLastBlock; tokenInBlock < tokensPerBlock; ++tokenInBlock)
+        {
+            int const vIdx = kvHeadIdx * tokensPerBlock * vecsPerHead + tokenInBlock * vecsPerHead + channelIdx;
+            vBlockVec[vIdx] = zero;
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Make sure each thread at least processes two elements (gptj rotary embedding).
 
 template <typename T, RotaryPositionEmbeddingType ROTARY_TYPE>
@@ -660,6 +693,8 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                             reinterpret_cast<VecType*>(kDst)[inBlockIdx] = k_to_cache;
                             reinterpret_cast<VecType*>(vDst)[inBlockIdx] = v;
                         }
+                        zeroPagedVCacheTail<T, TCache, VecType, GEN_PHASE>(params, batch_idx, token_idx_in_kv_cache,
+                            cache_seq_len, kv_head_idx, sizePerHeadDivX, channelIdx, /*isUniqueTokenWriter=*/true);
                     }
                 }
             }
@@ -1102,6 +1137,9 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                         reinterpret_cast<VecT*>(kDst)[inBlockIdx] = k;
                         reinterpret_cast<VecT*>(vDst)[inBlockIdx] = v;
                     }
+                    zeroPagedVCacheTail<T, TCache, VecT, GEN_PHASE>(params, batch_idx, token_idx_in_kv_cache,
+                        cache_seq_len, kv_head_idx, VECS_PER_HEAD, channelIdx,
+                        /*isUniqueTokenWriter=*/global_token_idx == bounded_global_token_idx);
                 }
             }
         }

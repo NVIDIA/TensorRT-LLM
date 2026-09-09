@@ -49,10 +49,9 @@ _RECEIVER_FAILURE_MARKERS = (
     "sourceidentity mismatch",
     "invalid sourceidentity",
 )
-_MATCHED_PARAMS_PATTERN = re.compile(r"Matched\s+(\d+)/(\d+)\s+params", re.IGNORECASE)
-_RANK_LOG_PATTERN = re.compile(r"rank(\d+)\.log", re.IGNORECASE)
-_TRANSFERRED_PARAMS_PATTERN = re.compile(
-    r"Rank\s+(\d+):\s+transferred\s+(\d+)\s+params",
+_RDMA_TRANSFER_PATTERN = re.compile(
+    r"\[Worker\s+(\d+)\].*?RDMA transfer complete:\s+"
+    r"(\d+)\s+tensors,\s+([0-9.]+)\s+GB",
     re.IGNORECASE,
 )
 _DONOR_PROCESS_FAILURE_MARKERS = (
@@ -61,7 +60,7 @@ _DONOR_PROCESS_FAILURE_MARKERS = (
     b"process returned a non-zero exit code",
 )
 _DONOR_PROCESS_FAILURE_OVERLAP = max(len(marker) for marker in _DONOR_PROCESS_FAILURE_MARKERS) - 1
-_MINIMUM_MODELEXPRESS_VERSION = Version("0.4.1")
+_MINIMUM_MODELEXPRESS_VERSION = Version("0.5.1")
 _MODELEXPRESS_VERSION_PREFIX = "MODELEXPRESS_VERSION="
 _MX_PREFLIGHT_SCRIPT = """
 import importlib.metadata as metadata
@@ -75,9 +74,7 @@ def module_exists(name):
         return False
 
 
-assert module_exists("modelexpress.trtllm_live_transfer") or module_exists(
-    "modelexpress.engines.trtllm"
-), "no TRT-LLM adapter is available"
+assert module_exists("modelexpress.engines.trtllm"), "no TRT-LLM adapter is available"
 from modelexpress.nixl_transfer import is_nixl_available
 
 assert is_nixl_available(), "NIXL is unavailable"
@@ -456,70 +453,36 @@ def _load_tokens(output_path: Path) -> list[list[int]]:
     return token_ids
 
 
-def _transfer_logs_by_rank(transfer_log_dir: Path, receiver_log: str) -> dict[int, str]:
-    log_files = tuple(path for path in transfer_log_dir.rglob("*") if path.is_file())
-    logs = tuple(path for path in log_files if path.stat().st_size > 0)
-    if not logs:
-        entries = ", ".join(
-            f"{path.relative_to(transfer_log_dir)} ({path.stat().st_size} bytes)"
-            for path in log_files
-        )
-        pytest.fail(
-            f"ModelExpress created no non-empty receiver transfer logs in "
-            f"{transfer_log_dir}; entries: {entries or '<none>'}\n"
-            f"Receiver log:\n{receiver_log}"
-        )
-
-    logs_by_rank = {}
-    for path in sorted(logs):
-        match = _RANK_LOG_PATTERN.fullmatch(path.name)
-        if match is None:
-            pytest.fail(f"Unexpected ModelExpress receiver transfer log: {path}")
-        rank = int(match.group(1))
-        if rank in logs_by_rank:
-            pytest.fail(f"ModelExpress created multiple receiver transfer logs for rank {rank}")
-        logs_by_rank[rank] = path.read_text(encoding="utf-8", errors="replace")
-    return logs_by_rank
-
-
 def _assert_transfer_evidence(
     case: MxE2ECase,
     receiver_log_path: Path,
-    receiver_transfer_log_dir: Path,
 ) -> None:
     receiver_log = receiver_log_path.read_text(encoding="utf-8", errors="replace")
-    transfer_logs = _transfer_logs_by_rank(receiver_transfer_log_dir, receiver_log)
     expected_ranks = set(range(case.tp_size))
-    assert set(transfer_logs) == expected_ranks, (
-        f"Expected receiver transfer logs for ranks {expected_ranks}, got {set(transfer_logs)}"
+    transfers_by_rank: dict[int, list[tuple[int, float]]] = {}
+    for rank, tensor_count, size_gb in _RDMA_TRANSFER_PATTERN.findall(receiver_log):
+        transfers_by_rank.setdefault(int(rank), []).append((int(tensor_count), float(size_gb)))
+
+    assert set(transfers_by_rank) == expected_ranks, (
+        f"Expected RDMA transfer completion for ranks {expected_ranks}, "
+        f"got {set(transfers_by_rank)}\nReceiver log:\n{receiver_log}"
     )
-    all_receiver_logs = receiver_log + "\n" + "\n".join(transfer_logs.values())
-    all_receiver_logs_lower = all_receiver_logs.lower()
+    receiver_log_lower = receiver_log.lower()
 
     for marker in _RECEIVER_FAILURE_MARKERS:
-        assert marker not in all_receiver_logs_lower, (
-            f"MX receiver logs contain failure marker {marker!r}"
+        assert marker not in receiver_log_lower, (
+            f"MX receiver log contains failure marker {marker!r}"
         )
 
     for rank in sorted(expected_ranks):
-        rank_log = transfer_logs[rank]
-        matched_params = _MATCHED_PARAMS_PATTERN.findall(rank_log)
-        assert len(matched_params) == 1, (
-            f"Expected one matched-parameter summary for rank {rank}, got {matched_params}"
+        transfers = transfers_by_rank[rank]
+        assert len(transfers) == 1, (
+            f"Expected one RDMA transfer completion for rank {rank}, got {transfers}"
         )
-        matched, total = (int(value) for value in matched_params[0])
-        assert matched == total > 0, (
-            f"MX receiver rank {rank} reported incomplete parameter match {matched}/{total}"
-        )
-
-        transferred_params = _TRANSFERRED_PARAMS_PATTERN.findall(rank_log)
-        assert len(transferred_params) == 1, (
-            f"Expected one transfer summary for rank {rank}, got {transferred_params}"
-        )
-        transferred_rank, transferred_count = (int(value) for value in transferred_params[0])
-        assert transferred_rank == rank and transferred_count == matched, (
-            f"MX receiver rank {rank} matched {matched} params but reported transfer summary "
-            f"{transferred_params[0]}"
+        tensor_count, size_gb = transfers[0]
+        assert tensor_count > 0 and size_gb > 0, (
+            f"MX receiver rank {rank} reported an empty transfer: "
+            f"{tensor_count} tensors, {size_gb} GB"
         )
 
 
@@ -530,6 +493,9 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
     mx_url, gpu_ids = _require_mx_environment(required_gpus)
     model_path = _resolve_model_path(case)
     timeout_s = int(os.environ.get("TRTLLM_MX_E2E_TIMEOUT_S", "1200"))
+    # NIXL binds base_port + device_id. The donor and receiver share one CI
+    # network namespace, so give their TP ranks adjacent, non-overlapping ranges.
+    metadata_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
 
     donor_snapshot = _build_canonical_snapshot(case, model_path, tmp_path)
     receiver_snapshot = _build_metadata_only_snapshot(donor_snapshot, tmp_path)
@@ -563,6 +529,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
     )
 
     donor_environment = _worker_environment(donor_gpu_ids, tmp_path / "donor-transfer-logs")
+    donor_environment["MX_METADATA_PORT"] = str(metadata_port)
     donor_returncode = None
     with (
         donor_log.open("w", encoding="utf-8") as donor_log_file,
@@ -585,6 +552,10 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
     ):
         try:
             _wait_for_donor(donor_process, donor_ready, donor_log, timeout_s)
+            receiver_environment = _worker_environment(
+                receiver_gpu_ids, tmp_path / "receiver-transfer-logs"
+            )
+            receiver_environment["MX_METADATA_PORT"] = str(metadata_port + case.tp_size)
             _run_worker(
                 _worker_command(
                     role="receiver",
@@ -593,7 +564,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
                     output_path=receiver_output,
                     mx_url=mx_url,
                 ),
-                _worker_environment(receiver_gpu_ids, tmp_path / "receiver-transfer-logs"),
+                receiver_environment,
                 receiver_log,
                 timeout_s,
             )
@@ -611,5 +582,4 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path) -> None:
     _assert_transfer_evidence(
         case,
         receiver_log,
-        tmp_path / "receiver-transfer-logs",
     )

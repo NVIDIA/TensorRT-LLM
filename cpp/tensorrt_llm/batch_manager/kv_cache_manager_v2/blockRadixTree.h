@@ -383,8 +383,9 @@ public:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     // Takes a non-owning TokenSpan so a zero-copy int32 token buffer can be matched without
     // allocating/copying (the hot path). Callers holding a std::vector pass toSpan(vec).
+    // backoff: tokens trimmed off the tail of the match (see KVCacheManagerConfig::reuseMatchBackoff).
     ReuseMatch match(ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest = false,
-        bool enablePartialMatch = false) const;
+        bool enablePartialMatch = false, int backoff = 0) const;
 
     // Detach all cached blocks. ~Block() releases pages when the last owner drops a block.
     void clear();

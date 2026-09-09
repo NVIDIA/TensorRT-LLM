@@ -136,6 +136,23 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
 
 
+def _mock_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: 107)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.torch.cuda.is_available",
+        lambda: True,
+    )
+
+
+def test_validate_and_set_kv_cache_quant_downgrades_nvfp4_on_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_sm107(monkeypatch)
+    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
 def _make_mixed_precision_model_config():
     """MIXED_PRECISION checkpoint shape: global config plus per-layer entries
     whose kv_cache_quant_algo comes only from hf_quant_config.json (None here)."""
@@ -164,6 +181,20 @@ def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
     validate_and_set_kv_cache_quant(model_config, "auto")
     for layer_quant_config in model_config.quant_config_dict.values():
         assert layer_quant_config.kv_cache_quant_algo is None
+
+
+def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_config_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SM107 NVFP4->FP8 downgrade must update per-layer QuantConfigs too,
+    otherwise a mixed-precision checkpoint keeps NVFP4 in quant_config_dict
+    while the KV pool (sized from the global config) uses FP8."""
+    _mock_sm107(monkeypatch)
+    model_config = _make_mixed_precision_model_config()
+    validate_and_set_kv_cache_quant(model_config, "nvfp4")
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):

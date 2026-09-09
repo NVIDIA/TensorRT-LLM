@@ -4,13 +4,13 @@ import torch
 from torch import nn
 from transformers import Exaone4Config
 
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.interface import (PositionalEmbeddingParams,
-                                           PredefinedAttentionMask, RopeParams)
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import (PositionalEmbeddingParams,
+                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding

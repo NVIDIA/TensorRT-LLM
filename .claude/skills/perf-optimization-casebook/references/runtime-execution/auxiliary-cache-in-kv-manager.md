@@ -49,7 +49,7 @@ measured: []
   (UINT8 side cache beside a BF16/FP8 KV) must be summed **additively per physical
   pool dtype**, never via one multiplicative dtype factor (#15088); (2) once blocks
   are onboarded from a secondary/host pool, **index them by the decoded memory-pool
-  index**, not the logical block ID (they diverge — `_get_pool_block_indices()` from
+  index**, not the logical block ID (they diverge — `get_pool_block_indices()` from
   `host_kv_cache_block_offsets`, #12010); (3) **null the Python tensor views before
   the C++ owner frees** the device memory at teardown (#9110).
 - **Generalizes to:** the pattern "**manage an auxiliary/compressed side cache as a
@@ -87,8 +87,8 @@ measured: []
 - **Prior art:** PRs #8699, #9383, #12010, #15088, #9110. Files:
   `cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp` (`createIndexerKCachePools`,
   `containsIndexerKCache`, `isEnableIndexerKCache`), `kvCacheUtils.h` (`BlockRange`),
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` (`DSACacheManager`,
-  `_get_pool_block_indices`). Owning specialist: **kernel-cuda-specialist**. Related:
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/cache_manager.py` (`DSACacheManager`,
+  `get_pool_block_indices`). Owning specialist: **kernel-cuda-specialist**. Related:
   the [MLA KV-cache reuse case](mla-kv-cache-reuse.md) (#9383 is the side-cache
   instance of that pattern) and [move bookkeeping into a C++ op](move-bookkeeping-into-cpp-op.md)
   (the scatter op that writes into this pool).

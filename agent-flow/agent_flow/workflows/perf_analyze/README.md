@@ -31,9 +31,12 @@ benchmarker ──▶ projector ──▶ analyzer ──▶ reporter
   (compute / memory / launch) that says where the headroom lives — and
   persists the machine-readable `sol_work/peaks.json` (latency
   constants merged in) that the analyzer's correlation joins against.
-- **Analyzer** — replays the same load under **Nsight Systems (nsys)**,
-  the **PyTorch profiler**, and **Nsight Compute (ncu)** — the ncu run
-  is a bounded per-kernel deep dive on the top nsys kernels, captured
+- **Analyzer** — replays the same load under **Nsight Systems (nsys)**
+  and **Nsight Compute (ncu)** — the nsys timeline is decomposed with
+  the **`internal-perf-nsight-system-analysis` skill** (per-iteration time,
+  busy/idle rungs, and the compute-absent split into launch-starved /
+  blocking / dependency-stalled), and the ncu run is a bounded
+  per-kernel deep dive on the top nsys kernels, captured
   over the same iteration window and interpreted with the
   **`perf-nsight-compute-analysis` skill** (per-kernel SOL%, occupancy,
   warp stalls → bound class) — mines the traces, and writes ranked
@@ -80,12 +83,12 @@ Copy [`task.example.yaml`](./task.example.yaml) and fill it in.
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `checkpoint_path` | ✅ | Model checkpoint dir to serve (must exist). |
-| `trtllm_repo_path` | ✅ | TensorRT-LLM checkout providing `trtllm-serve` + `benchmark_serving.py` (must exist). |
+| `checkpoint_path` | ✅ | Model checkpoint dir to serve. Remote when `cluster_ssh` is set; otherwise local. |
+| `trtllm_repo_path` | ✅ | Local TensorRT-LLM checkout providing `trtllm-serve` + `benchmark_serving.py` (must exist). |
 | `extra_llm_api_options` | optional | Path to a YAML passed verbatim to `trtllm-serve --extra_llm_api_options` — the single place for all server tuning (parallelism, batch sizes, KV-cache fraction, CUDA-graph config, ...). Omit to use server defaults. The server always runs the `pytorch` backend on `127.0.0.1:8000`. |
 | `benchmark` | optional | Operating point: `dataset_name`, `random_input_len` (ISL), `random_output_len` (OSL), `num_prompts`, `concurrency`, `request_rate`, `dataset_path`. `concurrency` is a positive int (single operating point, default `64`) **or a non-empty list of them** — a list turns on **Pareto-curve mode**: the benchmarker runs `benchmark_serving.py` once per point (sorted ascending, deduplicated, over one server launch), the analyzer profiles at the largest point, and the report gains a measured Pareto curve (x = tok/s/user = `1000/mean_tpot_ms`, y = tok/s/gpu = `output_throughput/num_gpus`) with its own chart in the HTML companion. `num_prompts` is a positive int (same count at every point, default `200`) or — curve mode only — a list paired index-by-index with the `concurrency` list (each entry ≥ its point; sorted together with it), so low-concurrency points can run far fewer prompts. |
-| `profile` | optional | `methods` (subset of `[nsys, torch, ncu]`, default all three) and `nsys_iter_range` (default `"100-150"`, gating nsys/torch server-side and the ncu capture via `--profile-from-start off`). |
-| `slurm-environment` | optional | When present (`slurm_partition` + `docker_image`), the server + benchmark run inside a Slurm-launched container instead of locally. |
+| `profile` | optional | `methods` (subset of `[nsys, ncu]`, default both) and `nsys_iter_range` (default `"100-150"`, gating nsys server-side and the ncu capture via `--profile-from-start off`). |
+| `slurm-environment` | optional | `slurm_partition` + `docker_image` run the workload in Slurm. Add `cluster_ssh: user@login-host` to run Slurm remotely; `remote_run_root` optionally selects its temporary campaign root (default `~/agent_flow_workspace/<campaign-name>`). |
 | `sol` | optional | Gates the projector stage (the SOL ceiling, per the `internal-perf-sol-analysis` skill), which runs **by default**. Every field is optional — `enabled` is the gate (default `true`) and `gpu` is the part-name hint for the skill's peaks calculator when the automatic mapping would guess wrong. Omit the block entirely to accept the defaults. |
 
 The spec is validated at the CLI boundary; defaults for the optional
@@ -109,7 +112,8 @@ workspace/perf-analyze/<name>/
 ├── sol_projection.md                 # ← projector (blank when disabled)
 ├── sol_work/                         # ← projector peaks.json; analyzer regions.json + sol.json
 ├── server_nsys.nsys-rep, nsys_stats.txt   # ← analyzer (nsys)
-├── torch_trace/, perf_metrics.json        # ← analyzer (torch)
+├── nsys_analysis/                         # ← analyzer (nsys timeline decomposition + items.json)
+├── perf_metrics.json                      # ← analyzer (request breakdown)
 ├── server_ncu.ncu-rep, ncu_details.txt, ncu_raw.csv   # ← analyzer (ncu)
 ├── profile_findings.md               # ← analyzer
 ├── performance_report.md / .html     # ← reporter (the deliverable)
@@ -121,9 +125,11 @@ workspace/perf-analyze/<name>/
 - **Local vs Slurm.** Without a `slurm-environment` block, the agents run
   `trtllm-serve` and `benchmark_serving.py` directly via `Bash` on the
   current node's GPUs. With it, they run inside a Slurm-launched container.
+  When `cluster_ssh` is set, workflow state and retained artifacts stay local;
+  agents sync only required inputs and outputs around remote Slurm jobs.
 - **Profiling knobs are verified at runtime.** Env-var names
-  (`TLLM_PROFILE_START_STOP`, the torch-profiler dir var) differ across
-  TensorRT-LLM versions, so the Analyzer greps the checkout in
+  (`TLLM_PROFILE_START_STOP`) differ across TensorRT-LLM versions, so
+  the Analyzer greps the checkout in
   `trtllm_repo_path` to confirm the actual names before relying on them.
 - The command knowledge lives in the prompts, so the workflow does not
   depend on any optional agent-toolkit skills being installed. The
@@ -136,9 +142,46 @@ workspace/perf-analyze/<name>/
   `--trace-fork-before-exec=true`; and for ncu
   `--target-processes all`, `--profile-from-start off`, a bounded
   `--launch-count`, and a `--kernel-name` filter built from the top
-  nsys kernels) rather than improvising per run; only
+  kernels of the nsys timeline decomposition) rather than improvising
+  per run; only
   the paths and the `benchmark` / `profile` values are filled in.
-- **ncu kernel analysis (Run C).** The Analyzer's ncu pass answers *why*
+- **Multi-rank capture (`profile.profile_ranks`, default `[0]`).** Where
+  the nsys wrap goes decides whether a multi-GPU run yields any model
+  kernels: a bare `trtllm-serve` above world size 1 creates its workers
+  with `MPI.COMM_SELF.Spawn`, which nsys does not follow, so only the
+  parent — holding no model rank — is traced. Listing several ranks puts
+  one wrap per rank inside the launcher step (the Slurm
+  `trtllm-llmapi-launch` shape the repo's own
+  `examples/disaggregated/slurm/benchmark/start_worker.sh` uses) and
+  unlocks the skill's **rank-jitter step**: mean jitter wait per
+  iteration, the non-communication busy spread, the imbalance operator,
+  and the `pinned`-vs-`rotating` straggler verdict — the only evidence
+  that distinguishes "the job waits on a slow rank" from "the job waits
+  on the network", which need opposite fixes. Only the listed ranks are
+  wrapped, because a rank slowed by its own profiler registers as jitter
+  the others wait on. Representatives and parts come from the survey's
+  measured fingerprint groups rather than an assumed rank layout.
+- **nsys timeline analysis (Run A).** `nsys stats` gives a kernel-sum
+  table; the Analyzer additionally exports the trace to `.sqlite` and
+  runs the **`internal-perf-nsight-system-analysis` skill**'s pipeline into
+  `nsys_analysis/`, which answers *where the iteration's wall clock
+  went*: per-iteration time against a detected anchor, three nested
+  busy rungs with their idle complements, the compute-absent time split
+  into launch-starved / blocking / dependency-stalled, the
+  kernel-category breakdown, the per-op breakdown (op-group or
+  module-slicing, whichever the fused share selects), and exposed
+  collective time (transfer vs jitter wait). Kernels are classified
+  with the checked-in TRT-LLM taxonomy
+  (`assets/taxonomy_trtllm.json`, extended per workload by the
+  skill's verify loop) rather than the skill's training-shaped
+  template, and the run closes by authoring `items.json` — the
+  machine-readable opportunity list a perf-optimize campaign keys its
+  roadmap coverage on. It re-reads the trace already captured, so it
+  costs no
+  extra server launch, and it degrades gracefully — a missing skill or
+  a pipeline error leaves an honest `timeline analysis unavailable`
+  line and falls back to the `nsys stats` numbers.
+- **ncu kernel analysis (Run B).** The Analyzer's ncu pass answers *why*
   the hot kernels are slow, complementing nsys's *where the time goes*:
   per-kernel Compute/Memory SOL%, occupancy, and warp stalls, classified
   with the `perf-nsight-compute-analysis` skill's thresholds

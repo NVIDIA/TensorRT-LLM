@@ -69,7 +69,7 @@ Valid keys are the input names listed in the [Inputs](#inputs) section. Unrecogn
 
 | Input | Description | Required | Example |
 |-------|-------------|----------|---------|
-| `test_cmd` | The exact test command to run (e.g. a `pytest` invocation). The skill runs this verbatim via `trtllm-case-executor` and does not generate test scripts. | **Yes** (module test) | `pytest tests/unittest/_torch/modules/test_attention.py -v` |
+| `test_cmd` | The exact test command to run (e.g. a `pytest` invocation). The skill runs this verbatim via `trtllm-case-executor` and does not generate test scripts. | **Yes** (module test) | `pytest tests/unittest/_torch/attention/test_attention.py -v` |
 | `class_name` | Name of the class under test (used for reporting only) | No | `Attention` or `LlamaAttention` |
 | `required_devices` | Number of GPUs required to run `test_cmd` | No (default: `1`) | `1`, `4` |
 

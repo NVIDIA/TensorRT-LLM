@@ -727,16 +727,12 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     """
     from tensorrt_llm.llmapi.llm_args import (
         AutoDecodingConfig,
-        MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
     )
 
     mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
     assert _walk_captured_keys(mtp) >= {"decoding_type"}
-
-    medusa = MedusaDecodingConfig(max_draft_len=1, medusa_choices=[[0]])
-    assert _walk_captured_keys(medusa) >= {"decoding_type"}
 
     ngram = NGramDecodingConfig(max_draft_len=1, max_matching_ngram_size=2)
     assert _walk_captured_keys(ngram) >= {"decoding_type"}

@@ -1,7 +1,6 @@
 import datetime
 import inspect
 import json
-import os as _os
 import pickle
 import typing as tp
 
@@ -90,25 +89,6 @@ def test_output_config_pickle():
     assert additional_model_output.gather_context == True
 
 
-def test_external_draft_tokens_config():
-    tokens = [1, 2, 3]
-    config = trtllm.ExternalDraftTokensConfig(tokens)
-    assert config.tokens == tokens
-    assert config.logits is None
-    assert config.acceptance_threshold is None
-    del config
-
-    logits = torch.ones(3, 1)
-    acceptance_threshold = 1.0
-    fast_logits = False
-    config = trtllm.ExternalDraftTokensConfig(tokens, logits,
-                                              acceptance_threshold, fast_logits)
-    assert config.tokens == tokens
-    assert (config.logits == logits).all()
-    assert config.acceptance_threshold == acceptance_threshold
-    assert config.fast_logits == fast_logits
-
-
 def test_prompt_tuning_config():
     embedding_table = torch.ones(100, 64)
     config = trtllm.PromptTuningConfig(embedding_table)
@@ -120,32 +100,20 @@ def test_multimodal_embedding():
     def get_base_kwargs():
         return {
             "input_token_ids": [1, 2, 3],
-            "max_tokens":
-            1,
-            "streaming":
-            False,
-            "sampling_config":
-            trtllm.SamplingConfig(),
-            "output_config":
-            trtllm.OutputConfig(),
-            "end_id":
-            -1,
-            "pad_id":
-            -2,
+            "max_tokens": 1,
+            "streaming": False,
+            "sampling_config": trtllm.SamplingConfig(),
+            "output_config": trtllm.OutputConfig(),
+            "end_id": -1,
+            "pad_id": -2,
             "bad_words": [[4, 5, 6]],
             "stop_words": [[7, 8, 9]],
-            "embedding_bias":
-            torch.ones(1),
-            "external_draft_tokens_config":
-            trtllm.ExternalDraftTokensConfig([1, 2, 3]),
+            "embedding_bias": torch.ones(1),
             "prompt_tuning_config":
             trtllm.PromptTuningConfig(torch.ones(100, 64)),
-            "lora_config":
-            trtllm.LoraConfig(1),
-            "logits_post_processor_name":
-            "my_logits_pp",
-            "client_id":
-            1234,
+            "lora_config": trtllm.LoraConfig(1),
+            "logits_post_processor_name": "my_logits_pp",
+            "client_id": 1234,
         }
 
     # Test with ones
@@ -364,8 +332,6 @@ def test_request():
         "bad_words": [[4, 5, 6]],
         "stop_words": [[7, 8, 9]],
         "embedding_bias": torch.ones(1),
-        "external_draft_tokens_config":
-        trtllm.ExternalDraftTokensConfig([1, 2, 3]),
         "prompt_tuning_config": trtllm.PromptTuningConfig(torch.ones(100, 64)),
         "multimodal_embedding": torch.ones(100, 64),
         "lora_config": trtllm.LoraConfig(1),
@@ -382,9 +348,6 @@ def test_request():
                 assert attr_value == v
     assert isinstance(request.sampling_config, trtllm.SamplingConfig)
     assert isinstance(request.output_config, trtllm.OutputConfig)
-    assert isinstance(request.external_draft_tokens_config,
-                      trtllm.ExternalDraftTokensConfig)
-    assert request.external_draft_tokens_config.tokens == [1, 2, 3]
     assert isinstance(request.prompt_tuning_config, trtllm.PromptTuningConfig)
     assert (request.prompt_tuning_config.embedding_table == torch.ones(
         100, 64)).all()
@@ -699,26 +662,6 @@ def test_kv_cache_retention_config():
         ], 50)
 
 
-def test_speculative_decoding_config():
-    config = trtllm.SpeculativeDecodingConfig(True)
-    assert config.fast_logits == True
-
-    kwargs = {
-        "fast_logits": True,
-    }
-
-    config = trtllm.SpeculativeDecodingConfig(**kwargs)
-    for k, v in kwargs.items():
-        assert getattr(config, k) == v
-
-
-@pytest.mark.cpu_only
-def test_speculative_decoding_config_pickle():
-    config = trtllm.SpeculativeDecodingConfig(True)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config_copy.fast_logits == True
-
-
 @pytest.mark.cpu_only
 def test_lookahead_decoding_config():
     config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -749,78 +692,6 @@ def test_lookahead_decoding_config_pickle():
     assert config_copy.max_window_size == 3
     assert config_copy.max_ngram_size == 5
     assert config_copy.max_verification_set_size == 7
-
-
-@pytest.mark.cpu_only
-def test_eagle_config():
-    config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
-    assert config.eagle_choices == [[0, 0], [0, 1]]
-    assert config.greedy_sampling == False
-    assert config.posterior_threshold == 0.5
-    assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK is None
-
-    config = trtllm.EagleConfig([[0, 0], [0, 1, 0]], True)
-    assert config.eagle_choices == [[0, 0], [0, 1, 0]]
-    assert config.greedy_sampling == True
-    assert config.posterior_threshold is None
-    assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK is None
-
-    config = trtllm.EagleConfig(None, True, 0.5)
-    assert config.eagle_choices is None
-    assert config.greedy_sampling == True
-    assert config.posterior_threshold == 0.5
-    assert config.use_dynamic_tree == False
-    assert config.dynamic_tree_max_topK is None
-
-    config = trtllm.EagleConfig(None, False, 0.5, True, 3)
-    assert config.eagle_choices is None
-    assert config.greedy_sampling == False
-    assert config.posterior_threshold == 0.5
-    assert config.use_dynamic_tree == True
-    assert config.dynamic_tree_max_topK == 3
-
-    kwargs1 = {
-        "eagle_choices": [[0, 0], [0, 1], [0, 2]],
-        "greedy_sampling": True,
-        "posterior_threshold": 0.5
-    }
-
-    config = trtllm.EagleConfig(**kwargs1)
-    for k, v in kwargs1.items():
-        assert getattr(config, k) == v
-
-    kwargs2 = {
-        "eagle_choices": None,
-        "greedy_sampling": True,
-        "posterior_threshold": 0.5,
-        "use_dynamic_tree": True,
-        "dynamic_tree_max_topK": 3,
-    }
-
-    config = trtllm.EagleConfig(**kwargs2)
-    for k, v in kwargs2.items():
-        assert getattr(config, k) == v
-
-
-@pytest.mark.cpu_only
-def test_eagle_config_pickle():
-    config = trtllm.EagleConfig([[0, 0], [0, 1]], False, 0.5)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
-    assert config.eagle_choices == config_copy.eagle_choices
-    assert config.posterior_threshold == config_copy.posterior_threshold
-    assert config.use_dynamic_tree == config_copy.use_dynamic_tree
-    assert config.greedy_sampling == config_copy.greedy_sampling
-
-    config = trtllm.EagleConfig(None, False, 0.5, True, 3)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.eagle_choices == config_copy.eagle_choices
-    assert config.greedy_sampling == config_copy.greedy_sampling
-    assert config.posterior_threshold == config_copy.posterior_threshold
-    assert config.use_dynamic_tree == config_copy.use_dynamic_tree
-    assert config.dynamic_tree_max_topK == config_copy.dynamic_tree_max_topK
 
 
 @pytest.mark.cpu_only
@@ -858,15 +729,11 @@ def test_decoding_config():
     config = trtllm.DecodingConfig()
     assert config.decoding_mode is None
     assert config.lookahead_decoding_config is None
-    assert config.medusa_choices is None
-    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     config.decoding_mode = trtllm.DecodingMode.TopKTopP()
     assert config.decoding_mode.isTopKandTopP()
     assert config.lookahead_decoding_config is None
-    assert config.medusa_choices is None
-    assert config.eagle_config is None
 
     config = trtllm.DecodingConfig()
     la_decoding_config = trtllm.LookaheadDecodingConfig(3, 5, 7)
@@ -876,44 +743,6 @@ def test_decoding_config():
     assert config.lookahead_decoding_config.max_ngram_size == la_decoding_config.max_ngram_size
     assert config.lookahead_decoding_config.max_window_size == la_decoding_config.max_window_size
     assert config.lookahead_decoding_config.max_verification_set_size == la_decoding_config.max_verification_set_size
-    assert config.medusa_choices is None
-    assert config.eagle_config is None
-
-    config = trtllm.DecodingConfig()
-    config.medusa_choices = [[0, 0], [0, 1]]
-
-    assert config.decoding_mode.isMedusa()
-    assert config.lookahead_decoding_config is None
-    assert config.medusa_choices == [[0, 0], [0, 1]]
-    assert config.eagle_config is None
-
-    config = trtllm.DecodingConfig()
-    config.eagle_config = trtllm.EagleConfig([[0, 0], [0, 1]])
-
-    assert config.decoding_mode.isEagle()
-    assert config.lookahead_decoding_config is None
-    assert config.medusa_choices is None
-    assert config.eagle_config is not None
-    assert config.eagle_config.eagle_choices == [[0, 0], [0, 1]]
-
-
-@pytest.mark.cpu_only
-def test_logits_post_processor_config():
-    config = trtllm.LogitsPostProcessorConfig()
-    assert config.processor_map is None
-    assert config.processor_batched is None
-    assert config.replicate == True
-
-    kwargs = {
-        "processor_map": {
-            "test_pp": None
-        },
-        "processor_batched": None,
-        "replicate": False
-    }
-    config = trtllm.LogitsPostProcessorConfig(**kwargs)
-    for k, v in kwargs.items():
-        assert getattr(config, k) == v
 
 
 @pytest.mark.cpu_only
@@ -930,176 +759,6 @@ def test_guided_decoding_config():
     assert guided_decoding_config.encoded_vocab == encoded_vocab
     assert guided_decoding_config.tokenizer_str == tokenizer_str
     assert guided_decoding_config.stop_token_ids == stop_token_ids
-
-
-@pytest.mark.cpu_only
-def test_executor_config():
-    config = trtllm.ExecutorConfig()
-    assert config.max_beam_width == 1
-    assert config.max_batch_size is None
-    assert config.max_num_tokens is None
-    assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
-    assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
-    assert config.enable_chunked_context == False
-    assert config.normalize_log_probs == False
-    assert config.iter_stats_max_iterations == 1000
-    assert config.batching_type == trtllm.BatchingType.INFLIGHT
-    assert config.parallel_config is None
-    assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
-    assert config.logits_post_processor_config is None
-    assert config.decoding_config is None
-    assert config.debug_config is None
-    assert config.recv_poll_period_ms == 0
-    assert config.max_seq_idle_microseconds == 180000000
-    assert config.spec_dec_config is None
-    assert config.guided_decoding_config is None
-    assert config.additional_model_outputs is None
-    assert config.gather_generation_logits is False
-    assert config.use_gpu_direct_storage is False
-    assert config.mm_embedding_offloading is False
-    assert config.enable_trt_overlap is False
-
-    unbounded_stats_config = trtllm.ExecutorConfig(
-        iter_stats_max_iterations=-1, request_stats_max_iterations=-1)
-    assert unbounded_stats_config.iter_stats_max_iterations == -1
-    assert unbounded_stats_config.request_stats_max_iterations == -1
-
-    with pytest.raises(Exception):
-        trtllm.ExecutorConfig(iter_stats_max_iterations=-2)
-    with pytest.raises(Exception):
-        trtllm.ExecutorConfig(request_stats_max_iterations=-2)
-
-    kwargs = {
-        "max_beam_width":
-        2,
-        "max_batch_size":
-        8,
-        "max_num_tokens":
-        128,
-        "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION),
-        "kv_cache_config":
-        trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5),
-        "enable_chunked_context":
-        True,
-        "normalize_log_probs":
-        False,
-        "iter_stats_max_iterations":
-        100,
-        "batching_type":
-        trtllm.BatchingType.STATIC,
-        "parallel_config":
-        trtllm.ParallelConfig(),
-        "peft_cache_config":
-        trtllm.PeftCacheConfig(10),
-        "logits_post_processor_config":
-        trtllm.LogitsPostProcessorConfig(),
-        "decoding_config":
-        trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
-        "extended_runtime_perf_knob_config":
-        trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
-        "debug_config":
-        trtllm.DebugConfig(debug_input_tensors=True,
-                           debug_output_tensors=True,
-                           debug_tensor_names=["test"]),
-        "recv_poll_period_ms":
-        50,
-        "max_seq_idle_microseconds":
-        240 * 1000 * 1000,
-        "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True),
-        "guided_decoding_config":
-        trtllm.GuidedDecodingConfig(
-            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-            encoded_vocab=["eos", "a", "b", "c", "d"]),
-        "additional_model_outputs":
-        [trtllm.AdditionalModelOutput("topKLogits")],
-        "gather_generation_logits":
-        True,
-        "use_gpu_direct_storage":
-        True,
-        "mm_embedding_offloading":
-        True,
-        "enable_trt_overlap":
-        True,
-    }
-    config = trtllm.ExecutorConfig(**kwargs)
-    for k, v in kwargs.items():
-        if "config" not in k and k != "additional_model_outputs":
-            assert getattr(config, k) == v
-    assert isinstance(config.scheduler_config, trtllm.SchedulerConfig)
-    assert config.scheduler_config.capacity_scheduler_policy == trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION
-    assert isinstance(config.kv_cache_config, trtllm.KvCacheConfig)
-    assert isinstance(config.parallel_config, trtllm.ParallelConfig)
-    assert isinstance(config.peft_cache_config, trtllm.PeftCacheConfig)
-    assert config.extended_runtime_perf_knob_config.multi_block_mode is True
-    assert isinstance(config.debug_config, trtllm.DebugConfig)
-    assert isinstance(config.logits_post_processor_config,
-                      trtllm.LogitsPostProcessorConfig)
-    assert isinstance(config.spec_dec_config, trtllm.SpeculativeDecodingConfig)
-    assert isinstance(config.guided_decoding_config,
-                      trtllm.GuidedDecodingConfig)
-    assert isinstance(config.additional_model_outputs, list)
-    assert len(config.additional_model_outputs) == 1
-    assert config.additional_model_outputs[0].name == "topKLogits"
-    assert config.additional_model_outputs[0].gather_context is False
-    assert config.gather_generation_logits is True
-    assert config.use_gpu_direct_storage is True
-    assert config.mm_embedding_offloading is True
-    assert config.enable_trt_overlap is True
-
-
-@pytest.mark.cpu_only
-def test_parallel_config():
-    comm_type = trtllm.CommunicationType.MPI
-    comm_mode = trtllm.CommunicationMode.LEADER
-    device_ids = [0, 1, 2, 3]
-    participant_ids = [4, 5, 6, 7]
-    num_nodes = 2
-    parallel_config = trtllm.ParallelConfig(comm_type,
-                                            comm_mode,
-                                            device_ids,
-                                            participant_ids,
-                                            num_nodes=num_nodes)
-    assert parallel_config.communication_type == comm_type
-    assert parallel_config.communication_mode == comm_mode
-    assert parallel_config.device_ids == device_ids
-    assert parallel_config.participant_ids == participant_ids
-    assert parallel_config.num_nodes == num_nodes
-
-    comm_mode = trtllm.CommunicationMode.ORCHESTRATOR
-    #Dummy path to worker executable
-    worker_path = _os.path.abspath(__file__)
-    orchestrator_config = trtllm.OrchestratorConfig(True, str(worker_path),
-                                                    None, True)
-    parallel_config = trtllm.ParallelConfig(comm_type, comm_mode, device_ids,
-                                            participant_ids,
-                                            orchestrator_config)
-    assert parallel_config.communication_mode == comm_mode
-    assert parallel_config.orchestrator_config.is_orchestrator == True
-    assert parallel_config.orchestrator_config.worker_executable_path == str(
-        worker_path)
-    assert parallel_config.orchestrator_config.spawn_processes == True
-
-
-@pytest.mark.cpu_only
-def test_parallel_config_pickle():
-    comm_type = trtllm.CommunicationType.MPI
-    comm_mode = trtllm.CommunicationMode.LEADER
-    device_ids = [0, 1, 2, 3]
-    participant_ids = [4, 5, 6, 7]
-    num_nodes = 2
-    parallel_config = trtllm.ParallelConfig(comm_type,
-                                            comm_mode,
-                                            device_ids,
-                                            participant_ids,
-                                            num_nodes=num_nodes)
-    parallel_config_copy = pickle.loads(pickle.dumps(parallel_config))
-    assert parallel_config_copy.communication_type == comm_type
-    assert parallel_config_copy.communication_mode == comm_mode
-    assert parallel_config_copy.device_ids == device_ids
-    assert parallel_config_copy.participant_ids == participant_ids
-    assert parallel_config_copy.num_nodes == num_nodes
 
 
 @pytest.mark.cpu_only
@@ -1321,35 +980,6 @@ def test_decoding_config_pickle():
     config_copy = pickle.loads(pickle.dumps(config))
     assert config_copy.decoding_mode.isBeamSearch
     assert config.lookahead_decoding_config == config_copy.lookahead_decoding_config
-    assert config.medusa_choices == config_copy.medusa_choices
-
-
-@pytest.mark.cpu_only
-def test_debug_config_pickle():
-    config = trtllm.DebugConfig(debug_input_tensors=True,
-                                debug_output_tensors=True,
-                                debug_tensor_names=["test"],
-                                debug_tensors_max_iterations=5)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.debug_input_tensors == config_copy.debug_input_tensors
-    assert config.debug_output_tensors == config_copy.debug_output_tensors
-    assert config.debug_tensor_names == config_copy.debug_tensor_names
-    assert config.debug_tensors_max_iterations == config_copy.debug_tensors_max_iterations
-
-
-@pytest.mark.cpu_only
-def test_logits_post_processor_config_pickle():
-    kwargs = {
-        "processor_map": {
-            "test_pp": None
-        },
-        "processor_batched": None,
-        "replicate": False
-    }
-    config = trtllm.LogitsPostProcessorConfig(**kwargs)
-    config_copy = pickle.loads(pickle.dumps(config))
-    for k in kwargs:
-        assert getattr(config, k) == getattr(config_copy, k)
 
 
 @pytest.mark.cpu_only
@@ -1396,110 +1026,6 @@ def test_cache_transceiver_config_pickle():
 
 
 @pytest.mark.cpu_only
-def test_executor_config_pickle() -> None:
-    beam_width = 2
-    config = trtllm.ExecutorConfig(beam_width)
-
-    kwargs = {
-        "max_beam_width":
-        2,
-        "max_batch_size":
-        8,
-        "max_num_tokens":
-        128,
-        "scheduler_config":
-        trtllm.SchedulerConfig(trtllm.CapacitySchedulerPolicy.MAX_UTILIZATION,
-                               enable_prefix_aware_scheduling=False),
-        "kv_cache_config":
-        trtllm.KvCacheConfig(enable_block_reuse=True,
-                             free_gpu_memory_fraction=0.5),
-        "enable_chunked_context":
-        True,
-        "normalize_log_probs":
-        False,
-        "iter_stats_max_iterations":
-        100,
-        "batching_type":
-        trtllm.BatchingType.STATIC,
-        "parallel_config":
-        trtllm.ParallelConfig(),
-        "peft_cache_config":
-        trtllm.PeftCacheConfig(10),
-        "logits_post_processor_config":
-        trtllm.LogitsPostProcessorConfig(),
-        "decoding_config":
-        trtllm.DecodingConfig(trtllm.DecodingMode.TopKTopP()),
-        "extended_runtime_perf_knob_config":
-        trtllm.ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
-        "debug_config":
-        trtllm.DebugConfig(debug_input_tensors=True,
-                           debug_output_tensors=True,
-                           debug_tensor_names=["test"]),
-        "recv_poll_period_ms":
-        50,
-        "max_seq_idle_microseconds":
-        240 * 1000 * 1000,
-        "spec_dec_config":
-        trtllm.SpeculativeDecodingConfig(fast_logits=True),
-        "guided_decoding_config":
-        trtllm.GuidedDecodingConfig(
-            trtllm.GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
-            encoded_vocab=["eos", "a", "b", "c", "d"]),
-        "additional_model_outputs":
-        [trtllm.AdditionalModelOutput("topKLogits")],
-        "gather_generation_logits":
-        True,
-        "mm_embedding_offloading":
-        True,
-        "enable_trt_overlap":
-        True,
-    }
-    config = trtllm.ExecutorConfig(**kwargs)
-    for k, v in kwargs.items():
-        if "config" not in k and k != "additional_model_outputs":
-            assert getattr(config, k) == v
-
-    config.backend = 'pytorch'
-
-    pickle.dumps(config)
-    config_copy = pickle.loads(pickle.dumps(config))
-    assert config.max_beam_width == config_copy.max_beam_width
-    assert config.max_batch_size == config_copy.max_batch_size
-    assert config.max_num_tokens == config_copy.max_num_tokens
-    assert config.scheduler_config.capacity_scheduler_policy == config_copy.scheduler_config.capacity_scheduler_policy
-    assert config_copy.scheduler_config.enable_prefix_aware_scheduling is False
-    assert config.kv_cache_config.enable_block_reuse == config_copy.kv_cache_config.enable_block_reuse
-    assert config.enable_chunked_context == config_copy.enable_chunked_context
-    assert config.normalize_log_probs == config_copy.normalize_log_probs
-    assert config.normalize_log_probs == config_copy.normalize_log_probs
-    assert config.iter_stats_max_iterations == config_copy.iter_stats_max_iterations
-    assert config.batching_type == config_copy.batching_type
-    assert config.parallel_config.communication_type == config_copy.parallel_config.communication_type
-    assert config.peft_cache_config.num_host_module_layer == config_copy.peft_cache_config.num_host_module_layer
-    assert config_copy.decoding_config.decoding_mode.isTopKandTopP
-    assert config.extended_runtime_perf_knob_config.multi_block_mode == config_copy.extended_runtime_perf_knob_config.multi_block_mode
-    assert config.debug_config.debug_input_tensors == config_copy.debug_config.debug_input_tensors
-    assert config.max_seq_idle_microseconds == config_copy.max_seq_idle_microseconds
-    assert config.backend == config_copy.backend
-    assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
-    assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
-
-    assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
-    assert config_copy.guided_decoding_config.encoded_vocab == config.guided_decoding_config.encoded_vocab
-    assert config_copy.guided_decoding_config.tokenizer_str == config.guided_decoding_config.tokenizer_str
-    assert config_copy.guided_decoding_config.stop_token_ids == config.guided_decoding_config.stop_token_ids
-
-    assert config.additional_model_outputs[
-        0].name == config_copy.additional_model_outputs[0].name
-    assert config.additional_model_outputs[
-        0].gather_context == config_copy.additional_model_outputs[
-            0].gather_context
-    assert config.gather_generation_logits == config_copy.gather_generation_logits
-    assert config.mm_embedding_offloading == config_copy.mm_embedding_offloading
-    assert config.enable_trt_overlap == config_copy.enable_trt_overlap
-
-
-@pytest.mark.cpu_only
 def test_return_full_tokens():
     max_tokens = 5
     input_tokens = [1, 2, 3, 4]
@@ -1511,16 +1037,6 @@ def test_return_full_tokens():
     assert request.return_all_generated_tokens == True
     request.return_all_generated_tokens = False
     assert request.return_all_generated_tokens == False
-
-
-@pytest.mark.cpu_only
-def test_getters_return_references():
-    config = trtllm.ExecutorConfig()
-    # Make sure kv_cache_config is a reference. Returning a value
-    # will lead to the very confusing behavior of this set statement
-    # not working.
-    config.kv_cache_config.max_tokens = 42
-    assert config.kv_cache_config.max_tokens == 42
 
 
 @pytest.mark.cpu_only
