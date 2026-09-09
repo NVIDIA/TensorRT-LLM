@@ -115,9 +115,9 @@ Then, start the server with the configuration file:
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+You can query the Chat API with any HTTP client, a typical example is OpenAI Python client:
 
-.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client_for_multimodal.py
     :language: python
     :linenos:
 
@@ -168,8 +168,8 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
 
 .. note::
    To convert images to base64-encoded format, use the utility function
-   :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
-   `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
+   :func:`tensorrt_llm.inputs.encode_base64_image`. Refer to the
+   `encode_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/inputs/utils.py>`__
    for implementation details.
 
 **Image embeddings**
@@ -352,4 +352,4 @@ This syntax section lists all command line arguments for ``trtllm-serve``'s subc
    :nested: full
 
 Besides the above examples, `trtllm-serve` is also used as an entrypoint for performance benchmarking.
-Please refer to `Performance Benchmarking with `trtllm-serve` <https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/commands/trtllm-serve/trtllm-serve-bench.md>` for more details.
+Please refer to `Performance Benchmarking with trtllm-serve <https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/commands/trtllm-serve/run-benchmark-with-trtllm-serve.md>`__ for more details.
