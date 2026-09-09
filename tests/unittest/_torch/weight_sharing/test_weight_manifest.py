@@ -344,9 +344,59 @@ def test_meta_tensors_are_skipped_with_reason():
 
     diff = compare_weight_manifests(meta_manifest, real_manifest)
     assert diff.unexpected_in_actual == ("weight",)
-    assert diff.skipped_only_in_expected == (("weight", "meta_device"),)
+    assert diff.skipped_only_in_expected == (
+        SkippedTensor("weight", "param", "meta_device", "torch.float32", (2, 2)),
+    )
     assert diff.skipped_only_in_actual == ()
+    assert diff.skipped_diffs == ()
     assert not diff.is_empty
+    assert "weight (param meta_device torch.float32 [2, 2])" in diff.describe("meta", "real")
+
+
+class _MetaHolder(nn.Module):
+    """A meta-device `weight` (skipped by the manifest) next to a real `scale` buffer."""
+
+    def __init__(
+        self,
+        *,
+        dtype: torch.dtype = torch.float32,
+        shape: tuple[int, ...] = (2, 2),
+        as_buffer: bool = False,
+    ) -> None:
+        super().__init__()
+        tensor = torch.zeros(*shape, dtype=dtype, device="meta")
+        if as_buffer:
+            self.register_buffer("weight", tensor)
+        else:
+            self.weight = nn.Parameter(tensor)
+        self.register_buffer("scale", torch.ones(2))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["dtype", "shape", "kind"])
+def test_skipped_records_with_same_reason_but_different_metadata_differ(variant: str):
+    expected = build_weight_manifest(_MetaHolder())
+    if variant == "dtype":
+        actual = build_weight_manifest(_MetaHolder(dtype=torch.bfloat16))
+    elif variant == "shape":
+        actual = build_weight_manifest(_MetaHolder(shape=(4,)))
+    else:
+        actual = build_weight_manifest(_MetaHolder(as_buffer=True))
+
+    # Only `scale` is hashed, so the whole-manifest digests agree; the fast path
+    # must not hide a skipped record that changed kind, dtype, or shape.
+    assert expected.manifest_sha256 == actual.manifest_sha256
+    diff = compare_weight_manifests(expected, actual)
+
+    assert not diff.is_empty
+    assert diff.skipped_only_in_expected == () and diff.skipped_only_in_actual == ()
+    assert [(left.fqn, right.fqn) for left, right in diff.skipped_diffs] == [("weight", "weight")]
+    left, right = diff.skipped_diffs[0]
+    assert left.reason == right.reason == "meta_device"
+    assert getattr(left, variant) != getattr(right, variant)
+    report = diff.describe("donor", "receiver")
+    assert "skipped records differ" in report
+    assert "weight expected=(param meta_device torch.float32 [2, 2]) actual=(" in report
 
 
 # --------------------------------------------------------------------------- #

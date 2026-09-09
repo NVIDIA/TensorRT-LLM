@@ -520,6 +520,27 @@ def load_payload(output_path: Path) -> dict[str, object]:
     return payload
 
 
+def collect_available_payloads(layout: MxRunLayout) -> dict[str, dict[str, object]]:
+    """Best-effort payloads of the roles that left a readable output file.
+
+    Used for the timing report from the cleanup path, so a role that never
+    finished is simply absent instead of failing the report.
+    """
+    payloads: dict[str, dict[str, object]] = {}
+    for role in ROLES:
+        path = layout.output(role)
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"MX E2E timing: ignoring unreadable payload {path}: {error}")
+            continue
+        if isinstance(payload, dict):
+            payloads[role] = payload
+    return payloads
+
+
 def assert_probe_payload(
     payload: Mapping[str, object],
     *,
@@ -606,6 +627,28 @@ def collect_weight_manifests(
     return manifests
 
 
+def collect_available_manifests(manifest_dir: Path) -> dict[ManifestKey, WeightManifest]:
+    """Best-effort manifests of a run for the timing report.
+
+    Unlike `collect_weight_manifests`, this never fails: files that do not
+    follow the manifest naming or do not load are reported and skipped.
+    """
+    manifests: dict[ManifestKey, WeightManifest] = {}
+    if not manifest_dir.is_dir():
+        return manifests
+    for path in sorted(manifest_dir.iterdir()):
+        match = WEIGHT_MANIFEST_FILE_PATTERN.match(path.name) if path.is_file() else None
+        if match is None:
+            continue
+        try:
+            manifest = load_weight_manifest(path)
+        except (OSError, ValueError, KeyError) as error:
+            print(f"MX E2E timing: ignoring unreadable manifest {path}: {error}")
+            continue
+        manifests[(match["family"], match["role"], int(match["rank"]))] = manifest
+    return manifests
+
+
 def _assert_manifests_equal(
     expected: WeightManifest,
     actual: WeightManifest,
@@ -680,10 +723,16 @@ def report_timings(
     manifests: Mapping[ManifestKey, WeightManifest],
     layout: MxRunLayout,
 ) -> list[dict[str, object]]:
-    """Print one `MX E2E timing` line per role and rank and persist them as JSON."""
+    """Print one `MX E2E timing` line per role and rank and persist them as JSON.
+
+    Meant to run from the test's cleanup path with whatever `payloads` and
+    `manifests` exist (see `collect_available_payloads` and
+    `collect_available_manifests`): a role or manifest that never appeared
+    renders as `None`, so partial timing data survives a failed run.
+    """
     rows: list[dict[str, object]] = []
     for role in ROLES:
-        payload = payloads[role]
+        payload = payloads.get(role) or {}
         for rank in range(case.tp_size):
             final = manifests.get(("final", role, rank))
             transfer = manifests.get(("transfer", role, rank))
@@ -755,6 +804,8 @@ __all__ = [
     "build_canonical_snapshot",
     "build_metadata_only_snapshot",
     "checkpoint_files",
+    "collect_available_manifests",
+    "collect_available_payloads",
     "collect_weight_manifests",
     "donor_session",
     "load_payload",
