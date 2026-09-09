@@ -2477,6 +2477,7 @@ def _create_kv_cache_manager(
             "cold_page_codec_provider"] = cold_page_codec_provider
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
+        manager_extra_kwargs["vocab_size"] = config.vocab_size
 
     if is_kimi_linear(config):
         # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on

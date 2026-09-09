@@ -262,6 +262,7 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = ...,
         window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
     ) -> None: ...
     def add_created_event(
         self,
@@ -269,7 +270,6 @@ class KVCacheEventManager:
         layer_group_ids: Sequence[int] | None = None,
     ) -> None: ...
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None: ...
-    def register_mm_keys(self, block_key: bytes, mm_keys: Sequence[MmKey]) -> None: ...
     def add_stored_event(
         self,
         parent_hash: EventBlockHash | None,

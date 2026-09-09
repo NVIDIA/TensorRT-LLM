@@ -134,7 +134,12 @@ class _StoredBlockState:
 
 
 class KVCacheEventManager:
-    """Python event queue matching the C++ KV cache event serializer contract."""
+    """Python event queue matching the C++ KV cache event serializer contract.
+
+    Setting ``mm_token_id_offset`` enables MM keys derived from item-digest tokens
+    and continuation IDs equal to that offset plus the item-local token index.
+    It must match the offset passed to ``gen_multimodal_cache_key_tokens``.
+    """
 
     def __init__(
         self,
@@ -145,7 +150,10 @@ class KVCacheEventManager:
         attention_dp_gather: AttentionDpGatherFn | None = None,
         hash_algo: str = KV_CACHE_HASH_ALGO_V2,
         window_size_by_layer_group: dict[int, int] | None = None,
+        mm_token_id_offset: int | None = None,
     ) -> None:
+        if mm_token_id_offset is not None and mm_token_id_offset < 0:
+            raise ValueError("mm_token_id_offset must be nonnegative")
         if hash_algo == KV_CACHE_HASH_ALGO_AUTO:
             hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         elif hash_algo not in (
@@ -160,6 +168,7 @@ class KVCacheEventManager:
         self._attention_dp_rank = attention_dp_rank
         self._attention_dp_gather = attention_dp_gather
         self._hash_algo = hash_algo
+        self._mm_token_id_offset = mm_token_id_offset
         self._next_event_id = 0
         self._stored_blocks: dict[bytes, _StoredBlockState] = {}
         self._latest_stored_events: dict[LayerGroupId, KVCacheEvent] = {}
@@ -167,7 +176,6 @@ class KVCacheEventManager:
         self._pending_events: list[KVCacheEvent] = []
         self._events: deque[KVCacheEvent] = deque()
         self._condition = Condition()
-        self._mm_keys_by_block_key: dict[bytes, list[MmKey]] = {}
         self._v1_hash_by_block_key: dict[bytes, int] = {}
         self._v1_hash_compatible_keys: set[bytes] = set()
         self._v1_root_attrs_by_block_key: dict[bytes, tuple[int | None, int | None]] = {}
@@ -189,15 +197,9 @@ class KVCacheEventManager:
         with self._condition:
             self._window_size_by_layer_group = dict(window_sizes)
 
-    def register_mm_keys(self, block_key: bytes, mm_keys: Sequence[MmKey]) -> None:
-        """Associate multimodal event metadata with a radix-tree block key."""
-        key = bytes(block_key)
-        normalized = list(mm_keys)
-        with self._condition:
-            previous = self._mm_keys_by_block_key.get(key)
-            if previous is not None and previous != normalized:
-                raise ValueError("Conflicting multimodal metadata for KV cache block")
-            self._mm_keys_by_block_key[key] = normalized
+    def needs_token_digest_context(self) -> bool:
+        """Whether radix blocks need to retain the latest item digest for events."""
+        return self._max_kv_event_entries > 0 and self._mm_token_id_offset is not None
 
     def add_stored_event(
         self,
@@ -505,7 +507,6 @@ class KVCacheEventManager:
         self, block_hash: BlockHashLike
     ) -> tuple[EventBlockHash, set[int]] | None:
         if isinstance(block_hash, bytes):
-            self._mm_keys_by_block_key.pop(block_hash, None)
             state = self._stored_blocks.pop(block_hash, None)
             if state is None:
                 return None
@@ -542,6 +543,30 @@ class KVCacheEventManager:
             return UniqueToken(token.hex())
         return UniqueToken(int(token))
 
+    def _mm_keys_from_radix_block(self, block: Any) -> list[MmKey]:
+        """Decode MM runs from actual block tokens and inherited item context."""
+        if not self.needs_token_digest_context():
+            return []
+        id_offset = self._mm_token_id_offset
+        assert id_offset is not None
+        parent = block.prev
+        digest = parent.last_token_digest if parent.ordinal >= 0 else None
+        in_mm_run = False
+        mm_keys: list[MmKey] = []
+        for token in block.tokens:
+            if isinstance(token, bytes):
+                digest = token
+                mm_keys.append((digest, 0))
+                in_mm_run = True
+            elif token > id_offset and digest is not None:
+                if not in_mm_run:
+                    mm_keys.append((digest, int(token) - id_offset))
+                in_mm_run = True
+            else:
+                # Text may separate runs of the same item, so retain its digest.
+                in_mm_run = False
+        return mm_keys
+
     def _stored_block_from_radix_block(
         self, block: Any, life_cycle_ids: set[int] | None = None
     ) -> KVCacheStoredBlockData | None:
@@ -567,7 +592,7 @@ class KVCacheEventManager:
             tokens=[self._normalize_token(token) for token in block.tokens],
             cache_level=int(cache_level),
             priority=int(priority),
-            mm_keys=list(self._mm_keys_by_block_key.get(bytes(block.key), ())),
+            mm_keys=self._mm_keys_from_radix_block(block),
         )
 
     @staticmethod

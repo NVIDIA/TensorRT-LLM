@@ -286,16 +286,6 @@ void initBindings(nb::module_& m)
                 }
                 return lengths;
             })
-        .def_prop_ro("multimodal_uuids",
-            [](GenLlmReq& self)
-            {
-                std::optional<std::vector<std::optional<std::string>>> uuids = std::nullopt;
-                if (self.getMultimodalUuids())
-                {
-                    uuids = *self.getMultimodalUuids().value();
-                }
-                return uuids;
-            })
         .def_prop_ro("multimodal_item_run_cu_offsets",
             [](GenLlmReq& self)
             {
