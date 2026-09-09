@@ -56,8 +56,16 @@ def ASSERT_DRV(err):
 # ref: https://github.com/NVIDIA/cuda-python/blob/main/examples/extra/jit_program_test.py
 def getSMVersion():
     # Init
-    err, = cuda.cuInit(0)
+    try:
+        err, = cuda.cuInit(0)
+    except RuntimeError as exc:
+        # Missing/broken driver. Returning inf makes skip_pre_* true and
+        # skip_post_* false so collection can proceed on CPU hosts.
+        print(f"WARNING: CUDA driver init failed in getSMVersion(): {exc}")
+        return math.inf
     if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        print("WARNING: CUDA reports no device in getSMVersion(). "
+              "Tests that require a GPU will be skipped.")
         return -1
     ASSERT_DRV(err)
 
