@@ -166,6 +166,7 @@ echo "  Command: ${SERVER_CMD}"
 echo ""
 
 srun -l \
+    --kill-on-bad-exit=1 \
     --export=ALL \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \

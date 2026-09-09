@@ -93,6 +93,7 @@ class _CudaGraphExecutionProbe:
         spec_resource_manager: BaseResourceManager | None = None,
         promoted_context_request_ids: frozenset[int] = frozenset(),
         peft_cache_data_type: torch.dtype | None = None,
+        use_lora_graph: bool = False,
     ) -> tuple[Any | None, Any | None, KeyType | None]:
         # A new decision means the preceding one reached eager execution if it
         # did not call replay. Keep that earlier observation unchanged.
@@ -107,6 +108,7 @@ class _CudaGraphExecutionProbe:
             spec_resource_manager,
             promoted_context_request_ids=promoted_context_request_ids,
             peft_cache_data_type=peft_cache_data_type,
+            use_lora_graph=use_lora_graph,
         )
         if promoted_context_request_ids:
             execution = _PromotedContextGraphExecution(

@@ -45,13 +45,30 @@ using tensorrt_llm::common::fmtstr;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    // Blackwell family. Family-compatible (sm_100f) cubins load on any SM in
+    // [100, 110); arch-specific ones are locked to the SM they were built for.
+    // The batchedGemm drop ships Sm100f, Sm100a, Sm103a and Sm107a.
+    // Range kept in sync with tensorrt_llm::common::isSM100Family (cudaUtils.h),
+    // which is not constexpr and so cannot be reused here.
+    if (gpuSM >= 100 && gpuSM < 110)
     {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
-    }
-    else if (gpuSM == 100)
-    {
-        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm100a;
+        if (kernelSM == SmVersion::Sm100f)
+        {
+            return true;
+        }
+        if (gpuSM == 100)
+        {
+            return kernelSM == SmVersion::Sm100a;
+        }
+        if (gpuSM == 103)
+        {
+            return kernelSM == SmVersion::Sm103a;
+        }
+        if (gpuSM == 107)
+        {
+            return kernelSM == SmVersion::Sm107a;
+        }
+        return false;
     }
     else if (gpuSM == 90)
     {
@@ -235,31 +252,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
-        auto sm = configs[i].mSm;
-        if (sm != SmVersion::Sm100f)
-        {
-            int smVersion = tensorrt_llm::common::getSMVersion();
-            if (smVersion == 100)
-            {
-                if (!acceptIf(sm == SmVersion::Sm100a,
-                        fmtstr("SM version 100 requires Sm100a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-            else if (smVersion == 103)
-            {
-                if (!acceptIf(sm == SmVersion::Sm103a,
-                        fmtstr("SM version 103 requires Sm103a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-        }
-
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrix should be false for DeepSeek Fp8"))
             {
                 continue;
             }
@@ -284,6 +279,31 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(options.mEpilogueTileM == mOptions.epilogueTileM,
                 fmtstr("epilogueTileM mismatch (kernel: %d, expected: %d)", options.mEpilogueTileM,
                     mOptions.epilogueTileM)))
+        {
+            continue;
+        }
+
+        if (!acceptIf(options.mFineGrainedConsumerA == mOptions.fineGrainedConsumerA,
+                fmtstr("fineGrainedConsumerA mismatch (kernel: %d, expected: %d)", options.mFineGrainedConsumerA,
+                    mOptions.fineGrainedConsumerA)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedConsumerB == mOptions.fineGrainedConsumerB,
+                fmtstr("fineGrainedConsumerB mismatch (kernel: %d, expected: %d)", options.mFineGrainedConsumerB,
+                    mOptions.fineGrainedConsumerB)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedForceValid == mOptions.fineGrainedForceValid,
+                fmtstr("fineGrainedForceValid mismatch (kernel: %d, expected: %d)", options.mFineGrainedForceValid,
+                    mOptions.fineGrainedForceValid)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mFineGrainedProducer == mOptions.fineGrainedProducer,
+                fmtstr("fineGrainedProducer mismatch (kernel: %d, expected: %d)", options.mFineGrainedProducer,
+                    mOptions.fineGrainedProducer)))
         {
             continue;
         }
@@ -445,7 +465,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), nullptr, globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), nullptr, std::ref(globalTrtllmGenBatchedGemmModuleCache));
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;

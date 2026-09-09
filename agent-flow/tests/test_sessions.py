@@ -53,6 +53,56 @@ def test_failed_persistent_send_recreates_client_on_next_call():
     assert backend.clients[1].closed is True
 
 
+def test_reset_session_starts_fresh_client_on_next_call():
+    backend = FakeBackend([{"text": "one"}, {"text": "two"}])
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        with AgentLayer(_config()) as layer:
+            assert layer("first") == "one"
+            layer.reset_session()
+            assert layer("second") == "two"
+
+    # A new client was built for the post-reset turn; the old one closed
+    # at reset time, and the backend itself stayed alive throughout.
+    assert backend.create_client_calls == 2
+    assert backend.clients[0].closed is True
+    assert backend.clients[0].send_count == 1
+    assert backend.clients[1].send_count == 1
+    assert backend.client_exit_count == 2
+    assert backend.enter_count == 1
+    assert backend.exit_count == 1
+
+
+def test_reset_session_before_first_turn_is_noop():
+    backend = FakeBackend([{"text": "ok"}])
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        with AgentLayer(_config()) as layer:
+            layer.reset_session()
+            layer("hello")
+
+    assert backend.create_client_calls == 1
+
+
+def test_reset_session_on_stateless_layer_is_noop():
+    backend = FakeBackend([{"text": "ok"}])
+    config = AgentLayerConfig(
+        name="stateless-layer",
+        system_prompt="No context.",
+        backend=BackendConfig(kind="claude-code", model="test-model"),
+        session=SessionConfig(mode="stateless"),
+    )
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        with AgentLayer(config) as layer:
+            layer("hello")
+            layer.reset_session()
+            layer("again")
+
+    # Stateless layers already build a client per call; reset adds nothing.
+    assert backend.create_client_calls == 2
+
+
 def test_persistent_sessions_require_stable_system_prompt():
     backend = FakeBackend([{"text": "ok"}])
 

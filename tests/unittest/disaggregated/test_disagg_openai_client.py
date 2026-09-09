@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import pytest
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
@@ -27,8 +29,17 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     UsageInfo,
 )
-from tensorrt_llm.serve.perf_metrics import _PERF_METRICS_HEADER_BUDGET_BYTES, SSE_METRICS_EVENT
-from tensorrt_llm.serve.responses_utils import ResponseHooks
+from tensorrt_llm.serve.perf_metrics import (
+    _PERF_METRICS_HEADER_BUDGET_BYTES,
+    CLOCK_SYNC_HEADER,
+    RETURN_METRICS_HEADER,
+    SERVER_TIMING_HEADER,
+    SSE_METRICS_EVENT,
+    START_END_TIME_HEADER,
+    PerfMetricsMiddleware,
+    adjusted_clock_from_headers,
+)
+from tensorrt_llm.serve.responses_utils import ResponseHooks, ServerArrivalTimeMiddleware
 from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only
@@ -39,6 +50,41 @@ def _reset_prometheus_registry():
 
     REGISTRY._names_to_collectors = {}
     REGISTRY._collector_to_names = {}
+
+
+def test_adjusted_steady_clock_uses_reference_domain():
+    source = Mock(return_value=10.0)
+    clock = AdjustedSteadyClock(2.0, time_source=source)
+
+    assert clock.now() == 12.0
+    assert clock.to_reference_time(20.0) == 22.0
+
+    clock.set_reference_offset(-3.0)
+    assert clock.now() == 7.0
+
+
+@pytest.mark.asyncio
+async def test_worker_clock_calibration_uses_global_clock():
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = object.__new__(OpenAIServer)
+    global_clock = Mock(side_effect=[10.0, 10.2])
+    delay = AsyncMock()
+    with (
+        patch(
+            "tensorrt_llm.serve.openai_server.get_global_steady_clock_now_in_seconds",
+            global_clock,
+        ),
+        patch("tensorrt_llm.serve.openai_server.asyncio.sleep", delay),
+    ):
+        response = await server.get_steady_clock_offset()
+
+    assert json.loads(response.body) == {
+        "receive_ts": 10.0,
+        "transmit_ts": 10.2,
+    }
+    assert global_clock.call_count == 2
+    delay.assert_awaited_once_with(0.2)
 
 
 @pytest.fixture
@@ -98,6 +144,54 @@ def streaming_completion_request():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("process_offset", [0.0, 1000.0])
+async def test_perf_metrics_middleware_reports_effective_frontend_clock(process_offset):
+    """Each frontend shard reports timestamps in its effective metrics clock."""
+    sent = []
+
+    async def app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    async def send(message):
+        sent.append(message)
+
+    clock = AdjustedSteadyClock(process_offset, time_source=Mock(side_effect=[10.0, 10.25]))
+    middleware = ServerArrivalTimeMiddleware(
+        PerfMetricsMiddleware(
+            app,
+            expose_headers=True,
+            adjusted_clock=clock,
+        ),
+        adjusted_clock=clock,
+    )
+    scope = {
+        "type": "http",
+        "headers": [(RETURN_METRICS_HEADER.lower().encode(), b"1")],
+    }
+    await middleware(scope, AsyncMock(), send)
+
+    response_headers = dict(sent[0]["headers"])
+    assert response_headers[CLOCK_SYNC_HEADER.encode()].decode() == (
+        f"receive;ts={10.0 + process_offset:.9f}, transmit;ts={10.25 + process_offset:.9f}"
+    )
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        {},
+        {CLOCK_SYNC_HEADER: "receive;ts=invalid, transmit;ts=1"},
+        {CLOCK_SYNC_HEADER: "receive;ts=1"},
+        {CLOCK_SYNC_HEADER: "receive;ts=nan, transmit;ts=1"},
+    ],
+)
+def test_invalid_clock_sync_header_is_ignored(header):
+    clock = adjusted_clock_from_headers(header, 1.0, 2.0)
+    assert clock.to_reference_time(1.0) == 1.0
+
+
 class TestOpenAIHttpClient:
     """Test OpenAIHttpClient main functionality."""
 
@@ -124,6 +218,109 @@ class TestOpenAIHttpClient:
         assert client._role == ServerRole.GENERATION
         assert client._session == mock_session
         assert client._max_retries == 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("clock_delta", [0.0, 1000.0])
+    async def test_request_metrics_normalize_frontend_clock_domain(
+        self,
+        clock_delta,
+        openai_client,
+        completion_request,
+        mock_session,
+    ):
+        """Metrics from synchronized and unsynchronized shards share one clock."""
+        openai_client._request_perf_metrics = True
+        response = self.dummy_response()
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {
+            "Content-Type": "application/json",
+            CLOCK_SYNC_HEADER: (
+                f"receive;ts={100.05 + clock_delta:.9f}, transmit;ts={100.35 + clock_delta:.9f}"
+            ),
+            START_END_TIME_HEADER: (
+                f"server-start;ts={100.1 + clock_delta:.9f}, "
+                f"server-end;ts={100.3 + clock_delta:.9f}"
+            ),
+            SERVER_TIMING_HEADER: (
+                "server_queue;dur=10.0, server_ttft;dur=50.0, server_e2e;dur=200.0"
+            ),
+        }
+        http_response.json = AsyncMock(return_value=response.model_dump())
+        http_response.__aenter__ = AsyncMock(return_value=http_response)
+        http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        with patch(
+            "tensorrt_llm.serve.openai_client.get_steady_clock_now_in_seconds",
+            side_effect=[100.0, 100.4, 100.5],
+        ):
+            await openai_client.send_request(completion_request, hooks=hooks)
+
+        _, role, record = hooks.on_perf_metrics.call_args.args
+        timing = record["phases"]["ctx"]["timing_metrics"]
+        assert role == "ctx"
+        assert timing["arrival_time"] == pytest.approx(100.1)
+        assert timing["first_scheduled_time"] == pytest.approx(100.11)
+        assert timing["first_token_time"] == pytest.approx(100.15)
+        assert timing["last_token_time"] == pytest.approx(100.3)
+
+    @pytest.mark.asyncio
+    async def test_streaming_metrics_normalize_frontend_clock_domain(
+        self,
+        openai_client,
+        streaming_completion_request,
+        mock_session,
+    ):
+        openai_client._request_perf_metrics = True
+        clock_delta = 1000.0
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {
+            "Content-Type": "text/event-stream",
+            CLOCK_SYNC_HEADER: (
+                f"receive;ts={100.05 + clock_delta:.9f}, transmit;ts={100.35 + clock_delta:.9f}"
+            ),
+        }
+        metrics_headers = {
+            START_END_TIME_HEADER: (
+                f"server-start;ts={100.1 + clock_delta:.9f}, "
+                f"server-end;ts={100.3 + clock_delta:.9f}"
+            ),
+            SERVER_TIMING_HEADER: (
+                "server_queue;dur=10.0, server_ttft;dur=50.0, server_e2e;dur=200.0"
+            ),
+        }
+        metrics_event = (
+            f"event: {SSE_METRICS_EVENT}\ndata: {json.dumps(metrics_headers)}\n\n"
+        ).encode()
+
+        async def mock_iter_any():
+            yield b'data: "Hello"\n\ndata: [DONE]\n\n'
+            yield metrics_event
+
+        http_response.content = AsyncMock()
+        http_response.content.iter_any = mock_iter_any
+        http_response.__aenter__ = AsyncMock(return_value=http_response)
+        http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        with patch(
+            "tensorrt_llm.serve.openai_client.get_steady_clock_now_in_seconds",
+            side_effect=[100.0, 100.4, 100.45, 100.5, 100.6],
+        ):
+            generator = await openai_client.send_request(streaming_completion_request, hooks=hooks)
+            chunks = [chunk async for chunk in generator]
+
+        assert b"".join(chunks) == b'data: "Hello"\n\ndata: [DONE]\n\n'
+        _, role, record = hooks.on_perf_metrics.call_args.args
+        timing = record["phases"]["ctx"]["timing_metrics"]
+        assert role == "ctx"
+        assert timing["arrival_time"] == pytest.approx(100.1)
+        assert timing["first_token_time"] == pytest.approx(100.15)
+        assert timing["last_token_time"] == pytest.approx(100.3)
 
     @pytest.mark.asyncio
     async def test_internal_client_accepts_perf_metrics_header_size(self, mock_router):
@@ -278,6 +475,49 @@ class TestOpenAIHttpClient:
         for i, chunk in enumerate(chunks):
             assert chunk == dummy_data[i]
         mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_perf_metrics_preserve_sse_event_boundaries(
+        self, openai_client, streaming_completion_request, mock_session, mock_router
+    ):
+        openai_client._request_perf_metrics = True
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        response_data = b'data: {"choices":[{"text":"Hello"}]}\n\n'
+        done_data = b"data: [DONE]\n\n"
+        metrics_data = (
+            f'event: {SSE_METRICS_EVENT}\ndata: {{"Server-Timing":"server_ttft;dur=1.0"}}\n\n'
+        ).encode()
+        marker_split = len("event: trtllm")
+
+        async def mock_iter_any():
+            yield response_data
+            yield done_data + metrics_data[:marker_split]
+            yield metrics_data[marker_split:]
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        response_generator = await openai_client.send_request(
+            streaming_completion_request, hooks=hooks
+        )
+        chunks = [chunk async for chunk in response_generator]
+
+        assert chunks == [response_data, done_data]
+        hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
+        hooks.on_perf_metrics.assert_called_once()
+        hooks.on_resp_done.assert_called_once_with(
+            "localhost:8000", streaming_completion_request, None
+        )
         mock_router.finish_request.assert_called_once_with(
             streaming_completion_request, mock_session, success=True
         )
@@ -480,6 +720,7 @@ class TestHttpErrorBodyPreservation:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -540,6 +781,7 @@ class TestDisaggIdRegenOnRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -640,6 +882,7 @@ class TestSelectiveTransientTcpRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))

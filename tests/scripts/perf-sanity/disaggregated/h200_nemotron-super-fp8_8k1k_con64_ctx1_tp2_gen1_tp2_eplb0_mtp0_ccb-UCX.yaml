@@ -64,6 +64,7 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
     disable_overlap_scheduler: false
   ctx:
     print_iter_log: true
@@ -86,4 +87,5 @@ worker_config:
       backend: TRTLLM
     cache_transceiver_config:
       backend: UCX
+      transceiver_runtime: CPP
     disable_overlap_scheduler: false

@@ -1,0 +1,48 @@
+# Kimi K3 NVFP4 on DEP16 (4 nodes x 4 GPU).
+# Derived from the DEP8 variant; kept separate from the shared MXFP4 DEP16
+# template so that one stays untouched.
+#
+# DEP8 does not fit. The parameters alone exceed a 288 GB GB300 at EP8: the
+# per-rank footprint is NOT checkpoint_bytes / 8, because enable_attention_dp
+# replicates every non-routed weight on every rank, and Kimi K3 converts the
+# checkpoint's FP8 attention to BF16 online (KIMI_K3_FP8_WEIGHT_READ is off by
+# default), doubling it. Halving the routed-expert share is what buys the
+# headroom back. See Phase 3 for making the attention weights read as FP8.
+#
+# max_batch_size is 8, not the template's 32. The V2 Mamba cache reserves a
+# full recurrent-state slot per resident sequence (69 KDA layers, fp32 state,
+# ~0.42 GiB/slot), so the manager's minimum live quota scales with it: at 32 it
+# demands 14.39 GiB. NVFP4 cannot pay that here. Its in-memory weights are
+# ~4.8 GiB LARGER per rank than MXFP4's (200.36 vs 195.58 GiB) even though its
+# checkpoint is smaller -- NVFP4 carries an FP8 block scale per 16 elements
+# where MXFP4 carries one UE8M0 per 32, i.e. 0.5625 vs 0.53125 bytes/element --
+# and the MXFP4 DEP16 recipe only had 1.06 GiB of slack in the second KV
+# sizing pass. Lowering the batch lowers the minimum instead of the headroom.
+# It costs eval wall time, not accuracy.
+#
+# backend: CUTLASS is required, not a preference -- AUTO resolves Kimi K3 to
+# TRTLLM, and trtllm-gen ships SiTu cubins for W4A8_MXFP4_MXFP8 only.
+#
+# moe_config.max_num_tokens stays at the inherited value: for CUTLASS it is a
+# per-call chunking bound. Do NOT carry it over to MEGAMOE_* backends, where
+# it is the SymmBuffer capacity and this value over-provisions it 32x.
+tensor_parallel_size: 16
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+max_batch_size: 8
+max_num_tokens: 8192
+max_seq_len: 8192
+trust_remote_code: true
+disable_overlap_scheduler: false
+enable_chunked_prefill: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 8
+moe_config:
+  backend: CUTLASS
+  max_num_tokens: 131072
+  use_low_precision_moe_combine: true
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

@@ -71,9 +71,57 @@ python -m agent_flow.workflows.modeling_bringup.cli \
 
 ![Modeling-bringup workflow](docs/workflow.svg)
 
-## Human Feedback
+## Running with a human in the loop
 
-You can run a task incrementally by passing feedback with `--feedback`:
+`modeling-bringup` is built to run with a human in the loop, not fully
+unattended. This section covers why that matters, how to watch a run, and how
+to steer it with feedback.
+
+### Why human involvement is needed
+
+The workflow needs to respond to human intervention quickly and effectively:
+
+- A human may discover partway through that the plan is unreasonable, and then
+  adjust it accordingly.
+- When the delivery deadline is tight, human intervention becomes necessary —
+  the human frequently offers suggestions on the agents' execution to keep the
+  run on the fastest path to a working model.
+
+An unattended run will still converge in many cases, but a human who watches
+the intermediate artifacts and injects course corrections at the right moments
+is typically both faster and more reliable — especially for models where
+accuracy tuning is delicate.
+
+### Observing the modeling agent's execution
+
+A run continuously writes its state into the workspace as a set of intermediate
+files:
+
+- `plan.md` — the current implementation plan and risk register.
+- `acceptance-criteria.md` — the outcome-bound pass/fail checklist QA verifies
+  against.
+- `progress.yaml` — an append-only audit log of every plan/build/QA turn, with
+  each agent's `decision` and `weighted_score`, plus the `human_feedback`
+  entries.
+- `status.md` — a rolling scratchpad the Coder and Reviewer overwrite each turn;
+  in replan mode its `## Stages & Goals` table at the top is the live state
+  machine (see below).
+- `.agent_team_state.json` — the checkpoint (current stage + iteration indices).
+
+You can tail these directly, but the recommended way to observe a run is to
+**open a second, independent Claude Code or Codex session** pointed at the same
+workspace and ask it to read these files and report back — for example, "read
+`progress.yaml` and `status.md` in this workspace and tell me which Stage we're
+on, what the last QA verdict was, and whether the run is stuck." That gives you
+a natural-language summary of a long run without parsing the raw artifacts
+yourself, and you can keep asking the observer session follow-up questions while
+the main run keeps going.
+
+### Steering the run with feedback
+
+**Delivering feedback.** Feedback is delivered by stopping the run (Ctrl-C) and
+re-running the same command with `--feedback`. Because the workspace holds all
+state, the run resumes from its checkpoint and folds in your note:
 
 ```bash
 modeling-bringup \
@@ -82,18 +130,65 @@ modeling-bringup \
     --feedback "your feedback for the next iteration"
 ```
 
-`agent-flow` restores the previous run from the workspace state files, then
-continues the task with the new feedback. This lets you steer the workflow one
-iteration at a time without losing the plan, progress, or checkpoint state.
+By default `--feedback` appends your note to `progress.yaml`'s `human_feedback`
+list, and the build-phase agents (Coder, Reviewer, QA) pick it up on their next
+turn. This lets you steer the workflow one iteration at a time without losing
+the plan, progress, or checkpoint state. (Use `--clean` instead to wipe the
+workspace and restart from the plan phase.)
 
-To rerun a task from scratch, add `--clean`:
+**Why the workflow keeps replanning.** Simply making a plan once at the start is
+not enough:
+
+- The initial plan gradually becomes ineffective as requirements shift.
+- The changing product requirements call for adjustments to the plan.
+
+To keep the plan alive, run with `--replan-on-qa`. After every QA turn the
+PlanDrafter is re-invoked in *replan mode* to revise `plan.md` and
+`acceptance-criteria.md` from the latest coder/reviewer/qa findings, and it —
+not QA — decides whether the task is `DONE`, needs a quick polish (straight back
+to the Coder), or a major rewrite (routed through the PlanReviewer first).
+
+To make your feedback drive a replan *immediately* instead of waiting for the
+agents to consume it on their own turn, combine the flags:
 
 ```bash
 modeling-bringup \
     --task task.yaml \
     --workspace workspace/modeling-bringup \
-    --clean
+    --replan-on-qa \
+    --trigger-replan-with-feedback \
+    --feedback "the plan should ...; drop the ... goal"
 ```
+
+On resume, `--trigger-replan-with-feedback` jumps straight into the replan
+sub-cycle so the PlanDrafter folds your new feedback (and the latest findings)
+into `plan.md` / `acceptance-criteria.md` before any further coding, rather than
+resuming at the saved build stage. It requires `--replan-on-qa`, and is a no-op
+on a fresh run or when `--feedback` is absent.
+
+**Stages and Goals.** Replan mode also introduces a **Stage/Goal** breakdown
+that makes a run far easier to observe and steer. `plan.md`'s implementation
+steps are organized into numbered Stages, each with an explicit exit criterion,
+and each Stage holds a list of Goals (`Goal <Stage>.<Goal>`). `status.md` carries
+a `## Stages & Goals` table at the top that is the live state machine:
+
+- **Stage** states: `PENDING`, `IN_PROGRESS`, `CLOSED (pending QA)`, `CLOSED`
+  (verified by QA), and `INTERRUPTED` (preempted by a feedback-triggered
+  replan).
+- **Goal** states: `[Undo]` (not started), `[Doing]` (active, with an
+  `(iterations=N)` counter), `[Done]`, `[Failed]`, and `[Skipped]` (superseded
+  by a feedback-triggered replan).
+
+The Coder works exactly one `[Doing]` Goal per turn, and the Reviewer and
+replan-mode PlanDrafter own the state transitions. For a modeling bring-up the
+Stages typically map to the bring-up milestones — e.g. Stage 1 accuracy
+convergence on a simple backend, Stage 2 the production performance backends,
+Stage 3 cuda_graph + overlap_scheduler — so at a glance you can see which
+milestone the run is on, which Goal is active, and how many iterations it has
+spent there. This is the single most useful thing for the observer session (or
+you) to read when deciding whether and how to intervene.
+
+![Human-in-the-loop operation](docs/human-in-the-loop.svg)
 
 ## Task file
 

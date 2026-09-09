@@ -2,7 +2,7 @@
 
 set -ex
 
-FLASH_ATTN_4_VERSION="4.0.0b11"
+FLASH_ATTN_4_VERSION="4.0.0b19"
 
 if [ -n "${GITHUB_MIRROR}" ]; then
   export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"

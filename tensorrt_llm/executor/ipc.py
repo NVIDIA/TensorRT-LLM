@@ -196,6 +196,21 @@ class ZeroMqQueue:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
 
+    def put_nowait(self, obj: Any, routing_id: Optional[bytes] = None):
+        """Send an object without waiting for a writable peer.
+
+        Raises:
+            zmq.Again: If the socket cannot accept the message immediately.
+        """
+        self.setup_lazily()
+        self._check_thread_safety()
+        with nvtx_range_debug("send", color="blue", category="IPC"):
+            if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
+                data = self._prepare_data(obj)
+                self._send_data(data, flags=zmq.NOBLOCK, routing_id=routing_id)
+            else:
+                self.socket.send_pyobj(obj, flags=zmq.NOBLOCK)
+
     def put_noblock(self,
                     obj: Any,
                     *,

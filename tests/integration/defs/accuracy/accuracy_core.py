@@ -34,11 +34,37 @@ from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.sampling_params import LogitsProcessor
 
 from ..common import venv_check_call, venv_mpi_check_call
 from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
 from .video_mme import VideoMME as VideoMMEEvaluator
+
+
+class ForceTokenLogitsProcessor(LogitsProcessor):
+
+    def __init__(self, forced_token_id: int) -> None:
+        self._forced_token_id = forced_token_id
+
+    def __call__(
+        self,
+        req_id: int,
+        logits: torch.Tensor,
+        token_ids: list[list[int]],
+        stream_ptr: int | None,
+        client_id: int | None,
+    ) -> None:
+        del req_id, token_ids, client_id
+        if stream_ptr is None:
+            self._force_token(logits)
+            return
+        with torch.cuda.stream(torch.cuda.ExternalStream(stream_ptr)):
+            self._force_token(logits)
+
+    def _force_token(self, logits: torch.Tensor) -> None:
+        logits.fill_(float("-inf"))
+        logits[..., self._forced_token_id] = 0
 
 
 def compute_theta(num_samples: int,
@@ -123,6 +149,84 @@ Evaluated {self.metric_name}: {accuracy:.3f}
             assert accuracy >= self.threshold, err_msg
         else:
             assert accuracy <= self.threshold, err_msg
+
+
+def compute_acceptance_length(llm: PyTorchLLM) -> float:
+    """Mean acceptance length over speculative iterations.
+
+    Requires enable_iter_perf_stats=True. Used by the AL-regression tests.
+    """
+    stats = llm.get_stats(timeout=2)
+    spec_iters = [
+        stat["specDecodingStats"] for stat in stats
+        if stat.get("specDecodingStats")
+        and stat["specDecodingStats"]["numDraftTokens"] > 0
+    ]
+    assert spec_iters, "No iterations with speculative decoding stats"
+    accepted = sum(stat["numAcceptedTokens"] for stat in spec_iters)
+    requests = sum(stat["numRequestsWithDraftTokens"] for stat in spec_iters)
+    return (accepted + requests) / requests
+
+
+def assert_acceptance_length(test_key: str, al_value: float) -> None:
+    """Assert acceptance length meets the registered minimum.
+
+    Reads ``references/acceptance_length.yaml`` and checks
+    ``al_value >= entry["min_al"]``.
+
+    Args:
+        test_key: Key in acceptance_length.yaml identifying the test variant,
+            e.g. ``"TestLlama3_1_8BInstruct::test_dflash"``.
+        al_value: Observed mean acceptance length to check.
+
+    Population:
+        Set ``TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1`` to write the observed
+        value as ``ref_al`` and set ``min_al`` to 95% of it. The YAML key
+        must already exist; add a ``ref_al: null`` / ``min_al: null`` stub
+        when introducing a new test baseline.
+
+    Raises:
+        KeyError: If test_key is absent from the YAML.
+        ValueError: If the YAML entry has ``min_al: null`` (not yet populated).
+        AssertionError: If al_value < min_al.
+    """
+    populate = os.getenv("TRTLLM_POPULATE_ACCEPTANCE_LENGTH") == "1"
+    if os.getenv("TRTLLM_ACCURACY_NO_REFERENCE") == "1" and not populate:
+        return
+
+    _ref_dir = f"{os.path.dirname(__file__)}/references"
+    yaml_path = f"{_ref_dir}/acceptance_length.yaml"
+    with open(yaml_path) as _f:
+        baselines: dict = yaml.safe_load(_f)
+
+    entry = baselines.get(test_key)
+    if entry is None:
+        raise KeyError(f"No acceptance-length baseline for '{test_key}'. "
+                       f"Add an entry to {yaml_path} after a GPU run.")
+
+    if populate:
+        entry["ref_al"] = al_value
+        entry["min_al"] = al_value * 0.95
+
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(baselines, f, sort_keys=False)
+
+        print(f"[AL] populated {test_key}: "
+              f"ref_al={entry['ref_al']:.6f}, min_al={entry['min_al']:.6f}")
+        return
+    min_al = entry.get("min_al")
+    if min_al is None:
+        raise ValueError(
+            f"Acceptance-length baseline for '{test_key}' has min_al=null. "
+            "Populate min_al after a GPU run, or set "
+            "TRTLLM_ACCURACY_NO_REFERENCE=1 to skip the check.")
+
+    ref_al = entry.get("ref_al")
+    ref_str = f"{ref_al:.3f}" if isinstance(ref_al, (int, float)) else "null"
+    assert al_value >= min_al, (
+        f"[AL] Regression: {test_key}: "
+        f"acceptance_length={al_value:.3f} < min_al={min_al:.3f} "
+        f"(ref_al={ref_str})")
 
 
 class AccuracyTask:

@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
+from typing import Any, Callable, Optional, TypeAlias, TypeVar
 
 from strenum import StrEnum
 
@@ -28,6 +28,10 @@ from ..llm_request import (
 RequestList = list[LlmRequest]
 PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
 PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
+# Radix-tree key returned by `PrefixReuseSummary.first_new_block`. Used only as a
+# hashable set element, so the mock KV manager in the unit tests substitutes a
+# plain tuple; the alias documents the production type.
+BlockKey: TypeAlias = tb_internal.batch_manager.BlockKey
 T = TypeVar("T")
 
 
@@ -63,21 +67,52 @@ def _call_with_optional_summary(
     return fn(*args, cached_summary=cached_summary)
 
 
-SchedulerOutput = namedtuple(
-    "SchedulerOutput",
-    [
-        "encoder_requests",
-        "context_requests",
-        "generation_requests",
-        "paused_requests",
-        "fitting_disagg_gen_init_requests",
-        "num_fitting_requests",
-        # request id -> prompt-ordered indices of its MM items selected for
-        # encoder execution this iteration
-        "scheduled_mm_encoder_items",
-    ],
-    defaults=[None],
-)
+class SchedulerOutput(
+    namedtuple(
+        "_SchedulerOutputBase",
+        [
+            "encoder_requests",
+            "context_requests",
+            "generation_requests",
+            "paused_requests",
+            "fitting_disagg_gen_init_requests",
+            "num_fitting_requests",
+            "scheduled_mm_encoder_items",
+            "recompute_paused_requests",
+        ],
+    )
+):
+    """Scheduler result.
+
+    ``scheduled_mm_encoder_items`` defaults to ``None``. The V2-only
+    ``recompute_paused_requests`` defaults to a fresh empty list so existing
+    V1 schedulers can keep constructing the original six-field output.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        encoder_requests: RequestList,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        paused_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        num_fitting_requests: int,
+        scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
+        recompute_paused_requests: RequestList | None = None,
+    ):
+        return super(SchedulerOutput, cls).__new__(
+            cls,
+            encoder_requests,
+            context_requests,
+            generation_requests,
+            paused_requests,
+            fitting_disagg_gen_init_requests,
+            num_fitting_requests,
+            scheduled_mm_encoder_items,
+            [] if recompute_paused_requests is None else recompute_paused_requests,
+        )
 
 
 def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
@@ -165,7 +200,9 @@ class ScheduledRequests:
     generation_requests: RequestList
     """Requests that are in the generation phase."""
     paused_requests: RequestList
-    """Requests that are paused."""
+    """Requests whose KV cache was suspended without resetting request state."""
+    recompute_paused_requests: RequestList
+    """Requests that must release resources and restart from context."""
     added_inflight_req_ids: list[int]
     """Request ids this batch inserted into the executor's inflight set.
 
@@ -187,6 +224,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
@@ -309,6 +347,8 @@ class SerializableSchedulerOutput:
     # request id -> prompt-ordered indices of its MM items selected for
     # encoder execution this iteration
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+    recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
+    """Request ids of recompute-paused requests."""
 
     @classmethod
     def from_scheduler_result(
@@ -334,6 +374,9 @@ class SerializableSchedulerOutput:
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
             scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
+            recompute_paused_requests=[
+                req.request_id for req in scheduled_requests.recompute_paused_requests
+            ],
         )
 
     def to_scheduler_result(
@@ -357,6 +400,9 @@ class SerializableSchedulerOutput:
             id_to_request[req_id] for req_id in self.paused_requests
         ]
         scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
+        scheduled_requests.recompute_paused_requests = [
+            id_to_request[req_id] for req_id in self.recompute_paused_requests
+        ]
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]
@@ -1064,7 +1110,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 )
 
         # Sort requests for consistency with C++
-        # C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        # C++ reference: sortRequests in microBatchScheduler.cpp
         encoder_requests.sort(key=_get_lora_task_id)
         self._sort_requests(context_requests, generation_requests, not all_context_requests_fit)
 
@@ -1085,7 +1131,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     ) -> None:
         """
         Sort requests for consistency with C++.
-        C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        C++ reference: sortRequests in microBatchScheduler.cpp
 
         1. If chunks are present, move context requests that reached the last
            context chunk to the end of the vector.
@@ -1402,8 +1448,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         skipping_is_relevant = scheduler._is_skipping_relevant()
 
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[BlockKey] = set()
+        newly_contributed_cross_context_blocks: set[BlockKey] = set()
         # Summary caches are populated lazily by _beneficial_to_skip during the
         # pending-loop; enough_available_blocks / decrement_reserved_blocks read
         # them via .get() so only requests that actually walked the tree pay
@@ -1470,17 +1516,21 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             "a cross_kv_cache_manager."
                         )
 
-                    if (
+                    # Computed once and reused at the registration sites below, so
+                    # the check and the registration cannot drift apart. Mirrors
+                    # C++ `skipTrackingApplies` (capacityScheduler.cpp:369-370).
+                    skip_tracking_applies = (
                         not self.static_batch
                         and skipping_is_relevant
-                        and not req.is_disagg_generation_init_state
-                        and scheduler._beneficial_to_skip(
-                            req,
-                            newly_contributed_context_blocks,
-                            newly_contributed_cross_context_blocks,
-                            summary_by_req=summary_by_req,
-                            cross_summary_by_req=cross_summary_by_req,
-                        )
+                        and scheduler._skip_tracking_applies(req)
+                    )
+
+                    if skip_tracking_applies and scheduler._beneficial_to_skip(
+                        req,
+                        newly_contributed_context_blocks,
+                        newly_contributed_cross_context_blocks,
+                        summary_by_req=summary_by_req,
+                        cross_summary_by_req=cross_summary_by_req,
                     ):
                         continue
 
@@ -1512,6 +1562,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             lora_task_id, is_new_task, needed_peft_pages = (
                                 scheduler._get_peft_task_info(req, uniq_task_ids)
                             )
+                            # A PEFT-page shortage skips to the next request without
+                            # registering anything: this request contributes no blocks
+                            # in this iteration.
                             if needed_peft_pages > available_peft_pages:
                                 continue
                             available_peft_pages -= needed_peft_pages
@@ -1519,6 +1572,18 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                                 uniq_task_ids.add(lora_task_id)
 
                         scheduled_requests.append(req)
+                        # No-op today: `_skip_tracking_applies` is context-init-only,
+                        # whereas C++ also registers the cross key for admitted
+                        # encoder requests — a pre-existing divergence. Call site kept
+                        # symmetric so closing that gap stays a one-predicate change.
+                        if skip_tracking_applies:
+                            scheduler._register_contributed_blocks(
+                                req,
+                                newly_contributed_context_blocks,
+                                newly_contributed_cross_context_blocks,
+                                summary_by_req=summary_by_req,
+                                cross_summary_by_req=cross_summary_by_req,
+                            )
 
                     elif req.is_context_init_state or req.is_disagg_generation_init_state:
                         enough_blocks = reserved_blocks.enough_available_blocks(
@@ -1533,7 +1598,9 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                         if not enough_blocks or not enough_cross_blocks:
                             break
 
-                        # PEFT check only when needed
+                        # PEFT check only when needed. A shortage skips to the next
+                        # request without registering anything: this request
+                        # contributes no blocks in this iteration.
                         if has_peft:
                             lora_task_id, is_new_task, needed_peft_pages = (
                                 scheduler._get_peft_task_info(req, uniq_task_ids)
@@ -1551,6 +1618,14 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                         if reserved_cross_blocks is not None:
                             reserved_cross_blocks.decrement_reserved_blocks(
                                 req, cached_summary=cached_cross_summary
+                            )
+                        if skip_tracking_applies:
+                            scheduler._register_contributed_blocks(
+                                req,
+                                newly_contributed_context_blocks,
+                                newly_contributed_cross_context_blocks,
+                                summary_by_req=summary_by_req,
+                                cross_summary_by_req=cross_summary_by_req,
                             )
 
         return scheduled_requests, []
@@ -1630,10 +1705,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                     f"Encoder-init request {req.request_id} requires a cross_kv_cache_manager."
                 )
 
+            # No cross tracking on this path (C++ passes std::nullopt for
+            # crossSummary), so pass None and skip the cross-pool walk entirely.
             if skipping_is_relevant and scheduler._beneficial_to_skip(
                 req,
                 newly_contributed_context_blocks,
-                set(),
+                None,
                 summary_by_req=summary_by_req,
             ):
                 req_it += 1
@@ -1653,6 +1730,17 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
 
             if was_scheduled:
                 logger.debug(f"MaxUtilizationScheduler: request ID {req.request_id} -> start")
+                # Register only now. The failure branch below pauses a started request and
+                # retries this same request without advancing req_it; registering at check
+                # time would put this request's own first_new_block in the set and make it
+                # skip itself on that retry — wasting the capacity the pause just freed.
+                if skipping_is_relevant:
+                    scheduler._register_contributed_blocks(
+                        req,
+                        newly_contributed_context_blocks,
+                        None,
+                        summary_by_req=summary_by_req,
+                    )
                 req_it += 1
             else:
                 last_started_idx = None
@@ -1970,15 +2058,17 @@ class PyCapacityScheduler:
             return False
         return True
 
-    def _prefill_contributed_blocks(self, active_requests: RequestList) -> tuple[set, set]:
+    def _prefill_contributed_blocks(
+        self, active_requests: RequestList
+    ) -> tuple[set[BlockKey], set[BlockKey]]:
         """
         Collect blocks contributed by chunked context requests already executing.
         These blocks can be reused by later requests.
 
         C++ reference: capacityScheduler.cpp:34-68 (prefillWithChunkedContextsAlreadyExecuting)
         """
-        newly_contributed_context_blocks: Set = set()
-        newly_contributed_cross_context_blocks: Set = set()
+        newly_contributed_context_blocks: set[BlockKey] = set()
+        newly_contributed_cross_context_blocks: set[BlockKey] = set()
 
         if self.kv_cache_manager is None or not self.enable_prefix_aware_scheduling:
             return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
@@ -2014,11 +2104,71 @@ class PyCapacityScheduler:
         """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`."""
         return {}, {}
 
+    def _skip_tracking_applies(self, req: LlmRequest) -> bool:
+        """Whether this request participates in duplicate-deferral tracking at all.
+
+        Gates both `_beneficial_to_skip` and `_register_contributed_blocks` so the
+        check and the registration can never drift apart. Callers hoist this into
+        one per-request local and reuse it at every site.
+
+        Mirrors C++ `isFirstChunkContext` (capacityScheduler.cpp:323-324, :547-548),
+        including its defensive `!isDisaggGenerationInitState()`: that state is
+        disjoint from CONTEXT_INIT today, so the clause is redundant, but keeping
+        it here means the whole predicate lives in exactly one place.
+        """
+        if not self.enable_prefix_aware_scheduling:
+            return False
+        return (
+            req.is_context_init_state
+            and req.is_first_context_chunk
+            and not req.is_disagg_generation_init_state
+        )
+
+    def _ctx_first_new_block(
+        self, req: LlmRequest, summary_by_req: Optional[PrefixSummaryCache] = None
+    ) -> Optional[BlockKey]:
+        """Return the self-pool firstNewBlock key for `req`, or None if there is none.
+
+        Populates `summary_by_req` on the way so later helpers
+        (`enough_available_blocks`, `decrement_reserved_blocks`) reuse the same
+        radix-tree walk. This mirrors the C++ single-walk-per-request convention.
+        """
+        if self.kv_cache_manager is None or not self.kv_cache_manager.enable_block_reuse:
+            return None
+        req_id = req.py_request_id
+        summary = summary_by_req.get(req_id) if summary_by_req is not None else None
+        if summary is None:
+            unique_tokens = req.get_unique_tokens(0)
+            summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+            if summary_by_req is not None:
+                summary_by_req[req_id] = summary
+        return summary.first_new_block
+
+    def _cross_first_new_block(
+        self, req: LlmRequest, cross_summary_by_req: Optional[PrefixSummaryCache] = None
+    ) -> Optional[BlockKey]:
+        """Return the cross-pool firstNewBlock key for `req`, or None if there is none."""
+        if (
+            self.cross_kv_cache_manager is None
+            or not self.cross_kv_cache_manager.enable_block_reuse
+        ):
+            return None
+        req_id = req.py_request_id
+        summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
+        if summary is None:
+            encoder_unique_tokens = req.get_encoder_unique_tokens()
+            if encoder_unique_tokens is None:
+                return None
+            summary = self.cross_kv_cache_manager.analyze_prefix_reuse(encoder_unique_tokens, req)
+            if cross_summary_by_req is not None:
+                cross_summary_by_req[req_id] = summary
+        return summary.first_new_block
+
     def _beneficial_to_skip(
         self,
         req: LlmRequest,
-        newly_contributed_context_blocks: set,
-        newly_contributed_cross_context_blocks: set,
+        newly_contributed_context_blocks: set[BlockKey],
+        newly_contributed_cross_context_blocks: Optional[set[BlockKey]],
         summary_by_req: Optional[PrefixSummaryCache] = None,
         cross_summary_by_req: Optional[PrefixSummaryCache] = None,
     ) -> bool:
@@ -2027,62 +2177,68 @@ class PyCapacityScheduler:
         A request should be skipped if it can reuse blocks contributed by
         already scheduled context requests.
 
-        When the request is NOT skipped, its firstNewBlock contributions are
-        registered so that subsequent duplicate requests can be deferred.
+        Pure with respect to the contribution sets: this does NOT register the
+        request's own firstNewBlock. Callers must invoke
+        `_register_contributed_blocks` once the request has actually been
+        scheduled — registering at check time would defer later duplicates on
+        behalf of a contributor the budget checks then reject, and in
+        MaxUtilization it would make a request skip itself on the retry that
+        follows a pause.
+
+        `newly_contributed_cross_context_blocks=None` means the caller does no
+        cross-pool tracking, and suppresses the cross walk entirely. Mirrors the
+        `std::nullopt` crossSummary the C++ MaxUtilization path passes.
 
         C++ reference: capacityScheduler.cpp (beneficialToSkip / oneManagerBeneficialToSkip)
         """
-        if not self.enable_prefix_aware_scheduling:
-            return False
-        if not (req.is_context_init_state and req.is_first_context_chunk):
+        if not self._skip_tracking_applies(req):
             return False
 
-        ctx_new_block = None
-        cross_new_block = None
-        req_id = req.py_request_id
-
-        if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
-            # Use the cached summary when present; otherwise walk the tree
-            # once and stash the result so later helpers
-            # (`enough_available_blocks`, `decrement_reserved_blocks`) can
-            # reuse it. This mirrors C++ capacityScheduler.cpp:295-302.
-            summary = summary_by_req.get(req_id) if summary_by_req is not None else None
-            if summary is None:
-                unique_tokens = req.get_unique_tokens(0)
-                summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
-                if summary_by_req is not None:
-                    summary_by_req[req_id] = summary
-            if summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_context_blocks:
-                    return True
-                ctx_new_block = summary.first_new_block
-
+        ctx_new_block = self._ctx_first_new_block(req, summary_by_req)
+        if ctx_new_block is not None and ctx_new_block in newly_contributed_context_blocks:
+            return True
+        if newly_contributed_cross_context_blocks is None:
+            return False
+        cross_new_block = self._cross_first_new_block(req, cross_summary_by_req)
         if (
-            self.cross_kv_cache_manager is not None
-            and self.cross_kv_cache_manager.enable_block_reuse
+            cross_new_block is not None
+            and cross_new_block in newly_contributed_cross_context_blocks
         ):
-            summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
-            if summary is None:
-                encoder_unique_tokens = req.get_encoder_unique_tokens()
-                if encoder_unique_tokens is not None:
-                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                        encoder_unique_tokens, req
-                    )
-                    if cross_summary_by_req is not None:
-                        cross_summary_by_req[req_id] = summary
-            if summary is not None and summary.first_new_block is not None:
-                if summary.first_new_block in newly_contributed_cross_context_blocks:
-                    return True
-                cross_new_block = summary.first_new_block
+            return True
+        return False
 
-        # Request is NOT skipped — register contributions so subsequent duplicate
-        # requests can be deferred correctly.
+    def _register_contributed_blocks(
+        self,
+        req: LlmRequest,
+        newly_contributed_context_blocks: set[BlockKey],
+        newly_contributed_cross_context_blocks: Optional[set[BlockKey]],
+        summary_by_req: Optional[PrefixSummaryCache] = None,
+        cross_summary_by_req: Optional[PrefixSummaryCache] = None,
+    ) -> None:
+        """
+        Register the blocks this request will newly contribute to the reuse tree.
+
+        Call only after the request has been scheduled. This upholds the
+        invariant that no request is deferred in an iteration where its
+        contributor was not scheduled.
+
+        `newly_contributed_cross_context_blocks=None` means the caller does no
+        cross-pool tracking, and suppresses the cross walk entirely. Mirrors the
+        `std::nullopt` crossSummary the C++ MaxUtilization path passes.
+
+        C++ reference: capacityScheduler.cpp (registerContributedBlocks)
+        """
+        if not self._skip_tracking_applies(req):
+            return
+
+        ctx_new_block = self._ctx_first_new_block(req, summary_by_req)
         if ctx_new_block is not None:
             newly_contributed_context_blocks.add(ctx_new_block)
+        if newly_contributed_cross_context_blocks is None:
+            return
+        cross_new_block = self._cross_first_new_block(req, cross_summary_by_req)
         if cross_new_block is not None:
             newly_contributed_cross_context_blocks.add(cross_new_block)
-
-        return False
 
     def _disabled_prefix_summary(self, req: LlmRequest) -> Optional[PrefixReuseSummary]:
         if self.enable_prefix_aware_scheduling:

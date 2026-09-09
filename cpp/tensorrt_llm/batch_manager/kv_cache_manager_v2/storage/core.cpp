@@ -580,6 +580,11 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
     }
 }
 
+HostMem const* HostPoolGroup::hostMem(PoolIndex poolIndex) const
+{
+    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
+}
+
 // ---------------------------------------------------------------------------
 // DiskPoolGroup
 // ---------------------------------------------------------------------------
@@ -622,17 +627,16 @@ TypedVec<PoolIndex, Address> CacheLevelStorage::slotAddress(PoolGroupIndex pgIdx
 // GpuCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-GpuCacheLevelStorage::GpuCacheLevelStorage(
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, size_t physMemSize)
+GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator)
+    : mPhysMemAllocator(physMemAllocator)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    mPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(physMemSize);
-
-    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList(), *mPhysMemAllocator));
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
     }
 }
 
@@ -641,14 +645,14 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(
 // ---------------------------------------------------------------------------
 
 HostCacheLevelStorage::HostCacheLevelStorage(
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(
-            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList()));
+            std::make_unique<HostPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList()));
     }
 }
 
@@ -656,16 +660,16 @@ HostCacheLevelStorage::HostCacheLevelStorage(
 // DiskCacheLevelStorage
 // ---------------------------------------------------------------------------
 
-DiskCacheLevelStorage::DiskCacheLevelStorage(
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
+DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == storageCfg.slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
-    for (PoolGroupIndex pgIdx{0}; pgIdx < storageCfg.slotDescList.size(); ++pgIdx)
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
-            slotCountList[pgIdx], storageCfg.slotDescList[pgIdx].slotSizeList(), mDirectory));
+        mPoolGroups.push_back(
+            std::make_unique<DiskPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory));
     }
 }
 
@@ -674,30 +678,25 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
-    StorageConfig const& storageCfg, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
+    TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
+    PooledPhysMemAllocator* gpuPhysMemAllocator)
 {
+    TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
         [&](auto const& cfg) -> std::unique_ptr<CacheLevelStorage>
         {
             using T = std::decay_t<decltype(cfg)>;
             if constexpr (std::is_same_v<T, GpuCacheTierConfig>)
             {
-                // Compute phys mem size (granularity) from quota.
-                constexpr size_t kPageSize = 2ULL << 20;
-                // Guard std::log2(0) (UB when cast to int) for quotas below 1 GiB,
-                // where the integer ratio is 0 and the exponent floor is used.
-                size_t const ratio = cfg.quota / (kPageSize * 512);
-                int const exponent = ratio == 0 ? 0 : std::min(4, std::max(0, static_cast<int>(std::log2(ratio))));
-                size_t physMemSize = kPageSize << exponent;
-                return std::make_unique<GpuCacheLevelStorage>(storageCfg, slotCountList, physMemSize);
+                return std::make_unique<GpuCacheLevelStorage>(slotDescList, slotCountList, *gpuPhysMemAllocator);
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
-                return std::make_unique<HostCacheLevelStorage>(storageCfg, slotCountList);
+                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList);
             }
             else
             {
-                return std::make_unique<DiskCacheLevelStorage>(storageCfg, slotCountList, cfg.path);
+                return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path);
             }
         },
         tierCfg);

@@ -6,7 +6,7 @@ implementation plus checkpoint, translate the model into TRT-LLM, and
 iterate until QA verifies the accuracy gate (GSM8K via `trtllm-eval`)
 passes.
 
-Install `agent-flow` first — see the [root README](../../README.md#preparation)
+Install `agent-flow` first — see the [root README](../../../README.md#prerequisites)
 for the Claude Code / Codex SDK prerequisites and `pip install -e .`.
 
 Fetch the reference HuggingFace repo (the agents treat its

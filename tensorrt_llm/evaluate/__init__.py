@@ -23,6 +23,7 @@ from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
 from .nemo_skills_eval import (AALCR, HLE, ArenaHard, GPQANemoSkills, IFBench,
                                SciCode)
+from .visual_gen.image_generation_eval import ImageGenerationEval
 
 __all__ = [
     "CnnDailymail",
@@ -32,6 +33,7 @@ __all__ = [
     "GPQAMain",
     "GPQAExtended",
     "JsonModeEval",
+    "ImageGenerationEval",
     "MMMU",
     "MMMUPro",
     "CoVoST2",

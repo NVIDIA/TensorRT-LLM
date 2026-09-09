@@ -126,8 +126,7 @@ cute.is_major(x, d)    # True if dimension d is stride-1
 ```python
 cute.make_tensor(ptr, layout)                  # From pointer + layout
 cute.make_identity_tensor(shape)               # Coordinate mapping tensor
-cute.make_rmem_tensor(layout)                  # Register memory tensor
-cute.make_fragment(shape, dtype)               # Register fragment
+cute.make_rmem_tensor(layout_or_shape, dtype)  # Register memory tensor
 ```
 
 ### Data Initialization

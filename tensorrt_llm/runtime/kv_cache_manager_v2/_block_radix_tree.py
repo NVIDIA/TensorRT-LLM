@@ -197,11 +197,24 @@ class ReuseScope(NamedTuple):
 
 
 class ReuseMatch(NamedTuple):
-    """Volatile result of a KV cache prefix match."""
+    """Volatile result of a KV cache prefix match.
+
+    ``num_reusable_tokens_before_hybrid_pruning`` is retained for internal
+    diagnostics. It is the prefix the attention pages alone would support,
+    before recurrent snapshot availability shortens it.
+
+    ``num_reusable_tokens_before_pruning`` is the raw token-path walk depth,
+    before any pruning at all. It locates where this request's content diverges
+    from the tree, independent of which pages happen to still be resident, so
+    ``num_reusable_tokens_before_pruning == num_lookup_tokens`` means the whole
+    lookup range matched and there is no fork here.
+    """
 
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
+    num_reusable_tokens_before_hybrid_pruning: int
+    num_reusable_tokens_before_pruning: int
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -581,7 +594,13 @@ class Block:
         # But for simplicity, we leave it for now.
         curr = start
         while (
-            (isinstance(curr, Block) and curr.get_page(lc_idx) is None)
+            (
+                isinstance(curr, Block)
+                and all(
+                    curr.get_page(life_cycle) is None
+                    for life_cycle in typed_range(curr.num_life_cycles)
+                )
+            )
             and not curr.next
             and curr._prev() is not None
         ):
@@ -705,13 +724,19 @@ class BlockRadixTree:
                 block = partial_block
                 yield block, match_len
 
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+    def _prune_match(
+        self, matched: list[tuple[Block, int]], ssm_lc_id: LifeCycleId | None
+    ) -> list[tuple[Block, int]]:
+        """Shorten `matched` to the prefix that is actually reusable.
+
+        Passing ssm_lc_id=None skips the recurrent-snapshot constraint and yields
+        the attention-only prefix (used for
+        num_reusable_tokens_before_hybrid_pruning).
+        """
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
-        life_cycles = self._life_cycles
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        attn_life_cycles = list(self._life_cycles.attention_life_cycles())
 
         # Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
         # shorten the match to the coverage of a required page. Every retry strictly
@@ -761,25 +786,67 @@ class BlockRadixTree:
                 break
         return matched
 
+    @staticmethod
+    def _back_off_match(
+        matched: list[tuple["Block", int]], backoff: int
+    ) -> list[tuple["Block", int]]:
+        """Drop `backoff` tokens from the tail of a match.
+
+        Shortens the last entry, dropping whole blocks while the backoff outruns
+        them. Leading entries stay full blocks, so _prune_match's invariant holds.
+        """
+        while backoff > 0 and matched:
+            block, num_matched = matched[-1]
+            if num_matched > backoff:
+                matched[-1] = (block, num_matched - backoff)
+                break
+            backoff -= num_matched
+            matched.pop()
+        return matched
+
     def match(
         self,
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        backoff: int = 0,
     ) -> ReuseMatch:
         """
         Return the currently reusable prefix match without holding pages.
 
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
+
+        `backoff` trims that many tokens off the tail (see
+        KVCacheManagerConfig.reuse_match_backoff).
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        num_reusable_tokens_before_pruning = self._num_matched_tokens(raw_matched)
+        ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        # Page requirements depend on the final endpoint. Back off before pruning
+        # so SWA coverage and recurrent snapshots are validated at that endpoint.
+        if backoff > 0:
+            raw_matched = self._back_off_match(raw_matched, backoff)
+        # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+        # the prefix the attention pages alone support. Only hybrid models pay for
+        # the second pass; without an SSM life cycle the two results are identical.
+        num_reusable_tokens_before_hybrid_pruning = (
+            self._num_matched_tokens(self._prune_match(list(raw_matched), None))
+            if ssm_lc_id is not None
+            else None
         )
+        matched = self._prune_match(raw_matched, ssm_lc_id)
+        num_tokens = self._num_matched_tokens(matched)
         return ReuseMatch(
             [block for block, _ in matched],
-            self._num_matched_tokens(matched),
+            num_tokens,
             len(tokens),
+            (
+                num_tokens
+                if num_reusable_tokens_before_hybrid_pruning is None
+                else num_reusable_tokens_before_hybrid_pruning
+            ),
+            num_reusable_tokens_before_pruning,
         )
 
     def _check_sanity(self) -> bool:

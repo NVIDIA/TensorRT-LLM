@@ -16,7 +16,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
-    SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestQueueItem)
+    SHUTDOWN_REQUEST_ID, ExecutorRequestQueue, RequestAdmissionState,
+    RequestQueueItem)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -65,6 +66,7 @@ def test_executor_queue_init(executor_queue, mock_dist):
     assert executor_queue.next_request_id == 8
     assert executor_queue.enable_iter_perf_stats
     assert executor_queue.active
+    assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
     assert isinstance(executor_queue.request_queue, queue.Queue)
     assert isinstance(executor_queue.enqueue_lock, type(threading.Lock()))
 
@@ -100,31 +102,15 @@ def test_enqueue_request_single(executor_queue):
     assert req_id in executor_queue.start_times
 
 
-def test_enqueue_request_with_query(executor_queue):
-    """Test enqueuing a request with query data."""
-    mock_request = Mock()
-    query_data = [1, 2, 3, 4]
-    with patch.object(executor_queue, '_generate_child_request_ids'):
-        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
-
-    assert req_id == 8
-
-    # Verify the item was enqueued with query
-    item = executor_queue.request_queue.get_nowait()
-    assert item.id == req_id
-    assert item.request == mock_request
-
-
 @pytest.mark.parametrize("n_children", [0, 1, 2])
 def test_enqueue_request_with_child_ids(executor_queue, n_children):
-    """Test enqueuing a request with query data."""
+    """Test enqueuing a request with child request ids."""
     mock_request = Mock()
-    query_data = [1, 2, 3, 4]
     with patch(
             'tensorrt_llm._torch.pyexecutor.executor_request_queue.get_num_child_requests'
     ) as mock_children:
         mock_children.return_value = n_children
-        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
+        req_id = executor_queue.enqueue_request(mock_request)
 
     assert req_id == 8
 
@@ -168,6 +154,69 @@ def test_enqueue_request_after_shutdown(executor_queue):
     executor_queue.enqueue_shutdown_request()
 
     with pytest.raises(AssertionError):
+        executor_queue.enqueue_request(Mock())
+
+
+def test_sleep_wakeup_admission_state_rejects_direct_enqueue(executor_queue):
+    """Admission stays closed from PARKING until the matching wakeup completes."""
+    executor_queue.begin_sleep_transition(["model", "kv_cache"])
+    assert executor_queue.get_admission_state() is RequestAdmissionState.PARKING
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="admission is parking"):
+        executor_queue.enqueue_request(Mock())
+
+    executor_queue.complete_sleep_transition()
+    assert executor_queue.get_admission_state() is RequestAdmissionState.PARKED
+    assert executor_queue.can_enqueue_control_request()
+    with pytest.raises(RuntimeError, match="admission is parked"):
+        executor_queue.enqueue_request(Mock())
+
+    executor_queue.begin_wakeup_transition(["kv_cache"])
+    assert executor_queue.get_admission_state() is RequestAdmissionState.WAKING
+    with pytest.raises(RuntimeError, match="admission is waking"):
+        executor_queue.enqueue_request(Mock())
+
+    executor_queue.complete_wakeup_transition()
+    assert executor_queue.get_admission_state() is RequestAdmissionState.PARKED
+    with pytest.raises(RuntimeError, match="admission is parked"):
+        executor_queue.enqueue_request(Mock())
+
+    executor_queue.begin_wakeup_transition(["model"])
+    executor_queue.complete_wakeup_transition()
+    assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
+    assert executor_queue.can_enqueue_request()
+
+
+def test_wakeup_allows_extra_tags_and_reopens_after_parked_tags(executor_queue):
+    executor_queue.begin_sleep_transition(["model"])
+    executor_queue.complete_sleep_transition()
+
+    executor_queue.begin_wakeup_transition(["model", "kv_cache"])
+    executor_queue.complete_wakeup_transition()
+
+    assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
+
+
+def test_recoverable_sleep_wakeup_failures_restore_prior_state(executor_queue):
+    executor_queue.begin_sleep_transition(["model"])
+    executor_queue.abort_sleep_transition()
+    assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
+
+    executor_queue.begin_sleep_transition(["model"])
+    executor_queue.complete_sleep_transition()
+    executor_queue.begin_wakeup_transition(["model"])
+    executor_queue.abort_wakeup_transition()
+    assert executor_queue.get_admission_state() is RequestAdmissionState.PARKED
+
+
+def test_post_mutation_failure_permanently_closes_admission(executor_queue):
+    executor_queue.begin_sleep_transition(["model"])
+    executor_queue.fail_sleep_wakeup_transition()
+    executor_queue.abort_sleep_transition()
+
+    assert executor_queue.get_admission_state() is RequestAdmissionState.FAILED
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="admission is failed"):
         executor_queue.enqueue_request(Mock())
 
 

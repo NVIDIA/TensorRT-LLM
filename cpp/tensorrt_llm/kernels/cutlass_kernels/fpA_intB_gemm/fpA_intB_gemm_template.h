@@ -465,7 +465,7 @@ void CutlassFpAIntBGemmRunner<ActivationType, WeightType, QuantOp, ScaleZeroType
             "arch to build_wheel.py.");
 #endif // COMPILE_HOPPER_TMA_GEMMS
     }
-    else if (sm_ == 100 || sm_ == 103)
+    else if (tk::isSM100Family(sm_))
     {
 #ifdef COMPILE_BLACKWELL_TMA_GEMMS
         cutlass_kernels_oss::sm100_dispatch_gemm_to_cutlass<ActivationType, WeightType, ScaleZeroType, BiasType,

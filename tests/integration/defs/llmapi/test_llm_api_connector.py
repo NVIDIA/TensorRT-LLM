@@ -15,7 +15,6 @@
 
 import math
 import os
-import sys
 import tempfile
 import time
 from unittest.mock import MagicMock, patch
@@ -49,11 +48,14 @@ def model_with_connector():
         def model_fn(*args, **kwargs):
 
             default_kwargs = {
-                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "model": f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
-                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1),
+                # Connector tests use at most 256 input tokens. Keep model
+                # construction independent of the GPU's available KV capacity.
+                "max_seq_len": 1024,
             }
 
             return LLM(*args, **{**default_kwargs, **kwargs})
@@ -577,17 +579,20 @@ def test_connector_rejects_unsupported_config(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_e2e_persistent_cache(enforce_single_worker):
+def test_connector_e2e_persistent_cache(enforce_single_worker, monkeypatch):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
     Runs generation twice with separate LLM instances sharing a disk-based
     connector cache, verifying that outputs are identical (proving cache
     save/load works end-to-end).
     """
+    # sys.path, not __extra_import_path__: the connector module is imported by
+    # name from inside tensorrt_llm, not by this file. monkeypatch restores the
+    # entry at teardown so a failure cannot leak it into later tests.
     examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
                                 "..", "examples", "llm-api")
     examples_dir = os.path.abspath(examples_dir)
-    sys.path.insert(0, examples_dir)
+    monkeypatch.syspath_prepend(examples_dir)
 
     cache_dir = tempfile.mkdtemp()
     os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
@@ -600,7 +605,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         )
 
         llm_kwargs = dict(
-            model=f"{llm_models_root()}/Qwen2-0.5B",
+            model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
             backend="pytorch",
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,
@@ -632,9 +637,6 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         del llm2
     finally:
         os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
-
-        if examples_dir in sys.path:
-            sys.path.remove(examples_dir)
 
         import shutil
         shutil.rmtree(cache_dir, ignore_errors=True)

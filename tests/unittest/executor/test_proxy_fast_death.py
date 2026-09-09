@@ -25,8 +25,10 @@ import pytest
 
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
+from tensorrt_llm.executor import worker as worker_module
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
 
 
 def test_engine_dead_error_is_importable_and_carries_root_cause():
@@ -54,6 +56,8 @@ def _bare_proxy():
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
     proxy._multi_frontend_ipc_dir = None
+    # Borrowed-session default; ownership-sensitive tests override it.
+    proxy._owns_mpi_session = False
     return proxy
 
 
@@ -115,6 +119,205 @@ def test_register_worker_processes_with_session_reuse_factory(monkeypatch):
     proxy._register_worker_processes((proxy.READY_SIGNAL, None, identities))
 
     proxy._worker_process_monitor.register.assert_called_once_with(identities)
+
+
+class _FakeWorkerInitStatusQueue:
+    """Worker status queue that returns a fixed message sequence."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.acks = []
+
+    def poll(self, timeout):
+        return bool(self._messages)
+
+    def get(self):
+        return self._messages.pop(0)
+
+    def put(self, message):
+        self.acks.append(message)
+
+
+class _DeadAfterRegistrationMonitor:
+    """Report a worker death only after the proxy registers identities."""
+
+    def __init__(self):
+        self.identities = []
+
+    def register(self, identities):
+        self.identities = identities
+
+    def find_dead_worker(self):
+        return self.identities[0] if self.identities else None
+
+
+def test_worker_death_before_ready_is_reported_from_registered_identity():
+    """A pre-READY worker death must not depend on its MPI future finishing."""
+    identity = WorkerProcessIdentity(
+        rank=3, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status])
+    proxy._worker_process_monitor = _DeadAfterRegistrationMonitor()
+    proxy.mpi_futures = [_Future()]  # Deliberately remains pending.
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock()
+
+    with pytest.raises(RuntimeError, match=r"rank 3 \(pid 12345\) exited unexpectedly"):
+        proxy._wait_for_executor_workers_ready()
+
+    assert not proxy.mpi_futures[0].done()
+    assert proxy.worker_init_status_queue.acks == ["ACK"]
+    proxy.pre_shutdown.assert_called_once_with()
+
+
+def test_remote_worker_death_before_ready_is_reported():
+    """Remote worker death must be polled before the error monitor starts."""
+    error = RuntimeError("remote worker died")
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.check_worker_error.return_value = error
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([])
+    proxy._worker_process_monitor = _Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+    proxy.mpi_futures = []
+    proxy._fatal_error = None
+    proxy._error_queue = _queue.Queue()
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock(
+        side_effect=AssertionError("wait loop continued after remote worker death")
+    )
+
+    with pytest.raises(RuntimeError, match="remote worker died"):
+        proxy._wait_for_executor_workers_ready()
+
+    proxy.mpi_session.check_worker_error.assert_called_once_with()
+    assert proxy.worker_init_status_queue.acks == []
+    assert proxy.mpi_futures == []
+    assert proxy._fatal_error is error
+    proxy.pre_shutdown.assert_called_once_with()
+    proxy._handle_background_error.assert_not_called()
+
+
+def test_worker_identities_are_registered_once_before_ready():
+    identity = WorkerProcessIdentity(
+        rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+    ready_status = (GenerationExecutorProxy.READY_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status, ready_status])
+    proxy._worker_process_monitor = _Mock()
+    proxy.mpi_futures = [_Future()]
+    proxy._handle_background_error = _Mock()
+
+    assert proxy._wait_for_executor_workers_ready() == ready_status
+    proxy._worker_process_monitor.register.assert_called_once_with([identity])
+    assert proxy.worker_init_status_queue.acks == ["ACK", "ACK"]
+
+
+def test_worker_error_status_is_not_treated_as_identities():
+    error = RuntimeError("backend construction failed")
+    error_status = (error, "traceback", [object()])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([error_status])
+    proxy._worker_process_monitor = _Mock()
+    proxy.mpi_futures = [_Future()]
+    proxy._handle_background_error = _Mock()
+
+    assert proxy._wait_for_executor_workers_ready() == error_status
+    proxy._worker_process_monitor.register.assert_not_called()
+    assert proxy.worker_init_status_queue.acks == ["ACK"]
+
+
+def test_worker_publishes_identities_before_backend_construction(monkeypatch):
+    identity = WorkerProcessIdentity(
+        rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    events = []
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, captured_identity):
+            assert captured_identity == identity
+            return [identity]
+
+    class _FakeInitStatusQueue:
+        succeeds = True
+
+        def notify_with_retry(self, message):
+            events.append(("notify", message[0]))
+            return self.succeeds
+
+    class _FailingWorker:
+        def __init__(self, *args, **kwargs):
+            events.append(("construct", None))
+            raise RuntimeError("expected construction failure")
+
+    init_status_queue = _FakeInitStatusQueue()
+
+    def make_ipc_queue(*args, name, **kwargs):
+        if name == "worker_init_status_queue":
+            return init_status_queue
+        return _Mock()
+
+    fake_comm = _FakeComm()
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: fake_comm)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda rank: identity)
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+    monkeypatch.setattr(worker_module, "IpcQueue", make_ipc_queue)
+    monkeypatch.setattr(worker_module, "FusedIpcQueue", lambda *args, **kwargs: _Mock())
+
+    worker_queues = _Mock(
+        frontend_result_queue_addrs=None,
+        request_queue_addr=("request", b"key"),
+        worker_init_status_queue_addr=("status", b"key"),
+        resource_governor_queue_addr=None,
+        result_queue_addr=("result", b"key"),
+    )
+    worker_module.worker_main(
+        engine=object(),
+        worker_queues=worker_queues,
+        log_level=worker_module.logger.level,
+        worker_cls=_FailingWorker,
+        ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        worker_process_identities_signal=(GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
+    )
+
+    assert events[:2] == [
+        ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
+        ("construct", None),
+    ]
+
+    events.clear()
+    init_status_queue.succeeds = False
+    with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=(
+                GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL
+            ),
+        )
+
+    assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
 
 
 def test_result_step_raises_on_engine_dead():
@@ -538,3 +741,238 @@ def test_pool_session_shutdown_never_blocks_after_release():
     session.shutdown()  # owner asks for the default blocking shutdown
 
     pool.shutdown.assert_called_once_with(wait=False)
+
+
+# --- Ordered teardown on initialization failure (_fail_initialization) ---
+# A rank that dies during init leaves its peers wedged in the init collective
+# still holding their weights, so the init wait loop must abort the owned
+# world strictly BEFORE marking the engine dead: release_exit_joins() (via
+# _mark_engine_dead) marks the pool dead, which forces shutdown_abort()'s
+# blocking shutdown() non-blocking and defangs its MPI_Abort escalation.
+
+
+def _proxy_awaiting_worker_init(
+    owns_session: bool, future_exception=None, ready_status=None, future_cancelled=False
+):
+    """Proxy parked in _start_executor_workers' init-status wait loop.
+
+    Seeds only what that path touches: a status queue, one worker future,
+    the process monitor, and the session. The spawn itself is stubbed --
+    the contract under test is what the wait loop does on each
+    initialization-failure path. By default the future is already finished
+    successfully (a silent non-leader death) and the status queue never
+    reports ready; ``future_exception`` makes the worker die raising
+    instead, ``future_cancelled`` makes the future cancelled, and
+    ``ready_status`` makes the status queue deliver that tuple (a pending
+    future) to exercise the non-ready path.
+    """
+    proxy = _bare_proxy()
+    proxy._error_queue = _queue.Queue()
+    proxy._fatal_error = None
+    proxy._owns_mpi_session = owns_session
+    proxy.worker_cls = object
+    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
+    # time is live: keep it out of pre_shutdown(), whose attributes (the
+    # worker-process monitor teardown, the request queue) this fixture does
+    # not seed.
+    proxy.doing_shutdown = True
+
+    worker_future = _Future()
+    if ready_status is None:
+        if future_cancelled:
+            assert worker_future.cancel()
+        elif future_exception is not None:
+            worker_future.set_exception(future_exception)
+        else:
+            worker_future.set_result(None)
+
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.submit.return_value = [worker_future]
+    proxy._worker_process_monitor = _Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+
+    status_queue = _Mock()
+    if ready_status is None:
+        status_queue.poll.return_value = False  # worker never signals ready
+    else:
+        status_queue.poll.return_value = True
+        status_queue.get.return_value = ready_status
+    proxy.worker_init_status_queue = status_queue
+    return proxy
+
+
+def test_worker_death_during_init_aborts_the_wedged_world():
+    """A rank dying during init must not leave its peers wedged.
+
+    A non-leader rank that fails setup returns without notifying anyone, so
+    the survivors stay blocked in the init collective still holding their
+    share of the weights. Raising alone leaks them until job end and makes
+    the next blocking shutdown() hang instead of reporting the failure.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # The world is recorded dead and forcibly torn down, not merely abandoned.
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    # Exit joins are released, so a later join cannot block on the dead pool.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    # Pending work fails fast rather than waiting on a gone producer.
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_worker_death_during_init_does_not_abort_borrowed_session():
+    """An externally owned session is marked dead but never torn down.
+
+    Its owner (the LLM API, or the test session-reuse pool) tears it down;
+    aborting it here would kill a session this proxy did not create.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=False)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    # The non-destructive part still has to happen for the borrowed session.
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_worker_death_during_init_aborts_before_marking_dead():
+    """The abort must precede the engine-dead bookkeeping.
+
+    shutdown_abort() escalates to MPI_Abort only when its own blocking
+    shutdown() overruns the grace period, but release_exit_joins() (reached
+    via _mark_engine_dead) marks the pool dead, which forces that shutdown()
+    non-blocking. Marking first would therefore silently defang the abort and
+    leave wedged ranks holding their weights.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    # Mock records child calls in order, so read the ordering off the session.
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_worker_death_during_init_marks_dead_even_if_abort_raises():
+    """A failing abort must not skip the engine-dead bookkeeping.
+
+    If shutdown_abort() itself raises, _mark_engine_dead() (pending-result
+    broadcast + exit-join release) must still run, and the original
+    initialization error must be the one raised, not the teardown failure.
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True)
+    proxy.mpi_session.shutdown_abort.side_effect = RuntimeError("abort blew up")
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_worker_exception_death_during_init_aborts_before_marking_dead():
+    """A rank dying RAISING during init must keep the abort-before-mark order.
+
+    add_done_callback() runs its callback synchronously when the future has
+    already completed, so registering the fast-death callback before the init
+    loop would let _handle_worker_death -> _mark_engine_dead ->
+    release_exit_joins() mark the pool dead ahead of the loop's abort,
+    defanging the MPI_Abort escalation. Registration is therefore deferred
+    until the world reported ready; this pins the ordering for the
+    exceptional-future death mode the silent-death test cannot see.
+    """
+    boom = RuntimeError("rank raised during init")
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_exception=boom)
+
+    with pytest.raises(RuntimeError, match="died during initialization") as excinfo:
+        proxy._start_executor_workers({})
+
+    # The worker's own exception is preserved as the cause.
+    assert excinfo.value.__cause__ is boom
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_worker_exception_death_during_init_does_not_abort_borrowed_session():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=False, future_exception=RuntimeError("rank raised during init")
+    )
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_cancelled_worker_future_during_init_is_treated_as_death():
+    """A cancelled worker future must fail init through the ordered teardown.
+
+    done() is True for a cancelled future and exception() then raises
+    CancelledError, so returning it from detection would escape the init
+    wait loop through a side entrance without the abort-before-mark
+    teardown; skipping the future instead would leave detection blind while
+    the ready wait loop spins forever. A cancelled worker_main future means
+    that rank can never come up, so it is a death like any other
+    (mirroring _check_mpi_futures on the runtime path).
+    """
+    proxy = _proxy_awaiting_worker_init(owns_session=True, future_cancelled=True)
+
+    with pytest.raises(RuntimeError, match="died during initialization"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+
+
+def test_non_ready_status_during_init_aborts_then_marks_dead():
+    """The non-ready status path must run the same ordered teardown.
+
+    Before the shared _fail_initialization helper it aborted but never marked
+    the engine dead, so pending-result and exit-join cleanup was inconsistent
+    with the worker-death path.
+    """
+    err = ValueError("worker init failed")
+    proxy = _proxy_awaiting_worker_init(owns_session=True, ready_status=(err, "trace"))
+    r = _FakeResult()
+    proxy._results = {1: r}
+
+    with pytest.raises(RuntimeError, match="returned error") as excinfo:
+        proxy._start_executor_workers({})
+
+    assert excinfo.value.__cause__ is err
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_called_once()
+    called = [c[0] for c in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
+    # Pending work fails fast on this path too.
+    assert isinstance(r.queue.get_nowait(), EngineDeadError)
+
+
+def test_non_ready_status_during_init_does_not_abort_borrowed_session():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=False, ready_status=(ValueError("worker init failed"), "trace")
+    )
+
+    with pytest.raises(RuntimeError, match="returned error"):
+        proxy._start_executor_workers({})
+
+    assert proxy._engine_dead is True
+    proxy.mpi_session.shutdown_abort.assert_not_called()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()

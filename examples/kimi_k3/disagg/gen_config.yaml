@@ -1,0 +1,48 @@
+# Kimi K3 disaggregated serving - GENERATION (decode) server extra LLM-API
+# options WITH suffix-automaton (SA) speculative decoding
+# (`trtllm-serve <model> --config gen_config.yaml`).
+#
+# DEP16 deployment (attention data-parallel + MoE EP dispatch/combine),
+# mirroring examples/kimi_k3/eval_extra_llm_options_sa.yaml: SA runs
+# eager (no CUDA graphs, no overlap scheduler) and needs
+# max_batch_size <= 8 (SpeculativeState buffers). For the SA-off variant
+# (validate KV/KDA transfer before enabling SA), use gen_config_no_sa.yaml.
+tensor_parallel_size: 16
+moe_expert_parallel_size: 16
+enable_attention_dp: true
+pipeline_parallel_size: 1
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+cuda_graph_config: null
+max_batch_size: 8
+# Decode-shaped: per scheduled request 1 + max_draft_len tokens; 256
+# leaves generous headroom for warmup/dummy batches.
+max_num_tokens: 256
+# Target ISL 8192 + OSL 1024 (+ margin).
+max_seq_len: 9236
+kv_cache_config:
+  enable_block_reuse: false      # mandatory for K3 (KDA state)
+  tokens_per_block: 64           # mandatory for K3 MLA kernels
+  # Proven by the aggregated DEP16 SA evals on GB300; bounds decode
+  # concurrency x seq-len. Tune upward once the deployment is stable.
+  free_gpu_memory_fraction: 0.25
+cache_transceiver_config:
+  backend: NIXL
+  # Mandatory for K3: `auto` resolves to the C++ transceiver, which
+  # throws for K3's MixedMambaHybridCacheManager.
+  transceiver_runtime: PYTHON
+  # Must be >= the target max ISL and match the ctx side.
+  max_tokens_in_buffer: 8448
+  # Fabric-VMM bounce buffer (recv side); must match the ctx server.
+  # Without it, cross-node V2 pool-to-pool transfers fall back to
+  # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.
+  # Bounce engages automatically above TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES
+  # (default 2 MiB) — always true for K3 payloads.
+  # Sized to fit one full request payload (fixed 433 MiB KDA state +
+  # ~27 KB/token MLA latent; 649 MiB at 8k ISL) -- see ctx_config.yaml;
+  # at 512 every 8k transfer falls back to the per-fragment tcp path.
+  kv_cache_bounce_size_mb: 1024
+speculative_config:
+  decoding_type: SA
+  max_draft_len: 2
+  max_matching_ngram_size: -1    # longest match via suffix automaton

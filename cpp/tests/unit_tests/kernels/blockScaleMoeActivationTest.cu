@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// Bit-exact equivalence between the two DeepSeek-FP8 MoE activation kernels.
+// Bit-exact equivalence between the expanded and permuted DeepSeek-FP8 MoE
+// activation paths.
 //
 // `moe::dev::activation::run` picks between
 //   * `activationDeepSeekKernel`         - grids over the expanded (numTokens x
@@ -22,12 +23,11 @@
 //   * `activationDeepSeekPermutedKernel` - grids directly over the permuted row
 //     space with one warp per (row, 128-element scale block),
 // via `shouldUsePermutedActivation()`. Both must produce *identical bits* for
-// every row that carries a real token: DevKernel.cu documents that the permuted
+// every row that carries a real token. DevKernel.cu documents that the permuted
 // kernel must not hoist a reciprocal out of `out / scaleOut`, because `x / s`
 // and `x * (1/s)` round differently and one ulp was enough to flip a
 // greedy-decoded token. An `isClose`-style comparison would not catch that
-// regression, so everything below compares raw bit patterns (which also makes
-// the NaN cases comparable).
+// regression, so everything below compares raw bit patterns.
 //
 // Note on coverage: fp8 e4m3 carries three mantissa bits, so most 1-ulp fp32
 // differences vanish when the result is rounded back down to fp8 -- only values
@@ -45,6 +45,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/DevKernel.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -52,6 +53,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -212,10 +214,10 @@ protected:
 
     // Allocates device buffers, fills the inputs deterministically and uploads
     // them. `zeroedRowBlock`, when set, forces one (row, scale block) pair of
-    // the input to all-zero so both kernels take the aMax == 0 -> 0/0 -> NaN
-    // path on exactly the same element.
+    // the input to all-zero so both kernels exercise the finite aMax floor on
+    // exactly the same element.
     void setUp(ActivationEquivParam const& param, PermutedLayout const& layout,
-        std::optional<std::pair<int32_t, int32_t>> zeroedRowBlock = std::nullopt)
+        std::optional<std::pair<int32_t, int32_t>> zeroedRowBlock = std::nullopt, int64_t misalignBytes = 0)
     {
         mParam = param;
         mInnerDim = 2 * param.intermediateSize;
@@ -257,12 +259,17 @@ protected:
                 host, ITensor::makeShape({static_cast<int64_t>(host.size())}), MemoryType::kGPU);
         };
 
-        mInDevice = upload(hostIn);
+        mPointerOffset = misalignBytes;
+        std::vector<int8_t> hostInStorage(numInElts + mPointerOffset, kDataSentinel);
+        std::copy(hostIn.begin(), hostIn.end(), hostInStorage.begin() + mPointerOffset);
+
+        mInDevice = upload(hostInStorage);
         mInSfDevice = upload(hostInSf);
         mExpandedMapDevice = upload(layout.expandedIdxToPermutedIdx);
         mTotalPaddedDevice = upload(std::vector<int32_t>{mTotalRows});
 
-        mOutDevice = mBufferManager->gpu(ITensor::makeShape({mNumOutElts}), tensorrt_llm::DataType::kINT8);
+        mOutDevice
+            = mBufferManager->gpu(ITensor::makeShape({mNumOutElts + mPointerOffset}), tensorrt_llm::DataType::kINT8);
         mOutSfDevice = mBufferManager->gpu(ITensor::makeShape({mNumOutSfElts}), tensorrt_llm::DataType::kFLOAT);
 
         mStream->synchronize();
@@ -270,20 +277,20 @@ protected:
 
     // Resets the outputs to sentinels, runs the activation with the requested
     // dispatch override, and reads the results back.
-    ActivationResult runOnce(int32_t tileTokensDimOverride)
+    ActivationResult runOnce(int32_t tileTokensDimOverride, bool usePdl = false)
     {
         ActivationResult result;
-        std::vector<int8_t> const outSentinel(mNumOutElts, kDataSentinel);
+        std::vector<int8_t> const outSentinel(mNumOutElts + mPointerOffset, kDataSentinel);
         std::vector<float> const outSfSentinel(mNumOutSfElts, kScaleSentinel);
         mBufferManager->copy(outSentinel.data(), *mOutDevice);
         mBufferManager->copy(outSfSentinel.data(), *mOutSfDevice);
 
         moe::dev::activation::Data data;
         data.mDtypeElt = tg::Dtype::E4m3;
-        data.mUsePdl = false;
+        data.mUsePdl = usePdl;
         data.mUseDeepSeekFp8 = true;
-        data.inPtr = bufferCast<int8_t>(*mInDevice);
-        data.outPtr = bufferCast<int8_t>(*mOutDevice);
+        data.inPtr = bufferCast<int8_t>(*mInDevice) + mPointerOffset;
+        data.outPtr = bufferCast<int8_t>(*mOutDevice) + mPointerOffset;
         data.inDqSfsPtr = bufferCast<float>(*mInSfDevice);
         data.outDqSfsPtr = bufferCast<float>(*mOutSfDevice);
         data.innerDim = mInnerDim;
@@ -299,11 +306,12 @@ protected:
         moe::dev::activation::run(data, mStream->get());
         TLLM_CUDA_CHECK(cudaGetLastError());
 
-        result.bytes.resize(mNumOutElts);
+        std::vector<int8_t> outStorage(mNumOutElts + mPointerOffset);
         result.scales.resize(mNumOutSfElts);
-        mBufferManager->copy(*mOutDevice, result.bytes.data());
+        mBufferManager->copy(*mOutDevice, outStorage.data());
         mBufferManager->copy(*mOutSfDevice, result.scales.data());
         mStream->synchronize();
+        result.bytes.assign(outStorage.begin() + mPointerOffset, outStorage.end());
         return result;
     }
 
@@ -324,6 +332,7 @@ protected:
     int32_t mNumOutSfBlocks{0};
     int64_t mNumOutElts{0};
     int64_t mNumOutSfElts{0};
+    int64_t mPointerOffset{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -394,6 +403,8 @@ INSTANTIATE_TEST_SUITE_P(BlockScaleMoeActivation, BlockScaleMoeActivationEquival
         ActivationEquivParam{"two_sf_blocks", 128, 4, 32, 8, 256, 8, false, 0.F, 17U},
         // Production-sized intermediate dims: 4 and 8 scale blocks per row.
         ActivationEquivParam{"four_sf_blocks", 96, 8, 64, 16, 512, 16, false, 0.F, 29U},
+        // An odd scale-block count, so the last group of a row is partial.
+        ActivationEquivParam{"five_sf_blocks", 96, 8, 64, 16, 640, 16, false, 0.F, 43U},
         ActivationEquivParam{"eight_sf_blocks", 64, 10, 40, 10, 1024, 8, false, 0.F, 31U},
         // The clamped SwiGLU branch (gemm1_clamp_limit) must match too.
         ActivationEquivParam{"swiglu_limit", 128, 4, 32, 8, 256, 8, true, 1.5F, 37U}),
@@ -401,12 +412,11 @@ INSTANTIATE_TEST_SUITE_P(BlockScaleMoeActivation, BlockScaleMoeActivationEquival
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// An all-zero scale block yields aMax == 0, so the quantization does 0 / 0. The
-// resulting NaN encoding is unspecified, but both kernels evaluate the same
-// expression and must therefore land on the same bits -- which is exactly what
-// would break if one of them replaced the division with a multiply by the
-// reciprocal.
-TEST_F(BlockScaleMoeActivationEquivalenceTest, ZeroScaleBlockProducesIdenticalNaNs)
+// An all-zero scale block must remain finite. A zero dequantization scale would
+// make quantization evaluate 0 / 0, which is undefined and writes FP8 NaNs into
+// that row. Both kernels floor aMax with the same epsilon and must emit
+// identical zero bytes and a finite, positive scale.
+TEST_F(BlockScaleMoeActivationEquivalenceTest, ZeroScaleBlockProducesFiniteZeros)
 {
     ActivationEquivParam const param{"zero_block", /*numTokens=*/64, /*topK=*/4, /*numExperts=*/32,
         /*numLocalExperts=*/8, /*intermediateSize=*/256, /*paddingTile=*/8, /*hasSwigluLimit=*/false,
@@ -422,15 +432,144 @@ TEST_F(BlockScaleMoeActivationEquivalenceTest, ZeroScaleBlockProducesIdenticalNa
     auto const permuted = runOnce(kTileForcePermuted);
 
     auto const sfIdx = static_cast<int64_t>(zeroedRow) + static_cast<int64_t>(mTotalRows) * zeroedBlock;
-    EXPECT_EQ(floatBits(legacy.scales[sfIdx]), 0U) << "an all-zero block must give scaleOut == +0";
+    EXPECT_TRUE(std::isfinite(legacy.scales[sfIdx]));
+    EXPECT_GT(legacy.scales[sfIdx], 0.F);
     EXPECT_EQ(floatBits(legacy.scales[sfIdx]), floatBits(permuted.scales[sfIdx]));
 
     for (int32_t elt = 0; elt < kEltsPerSf; ++elt)
     {
         auto const idx = static_cast<int64_t>(zeroedRow) * mOutputDim + zeroedBlock * kEltsPerSf + elt;
+        EXPECT_EQ(legacy.bytes[idx], toFp8Byte(0.F)) << "zero block emitted non-zero FP8 at element " << elt;
         ASSERT_EQ(static_cast<uint8_t>(legacy.bytes[idx]), static_cast<uint8_t>(permuted.bytes[idx]))
-            << "0/0 encoding differs at element " << elt;
+            << "zero-block encoding differs at element " << elt;
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(BlockScaleMoeActivationEquivalenceTest, FourByteAlignedIoUsesNarrowPackedKernel)
+{
+    // Eight-byte alignment selects the wide packed variant; four-byte alignment
+    // keeps the packed permuted path but drops to the narrow one. Both must
+    // still agree with the expanded-space kernel bit for bit.
+    ActivationEquivParam const param{"narrow_640", 96, 8, 64, 16, 640, 16, false, 0.F, 53U};
+    auto const layout = buildPermutedLayout(param);
+    setUp(param, layout, std::nullopt, /*misalignBytes=*/4);
+
+    auto const legacy = runOnce(kTileForceLegacy);
+    auto const permuted = runOnce(kTileForcePermuted);
+
+    ASSERT_EQ(legacy.bytes.size(), permuted.bytes.size());
+    for (auto const row : layout.realRows)
+    {
+        for (int32_t i = 0; i < mOutputDim; ++i)
+        {
+            auto const idx = static_cast<int64_t>(row) * mOutputDim + i;
+            EXPECT_EQ(legacy.bytes[idx], permuted.bytes[idx]) << "row " << row << " element " << i;
+        }
+        for (int32_t sfBlock = 0; sfBlock < mNumOutSfBlocks; ++sfBlock)
+        {
+            auto const idx = static_cast<int64_t>(row) + static_cast<int64_t>(mTotalRows) * sfBlock;
+            EXPECT_EQ(floatBits(legacy.scales[idx]), floatBits(permuted.scales[idx]));
+        }
+    }
+
+    // Only the permuted kernels sweep padding rows; matching real rows alone
+    // would also pass if the dispatch had fallen back to the expanded-space one.
+    ASSERT_FALSE(layout.paddingRows.empty());
+    for (auto const row : layout.paddingRows)
+    {
+        for (int32_t sfBlock = 0; sfBlock < mNumOutSfBlocks; ++sfBlock)
+        {
+            auto const idx = static_cast<int64_t>(row) + static_cast<int64_t>(mTotalRows) * sfBlock;
+            EXPECT_NE(floatBits(permuted.scales[idx]), floatBits(kScaleSentinel));
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(BlockScaleMoeActivationEquivalenceTest, MisalignedIoFallsBackToScalarKernel)
+{
+    ActivationEquivParam const param{"misaligned_640", 96, 8, 64, 16, 640, 16, false, 0.F, 47U};
+    auto const layout = buildPermutedLayout(param);
+    ASSERT_FALSE(layout.realRows.empty());
+    ASSERT_FALSE(layout.paddingRows.empty());
+    setUp(param, layout, std::nullopt, /*misalignBytes=*/1);
+
+    auto const legacy = runOnce(kTileForceLegacy);
+    auto const requestedPermuted = runOnce(kTileForcePermuted);
+
+    // Packed loads require aligned pointers. The requested permuted run must
+    // therefore take the scalar expanded-space fallback, which leaves padding
+    // rows untouched just like the explicitly selected legacy run.
+    for (auto const row : layout.paddingRows)
+    {
+        for (int32_t sfBlock = 0; sfBlock < mNumOutSfBlocks; ++sfBlock)
+        {
+            auto const idx = static_cast<int64_t>(row) + static_cast<int64_t>(mTotalRows) * sfBlock;
+            ASSERT_EQ(floatBits(requestedPermuted.scales[idx]), floatBits(kScaleSentinel));
+        }
+    }
+    EXPECT_EQ(legacy.bytes, requestedPermuted.bytes);
+    ASSERT_EQ(legacy.scales.size(), requestedPermuted.scales.size());
+    for (std::size_t i = 0; i < legacy.scales.size(); ++i)
+    {
+        EXPECT_EQ(floatBits(legacy.scales[i]), floatBits(requestedPermuted.scales[i]));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST_F(BlockScaleMoeActivationEquivalenceTest, PdlMatchesOrdinaryLaunch)
+{
+    ActivationEquivParam const param{"pdl_640", 96, 8, 64, 16, 640, 16, true, 1.5F, 53U};
+    auto const layout = buildPermutedLayout(param);
+    setUp(param, layout);
+
+    auto const ordinary = runOnce(kTileForcePermuted, false);
+    auto const pdl = runOnce(kTileForcePermuted, true);
+
+    EXPECT_EQ(ordinary.bytes, pdl.bytes);
+    ASSERT_EQ(ordinary.scales.size(), pdl.scales.size());
+    for (std::size_t i = 0; i < ordinary.scales.size(); ++i)
+    {
+        EXPECT_EQ(floatBits(ordinary.scales[i]), floatBits(pdl.scales[i]));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST(BlockScaleMoeActivationBackingTest, PadsActivationUsingItsOwnRowWidth)
+{
+    // A single-token decode can have only 32 padded rows. FC1 writes
+    // 2 * intermediateSize elements per row, while the gated activation read by
+    // FC2 is half as wide, so reusing FC1's capacity delivers only half of
+    // maybeGetMinTokenCount's 128 KiB floor. This is host-side arithmetic: it
+    // pins the sizing invariant, it does not observe the actual allocation.
+    constexpr int32_t maxNumPaddedTokens = 32;
+    constexpr int32_t intermediateSize = 2304;
+    constexpr int64_t minActivationBytes = 128 * 1024;
+    // Not an independent requirement: the FP32 scales are indexed by the same
+    // token capacity, so they scale with the activation and land just past 4 KiB.
+    constexpr int64_t minScaleBytes = 4 * 1024;
+    auto const fp8Bits = tg::dtypeGetNumBits(tg::Dtype::E4m3);
+
+    auto const gemm1Capacity = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+        maxNumPaddedTokens, 2 * intermediateSize, fp8Bits);
+    auto const activationCapacity = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+        maxNumPaddedTokens, intermediateSize, fp8Bits);
+
+    auto const activationBytes = static_cast<int64_t>(activationCapacity) * intermediateSize * fp8Bits / 8;
+    auto const activationBytesWithGemm1Capacity = static_cast<int64_t>(gemm1Capacity) * intermediateSize * fp8Bits / 8;
+    auto const scaleBytes = static_cast<int64_t>(activationCapacity) * (intermediateSize / kEltsPerSf) * sizeof(float);
+    auto const scaleBytesWithGemm1Capacity
+        = static_cast<int64_t>(gemm1Capacity) * (intermediateSize / kEltsPerSf) * sizeof(float);
+
+    EXPECT_GE(activationBytes, minActivationBytes);
+    EXPECT_GE(scaleBytes, minScaleBytes);
+    EXPECT_LT(activationBytesWithGemm1Capacity, minActivationBytes);
+    EXPECT_LT(scaleBytesWithGemm1Capacity, minScaleBytes);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

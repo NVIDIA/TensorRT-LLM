@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
-import fcntl
 import hashlib
 import json
 import logging
@@ -151,11 +150,6 @@ def drain_pending_uploads(output_path: str, secret_key: str | None = None) -> bo
     for config_path in config_paths:
         try:
             with config_path.open("r", encoding="utf-8") as config_file:
-                try:
-                    fcntl.flock(config_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-
                 config = json.load(config_file)
                 owner_host = config.get("hostname")
                 owner_pid = int(config.get("pid", 0))
@@ -217,9 +211,6 @@ def drain_pending_uploads(output_path: str, secret_key: str | None = None) -> bo
                         spool_dir.parent.rmdir()
                     except OSError:
                         pass
-        except FileNotFoundError:
-            # Another rank may have drained and removed this config after rglob.
-            continue
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             success = False
             logger.warning("Failed to read S3 spool config %s: %s", config_path, exc)

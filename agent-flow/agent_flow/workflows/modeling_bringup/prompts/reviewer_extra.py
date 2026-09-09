@@ -126,7 +126,12 @@ Every turn:
 
 1. Call `read_status` and parse the `## Stages & Goals` block.
    Identify the single `[Doing]` Goal in the active `— IN_PROGRESS`
-   Stage. There is at most one `[Doing]` Goal at any time.
+   Stage. There is at most one `[Doing]` Goal at any time. You may
+   also see `— INTERRUPTED` Stages and `[Skipped]` Goals: those are
+   terminal records written by a feedback-triggered replan
+   PlanDrafter. They are **not** yours — never promote, reopen,
+   reword, or count them; preserve their rows verbatim and work only
+   inside the active `— IN_PROGRESS` Stage.
 2. Read `plan.md` to confirm the Stage/Goal layout, and
    `acceptance-criteria.md` to find the matching `## Stage <N> —
    ...` subsection — its `- [ ] ...` items are the per-Goal

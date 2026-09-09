@@ -22,7 +22,16 @@ from typing import Any, Mapping, Optional, Protocol
 # ``request.conversation_params`` only when the body omits it. Routers then read
 # ``conversation_params.conversation_id`` to keep later turns of the same
 # conversation on the same backend when sticky conversation routing is enabled.
+#
+# The Claude Code headers are listed first because a client that sends one also
+# sends nothing else on this list; ordering them ahead of the generic names
+# keeps the common case a single lookup. They mirror the set the Anthropic
+# adapter already reads for audit records, so the Messages API gets the same
+# conversation identity the audit log records rather than a second notion of a
+# session.
 CONVERSATION_ID_HEADERS = (
+    "x-claude-code-session-id",
+    "x-claude-session-id",
     "x-session-id",
     "x-correlation-id",
     "x-session-affinity",
@@ -36,10 +45,7 @@ class RequestWithConversationParams(Protocol):
 
 def get_request_conversation_id(request: RequestWithConversationParams) -> Optional[str]:
     conversation_params = request.conversation_params
-    if conversation_params is not None:
-        return conversation_params.conversation_id
-    disaggregated_params = getattr(request, "disaggregated_params", None)
-    return None if disaggregated_params is None else disaggregated_params.conversation_id
+    return None if conversation_params is None else conversation_params.conversation_id
 
 
 def extract_conversation_id_from_headers(headers: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -62,8 +68,7 @@ def resolve_request_conversation_id(
 ) -> Optional[str]:
     """Return conversation_params.conversation_id populated at the serve edge.
 
-    Body ``conversation_params.conversation_id`` is canonical. Headers are used
-    only when the body does not provide an id.
+    Body ``conversation_params.conversation_id`` takes precedence over headers.
     """
     conversation_params = request.conversation_params
     if conversation_params is not None:
