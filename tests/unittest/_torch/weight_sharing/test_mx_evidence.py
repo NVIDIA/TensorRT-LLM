@@ -20,6 +20,7 @@ so it is loaded here by file path rather than through the `defs` package.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -65,10 +66,47 @@ def _good_log(tp_size: int) -> str:
     return "INFO some TRT-LLM chatter\n" + "".join(_completion(rank) for rank in range(tp_size))
 
 
+def _import_contract_violations(source: str) -> tuple[list[str], list[int]]:
+    """Return `(third_party_modules, relative_import_lines)` found in `source`.
+
+    Every absolute import must resolve to a standard-library top-level module,
+    and relative imports are rejected because the worker imports the module as
+    a bare top-level `mx_evidence`, where they cannot resolve.
+    """
+    imported: set[str] = set()
+    relative_lines: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                relative_lines.append(node.lineno)
+            elif node.module:
+                imported.add(node.module.partition(".")[0])
+    return sorted(imported - sys.stdlib_module_names), relative_lines
+
+
 def test_module_is_standard_library_only() -> None:
-    source = _MODULE_PATH.read_text(encoding="utf-8")
-    for forbidden in ("import torch", "import pytest", "from defs", "import tensorrt_llm"):
-        assert forbidden not in source, f"mx_evidence.py must stay stdlib-only, found {forbidden!r}"
+    third_party, relative_lines = _import_contract_violations(
+        _MODULE_PATH.read_text(encoding="utf-8")
+    )
+    assert not third_party, f"mx_evidence.py must stay stdlib-only, found {third_party}"
+    assert not relative_lines, f"mx_evidence.py must not use relative imports: {relative_lines}"
+
+
+def test_import_contract_check_catches_third_party_and_relative_imports() -> None:
+    source = (
+        "from __future__ import annotations\n"
+        "import re\n"
+        "import numpy as np\n"
+        "from arbitrary_third_party.sub import helper\n"
+        "from . import sibling\n"
+        "def f():\n"
+        "    import torch.nn\n"
+    )
+    third_party, relative_lines = _import_contract_violations(source)
+    assert third_party == ["arbitrary_third_party", "numpy", "torch"]
+    assert relative_lines == [5]
 
 
 def test_complete_evidence_has_no_problems(evidence: ModuleType) -> None:
