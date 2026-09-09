@@ -371,7 +371,9 @@ async def test_subagent_body_id_and_affinity_at_router_dispatch(
 
     service._ctx_router.get_next_server.side_effect = select_context
     service._gen_router.get_next_server.side_effect = select_generation
-    # Keep client-side router selection, mocking only the HTTP exchange.
+    # Isolate metrics registration across parametrized cases and other client tests.
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
+    # Keep client-side router selection, mocking the HTTP exchange.
     service._ctx_client = OpenAIHttpClient(
         service._ctx_router, ServerRole.CONTEXT, session=mock.Mock()
     )
