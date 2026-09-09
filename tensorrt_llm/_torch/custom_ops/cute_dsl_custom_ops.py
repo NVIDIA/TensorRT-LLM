@@ -9385,6 +9385,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         for use_2cta_instrs, mma_tiler_mn, max_num_ab_stage in itertools.product(
                 use_2cta_instrs_candi, mma_tiler_mn_candi,
                 _SM107_BF16_MAX_NUM_AB_STAGE_CANDIDATES):
+            # CTA_N=256 with cluster_n=2 is an illegal memory access on SM107.
+            if mma_tiler_mn[1] == 256 and preferred_cluster_shape_mn[1] == 2:
+                continue
             if not _bf16_cluster_m_fits(m, use_2cta_instrs, mma_tiler_mn,
                                         preferred_cluster_shape_mn):
                 continue
