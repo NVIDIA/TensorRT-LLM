@@ -114,7 +114,9 @@ def wait_all(started: Sequence[tuple[CampaignLaunch, subprocess.Popen]]) -> dict
 AGENT = "claude"
 
 
-def design(instruction: str, *, cwd: Path, timeout: int | None = None) -> int:
+def design(
+    instruction: str, *, cwd: Path, timeout: int | None = None, log: Path | None = None
+) -> int:
     """Run the design skill to completion, in the checkout that ships it.
 
     ``cwd`` is not incidental: a skill is discovered from the agent's working
@@ -130,12 +132,30 @@ def design(instruction: str, *, cwd: Path, timeout: int | None = None) -> int:
     Permissions are bypassed because this runs unattended for hours and the
     skill's own submission gates are the review step -- they are what the
     instruction tells it to honour.
+
+    **Its output is kept, unlike a campaign's.** A campaign reports through
+    its workspace, so discarding its pipe loses nothing; a design that fails
+    to start leaves no workspace at all, and the caller's only symptom is a
+    later refusal saying the design was never established -- which points at
+    the design rather than at whatever stopped it. The first real run of this
+    function returned 1 because the agent's credentials had expired, and the
+    message saying so went to /dev/null.
     """
-    return subprocess.run(  # noqa: S603 - argv is built, never a shell string
+    completed = subprocess.run(  # noqa: S603 - argv is built, never a shell string
         [AGENT, "--dangerously-skip-permissions", "--print", instruction],
         cwd=str(cwd),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
+        text=True,
         timeout=timeout,
         check=False,
-    ).returncode
+    )
+    if log is not None:
+        Path(log).parent.mkdir(parents=True, exist_ok=True)
+        Path(log).write_text((completed.stdout or "") + (completed.stderr or ""), encoding="utf-8")
+    if completed.returncode != 0:
+        tail = ((completed.stderr or "") + (completed.stdout or "")).strip().splitlines()
+        raise DisaggSolError(
+            f"the design agent exited {completed.returncode} in {cwd}. Its last "
+            f"output was: " + (" | ".join(tail[-3:]) or "(nothing)")
+        )
+    return completed.returncode

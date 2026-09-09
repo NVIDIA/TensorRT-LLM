@@ -139,7 +139,13 @@ def _run_disagg_sol(args) -> None:
             # which is the safer default for a step that costs an order of
             # magnitude more than the campaigns it enables.
             designer=(
-                (lambda instruction: spawn.design(instruction, cwd=Path(block["config_repo"])))
+                (
+                    lambda instruction: spawn.design(
+                        instruction,
+                        cwd=Path(block["config_repo"]),
+                        log=root / "design.log",
+                    )
+                )
                 if block.get("config_repo")
                 else None
             ),
