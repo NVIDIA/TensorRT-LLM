@@ -16,6 +16,7 @@
 import gc
 import unittest
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -27,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -50,6 +52,7 @@ def _create_kv_cache_manager_v2(
     kv_cache_config = KvCacheConfigV2(
         max_tokens=max_tokens,
         enable_block_reuse=False,
+        dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
     )
     return KVCacheManagerV2(
         kv_cache_config,
@@ -334,6 +337,76 @@ class TestPerLayerHeadDimHeterogeneous(unittest.TestCase):
         finally:
             mgr_uniform.shutdown()
             mgr_mixed.shutdown()
+
+
+@pytest.mark.parametrize("dtype", [DataType.HALF, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("is_gen", [False, True])
+def test_heterogeneous_page_tables_match_allocated_addresses(dtype, is_gen):
+    # Gemma's short-sequence configuration puts both head sizes in one
+    # lifecycle group. Unequal layer counts also give them different page
+    # index scales, so sharing a group's pointer or scale is incorrect.
+    mgr = _create_kv_cache_manager_v2(num_layers=6, head_dim=[256] * 5 + [512], dtype=dtype)
+    try:
+        request_ids = [11, 22, 33]
+        token_nums = [1, 9, 17]
+        requests = mgr.add_dummy_requests(request_ids, token_nums, is_gen=is_gen)
+        assert requests is not None
+        request_ids.reverse()
+        token_nums.reverse()
+        block_offsets = torch.empty(
+            mgr.num_attention_op_pools,
+            len(request_ids),
+            2,
+            mgr.max_blocks_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        mgr.copy_batch_block_offsets(
+            block_offsets,
+            request_ids,
+            beam_width=1,
+            num_contexts=0 if is_gen else len(request_ids),
+            num_seqs=len(request_ids),
+        )
+        torch.cuda.synchronize()
+        block_offsets = block_offsets.cpu()
+        for layer_id in range(mgr.num_local_layers):
+            pool_id, layer_offset = mgr.kv_cache_pool_mapping[layer_id].tolist()
+            lifecycle_id = mgr.impl.get_layer_group_id(layer_id)
+            roles = [(Role.KEY, Role.VALUE)]
+            if dtype == DataType.NVFP4:
+                roles.append((Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE))
+            for buffer_idx, role_pair in enumerate(roles):
+                pool_pointer = mgr.kv_cache_pool_pointers[pool_id, 0]
+                if dtype == DataType.NVFP4:
+                    pool_pointer = pool_pointer[buffer_idx]
+                for kv_idx, role in enumerate(role_pair):
+                    stride = mgr.impl.get_page_stride(layer_id, role)
+                    layer_base = mgr.impl.get_mem_pool_base_address(
+                        layer_id, role, PageIndexMode.SHARED
+                    )
+                    scale = mgr.impl.get_page_index_scale(layer_id, role)
+                    for seq_idx, (req_id, token_num) in enumerate(zip(request_ids, token_nums)):
+                        base_indices = mgr.kv_cache_map[req_id].get_base_page_indices(lifecycle_id)
+                        num_blocks = (token_num + mgr.tokens_per_block - 1) // mgr.tokens_per_block
+                        page_indices = block_offsets[pool_id, seq_idx, kv_idx, :num_blocks].long()
+                        actual = (
+                            int(pool_pointer)
+                            + (layer_offset * mgr.kv_factor + page_indices) * stride
+                        )
+                        allocated_indices = torch.tensor(
+                            list(base_indices[:num_blocks]), dtype=torch.int64
+                        )
+                        expected = layer_base + allocated_indices * scale * stride
+                        torch.testing.assert_close(
+                            actual,
+                            expected,
+                            rtol=0,
+                            atol=0,
+                            msg=f"layer={layer_id}, role={role}, request={req_id}",
+                        )
+    finally:
+        mgr.shutdown()
 
 
 if __name__ == "__main__":
