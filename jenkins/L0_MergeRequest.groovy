@@ -782,50 +782,62 @@ def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", fileP
     def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
     def headCommit = env.gitlabCommit?.toString()
     def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
-    withCredentials([
-        gitUsernamePassword(
-            credentialsId: 'svc_tensorrt_gitlab_api_token',
-            gitToolName: 'Default'
-        ),
-    ]) {
+    withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
         pipeline.sh "git -C ${LLM_ROOT} fetch --no-tags --depth=1 origin ${baseRef}"
     }
-    def baseCommit = pipeline.sh(
-        script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD",
-        returnStdout: true
-    ).trim()
+    def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
     pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
 
+    def nameStatus = pipeline.sh(
+        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
+        returnStdout: true
+    )
+    def changedFiles = nameStatus.readLines().collect { line ->
+        def fields = line.split('\t', -1)
+        [status: fields[0], paths: fields.drop(1).findAll { it }]
+    }
     if (function == "getChangedFileList") {
-        def nameStatus = pipeline.sh(
-            script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
-            returnStdout: true
-        )
-        return nameStatus.readLines().collectMany { line ->
-            line.split('\t', -1).drop(1).findAll { it }
+        return changedFiles.collectMany { changedFile ->
+            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
+                ? changedFile.paths.reverse()
+                : changedFile.paths
         }
     }
 
+    def renamePaths = [:]
+    changedFiles.findAll { changedFile ->
+        changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
+    }.each { changedFile ->
+        changedFile.paths.each { changedFilePath -> renamePaths[changedFilePath] = changedFile.paths }
+    }
+    def cachedDiffs = [:]
     def getFileDiff = { changedFilePath ->
+        if (cachedDiffs.containsKey(changedFilePath)) {
+            return cachedDiffs[changedFilePath]
+        }
+        def diffPaths = renamePaths.get(changedFilePath, [changedFilePath])
         def rawDiff = ""
-        pipeline.withEnv(["GIT_DIFF_PATH=${changedFilePath}"]) {
+        pipeline.withEnv([
+            "GIT_DIFF_PATH=${diffPaths[0]}",
+            "GIT_DIFF_RENAME_PATH=${diffPaths.size() > 1 ? diffPaths[1] : diffPaths[0]}",
+        ]) {
             rawDiff = pipeline.sh(
-                script: "git -C ${LLM_ROOT} diff --unified=3 --find-renames ${baseCommit} ${headCommit} -- \"\${GIT_DIFF_PATH}\"",
+                script: "git -C ${LLM_ROOT} diff --unified=3 --inter-hunk-context=1 --find-renames ${baseCommit} ${headCommit} -- \"\${GIT_DIFF_PATH}\" \"\${GIT_DIFF_RENAME_PATH}\"",
                 returnStdout: true
             )
         }
         def lines = rawDiff.readLines()
         def firstHunk = lines.findIndexOf { it.startsWith("@@") }
-        return firstHunk < 0 ? "" : lines.drop(firstHunk).join("\n")
+        def diff = firstHunk < 0 ? "" : lines.drop(firstHunk).join("\n")
+        diffPaths.each { diffPath -> cachedDiffs[diffPath] = diff }
+        return diff
     }
 
     if (function == "getOneFileChanges") {
         return getFileDiff(filePath)
     }
     if (function == "getFileChanges") {
-        return filePaths.unique().collectEntries { changedFilePath ->
-            [(changedFilePath): getFileDiff(changedFilePath)]
-        }
+        return filePaths.unique().collectEntries { changedFilePath -> [(changedFilePath): getFileDiff(changedFilePath)] }
     }
     pipeline.error("Unsupported PR diff operation: ${function}")
 }
@@ -906,8 +918,7 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     try {
         def changedFileList = []
         if (githubPrApiUrl != null) {
-            changedFileList = getGithubMRChangedFileWithFallback(
-                pipeline, globalVars, "getChangedFileList")
+            changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
             changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
@@ -940,8 +951,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     def diff = ""
 
     if (githubPrApiUrl != null) {
-        diff = getGithubMRChangedFileWithFallback(
-            pipeline, globalVars, "getOneFileChanges", filePath)
+        diff = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getOneFileChanges", filePath)
     } else {
         diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
     }
@@ -1042,8 +1052,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (filesNeedingDiff) {
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFileWithFallback(
-                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
                 : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
