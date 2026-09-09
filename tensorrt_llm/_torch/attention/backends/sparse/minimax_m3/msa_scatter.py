@@ -92,13 +92,15 @@ def fused_write_layer_caches(
     keep the legacy per-cache writes.
 
     `k_cache`/`v_cache` are [num_pages, num_kv_heads, tokens_per_block,
-    head_dim] HND views; `idx_cache` is the MQA index-K view with head dim 1.
-    `k`/`v` are the layer's new-token values, [T, H*D] or [T, H, D] row views;
-    `idx_k` is [T, D] or [T, 1, D].
+    head_dim] HND views; `idx_cache` is the MQA index-K view with one head.
+    `k`/`v` are the layer's new-token values as [T, H*D] row views;
+    `idx_k` is [T, D]. Their inner dimension must be contiguous.
     """
     if not (k.is_cuda and k_cache.is_cuda):
         return False
     if k_cache.dim() != 4 or v_cache.dim() != 4:
+        return False
+    if v_cache.shape != k_cache.shape:
         return False
     if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
         return False
@@ -131,6 +133,10 @@ def fused_write_layer_caches(
     num_tokens = int(out_cache_loc.shape[0])
     if num_tokens == 0:
         return True
+    if k.shape[0] < num_tokens or v.shape[0] < num_tokens:
+        return False
+    if has_idx and idx_k.shape[0] < num_tokens:
+        return False
 
     _fused_paged_scatter_kernel[(num_tokens,)](
         k,

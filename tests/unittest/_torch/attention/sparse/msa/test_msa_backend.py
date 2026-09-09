@@ -753,7 +753,10 @@ def _reference_scatter_write(k_cache, v_cache, idx_cache, slots, k, v, idx_k):
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("num_kv_heads", [1, 4])
 @pytest.mark.parametrize("with_idx", [True, False])
-def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
+@pytest.mark.parametrize(
+    "input_case", ["supported", "empty", "strided", "short_k", "short_v", "short_idx", "v_shape"]
+)
+def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx, input_case):
     """The fused per-layer cache scatter must match the legacy write_kv_slots
     path exactly on production-shaped inputs: non-contiguous HND cache views
     carved from a pooled allocation and strided source rows sliced from a fused
@@ -786,12 +789,29 @@ def test_fused_scatter_matches_reference(cache_dtype, num_kv_heads, with_idx):
 
     ref_pool = pool.clone()
     ref_idx_pool = idx_pool.clone()
-    _reference_scatter_write(ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k)
+    if input_case == "empty":
+        slots = slots[:0]
+    elif input_case == "strided":
+        k = qkv[:, : 2 * inner : 2]
+    elif input_case == "short_k":
+        k = k[:-1]
+    elif input_case == "short_v":
+        v = v[:-1]
+    elif input_case == "short_idx":
+        if idx_k is None:
+            pytest.skip("Requires index-K")
+        idx_k = idx_k[:-1]
+    elif input_case == "v_shape":
+        v_cache = v_cache[:, :, :-1, :]
+    else:
+        _reference_scatter_write(
+            ref_pool[:, 0], ref_pool[:, 1], ref_idx_pool[:, 0], slots, k, v, idx_k
+        )
 
     wrote = fused_write_layer_caches(
         k_cache, v_cache, idx_cache if with_idx else None, slots, k, v, idx_k
     )
-    assert wrote
+    assert wrote == (input_case in ("supported", "empty"))
 
     torch.testing.assert_close(pool.to(torch.float32), ref_pool.to(torch.float32))
     torch.testing.assert_close(idx_pool, ref_idx_pool)
