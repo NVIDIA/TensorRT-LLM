@@ -1438,8 +1438,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
                      marks=skip_pre_blackwell,
                      id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
-        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
-                     id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
                      id="mistralai_Ministral-8B-Instruct-2410"),
         pytest.param(

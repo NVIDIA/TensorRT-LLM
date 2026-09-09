@@ -20,25 +20,12 @@ CPU-only — no GPU, MPI, or tensorrt_llm dependency.
 import csv
 import json
 import os
-import sys
 
 import pytest
 
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        "examples",
-        "disaggregated",
-        "slurm",
-        "cache_transceiver_test",
-    ),
-)
+__extra_import_path__ = ["~/examples/disaggregated/slurm/cache_transceiver_test"]
 
-from report import (  # noqa: E402
+from report import (
     RID_COMBINATION_STRIDE,
     RID_REQLEN_STRIDE,
     _is_kv_data_header,

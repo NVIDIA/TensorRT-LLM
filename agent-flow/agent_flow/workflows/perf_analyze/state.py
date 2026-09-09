@@ -39,8 +39,8 @@ SCHEMA_VERSION = 1
 #                       is conditional: it runs only when ``task.yaml``
 #                       carries a ``sol`` block, and is skipped (never
 #                       marked done) otherwise.
-#   - ``analyzer``    — relaunches the server under nsys and the torch
-#                       profiler, replays the same load, writes
+#   - ``analyzer``    — relaunches the server under nsys and ncu,
+#                       replays the same load, writes
 #                       ``profile_findings.md`` + trace artifacts (and,
 #                       with a ``sol`` block, the measured↔SOL
 #                       correlation). Named like perf-optimize's

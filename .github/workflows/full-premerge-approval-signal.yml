@@ -1,0 +1,189 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Full Pre-Merge Approval Signal
+run-name: "Full approval re-check for PR #${{ github.event.pull_request.number }}"
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  evaluate-full-approval:
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      (github.event.pull_request.base.ref == 'main' ||
+       startsWith(github.event.pull_request.base.ref, 'release/')) &&
+      github.event.review.state == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish approval candidate
+        continue-on-error: true
+        uses: actions/github-script@v8
+        env:
+          SIGNAL_PATH: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
+        with:
+          retries: 2
+          script: |
+            const { mkdir, writeFile } = require('node:fs/promises');
+            const { dirname } = require('node:path');
+
+            const pullNumber = context.payload.pull_request?.number;
+            if (!Number.isSafeInteger(pullNumber)) {
+              core.warning('The review event does not contain a valid pull request number.');
+              return;
+            }
+
+            await mkdir(dirname(process.env.SIGNAL_PATH), { recursive: true });
+            await writeFile(process.env.SIGNAL_PATH, `${pullNumber}\n`, 'utf8');
+
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    baseRefName
+                    reviewDecision
+                    state
+                    latestOpinionatedReviews(first: 100, writersOnly: true) {
+                      nodes {
+                        state
+                      }
+                      pageInfo {
+                        hasNextPage
+                      }
+                    }
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        isOutdated
+                      }
+                      pageInfo {
+                        hasNextPage
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            try {
+              const result = await github.graphql(query, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: pullNumber,
+              });
+              const pullRequest = result.repository?.pullRequest;
+              if (!pullRequest || pullRequest.state !== 'OPEN') {
+                console.log(`PR #${pullNumber} is not open.`);
+                return;
+              }
+              const latestOpinions = pullRequest.latestOpinionatedReviews?.nodes ?? [];
+              const hasApproval = latestOpinions.some(
+                (review) => review.state === 'APPROVED'
+              );
+              const hasChangesRequested = latestOpinions.some(
+                (review) => review.state === 'CHANGES_REQUESTED'
+              );
+              const hasUnresolvedConversation =
+                (pullRequest.reviewThreads?.nodes ?? []).some(
+                  (thread) => !thread.isResolved && !thread.isOutdated
+                );
+              const opinionsComplete =
+                pullRequest.latestOpinionatedReviews?.pageInfo?.hasNextPage === false;
+              let requiredApprovalCountSatisfied = false;
+              if (pullRequest.reviewDecision === null &&
+                  opinionsComplete &&
+                  hasApproval &&
+                  !hasChangesRequested &&
+                  hasUnresolvedConversation) {
+                try {
+                  const response = await github.request(
+                    'GET /repos/{owner}/{repo}/rules/branches/{branch}',
+                    { ...context.repo, branch: pullRequest.baseRefName }
+                  );
+                  const approvalCounts = response.data
+                    .filter((rule) => rule.type === 'pull_request')
+                    .map((rule) => rule.parameters?.required_approving_review_count)
+                    .filter((count) => Number.isSafeInteger(count));
+                  if (approvalCounts.length === 0) {
+                    core.warning('Could not determine the required approval count.');
+                  } else {
+                    const approvalCount = latestOpinions.filter(
+                      (review) => review.state === 'APPROVED'
+                    ).length;
+                    requiredApprovalCountSatisfied =
+                      approvalCount >= Math.max(...approvalCounts);
+                  }
+                } catch (error) {
+                  core.warning(`Could not read branch approval rules: ${error.message}`);
+                }
+              }
+              const fullyApproved =
+                pullRequest.reviewDecision === 'APPROVED' ||
+                (pullRequest.reviewDecision === null &&
+                 opinionsComplete &&
+                 hasApproval &&
+                 !hasChangesRequested &&
+                 hasUnresolvedConversation &&
+                 requiredApprovalCountSatisfied);
+              if (fullyApproved) {
+                console.log(`PR #${pullNumber} is fully approved.`);
+                return;
+              }
+
+              let requests = [];
+              try {
+                const response = await github.request(
+                  'GET /repos/{owner}/{repo}/pulls/{pull_number}/requested_reviewers',
+                  { ...context.repo, pull_number: pullNumber }
+                );
+                requests = [
+                  ...response.data.users.map((user) => `user \`${user.login}\``),
+                  ...response.data.teams.map(
+                    (team) => `team \`${context.repo.owner}/${team.slug}\``
+                  ),
+                ];
+              } catch (error) {
+                core.warning(`Could not read outstanding review requests: ${error.message}`);
+              }
+              const detail = requests.length > 0
+                ? `Outstanding review requests: ${requests.join(', ')}.`
+                : 'No specific outstanding user or team review request is currently visible.';
+              const summary =
+                `PR #${pullNumber} is not fully approved (reviewDecision: ` +
+                `\`${pullRequest.reviewDecision || 'NOT_AVAILABLE'}\`).\n\n${detail}\n\n` +
+                'GitHub review requirements, CODEOWNERS, or a blocking review may require ' +
+                'additional approvals. Unresolved review conversations are evaluated separately.';
+              core.notice(summary.replaceAll('\n', ' '));
+              await core.summary
+                .addHeading('Full pre-merge approval is still required')
+                .addRaw(summary)
+                .write();
+            } catch (error) {
+              core.warning(`Could not report approval details for PR #${pullNumber}: ${error.message}`);
+            }
+
+      - name: Upload full approval signal
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-premerge-approval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
+          if-no-files-found: ignore
+          retention-days: 1

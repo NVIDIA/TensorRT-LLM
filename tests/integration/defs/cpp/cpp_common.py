@@ -1,65 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import datetime
 import glob
 import logging as _logger
 import os as _os
 import pathlib as _pl
 import subprocess as _sp
-import sys as _sys
-from typing import Generator, List, Optional, Sequence
-
-build_script_dir = _pl.Path(
-    __file__).parent.resolve().parent.parent.parent.parent / "scripts"
-assert build_script_dir.is_dir()
-_sys.path.append(str(build_script_dir))
+from typing import Optional, Sequence
 
 from build_wheel import get_build_dir as get_trt_llm_build_dir
 
 default_test_parallel = 2
-default_test_timeout = 3600
-
-include_test_map = {
-    "gpt": ("Gpt[^j]", ),
-    "gpt_executor": ("GptExecutor", ),
-    "gpt_tests": ("GptTests", ),
-    "gptj": ("Gptj", ),
-    "llama": ("Llama", ),
-    "chatglm": ("ChatGlm", ),
-    "medusa": ("Medusa", ),
-    "eagle": ("Eagle", ),
-    "mamba": ("Mamba", ),
-    "recurrentgemma": ("RecurrentGemma", ),
-    "encoder": ("EncoderModelTestSingleGPU", ),
-    "bart": ("BartBasicTest", ),
-    "t5": (
-        "T5BasicTest",
-        "T5Beam2Test",
-    ),
-    "enc_dec_language_adapter": ("LanguageAdapterBasicTest", ),
-    "redrafter": ("ExplicitDraftTokens", )
-}
-
-
-def generate_included_model_tests(
-        test_list: List[str]) -> Generator[str, None, None]:
-
-    yield from (item for model in test_list for item in include_test_map[model])
-
-
-def generate_result_file_name(test_list: List[str],
-                              run_fp8=False) -> Generator[str, None, None]:
-    yield "results-single-gpu"
-    yield from test_list
-
-    if run_fp8:
-        yield "fp8"
-
-
-def generate_excluded_test_list(test_list):
-    if "gpt" in test_list:
-        if "gpt_executor" not in test_list:
-            yield "GptExecutor"
-        if "gpt_tests" not in test_list:
-            yield "GptTests"
 
 
 def find_dir_containing(files: Sequence[str],
@@ -233,12 +197,3 @@ def parallel_run_ctest(
             report = get_report()
         if report:
             add_parallel_info(cwd / report, parallel)
-
-
-def produce_mpirun_command(*, global_commands, nranks, local_commands,
-                           leader_commands):
-    l = global_commands
-    for rank in range(nranks):
-        l += ["-n", "1"] + local_commands + (leader_commands
-                                             if rank == 0 else []) + [":"]
-    return l[:-1]

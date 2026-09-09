@@ -1,7 +1,7 @@
 """Performance-analyze workflow built on ``agent_flow.AgentLayer``.
 
 Serves a model checkpoint with ``trtllm-serve``, benchmarks and profiles
-it with ``benchmark_serving.py`` (nsys + torch profiler), and synthesizes
+it with ``benchmark_serving.py`` (nsys + ncu), and synthesizes
 a report whose headline is the main performance bottleneck. When the task
 spec carries a ``sol`` block, a projector stage additionally derives an
 analytical speed-of-light (SOL) ceiling — following the

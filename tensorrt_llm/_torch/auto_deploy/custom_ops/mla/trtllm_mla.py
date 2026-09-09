@@ -60,7 +60,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PositionEmbeddingType,
     RopeParams,
@@ -1142,7 +1142,7 @@ def _handle_prefill_thop_cached_kv(
     """Cache-reused / chunked-prefill MLA attention.
 
     Mirrors ``MLA.forward_context_with_chunked_prefill`` from the main
-    PyTorch backend (``tensorrt_llm/_torch/modules/attention.py``).  Required
+    PyTorch backend (``tensorrt_llm/_torch/attention/attention.py``).  Required
     when any prefill seq has ``host_past_kv > 0`` — the fresh-prefill kernel
     path misbehaves under that config because it would re-RoPE/append the
     new tokens via ``invokeMLARopeContext`` while the FMHA expects K/V to

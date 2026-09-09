@@ -83,7 +83,7 @@ inline void kernel_launcher(int arch, Params& params, cudaStream_t s)
         EXEC(KernelType::FP16Int4PerChannel, FP16DetailsA, Int4DetailsW, ColumnMajorInterleavedForHopper, true);
         EXEC(KernelType::BF16Int4PerChannel, BF16DetailsA, Int4DetailsW, ColumnMajorInterleavedForHopper, true);
     }
-    else if (arch == 100 || arch == 103)
+    else if (tensorrt_llm::common::isSM100Family(arch))
     {
         EXEC_W4A8(KernelType::FP16Int4Groupwise, FP16DetailsA, Int4DetailsW, ColumnMajor, false);
         EXEC_W4A8(KernelType::BF16Int4Groupwise, BF16DetailsA, Int4DetailsW, ColumnMajor, false);

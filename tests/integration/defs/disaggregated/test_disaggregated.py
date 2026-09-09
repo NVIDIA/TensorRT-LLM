@@ -1076,7 +1076,7 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            300,  # timeout
+            server_start_timeout,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
@@ -3054,7 +3054,8 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                            "gpt_oss_120b_harmony",
                            env=env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=600)
 
 
 @skip_pre_hopper

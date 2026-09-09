@@ -190,6 +190,7 @@ else:
         layers: object = None
         max_util_for_resume: float = 0.97
         enable_partial_reuse: bool = True
+        reuse_match_backoff: int = 0
         constraints: object = None
         typical_step: object = None
         initial_pool_ratio: object = None

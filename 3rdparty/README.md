@@ -1,8 +1,9 @@
 # `3rdparty/`
 
-This directory holds TensorRT-LLM's third-party C++ dependencies (driven by
-cmake `FetchContent` from `fetch_content.json`) plus tooling that
-accelerates repeat clones of those dependencies.
+This directory holds TensorRT-LLM's third-party dependency metadata and
+tooling. C++ dependencies are driven by CMake `FetchContent` from
+`fetch_content.json`; source vendors use a generated lock and patches. It also
+contains tooling that accelerates repeat clones of C++ dependencies.
 
 ## Adding new third-party dependencies
 
@@ -14,6 +15,8 @@ dependency you want to add:
   and re-distributed with the wheel, see [cpp-thirdparty.md](cpp-thirdparty.md)
 * For python dependencies declared via wheel metadata and installed in the
   container via pip, see [py-thirdparty.md](py-thirdparty.md)
+* For source trees copied into this repository and pinned to an upstream Git
+  commit, see [vendor-sources.md](vendor-sources.md)
 
 ## FetchContent cache (`--use-3rdparty-cache`)
 

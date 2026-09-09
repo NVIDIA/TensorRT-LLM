@@ -3118,6 +3118,39 @@ class TestPoolsideV1ToolParserFactory:
 
 
 # ============================================================================
+# Nemotron 3.5 Super VL Parser Tests
+# ============================================================================
+
+
+class TestNemotron35SuperVLToolParserFactory:
+    """Nemotron 3.5 Super VL reuses `qwen3_coder`.
+
+    Its chat template instructs the model to emit that XML shape rather than
+    JSON, so it ships no parser of its own. The parser itself is covered by
+    `TestQwen3CoderToolParser`; only the mapping is new here.
+    """
+
+    def test_auto_detect_nemotron_h_omni(self, tmp_path):
+        """`model_type` diverges from the architecture string.
+
+        The checkpoint's architecture is `NemotronH_Omni_Reasoning_V3` but its
+        `model_type` is `nemotron_h_omni`, and the lookup is exact-match, so
+        without the mapping row `--tool_parser auto` resolved to None.
+        """
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "NVIDIA-Nemotron-3.5-Super-120B-A12B"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({
+                "model_type": "nemotron_h_omni",
+                "architectures": ["NemotronH_Omni_Reasoning_V3"],
+            }))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "qwen3_coder"
+
+
+# ============================================================================
 # Integration Tests
 # ============================================================================
 

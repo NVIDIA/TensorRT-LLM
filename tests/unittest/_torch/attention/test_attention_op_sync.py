@@ -44,14 +44,15 @@ from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.attention_backend.fmha.fallback import (
+from tensorrt_llm._torch.attention.backends.fmha.fallback import (
     _THOP_EXCLUDED_FIELDS,
     _THOP_LITERALS,
     FallbackFmha,
 )
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 
 pytestmark = pytest.mark.cpu_only
 
@@ -676,3 +677,13 @@ def test_fallback_support_matches_thop_kv_update_contract(is_cross, update_kv_ca
     forward_args = AttentionForwardArgs(update_kv_cache=update_kv_cache)
 
     assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
+
+
+def test_fallback_rejects_raw_fp8_input():
+    """Do not dispatch raw FP8 QKV to the native attention op."""
+    fmha = object.__new__(FallbackFmha)
+    metadata = SimpleNamespace(is_cross=False)
+    forward_args = AttentionForwardArgs(update_kv_cache=True)
+    q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
+
+    assert not fmha.is_supported(q, None, None, metadata, forward_args)

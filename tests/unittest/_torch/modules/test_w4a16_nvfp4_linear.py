@@ -19,9 +19,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import (
     Linear,

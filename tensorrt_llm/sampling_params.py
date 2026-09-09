@@ -259,7 +259,6 @@ class SamplingParams:
         return_perf_metrics (bool): Controls if Result should contain the performance metrics for this request. Defaults to False.
         additional_model_outputs (List[str], optional): The additional outputs to gather from the model. Defaults to None.
 
-        lookahead_config (tensorrt_llm.bindings.executor.LookaheadDecodingConfig , optional): Lookahead decoding config. Defaults to None.
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
 
@@ -345,9 +344,6 @@ class SamplingParams:
 
     # TODO: deprecate this after trtllm-serve migrate to use TopK logprobs
     _return_log_probs: bool = False
-
-    # Lookahead decoding config
-    lookahead_config: Optional[tllme.LookaheadDecodingConfig] = None
 
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None

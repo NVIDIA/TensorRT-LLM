@@ -978,6 +978,29 @@ class TestLifecycle:
         assert ret.success is False
         assert c.state is bcore.TransferState.FAILED
 
+    def test_partial_publication_waits_for_published_writers_without_scatter(self):
+        c = self._ctx(2)
+        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+
+        c.abort_publication(published_writers={7})
+
+        assert not c.ready_to_scatter()
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
+        assert c.state is bcore.TransferState.FAILED
+
+    def test_failed_publication_with_no_published_writer_settles_immediately(self):
+        c = self._ctx(2)
+
+        c.abort_publication(published_writers=set())
+
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
+
     def test_orphan_quarantines(self):
         c = self._ctx(2)
         c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())

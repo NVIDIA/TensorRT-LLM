@@ -32,8 +32,8 @@ from transformers.models.parakeet.modeling_parakeet import (
 )
 
 from ...logger import logger
+from ..attention.attention import Attention
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm

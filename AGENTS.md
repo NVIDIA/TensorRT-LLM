@@ -15,6 +15,9 @@ Python and C++ codebase with PyTorch and AutoDeploy execution paths.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
   `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
+- When adding or renaming a public model architecture, update
+  `tensorrt_llm/usage/architecture_allowlist.py` with its exact Hugging Face architecture name;
+  never add private or customer-specific names
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
@@ -84,7 +87,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy)
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
-| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py`, `tensorrt_llm/_torch/modules/mla.py`, or `tensorrt_llm/_torch/attention_backend/`** |
+| `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
@@ -108,7 +111,7 @@ PyTorch backend where it makes sense (attention, quantization, parallelism).
 
 Key entry points:
 - Public Python API: `from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams`.
-- Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
+- Serving CLI: `trtllm-serve <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
 - `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.

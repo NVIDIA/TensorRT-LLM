@@ -17,13 +17,10 @@
 
 #include "algorithms.h"
 #include "tensorrt_llm/batch_manager/agentTree.h"
-#include "tensorrt_llm/batch_manager/allocateKvCache.h"
-#include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
-#include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -104,25 +101,4 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("__call__", &MicroBatchScheduler::operator(), nb::arg("active_requests"), nb::arg("inflight_req_ids"),
             nb::arg("max_batch_size_runtime"), nb::arg("max_num_tokens_runtime"))
         .def("name", [](MicroBatchScheduler const&) { return MicroBatchScheduler::name; });
-
-    nb::class_<PauseRequests>(m, PauseRequests::name)
-        .def(nb::init<SizeType32>(), nb::arg("max_input_len"))
-        .def("__call__", &PauseRequests::operator(), nb::arg("requests_to_pause"), nb::arg("inflight_req_ids"),
-            nb::arg("req_ids_to_pause"), nb::arg("pause_flagged"), nb::arg("seq_slot_manager"),
-            nb::arg("kv_cache_manager") = std::nullopt, nb::arg("cross_kv_cache_manager") = std::nullopt,
-            nb::arg("peft_cache_manager") = std::nullopt)
-        .def("name", [](PauseRequests const&) { return PauseRequests::name; });
-
-    nb::class_<AssignReqSeqSlots>(m, AssignReqSeqSlots::name)
-        .def(nb::init<>())
-        .def("__call__", &AssignReqSeqSlots::operator(), nb::arg("seq_slot_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"))
-        .def("name", [](AssignReqSeqSlots const&) { return AssignReqSeqSlots::name; });
-
-    nb::class_<AllocateKvCache>(m, AllocateKvCache::name)
-        .def(nb::init<>(), nb::call_guard<nb::gil_scoped_release>())
-        .def("__call__", &AllocateKvCache::operator(), nb::arg("kv_cache_manager"), nb::arg("context_requests"),
-            nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
-        .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 }

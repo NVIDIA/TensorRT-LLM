@@ -23,7 +23,6 @@ Coverage:
 """
 
 import os
-import sys
 import time
 
 import pytest
@@ -35,7 +34,6 @@ from .conftest import find_repo_root, venv_check_call, venv_check_output
 from .trt_test_alternative import call, check_call, print_info
 
 LLM_ROOT = os.environ.get("LLM_ROOT", find_repo_root())
-sys.path.append(os.path.join(LLM_ROOT, "triton_backend"))
 
 
 @pytest.fixture(autouse=True)

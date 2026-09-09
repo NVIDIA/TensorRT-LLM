@@ -131,20 +131,28 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
-### FlashInfer JIT workspace for dynamically spawned MPI workers
+### FlashInfer JIT workspaces for MPI workers
 
-When the LLM API dynamically spawns multiple MPI workers, users affected by
-concurrent FlashInfer source-generation races can enable persistent, per-worker
-cache slots for FlashInfer JIT artifacts. Set
-`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance.
-The workaround preserves compiled artifacts between launches, and downloaded
-cubins remain in FlashInfer's shared cache. It is disabled by default and can
-be removed once FlashInfer guards source generation before writing shared
-workspace files.
+`trtllm-llmapi-launch` ranks and dynamically spawned `MpiPoolSession` workers
+isolate FlashInfer JIT source-generation workspaces by default. Each process
+normally claims a locked, persistent cache slot under
+`~/.cache/tensorrt_llm/flashinfer`, while downloaded cubins remain in
+FlashInfer's shared cache. This prevents concurrent MPI processes from writing
+the same generated source files without forcing a cold JIT compilation on
+every launch. Set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking
+the launcher or creating the LLM instance to disable this behavior.
 
-An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. Workers
-started outside the LLM API's dynamic MPI pool must configure their own
-workspace isolation.
+Persistent slots are not pruned automatically, so their count can grow with
+peak job concurrency. When no TensorRT-LLM processes are using the cache, the
+slots may be deleted safely; subsequent launches rebuild the removed JIT
+artifacts.
+
+If persistent workspace setup is unavailable, each process falls back to a
+process-unique temporary workspace that is removed when the process exits.
+Persistent cache reuse is not available for this fallback.
+
+An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
+launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved.
 
 ### Cannot quit after generation
 

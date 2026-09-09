@@ -149,6 +149,16 @@ class MoERunner(TunableRunner):
                           profile: OptimizationProfile, **kwargs) -> List[int]:
         return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
+    def _resolve_fallback_tactic(self, tactic: int, gemm_idx: int) -> int:
+        if (tactic == -1 and get_sm_version() == 107
+                and self.x_dtype == torch.bfloat16
+                and self.weight_dtype == torch.bfloat16):
+            # MoeGemmRunner appends the SM80-style grouped-GEMM tactics after
+            # the TMA-WS tactics. Its final tactic is a shape-safe fallback on
+            # SM107, where the first SM100 TMA-WS tactic can fail to initialize.
+            return self.fused_moe_runner.get_tactic_num(gemm_idx) - 1
+        return tactic
+
     def unique_id(self):
         return (
             self.x_dtype,
@@ -178,6 +188,7 @@ class MoERunner(TunableRunner):
         do_preparation: bool = False,
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        tactic = self._resolve_fallback_tactic(tactic, gemm_idx)
         self.fused_moe_runner.run_gemm_profile(
             x,
             fc1_expert_weights,
@@ -320,6 +331,9 @@ def fused_moe(
         ],
         gemm_idx=2,
     )
+
+    gemm_tactic_1 = moe_runner._resolve_fallback_tactic(gemm_tactic_1, 1)
+    gemm_tactic_2 = moe_runner._resolve_fallback_tactic(gemm_tactic_2, 2)
 
     lora_active = (fc1_lora_ranks is not None) or (fc1_slot_lora_ranks
                                                    is not None)

@@ -374,7 +374,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         TLLM_LOG_DEBUG(
             mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
         TLLM_CHECK_WITH_INFO(
-            (*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+            (*llmRequest)->mSamplingConfig.getBeamWidth() == 1, "Currently, only beam width 1 is supported.");
     }
 
     auto const& connections = session.getConnections();

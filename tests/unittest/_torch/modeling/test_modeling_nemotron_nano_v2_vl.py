@@ -18,6 +18,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.models import modeling_nemotron_nano as nemotron_nano
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
+from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     NanoV2VLInputProcessor,
     NanoV2VLMultimodalEncoder,
@@ -43,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
+    TorchLlmArgs,
 )
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -218,6 +220,81 @@ def test_nemotron_nano_rejects_evs_attached_video_embeddings():
             input_ids=torch.tensor([[20]], dtype=torch.long),
             multimodal_params=[param],
         )
+
+
+def _spec_forward_stub():
+    """Minimal stand-in for the VL model: only what `forward` touches."""
+    llm = MagicMock()
+    llm.forward.return_value = torch.zeros(1, 4)
+    return SimpleNamespace(
+        llm=llm,
+        mm_token_ids=torch.tensor([0], dtype=torch.int32),
+        video_pruning_rate=0.0,
+    )
+
+
+def test_nemotron_nano_forward_threads_spec_decoding_args():
+    """MTP drafting needs spec_metadata and resource_manager to reach the inner LM."""
+    model = _spec_forward_stub()
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
+    spec_metadata = object()
+    resource_manager = object()
+
+    NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=input_ids,
+        spec_metadata=spec_metadata,
+        resource_manager=resource_manager,
+    )
+
+    kwargs = model.llm.forward.call_args.kwargs
+    assert kwargs["spec_metadata"] is spec_metadata
+    assert kwargs["resource_manager"] is resource_manager
+    # Text-only request: fusion is a no-op, so both id arguments agree.
+    assert torch.equal(kwargs["input_ids"], input_ids)
+    assert torch.equal(kwargs["orig_input_ids"], input_ids)
+
+
+def test_nemotron_nano_forward_keeps_prompt_ids_when_embeds_are_fused(monkeypatch):
+    """Fusion nulls input_ids, so orig_input_ids is the drafter's only token source."""
+    monkeypatch.setattr(
+        nemotron_nano,
+        "fuse_input_embeds",
+        lambda *args, **kwargs: (None, torch.zeros(3, 4)),
+    )
+    model = _spec_forward_stub()
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
+
+    NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=input_ids,
+        spec_metadata=object(),
+    )
+
+    kwargs = model.llm.forward.call_args.kwargs
+    assert kwargs["input_ids"] is None
+    assert torch.equal(kwargs["orig_input_ids"], input_ids)
+
+
+def test_nemotron_nano_forward_passes_through_spec_worker_dict():
+    """One-model MTP returns a dict, not logits; forward must hand it back as-is."""
+    model = _spec_forward_stub()
+    spec_output = {"logits": torch.zeros(1, 4), "next_draft_tokens": torch.zeros(1, 3)}
+    model.llm.forward.return_value = spec_output
+    attn_metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+
+    out = NemotronH_Nano_VL_V2.forward(
+        model,
+        attn_metadata,
+        input_ids=torch.tensor([5, 6, 7], dtype=torch.long),
+        spec_metadata=object(),
+    )
+
+    assert out is spec_output
 
 
 def test_get_vision_encoder_cuda_graph_config():
@@ -568,6 +645,60 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
             f"  batched : {b_logp}\n"
             f"  separate: {s_logp}"
         )
+
+
+@pytest.mark.cpu_only
+def test_nemotron_nano_v2_vl_defaults_keep_block_reuse_opt_in():
+    """The VL wrapper must inherit the inner LM's block-reuse default.
+
+    `ModelLoader` applies `get_model_defaults()` to the resolved outer class,
+    so with no override here `NemotronHForCausalLM`'s
+    `enable_block_reuse: False` never reaches the user's args. The hybrid
+    auto-disable in `_validate_and_adjust_mamba_snapshot_config` does not catch
+    it either: that one tests `is_nemotron_hybrid`, which reads a flat
+    `hybrid_override_pattern` the outer VL config does not carry -- the inner
+    config only becomes `pretrained_config` later, in `post_config`. Between
+    the two, block reuse stays on with no Mamba state snapshot policy and no
+    warning.
+    """
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+    defaults = NemotronH_Nano_VL_V2.get_model_defaults(llm_args)
+
+    assert defaults == NemotronHForCausalLM.get_model_defaults(llm_args), (
+        "VL wrapper defaults diverged from the inner LM they delegate to"
+    )
+    assert defaults["kv_cache_config"]["enable_block_reuse"] is False
+
+
+@pytest.mark.cpu_only
+def test_nemotron_nano_v2_vl_set_guided_decoder_reaches_inner_lm():
+    """`MultimodalModelMixin.set_guided_decoder` must reach the inner LM.
+
+    The mixin routes through the `language_model` property, whose base
+    implementation raises. Without the wrapper's override this fails with
+    `NotImplementedError` -- not an assertion -- which is what guided decoding
+    plus a one-model spec-decode mode hit at executor creation.
+    """
+    received = []
+
+    class _InnerWithGuidedDecoder(torch.nn.Module):
+        def set_guided_decoder(self, guided_decoder):
+            received.append(guided_decoder)
+            return True
+
+    # The delegation is decided by the class body, not by any loaded weight, so
+    # skipping `__init__` keeps this on CPU and off the checkpoint.
+    # `nn.Module.__init__` still has to run first, since `nn.Module.__setattr__`
+    # refuses submodules otherwise.
+    model = object.__new__(NemotronH_Nano_VL_V2)
+    torch.nn.Module.__init__(model)
+    model.llm = _InnerWithGuidedDecoder()
+
+    sentinel = object()
+
+    assert model.set_guided_decoder(sentinel) is True
+    assert received == [sentinel]
 
 
 @pytest.mark.cpu_only

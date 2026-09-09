@@ -9,8 +9,8 @@ from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.rocket import (
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.sparse.rocket import (
     RocketKVCacheManager,
     RocketTrtllmAttention,
     RocketTrtllmAttentionMetadata,

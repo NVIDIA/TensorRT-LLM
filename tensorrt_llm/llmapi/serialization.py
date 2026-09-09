@@ -75,9 +75,8 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExecutorConfig", "ExtendedRuntimePerfKnobConfig", "Response", "Result",
-        "FinishReason", "KvCacheConfig", "KvCacheTransferMode",
-        "KvCacheRetentionConfig",
+        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
+        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
@@ -100,8 +99,7 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
-        "KvCacheConfig", "LookaheadDecodingConfig", "SchedulerConfig",
-        "LoadFormat", "DynamicBatchConfig"
+        "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":

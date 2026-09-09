@@ -11,6 +11,7 @@ import torch
 pytest.importorskip("fla")
 
 from fla.modules import ShortConvolution  # noqa: E402
+from kimi_kda_test_utils import KimiKDAReference, get_production_prefill_kernel_path
 
 from tensorrt_llm._torch.modules.kimi_kda import (
     KimiKDALinearAttention,  # noqa: E402
@@ -21,10 +22,6 @@ from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
     fused_kda_post_conv,
 )
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
-    KimiKDAReference,
-    get_production_prefill_kernel_path,
-)
 
 NUM_HEADS = 96
 HEAD_DIM = 128
@@ -128,7 +125,7 @@ def _run_production_prefill(
         state_indices=slot_indices.to(torch.int32),
         query_start_loc=cu_seqlens.to(torch.int32),
     )
-    output = attention.forward_prefill(
+    core = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),
         cu_seqlens,
         metadata,
@@ -137,6 +134,7 @@ def _run_production_prefill(
         state_pool,
         slot_indices,
     )
+    output = attention._project_output(core)
     return output.reshape_as(hidden_states)
 
 

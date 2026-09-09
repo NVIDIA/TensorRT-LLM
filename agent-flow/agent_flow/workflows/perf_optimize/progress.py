@@ -46,6 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import yaml
@@ -56,7 +57,17 @@ from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
 
 OPTIMIZATION_STAGE = "optimization"
-_AGENTS = ("benchmarker", "projector", "analyzer", "optimizer", "evaluator", "qa", "reporter")
+_AGENTS = (
+    "benchmarker",
+    "projector",
+    "analyzer",
+    "optimizer",
+    "evaluator",
+    "integrator",
+    "qa",
+    "reporter",
+)
+_READABLE_AGENTS = (*_AGENTS, "optimizer_evaluator")
 
 # Structured decision vocabulary the orchestrator branches on. APPROVE
 # accepts the attempt; REJECT fails the item terminally (no retry would
@@ -64,6 +75,7 @@ _AGENTS = ("benchmarker", "projector", "analyzer", "optimizer", "evaluator", "qa
 # bounded by ``optimize.max_attempts_per_item``.
 EVALUATOR_DECISIONS = ("APPROVE", "REJECT", "PUSH_BACK")
 EVALUATOR_REASON_CATEGORIES = ("none", "code_quality", "functionality", "perf_shortfall")
+INTEGRATOR_DECISIONS = ("APPROVE", "FALLBACK_BEST", "REJECT")
 
 # Per-point curve measurements (Pareto-curve mode only: when
 # ``benchmark.concurrency`` in task.yaml is a list). Shared by the
@@ -170,7 +182,7 @@ def find_entries(
     """
     if last_steps is not None and last_steps < 1:
         raise ValueError(f"last_steps must be >= 1, got {last_steps}")
-    if agent is not None and agent not in _AGENTS:
+    if agent is not None and agent not in _READABLE_AGENTS:
         return []
     entries = list(read_progress(path)[OPTIMIZATION_STAGE])
     if agent is not None:
@@ -186,16 +198,34 @@ def find_entries(
 
 def latest_entry(path: Path, agent: str) -> dict[str, Any] | None:
     """Return the most recent entry written by ``agent``, or ``None``."""
-    if agent not in _AGENTS:
+    if agent not in _READABLE_AGENTS:
         return None
     matches = find_entries(path, agent=agent)
     return matches[-1] if matches else None
 
 
-def _append(path: Path, entry: dict[str, Any]) -> None:
-    data = read_progress(path)
-    data[OPTIMIZATION_STAGE].append(entry)
-    write_progress(path, data)
+def _append(
+    path: Path,
+    entry: dict[str, Any],
+    *,
+    lock: Lock | None = None,
+    allocate_step: bool = False,
+) -> dict[str, Any]:
+    """Append one entry, optionally serializing and allocating its step."""
+
+    def _write() -> dict[str, Any]:
+        data = read_progress(path)
+        stored = dict(entry)
+        if allocate_step:
+            stored["step"] = len(data[OPTIMIZATION_STAGE]) + 1
+        data[OPTIMIZATION_STAGE].append(stored)
+        write_progress(path, data)
+        return stored
+
+    if lock is None:
+        return _write()
+    with lock:
+        return _write()
 
 
 def _now_iso() -> str:
@@ -237,11 +267,38 @@ class ProgressContext:
     """
 
     path: Path
+    # Item workers append to the global dashboard first under this shared
+    # lock, then append the same structured event to their own progress file.
+    global_path: Path | None = None
+    global_lock: Lock | None = field(default=None, repr=False, compare=False)
     current_step: int = 0
     current_round: int = 0
     current_attempt: int | None = None
     current_item_id: str = ""
     _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
+
+
+def append_workflow_event(
+    path: Path,
+    lock: Lock,
+    *,
+    event: str,
+    round_no: int,
+    summary: str,
+    item_ids: list[str],
+) -> dict[str, Any]:
+    """Append a main-thread batch lifecycle event to global progress."""
+    entry = {
+        "agent": "optimizer_evaluator",
+        "round": round_no,
+        "timestamp": _now_iso(),
+        "event": event,
+        "item_ids": list(item_ids),
+        "summary": summary,
+    }
+    stored = _append(path, entry, lock=lock, allocate_step=True)
+    _log_progress_write("optimizer_evaluator", stored)
+    return stored
 
 
 def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
@@ -263,6 +320,19 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         if ctx.current_item_id:
             entry["item_id"] = ctx.current_item_id
         entry["timestamp"] = _now_iso()
+        return entry
+
+    def _append_for_context(entry: dict[str, Any]) -> dict[str, Any]:
+        if ctx.global_path is not None:
+            global_entry = _append(
+                ctx.global_path,
+                entry,
+                lock=ctx.global_lock,
+                allocate_step=True,
+            )
+            _append(ctx.path, entry)
+            return global_entry
+        _append(ctx.path, entry)
         return entry
 
     def _ack(agent: str) -> dict[str, Any]:
@@ -296,8 +366,8 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         async def append_summary_progress(args: dict[str, Any]) -> dict[str, Any]:
             entry = _base_entry(agent)
             entry["summary"] = args["summary"]
-            _append(ctx.path, entry)
-            _log_progress_write(agent, entry)
+            stored = _append_for_context(entry)
+            _log_progress_write(agent, stored)
             return _ack(agent)
 
         return append_summary_progress
@@ -404,8 +474,8 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         entry["measured_value"] = float(args["measured_value"])
         if args.get("curve"):
             entry["curve"] = _coerce_curve(args["curve"])
-        _append(ctx.path, entry)
-        _log_progress_write("evaluator", entry)
+        stored = _append_for_context(entry)
+        _log_progress_write("evaluator", stored)
         return {
             "content": [
                 {
@@ -414,6 +484,83 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                         f"Recorded evaluator entry for step {ctx.current_step} "
                         f"(decision={entry['decision']}, "
                         f"reason_category={entry['reason_category']})."
+                    ),
+                }
+            ]
+        }
+
+    @tool(
+        "append_integrator_progress",
+        (
+            "Record the Integrator's authoritative combined-candidate verdict. "
+            "Call this exactly once as the last action of your turn."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "decision": {
+                    "type": "string",
+                    "enum": list(INTEGRATOR_DECISIONS),
+                },
+                "included_item_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "dropped_item_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "remediation_attempts": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2,
+                },
+                "measured_gain_pct": {"type": "number"},
+                "measured_value": {"type": "number"},
+                "required_gain_pct": {"type": "number"},
+                "best_candidate_id": {"type": "string"},
+                "curve": _CURVE_FIELD_SCHEMA,
+            },
+            "required": [
+                "summary",
+                "decision",
+                "included_item_ids",
+                "dropped_item_ids",
+                "remediation_attempts",
+                "measured_gain_pct",
+                "measured_value",
+                "required_gain_pct",
+                "best_candidate_id",
+            ],
+        },
+    )
+    async def append_integrator_progress(args: dict[str, Any]) -> dict[str, Any]:
+        entry = _base_entry("integrator")
+        entry.update(
+            {
+                "summary": args["summary"],
+                "decision": args["decision"],
+                "included_item_ids": list(args["included_item_ids"]),
+                "dropped_item_ids": list(args["dropped_item_ids"]),
+                "remediation_attempts": int(args["remediation_attempts"]),
+                "measured_gain_pct": float(args["measured_gain_pct"]),
+                "measured_value": float(args["measured_value"]),
+                "required_gain_pct": float(args["required_gain_pct"]),
+                "best_candidate_id": str(args["best_candidate_id"]),
+            }
+        )
+        if args.get("curve"):
+            entry["curve"] = _coerce_curve(args["curve"])
+        stored = _append_for_context(entry)
+        _log_progress_write("integrator", stored)
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Recorded authoritative integrator verdict "
+                        f"{entry['decision']} for step {ctx.current_step}."
                     ),
                 }
             ]
@@ -455,8 +602,8 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         entry["cumulative_improvement_pct"] = float(args["cumulative_improvement_pct"])
         if args.get("curve"):
             entry["curve"] = _coerce_curve(args["curve"])
-        _append(ctx.path, entry)
-        _log_progress_write("qa", entry)
+        stored = _append_for_context(entry)
+        _log_progress_write("qa", stored)
         return {
             "content": [
                 {
@@ -494,7 +641,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                     },
                     "agent": {
                         "type": "string",
-                        "enum": list(_AGENTS),
+                        "enum": list(_READABLE_AGENTS),
                         "description": "Optional filter: return only entries written by "
                         f"this agent (one of {list(_AGENTS)}). Omit to "
                         "return entries from every agent.",
@@ -522,6 +669,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         "analyzer": append_analyzer_progress,
         "optimizer": append_optimizer_progress,
         "evaluator": append_evaluator_progress,
+        "integrator": append_integrator_progress,
         "qa": append_qa_progress,
         "reporter": append_reporter_progress,
     }

@@ -8,7 +8,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer

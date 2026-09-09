@@ -13,11 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import atexit
 import itertools
 import secrets
 import sys
-import weakref
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
 
@@ -285,8 +283,6 @@ class VisualGen:
         )
         self._req_counter = itertools.count()
 
-        atexit.register(VisualGen._atexit_shutdown, weakref.ref(self))
-
     @property
     def extra_param_specs(self) -> Dict[str, "ExtraParamSchema"]:
         """Returns extra param specs for the loaded pipeline.
@@ -458,12 +454,6 @@ class VisualGen:
         request.refs_to_shm()
         self.executor.enqueue_requests([request])
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)
-
-    @staticmethod
-    def _atexit_shutdown(self_ref):
-        instance = self_ref()
-        if instance is not None:
-            instance.shutdown()
 
     def __enter__(self):
         return self

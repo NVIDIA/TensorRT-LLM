@@ -56,7 +56,7 @@ measured: []
   attention-metadata class. Delegate optimization to **perf-host-optimization**
   (line_profiler / nsys host rounds) and detection to **perf-host-analysis**.
   Touch points (prior art, TRT-LLM repo):
-  `tensorrt_llm/_torch/attention_backend/sparse/dsa.py` —
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/metadata.py` —
   `transform_local_topk_and_prepare_pool_view()` (now reads `_cached_*`),
   `_ensure_pool_view_cached()` / `_invalidate_pool_view_cache()`, and the
   invalidation calls in `prepare()` and `on_update_kv_lens()`.

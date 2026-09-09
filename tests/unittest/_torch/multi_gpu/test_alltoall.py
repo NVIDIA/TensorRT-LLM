@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import pickle
 import sys
 import traceback
@@ -26,7 +25,6 @@ from mpi4py import MPI
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import alltoall_helix
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,

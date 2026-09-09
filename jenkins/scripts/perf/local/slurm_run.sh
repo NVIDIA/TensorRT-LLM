@@ -13,6 +13,9 @@ if [[ -z "${DISAGG_SERVING_TYPE:-}" ]]; then
     slurm_install_setup
 fi
 
+# Install media deps in test fixtures
+export TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1
+
 cd $llmSrcNode/tests/integration/defs
 
 # Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.

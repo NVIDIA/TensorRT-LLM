@@ -1,7 +1,7 @@
 metadata:
-  model_name: deepseek_v4_pro_dspark
+  model_name: deepseek_v4_pro_nvfp4_dspark
   precision: fp4
-  model_dir_name: DeepSeek-V4-Pro-DSpark
+  model_dir_name: DeepSeek-V4-Pro-nvfp4-DSpark
   supported_gpus:
   - GB300
   script_file: disaggr_torch.slurm
@@ -84,7 +84,7 @@ worker_config:
       decoding_type: DSpark
       max_draft_len: 5
       block_size: 5
-      speculative_model: DeepSeek-V4-Pro-DSpark
+      speculative_model: DeepSeek-V4-Pro-nvfp4-DSpark
     custom_tokenizer: deepseek_v4
     return_perf_metrics: true
     perf_metrics_max_requests: 100000

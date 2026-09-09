@@ -3,7 +3,7 @@ from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .eagle3 import Eagle3SpecMetadata, MTPEagleWorker
-from .interface import (SpecMetadata, SpecWorkerBase,
+from .interface import (SpecMetadata, SpecWorkerBase, draft_prompt_lookahead,
                         prepare_attn_metadata_for_draft_replay,
                         restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
@@ -49,6 +49,7 @@ __all__ = [
     "SpecMetadata",
     "SpecSampler",
     "SpecWorkerBase",
+    "draft_prompt_lookahead",
     "get_draft_kv_cache_manager",
     "get_num_extra_kv_tokens",
     "get_num_spec_layers",

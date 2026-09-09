@@ -18,6 +18,25 @@ from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
 
 
+def row_has_valid_token(row: torch.Tensor, vocab_size_padded: int) -> bool:
+    """Whether a filled next-token bitmask row allows at least one token.
+
+    A grammar state with no valid continuation produces an all-zero row, which
+    would mask the whole logits row to -inf and make softmax return NaN for it.
+
+    Only the bits below `vocab_size_padded` are counted: the trailing bits of a
+    partial last word are never read by the apply kernel and are not guaranteed
+    to be cleared by the backends, so counting them could report a dead-end row
+    as valid.
+    """
+    num_words, num_tail_bits = divmod(vocab_size_padded, 32)
+    if torch.any(row[:num_words]):
+        return True
+    if num_tail_bits == 0:
+        return False
+    return bool(row[num_words].item() & ((1 << num_tail_bits) - 1))
+
+
 @dataclass(slots=True)
 class GuidedRequest:
     """A snapshot of an LlmRequest that contains relevant fields for guided decoding.
@@ -206,6 +225,11 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
+    def _has_valid_token(self, index: int) -> bool:
+        """Whether the bitmask row just filled at `index` allows any token."""
+        return row_has_valid_token(self.bitmask_host[index],
+                                   self.vocab_size_padded)
+
     def _build(self, requests: GuidedRequests) -> List[Tuple[int, str]]:
         """Build the bitmask for requests with guided decoding enabled.
 
@@ -257,6 +281,25 @@ class GuidedDecoder:
                 self.num_advanced_tokens[slot] += 1
                 if not matcher.is_terminated():
                     matcher.fill_next_token_bitmask(self.bitmask_host, offset)
+                    if not self._has_valid_token(offset):
+                        if req.is_draft:
+                            self.is_draft_terminated[slot] = True
+                            logger.debug(
+                                f"Draft request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                            )
+                            # Unlike the unacceptable-token path above, the
+                            # matcher did advance past new_token here, so the
+                            # drafting loop must still roll that advance back.
+                            self.num_advanced_draft_tokens[
+                                slot] += self.num_advanced_tokens[slot]
+                            continue
+                        # The request is about to be terminated, so exclude it
+                        # from the rollback pass: the matcher advance made
+                        # above is never verified against accepted tokens.
+                        self.num_advanced_tokens[slot] = 0
+                        raise ValueError(
+                            f"Request {req.request_id} at slot {slot} reached a grammar state with no valid token."
+                        )
                     self.token_mask_host[offset] = 1
                     self.num_guided_tokens[slot] += 1
                     # Process draft tokens. Bound by the layout's draft length:
@@ -273,6 +316,11 @@ class GuidedDecoder:
                             break
                         matcher.fill_next_token_bitmask(self.bitmask_host,
                                                         offset + i)
+                        if not self._has_valid_token(offset + i):
+                            # Stop guiding here rather than failing the
+                            # request: the remaining draft positions are left
+                            # unconstrained and get verified as usual.
+                            break
                         self.token_mask_host[offset + i] = 1
                         self.num_guided_tokens[slot] += 1
 
