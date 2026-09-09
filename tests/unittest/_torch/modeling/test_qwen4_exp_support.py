@@ -532,13 +532,26 @@ def test_ple_cache_layout_excludes_separate_mtp_draft() -> None:
     assert draft is None
 
 
-def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
+@pytest.mark.parametrize(
+    "offsets_from_start,offsets_from_end,expected_state_slots",
+    [
+        # Two live request slots plus one non-speculative CUDA-graph dummy slot.
+        ([], [], 3),
+        # Each snapshot rule reserves one more slot per resident sequence, and
+        # the PLE state is part of every one of those slots.
+        ([256], [0], 7),
+    ],
+    ids=["no_reuse", "snapshot_offsets"],
+)
+def test_v2_cache_estimator_counts_ple_lifecycle_state(
+    offsets_from_start, offsets_from_end, expected_state_slots
+) -> None:
     from tensorrt_llm._torch.configs import Qwen4ExpTextConfig
     from tensorrt_llm._torch.pyexecutor.config_utils import extract_qwen4_exp_ple_cache_params
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
     )
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MambaStateConfig
     from tensorrt_llm.mapping import Mapping
 
     config = Qwen4ExpTextConfig.from_dict(_text_config_dict())
@@ -547,7 +560,13 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
     common = {
         "mapping": Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         "max_batch_size": 2,
-        "kv_cache_config": KvCacheConfig(enable_block_reuse=False),
+        "kv_cache_config": KvCacheConfig(
+            enable_block_reuse=bool(offsets_from_start or offsets_from_end),
+            mamba_state_config=MambaStateConfig(
+                additional_snapshot_offsets_from_start=offsets_from_start,
+                additional_snapshot_offsets_from_end=offsets_from_end,
+            ),
+        ),
     }
     with_ple = MambaHybridCacheManagerV2.get_cache_size_per_token(
         SimpleNamespace(pretrained_config=config, quant_config=None), **common
@@ -562,8 +581,7 @@ def test_v2_cache_estimator_counts_ple_lifecycle_state() -> None:
         + ple.ngram_context_len * torch.int64.itemsize
     )
     assert with_ple[0] == without_ple[0]
-    # Two live request slots plus one non-speculative CUDA-graph dummy slot.
-    assert with_ple[1] - without_ple[1] == 3 * bytes_per_slot
+    assert with_ple[1] - without_ple[1] == expected_state_slots * bytes_per_slot
 
 
 def test_ple_states_use_v2_lifecycle_buffers(monkeypatch) -> None:
