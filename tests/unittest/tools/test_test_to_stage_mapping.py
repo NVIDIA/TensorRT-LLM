@@ -33,8 +33,19 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
 STAGE_CONFIG_JSON = os.path.join(REPO_ROOT, 'jenkins', 'scripts',
                                  'test_stage_configs.json')
+GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')
+
+# Matches the literal "Stage-Name": ["platform", "yaml_file", ...] entries
+# that test_to_stage_mapping.py used to regex-scan out of L0_Test.groovy
+# directly, before jenkins/scripts/test_stage_configs.json became the single
+# source of truth. Any stage still defined this way in Groovy bypasses the
+# JSON file, so scripts/test_to_stage_mapping.py -- and this test -- would
+# never see it.
+_GROOVY_STAGE_RE = re.compile(
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"'
+    r'(?:,\s*(?:\d+|true|false))*\s*\]')
 
 # Sampling configuration
 MAX_SAMPLES = 10  # Small number for efficient testing
@@ -159,6 +170,37 @@ def test_documented_stage_examples_are_live(stage_query):
                 checked += 1
 
     assert checked, 'Found no documented --stages examples to validate'
+
+
+def test_groovy_literal_stage_maps_are_registered(stage_query):
+    """Every literal stage->YAML entry left in Groovy must also be in the JSON.
+
+    jenkins/L0_Test.groovy still has a handful of ``"Stage": ["platform",
+    "yaml_file", ...]`` maps (e.g. multiNodesSBSAConfigs) that predate the
+    move to jenkins/scripts/test_stage_configs.json. Those are only safe to
+    keep as literals because every stage they define is *also* generated
+    from the JSON file. If a future edit adds a new literal stage entry
+    without registering it in the JSON, scripts/test_to_stage_mapping.py
+    would silently never see it -- catch that here instead.
+    """
+    with open(GROOVY, 'r') as f:
+        lines = f.readlines()
+
+    unregistered = []
+    for lineno, line in enumerate(lines, start=1):
+        if line.lstrip().startswith('//'):
+            continue
+        m = _GROOVY_STAGE_RE.search(line)
+        if not m:
+            continue
+        stage, yml = m.group('stage'), m.group('yml') + '.yml'
+        if stage_query.stage_to_yaml.get(stage) != yml:
+            unregistered.append(f'{GROOVY}:{lineno}: "{stage}": "{yml}"')
+
+    assert not unregistered, (
+        'Found stage(s) defined literally in jenkins/L0_Test.groovy that are '
+        'missing (or mismatched) from jenkins/scripts/test_stage_configs.json:'
+        '\n' + '\n'.join(unregistered))
 
 
 def test_unknown_stage_reports_a_diagnostic(stage_query):
