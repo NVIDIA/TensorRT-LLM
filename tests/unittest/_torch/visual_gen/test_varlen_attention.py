@@ -200,6 +200,83 @@ class TestFA4VarlenKv:
             )
 
 
+class TestFA4PaddedQRaggedK:
+    """FA4 kernel combination cu_seqlens_k set + cu_seqlens_q=None (Q stays
+    padded, only K/V ragged) -- the path Attention._attn_impl_varlen_kv uses.
+    Calls FlashAttn4Attention._fwd directly."""
+
+    pytestmark = fa4_cuda_only
+
+    def test_padded_q_ragged_k_matches_sdpa_reference(self):
+        device, dtype = "cuda", torch.bfloat16
+        B, S_q, H, d_h = 2, 4, 8, 64
+        kv_lens = [3, 9]
+        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
+
+        torch.manual_seed(4)
+        q_bhsd = torch.randn(B, H, S_q, d_h, device=device, dtype=dtype)
+        k_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        v_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        ref = _sdpa_reference(q_bhsd, k_list, v_list, attn.scale)
+
+        q_nhd = q_bhsd.transpose(1, 2).contiguous()
+        k_ragged = torch.cat([k.transpose(0, 1) for k in k_list], dim=0)
+        v_ragged = torch.cat([v.transpose(0, 1) for v in v_list], dim=0)
+        cu_seqlens_kv = torch.nn.functional.pad(
+            torch.cumsum(torch.tensor(kv_lens, dtype=torch.int32, device=device), dim=0), (1, 0)
+        ).to(torch.int32)
+
+        out, _ = attn._fwd(
+            q_nhd,
+            k_ragged,
+            v_ragged,
+            causal=False,
+            cu_seqlens_q=None,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=None,
+            max_seqlen_k=max(kv_lens),
+        )
+        out_bhsd = out.transpose(1, 2)
+        torch.testing.assert_close(out_bhsd, ref, rtol=2e-2, atol=2e-2)
+
+    def test_split_consistency(self):
+        """A sub-batch run alone must match its slice of a larger batch."""
+        device, dtype = "cuda", torch.bfloat16
+        B, S_q, H, d_h = 3, 4, 8, 64
+        kv_lens = [3, 9, 5]
+        attn = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
+
+        torch.manual_seed(5)
+        q_bhsd = torch.randn(B, H, S_q, d_h, device=device, dtype=dtype)
+        k_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+        v_list = [torch.randn(H, n, d_h, device=device, dtype=dtype) for n in kv_lens]
+
+        def _run(q_bhsd, k_list, v_list):
+            q_nhd = q_bhsd.transpose(1, 2).contiguous()
+            k_ragged = torch.cat([k.transpose(0, 1) for k in k_list], dim=0)
+            v_ragged = torch.cat([v.transpose(0, 1) for v in v_list], dim=0)
+            lens = [k.shape[1] for k in k_list]
+            cu_seqlens_kv = torch.nn.functional.pad(
+                torch.cumsum(torch.tensor(lens, dtype=torch.int32, device=device), dim=0), (1, 0)
+            ).to(torch.int32)
+            out, _ = attn._fwd(
+                q_nhd,
+                k_ragged,
+                v_ragged,
+                causal=False,
+                cu_seqlens_q=None,
+                cu_seqlens_k=cu_seqlens_kv,
+                max_seqlen_q=None,
+                max_seqlen_k=max(lens),
+            )
+            return out
+
+        full_out = _run(q_bhsd, k_list, v_list)
+        sub_idx = [1, 2]
+        sub_out = _run(q_bhsd[sub_idx], [k_list[i] for i in sub_idx], [v_list[i] for i in sub_idx])
+        torch.testing.assert_close(sub_out, full_out[sub_idx], rtol=2e-2, atol=2e-2)
+
+
 class TestAttnImplVarlenDispatch:
     """Attention._attn_impl_varlen_kv: the reshape/dispatch glue, isolated
     from full Attention construction (no Linear weights / QKV proj needed --

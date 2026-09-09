@@ -183,12 +183,11 @@ class FlashAttn4Attention(AttentionBackend):
         Forward pass returning both output and log-sum-exp (LSE).
 
         Returns:
-            output: [batch_size, seq_len, num_heads, head_dim], or
-                [total_q_tokens, num_heads, head_dim] in the varlen path
-                (cu_seqlens_kv set).
-            lse:    [batch_size, num_heads, seq_len] in the padded path, or
-                [num_heads, total_q_tokens] in the varlen path. Callers doing
-                Attention2D/Ring LSE-based combination need to handle both shapes.
+            output: [batch_size, seq_len, num_heads, head_dim] if cu_seqlens_q is
+                unset, else [total_q_tokens, num_heads, head_dim].
+            lse:    [batch_size, num_heads, seq_len] if cu_seqlens_q is unset, else
+                [num_heads, total_q_tokens]. Callers combining LSE across ranks
+                need to handle both shapes.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
 
@@ -197,9 +196,10 @@ class FlashAttn4Attention(AttentionBackend):
                 "cu_seqlens_kv (ragged varlen) and key_padding_mask (padded+mask) "
                 "are mutually exclusive attention modes"
             )
-            assert (
-                cu_seqlens_q is not None and max_seqlen_q is not None and max_seqlen_kv is not None
-            ), "cu_seqlens_kv requires cu_seqlens_q, max_seqlen_q, and max_seqlen_kv"
+            assert max_seqlen_kv is not None, "cu_seqlens_kv requires max_seqlen_kv"
+            assert cu_seqlens_q is None or max_seqlen_q is not None, (
+                "cu_seqlens_q requires max_seqlen_q"
+            )
             output, lse = self._fwd(
                 q,
                 k,

@@ -626,10 +626,8 @@ class Attention(nn.Module):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Ragged K/V cross-attention: Q is uniform-length [B, S, H*D], K/V arrive
-        pre-packed as [total_kv_tokens, H_kv*D]. The caller builds
-        ``cu_seqlens_kv``/``max_seqlen_kv`` from the real per-sample lengths.
-        """
+        """Ragged K/V cross-attention: Q stays batched [B, S, H*D], K/V arrive
+        pre-packed as [total_kv_tokens, H_kv*D]."""
         if not self.supports_varlen:
             raise ValueError(
                 f"{type(self.attn).__name__} does not support varlen cross-attention "
@@ -641,12 +639,8 @@ class Attention(nn.Module):
         max_seqlen_kv = kwargs.pop("max_seqlen_kv")
 
         batch_size, seq_len_q = q.shape[0], q.shape[1]
-        total_q = batch_size * seq_len_q
-        cu_seqlens_q = torch.arange(
-            0, total_q + seq_len_q, seq_len_q, dtype=torch.int32, device=q.device
-        )
 
-        q = q.reshape(total_q, self.local_num_attention_heads, self.head_dim)
+        q = q.reshape(batch_size, seq_len_q, self.local_num_attention_heads, self.head_dim)
         k = k.reshape(-1, self.local_num_key_value_heads, self.head_dim)
         v = v.reshape(-1, self.local_num_key_value_heads, self.head_dim)
 
@@ -654,9 +648,7 @@ class Attention(nn.Module):
             {
                 "batch_size": batch_size,
                 "seq_len": seq_len_q,
-                "cu_seqlens_q": cu_seqlens_q,
                 "cu_seqlens_kv": cu_seqlens_kv,
-                "max_seqlen_q": seq_len_q,
                 "max_seqlen_kv": max_seqlen_kv,
             }
         )
