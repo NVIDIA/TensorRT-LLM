@@ -1283,7 +1283,24 @@ def _apply_tool_parser(
     text: str,
     streaming: bool,
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
+    warn_on_empty_extraction: bool = True,
 ) -> Tuple[str, list[ToolCallItem]]:
+    """Apply the configured tool parser to extract tool calls from generated text.
+
+    Args:
+        tool_parser_id: Identifier of the tool parser to use.
+        tools: List of available tools for this request.
+        output_index: Output index of the sequence being processed.
+        text: Text to parse (full text if non-streaming, incremental chunk if streaming).
+        streaming: Whether this is an incremental streaming step.
+        tool_parser_dict: Cache of instantiated tool parsers per output index.
+        warn_on_empty_extraction: Whether to emit diagnostic warning if tool marker is
+            detected but no calls are extracted. Set to False during intermediate
+            streaming done-event reparses.
+
+    Returns:
+        Tuple of cleaned text and list of extracted ToolCallItem objects.
+    """
     tool_parser: Optional[BaseToolParser] = None
     if tool_parser_id is not None and tools is not None:
         if tool_parser_dict is not None:
@@ -1299,6 +1316,14 @@ def _apply_tool_parser(
     if tool_parser is not None and tools is not None:
         if not streaming:
             result = tool_parser.detect_and_parse(text, tools)
+            if warn_on_empty_extraction and not result.calls and tool_parser.has_tool_call(
+                    text):
+                logger.warning(
+                    f"Configured tool parser '{tool_parser_id}' matched "
+                    "tool-call marker in output but extracted no calls. "
+                    "Plausible causes: parser/template mismatch, malformed or "
+                    "truncated output, an empty tool block, or arguments the "
+                    "parser rejected.")
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
@@ -1995,6 +2020,7 @@ def _should_send_done_events(
             text=full_text,
             streaming=False,
             tool_parser_dict=tool_parser_dict,
+            warn_on_empty_extraction=False,
         )
 
     # Detect reasoning -> text transition
