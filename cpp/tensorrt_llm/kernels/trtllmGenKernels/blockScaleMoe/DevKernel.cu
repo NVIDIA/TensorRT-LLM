@@ -23,9 +23,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
-#include <type_traits>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -41,13 +39,6 @@ __host__ __device__ constexpr static U arrayConvert(T const& input)
 
 namespace moe::dev
 {
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-inline bool isAlignedTo(void const* ptr, std::size_t alignment)
-{
-    return reinterpret_cast<std::uintptr_t>(ptr) % alignment == 0;
-}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -292,15 +283,14 @@ constexpr bool shouldUsePermutedActivation(int innerDim, int numTokens, int topK
     return layoutEligible && paddingAmortised;
 }
 
-// Permuted-space DeepSeek FP8 activation.
-//
-// The grid is (rowCtas, numSfBlocks), so blockIdx.y names the scale block.
-// EltsPerThread sets each thread's packed load and store width; the group that
-// cooperates on one (row, scale block) shrinks to match, so the amax reduction
-// still spans exactly kDsActEltsPerSf elements either way.
-template <typename KernelParams, int EltsPerThread>
-__device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams const& params)
+template <typename KernelParams>
+__global__ void activationDeepSeekPermutedKernel(KernelParams params)
 {
+    using Type = typename KernelParams::Type;
+    using PackedIo = uint32_t; // kDsActEltsPerThread x 8-bit elements
+
+    static_assert(kDsActEltsPerThread == 4, "PackedIo assumes 4 elements per thread");
+
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     if constexpr (KernelParams::UsePdl)
     {
@@ -308,12 +298,6 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         cudaGridDependencySynchronize();
     }
 #endif
-    using Type = typename KernelParams::Type;
-    static_assert(EltsPerThread == 4 || EltsPerThread == 8, "packed I/O supports 4 or 8 elements per thread");
-    using PackedIo = std::conditional_t<EltsPerThread == 8, uint64_t, uint32_t>;
-    constexpr int kThreadsPerGroup = kDsActEltsPerSf / EltsPerThread;
-    // uint64_t so the 32-thread case does not shift a 32-bit 1 by 32.
-    constexpr uint32_t kGroupBaseMask = static_cast<uint32_t>((uint64_t{1} << kThreadsPerGroup) - 1);
 
     float constexpr kE4m3MaxVal{448.F};
 
@@ -324,19 +308,20 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
     bool const hasSwigluLimit = params.hasSwigluLimit;
     float const swigluLimit = params.swigluLimit;
 
-    int const sfBlock = blockIdx.y;
-    int const groupsPerCta = blockDim.x / kThreadsPerGroup;
-    int const groupInCta = threadIdx.x / kThreadsPerGroup;
-    int const laneInGroup = threadIdx.x % kThreadsPerGroup;
-    int const hiddenBase = sfBlock * kDsActEltsPerSf + laneInGroup * EltsPerThread;
     int const lane = threadIdx.x % kDsActWarpSize;
-    uint32_t const groupMask = kGroupBaseMask << ((lane / kThreadsPerGroup) * kThreadsPerGroup);
+    int const warpInCta = threadIdx.x / kDsActWarpSize;
 
-    int const rowStride = gridDim.x * groupsPerCta;
-    for (int permutedIdx = blockIdx.x * groupsPerCta + groupInCta; permutedIdx < totalNumPaddedTokens;
-         permutedIdx += rowStride)
+    int64_t const numTasks = static_cast<int64_t>(totalNumPaddedTokens) * numSfBlocks;
+    int64_t const taskStride = static_cast<int64_t>(gridDim.x) * kDsActWarpsPerCta;
+
+    for (int64_t task = static_cast<int64_t>(blockIdx.x) * kDsActWarpsPerCta + warpInCta; task < numTasks;
+         task += taskStride)
     {
-        // Both scales are uniform across the group: one per (row, scale block).
+        int const permutedIdx = static_cast<int>(task / numSfBlocks);
+        int const sfBlock = static_cast<int>(task % numSfBlocks);
+        int const hiddenBase = sfBlock * kDsActEltsPerSf + lane * kDsActEltsPerThread;
+
+        // Both scales are uniform across the warp: one per (row, scale block).
         float const scale1 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock];
         float const scale2 = params.inDqSfsPtr[permutedIdx + totalNumPaddedTokens * (sfBlock + numSfBlocks)];
 
@@ -347,10 +332,10 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         Type const* elts1 = reinterpret_cast<Type const*>(&packed1);
         Type const* elts2 = reinterpret_cast<Type const*>(&packed2);
 
-        float out[EltsPerThread];
+        float out[kDsActEltsPerThread];
         float aMax = 0.F;
 #pragma unroll
-        for (int i = 0; i < EltsPerThread; ++i)
+        for (int i = 0; i < kDsActEltsPerThread; ++i)
         {
             float x1 = scale1 * static_cast<float>(elts1[i]); // up (linear)
             float x2 = scale2 * static_cast<float>(elts2[i]); // gate (silu input)
@@ -364,9 +349,9 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         }
 
 #pragma unroll
-        for (int offset = kThreadsPerGroup / 2; offset > 0; offset >>= 1)
+        for (int offset = kDsActWarpSize / 2; offset > 0; offset >>= 1)
         {
-            aMax = fmaxf(aMax, __shfl_xor_sync(groupMask, aMax, offset, kThreadsPerGroup));
+            aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, offset));
         }
 
         // Floor aMax so an all-zero block stays finite: without it scaleOut is
@@ -375,7 +360,7 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         // quantizer (fp8_utils.py).
         float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
 
-        if (laneInGroup == 0)
+        if (lane == 0)
         {
             params.outDqSfsPtr[permutedIdx + totalNumPaddedTokens * sfBlock] = scaleOut;
         }
@@ -383,7 +368,7 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         PackedIo packedOut;
         Type* outElts = reinterpret_cast<Type*>(&packedOut);
 #pragma unroll
-        for (int i = 0; i < EltsPerThread; ++i)
+        for (int i = 0; i < kDsActEltsPerThread; ++i)
         {
             // Divide; do NOT hoist a reciprocal. `x / s` and `x * (1/s)` round
             // differently, and an equivalence run showed that single ulp flip a
@@ -394,22 +379,6 @@ __device__ __forceinline__ void activationDeepSeekPermutedImpl(KernelParams cons
         *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
             = packedOut;
     }
-}
-
-template <typename KernelParams>
-__global__ void activationDeepSeekPermutedKernel(KernelParams params)
-{
-    activationDeepSeekPermutedImpl<KernelParams, kDsActEltsPerThread>(params);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Same kernel with 8-byte packed I/O, selected when both pointers are 8-byte
-// aligned.
-template <typename KernelParams>
-__global__ void activationDeepSeekPermutedWideKernel(KernelParams params)
-{
-    activationDeepSeekPermutedImpl<KernelParams, 2 * kDsActEltsPerThread>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -589,13 +558,6 @@ void run(Data const& data, void* stream)
         constexpr int NUM_ELTS_PER_LOAD = 1;
         constexpr int NUM_ELTS_PER_SF = 128;
 
-        bool const packedFp8Eligible = data.mDtypeElt == tg::Dtype::E4m3 && isAlignedTo(data.inPtr, alignof(uint32_t))
-            && isAlignedTo(data.outPtr, alignof(uint32_t));
-        // 8-byte packed loads and stores need 8-byte aligned pointers; the
-        // 4-byte variant covers everything else that is packed-eligible.
-        bool const wideLoadEligible = packedFp8Eligible && isAlignedTo(data.inPtr, alignof(uint64_t))
-            && isAlignedTo(data.outPtr, alignof(uint64_t));
-
         int device{-1};
         cudaGetDevice(&device);
         int numSms = 0;
@@ -646,33 +608,19 @@ void run(Data const& data, void* stream)
         // So gate on real work per expert. tileTokensDim is exactly the padding
         // granularity, which makes it the natural threshold: below it, an
         // expert's real rows do not even fill the tile that must be swept for it.
-        if (packedFp8Eligible
-            && shouldUsePermutedActivation(
-                data.innerDim, data.numTokens, data.topK, data.numExperts, data.tileTokensDim))
+        if (shouldUsePermutedActivation(data.innerDim, data.numTokens, data.topK, data.numExperts, data.tileTokensDim))
         {
-            int const groupsPerCta = wideLoadEligible
-                ? kDsActPermutedNumThreadsPerCta / (kDsActEltsPerSf / (2 * kDsActEltsPerThread))
-                : kDsActPermutedNumThreadsPerCta / kDsActWarpSize;
-            int64_t const maxRows = static_cast<int64_t>(data.numTokens) * data.topK;
-            int64_t const rowCtasForAllRows = (maxRows + groupsPerCta - 1) / groupsPerCta;
+            int64_t const maxTasks = static_cast<int64_t>(data.numTokens) * data.topK * (outputDim / kDsActEltsPerSf);
+            int64_t const ctasForAllTasks = (maxTasks + kDsActWarpsPerCta - 1) / kDsActWarpsPerCta;
             // Persistent grid: totalNumPaddedTokens is a device-side value, so the
             // host can only bound it. Cap at a few waves and let the grid stride
             // absorb the difference rather than launching the (numTokens x topK)
             // worst case that the expanded-space kernel pays unconditionally.
-            int64_t const maxRowCtas = std::max<int64_t>(1, int64_t{numSms} * 32 / numScaleBlocks);
-            int const numRowCtas = static_cast<int>(std::max<int64_t>(1, std::min(rowCtasForAllRows, maxRowCtas)));
-            dim3 const permutedGrid(numRowCtas, numScaleBlocks, 1);
+            int const numCtas = static_cast<int>(std::min<int64_t>(ctasForAllTasks, int64_t{numSms} * 32));
+            dim3 const permutedGrid(std::max(numCtas, 1), 1, 1);
 
-            if (wideLoadEligible)
-            {
-                LAUNCH_ACTIVATION(data, activationDeepSeekPermutedWideKernel, 1, permutedGrid,
-                    kDsActPermutedNumThreadsPerCta, 0, stream);
-            }
-            else
-            {
-                LAUNCH_ACTIVATION(
-                    data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
-            }
+            LAUNCH_ACTIVATION(
+                data, activationDeepSeekPermutedKernel, 1, permutedGrid, kDsActPermutedNumThreadsPerCta, 0, stream);
         }
         else
         {
@@ -1054,7 +1002,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params)
     int64_t const hiddenBlockIdx = blockIdx.y;
     int64_t const tokenIdx = blockIdx.x;
     int64_t const startOffset = threadIdx.x + hiddenBlockIdx * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
-    int64_t const stride = blockDim.x;
+    int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
     int64_t const numElemsInPaddedCol = params.hiddenDimPadded / FINALIZE_ELEM_PER_THREAD;
     int64_t const numElemsInColPerBlock = (hiddenBlockIdx + 1) * params.hiddenDimPerBlock / FINALIZE_ELEM_PER_THREAD;
 
@@ -1203,14 +1151,7 @@ void run(Data const& data, void* stream)
         // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
         int const numBlocksY = std::min(8192, data.numTokens);
 
-        int const dtypeBits = tg::dtypeGetNumBits(data.mDtypeElt);
-        // The vector kernel casts every row to 128-bit loads. Keep irregular
-        // layouts on the scalar kernel instead of relying on allocator luck.
-        bool const vectorLayoutEligible = data.hiddenDim > 0
-            && static_cast<int64_t>(data.hiddenDim) * dtypeBits % 128 == 0
-            && static_cast<int64_t>(data.hiddenDimPadded) * dtypeBits % 128 == 0
-            && isAlignedTo(data.inPtr, alignof(float4)) && isAlignedTo(data.outPtr, alignof(float4));
-        if (numBlocksX * numBlocksY < 1184 || !vectorLayoutEligible)
+        if (numBlocksX * numBlocksY < 1184)
         {
             // The number 1184 comes from 148 * 8, where 148 is the number of SMs (Streaming Multiprocessors) in the
             // Blackwell architecture,
@@ -1222,23 +1163,8 @@ void run(Data const& data, void* stream)
         }
         else
         {
-            // A row is this many 128-bit vectors. One thread per vector removes
-            // the trailing iteration that runs with most lanes idle. Past 1.5x the
-            // default block the wider block gives up more occupancy than that tail
-            // costs.
-            int const vecPerRow = static_cast<int>(static_cast<int64_t>(data.hiddenDim) * dtypeBits / 128);
-            bool const useSinglePass
-                = vecPerRow > FINALIZE_THREADS_PER_BLOCK && vecPerRow <= 3 * FINALIZE_THREADS_PER_BLOCK / 2;
-            if (useSinglePass)
-            {
-                LAUNCH_EXPW(data, finalizeKernelVecLoad, false, /*numBlocks=*/data.numTokens,
-                    /*numThreads=*/vecPerRow, 0, stream);
-            }
-            else
-            {
-                LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
-                    /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
-            }
+            LAUNCH_EXPW(data, finalizeKernelVecLoad, true, /*numBlocks=*/data.numTokens,
+                /*numThreads=*/FINALIZE_THREADS_PER_BLOCK, 0, stream);
         }
     }
 }
