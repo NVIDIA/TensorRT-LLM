@@ -6158,12 +6158,13 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // useClusterDurations, modelExpressSidecar) must be mirrored there.
     //
     // Other stage maps further below (e.g. multiNodesSBSAConfigs,
-    // agentFlowTestConfigs) are still literal "Stage-Name": ["platform",
-    // "yaml_file", splitId, split_count, gpu_count, ...] entries, which
-    // scripts/test_to_stage_mapping.py parses by regex-scanning this file's
-    // source text line by line. Keep those literal -- generating them via a
-    // helper (as buildStageConfigsFromSpecs used to, before moving to the
-    // JSON file) breaks that parser silently.
+    // agentFlowTestConfigs, the sanity-check configs) are still literal
+    // "Stage-Name": ["platform", "yaml_file", splitId, split_count,
+    // gpu_count, ...] entries. scripts/test_to_stage_mapping.py only reads
+    // jenkins/scripts/test_stage_configs.json -- it does not parse this
+    // file's source text, so none of these remaining literal maps are
+    // covered by that tool. Stages defined only here will not show up in
+    // its lookups.
 
     // Loads the single source of truth for every sharded L0 test stage family
     // (x86/SBSA, K8s/Slurm) from jenkins/scripts/test_stage_configs.json.
