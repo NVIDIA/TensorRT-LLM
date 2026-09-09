@@ -692,7 +692,18 @@ def _logic_cosmos3_ulysses_vs_single_gpu(rank, world_size):
     text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
 
     ref_out = _forward(ref_model, device, text_seed)
-    ulysses_out = _forward(ulysses_model, device, text_seed)
+    from tensorrt_llm._torch.visual_gen.attention_backend import parallel as parallel_attention
+
+    original_prefix_helper = parallel_attention._run_attention_with_replicated_kv
+
+    def fail_disabled_prefix_helper(*_args, **_kwargs):
+        raise AssertionError("Uniform Ulysses text must not enter the compiler-disabled helper")
+
+    parallel_attention._run_attention_with_replicated_kv = fail_disabled_prefix_helper
+    try:
+        ulysses_out = _forward(ulysses_model, device, text_seed)
+    finally:
+        parallel_attention._run_attention_with_replicated_kv = original_prefix_helper
 
     if rank == 0:
         diff = (ulysses_out.float() - ref_out.float()).abs()

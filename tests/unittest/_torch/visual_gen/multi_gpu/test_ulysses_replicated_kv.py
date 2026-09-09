@@ -16,12 +16,14 @@
 
 import os
 
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import pytest
 
-from .test_ulysses_attention import (
+_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
+os.environ["TLLM_DISABLE_MPI"] = "1"
+
+from .test_ulysses_attention import (  # noqa: E402
     MODULES_AVAILABLE,
+    _logic_ulysses_replicated_kv_equal_lengths,
     _logic_ulysses_replicated_kv_unequal_lengths,
     run_test_in_distributed,
 )
@@ -32,7 +34,10 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
     yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
+    if _TLLM_DISABLE_MPI is None:
+        os.environ.pop("TLLM_DISABLE_MPI", None)
+    else:
+        os.environ["TLLM_DISABLE_MPI"] = _TLLM_DISABLE_MPI
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
@@ -41,5 +46,15 @@ def test_ulysses_replicated_kv_unequal_lengths():
     run_test_in_distributed(
         world_size=2,
         test_fn=_logic_ulysses_replicated_kv_unequal_lengths,
+        use_cuda=False,
+    )
+
+
+@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")
+def test_ulysses_replicated_kv_equal_lengths():
+    """Uniform replicated context stays on the batched attention path."""
+    run_test_in_distributed(
+        world_size=2,
+        test_fn=_logic_ulysses_replicated_kv_equal_lengths,
         use_cuda=False,
     )

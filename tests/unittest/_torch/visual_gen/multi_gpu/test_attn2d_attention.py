@@ -294,7 +294,7 @@ def _logic_attn2d_vs_standard(rank, world_size):
 
 
 def _logic_attn2d_replicated_kv_unequal_lengths_impl(
-    rank, world_size, use_fa4, row_size=1, col_size=2
+    rank, world_size, use_fa4, row_size=1, col_size=2, unequal_lengths=True
 ):
     """Partition replicated context and exclude text and generated padding tails."""
     if use_fa4 and not _flash_attn4_available:
@@ -307,7 +307,7 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(
     seq_per_rank = 3
     generated_padded_len = seq_per_rank * world_size
     context_len = 5
-    context_lengths = [2, context_len]
+    context_lengths = [2, context_len] if unequal_lengths else [context_len] * batch
     device = torch.device(f"cuda:{rank}")
 
     row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
@@ -343,11 +343,18 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(
         attention_mask=PredefinedAttentionMask.FULL,
         replicated_k=context_k,
         replicated_v=context_v,
-        replicated_k_lengths=torch.tensor(context_lengths, dtype=torch.int32),
+        replicated_k_lengths=(
+            torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
+        ),
         global_generated_seq_len=generated_len,
     )
     if not use_fa4:
-        if (row_size, col_size) == (1, 2):
+        if not unequal_lengths:
+            context_start = context_len * rank // col_size
+            context_end = context_len * (rank + 1) // col_size
+            valid_generated_len = min(max(generated_len - rank * seq_per_rank, 0), seq_per_rank)
+            expected_kv_seq_lens = [valid_generated_len + context_end - context_start]
+        elif (row_size, col_size) == (1, 2):
             expected_kv_seq_lens = [5] if rank == 0 else [2, 5]
         else:
             expected_kv_seq_lens = [7, 10]
@@ -395,6 +402,15 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(
 
 def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
     _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4=False)
+
+
+def _logic_attn2d_replicated_kv_equal_lengths(rank, world_size):
+    _logic_attn2d_replicated_kv_unequal_lengths_impl(
+        rank,
+        world_size,
+        use_fa4=False,
+        unequal_lengths=False,
+    )
 
 
 def _logic_attn2d_replicated_kv_padded_generated(rank, world_size):
@@ -648,6 +664,14 @@ class TestAttn2DAttention:
         run_test_in_distributed(
             world_size=2,
             test_fn=_logic_attn2d_replicated_kv_unequal_lengths,
+            use_cuda=True,
+        )
+
+    def test_attn2d_replicated_kv_equal_lengths(self):
+        """A 1x2 mesh keeps uniform context on one batched attention call."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_attn2d_replicated_kv_equal_lengths,
             use_cuda=True,
         )
 

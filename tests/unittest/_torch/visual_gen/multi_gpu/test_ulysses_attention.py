@@ -377,14 +377,14 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
         )
 
 
-def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
-    """Replicated context excludes per-sample and generated-sequence padding."""
+def _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths):
+    """Replicated context excludes text and generated-sequence padding."""
     batch = 2
     generated_len = 5
     generated_padded_len = 6
     seq_per_rank = generated_padded_len // world_size
     context_len = 4
-    context_lengths = [1, context_len]
+    context_lengths = [1, context_len] if unequal_lengths else [context_len] * batch
     num_heads = world_size * 2
     head_dim = 16
     device = torch.device("cpu")
@@ -424,10 +424,17 @@ def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
         attention_mask=PredefinedAttentionMask.FULL,
         replicated_k=context_k,
         replicated_v=context_v,
-        replicated_k_lengths=torch.tensor(context_lengths, dtype=torch.int32),
+        replicated_k_lengths=(
+            torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
+        ),
         global_generated_seq_len=generated_len,
     )
-    assert inner.kv_seq_lens == [generated_len + length for length in context_lengths]
+    expected_kv_seq_lens = (
+        [generated_len + length for length in context_lengths]
+        if unequal_lengths
+        else [generated_len + context_len]
+    )
+    assert inner.kv_seq_lens == expected_kv_seq_lens
 
     reference = []
     for batch_idx, text_len in enumerate(context_lengths):
@@ -465,6 +472,14 @@ def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
             atol=1e-4,
             msg=f"Rank {rank}: replicated K/V padding changed Ulysses attention output",
         )
+
+
+def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=True)
+
+
+def _logic_ulysses_replicated_kv_equal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=False)
 
 
 def _logic_ulysses_invalid_heads(rank, world_size):
