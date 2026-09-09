@@ -277,6 +277,67 @@ def test_cuda_graph_replay_matches_eager():
     torch.testing.assert_close(out_replay, out_ref, rtol=_RTOL, atol=_ATOL)
 
 
+@pytest.mark.parametrize("distinct_layers", [False, True])
+@requires_cuda_and_op
+def test_cuda_graph_replay_multiple_calls_shared_runner(distinct_layers: bool) -> None:
+    """Replay several MoE layers that share one cached grouped-GEMM runner."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 4, 128, 256
+    num_experts, top_k, rank = 4, 2, 8
+    num_layers = 4
+
+    layer_inputs = []
+    for layer_idx in range(num_layers):
+        if not distinct_layers and layer_inputs:
+            layer_inputs.append(layer_inputs[0])
+            continue
+        input_seed = 1000 + layer_idx if distinct_layers else 1000
+        adapter_seed = 1100 + 10 * layer_idx if distinct_layers else 1100
+        x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+            num_tokens,
+            hidden_size,
+            inter_size,
+            num_experts,
+            top_k,
+            dtype,
+            device,
+            seed=input_seed,
+        )
+        adapters = _make_adapter_set(
+            num_experts,
+            rank,
+            hidden_size,
+            inter_size,
+            dtype,
+            device,
+            base_seed=adapter_seed,
+        )
+        slot_kwargs = _slot_kwargs(torch.zeros(num_tokens, dtype=torch.int32), [adapters], rank)
+        # Retain adapter tensors alongside the raw-pointer tables.
+        layer_inputs.append((x, w3_w1, w2, topk_ids, topk_scores, slot_kwargs, adapters))
+
+    def call_layers() -> list[torch.Tensor]:
+        return [
+            _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, dtype, dict(slot_kwargs))
+            for x, w3_w1, w2, topk_ids, topk_scores, slot_kwargs, _adapters in layer_inputs
+        ]
+
+    eager_outputs = [output.clone() for output in call_layers()]
+    for _ in range(2):
+        call_layers()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_outputs = call_layers()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for replay_output, eager_output in zip(captured_outputs, eager_outputs):
+        torch.testing.assert_close(replay_output, eager_output, rtol=0, atol=0)
+
+
 @requires_cuda_and_op
 def test_cuda_graph_multi_adapter():
     """Two adapter slots routed per-token via token_to_slot, captured + replayed.

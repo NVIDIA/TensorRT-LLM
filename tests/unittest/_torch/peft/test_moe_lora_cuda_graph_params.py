@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 
@@ -38,6 +39,29 @@ requires_cuda = pytest.mark.skipif(
 
 _HIDDEN = 128
 _INTER = 256
+
+
+def test_workspace_reservation_covers_eager_prefill_capacity() -> None:
+    reservations: list[tuple[int, int, int]] = []
+
+    class _MoeStub(torch.nn.Module):
+        def reserve_moe_lora_cuda_graph_workspace(
+            self, max_num_tokens: int, max_lora_rank: int, max_lora_size: int
+        ) -> None:
+            reservations.append((max_num_tokens, max_lora_rank, max_lora_size))
+
+    model = torch.nn.Module()
+    model.moe = _MoeStub()
+    manager = CudaGraphLoraManager.__new__(CudaGraphLoraManager)
+    manager.max_batch_size = 4
+    manager.max_tokens_per_seq = 1
+    manager.max_num_tokens = 256
+    manager.max_lora_rank = 16
+    manager.max_lora_size = 1
+
+    manager._reserve_moe_lora_workspaces(model)
+
+    assert reservations == [(256, 16, 1)]
 
 
 class _ExtractStub:

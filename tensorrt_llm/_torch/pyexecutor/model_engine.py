@@ -1151,7 +1151,8 @@ class PyTorchModelEngine(ModelEngine):
                 lora_config,
                 self.lora_model_config,
                 self.batch_size,  # Use engine's max batch size
-                max_tokens_per_seq)
+                max_tokens_per_seq,
+                self.max_num_tokens)
 
     def _use_lora_cuda_graph(self,
                              scheduled_requests: ScheduledRequests) -> bool:
