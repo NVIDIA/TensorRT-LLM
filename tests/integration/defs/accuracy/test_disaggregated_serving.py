@@ -2021,8 +2021,9 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         DSpark drafter's activations.
 
         DSpark runs on the generation worker only: the drafter proposes
-        tokens during decode, and the context worker never decodes. This
-        mirrors the two-node TestDeepSeekV4ProDSparkMultinode recipe.
+        tokens during decode, so on the context worker -- which only ever
+        prefills and hands the KV cache off -- it would load weights and
+        warm up for a phase that never runs.
         """
         model_path = self.MODEL_PATH
         # V4 uses the pure-Python KVCacheManagerV2, so the transceiver has to
@@ -2035,7 +2036,8 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         }
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
-        # chunked prefill on either worker.
+        # chunked prefill on either worker -- the same pairing the aggregate
+        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
