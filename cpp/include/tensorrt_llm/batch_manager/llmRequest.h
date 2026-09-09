@@ -2488,10 +2488,6 @@ public:
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 
-    void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager);
-
-    void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
-
     // Remove LoRA weights and LoRA config tensors
     void removeLoraTensors();
 };
