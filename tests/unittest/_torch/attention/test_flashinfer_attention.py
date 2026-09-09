@@ -185,6 +185,38 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
+    def test_blocks_in_primary_pool_falls_back_to_blocks_per_window(self):
+        # V2 managers always expose the scalar; use it as-is, even when a
+        # per-window table is also present.
+        v2_manager = SimpleNamespace(
+            blocks_in_primary_pool=512,
+            blocks_per_window={4096: (999, 0)},
+        )
+        self.assertEqual(
+            flashinfer_backend._get_blocks_in_primary_pool(v2_manager), 512)
+
+        # V1 managers only set the scalar for the single-window case. VSWA
+        # models leave it unset and fill blocks_per_window instead, so sizing
+        # the page-index buffer must take the largest per-window primary
+        # count rather than raise AttributeError.
+        v1_vswa_manager = SimpleNamespace(blocks_per_window={
+            512: (64, 8),
+            4096: (256, 32),
+            1024: (128, 16),
+        })
+        self.assertFalse(hasattr(v1_vswa_manager, "blocks_in_primary_pool"))
+        self.assertEqual(
+            flashinfer_backend._get_blocks_in_primary_pool(v1_vswa_manager),
+            256)
+
+        # A manager with neither attribute is reported by name instead of
+        # failing on an anonymous attribute read.
+        with self.assertRaisesRegex(AttributeError, "SimpleNamespace"):
+            flashinfer_backend._get_blocks_in_primary_pool(SimpleNamespace())
+        with self.assertRaisesRegex(AttributeError, "blocks_per_window"):
+            flashinfer_backend._get_blocks_in_primary_pool(
+                SimpleNamespace(blocks_per_window={}))
+
     def test_decode_query_width_is_part_of_plan_params(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
