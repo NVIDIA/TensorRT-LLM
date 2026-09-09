@@ -44,7 +44,8 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
-                            get_accuracy_task)
+                            acceptance_length_from_iteration_stats,
+                            assert_acceptance_length, get_accuracy_task)
 
 
 class Result(GenerationResultBase):
@@ -63,7 +64,43 @@ class Result(GenerationResultBase):
         return self
 
 
-DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
+# ``serve_url`` is the disaggregated server's base URL. It defaults to None so
+# that callers building a DuckLLM by hand keep working; tests that need to
+# reach the workers (e.g. for iteration stats) read it off the harness.
+DuckLLM = namedtuple('DuckLLM',
+                     ['args', 'tokenizer', 'generate_async', 'serve_url'],
+                     defaults=(None, ))
+
+
+def compute_disagg_acceptance_length(serve_url: str) -> float:
+    """Acceptance length from the generation workers' iteration stats.
+
+    The disaggregated server does not proxy ``/metrics``, so the workers are
+    resolved through ``/cluster_info`` -- the only authoritative source for
+    their addresses, since the harness starts them with ``port=0`` -- and
+    polled directly. Only generation workers are asked: the drafter runs
+    during decode, so context workers report no speculative iterations.
+
+    Requires ``enable_iter_perf_stats`` on the generation workers, plus
+    ``iter_stats_max_iterations: -1`` so the server's stats buffer (default
+    1000 iterations) does not silently drop the earlier part of a long run.
+    """
+    info = requests.get(f"{serve_url}/cluster_info", timeout=10)
+    info.raise_for_status()
+    workers = info.json().get("current_workers", {})
+    gen_workers = workers.get("generation_servers", [])
+    assert gen_workers, f"No generation workers registered: {workers}"
+
+    stats = []
+    for worker in gen_workers:
+        # /metrics drains the buffer, so call it exactly once per worker,
+        # after the workload has finished.
+        response = requests.get(
+            f"http://{worker['host']}:{worker['port']}/metrics", timeout=60)
+        response.raise_for_status()
+        stats.extend(response.json())
+    return acceptance_length_from_iteration_stats(stats)
+
 
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
@@ -541,7 +578,8 @@ def launch_disaggregated_llm(
 
         tokenizer = load_hf_tokenizer(model_name)
         try:
-            yield DuckLLM(args, tokenizer, generate_async)
+            yield DuckLLM(args, tokenizer, generate_async,
+                          f"http://localhost:{serve_port}")
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
@@ -2069,6 +2107,11 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 "max_draft_len": 5,
                 "speculative_model": model_path,
             },
+            # Acceptance length is read back off this worker's /metrics.
+            # -1 keeps the server's stats buffer unbounded; the 1000-iteration
+            # default would silently drop the start of a full GSM8K run.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -2099,6 +2142,18 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
                 speculative_model=model_path,
             )
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"], timeout=7200)
+
+            # Verified speculative decoding is lossless, so the score above
+            # cannot see a degraded drafter -- one that proposes garbage is
+            # rejected every step and only costs speed. Gate on acceptance
+            # length too, or this test covers everything except the feature
+            # it exists to exercise.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_dep4 "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4",
+                acceptance_length)
 
 
 @pytest.mark.timeout(14400)

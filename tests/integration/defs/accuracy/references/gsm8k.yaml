@@ -113,9 +113,10 @@ deepseek-ai/DeepSeek-V4-Flash:
   # checkpoint's own cast_mxfp4_to_nvfp4.log reports the cast as bit-lossless
   # (33792/33792 layers, MSE 0) and speculative decoding is lossless too, so
   # the threshold is kept level with the non-speculative row above.
-  # Measured 95.224 over all 1319 samples by
+  # Measured by
   # test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4
-  # (1 ctx + 1 gen, both DEP4, MegaMoE CuTe DSL) on 8x B200 183 GB.
+  # (1 ctx + 1 gen, both DEP4, MegaMoE CuTe DSL): 95.565 over all 1319
+  # samples on 8x B200 183 GB.
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: DSpark
     accuracy: 95.11
