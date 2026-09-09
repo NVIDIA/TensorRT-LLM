@@ -34,16 +34,16 @@ for the user-facing collection and opt-out overview, and the
 for the wire schema.
 
 **No PII or free-form fields are captured.** LLM API configuration capture is
-*type-driven*: fields whose type is categorical (`Literal`/`Enum`/`bool`) or
-numeric (`int`/`float`), plus safe collections of those, are captured
-automatically. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are never captured
-unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`),
-and any field may opt out with `telemetry=False`. Every captured field is listed
-below; the runtime can capture nothing absent from this list.
+automatic for `bool`, `int`, finite `float`, `Literal`, `Enum`, supported unions,
+and homogeneous sequences. Unsafe scalar `str`, `Any`, and `object` branches
+require `TelemetryField.categorical(...)`; paths, mappings, callables, and
+unsupported structures always fail closed. Use `telemetry=False` to exclude a
+field. The runtime can capture nothing absent from the list below.
 
-Union branches are sanitized independently. Explicit allowed values opt in only
-otherwise unsafe scalar branches; they never filter a safe boolean, numeric,
-`Literal`, or `Enum` branch in the same union.
+`capture_policy` branches separated by `|` are tried independently; `enum[X]`
+requires the exact enum type `X`. The categorical domain lists tokens from
+`Literal`/`Enum` annotations or explicit `allowed_values`; it does not restrict
+`bool`, `int`, or `float` branches.
 
 If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
 `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
@@ -69,8 +69,8 @@ def _format_values(values: list[object]) -> str:
 
 def _table(rows: list[dict]) -> str:
     lines = [
-        "| Captured key | Capture policy | Kind | Allowed values |",
-        "|--------------|----------------|------|----------------|",
+        "| Captured key | Capture policy | Kind | Categorical domain |",
+        "|--------------|----------------|------|--------------------|",
     ]
     for row in rows:
         lines.append(

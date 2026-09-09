@@ -71,10 +71,6 @@ def _is_pydantic_model(value: Any) -> bool:
     return isinstance(value, BaseModel)
 
 
-def _none_type() -> type[None]:
-    return type(None)
-
-
 def _unwrap_annotated(annotation: Any) -> Any:
     while get_origin(annotation) is Annotated:
         annotation = get_args(annotation)[0]
@@ -90,17 +86,11 @@ def _is_literal(annotation: Any) -> bool:
 
 
 def _is_enum_annotation(annotation: Any) -> bool:
-    try:
-        return isinstance(annotation, type) and issubclass(annotation, Enum)
-    except TypeError:
-        return False
+    return isinstance(annotation, type) and issubclass(annotation, Enum)
 
 
 def _is_path_annotation(annotation: Any) -> bool:
-    try:
-        return isinstance(annotation, type) and issubclass(annotation, Path)
-    except TypeError:
-        return False
+    return isinstance(annotation, type) and issubclass(annotation, Path)
 
 
 def _is_callable_annotation(annotation: Any) -> bool:
@@ -182,12 +172,22 @@ def _dedupe_typed(values: list[Any]) -> tuple[Any, ...]:
     return tuple(deduped)
 
 
+def _policy_key(policy: _CapturePolicy) -> tuple[Any, ...]:
+    """Typed structural identity for a compiled capture policy."""
+    return (
+        policy.policy_type,
+        policy.runtime_type,
+        tuple((type(value), value) for value in policy.allowed_values),
+        tuple(_policy_key(branch) for branch in policy.branches),
+    )
+
+
 def _combine_policies(policies: list[_CapturePolicy]) -> _CapturePolicy | None:
     branches: list[_CapturePolicy] = []
     for policy in policies:
         candidates = policy.branches if policy.policy_type == "union" else (policy,)
         for candidate in candidates:
-            if candidate not in branches:
+            if not any(_policy_key(candidate) == _policy_key(branch) for branch in branches):
                 branches.append(candidate)
     if not branches:
         return None
@@ -196,15 +196,27 @@ def _combine_policies(policies: list[_CapturePolicy]) -> _CapturePolicy | None:
     return _CapturePolicy("union", branches=tuple(branches))
 
 
-def _sequence_element_annotation(annotation: Any) -> tuple[type, Any] | None:
+def _compile_sequence_policy(annotation: Any) -> _CapturePolicy | None:
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin in {list, set} and len(args) == 1:
-        return origin, args[0]
-    if origin is tuple:
-        if len(args) == 2 and args[1] is Ellipsis:
-            return origin, args[0]
-    return None
+        element_annotations = args
+    elif origin is tuple and args:
+        element_annotations = args[:1] if len(args) == 2 and args[1] is Ellipsis else args
+    else:
+        return None
+
+    element_policies: list[_CapturePolicy] = []
+    for element_annotation in element_annotations:
+        policy = _compile_annotation_policy(element_annotation)
+        if policy is None:
+            return None
+        element_policies.append(policy)
+    if any(
+        _policy_key(policy) != _policy_key(element_policies[0]) for policy in element_policies[1:]
+    ):
+        return None
+    return _CapturePolicy("sequence", runtime_type=origin, branches=(element_policies[0],))
 
 
 def _compile_annotation_policy(annotation: Any) -> _CapturePolicy | None:
@@ -213,7 +225,7 @@ def _compile_annotation_policy(annotation: Any) -> _CapturePolicy | None:
 
     if annotation is Any or annotation in {str, object}:
         return None
-    if annotation is _none_type():
+    if annotation is types.NoneType:
         return _CapturePolicy("none")
     if _is_path_annotation(annotation) or _is_callable_annotation(annotation):
         return None
@@ -228,35 +240,23 @@ def _compile_annotation_policy(annotation: Any) -> _CapturePolicy | None:
         return _CapturePolicy(annotation.__name__)
     if _is_union(annotation):
         policies: list[_CapturePolicy] = []
-        has_none = False
         for branch in get_args(annotation):
-            if _unwrap_annotated(branch) is _none_type():
-                has_none = True
-                continue
             policy = _compile_annotation_policy(branch)
             if policy is not None:
                 policies.append(policy)
         # Optional does not make an otherwise unsafe field capturable by itself.
-        if not policies:
+        if not any(policy.policy_type != "none" for policy in policies):
             return None
-        if has_none:
-            policies.append(_CapturePolicy("none"))
         return _combine_policies(policies)
 
-    sequence = _sequence_element_annotation(annotation)
-    if sequence is not None:
-        origin, element_annotation = sequence
-        element_policy = _compile_annotation_policy(element_annotation)
-        if element_policy is not None:
-            return _CapturePolicy("sequence", runtime_type=origin, branches=(element_policy,))
-    return None
+    return _compile_sequence_policy(annotation)
 
 
 def _annotation_allows_none(annotation: Any) -> bool:
     annotation = _unwrap_annotated(annotation)
-    return annotation is _none_type() or (
+    return annotation is types.NoneType or (
         _is_union(annotation)
-        and any(_unwrap_annotated(branch) is _none_type() for branch in get_args(annotation))
+        and any(_unwrap_annotated(branch) is types.NoneType for branch in get_args(annotation))
     )
 
 
@@ -372,13 +372,6 @@ def _nested_models(annotation: Any) -> list[type]:
     return deduped
 
 
-def _defining_class(cls: type, field_name: str) -> str:
-    for klass in cls.__mro__:
-        if field_name in getattr(klass, "__annotations__", {}):
-            return f"{klass.__name__}.{field_name}"
-    return f"{cls.__name__}.{field_name}"
-
-
 def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     """Walk real type objects and emit the complete capturable manifest.
 
@@ -399,25 +392,24 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
             key = f"{prefix}.{fname}" if prefix else fname
             ann = finfo.annotation
             meta = _get_telemetry_metadata(finfo)
-            normalized = meta if (meta and not _is_explicit_exclude(meta)) else {}
-            policy = None if _is_explicit_exclude(meta) else _compile_field_policy(ann, normalized)
+            if _is_explicit_exclude(meta):
+                continue
+            policy = _compile_field_policy(ann, meta or {})
             if policy is not None:
                 rows.append(
                     {
                         "key": key,
-                        "defining": _defining_class(cls, fname),
                         "owner": cls,
                         "policy": policy,
                         "kind": _policy_kind(policy),
                     }
                 )
-            if not _is_explicit_exclude(meta):
-                for sub in _nested_models(ann):
-                    walk(sub, key, (*stack, cls))
+            for sub in _nested_models(ann):
+                walk(sub, key, (*stack, cls))
 
     walk(model_cls, "", ())
 
-    rows.sort(key=lambda r: (r["key"], r["defining"], r["owner"].__qualname__))
+    rows.sort(key=lambda r: (r["key"], r["owner"].__module__, r["owner"].__qualname__))
     grouped: dict[str, dict[str, Any]] = {}
     for r in rows:
         key = r["key"]
@@ -431,7 +423,7 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
         variants: list[_PolicyVariant] = grouped[key]["variants"]
         matching = [variant for variant in variants if variant.owner is r["owner"]]
         if matching:
-            if any(variant.policy != r["policy"] for variant in matching):
+            if any(_policy_key(variant.policy) != _policy_key(r["policy"]) for variant in matching):
                 raise ValueError(
                     f"telemetry manifest: key '{key}' has conflicting policies "
                     f"for model arm {r['owner'].__qualname__}"
@@ -460,14 +452,9 @@ def build_capture_manifest(model_cls: type[BaseModel]) -> list[_ManifestEntry]:
     return entries
 
 
-def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
-    """Serializable, human-legible projection of build_capture_manifest.
-
-    Used by the committed golden, the docs renderer, and the
-    capture_manifest_digest.
-    """
+def _manifest_rows(entries: list[_ManifestEntry]) -> list[dict[str, Any]]:
     rows = []
-    for entry in build_capture_manifest(model_cls):
+    for entry in entries:
         row = {
             "path": entry.path,
             "kind": entry.kind,
@@ -477,6 +464,11 @@ def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
             row["allowed_values"] = list(entry.allowed_values)
         rows.append(row)
     return rows
+
+
+def manifest_rows(model_cls: type[BaseModel]) -> list[dict[str, Any]]:
+    """Serializable projection used by the golden, docs, and manifest digest."""
+    return _manifest_rows(build_capture_manifest(model_cls))
 
 
 def golden_manifest() -> dict[str, list[dict[str, Any]]]:
@@ -600,26 +592,10 @@ def _resolve_path(instance: BaseModel, path: str) -> tuple[bool, Any, BaseModel 
 
 
 def _policy_for_owner(entry: _ManifestEntry, owner: BaseModel) -> _CapturePolicy | None:
-    exact = [variant.policy for variant in entry.variants if type(owner) is variant.owner]
-    if exact:
-        return _combine_policies(exact)
-
-    owner_mro = type(owner).__mro__
-    compatible = [
-        (owner_mro.index(variant.owner), variant.policy)
-        for variant in entry.variants
-        if variant.owner in owner_mro
-    ]
-    if not compatible:
-        return None
-    closest_distance = min(distance for distance, _ in compatible)
-    closest = [policy for distance, policy in compatible if distance == closest_distance]
-    if any(policy != closest[0] for policy in closest[1:]):
-        raise ValueError(
-            f"telemetry manifest: key '{entry.path}' has ambiguous policies "
-            f"for active model arm {type(owner).__qualname__}"
-        )
-    return closest[0]
+    return next(
+        (variant.policy for variant in entry.variants if type(owner) is variant.owner),
+        None,
+    )
 
 
 def _truncate_to_budget(values: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -692,7 +668,7 @@ def collect_llm_api_config_payloads(llm_args: Any) -> tuple[str, str]:
             state.values, config_json = _truncate_to_budget(state.values)
             state.payload_truncated = True
 
-        rows = manifest_rows(cls)
+        rows = _manifest_rows(entries)
         metadata = {
             "api_contract_version": API_CONTRACT_VERSION,
             "args_class": cls.__name__,

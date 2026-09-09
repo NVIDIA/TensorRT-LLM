@@ -502,6 +502,7 @@ def test_renderer_emits_table_from_committed_golden(tmp_path):
     assert "python3 scripts/generate_llm_args_golden_manifest.py" in text
     assert "explicitly marked" not in text  # opt-in prose must be gone
     assert "Capture policy" in text
+    assert "Categorical domain" in text
     assert "Converter" not in text
     assert "`backend`" in text  # a known captured key renders
 

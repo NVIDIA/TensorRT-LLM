@@ -36,19 +36,17 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
-    marked: int = Field(default=7, telemetry={"kind": "value"})
+    marked: int = 7
     unmarked: int = Field(default=11)
 
 
 class _ExampleConfig(StrictBaseModel):
-    safe_marked: int = Field(default=3, telemetry={"kind": "value"})
+    safe_marked: int = 3
     safe_unmarked: int = Field(default=5)
-    private_path: str = Field(default="/customer/private/model", telemetry={"kind": "value"})
-    mode: Literal["auto", "slow"] = Field(default="auto", telemetry={"kind": "categorical"})
+    private_path: str = "/customer/private/model"
+    mode: Literal["auto", "slow"] = "auto"
     nested: _NestedConfig = Field(default_factory=_NestedConfig)
-    unsafe_union: Optional[Union[str, Path]] = Field(
-        default="/customer/tokenizer", telemetry={"kind": "categorical"}
-    )
+    unsafe_union: Optional[Union[str, Path]] = "/customer/tokenizer"
 
 
 def _loads_payloads(args) -> tuple[dict, dict]:
@@ -134,7 +132,7 @@ def test_non_scalar_allowed_value_fails_manifest_build_loudly():
 
 def test_collect_llm_api_config_walks_only_declared_pydantic_fields():
     class _DeclaredFieldsOnlyConfig(StrictBaseModel):
-        safe_value: int = Field(default=3, telemetry={"kind": "value"})
+        safe_value: int = 3
 
         @property
         def leaked_value(self):
@@ -149,10 +147,10 @@ def test_collect_llm_api_config_walks_only_declared_pydantic_fields():
 
 def test_collect_llm_api_config_rejects_unsafe_annotations_even_for_safe_values():
     class _UnsafeAnnotationConfig(StrictBaseModel):
-        safe_value: int = Field(default=3, telemetry={"kind": "value"})
-        raw_any: Any = Field(default=11, telemetry={"kind": "value"})
-        object_like: object = Field(default=True, telemetry={"kind": "value"})
-        raw_dict: dict[str, Any] = Field(default_factory=dict, telemetry={"kind": "value"})
+        safe_value: int = 3
+        raw_any: Any = 11
+        object_like: object = True
+        raw_dict: dict[str, Any] = Field(default_factory=dict)
         converted_any: Any = Field(
             default="known",
             telemetry=TelemetryField.categorical("known"),
@@ -247,10 +245,8 @@ def test_collect_llm_api_config_captures_int_enum_name():
         FP8 = "fp8"
 
     class _EnumConfig(StrictBaseModel):
-        mode: _LoadMode = Field(default=_LoadMode.AUTO, telemetry={"kind": "categorical"})
-        precision: _PrecisionMode = Field(
-            default=_PrecisionMode.FP8, telemetry={"kind": "categorical"}
-        )
+        mode: _LoadMode = _LoadMode.AUTO
+        precision: _PrecisionMode = _PrecisionMode.FP8
 
     config, meta = _loads_payloads(_EnumConfig())
 
@@ -260,7 +256,7 @@ def test_collect_llm_api_config_captures_int_enum_name():
 
 def test_collect_llm_api_config_keeps_bool_values_boolean():
     class _BoolConfig(StrictBaseModel):
-        enabled: bool = Field(default=True, telemetry={"kind": "value"})
+        enabled: bool = True
 
     config, _ = _loads_payloads(_BoolConfig())
 
@@ -274,6 +270,7 @@ def test_float_policy_normalizes_integer_defaults_but_rejects_bool():
 
     config, meta = _loads_payloads(_FloatConfig())
     assert config == {"value": 0.0}
+    assert type(config["value"]) is float
     assert meta["unsafe_excluded"] is False
 
     invalid = _FloatConfig.model_construct(value=True)
@@ -320,6 +317,28 @@ def test_int_literal_union_preserves_typed_branch_distinctions():
         config, meta = _loads_payloads(invalid)
         assert "value" not in config
         assert meta["unsafe_excluded"] is True
+
+
+def test_equal_valued_literal_union_branches_preserve_python_types():
+    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
+
+    class _TypedLiteralConfig(StrictBaseModel):
+        value: Literal[1] | Literal[True] = 1
+        values: list[Literal[0] | Literal[False]] = Field(default_factory=lambda: [0, False])
+
+    entry = next(
+        item for item in build_capture_manifest(_TypedLiteralConfig) if item.path == "value"
+    )
+    assert [type(value) for value in entry.allowed_values] == [int, bool]
+
+    for value in (1, True):
+        config, meta = _loads_payloads(_TypedLiteralConfig.model_construct(value=value))
+        assert type(config["value"]) is type(value)
+        assert meta["unsafe_excluded"] is False
+
+    config, meta = _loads_payloads(_TypedLiteralConfig())
+    assert [type(value) for value in config["values"]] == [int, bool]
+    assert meta["unsafe_excluded"] is False
 
 
 def test_literal_mamba_cache_dtype_needs_no_explicit_allowlist():
@@ -398,10 +417,17 @@ def test_nested_union_sequence_is_sanitized_branch_by_branch():
 def test_homogeneous_tuple_and_set_sequences_remain_capturable():
     class _SequenceConfig(StrictBaseModel):
         sizes: tuple[int, ...] = (3, 1)
+        fixed_sizes: tuple[int, int] = (5, 2)
+        fixed_modes: tuple[Literal["auto"], Literal["auto"]] = ("auto", "auto")
         modes: set[Literal["auto", "manual"]] = {"manual", "auto"}
 
     config, meta = _loads_payloads(_SequenceConfig())
-    assert config == {"modes": ["auto", "manual"], "sizes": [3, 1]}
+    assert config == {
+        "fixed_modes": ["auto", "auto"],
+        "fixed_sizes": [5, 2],
+        "modes": ["auto", "manual"],
+        "sizes": [3, 1],
+    }
     assert meta["unsafe_excluded"] is False
 
 
@@ -415,9 +441,9 @@ def test_collect_llm_api_config_rejects_non_finite_floats():
     """
 
     class _FloatConfig(StrictBaseModel):
-        finite: float = Field(default=0.5, telemetry={"kind": "value"})
-        infinite: float = Field(default=float("inf"), telemetry={"kind": "value"})
-        not_a_number: float = Field(default=float("nan"), telemetry={"kind": "value"})
+        finite: float = 0.5
+        infinite: float = float("inf")
+        not_a_number: float = float("nan")
 
     config, meta = _loads_payloads(_FloatConfig())
 
@@ -549,7 +575,8 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
 
 def test_collect_llm_api_config_rejects_heterogeneous_tuples():
     class _TupleConfig(StrictBaseModel):
-        pair: tuple[int, Literal["safe"]] = Field(default=(1, "safe"), telemetry={"kind": "value"})
+        pair: tuple[int, Literal["safe"]] = (1, "safe")
+        typed_pair: tuple[Literal[1], Literal[True]] = (1, True)
 
     config, meta = _loads_payloads(_TupleConfig())
 
@@ -560,11 +587,7 @@ def test_collect_llm_api_config_rejects_heterogeneous_tuples():
 
 
 def test_collect_llm_api_config_derives_manifest_kind_from_annotation():
-    """Manifest 'kind' is derived per D1, not taken from the registered value.
-
-    Categorical iff (Optional-unwrapped) annotation is Literal/Enum OR an
-    allowlist is present; otherwise 'value'. The registered kind is ignored.
-    """
+    """Stored kind metadata cannot override the kind derived from compiled policies."""
 
     class _Mode(Enum):
         AUTO = "auto"
@@ -710,12 +733,7 @@ def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
 
 
 def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
-    """None on an Optional allowlist field is captured as null, not excluded.
-
-    Regression: the None check must precede the allowlist branch, else a None
-    default (e.g. reasoning_parser, TrtLlmArgs.backend) fails the allowlist and
-    permanently flips unsafe_excluded on default configs.
-    """
+    """None is captured through the independent policy on Optional fields."""
 
     class _C(StrictBaseModel):
         backend: Optional[str] = Field(
@@ -822,13 +840,7 @@ def _walk_captured_keys(model) -> set[str]:
 
 
 def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
-    """The speculative discriminator decoding_type is captured for every arm.
-
-    decoding_type is the single most valuable categorical (it identifies which
-    speculative mode is active). The runtime collector walks the concrete active
-    arm's model_fields, so marking it on only one arm drops it for the others.
-    Assert representative non-UserProvided arms capture it.
-    """
+    """Every reachable decoding_type Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
         AutoDecodingConfig,
         MTPDecodingConfig,
@@ -846,12 +858,7 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
 
 
 def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
-    """max_total_draft_tokens is a safe value field on the shared base.
-
-    Marking it only on a single override (SaveHiddenStates) drops it for every
-    other arm at runtime even though the doc-gen union-collapse advertises it.
-    Mark it on DecodingBaseConfig so all arms capture it.
-    """
+    """Inherited safe fields remain capturable on concrete model arms."""
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     mtp = MTPDecodingConfig(num_nextn_predict_layers=1)
@@ -859,11 +866,7 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 
 
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
-    """The sparse-attention discriminator algorithm is captured for every arm.
-
-    The collapsed manifest path retains the policy for each concrete model arm;
-    adding an arm needs only its real Literal discriminator annotation.
-    """
+    """Every reachable sparse algorithm Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
@@ -900,6 +903,30 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
         captured, meta = _loads_payloads(args)
         assert captured["sparse_attention_config.algorithm"] == sparse_config.algorithm
         assert meta["unsafe_excluded"] is False
+
+
+@pytest.mark.parametrize("field_name", ["target_sparsity", "threshold_scale_factor"])
+def test_sparse_scalar_union_branches_capture_float_but_not_mapping(field_name):
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+    def capture(value):
+        sparse_config = SkipSoftmaxAttentionConfig(**{field_name: value})
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            sparse_attention_config=sparse_config,
+        )
+        return _loads_payloads(args)
+
+    path = f"sparse_attention_config.{field_name}"
+    config, meta = capture(0.5)
+    assert config[path] == 0.5
+    assert type(config[path]) is float
+    assert meta["unsafe_excluded"] is False
+
+    config, meta = capture({"decode": 0.5})
+    assert path not in config
+    assert meta["unsafe_excluded"] is True
 
 
 def test_background_reporter_keeps_initial_report_when_config_capture_fails(
@@ -963,6 +990,21 @@ def test_collect_llm_api_config_honors_explicit_exclude_sentinel():
     config, meta = _loads_payloads(_ExcludeConfig())
     assert config == {"kept": 1}
     assert "secret_seed" not in config
+    assert meta["capturable_field_count"] == 1
+
+
+def test_unknown_subclass_cannot_inherit_a_base_capture_policy():
+    class _BaseArm(StrictBaseModel):
+        sensitive: int = 1
+
+    class _ChildArm(_BaseArm):
+        sensitive: int = Field(default=2, telemetry=False)
+
+    class _Root(StrictBaseModel):
+        arm: _BaseArm
+
+    config, meta = _loads_payloads(_Root(arm=_ChildArm()))
+    assert "arm.sensitive" not in config
     assert meta["capturable_field_count"] == 1
 
 

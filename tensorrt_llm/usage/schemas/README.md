@@ -225,11 +225,11 @@ flags such as LoRA/speculative decoding have explicit safe config fields.
 
 The `llmApiConfigJson` field is a JSON-serialized dict containing a type-driven
 subset of the validated, effective LLM API configuration. Capture is
-**type-driven**: a field is captured automatically when its type is categorical
-(`Literal`/`Enum`/`bool`) or numeric (`int`/`float`), or a safe collection of
-those. Free-form `str`/`Any`/`Path`/`dict`/`Callable` are not captured unless the
-field carries an explicit allowlist (`TelemetryField.categorical(...)`). Any field
-can opt out with `telemetry=False`.
+automatic for `bool`, `int`, finite `float`, `Literal`, `Enum`, supported unions,
+and homogeneous sequences. Unsafe scalar `str`, `Any`, and `object` branches
+require `TelemetryField.categorical(...)`; paths, mappings, callables, and
+unsupported structures always fail closed. Use `telemetry=False` to exclude a
+field.
 
 Captured values must be safe primitives. Raw strings are excluded unless the
 field is a `Literal[...]`/`Enum` or matches explicit `allowed_values`. Paths,
@@ -243,13 +243,10 @@ Captured sequences are capped at a fixed length and any clipping is reported in
 of being serialized, and `llmApiConfigMetaJson` reports whether any resolved field
 was excluded as unsafe.
 
-The table below is a non-exhaustive set of examples for readers building
-dashboards. The exhaustive source of truth is
-`tensorrt_llm/usage/llm_args_golden_manifest.json` (regenerated from
-`build_capture_manifest`), after the safety sanitizer has excluded unsafe values.
-Use `llmApiConfigMetaJson` digests and field counts to track the exact capture
-manifest for a given release. The rendered documentation generates the
-exhaustive field table at docs build time under **Developer Guide > Telemetry**.
+The table below gives common dashboard examples. The committed manifest is the
+canonical list of `TorchLlmArgs` capturable paths, merged policies, and
+categorical domains. `llmApiConfigMetaJson` identifies that manifest by digest.
+The docs build renders the full table under **Developer Guide > Telemetry**.
 
 | Key | Description |
 |-----|-------------|
@@ -324,10 +321,10 @@ Checklist for adding an LLM API config capture field inside `llmApiConfigJson`:
    exclusion sentinel keeps a categorical/numeric field out of capture.
 4. **Do not capture unsafe data.** No model/tokenizer/file paths, prompts,
    outputs, secrets/tokens/URLs/hostnames, free-form user strings, raw
-   dict/object payloads, or callables. The sanitizer fails closed regardless:
-   bare `str`, `Any`, `object`, `Path`, `dict`, callables, unsupported union
-   branches, and non-finite floats are dropped unless the runtime value exactly
-   matches explicit finite `allowed_values` on that field.
+   dict/object payloads, or callables. Paths, mappings, callables, arbitrary
+   non-scalars, heterogeneous sequences, and non-finite floats always fail
+   closed. A `str`/`Any`/`object` scalar branch is emitted only when it exactly
+   matches the field's finite `allowed_values`.
 5. **`tests/unittest/usage/test_llmapi_config_capture.py`** — Add behavior
    coverage: assert the value is captured, and for a categorical bare-string
    field assert that an out-of-allowlist value is redacted (dropped) while an
