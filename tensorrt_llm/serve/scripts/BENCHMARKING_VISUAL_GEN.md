@@ -128,7 +128,7 @@ sequenceDiagram
     end
 
     Note over C: --output-media-dir writes outside the concurrency slot
-    Note over C: aggregate; exit non-zero if any request failed
+    Note over C: aggregate, and exit non-zero if any request failed
 ```
 
 ```math
