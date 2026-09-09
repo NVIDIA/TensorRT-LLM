@@ -123,7 +123,6 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
-        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -168,7 +167,6 @@ public:
         , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
         , mMultimodalRunPositions(std::move(multimodalRunPositions))
         , mMultimodalRunLengths(std::move(multimodalRunLengths))
-        , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
         , mLoraTaskId(loraTaskId)
@@ -919,11 +917,6 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunLengths() const
     {
         return mMultimodalRunLengths;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
-    {
-        return mMultimodalEmbedding;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMropeRotaryCosSin() const
@@ -1957,7 +1950,6 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuOffsets{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunLengths{std::nullopt};
-    std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
 
@@ -2198,7 +2190,6 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -2236,9 +2227,9 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
-            std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
-            std::move(loraWeights), std::move(loraConfig), std::move(kvCacheRetentionConfig), returnLogProbs,
-            returnContextLogits, returnGenerationLogits,
+            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
+            std::move(loraConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
+            returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             excludeInputFromOutput,

@@ -919,6 +919,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             "embedding_bias", None)
         self.py_position_ids: list[int] | None = kwargs.pop(
             "position_ids", None)
+        self.py_multimodal_embedding: Optional[torch.Tensor] = kwargs.pop(
+            "multimodal_embedding", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
