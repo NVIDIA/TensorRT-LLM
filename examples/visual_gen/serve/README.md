@@ -308,13 +308,13 @@ You can customize these by:
 - `input_reference` (deprecated): a single image or video reference, routed by content signature to I2V or V2V. A JSON request carries base64 bytes and a multipart request uploads the file; it is ignored when `image_reference` / `video_reference` is also given. Prefer the typed fields.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
-- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
+- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries every generated tensor, including video, audio, or action, plus scalar metadata in one payload).
 
 > **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400. One switch covers both directions: it also rejects a reference sent with `format="path"`.
 
 #### Tensor-format consumer contract
 
-When `format="safetensors"` or `format="pt"`, the payload bundles every populated media tensor (`image` / `video` / `audio`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
+When `format="safetensors"` or `format="pt"`, the payload bundles every populated tensor (`image` / `video` / `audio` / `action`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
 
 - **`pt`**: `torch.load(buf, weights_only=True)` returns a dict with the tensor keys and the scalars as native Python values.
 - **`safetensors`**: `safetensors.torch.load(bytes)` returns a dict with the tensor keys and each scalar as a 0-d tensor under the same key — call `.item()` to unbox (e.g. `loaded["frame_rate"].item()`). The same scalars are also written to the safetensors file header as strings; `safe_open(path, framework="pt").metadata()` exposes them in that form for consumers that prefer header access.
@@ -336,7 +336,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`; Action's `action_mode`, `domain_name`, `domain_id`, `raw_action_dim`, `action_chunk_size`, `action`, `use_state`, `action_resolution`, `action_fps`; and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
 
 ##### Cosmos3 transfer hints
 
@@ -420,6 +420,28 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "fps=24" \
   -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'
 ```
+
+### Cosmos3 Edge Policy DROID (Multipart with File Upload)
+
+The checkpoint selects Policy mode and its DROID defaults. The prompt remains a
+string: this example serializes the caller-owned nested caption instead of
+asking the server to construct or validate it. The current state contains seven
+joint positions followed by the gripper value in the model's convention.
+
+```bash
+prompt=$(jq -c '.prompt' ../models/cosmos3/prompts/action_edge_policy_droid.json)
+curl -X POST "http://localhost:8000/v1/videos/sync" \
+  -F "prompt=${prompt}" \
+  -F "image_reference=@./droid_observation.png" \
+  -F 'extra_params={"action": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}' \
+  -o droid_policy.safetensors
+```
+
+The tensor payload contains both `video` and `action`; `action` has shape
+`[32, 8]` for one request. The checkpoint-selected Policy default is applied
+before format resolution, so omitting both `action_mode` and `format` still
+resolves `format=auto` to `safetensors`. An explicit `-F 'format=safetensors'`
+is optional.
 
 ### Check Video Status
 ```bash
