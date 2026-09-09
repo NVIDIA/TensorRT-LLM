@@ -35,6 +35,7 @@ from defs.model_express.mx_harness import (
     donor_session,
     load_payload,
     log_tail,
+    mx_metadata_ports,
     report_timings,
     require_mx_environment,
     resolve_model_path,
@@ -133,9 +134,9 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     """Compare HF, MX donor, and no-weight-shards MX receiver outputs and weight manifests.
 
     Three checks stack up: exact greedy token equality across the roles (the
-    behavioral probe), per-rank transfer evidence proving the receiver's bytes
-    arrived through P2P, and byte-exact weight manifests at the transfer
-    boundary and after finalization. Artifacts are archived under `output_dir`
+    behavioral probe), the receiver's per-rank RDMA completion records proving
+    its bytes arrived through P2P, and byte-exact weight manifests at the
+    transfer boundary and after finalization. Artifacts are archived under `output_dir`
     when pytest runs with `--output-dir` (always in CI), including on failure.
     """
     required_gpus = case.tp_size * 2
@@ -153,6 +154,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
 
     donor_gpu_ids = gpu_ids[: case.tp_size]
     receiver_gpu_ids = gpu_ids[case.tp_size :]
+    donor_port, receiver_port = mx_metadata_ports(case.tp_size)
 
     try:
         # Leave donor GPUs untouched in case MPI worker teardown trails the baseline process.
@@ -182,7 +184,10 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 max_serve_seconds=timeout_s + 120,
             ),
             environment=worker_environment(
-                donor_gpu_ids, layout.transfer_logs("donor"), layout.manifest_dir
+                donor_gpu_ids,
+                layout.transfer_logs("donor"),
+                layout.manifest_dir,
+                metadata_port=donor_port,
             ),
             log_path=layout.log("donor"),
             ready_file=layout.donor_ready,
@@ -198,7 +203,10 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                     mx_url=mx_url,
                 ),
                 worker_environment(
-                    receiver_gpu_ids, layout.transfer_logs("receiver"), layout.manifest_dir
+                    receiver_gpu_ids,
+                    layout.transfer_logs("receiver"),
+                    layout.manifest_dir,
+                    metadata_port=receiver_port,
                 ),
                 layout.log("receiver"),
                 timeout_s,
@@ -208,7 +216,6 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
             f"MX donor exited with status {donor.returncode}\n{log_tail(layout.log('donor'))}"
         )
         payloads = {role: load_payload(layout.output(role)) for role in ROLES}
-        assert payloads["donor"]["server_query_timeout_s"] == 0
         tokens = {role: assert_probe_payload(payloads[role], role=role) for role in ROLES}
         assert (
             payloads["baseline"]["prompt_lengths"]
@@ -219,9 +226,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
         assert tokens["receiver"] == tokens["baseline"], (
             "MX receiver tokens differ from the HF baseline"
         )
-        assert_transfer_evidence(
-            case, layout.log("receiver"), layout.transfer_logs("receiver"), payloads["receiver"]
-        )
+        assert_transfer_evidence(case, layout.log("receiver"))
         manifests = collect_weight_manifests(layout.manifest_dir, case)
         assert_weight_manifests(case, manifests)
         report_timings(case, payloads, manifests, layout)

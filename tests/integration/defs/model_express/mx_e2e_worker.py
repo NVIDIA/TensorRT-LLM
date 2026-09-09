@@ -25,11 +25,6 @@ from pathlib import Path
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 
-try:  # Run as a script: the worker directory is `sys.path[0]`.
-    from mx_evidence import summarize_transfer_logs
-except ImportError:  # Imported by pytest as part of the `defs` package.
-    from defs.model_express.mx_evidence import summarize_transfer_logs
-
 # Eight prompts of distinct lengths (4-12 tokens). Every ID stays below 30000
 # so the same probe is valid for TinyLlama (32000-token vocabulary), Mistral,
 # and Qwen tokenizers; the leading `1` mirrors a BOS token.
@@ -86,13 +81,9 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
     if args.role != "baseline":
         if not args.mx_url:
             raise ValueError("MX donor and receiver roles require --mx-url")
-        kwargs["mx_config"] = {
-            "server_url": args.mx_url,
-            # ModelExpress 0.4.1 skips polling at zero but still sleeps once
-            # for five seconds before disk fallback. The receiver starts only
-            # after donor readiness, so it can use a bounded discovery window.
-            "server_query_timeout_s": 0 if args.role == "donor" else 30,
-        }
+        # ModelExpress checks once for a compatible source and otherwise loads
+        # natively; the receiver starts only after donor readiness.
+        kwargs["mx_config"] = {"server_url": args.mx_url}
     return kwargs
 
 
@@ -101,8 +92,10 @@ def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
 
     MPI-spawned ranks inherit only selected `TRTLLM*`/`TLLM*` variables, so
     everything the loaders read must travel through `LLM(env_overrides=...)`.
-    The weight-manifest variables apply to every role (the HF baseline too);
-    the MX transfer log only exists for MX roles.
+    The weight-manifest variables apply to every role (the HF baseline too).
+    `MX_TRANSFER_LOG_DIR` applies to MX roles only; the MX checkpoint loader
+    raises the `modelexpress` logger to INFO when it is set, which is how the
+    RDMA completion records reach this process's log.
     """
     overrides: dict[str, str] = {}
     manifest_dir = os.environ.get("MX_WEIGHT_MANIFEST_DIR")
@@ -114,18 +107,6 @@ def _rank_process_env_overrides(args: argparse.Namespace) -> dict[str, str]:
         if transfer_log_dir:
             overrides["MX_TRANSFER_LOG_DIR"] = transfer_log_dir
     return overrides
-
-
-def _receiver_transfer_evidence() -> dict[str, object] | None:
-    """Summarize this receiver's own MX rank logs with the shared evidence rules."""
-    transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
-    if not transfer_log_dir:
-        return None
-    try:
-        summaries = summarize_transfer_logs(Path(transfer_log_dir))
-    except ValueError as error:
-        return {"error": str(error)}
-    return {str(rank): summary.to_dict() for rank, summary in sorted(summaries.items())}
 
 
 def main() -> None:
@@ -154,22 +135,16 @@ def main() -> None:
             )
         )
         generate_seconds = time.perf_counter() - generate_started
-        mx_config = llm_kwargs.get("mx_config")
         payload: dict[str, object] = {
             "role": args.role,
             "tp_size": args.tp_size,
             "load_seconds": load_seconds,
             "generate_seconds": generate_seconds,
-            "server_query_timeout_s": (
-                mx_config.get("server_query_timeout_s") if isinstance(mx_config, dict) else None
-            ),
             "max_new_tokens": _MAX_NEW_TOKENS,
             "prompt_count": len(_PROMPT_TOKEN_IDS),
             "prompt_lengths": [len(prompt) for prompt in _PROMPT_TOKEN_IDS],
             "token_ids": [list(result.outputs[0].token_ids) for result in results],
         }
-        if args.role == "receiver":
-            payload["transfer_evidence"] = _receiver_transfer_evidence()
         args.output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
         if args.role == "donor":
