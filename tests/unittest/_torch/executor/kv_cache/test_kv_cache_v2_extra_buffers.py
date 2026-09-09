@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Focused regression tests for the KVCacheManagerV2 per-layer extra-buffer
-# registration hook used by MiniMax-M3 sparse index-K support. The hook lets
+# Regression tests for KVCacheManagerV2 page-table mapping and the per-layer
+# extra-buffer hook used by MiniMax-M3 sparse index-K support. The hook lets
 # subclasses register additional per-layer ``BufferConfig`` entries (e.g.
 # ``Role.INDEX_KEY``) alongside the standard K/V/NVFP4 scale buffers without
 # disturbing the existing K/V wiring or lifecycle.
@@ -14,6 +14,7 @@ import gc
 import unittest
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -158,32 +159,41 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             del mgr
 
     def test_page_table_uses_physical_pool_representative(self):
-        # Equal page sizes exercise the shared page-table path.
-        mgr = KVCacheManagerV2(**_make_kwargs())
-        real_impl = mgr.impl
-        try:
-            pool_id = 0
-            physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
-            other_layer = next(
-                layer_id
-                for layer_id in real_impl.layer_grouping[pool_id]
-                if int(layer_id) != int(physical_layer)
-            )
-            impl_proxy = Mock(wraps=real_impl)
-            impl_proxy.layer_grouping = ((other_layer, physical_layer),)
-            mgr.impl = impl_proxy
+        for head_dim in (128, [64, 192, 64, 192]):
+            with self.subTest(head_dim=head_dim):
+                mgr = KVCacheManagerV2(**_make_kwargs(head_dim=head_dim))
+                real_impl = mgr.impl
+                try:
+                    pool_id = 0
+                    physical_layer = mgr._pool_layer_ids_by_role[(pool_id, Role.KEY)]
+                    layers = real_impl.layer_grouping[pool_id]
+                    other_layer = next(layer for layer in layers if layer != physical_layer)
+                    impl_proxy = Mock(wraps=real_impl)
+                    impl_proxy.layer_grouping = (
+                        (other_layer, *(layer for layer in layers if layer != other_layer)),
+                    )
+                    mgr.impl = impl_proxy
 
-            mgr._prepare_page_table_tensor(index_mapper_capacity=1)
+                    mgr._prepare_page_table_tensor(index_mapper_capacity=1)
 
-            self.assertEqual(
-                impl_proxy.get_mem_pool_base_address.call_args_list[0].args,
-                (physical_layer, Role.KEY, PageIndexMode.SHARED),
-            )
-            impl_proxy.get_page_index_scale.assert_called_once_with(physical_layer, Role.KEY)
-        finally:
-            mgr.impl = real_impl
-            mgr.shutdown()
-            del mgr
+                    # Both paths still use a physical representative for group
+                    # metadata. Per-layer pointer lookups can precede it.
+                    shared_key_calls = [
+                        call.args
+                        for call in impl_proxy.get_mem_pool_base_address.call_args_list
+                        if call.args[1:] == (Role.KEY, PageIndexMode.SHARED)
+                    ]
+                    self.assertEqual(
+                        shared_key_calls[0],
+                        (physical_layer, Role.KEY, PageIndexMode.SHARED),
+                    )
+                    impl_proxy.get_page_index_scale.assert_called_once_with(
+                        physical_layer, Role.KEY
+                    )
+                finally:
+                    mgr.impl = real_impl
+                    mgr.shutdown()
+                    del mgr
 
     def test_subclass_registers_index_key_only_on_sparse_layers(self):
         # Sparse layer convention: layers 0-2 dense (no INDEX_KEY), 3+ sparse
@@ -271,6 +281,81 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
         # this hook adds and for AttentionLayerConfig.__post_init__.
         with self.assertRaises(AssertionError):
             _DuplicateRoleV2(**_make_kwargs(num_layers=4))
+
+
+@pytest.mark.parametrize("dtype", [DataType.HALF, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("is_gen", [False, True])
+def test_heterogeneous_page_tables_match_allocated_addresses(dtype, is_gen):
+    # Gemma's short-sequence configuration puts both head sizes in one
+    # lifecycle group. Unequal layer counts also give them different page
+    # index scales, so sharing a group's pointer or scale is incorrect.
+    kwargs = _make_kwargs(num_layers=6, head_dim=[256] * 5 + [512], dtype=dtype)
+    if dtype == DataType.NVFP4:
+        kwargs["kv_cache_config"] = KvCacheConfigV2(
+            max_tokens=2048, enable_block_reuse=False, dtype="nvfp4"
+        )
+    mgr = KVCacheManagerV2(**kwargs)
+    try:
+        request_ids = [11, 22, 33]
+        token_nums = [1, 9, 17]
+        requests = mgr.add_dummy_requests(request_ids, token_nums, is_gen=is_gen)
+        assert requests is not None
+        request_ids.reverse()
+        token_nums.reverse()
+        block_offsets = torch.empty(
+            mgr.num_attention_op_pools,
+            len(request_ids),
+            2,
+            mgr.max_blocks_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        mgr.copy_batch_block_offsets(
+            block_offsets,
+            request_ids,
+            beam_width=1,
+            num_contexts=0 if is_gen else len(request_ids),
+            num_seqs=len(request_ids),
+        )
+        torch.cuda.synchronize()
+        block_offsets = block_offsets.cpu()
+        for layer_id in range(mgr.num_local_layers):
+            pool_id, layer_offset = mgr.kv_cache_pool_mapping[layer_id].tolist()
+            lifecycle_id = mgr.impl.get_layer_group_id(layer_id)
+            roles = [(Role.KEY, Role.VALUE)]
+            if dtype == DataType.NVFP4:
+                roles.append((Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE))
+            for buffer_idx, role_pair in enumerate(roles):
+                pool_pointer = mgr.kv_cache_pool_pointers[pool_id, 0]
+                if dtype == DataType.NVFP4:
+                    pool_pointer = pool_pointer[buffer_idx]
+                for kv_idx, role in enumerate(role_pair):
+                    stride = mgr.impl.get_page_stride(layer_id, role)
+                    layer_base = mgr.impl.get_mem_pool_base_address(
+                        layer_id, role, PageIndexMode.SHARED
+                    )
+                    scale = mgr.impl.get_page_index_scale(layer_id, role)
+                    for seq_idx, (req_id, token_num) in enumerate(zip(request_ids, token_nums)):
+                        base_indices = mgr.kv_cache_map[req_id].get_base_page_indices(lifecycle_id)
+                        num_blocks = (token_num + mgr.tokens_per_block - 1) // mgr.tokens_per_block
+                        page_indices = block_offsets[pool_id, seq_idx, kv_idx, :num_blocks].long()
+                        actual = (
+                            int(pool_pointer)
+                            + (layer_offset * mgr.kv_factor + page_indices) * stride
+                        )
+                        allocated_indices = torch.tensor(
+                            list(base_indices[:num_blocks]), dtype=torch.int64
+                        )
+                        expected = layer_base + allocated_indices * scale * stride
+                        torch.testing.assert_close(
+                            actual,
+                            expected,
+                            rtol=0,
+                            atol=0,
+                            msg=f"layer={layer_id}, role={role}, request={req_id}",
+                        )
+    finally:
+        mgr.shutdown()
 
 
 class TestIndexKeyBufferAccessor(unittest.TestCase):
