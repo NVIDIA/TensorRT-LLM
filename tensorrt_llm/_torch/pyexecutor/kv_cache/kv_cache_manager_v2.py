@@ -1453,15 +1453,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # (TRANS_IN_PROGRESS) and continue to hold their index slots. The 2x
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
-        #
-        # Attention DP with the overlap scheduler needs the same coefficient:
-        # teardown of the retiring batch (`_process_previous_batch`) runs *after*
-        # the replacement batch has already been scheduled, so both cohorts hold
-        # their index slots at once. Without the extra capacity the index mapper
-        # runs dry and `_create_kv_cache` silently defers requests one at a time
-        # (nvbug 6627795). Pipeline parallelism is excluded because
-        # `max_num_sequences` already scales with the number of in-flight
-        # microbatches.
         needs_extra_index_slots = is_disagg or (
             mapping.enable_attention_dp and not disable_overlap_scheduler and not mapping.has_pp()
         )
