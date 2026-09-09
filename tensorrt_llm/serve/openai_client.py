@@ -37,6 +37,10 @@ from pydantic import BaseModel
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.conversation_id import (
+    SUBAGENT_AFFINITY_HEADER,
+    get_request_subagent_affinity_id,
+)
 from tensorrt_llm.serve.disagg_auth import (
     build_internal_disagg_auth_headers,
     request_requires_internal_disagg_auth,
@@ -200,11 +204,16 @@ class OpenAIHttpClient(OpenAIClient):
         self._internal_disagg_auth_key = internal_disagg_auth_key
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
-        if self._role != ServerRole.GENERATION:
-            return {}
-        if not request_requires_internal_disagg_auth(request):
-            return {}
-        return build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
+        headers: dict[str, str] = {}
+        # Carry rank affinity in a header so older workers can ignore it.
+        affinity_id = get_request_subagent_affinity_id(request)
+        if affinity_id is not None:
+            headers[SUBAGENT_AFFINITY_HEADER] = affinity_id
+        if self._role == ServerRole.GENERATION and request_requires_internal_disagg_auth(request):
+            headers.update(
+                build_internal_disagg_auth_headers(self._internal_disagg_auth_key, request)
+            )
+        return headers
 
     async def post_json(
         self,

@@ -260,6 +260,14 @@ class ConversationParams(OpenAIBaseModel):
     conversation_id: str = Field(
         description=("Stable multi-turn conversation id used for routing"), )
 
+    # Forwarded as a header; excluded from the request body for older workers.
+    subagent_affinity_id: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description=("Server-private parent-session id for sub-agent routing "
+                     "affinity; forwarded to workers as a header, never in the "
+                     "body."))
+
     @field_validator("conversation_id", mode="before")
     @classmethod
     def validate_conversation_id(cls, value: Any) -> str:

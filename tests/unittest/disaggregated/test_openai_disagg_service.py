@@ -248,6 +248,84 @@ def test_get_ctx_request_preserves_conversation_params_on_wire():
     assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
 
 
+def test_get_ctx_request_isolates_subagent_affinity_from_gen():
+    # The ctx request must carry the parent affinity key on its OWN
+    # conversation_params copy, so stripping the gen request (which shares the
+    # original object via a shallow model_copy) never mutates the ctx copy.
+    service = _make_service("context_first")
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    ctx_request = service._get_ctx_request(request, 42)
+    assert ctx_request.conversation_params.subagent_affinity_id == "parent"
+    # The ctx copy is a distinct object from the original conversation_params.
+    assert ctx_request.conversation_params is not request.conversation_params
+
+    # Simulate the gen request, which shares conversation_params with the original.
+    gen_req = request.model_copy(update={"disaggregated_params": None})
+    assert gen_req.conversation_params is request.conversation_params
+    service._strip_gen_subagent_affinity(gen_req)
+
+    assert gen_req.conversation_params.subagent_affinity_id is None
+    # Stripping gen did not disturb the ctx copy's parent pin.
+    assert ctx_request.conversation_params.subagent_affinity_id == "parent"
+
+
+def test_strip_gen_subagent_affinity_context_scope_clears_gen():
+    service = _make_service("context_first")
+    service._subagent_affinity_scope = "context"
+    gen_req = CompletionRequest(
+        model="test-model",
+        prompt="hi",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    service._strip_gen_subagent_affinity(gen_req)
+
+    # "context" scope: gen load-balances on its own id, no parent pin.
+    assert gen_req.conversation_params.subagent_affinity_id is None
+    assert gen_req.conversation_params.conversation_id == "child"
+
+
+def test_strip_gen_subagent_affinity_both_scope_keeps_gen():
+    service = _make_service("context_first")
+    service._subagent_affinity_scope = "both"
+    gen_req = CompletionRequest(
+        model="test-model",
+        prompt="hi",
+        conversation_params=ConversationParams(
+            conversation_id="child", subagent_affinity_id="parent"
+        ),
+    )
+
+    service._strip_gen_subagent_affinity(gen_req)
+
+    # "both" scope: the parent pin is preserved on the gen request too.
+    assert gen_req.conversation_params.subagent_affinity_id == "parent"
+
+
+def test_subagent_affinity_id_excluded_from_wire():
+    # The whole rolling-deploy guarantee: subagent_affinity_id is server-private
+    # and must never cross the wire in the body (an old worker's extra="forbid"
+    # schema would reject an unknown field). It is forwarded as a header instead.
+    params = ConversationParams(conversation_id="child", subagent_affinity_id="parent")
+    dumped = params.model_dump(mode="json", exclude_unset=True)
+    assert "subagent_affinity_id" not in dumped
+    assert dumped["conversation_id"] == "child"
+
+    # Same at the request level, matching OpenAIClient's wire encoding.
+    request = CompletionRequest(model="m", prompt="hi", conversation_params=params)
+    wire = request.model_dump(mode="json", exclude_unset=True)
+    assert "subagent_affinity_id" not in wire["conversation_params"]
+
+
 @pytest.mark.asyncio
 async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
     from tensorrt_llm.serve.openai_server import OpenAIServer
