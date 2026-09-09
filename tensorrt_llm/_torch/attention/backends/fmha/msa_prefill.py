@@ -25,7 +25,7 @@ from ..sparse.minimax_m3_kernels.msa_utils import (
     is_msa_layer,
     msa_paged_kv,
     require_msa_module,
-    write_msa_step_kv,
+    write_msa_phase_kv,
 )
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
@@ -214,19 +214,16 @@ class MsaPrefillFmha(PhasedFmha):
         # alone: a mixed step belongs to the two together through CombinedFmha.
         return phase is FmhaPhase.CONTEXT
 
-    def prepare_workspace(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: "TrtllmAttentionMetadata",
-        forward_args: "AttentionForwardArgs",
-        workspace: torch.Tensor,
-    ) -> None:
-        write_msa_step_kv(self.attn, k, v, metadata, forward_args.attention_input_type)
-
     def run_context(self, params: FmhaParams) -> None:
         metadata = params.meta
+        write_msa_phase_kv(
+            params.attn,
+            params.key_input,
+            params.value_input,
+            metadata,
+            params.fwd.attention_input_type,
+            token_offset=params.token_offset,
+        )
         # Sparse layers attend the per-query top-k blocks with the sparse plan;
         # dense layers leave the indices None and attend the full page table
         # with the dense plan.

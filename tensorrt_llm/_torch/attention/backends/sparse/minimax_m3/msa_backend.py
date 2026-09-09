@@ -189,10 +189,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        # A plain instance attribute rather than a dataclass field: this class
-        # is init=False, so a field's default_factory would never run and the
-        # attribute would not exist. See msa_mark_kv_written for what it holds.
-        self._msa_kv_written_layers: set[int] = set()
         params = self.sparse_metadata_params
         self._msa_params = params if isinstance(params, MiniMaxM3SparseMetadataParams) else None
         self._create_msa_buffers()
@@ -309,20 +305,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if table is None:
             return None, 0
         return table[row_first:row_last], self._msa_subpages_per_slot
-
-    def msa_mark_kv_written(self, layer_idx: int) -> bool:
-        """Claim this step's main K/V cache write for one layer, once.
-
-        A mixed batch runs the layer's context and generation phases as two
-        FMHA calls, each of which reaches prepare_workspace, so the first
-        caller claims the write and the second gets False. The claims are
-        cleared in prepare(), so a captured graph carries exactly the one write
-        the capture admitted.
-        """
-        if layer_idx in self._msa_kv_written_layers:
-            return False
-        self._msa_kv_written_layers.add(layer_idx)
-        return True
 
     def _msa_main_kv_is_fp8(self) -> bool:
         """Whether the main paged K/V cache is stored as FP8 E4M3.
@@ -538,7 +520,6 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
-        self._msa_kv_written_layers.clear()
         self._check_beam_width()
         # Everything below reads these.
         self._stage_host_lengths()

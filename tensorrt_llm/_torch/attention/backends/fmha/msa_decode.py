@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from ..sparse.minimax_m3_kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_step_kv
+from ..sparse.minimax_m3_kernels.msa_utils import is_msa_layer, msa_paged_kv, write_msa_phase_kv
 from ..sparse.minimax_m3_kernels.trtllm_gen_dense_decode import (
     minimax_m3_trtllm_gen_dense_decode,
     reserve_dense_decode_workspace,
@@ -83,7 +83,6 @@ class MsaDecodeFmha(PhasedFmha):
         forward_args: "AttentionForwardArgs",
         workspace: torch.Tensor,
     ) -> None:
-        write_msa_step_kv(self.attn, k, v, metadata, forward_args.attention_input_type)
         if forward_args.sparse_runtime_params.sparse_attn_indices is not None:
             # A sparse layer; the Triton kernel takes its split-K scratch from
             # the arena itself, sized by the grid it just chose.
@@ -144,6 +143,14 @@ class MsaDecodeFmha(PhasedFmha):
                 f"row {params.seq_offset} with {params.input_seq_length} query "
                 "tokens per request."
             )
+        write_msa_phase_kv(
+            params.attn,
+            params.key_input,
+            params.value_input,
+            metadata,
+            params.fwd.attention_input_type,
+            token_offset=params.token_offset,
+        )
         row_first = params.seq_offset
         row_last = row_first + metadata.num_generations
         block_table = metadata.msa_block_table[row_first:row_last]

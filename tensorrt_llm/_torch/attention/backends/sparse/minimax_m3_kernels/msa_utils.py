@@ -123,20 +123,24 @@ def write_msa_main_kv(
     )
 
 
-def write_msa_step_kv(
+def write_msa_phase_kv(
     attn,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
     metadata,
     attention_input_type,
+    *,
+    token_offset: int,
 ) -> None:
-    """Write this step's new-token main K/V for one layer, at most once.
+    """Write one phase's new-token main K/V for one layer.
 
-    Both the decode kernels and fmha_sm100 read the paged cache directly, so
-    the new-token K/V has to be resident before either runs. The write covers
-    every token of the step, so it belongs to the layer rather than to a phase
-    of it, and both FMHA libraries call it; msa_mark_kv_written keeps a mixed
-    batch's second phase from repeating it.
+    The decode kernels and fmha_sm100 read the paged cache directly, so a
+    phase's new-token K/V has to be resident before its kernel runs. Each FMHA
+    library writes the rows it is about to attend, so a mixed batch's two
+    phases cover the step between them and neither repeats the other's write.
+
+    k and v are the phase's token slice, and token_offset its first token on
+    the step's token axis, which is what msa_out_cache_loc is indexed by.
     """
     if attention_input_type != AttentionInputType.mixed:
         raise NotImplementedError(
@@ -146,12 +150,13 @@ def write_msa_step_kv(
         )
     if k is None or v is None:
         return
-    if not metadata.msa_mark_kv_written(attn.layer_idx):
+    num_tokens = int(k.shape[0])
+    if num_tokens == 0:
         return
     write_msa_main_kv(
         metadata.kv_cache_manager,
         attn.layer_idx,
-        metadata.msa_out_cache_loc[: int(k.shape[0])],
+        metadata.msa_out_cache_loc[token_offset : token_offset + num_tokens],
         k,
         v,
     )
@@ -265,5 +270,5 @@ __all__ = [
     "require_msa_module",
     "select_blocks_from_maxscore",
     "write_msa_main_kv",
-    "write_msa_step_kv",
+    "write_msa_phase_kv",
 ]

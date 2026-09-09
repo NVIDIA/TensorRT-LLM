@@ -1071,20 +1071,27 @@ def _phase_libraries():
     return attention, libraries
 
 
-def _generation_params(attention, metadata, *, seq_offset, input_seq_length):
+def _generation_params(
+    attention, metadata, *, seq_offset, input_seq_length, token_offset=0, key_input=None
+):
     """Phase params as PhasedFmha.forward builds them for a generation phase."""
     from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 
     params = FmhaParams(
         attn=attention,
         meta=metadata,
         fwd=SimpleNamespace(
             sparse_runtime_params=SimpleNamespace(sparse_attn_indices=None),
+            attention_input_type=AttentionInputType.mixed,
         ),
         workspace=torch.zeros(1),
     )
     params.seq_offset = seq_offset
     params.input_seq_length = input_seq_length
+    params.token_offset = token_offset
+    params.key_input = key_input
+    params.value_input = key_input
     return params
 
 
@@ -1109,6 +1116,41 @@ def test_decode_fmha_runs_the_phase_its_span_describes():
     # The span's rows, not the whole batch: a dense layer attends the page
     # table of the generation requests alone.
     assert dispatched == [(2, 2)]
+
+
+def test_each_phase_writes_the_cache_slots_of_the_rows_it_attends():
+    """A mixed step's cache write is split with its phases, not repeated.
+
+    A phase that wrote from the head of msa_out_cache_loc instead of its own
+    token offset would land the generation rows' K/V in the context rows'
+    slots.
+    """
+    from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3_kernels.msa_utils import (
+        write_msa_phase_kv,
+    )
+
+    page_size, num_kv_heads, head_dim = 8, 1, 4
+    buffers = torch.zeros(2, 2, num_kv_heads, page_size, head_dim)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_buffers=lambda layer_idx, kv_layout=None: buffers),
+        msa_out_cache_loc=torch.tensor([1, 2, page_size + 3], dtype=torch.int32),
+    )
+    attention = SimpleNamespace(layer_idx=0)
+    k = torch.arange(1, 3 * head_dim + 1, dtype=torch.float32).reshape(3, head_dim)
+    v = -k
+
+    # Two context tokens, then the one-token generation row behind them.
+    write_msa_phase_kv(attention, k[:2], v[:2], metadata, AttentionInputType.mixed, token_offset=0)
+    write_msa_phase_kv(attention, k[2:], v[2:], metadata, AttentionInputType.mixed, token_offset=2)
+
+    k_cache, v_cache = buffers[:, 0], buffers[:, 1]
+    torch.testing.assert_close(k_cache[0, 0, 1], k[0])
+    torch.testing.assert_close(k_cache[0, 0, 2], k[1])
+    torch.testing.assert_close(k_cache[1, 0, 3], k[2])
+    torch.testing.assert_close(v_cache[1, 0, 3], v[2])
+    # Only the three named slots were touched.
+    assert int((k_cache != 0).sum()) == 3 * head_dim
 
 
 @pytest.mark.parametrize(
