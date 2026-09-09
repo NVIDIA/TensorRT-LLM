@@ -142,8 +142,8 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
         tllmRunnerParams.mBatchSize = 1;
         tllmRunnerParams.mMaxSeqLenQ = 1;
-        // Use a representative sequence long enough that the smallest valid
-        // sliding windows below are not normalized to Causal or Dense.
+        // isSupported() uses synthetic dimensions. A KV length of 4 keeps the minimal (0, 0) and (1, 1)
+        // window probes distinct from Causal and Dense.
         tllmRunnerParams.mMaxSeqLenKv = 4;
         tllmRunnerParams.mMaxSeqLenCacheKv = 4;
         tllmRunnerParams.mSumOfSeqLensQ = 1;
