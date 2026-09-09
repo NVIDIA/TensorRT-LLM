@@ -31,6 +31,8 @@ from defs.model_express.mx_harness import (
     assert_weight_manifests,
     build_canonical_snapshot,
     build_metadata_only_snapshot,
+    collect_available_manifests,
+    collect_available_payloads,
     collect_weight_manifests,
     donor_session,
     load_payload,
@@ -136,8 +138,10 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     Three checks stack up: exact greedy token equality across the roles (the
     behavioral probe), the receiver's per-rank RDMA completion records proving
     its bytes arrived through P2P, and byte-exact weight manifests at the
-    transfer boundary and after finalization. Artifacts are archived under `output_dir`
-    when pytest runs with `--output-dir` (always in CI), including on failure.
+    transfer boundary and after finalization. The timing report and the
+    artifact archive are produced from the cleanup path, so `timing.json` and
+    everything under `output_dir` (when pytest runs with `--output-dir`, always
+    in CI) survive a failure with whatever the finished roles produced.
     """
     required_gpus = case.tp_size * 2
     mx_url, gpu_ids = require_mx_environment(required_gpus)
@@ -229,6 +233,13 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
         assert_transfer_evidence(case, layout.log("receiver"))
         manifests = collect_weight_manifests(layout.manifest_dir, case)
         assert_weight_manifests(case, manifests)
-        report_timings(case, payloads, manifests, layout)
     finally:
+        # Best-effort timing first so `timing.json` exists even after a worker
+        # or assertion failure; then archive everything the run left behind.
+        report_timings(
+            case,
+            collect_available_payloads(layout),
+            collect_available_manifests(layout.manifest_dir),
+            layout,
+        )
         archive_run_artifacts(output_dir, request.node.callspec.id, layout)

@@ -226,6 +226,9 @@ class WeightManifestDiff:
 
     `exempted_digest_diffs` records digest differences on tensors that matched an
     exemption pattern; they are informational and do not make the diff non-empty.
+    Skipped tensors are compared as complete records: `skipped_only_in_*` hold
+    the `SkippedTensor` records present on one side only, and `skipped_diffs`
+    pairs records that share a name but differ in kind, reason, dtype, or shape.
     """
 
     missing_in_actual: tuple[str, ...] = ()
@@ -233,8 +236,9 @@ class WeightManifestDiff:
     metadata_diffs: tuple[tuple[str, str, Any, Any], ...] = ()
     digest_diffs: tuple[str, ...] = ()
     exempted_digest_diffs: tuple[str, ...] = ()
-    skipped_only_in_expected: tuple[tuple[str, str], ...] = ()
-    skipped_only_in_actual: tuple[tuple[str, str], ...] = ()
+    skipped_only_in_expected: tuple[SkippedTensor, ...] = ()
+    skipped_only_in_actual: tuple[SkippedTensor, ...] = ()
+    skipped_diffs: tuple[tuple[SkippedTensor, SkippedTensor], ...] = ()
     alias_groups_only_in_expected: tuple[tuple[str, ...], ...] = ()
     alias_groups_only_in_actual: tuple[tuple[str, ...], ...] = ()
     expected_context: dict[str, Any] = field(default_factory=dict)
@@ -251,6 +255,7 @@ class WeightManifestDiff:
             or self.digest_diffs
             or self.skipped_only_in_expected
             or self.skipped_only_in_actual
+            or self.skipped_diffs
             or self.alias_groups_only_in_expected
             or self.alias_groups_only_in_actual
         )
@@ -295,6 +300,7 @@ class WeightManifestDiff:
             f"exempted-digest={len(self.exempted_digest_diffs)}, "
             f"skipped-only-in-expected={len(self.skipped_only_in_expected)}, "
             f"skipped-only-in-actual={len(self.skipped_only_in_actual)}, "
+            f"skipped-differs={len(self.skipped_diffs)}, "
             f"alias-groups-only-in-expected={len(self.alias_groups_only_in_expected)}, "
             f"alias-groups-only-in-actual={len(self.alias_groups_only_in_actual)}",
         ]
@@ -317,15 +323,27 @@ class WeightManifestDiff:
         )
         section("digest differs", self.digest_diffs, entry_line)
         section("digest differs (exempted)", self.exempted_digest_diffs, entry_line)
+
+        def skipped_summary(item: SkippedTensor) -> str:
+            return f"{item.kind} {item.reason} {item.dtype} {list(item.shape)}"
+
         section(
             "skipped only in expected",
             self.skipped_only_in_expected,
-            lambda item: f"  {item[0]} ({item[1]})",
+            lambda item: f"  {item.fqn} ({skipped_summary(item)})",
         )
         section(
             "skipped only in actual",
             self.skipped_only_in_actual,
-            lambda item: f"  {item[0]} ({item[1]})",
+            lambda item: f"  {item.fqn} ({skipped_summary(item)})",
+        )
+        section(
+            "skipped records differ",
+            self.skipped_diffs,
+            lambda pair: (
+                f"  {pair[0].fqn} expected=({skipped_summary(pair[0])}) "
+                f"actual=({skipped_summary(pair[1])})"
+            ),
         )
         section(
             "alias groups only in expected",
@@ -538,7 +556,10 @@ def compare_weight_manifests(
     Manifests with different `manifest_format_version` never compare (raises
     `ValueError`). `exempt_patterns` are `fnmatch` patterns on fully-qualified
     names whose *digest* differences are reported separately and do not make the
-    diff non-empty; metadata differences are never exempted.
+    diff non-empty; metadata differences are never exempted. Skipped tensors
+    are compared as complete records (name, kind, reason, dtype, shape), so two
+    roles that skip the same name for the same reason still differ when they
+    disagree on what the tensor is.
     """
     if expected.manifest_format_version != actual.manifest_format_version:
         raise ValueError(
@@ -555,8 +576,8 @@ def compare_weight_manifests(
 
     expected_entries = expected.entries_by_fqn(kinds)
     actual_entries = actual.entries_by_fqn(kinds)
-    expected_skipped = {(item.fqn, item.reason) for item in expected.skipped if item.kind in kinds}
-    actual_skipped = {(item.fqn, item.reason) for item in actual.skipped if item.kind in kinds}
+    expected_skipped = {item.fqn: item for item in expected.skipped if item.kind in kinds}
+    actual_skipped = {item.fqn: item for item in actual.skipped if item.kind in kinds}
     expected_alias = _alias_partition(expected, expected_entries.keys())
     actual_alias = _alias_partition(actual, actual_entries.keys())
 
@@ -605,8 +626,17 @@ def compare_weight_manifests(
         metadata_diffs=tuple(metadata_diffs),
         digest_diffs=tuple(digest_diffs),
         exempted_digest_diffs=tuple(exempted_digest_diffs),
-        skipped_only_in_expected=tuple(sorted(expected_skipped - actual_skipped)),
-        skipped_only_in_actual=tuple(sorted(actual_skipped - expected_skipped)),
+        skipped_only_in_expected=tuple(
+            expected_skipped[fqn] for fqn in sorted(expected_skipped.keys() - actual_skipped.keys())
+        ),
+        skipped_only_in_actual=tuple(
+            actual_skipped[fqn] for fqn in sorted(actual_skipped.keys() - expected_skipped.keys())
+        ),
+        skipped_diffs=tuple(
+            (expected_skipped[fqn], actual_skipped[fqn])
+            for fqn in sorted(expected_skipped.keys() & actual_skipped.keys())
+            if expected_skipped[fqn] != actual_skipped[fqn]
+        ),
         alias_groups_only_in_expected=tuple(
             sorted(tuple(sorted(group)) for group in expected_alias - actual_alias)
         ),
