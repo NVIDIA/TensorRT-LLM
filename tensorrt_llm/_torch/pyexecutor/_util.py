@@ -3118,19 +3118,7 @@ def should_enable_disagg_adp_overlap_headroom(
         mapping: Mapping,
         cache_transceiver_config: Optional[CacheTransceiverConfig],
         disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to non-PP attention DP.
-
-    The overlap scheduler defers a finished request's teardown by one iteration,
-    so its sequence slot is still held when the ADP router admits the batch that
-    replaces it. Without spare slots the router cannot backfill and the forward
-    batch runs short (nvbug 6627795). Disaggregation needs the same headroom even
-    with overlap off, because a request awaiting its KV transfer keeps its lease.
-
-    Pipeline parallelism is excluded: admission is capped independently at
-    ``pp_size * max_batch_size``, so the extra seats are unspendable, and
-    ADPRouter's retiring-request correction would additionally require every
-    pipeline stage to agree on which requests are retiring.
-    """
+    """Gate extra sequence slots to non-PP attention DP."""
     is_disagg = is_disagg_enabled(cache_transceiver_config)
     return (mapping.enable_attention_dp and not mapping.has_pp()
             and (is_disagg or not disable_overlap_scheduler))

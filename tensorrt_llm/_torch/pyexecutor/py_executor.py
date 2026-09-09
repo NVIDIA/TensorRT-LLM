@@ -690,10 +690,6 @@ class PyExecutor:
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
-        #
-        # The router's overlap correction spends sequence-slot headroom, so it is
-        # handed the engine's headroom flag rather than re-deriving the predicate:
-        # that flag is what sized the seat pool the correction spends.
         self.adp_router: ADPRouter = ADPRouter.create(
             dist=self.dist,
             has_seq_slot_headroom=getattr(
@@ -5801,13 +5797,7 @@ class PyExecutor:
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
-        """Fetch requests from request_queue and enqueue to waiting_queue.
-
-        `total_num_live_requests` counts every request still resident on any
-        rank, including the retiring ones that `num_active_requests` excludes:
-        the idle decision below selects a blocking versus a zero timeout and must
-        be identical on every rank.
-        """
+        """Fetch requests from request_queue and enqueue to waiting_queue."""
         # Block new requests while control requests are pending
         if len(self.control_requests) != 0:
             return
@@ -6025,9 +6015,6 @@ class PyExecutor:
                 s.num_active_requests for s in all_rank_states
             ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
-            # Retiring requests are excluded from num_active_requests but are
-            # still resident, so fold them back in for the liveness test only
-            # (nvbug 6627795).
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -7242,10 +7229,6 @@ class PyExecutor:
             return
 
         expected_num_active_requests = self.expected_num_active_requests
-        # Compare against the same routable count the router balanced on:
-        # gather_all_rank_states excludes retiring requests from the per-rank
-        # loads that floor `expected` (nvbug 6627795), so measuring against the
-        # raw len() here would make the warning below fire every iteration.
         num_routable_active_requests = len(self.active_requests)
         if self.adp_router.exclude_retiring_requests:
             num_routable_active_requests -= count_retiring_requests(
