@@ -231,6 +231,9 @@ class BaseResourceManager(ABC):
     def add_dummy_requests(self, request_ids: List[int]):
         pass
 
+    def pick_locality_domain(self, request_id: int) -> int | None:
+        return None
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
