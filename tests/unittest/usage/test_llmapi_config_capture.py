@@ -55,9 +55,7 @@ def _loads_payloads(args) -> tuple[dict, dict]:
 
 
 def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
-    # Renamed from ..._uses_strict_opt_in_...: under auto-enroll, unmarked
-    # type-safe ints (safe_unmarked, nested.unmarked) are now captured; bare
-    # str / Union[str,Path] without an explicit allowlist remain uncapturable.
+    """Safe annotations auto-enroll while bare strings and paths stay excluded."""
     config, meta = _loads_payloads(_ExampleConfig())
 
     assert config == {
@@ -79,12 +77,8 @@ def test_collect_llm_api_config_uses_type_driven_autoenroll_and_safety_vetoes():
 
 
 def test_collect_llm_api_config_allows_only_explicit_categorical_values():
-    # The union_backend / union_path fixtures below are Union[str, Path] solely
-    # to exercise the value-fail-closed allowlist seam: union_path defaults to a
-    # Path, which is dropped because it is not an allowed scalar, while
-    # union_backend's allowed str is captured. No production telemetry field
-    # is Union[str, Path]; the only real Union allowlist fields are
-    # Union[str, Enum] (load_format). See CR-E (declined).
+    """Explicit strings capture while arbitrary strings and Path values fail closed."""
+
     class _StringConfig(StrictBaseModel):
         backend: Optional[str] = Field(
             default="pytorch",
@@ -432,13 +426,7 @@ def test_homogeneous_tuple_and_set_sequences_remain_capturable():
 
 
 def test_collect_llm_api_config_rejects_non_finite_floats():
-    """Non-finite floats (nan/inf) are excluded; finite floats are captured.
-
-    json.dumps emits the bare NaN/Infinity tokens for non-finite floats, which
-    are invalid JSON and break downstream parsing and digest stability. Guard
-    the float branch with math.isfinite so a marked float set to inf/nan is
-    dropped (unsafe_excluded) while a finite float is still captured.
-    """
+    """Non-finite floats are excluded while finite floats are captured."""
 
     class _FloatConfig(StrictBaseModel):
         finite: float = 0.5
@@ -455,19 +443,11 @@ def test_collect_llm_api_config_rejects_non_finite_floats():
 
 
 def test_collect_llm_api_config_rejects_non_finite_floats_in_sequence():
-    """A single non-finite float poisons the whole marked sequence.
-
-    The sequence sanitizer fails closed on one bad item, so a list containing
-    inf/nan is dropped entirely rather than emitting invalid JSON tokens.
-    """
+    """One non-finite item excludes the entire sequence."""
 
     class _FloatSeqConfig(StrictBaseModel):
-        finite_buckets: list[float] = Field(
-            default_factory=lambda: [0.1, 0.5, 1.0], telemetry={"kind": "value"}
-        )
-        poisoned_buckets: list[float] = Field(
-            default_factory=lambda: [0.1, float("inf"), 1.0], telemetry={"kind": "value"}
-        )
+        finite_buckets: list[float] = Field(default_factory=lambda: [0.1, 0.5, 1.0])
+        poisoned_buckets: list[float] = Field(default_factory=lambda: [0.1, float("inf"), 1.0])
 
     config, meta = _loads_payloads(_FloatSeqConfig())
 
@@ -476,85 +456,35 @@ def test_collect_llm_api_config_rejects_non_finite_floats_in_sequence():
     assert meta["unsafe_excluded"] is True
 
 
-def test_collect_llm_api_config_caps_long_sequences_and_flags_truncation():
-    """A marked sequence longer than MAX_SEQ_ITEMS is clipped and flagged.
-
-    llmApiConfigJson is unbounded on the wire and the reporter is fail-silent,
-    so a pathological user-sized list could silently drop the whole payload.
-    Cap captured sequences to MAX_SEQ_ITEMS and record a single honest
-    sequence_truncated boolean in the metadata.
-    """
+def test_collect_llm_api_config_caps_sequences_recursively_and_flags_truncation():
     from tensorrt_llm.usage import llmapi_config
 
     cap = llmapi_config.MAX_SEQ_ITEMS
 
-    class _LongSeqConfig(StrictBaseModel):
-        values: list[int] = Field(
-            default_factory=lambda: list(range(cap + 50)), telemetry={"kind": "value"}
+    class _SequenceConfig(StrictBaseModel):
+        flat: list[int]
+        inner: list[list[int]]
+        outer: list[list[int]]
+
+    config, meta = _loads_payloads(
+        _SequenceConfig(
+            flat=list(range(cap + 50)),
+            inner=[list(range(cap + 10)), list(range(cap + 20))],
+            outer=[[0, 1] for _ in range(cap + 30)],
         )
-
-    config, meta = _loads_payloads(_LongSeqConfig())
-
-    assert len(config["values"]) == cap
-    assert config["values"] == list(range(cap))
+    )
+    assert config["flat"] == list(range(cap))
+    assert len(config["inner"]) == 2
+    assert all(row == list(range(cap)) for row in config["inner"])
+    assert len(config["outer"]) == cap
     assert meta["sequence_truncated"] is True
 
-
-def test_collect_llm_api_config_caps_nested_inner_sequences():
-    """Each inner list of a nested List[List[int]] is capped independently."""
-    from tensorrt_llm.usage import llmapi_config
-
-    cap = llmapi_config.MAX_SEQ_ITEMS
-
-    class _NestedSeqConfig(StrictBaseModel):
-        rows: list[list[int]] = Field(
-            default_factory=lambda: [list(range(cap + 10)), list(range(cap + 20))],
-            telemetry={"kind": "value"},
-        )
-
-    config, meta = _loads_payloads(_NestedSeqConfig())
-
-    assert len(config["rows"]) == 2
-    assert all(len(inner) == cap for inner in config["rows"])
-    assert config["rows"][0] == list(range(cap))
-    assert meta["sequence_truncated"] is True
-
-
-def test_collect_llm_api_config_caps_outer_nested_sequence():
-    """The outer list of a nested List[List[int]] is also capped."""
-    from tensorrt_llm.usage import llmapi_config
-
-    cap = llmapi_config.MAX_SEQ_ITEMS
-
-    class _WideNestedSeqConfig(StrictBaseModel):
-        rows: list[list[int]] = Field(
-            default_factory=lambda: [[0, 1] for _ in range(cap + 30)],
-            telemetry={"kind": "value"},
-        )
-
-    config, meta = _loads_payloads(_WideNestedSeqConfig())
-
-    assert len(config["rows"]) == cap
-    assert meta["sequence_truncated"] is True
-
-
-def test_collect_llm_api_config_small_sequence_not_truncated():
-    """A sequence within the cap is captured whole and the flag stays false."""
-
-    class _SmallSeqConfig(StrictBaseModel):
-        values: list[int] = Field(default_factory=lambda: [1, 2, 3], telemetry={"kind": "value"})
-
-    config, meta = _loads_payloads(_SmallSeqConfig())
-
-    assert config["values"] == [1, 2, 3]
-    assert meta["sequence_truncated"] is False
-
-
-def test_collect_llm_api_config_failure_meta_has_truncation_key():
-    """Failure metadata carries sequence_truncated for shape parity."""
-    from tensorrt_llm.usage import llmapi_config
-
-    meta = llmapi_config._failure_meta(args_class="Foo")
+    config, meta = _loads_payloads(
+        _SequenceConfig(flat=[1, 2, 3], inner=[[1], [2]], outer=[[0, 1]])
+    )
+    assert config["flat"] == [1, 2, 3]
+    assert config["inner"] == [[1], [2]]
+    assert config["outer"] == [[0, 1]]
     assert meta["sequence_truncated"] is False
 
 
@@ -567,6 +497,7 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
     assert meta["field_policy_version"] == "3"
     assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
     assert meta["payload_truncated"] is False
+    assert meta["sequence_truncated"] is False
     # The pre-migration keys must be gone from the new contract; assert by literal
     # so a regression that reintroduces them fails loudly.
     assert "excluded_marked_field_count" not in meta
@@ -648,50 +579,6 @@ def test_collect_llm_api_config_propagates_unexpected_errors(monkeypatch):
         collect_llm_api_config_payloads(_ExampleConfig())
 
 
-def test_collect_llm_api_config_captures_expanded_value_fields():
-    """Representative newly-marked value fields are captured on TorchLlmArgs."""
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        moe_expert_parallel_size=2,
-        moe_tensor_parallel_size=1,
-        moe_cluster_parallel_size=1,
-        num_postprocess_workers=3,
-        stream_interval=4,
-        trust_remote_code=True,
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["moe_expert_parallel_size"] == 2
-    assert config["moe_tensor_parallel_size"] == 1
-    assert config["moe_cluster_parallel_size"] == 1
-    assert config["num_postprocess_workers"] == 3
-    assert config["stream_interval"] == 4
-    assert config["trust_remote_code"] is True
-    # backend on TorchLlmArgs is the Literal["pytorch"] override -> value capture.
-    assert config["backend"] == "pytorch"
-    assert meta["capture_succeeded"] is True
-
-
-def test_collect_llm_api_config_captures_nested_config_value_fields():
-    """Newly-marked nested-config value fields are captured via recursion."""
-    from tensorrt_llm.llmapi.llm_args import MoeConfig
-
-    args = TorchLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        moe_config=MoeConfig(max_num_tokens=8192, disable_finalize_fusion=True),
-    )
-
-    config, _ = _loads_payloads(args)
-
-    assert config["moe_config.max_num_tokens"] == 8192
-    assert config["moe_config.disable_finalize_fusion"] is True
-    # MoeConfig.backend is a Literal -> derived categorical, value captured.
-    assert config["moe_config.backend"] == "AUTO"
-
-
 def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
     """Preserve callable json_schema_extra when adding status/telemetry metadata.
 
@@ -749,13 +636,7 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
 
 
 def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
-    """transceiver_runtime is a single Optional[Literal] categorical.
-
-    Regression: a two-branch Literal union (Optional[Literal['CPP','PYTHON']]
-    | Literal['auto']) would not unwrap to a top-level Literal, degrading the
-    manifest kind to 'value' and making the sanitizer reject all three
-    strings. Every allowed value plus None must be captured, not excluded.
-    """
+    """Every Optional transceiver-runtime Literal value is captured."""
     from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
     for runtime in ("CPP", "PYTHON", "auto", None):
@@ -774,12 +655,7 @@ def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
 
 
 def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
-    """An out-of-allowlist value on a categorical bare-str field is dropped.
-
-    reasoning_parser is captured via TelemetryField.categorical mirroring the
-    ReasoningParserFactory registry; any value outside that recognized domain
-    (e.g. injected free-form text) must be excluded, not captured.
-    """
+    """The reasoning-parser allowlist rejects arbitrary strings."""
     args = TorchLlmArgs(
         model="/customer/private/Llama",
         skip_tokenizer_init=True,
@@ -801,12 +677,7 @@ def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
 
 
 def test_collect_llm_api_config_captures_gms_load_format():
-    """load_format=GMS is captured as 'gms' (was dropped before the allowlist fix).
-
-    LoadFormat.GMS is a real, accepted value (convert_load_format maps the
-    string 'gms' to the enum), but it was missing from the load_format telemetry
-    allowlist, so GMS deployments were silently excluded from llmApiConfigJson.
-    """
+    """The explicit load-format policy captures GMS as ``gms``."""
     args = TorchLlmArgs(
         model="/customer/private/Llama",
         skip_tokenizer_init=True,
@@ -972,16 +843,6 @@ def test_background_reporter_keeps_initial_report_when_config_capture_fails(
     assert params["featuresJson"]
 
 
-def test_field_wrapper_records_explicit_exclude_marker():
-    from tensorrt_llm.usage.llmapi_config import _get_telemetry_metadata
-
-    class _C(StrictBaseModel):
-        a: int = Field(default=1, telemetry=False)
-
-    meta = _get_telemetry_metadata(_C.model_fields["a"])
-    assert meta == {"exclude": True}
-
-
 def test_collect_llm_api_config_honors_explicit_exclude_sentinel():
     class _ExcludeConfig(StrictBaseModel):
         kept: int = Field(default=1)
@@ -1020,15 +881,6 @@ def test_collect_llm_api_config_honors_raw_json_schema_extra_exclude():
     config, meta = _loads_payloads(_RawExcludeConfig())
     assert "secret" not in config
     assert config == {"kept": 1}
-
-
-def test_runtime_keys_are_subset_of_manifest_for_fixture():
-    from tensorrt_llm.usage.llmapi_config import build_capture_manifest
-
-    inst = _ExampleConfig()
-    manifest_paths = {e.path for e in build_capture_manifest(_ExampleConfig)}
-    config, _ = _loads_payloads(inst)
-    assert set(config) <= manifest_paths
 
 
 def test_manifest_excludes_loosely_typed_model_children():

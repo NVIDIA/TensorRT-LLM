@@ -120,13 +120,7 @@ class TestFieldTelemetryMetadata:
     """Verify llm_args.Field telemetry metadata handling."""
 
     def test_telemetry_false_records_exclude_marker(self):
-        """Field(telemetry=False) records an honored exclude sentinel.
-
-        Under type-driven auto-enroll, telemetry=False is no longer a no-op: it
-        is the explicit opt-out for a type-safe-but-sensitive field, recorded as
-        json_schema_extra['telemetry'] = {"exclude": True} and honored by
-        build_capture_manifest's selection rule.
-        """
+        """Field(telemetry=False) records the explicit exclude sentinel."""
         from tensorrt_llm.llmapi import llm_args
 
         field = llm_args.Field(default=0, telemetry=False)
