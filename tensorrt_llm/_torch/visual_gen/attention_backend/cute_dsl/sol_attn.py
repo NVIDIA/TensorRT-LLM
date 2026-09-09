@@ -48,6 +48,7 @@ from typing import Any, Optional
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
 from tensorrt_llm.logger import logger
 
 from ..interface import AttentionBackend, AttentionTensorLayout
@@ -60,38 +61,6 @@ try:
 except (ImportError, OSError) as e:
     _sol_attn_run = None
     _sol_attn_import_error = e
-
-
-def _as_float(timestep: Any) -> Optional[float]:
-    """Coerce a scalar/0-d/1-element timestep to float, else None."""
-    if timestep is None:
-        return None
-    if isinstance(timestep, torch.Tensor):
-        if timestep.numel() == 0:
-            return None
-        return float(timestep.reshape(-1)[0].item())
-    try:
-        return float(timestep)
-    except (TypeError, ValueError):
-        return None
-
-
-def sol_attn_graph_phase(
-    timestep: Any, *, disabled_until_timestep: Optional[float]
-) -> Optional[int]:
-    """Return 1 once descending timesteps cross the cutoff, 0 before, else None.
-
-    Same contract and sense as
-    ``SkipSoftmaxScheduler.get_graph_phase_for_timestep``: phase 0 is the dense
-    prefix, phase 1 the sparse phase, and ``None`` means there is no phase to
-    distinguish so the CUDA-graph runner omits the key part.
-    """
-    if disabled_until_timestep is None:
-        return None
-    value = _as_float(timestep)
-    if value is None:
-        return None
-    return int(value < disabled_until_timestep)
 
 
 def _cute_dense_available() -> bool:
@@ -208,7 +177,7 @@ class SolAttention(AttentionBackend):
     # phases still compile as separate graphs -- they run different kernels.
     @torch.compiler.disable
     def _dense_by_step(self, timestep: Any) -> bool:
-        phase = sol_attn_graph_phase(
+        phase = SkipSoftmaxScheduler.get_graph_phase_for_timestep(
             timestep,
             disabled_until_timestep=self.disabled_until_timestep,
         )

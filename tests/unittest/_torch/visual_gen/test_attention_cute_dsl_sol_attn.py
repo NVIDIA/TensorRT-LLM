@@ -27,11 +27,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxScheduler
 from tensorrt_llm._torch.visual_gen.attention_backend import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn import (
     SolAttention,
     _parse_dense_layers,
-    sol_attn_graph_phase,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.config import (
@@ -220,17 +220,32 @@ def test_graph_phase_matches_skip_softmax_sense(timestep, expected):
 
     Same contract as SkipSoftmaxScheduler.get_graph_phase_for_timestep.
     """
-    assert sol_attn_graph_phase(timestep, disabled_until_timestep=0.9545) == expected
+    assert (
+        SkipSoftmaxScheduler.get_graph_phase_for_timestep(timestep, disabled_until_timestep=0.9545)
+        == expected
+    )
 
 
 def test_graph_phase_none_when_prefix_unset():
-    assert sol_attn_graph_phase(0.5, disabled_until_timestep=None) is None
+    assert (
+        SkipSoftmaxScheduler.get_graph_phase_for_timestep(0.5, disabled_until_timestep=None) is None
+    )
 
 
 def test_graph_phase_accepts_tensor_timestep():
     """Pipelines pass a tensor; a 0-d or 1-element tensor must work."""
-    assert sol_attn_graph_phase(torch.tensor(0.99), disabled_until_timestep=0.95) == 0
-    assert sol_attn_graph_phase(torch.tensor([0.10]), disabled_until_timestep=0.95) == 1
+    assert (
+        SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+            torch.tensor(0.99), disabled_until_timestep=0.95
+        )
+        == 0
+    )
+    assert (
+        SkipSoftmaxScheduler.get_graph_phase_for_timestep(
+            torch.tensor([0.10]), disabled_until_timestep=0.95
+        )
+        == 1
+    )
 
 
 def test_dense_prefix_skips_kernel(monkeypatch):
@@ -626,6 +641,12 @@ def test_dense_paths_use_cutedsl_backend(monkeypatch):
     `q.is_cuda` is false, so they exercise the wrong branch by construction.
     """
     import tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.sol_attn as sol_attn_mod
+
+    if not sol_attn_mod._cute_dense_available():
+        # A CUDA device is not enough: the premise here is that the dense paths
+        # reach `cute_dsl_fmha_fwd`, which only exists on sm100/sm103. Without
+        # this the test fails rather than skips on any other CUDA runner.
+        pytest.skip("no CuTe DSL dense kernel for this device")
 
     device = torch.device("cuda")
     q = k = v = torch.randn(1, 64, 2, 128, device=device, dtype=torch.bfloat16)
