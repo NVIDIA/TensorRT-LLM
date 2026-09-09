@@ -2557,6 +2557,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return full_view[:, 0]
 
     @property
+    def fork_join_attn(self) -> bool:
+        """Whether attention runs as a per-locality-domain fork-join."""
+        return self._fork_join_attn
+
+    @property
     def num_locality_domains(self) -> int:
         """Number of locality domains. Returns 1 for non-localized configurations."""
         return getattr(self.impl, "num_locality_domains", 1)
