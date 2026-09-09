@@ -29,18 +29,21 @@ from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForw
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import backend as vsa_backend
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import kernels as vsa_kernels
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa import predictor as vsa_predictor
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.backend import (
     VSACuTeDSLAttention,
     VSATrtllmAttention,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.kernels import tile_and_pool_cubes
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.metadata import (
+    VSA_BLOCK_SIZE,
     VSAMetadataBuilder,
     set_vsa_forward_context,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.sparse.vsa.predictor import (
     VSAForwardInputs,
     VSAPredictor,
-    VSAPreprocessor,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
@@ -190,7 +193,7 @@ def test_vsa_predictor_dense_fallback_keeps_compact_qkv_and_no_block_inputs() ->
     assert inputs.v is v
     assert inputs.seq_len == 80
     assert inputs.block_sparse_inputs is None
-    assert inputs.post_context.untile_idx is None
+    assert not inputs.post_context.fine_is_tiled
 
 
 def test_vsa_shared_post_process_restores_shape_and_applies_gates() -> None:
@@ -217,7 +220,11 @@ def test_vsa_shared_post_process_restores_shape_and_applies_gates() -> None:
 
     output = vsa_backend.vsa_post_process(fine_output, inputs)
 
-    expected = 2.0 * inputs.post_context.coarse_output + 0.5 * fine_output
+    coarse_per_token = inputs.post_context.coarse_output.index_select(
+        1, metadata.untile_idx // VSA_BLOCK_SIZE
+    )
+    expected = 2.0 * coarse_per_token + 0.5 * fine_output
+    assert inputs.post_context.coarse_output.shape == (1, metadata.num_cubes, 1, 8)
     assert output.shape == q.shape
     torch.testing.assert_close(output, expected)
 
@@ -529,13 +536,24 @@ def test_vsa_metadata_builder_reuses_shape_tensors_with_live_step_policy() -> No
     assert first is not second
     assert (first.current_timestep, first.vsa_sparsity) == (3, 0.25)
     assert (second.current_timestep, second.vsa_sparsity) == (4, 0.75)
-    assert second.gather_idx is first.gather_idx
+    assert second.tile_source_index is first.tile_source_index
     assert first.num_cubes == 27
 
     builder.clear()
 
     rebuilt = builder.build(current_timestep=5, vsa_sparsity=0.5, **build_args)
-    assert rebuilt.gather_idx is not first.gather_idx
+    assert rebuilt.tile_source_index is not first.tile_source_index
+
+
+def test_vsa_metadata_exposes_tile_source_index_and_packed_kv_words() -> None:
+    metadata = _make_vsa_metadata()
+
+    source = metadata.tile_source_index
+    assert source.shape == (metadata.padded_seq_length,)
+    assert int((source >= 0).sum()) == 80
+    assert torch.equal(source[metadata.untile_idx], torch.arange(80))
+    assert metadata.kv_valid_words.dtype == torch.uint32
+    assert metadata.kv_valid_words.tolist() == [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF, 0]
 
 
 def test_vsa_graph_stable_caches_bound_shape_profiles() -> None:
@@ -551,11 +569,11 @@ def test_vsa_graph_stable_caches_bound_shape_profiles() -> None:
         builder.build(raw_latent_shape=(8, 4, 4), **build_args)
 
     route_builder = VSAPredictor(num_heads=1, max_cached_shapes=1)._route_builder
-    kv_valid_bits = torch.ones((1, 1), dtype=torch.uint32)
-    route_builder.from_selected_blocks(torch.zeros((1, 1, 1, 1), dtype=torch.int32), kv_valid_bits)
+    kv_valid_words = torch.ones((1,), dtype=torch.uint32)
+    route_builder.from_selected_blocks(torch.zeros((1, 1, 1, 1), dtype=torch.int32), kv_valid_words)
     with pytest.raises(RuntimeError, match="route cache reached its 1-shape limit"):
         route_builder.from_selected_blocks(
-            torch.zeros((1, 1, 2, 1), dtype=torch.int32), kv_valid_bits
+            torch.zeros((1, 1, 2, 1), dtype=torch.int32), kv_valid_words
         )
 
 
@@ -570,7 +588,7 @@ def test_vsa_graph_stable_caches_bound_shape_profiles() -> None:
     ids=["clean_8x8x8", "ragged_9x9x9", "wan720p_21x45x80"],
 )
 def test_vsa_tile_untile_roundtrip(latent_shape):
-    """VSAPreprocessor.tile then .untile must losslessly reproduce the input."""
+    """Tiling then untiling must reproduce the input, and pooled cubes must be token means."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(0)
@@ -589,24 +607,20 @@ def test_vsa_tile_untile_roundtrip(latent_shape):
 
     x = torch.randn(B, seq_len, H, D, device=device, dtype=dtype)
 
-    x_tiled = VSAPreprocessor.tile(
+    x_tiled, x_pooled = tile_and_pool_cubes(
         x,
-        meta.non_pad_index,
-        meta.gather_idx,
-        meta.padded_seq_length,
+        meta.tile_source_index,
+        meta.variable_block_sizes,
+        cube_size=VSA_BLOCK_SIZE,
     )
 
-    pad_mask = torch.ones(meta.padded_seq_length, dtype=torch.bool, device=device)
-    pad_mask[meta.non_pad_index] = False
+    pad_mask = meta.tile_source_index < 0
     if pad_mask.any():
         assert x_tiled[:, pad_mask, :, :].abs().max().item() == 0.0, (
-            "tile() must zero-fill padded positions"
+            "tiling must zero-fill padded positions"
         )
 
-    x_roundtrip = VSAPreprocessor.untile(
-        x_tiled,
-        meta.untile_idx,
-    )
+    x_roundtrip = x_tiled.index_select(1, meta.untile_idx)
 
     assert x_roundtrip.shape == x.shape, (
         f"shape mismatch after tile/untile: {x_roundtrip.shape} vs {x.shape}"
@@ -615,6 +629,109 @@ def test_vsa_tile_untile_roundtrip(latent_shape):
         f"tile/untile round-trip is not lossless for latent_shape={latent_shape}: "
         f"max_diff={(x_roundtrip - x).abs().max().item():.3e}"
     )
+
+    expected_pooled = x_tiled.view(B, meta.num_cubes, VSA_BLOCK_SIZE, H, D).float().sum(dim=2)
+    expected_pooled = expected_pooled / meta.variable_block_sizes.view(1, -1, 1, 1).float()
+    torch.testing.assert_close(x_pooled, expected_pooled.to(dtype), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
+def test_vsa_predictor_kernels_match_torch_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Triton path and the PyTorch fallback must produce the same envelope and output."""
+    device = torch.device("cuda")
+    metadata = VSAMetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=(9, 9, 9),
+        patch_size=(1, 1, 1),
+        vsa_sparsity=0.75,
+        device=device,
+    )
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 729, 4, 32, device=device) for _ in range(3))
+    gate = torch.randn_like(q)
+    fine_output = torch.randn(2, metadata.padded_seq_length, 4, 32, device=device)
+    call_args = {
+        "batch_size": 2,
+        "seq_len": 729,
+        "seq_len_kv": 729,
+        "attention_mask": PredefinedAttentionMask.FULL,
+        "gate_compress": gate,
+        "gate_fine": gate,
+        "use_sparse_fine": True,
+        "produce_block_sparse_inputs": True,
+        "metadata": metadata,
+    }
+
+    with_kernels = VSAPredictor(num_heads=4).predict(q, k, v, **call_args)
+    output_with_kernels = vsa_backend.vsa_post_process(fine_output, with_kernels)
+
+    monkeypatch.setattr(
+        vsa_predictor, "tile_and_pool_cubes", vsa_kernels._tile_and_pool_cubes_torch
+    )
+    monkeypatch.setattr(vsa_predictor, "sort_last_dim", vsa_kernels._sort_last_dim_torch)
+    monkeypatch.setattr(vsa_predictor, "blend_coarse_fine", vsa_kernels._blend_coarse_fine_torch)
+    fallback = VSAPredictor(num_heads=4).predict(q, k, v, **call_args)
+    output_fallback = vsa_backend.vsa_post_process(fine_output, fallback)
+
+    for name in ("q", "k", "v"):
+        assert torch.equal(getattr(with_kernels, name), getattr(fallback, name)), name
+    assert torch.equal(
+        with_kernels.block_sparse_inputs.block_indices, fallback.block_sparse_inputs.block_indices
+    )
+    torch.testing.assert_close(
+        with_kernels.post_context.coarse_output, fallback.post_context.coarse_output
+    )
+    torch.testing.assert_close(output_with_kernels, output_fallback)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
+def test_vsa_predictor_replays_inside_cuda_graph() -> None:
+    device = torch.device("cuda")
+    metadata = VSAMetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=(8, 8, 8),
+        patch_size=(1, 1, 1),
+        vsa_sparsity=0.5,
+        device=device,
+    )
+    predictor = VSAPredictor(num_heads=2)
+    torch.manual_seed(0)
+    q = torch.randn(1, 512, 2, 16, device=device, dtype=torch.bfloat16)
+    gate = torch.randn_like(q)
+
+    def run() -> tuple[torch.Tensor, torch.Tensor]:
+        inputs = predictor.predict(
+            q,
+            q,
+            q,
+            batch_size=1,
+            seq_len=512,
+            seq_len_kv=512,
+            attention_mask=PredefinedAttentionMask.FULL,
+            gate_compress=gate,
+            gate_fine=None,
+            use_sparse_fine=True,
+            produce_block_sparse_inputs=True,
+            metadata=metadata,
+        )
+        return vsa_backend.vsa_post_process(
+            inputs.q, inputs
+        ), inputs.block_sparse_inputs.block_indices
+
+    eager_output, eager_routes = run()
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output, graph_routes = run()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(graph_output, eager_output)
+    assert torch.equal(graph_routes, eager_routes)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="kernel test needs CUDA")
