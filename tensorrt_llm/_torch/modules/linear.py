@@ -761,7 +761,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                  if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                  and module.mapping is not None else None)
 
-        # This op does not support bias now.
+        # cuda_scaled_mm does not support bias, so keep its separate bias add.
+        # cublas_scaled_mm consumes bias in the cublasLt epilogue.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
@@ -780,11 +781,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.weight.t(),
                 scale_a=cur_input_scale,
                 scale_b=module.weight_scale,
-                bias=None,
+                bias=bias.contiguous() if bias is not None else None,
                 out_dtype=module.dtype or input.dtype,
                 output_buffer_kind=output_buffer_kind,
                 group=group,
             )
+            bias = None
 
         # Reshape output back to original shape (with out_features as last dim)
         if len(original_shape) > 2:

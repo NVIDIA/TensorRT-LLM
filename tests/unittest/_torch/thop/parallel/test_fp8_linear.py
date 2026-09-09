@@ -10,7 +10,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 @skip_pre_hopper
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fp8_linear(dtype):
+@pytest.mark.parametrize("bias", [False, True])
+def test_fp8_linear(dtype, bias):
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
     torch.manual_seed(0)
@@ -26,19 +27,20 @@ def test_fp8_linear(dtype):
     qc = QuantConfig(quant_algo=QuantAlgo.FP8)
     l0 = Linear(in_features=HIDDEN_SIZE,
                 out_features=HIDDEN_SIZE,
-                bias=False,
+                bias=bias,
                 dtype=dtype,
                 quant_config=qc)
     assert l0.weight.dtype == torch.float8_e4m3fn
-    l0.load_weights([{
-        'weight': w_fp8,
-        'weight_scale': w_scale,
-        'input_scale': x_scale
-    }])
+    weights = {'weight': w_fp8, 'weight_scale': w_scale, 'input_scale': x_scale}
+    if bias:
+        weights['bias'] = torch.randn(HIDDEN_SIZE, dtype=dtype).cuda()
+    l0.load_weights([weights])
     l0.cuda()
     torch.testing.assert_close(l0.weight, w_fp8)
     torch.testing.assert_close(l0.weight_scale, w_scale)
     torch.testing.assert_close(l0.input_scale, x_scale)
+    if bias:
+        torch.testing.assert_close(l0.bias, weights['bias'])
 
     with torch.inference_mode():
         output = l0.forward(x)
@@ -76,4 +78,4 @@ def test_fp8_linear(dtype):
 
 
 if __name__ == '__main__':
-    test_fp8_linear(torch.float16)
+    test_fp8_linear(torch.float16, False)
