@@ -56,8 +56,9 @@ TensorRT LLM has implemented custom kernels for AWQ, and taken the technique a
 step further by performing FP8 computation on Hopper GPUs instead of the
 standard FP16.
 
-Similar examples running Falcon-180B with quantization in TensorRT LLM are
-available in [examples/models/contrib/falcon](/examples/models/contrib/falcon).
+The legacy Falcon contrib example tree under `examples/models/contrib/falcon`
+has been removed with the TensorRT workflow. For current quantization guidance,
+see the [quantization feature documentation](../features/quantization.md).
 
 ## Llama-70B on H200 up to 6.7x A100
 
