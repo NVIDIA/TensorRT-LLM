@@ -117,9 +117,7 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
@@ -161,7 +159,6 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
         , mMultimodalHashes(std::move(multimodalHashes))
@@ -213,9 +210,7 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<SizeType32>>> positionIds = std::nullopt,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt, bool returnLogProbs = false,
@@ -236,7 +231,6 @@ public:
         , mOrigPromptLen(mPromptLen)
         , mNumPreDecodedTokens(samplingConfig.getBeamWidth(), 0)
         , mMaxSentTokenLen(mPromptLen)
-        , mPositionIds(std::move(positionIds))
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
         , mLoraTaskId(loraTaskId)
@@ -331,11 +325,6 @@ public:
             {
                 mEncoderTokens = std::make_shared<VecTokens>(req.getEncoderInputTokenIds().value());
             }
-        }
-
-        if (req.getPositionIds())
-        {
-            mPositionIds = std::make_shared<std::vector<SizeType32>>(req.getPositionIds().value());
         }
 
         auto pTuningConfig = req.getPromptTuningConfig();
@@ -660,11 +649,6 @@ public:
         }
 
         TLLM_THROW("GenericLlmRequest::getEncoderInputLen - Do not have encoder length!");
-    }
-
-    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getPositionIds() const
-    {
-        return mPositionIds;
     }
 
     /// @brief Get the draft tokens
@@ -1964,8 +1948,6 @@ protected:
 
     SizeType32 mMaxSentTokenLen;
 
-    std::optional<std::shared_ptr<std::vector<SizeType32>>> mPositionIds{std::nullopt};
-
     std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
     std::optional<SizeType32> mPromptVocabSize{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashes{std::nullopt};
@@ -2210,9 +2192,7 @@ public:
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<SizeType32> endId = std::nullopt,
-        std::optional<std::vector<SizeType32>> positionIds = std::nullopt,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
+        std::optional<SizeType32> endId = std::nullopt, std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
@@ -2243,10 +2223,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, endId,
-            positionIds.has_value() ? std::make_shared<std::vector<SizeType32>>(std::move(positionIds.value()))
-                                    : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(promptEmbeddingTable), promptVocabSize,
+            samplingConfig, isStreaming, endId, std::move(promptEmbeddingTable), promptVocabSize,
             multimodalHashes.has_value()
                 ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashes.value()))
                 : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),

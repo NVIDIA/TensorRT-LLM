@@ -917,6 +917,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # consumer, so the C++ request no longer carries a copy.
         self.py_embedding_bias: Optional[torch.Tensor] = kwargs.pop(
             "embedding_bias", None)
+        self.py_position_ids: list[int] | None = kwargs.pop(
+            "position_ids", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
