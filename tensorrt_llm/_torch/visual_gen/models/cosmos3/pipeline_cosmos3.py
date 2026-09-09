@@ -2739,7 +2739,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> torch.Tensor:
         """Run Cosmos3 transfer denoising with sequential control/text CFG branches."""
 
-        branch_caches: dict[str, tuple[Any, Any]] = {}
+        branch_caches: dict[str, tuple[Any, Any, torch.Tensor | None]] = {}
 
         def run_branch(
             cache_key: str,
@@ -2749,10 +2749,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_control_latents: list[torch.Tensor] | None,
             timestep: torch.Tensor,
         ) -> torch.Tensor:
-            self.transformer.cached_kv, self.transformer.cached_freqs_gen = branch_caches.get(
-                cache_key,
-                (None, None),
-            )
+            (
+                self.transformer.cached_kv,
+                self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
+            ) = branch_caches.get(cache_key, (None, None, None))
             result = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
@@ -2766,6 +2767,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             branch_caches[cache_key] = (
                 self.transformer.cached_kv,
                 self.transformer.cached_freqs_gen,
+                self.transformer.cached_real_text_lens,
             )
             if result.video is None:
                 raise ValueError("Cosmos3 transfer diffusion expects video predictions.")

@@ -216,6 +216,7 @@ def test_cute_dsl_ulysses_backend_fallback(monkeypatch):
         backend="CUTEDSL",
     )
     monkeypatch.setattr(dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
 
     cross_attention = Cosmos3CrossAttention(
         hidden_size=_COSMOS3_TEST_CONFIG["hidden_size"],

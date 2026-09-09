@@ -293,12 +293,13 @@ def _logic_attn2d_vs_standard(rank, world_size):
     )
 
 
-def _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4):
-    """A 1x2 mesh partitions replicated context and excludes both padding tails."""
+def _logic_attn2d_replicated_kv_unequal_lengths_impl(
+    rank, world_size, use_fa4, row_size=1, col_size=2
+):
+    """Partition replicated context and exclude text and generated padding tails."""
     if use_fa4 and not _flash_attn4_available:
         pytest.skip("FlashAttn4 JIT kernels not available")
 
-    row_size, col_size = 1, 2
     batch, num_heads = 2, 4
     head_dim = 128 if use_fa4 else 16
     dtype = torch.bfloat16 if use_fa4 else torch.float32
@@ -346,7 +347,10 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4):
         global_generated_seq_len=generated_len,
     )
     if not use_fa4:
-        expected_kv_seq_lens = [5] if rank == 0 else [2, 5]
+        if (row_size, col_size) == (1, 2):
+            expected_kv_seq_lens = [5] if rank == 0 else [2, 5]
+        else:
+            expected_kv_seq_lens = [7, 10]
         assert inner.kv_seq_lens == expected_kv_seq_lens
         assert not inner.saw_key_padding_mask
 
@@ -391,6 +395,16 @@ def _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4):
 
 def _logic_attn2d_replicated_kv_unequal_lengths(rank, world_size):
     _logic_attn2d_replicated_kv_unequal_lengths_impl(rank, world_size, use_fa4=False)
+
+
+def _logic_attn2d_replicated_kv_padded_generated(rank, world_size):
+    _logic_attn2d_replicated_kv_unequal_lengths_impl(
+        rank,
+        world_size,
+        use_fa4=False,
+        row_size=2,
+        col_size=1,
+    )
 
 
 def _logic_attn2d_fa4_replicated_kv_unequal_lengths(rank, world_size):
@@ -634,6 +648,14 @@ class TestAttn2DAttention:
         run_test_in_distributed(
             world_size=2,
             test_fn=_logic_attn2d_replicated_kv_unequal_lengths,
+            use_cuda=True,
+        )
+
+    def test_attn2d_replicated_kv_padded_generated(self):
+        """A 2x1 mesh excludes generated padding after the K/V row gather."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_attn2d_replicated_kv_padded_generated,
             use_cuda=True,
         )
 
