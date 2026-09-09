@@ -171,10 +171,6 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig
         status: beta
         default: null
-      disable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin:
-        annotation: bool
-        default: False
-        status: beta
       attn_backend:
         annotation: str
         default: TRTLLM
