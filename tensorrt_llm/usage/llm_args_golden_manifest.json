@@ -755,6 +755,7 @@
         "float16",
         "bfloat16",
         "float32",
+        "int8",
         "fp8",
         "fp8_ds_mla",
         "nvfp4"

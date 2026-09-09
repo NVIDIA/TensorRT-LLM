@@ -2465,7 +2465,25 @@ def _create_kv_cache_manager(
     # use cache_layer_idx to read from the target layer's cache slot via
     # Gemma4Attention. No layer_mask exclusion needed here.
 
-    if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
+    if quant_config is not None and quant_config.quant_mode.has_int8_kv_cache():
+        if is_hybrid_linear(config) or _model_config.is_encoder_decoder:
+            raise ValueError(
+                "INT8 KV cache currently supports dense decoder-only models.")
+        if kv_cache_config.enable_block_reuse:
+            raise ValueError(
+                "INT8 KV cache requires kv_cache_config.enable_block_reuse=False; "
+                "paged context attention does not support INT8 KV cache.")
+        if spec_config is not None:
+            raise ValueError(
+                "INT8 KV cache does not support speculative decoding.")
+        if (model_engine is not None
+                and model_engine.attn_runtime_features.chunked_prefill):
+            raise ValueError(
+                "INT8 KV cache requires enable_chunked_prefill=False; "
+                "paged context attention does not support INT8 KV cache.")
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.INT8
+    elif quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
+    ):
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
     elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
     ):

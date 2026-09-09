@@ -14,6 +14,9 @@ l0_a10:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/attention/test_int8_kv_cache.py
+  - unittest/_torch/test_int8_kv_scales.py
+  - unittest/_torch/test_int8_kv_llm.py
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_penalties.py
   - unittest/_torch/test_tensor_lru_cache.py

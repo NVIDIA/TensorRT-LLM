@@ -1589,8 +1589,9 @@ class KVCacheManager(BaseResourceManager):
         mem_per_token = kv_factor * num_attention_layers * head_dim
         # The data type bytes.
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is not None and (
+                quant_config.quant_mode.has_fp8_kv_cache()
+                or quant_config.quant_mode.has_int8_kv_cache()):
             mem_per_token *= 1
         elif quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache(
         ):
@@ -1615,8 +1616,8 @@ class KVCacheManager(BaseResourceManager):
             cache_size_per_token = self.kv_factor * sum(
                 self.num_kv_heads_per_layer) * self.head_dim
 
-        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
+        if self.dtype not in (DataType.INT8, DataType.FP8, DataType.HALF,
+                              DataType.BF16, DataType.FLOAT, DataType.NVFP4):
             raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,

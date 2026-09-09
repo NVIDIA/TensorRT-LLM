@@ -4004,6 +4004,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         if self.dtype not in (
+            DataType.INT8,
             DataType.FP8,
             DataType.HALF,
             DataType.BF16,

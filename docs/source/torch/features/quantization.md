@@ -16,3 +16,48 @@ git clone https://github.com/NVIDIA/Model-Optimizer.git
 cd Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --export_fmt hf
 ```
+
+## INT8 KV cache
+
+Dense decoder-only models with FP16 or BF16 weights can store their KV cache in
+INT8 using the `TRTLLM` attention backend. The KV tensors use one byte per element,
+half the storage of an FP16/BF16 cache with the same number of elements. Allocator
+granularity can prevent small pools from reserving exactly half the GPU memory.
+Model weights and other runtime allocations are unchanged.
+
+The checkpoint must contain calibrated, positive scalar dequantization scales
+`model.layers.<layer>.self_attn.k_proj.k_scale` and
+`model.layers.<layer>.self_attn.v_proj.v_scale` for each attention layer (using the
+model's corresponding projection paths). The native kernels share one FP32 scale
+between K and V, so the loader uses the larger of the two values. Values are stored
+as `clamp(round(x / scale), -128, 127)` and read back as `value * scale`. Full
+checkpoint loading fails if either scale is missing or invalid. Weight-only
+partial reloads preserve the existing scales; scale updates must supply both K
+and V scales together. Large differences between the K and V ranges can cause
+substantial accuracy loss with a shared scale. Calibrate for INT8's range,
+including the effect of rotary
+position embeddings on K; FP8 or FP4 scales cannot be reused unchanged.
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig
+
+with LLM(
+    model="/path/to/checkpoint-with-int8-kv-scales",
+    backend="pytorch",
+    dtype="bfloat16",
+    attn_backend="TRTLLM",
+    enable_chunked_prefill=False,
+    kv_cache_config=KvCacheConfig(dtype="int8", enable_block_reuse=False),
+) as llm:
+    output = llm.generate("Explain the role of a KV cache.", SamplingParams(max_tokens=64))
+```
+
+This path supports full prefill followed by single-token decoding with paged KV
+storage. It does not support cached/chunked prefill, prefix block reuse,
+speculative decoding, MLA, sparse or cross attention, context parallelism,
+hybrid attention/state-space models, or quantized projection weights. These
+combinations are rejected because they require different kernel paths. Select
+`max_num_tokens` large enough to hold the longest complete prompt when chunked
+prefill is disabled. Validate model quality with representative calibration and
+evaluation data before using the quantized cache in a deployment.
