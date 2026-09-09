@@ -53,6 +53,7 @@ from ..conftest import (check_device_contain, get_device_count,
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness,
                             LongBenchV1, LongBenchV2, assert_acceptance_length,
+                            assert_acceptance_length_for_llm,
                             compute_acceptance_length)
 
 
@@ -3216,6 +3217,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+        check_acceptance_length = (mtp_nextn == 1 and not disable_skip_indexer
+                                   and not enable_heuristic_topk
+                                   and not use_cute_dsl_topk)
+        stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
+                      if check_acceptance_length else {})
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-hf",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3226,6 +3232,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
                  sparse_attention_config=dsa_config,
+                 **stats_args,
                  **extra_llm_args) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
@@ -3240,6 +3247,11 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
+                if check_acceptance_length:
+                    assert_acceptance_length_for_llm(
+                        "TestDeepSeekV32::test_fp8_blockscale[baseline_mtp1]",
+                        llm,
+                    )
 
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_hopper
@@ -3759,9 +3771,15 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 max_num_tokens=4096,
                 cuda_graph_config=CudaGraphConfig(enable_padding=True),
                 kv_cache_config=kv_cache_config,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestDeepSeekV4Flash::test_tep_mtp_separate_draft_kv_cache",
+                llm,
+            )
 
     @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", ["TRTLLM", "MEGAMOE_DEEPGEMM"])
@@ -4658,6 +4676,48 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                             ids=["linear", "dynamic"])
+    def test_eagle3_accuracy(self, use_dynamic_tree):
+        """Check Qwen3 MoE EAGLE-3 accuracy and acceptance length."""
+        spec_config_kwargs = dict(
+            max_draft_len=4,
+            speculative_model=f"{llm_models_root()}/Qwen3/Qwen3-30B-eagle3",
+            eagle3_one_model=True,
+        )
+        if use_dynamic_tree:
+            spec_config_kwargs.update(
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=4,
+                max_total_draft_tokens=16,
+            )
+        spec_config = Eagle3DecodingConfig(**spec_config_kwargs)
+
+        with LLM(
+                f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B",
+                disable_overlap_scheduler=True,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                cuda_graph_config=None,
+                speculative_config=spec_config,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            tree_mode = "dynamic" if use_dynamic_tree else "linear"
+            assert_acceptance_length_for_llm(
+                f"TestQwen3_30B_A3B::test_eagle3_accuracy[{tree_mode}]",
+                llm,
+            )
 
     @skip_pre_hopper
     @skip_post_blackwell
@@ -6161,6 +6221,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
                                            eagle3_one_model=one_model)
+        check_acceptance_length = one_model and moe_backend == "CUTLASS"
+        stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
+                      if check_acceptance_length else {})
 
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
@@ -6168,6 +6231,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
                   speculative_config=spec_config,
+                  **stats_args,
                   **pytorch_config,
                   enable_attention_dp=False,
                   moe_config=MoeConfig(backend=moe_backend))
@@ -6177,6 +6241,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+            if check_acceptance_length:
+                assert_acceptance_length_for_llm(
+                    "TestGPTOSS::test_eagle3_1gpu[cutlass-one_model]",
+                    llm,
+                )
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
@@ -6673,12 +6742,18 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  enable_chunked_prefill=True,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
-                 speculative_config=mtp_config) as llm:
+                 speculative_config=mtp_config,
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True) as llm:
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert_acceptance_length_for_llm(
+                "TestQwen3_5_35B_A3B::test_bf16_mtp",
+                llm,
+            )
 
     @skip_pre_hopper
     @parametrize_with_ids("enable_block_reuse", [False, True])
@@ -7234,6 +7309,7 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    tensor_parallel_size: int,
                    moe_backend: str,
                    max_draft_len: Optional[int],
+                   check_acceptance_length: bool,
                    moe_expert_parallel_size: int = 1,
                    enable_attention_dp: bool = False) -> LLM:
         """Construct the engine shared by both evaluation tasks."""
@@ -7244,6 +7320,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                                             enable_padding=True)
         mtp_config = (None if max_draft_len is None else MTPDecodingConfig(
             max_draft_len=max_draft_len))
+        stats_args = (dict(max_stats_len=-1, enable_iter_perf_stats=True)
+                      if check_acceptance_length else {})
         return LLM(model_path,
                    trust_remote_code=True,
                    tensor_parallel_size=tensor_parallel_size,
@@ -7255,7 +7333,8 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                    kv_cache_config=kv_cache_config,
                    cuda_graph_config=cuda_graph_config,
                    moe_config=MoeConfig(backend=moe_backend),
-                   speculative_config=mtp_config)
+                   speculative_config=mtp_config,
+                   **stats_args)
 
     def _run_evals(self,
                    model_path: str,
@@ -7272,10 +7351,16 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
 
         monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "1")
 
+        check_acceptance_length = (
+            expected_quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and tensor_parallel_size == 4 and moe_backend == "TRTLLM"
+            and max_draft_len == 3 and moe_expert_parallel_size == 4
+            and enable_attention_dp)
         with self._build_llm(model_path,
                              tensor_parallel_size,
                              moe_backend,
                              max_draft_len,
+                             check_acceptance_length,
                              moe_expert_parallel_size=moe_expert_parallel_size,
                              enable_attention_dp=enable_attention_dp) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
@@ -7284,6 +7369,12 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+            if check_acceptance_length:
+                assert_acceptance_length_for_llm(
+                    "TestQwen3_8_Flash_Next::"
+                    "test_fp8_adp4_mtp3_trtllm_ple_offload",
+                    llm,
+                )
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.MMLU_EVALUATOR_KWARGS)
@@ -8451,6 +8542,120 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestLlama4SpeculativeDecoding(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "meta-llama/Llama-4-Maverick-17B-128E-Instruct"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @pytest.mark.parametrize("use_dynamic_tree", [False, True],
+                             ids=["linear", "dynamic"])
+    def test_llama4_eagle3(self, use_dynamic_tree):
+        spec_config_kwargs = dict(
+            max_draft_len=4,
+            speculative_model=(
+                f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"),
+            eagle3_one_model=True,
+        )
+        if use_dynamic_tree:
+            spec_config_kwargs.update(
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=4,
+                max_total_draft_tokens=16,
+            )
+
+        with LLM(
+                f"{llm_models_root()}/llama4-models/nvidia/"
+                "Llama-4-Maverick-17B-128E-Instruct-FP8",
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                disable_overlap_scheduler=True,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                cuda_graph_config=None,
+                speculative_config=Eagle3DecodingConfig(**spec_config_kwargs),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            tree_mode = "dynamic" if use_dynamic_tree else "linear"
+            assert_acceptance_length_for_llm(
+                f"TestLlama4SpeculativeDecoding::"
+                f"test_llama4_eagle3[{tree_mode}]",
+                llm,
+            )
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestStep3p7SpeculativeDecoding(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "stepfun-ai/Step-3.7-Flash"
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_step3p7_mtp(self):
+        with LLM(
+                f"{llm_models_root()}/Step-3.7-Flash-FP8",
+                trust_remote_code=True,
+                tensor_parallel_size=4,
+                moe_expert_parallel_size=4,
+                moe_config=MoeConfig(backend="TRTLLM"),
+                disable_overlap_scheduler=True,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                speculative_config=MTPDecodingConfig(max_draft_len=3),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestStep3p7SpeculativeDecoding::test_step3p7_mtp",
+                llm,
+            )
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestGlm4MoeSpeculativeDecoding(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "zai-org/GLM-4.7"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_glm4_moe_mtp(self):
+        with LLM(
+                f"{llm_models_root()}/GLM-4.7",
+                tensor_parallel_size=8,
+                moe_expert_parallel_size=8,
+                disable_overlap_scheduler=True,
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    free_gpu_memory_fraction=0.5,
+                ),
+                max_batch_size=32,
+                max_num_tokens=4096,
+                max_seq_len=8192,
+                max_stats_len=-1,
+                enable_iter_perf_stats=True,
+                speculative_config=MTPDecodingConfig(max_draft_len=1),
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            assert_acceptance_length_for_llm(
+                "TestGlm4MoeSpeculativeDecoding::test_glm4_moe_mtp",
+                llm,
+            )
 
 
 class TestNemotron35Lightning(LlmapiAccuracyTestHarness):

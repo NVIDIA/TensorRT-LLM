@@ -36,6 +36,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 
 from .transformer_glm_image import GlmImageTransformer2DModel
 
@@ -548,7 +549,7 @@ class GlmImagePipeline(BasePipeline):
             )
         generator = None
         if params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(params.seed)
+            generator = make_noise_generator(params.seed, self.device)
         return self.forward(
             prompt=req.prompt,
             height=params.height,
@@ -567,7 +568,7 @@ class GlmImagePipeline(BasePipeline):
                 height=height,
                 width=width,
                 num_inference_steps=steps,
-                generator=torch.Generator(device=self.device).manual_seed(42),
+                generator=make_noise_generator(42, self.device),
             )
 
     @torch.inference_mode()
