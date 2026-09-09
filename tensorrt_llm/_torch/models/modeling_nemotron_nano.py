@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import math
+import os
 import re
 from dataclasses import dataclass
 from functools import partial
@@ -2917,6 +2918,44 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @staticmethod
+    def lora_config(model_dir: str):
+        """Delegate to the inner decoder's LoRA target set.
+
+        Callers resolve `lora_config` on the *outer* model class (see
+        `examples/llm-api/quickstart_multimodal.py`), which for this VLM is the
+        wrapper, not `NemotronHForCausalLM`. Without this forward the wrapper
+        would raise AttributeError and every LoRA entry point would be closed
+        to the model.
+
+        LoRA applies to the language model only. No vision-tower module is a
+        LoRA target here, and none is in any other VLM in the repo.
+        """
+        from .modeling_nemotron_h import NemotronHForCausalLM
+
+        return NemotronHForCausalLM.lora_config(model_dir)
+
+    @staticmethod
+    def lora_request(num_requests: int, modality: str, base_model_dir: str):
+        """Per-request adapters for a checkpoint that bundles one.
+
+        Unlike Phi-4-multimodal, whose checkpoint ships `vision-lora` and
+        `speech-lora` side by side, the Nemotron VL checkpoints ship no adapter
+        at all. Returning None here would silently turn `--load_lora` into a
+        no-op, so an absent adapter is an error naming what to supply instead.
+        """
+        from ...executor.request import LoRARequest
+
+        bundled = os.path.join(base_model_dir, "lora")
+        if not os.path.isdir(bundled):
+            raise FileNotFoundError(
+                f"No bundled LoRA adapter at {bundled}. Nemotron VL checkpoints "
+                "do not ship one; build LoraConfig from "
+                "NemotronH_Nano_VL_V2.lora_config() and pass your "
+                "own LoRARequest per prompt instead of using --load_lora."
+            )
+        return [LoRARequest("nemotron-vl-lora", 0, bundled) for _ in range(num_requests)]
 
     def _build_evs_adjusted_context_ids(
         self,
