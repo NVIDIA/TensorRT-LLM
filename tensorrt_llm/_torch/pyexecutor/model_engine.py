@@ -77,6 +77,7 @@ from ..utils import (get_model_extra_attrs,
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig)
+from .engine.cuda_graph import filter_cuda_graph_batch_sizes
 from .engine.lora import (LoraParamBuilder, make_cuda_graph_lora_manager,
                           make_lora_model_config)
 from .engine.metadata import build_attention_metadata, update_spec_metadata
@@ -89,8 +90,8 @@ from .engine.runners import (apply_position_id_offset, get_all_rank_num_tokens,
                              resolve_runner_type,
                              set_spec_metadata_all_rank_num_tokens,
                              ship_multimodal_indices)
-from .engine.runners.common import filter_cuda_graph_batch_sizes
-from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
+from .engine.runners.encoder import (EncoderRunner, EncoderRunnerConfig,
+                                     get_encoder_graph_batch_sizes)
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
                                              EncoderDecoderRunnerConfig)
 from .engine.runners.interface import ModelRunner, RunnerDeps
@@ -188,7 +189,9 @@ class ModelEngine(ABC):
                 new_tensors_device: Optional[SampleStateTensors],
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                num_accepted_tokens_device: Optional[torch.Tensor] = None):
+                num_accepted_tokens_device: Optional[torch.Tensor] = None,
+                **model_inputs: Any):
+        """Execute a batch with implementation-supported model-specific inputs."""
         raise NotImplementedError
 
     def warmup(self, resource_manager: Optional[ResourceManager]) -> None:
@@ -318,6 +321,12 @@ class PyTorchModelEngine(ModelEngine):
 
         self.forward_pass_callable = None
         self._cleanup_done = False
+        self._runner: Optional[ModelRunner] = None
+        # Transitional snapshot for decoder capture and encoder scheduling.
+        # Encoder graph resources and lifecycle remain entirely runner-owned.
+        self._encoder_graph_shapes: frozenset[tuple[int, int]] = frozenset()
+        self._encoder_graph_batch_sizes: tuple[int, ...] = ()
+        self._encoder_graph_pad_to_limit = False
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
         # the tail of _forward_step -- i.e. right after the LM head, and inside
         # capture_forward_fn -- so that for graph-capturable sampling tiers the
@@ -829,8 +838,7 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         enable_encoder_decoder_mixed_cuda_graph = (
-            is_encoder_decoder and self._runner.cuda_graph_enabled
-            and bool(self._runner.cuda_graph_capture_keys)
+            is_encoder_decoder and bool(self._encoder_graph_shapes)
             and self.cuda_graph_config is not None
             and self.llm_args.enable_encoder_decoder_mixed_cuda_graph)
 
@@ -932,11 +940,17 @@ class PyTorchModelEngine(ModelEngine):
             is_encoder_decoder=True,
             draft_model=self.is_draft_model,
         )
-        return runner_cls(
+        runner = runner_cls(
             self.model,
             self._create_runner_deps(),
             runner_config,
         )
+        # Remove this bridge when decoder graph ownership moves into the runner.
+        # Only immutable planning data is shared; graph resources stay private.
+        self._encoder_graph_shapes = runner._encoder_graph_shapes
+        self._encoder_graph_batch_sizes = runner._encoder_graph_batch_sizes
+        self._encoder_graph_pad_to_limit = runner._encoder_graph_pad_to_limit
+        return runner
 
     def _initialize_no_kv_cache_runner(
             self, runner_cls: Type[NoKVCacheRunner]) -> NoKVCacheRunner:
@@ -1313,19 +1327,30 @@ class PyTorchModelEngine(ModelEngine):
         self,
         resource_manager: ResourceManager,
     ) -> None:
-        if not isinstance(self._runner, EncoderDecoderRunner):
+        if not self._is_encoder_decoder_model():
             return
+        if self._runner is None:
+            raise RuntimeError(
+                "Encoder-decoder model did not initialize a model runner.")
         self._runner.warmup(resource_manager)
         self._runner.capture_graphs(resource_manager)
+
+    def _get_encoder_cuda_graph_batch_sizes(
+            self, max_batch_size: int) -> tuple[int, ...]:
+        """Use startup settings while encoder scheduling remains in PyExecutor."""
+        return get_encoder_graph_batch_sizes(
+            self._encoder_graph_batch_sizes,
+            max_batch_size,
+            pad_to_limit=self._encoder_graph_pad_to_limit)
 
     def forward_encoder(
         self,
         encoder_requests: List[LlmRequest],
         resource_manager: Optional[ResourceManager] = None,
     ) -> Tuple[torch.Tensor, List[int]]:
-        if not isinstance(self._runner, EncoderDecoderRunner):
+        if not self._is_encoder_decoder_model() or self._runner is None:
             raise RuntimeError(
-                "Encoder-decoder model did not initialize EncoderDecoderRunner."
+                "Encoder phase requires an initialized encoder-decoder model runner."
             )
         if resource_manager is None:
             raise ValueError(
@@ -2750,19 +2775,12 @@ class PyTorchModelEngine(ModelEngine):
         runner = self.cuda_graph_runner
         if not runner.enable_encoder_decoder_mixed_cuda_graph:
             return
-        if self._runner is None:
-            raise RuntimeError(
-                "Mixed encoder-decoder CUDA graph capture requires a model runner."
-            )
-
         max_encoder_output_len = self._get_max_encoder_output_len(
             resource_manager)
-        context_shapes = {(batch_size, total_tokens)
-                          for batch_size, total_tokens, _ in
-                          self._runner.cuda_graph_capture_keys}
+        context_shapes = set(self._encoder_graph_shapes)
         if not context_shapes:
             logger.warning("Skipping mixed encoder-decoder CUDA graph capture: "
-                           "no encoder CUDA graph shapes were captured.")
+                           "no encoder CUDA graph shapes are configured.")
             return
 
         max_encoder_batch_size = max(batch_size
@@ -3545,6 +3563,10 @@ class PyTorchModelEngine(ModelEngine):
             model_loader.cleanup()
             self.model_loader = None
 
+        # Release runner-owned graphs before dropping the runner. Keep the
+        # handle available if graph release fails and cleanup is retried.
+        self._release_cuda_graphs()
+
         # The runner and scheduler keep their own references to the model, so
         # clearing the engine's attribute alone would leave the weights
         # reachable past `release_gc()` below.
@@ -3552,7 +3574,6 @@ class PyTorchModelEngine(ModelEngine):
         self._mm_item_scheduler = None
         self.model = None
 
-        self._release_cuda_graphs()
         self.input_processor = None
 
         # Release model weights.
@@ -6389,6 +6410,10 @@ class PyTorchModelEngine(ModelEngine):
                 gather_context_logits=gather_context_logits,
                 **model_inputs,
             )
+        if model_inputs:
+            raise NotImplementedError(
+                "The legacy decoder path does not support additional model "
+                f"inputs. Unsupported keys: {sorted(model_inputs)}")
         assert kv_cache_manager is not None, (
             "the legacy runner requires a KV cache manager")
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(

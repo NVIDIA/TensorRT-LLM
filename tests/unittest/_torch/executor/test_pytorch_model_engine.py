@@ -12,6 +12,9 @@ from unittest.mock import Mock, patch
 import torch
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.backends.interface import \
+    AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
     MultimodalEncoderMixin
@@ -24,13 +27,18 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, EncoderCUDAGraphRunner, EncoderCUDAGraphRunnerConfig,
     KeyType, SampleType, _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state)
+from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import \
+    filter_cuda_graph_batch_sizes
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
+    EncoderConfigMixin, EncoderRunnerConfig)
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import \
+    EncoderDecoderRunnerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
-    _filter_cuda_graph_batch_sizes, _get_context_prompt_lookahead_token,
-    _make_single_token_context_graph_batch)
+    _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
@@ -1298,17 +1306,20 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          frozenset(runner._capture_sequence_lengths))
 
     @staticmethod
-    def _encoder_spec_engine(
+    def _encoder_spec_config(
         encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig],
         declares_spec: bool,
         tp_size: int = 1,
         is_encode_only: bool = False
-    ) -> Tuple[PyTorchModelEngine, Tuple[Tuple[int, ...], torch.dtype, int]]:
-        """A bare engine carrying only what `_encoder_graph_spec` reads."""
+    ) -> Tuple[EncoderConfigMixin, Tuple[Tuple[int, ...], torch.dtype, int]]:
+        """Resolve the runner config against a model's encoder graph contract."""
         spec = ((480000, ), torch.float32, 1500)
 
         class _Model:
-            model_config = SimpleNamespace(is_encoder_decoder=True)
+            model_config = SimpleNamespace(
+                is_encoder_decoder=not is_encode_only,
+                pretrained_config=SimpleNamespace(),
+            )
 
             if declares_spec:
 
@@ -1317,13 +1328,39 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     """Stand-in fixed-shape encoder contract for the test model."""
                     return spec
 
-        engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
-        engine.encoder_cuda_graph_config = encoder_cuda_graph_config
-        engine.is_draft_model = False
-        engine._is_encode_only = is_encode_only
-        engine.model = _Model()
-        engine.mapping = SimpleNamespace(tp_size=tp_size)
-        return engine, spec
+        config: EncoderConfigMixin
+        if is_encode_only:
+            config = EncoderRunnerConfig.create(
+                model=_Model(),
+                mapping=SimpleNamespace(tp_size=tp_size),
+                graph_config=encoder_cuda_graph_config,
+                max_batch_size=8,
+                max_num_tokens=8 * 1500,
+                max_seq_len=1500,
+                max_beam_width=1,
+                without_logits=False,
+                attention_backend=TrtllmAttention,
+                attention_runtime_features=AttentionRuntimeFeatures(),
+                enable_autotuner=False,
+                draft_model=False,
+            )
+        else:
+            config = EncoderDecoderRunnerConfig.create(
+                model=_Model(),
+                mapping=SimpleNamespace(tp_size=tp_size),
+                graph_config=encoder_cuda_graph_config,
+                max_batch_size=8,
+                max_num_tokens=8 * 1500,
+                max_seq_len=1500,
+                max_beam_width=1,
+                without_logits=False,
+                attention_backend=TrtllmAttention,
+                attention_runtime_features=AttentionRuntimeFeatures(),
+                enable_autotuner=False,
+                is_encoder_decoder=True,
+                draft_model=False,
+            )
+        return config, spec
 
     def test_encoder_graph_spec_selection(self) -> None:
         """The model, not the config, selects feature mode; TP > 1 stays eager."""
@@ -1345,10 +1382,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         for name, config, declares_spec, tp_size, expected in cases:
             with self.subTest(name):
-                engine, spec = self._encoder_spec_engine(
+                runner_config, spec = self._encoder_spec_config(
                     config, declares_spec=declares_spec, tp_size=tp_size)
-                self.assertEqual(engine._encoder_graph_spec(),
-                                 expected if expected is not None else spec)
+                self.assertEqual(
+                    (runner_config.feature_shape, runner_config.feature_dtype,
+                     runner_config.fixed_seq_len),
+                    expected if expected is not None else spec)
 
     def test_encoder_graph_bucket_config_is_required_for_token_encoders(
             self) -> None:
@@ -1357,18 +1396,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # space, so a config missing them can only run eager — a loud failure,
         # not a silent perf regression. A feature encoder derives both from the
         # model, so the same config is complete there.
-        engine, _ = self._encoder_spec_engine(
-            EncodeCudaGraphConfig(batch_sizes=[1, 2]), declares_spec=False)
         with self.assertRaisesRegex(
                 ValueError, "num_tokens/max_num_token and "
                 "seq_lens/max_seq_len"):
-            engine._check_encoder_graph_bucket_config([], [])
+            self._encoder_spec_config(EncodeCudaGraphConfig(batch_sizes=[1, 2]),
+                                      declares_spec=False)
 
-        engine, _ = self._encoder_spec_engine(EncodeCudaGraphConfig(
-            batch_sizes=[1, 2], num_tokens=[1500]),
-                                              declares_spec=False)
         with self.assertRaisesRegex(ValueError, "seq_lens/max_seq_len unset"):
-            engine._check_encoder_graph_bucket_config([1500], [])
+            self._encoder_spec_config(EncodeCudaGraphConfig(batch_sizes=[1, 2],
+                                                            num_tokens=[1500]),
+                                      declares_spec=False)
 
         for name, config, declares_spec in [
             ("token model with both buckets",
@@ -1380,12 +1417,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             ("no config", None, False),
         ]:
             with self.subTest(name):
-                engine, _ = self._encoder_spec_engine(
-                    config, declares_spec=declares_spec)
-                num_tokens = config.num_tokens if config else []
-                seq_lens = config.seq_lens if config else []
-                engine._check_encoder_graph_bucket_config(
-                    num_tokens or [], seq_lens or [])
+                self._encoder_spec_config(config, declares_spec=declares_spec)
 
     def test_encoder_graph_bucket_config_warns_for_encode_only(self) -> None:
         """An encode-only model warns and stays eager rather than raising."""
@@ -1393,13 +1425,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         # a slot that has always accepted a batch-sizes-only
         # EncodeCudaGraphConfig and run eager. Raising there would break
         # deployments that predate feature mode, so warn and stay eager.
-        engine, _ = self._encoder_spec_engine(
-            EncodeCudaGraphConfig(batch_sizes=[1, 2]),
-            declares_spec=False,
-            is_encode_only=True)
-        with patch("tensorrt_llm._torch.pyexecutor.model_engine.logger.warning"
-                   ) as warning:
-            engine._check_encoder_graph_bucket_config([], [])
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.engine.runners.encoder.logger.warning"
+        ) as warning:
+            self._encoder_spec_config(EncodeCudaGraphConfig(batch_sizes=[1, 2]),
+                                      declares_spec=False,
+                                      is_encode_only=True)
         warning.assert_called_once()
         self.assertIn("stays eager", warning.call_args.args[0])
 
@@ -1420,11 +1451,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         ]:
             with self.subTest(name):
                 self.assertEqual(
-                    _filter_cuda_graph_batch_sizes([1, 2, 4, 8],
-                                                   max_batch_size,
-                                                   max_num_tokens,
-                                                   fixed,
-                                                   enable_padding=False),
+                    filter_cuda_graph_batch_sizes([1, 2, 4, 8],
+                                                  max_batch_size,
+                                                  max_num_tokens,
+                                                  fixed,
+                                                  enable_padding=False),
                     expected)
 
     def test_feature_pad_batch_refuses_wide_bucket_gaps(self) -> None:

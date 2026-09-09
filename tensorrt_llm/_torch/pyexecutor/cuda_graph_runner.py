@@ -1293,8 +1293,8 @@ class EncoderCUDAGraphRunner:
 
         # Replays served from a captured feature graph. A populated `graphs`
         # only proves capture happened; both `pad_batch` and the shape checks
-        # in `_maybe_forward_encoder_graph` can route every request to the
-        # eager encoder without emptying it, so tests need this to tell a
+        # in `EncoderMixin._prepare_encoder_feature_graph_inputs` can route requests
+        # to the eager encoder without emptying it, so tests need this to tell a
         # working graph path from a silent eager fallback.
         self.num_feature_replays = 0
 
@@ -1818,7 +1818,7 @@ class EncoderCUDAGraphRunner:
             return None, None
 
         if "multi_item_part_lens" in inputs:
-            # See model_engine.py for more details
+            # Per-request scoring metadata cannot share captured graph state.
             logger.warning_once(
                 "Encoder CUDA graph does not support multi-item scoring; "
                 "falling back to eager.",

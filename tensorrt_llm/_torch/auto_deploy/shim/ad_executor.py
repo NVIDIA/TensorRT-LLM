@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -1055,8 +1055,14 @@ class ADEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
+        **model_inputs: Any,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
+        if model_inputs:
+            raise NotImplementedError(
+                "ADEngine does not support additional model inputs. "
+                f"Unsupported keys: {sorted(model_inputs)}"
+            )
         # we don't support gather_context_logits in spec dec
         if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
             assert not gather_context_logits, "gather_context_logits not supported in spec dec"

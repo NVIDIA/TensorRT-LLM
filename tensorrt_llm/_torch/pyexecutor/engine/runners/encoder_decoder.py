@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
 from tensorrt_llm._torch.memory_buffer_utils import with_shared_pool
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -21,11 +24,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
-from tensorrt_llm.logger import logger
 
 from .common import apply_position_id_offset, get_top_level_model
-from .encoder import EncoderConfigMixin, EncoderMixin
-from .interface import PreparedInputs, RunnerConfig, RunnerDeps
+from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
+from .interface import RunnerConfig, RunnerDeps
 
 
 @dataclass(frozen=True)
@@ -53,13 +55,48 @@ class EncoderDecoderRunner(EncoderMixin):
         self._feature_staging_event: torch.cuda.Event | None = None
         self._feature_copy_stream: torch.cuda.Stream | None = None
 
-    def _prepare_encoder_requests(
+    def _build_attention_metadata(
         self,
-        encoder_requests: list[LlmRequest],
+        sequence_lengths: list[int],
+        request_ids: list[int],
+    ) -> VanillaAttentionMetadata | TrtllmAttentionMetadata:
+        if len(sequence_lengths) != len(request_ids):
+            raise ValueError("Encoder sequence lengths and request IDs must have the same length.")
+        metadata = self._create_attention_metadata(
+            enable_context_mla_with_cached_kv=False,
+            num_heads_per_kv=1,
+        )
+        if not isinstance(metadata, (VanillaAttentionMetadata, TrtllmAttentionMetadata)):
+            raise TypeError(
+                "Only vanilla and TRT-LLM attention metadata are supported "
+                "for encoder-decoder encoder execution."
+            )
+        metadata.seq_lens = torch.tensor(
+            sequence_lengths, dtype=torch.int, pin_memory=prefer_pinned()
+        )
+        metadata.num_contexts = len(sequence_lengths)
+        metadata.max_seq_len = self._config.max_seq_len
+        metadata.request_ids = request_ids
+        metadata.prepare_encoder_only()
+        return metadata
+
+    def prepare_inputs(
+        self,
+        scheduled_requests: ScheduledRequests,
         *,
-        resource_manager: ResourceManager | None = None,
-    ) -> PreparedInputs:
+        resource_manager: ResourceManager | None,
+        cuda_graph_lora_manager: CudaGraphLoraManager | None,
+        runtime_draft_len: int,
+        **model_inputs: Any,
+    ) -> EncoderPreparedInputs:
         """Pack one scheduled encoder batch into the model's input contract."""
+        if model_inputs:
+            raise NotImplementedError(
+                "EncoderDecoderRunner does not support additional model inputs. "
+                f"Unsupported keys: {sorted(model_inputs)}"
+            )
+        del cuda_graph_lora_manager, runtime_draft_len
+        encoder_requests = scheduled_requests.encoder_requests
         if not encoder_requests:
             raise ValueError("Encoder execution requires at least one request.")
 
@@ -80,26 +117,12 @@ class EncoderDecoderRunner(EncoderMixin):
             resource_manager=resource_manager,
         )
 
-    def prepare_inputs(
-        self,
-        scheduled_requests: ScheduledRequests,
-        *,
-        resource_manager: ResourceManager | None,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        runtime_draft_len: int,
-    ) -> PreparedInputs:
-        del cuda_graph_lora_manager, runtime_draft_len
-        return self._prepare_encoder_requests(
-            scheduled_requests.encoder_requests,
-            resource_manager=resource_manager,
-        )
-
     def _prepare_token_inputs(
         self,
         encoder_requests: list[LlmRequest],
         *,
         resource_manager: ResourceManager | None,
-    ) -> PreparedInputs:
+    ) -> EncoderPreparedInputs:
         input_ids: list[int] = []
         position_ids: list[int] = []
         sequence_lengths: list[int] = []
@@ -141,7 +164,7 @@ class EncoderDecoderRunner(EncoderMixin):
         encoder_requests: list[LlmRequest],
         *,
         resource_manager: ResourceManager | None,
-    ) -> PreparedInputs:
+    ) -> EncoderPreparedInputs:
         features: list[torch.Tensor] = []
         sequence_lengths: list[int] = []
         request_ids: list[int] = []
@@ -159,15 +182,23 @@ class EncoderDecoderRunner(EncoderMixin):
                 f"Encoder packed length ({num_tokens}) exceeds max_num_tokens "
                 f"({self._config.max_num_tokens})."
             )
-        return PreparedInputs(
+        graph_inputs = self._prepare_encoder_feature_graph_inputs(
+            features,
+            sequence_lengths,
+            request_ids,
+            self._build_attention_metadata,
+        )
+        if graph_inputs is not None:
+            return graph_inputs
+        metadata = self._build_attention_metadata(sequence_lengths, request_ids)
+        return EncoderPreparedInputs(
             {
-                "input_features_list": features,
-                "encoder_attn_metadata": self._build_attention_metadata(
-                    sequence_lengths, request_ids
-                ),
+                "input_features": self._pack_features(features),
+                "encoder_attn_metadata": metadata,
                 "encoder_seq_lens": sequence_lengths,
                 "resource_manager": resource_manager,
-            }
+            },
+            sequence_lengths=sequence_lengths,
         )
 
     def _pack_features(self, features: list[torch.Tensor]) -> torch.Tensor:
@@ -224,53 +255,29 @@ class EncoderDecoderRunner(EncoderMixin):
         """Encoder-decoder warmup is performed while capturing graph shapes."""
 
     def capture_graphs(self, resource_manager: ResourceManager | None) -> None:
-        self._capture_after_warmup(lambda: self._capture_configured_graphs(resource_manager))
+        self._capture_encoder_cuda_graphs(
+            lambda sequence_lengths: self._prepare_capture_inputs(
+                sequence_lengths, resource_manager
+            ),
+            self._execute_prepared,
+            build_metadata=self._build_attention_metadata,
+        )
 
-    def _capture_configured_graphs(self, resource_manager: ResourceManager | None) -> None:
-        runner = self._cuda_graph_runner
-        operation = "warmup" if runner.is_warmup_only else "capture"
-        num_processed = 0
-        logger.info(f"Running encoder-decoder encoder CUDA graph {operation} ...")
-        for key in sorted(runner.capture_keys, reverse=True):
-            sequence_lengths = runner.get_capture_warmup_sequence_lengths(key)
-            if sequence_lengths is None:
-                continue
-            logger.info(f"Encoder-decoder encoder CUDA graph {operation}: key={key}")
-            if runner.feature_mode:
-                self._forward_feature_graph(
-                    features=[
-                        torch.zeros(
-                            (1, *runner.config.feature_shape),
-                            dtype=runner.config.feature_dtype,
-                        )
-                        for _ in sequence_lengths
-                    ],
-                    sequence_lengths=sequence_lengths,
-                    request_ids=list(range(len(sequence_lengths))),
-                )
-            else:
-                input_ids = [0] * sum(sequence_lengths)
-                position_ids: list[int] = []
-                for sequence_length in sequence_lengths:
-                    position_ids.extend(
-                        apply_position_id_offset(
-                            list(range(sequence_length)),
-                            model=self._model,
-                        )
-                    )
-                prepared = self._prepare_packed_token_inputs(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    sequence_lengths=sequence_lengths,
-                    request_ids=list(range(len(sequence_lengths))),
-                    resource_manager=resource_manager,
-                )
-                self._execute_prepared(prepared.kwargs)
-            torch.cuda.synchronize()
-            num_processed += 1
-        logger.info(
-            "Completed encoder-decoder encoder CUDA graph "
-            f"{operation} for {num_processed} graph shape(s)."
+    def _prepare_capture_inputs(
+        self, sequence_lengths: list[int], resource_manager: ResourceManager | None
+    ) -> EncoderPreparedInputs:
+        request_ids = list(range(len(sequence_lengths)))
+        position_ids: list[int] = []
+        for sequence_length in sequence_lengths:
+            position_ids.extend(
+                apply_position_id_offset(list(range(sequence_length)), model=self._model)
+            )
+        return self._prepare_packed_token_inputs(
+            input_ids=[0] * sum(sequence_lengths),
+            position_ids=position_ids,
+            sequence_lengths=sequence_lengths,
+            request_ids=request_ids,
+            resource_manager=resource_manager,
         )
 
     def _prepare_packed_token_inputs(
@@ -281,7 +288,7 @@ class EncoderDecoderRunner(EncoderMixin):
         sequence_lengths: list[int],
         request_ids: list[int],
         resource_manager: ResourceManager | None,
-    ) -> PreparedInputs:
+    ) -> EncoderPreparedInputs:
         input_ids_cpu = torch.tensor(
             input_ids,
             dtype=torch.int,
@@ -292,56 +299,29 @@ class EncoderDecoderRunner(EncoderMixin):
             dtype=torch.int,
             pin_memory=prefer_pinned(),
         )
-        runner = self._cuda_graph_runner
-        batch_size = len(sequence_lengths)
-        use_graph_staging = runner.enabled and (
-            batch_size in runner.supported_batch_sizes
-            or (runner.padding_enabled and batch_size <= runner.max_supported_batch_size)
-        )
-        return PreparedInputs(
+        metadata = self._build_attention_metadata(sequence_lengths, request_ids)
+        graph_inputs = {
+            "input_ids": input_ids_cpu,
+            "position_ids": position_ids_cpu,
+            "seq_lens": sequence_lengths,
+            "resource_manager": resource_manager,
+        }
+        prepared = self._prepare_encoder_graph_inputs(graph_inputs, metadata)
+        if prepared is not None:
+            return prepared
+        return EncoderPreparedInputs(
             {
-                "encoder_input_ids": (
-                    input_ids_cpu
-                    if use_graph_staging
-                    else input_ids_cpu.to("cuda", non_blocking=True)
-                ),
-                "encoder_position_ids": (
-                    position_ids_cpu
-                    if use_graph_staging
-                    else position_ids_cpu.to("cuda", non_blocking=True)
-                ).unsqueeze(0),
-                "encoder_attn_metadata": self._build_attention_metadata(
-                    sequence_lengths, request_ids
-                ),
+                "encoder_input_ids": input_ids_cpu.to("cuda", non_blocking=True),
+                "encoder_position_ids": position_ids_cpu.to("cuda", non_blocking=True).unsqueeze(0),
+                "encoder_attn_metadata": metadata,
                 "encoder_seq_lens": sequence_lengths,
-                "encoder_input_ids_host": input_ids_cpu,
-                "encoder_position_ids_host": position_ids_cpu,
                 "resource_manager": resource_manager,
-            }
+            },
+            sequence_lengths=sequence_lengths,
         )
 
     @torch.inference_mode()
     @nvtx_range("encoder_decoder_forward")
-    def _forward_encoder_requests(
-        self,
-        encoder_requests: list[LlmRequest],
-        *,
-        prepared_inputs: PreparedInputs,
-    ) -> tuple[torch.Tensor, list[int]]:
-        """Execute one scheduled encoder phase and return packed states."""
-        graph_result = self._maybe_forward_feature_graph(encoder_requests)
-        if graph_result is not None:
-            return graph_result
-
-        model_inputs = prepared_inputs.kwargs
-        features = model_inputs.get("input_features_list")
-        if features is not None:
-            model_inputs = dict(model_inputs)
-            model_inputs.pop("input_features_list")
-            model_inputs["input_features"] = self._pack_features(features)
-        hidden_states = self._execute_prepared(model_inputs)
-        return hidden_states, model_inputs["encoder_seq_lens"]
-
     def forward(
         self,
         scheduled_requests: ScheduledRequests,
@@ -351,22 +331,21 @@ class EncoderDecoderRunner(EncoderMixin):
         runtime_draft_len: int,
         moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
+        **model_inputs: Any,
     ) -> dict[str, Any]:
-        del cuda_graph_lora_manager, runtime_draft_len
         del gather_context_logits
-        encoder_requests = scheduled_requests.encoder_requests
-        prepared_inputs = self._prepare_encoder_requests(
-            encoder_requests,
+        prepared = self.prepare_inputs(
+            scheduled_requests,
             resource_manager=resource_manager,
+            cuda_graph_lora_manager=cuda_graph_lora_manager,
+            runtime_draft_len=runtime_draft_len,
+            **model_inputs,
         )
         with MoeLoadBalancerIterContext(moe_load_balancer):
-            hidden_states, sequence_lengths = self._forward_encoder_requests(
-                encoder_requests,
-                prepared_inputs=prepared_inputs,
-            )
+            hidden_states = self._execute_prepared(prepared)
         return {
             "encoder_hidden_states": hidden_states,
-            "encoder_seq_lens": sequence_lengths,
+            "encoder_seq_lens": prepared.sequence_lengths,
         }
 
     def _forward_encoder_stack(self, inputs: dict[str, Any]) -> torch.Tensor:
@@ -416,157 +395,30 @@ class EncoderDecoderRunner(EncoderMixin):
             }
         )
 
-    def _execute_prepared(self, inputs: dict[str, Any]) -> torch.Tensor:
-        input_ids = inputs.get("encoder_input_ids_host")
-        position_ids = inputs.get("encoder_position_ids_host")
-        sequence_lengths = inputs["encoder_seq_lens"]
-        runner = self._cuda_graph_runner
-        if input_ids is None or position_ids is None:
-            return self._forward_encoder_stack(inputs)
+    def _execute_prepared(self, prepared: EncoderPreparedInputs) -> torch.Tensor:
+        key = prepared.graph_key
+        if key is None:
+            return self._forward_encoder_stack(prepared.kwargs)
 
-        graph_inputs = {
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "seq_lens": sequence_lengths,
-            "resource_manager": inputs.get("resource_manager"),
-        }
-        with runner.pad_batch(graph_inputs, len(sequence_lengths)) as padded_inputs:
-            graph_metadata, key = runner.maybe_get_cuda_graph(
-                padded_inputs,
-                inputs["encoder_attn_metadata"],
+        graph_runner = self._encoder_cuda_graph_runner
+        # Feature graphs must not install the token path's shared allocator pool.
+        pool_context = (
+            nullcontext()
+            if graph_runner.feature_mode
+            else with_shared_pool(graph_runner.get_graph_pool())
+        )
+        with pool_context:
+            graph_outputs = self._execute_encoder_cuda_graph(
+                prepared,
+                self._forward_feature_graph_inputs
+                if graph_runner.feature_mode
+                else self._forward_graph_inputs,
             )
-            if key is None:
-                eager_inputs = inputs
-                if inputs["encoder_input_ids"].device.type == "cpu":
-                    eager_inputs = dict(inputs)
-                    eager_inputs["encoder_input_ids"] = inputs["encoder_input_ids"].to(
-                        "cuda", non_blocking=True
-                    )
-                    eager_inputs["encoder_position_ids"] = inputs["encoder_position_ids"].to(
-                        "cuda", non_blocking=True
-                    )
-                return self._forward_encoder_stack(eager_inputs)
-
-            runner.retire_staging()
-            model_inputs = runner.prepare_encoder_decoder_inputs(
-                padded_inputs,
-                key,
-                sequence_lengths,
-            )
-            graph_metadata.prepare_encoder_cuda_graph_replay(model_inputs["seq_lens"], key[1])
-            model_inputs["attn_metadata"] = graph_metadata
-
-            with with_shared_pool(runner.get_graph_pool()):
-                capture_outputs = None
-                if runner.needs_capture(key):
-
-                    def capture_forward_fn(
-                        capture_inputs: dict[str, Any],
-                    ) -> torch.Tensor:
-                        return self._forward_graph_inputs(capture_inputs)
-
-                    capture_outputs = runner.capture(
-                        key,
-                        capture_forward_fn,
-                        model_inputs,
-                    )
-
-                if runner.is_warmup_only:
-                    graph_outputs = capture_outputs
-                else:
-                    graph_outputs = runner.replay(key, model_inputs)
-
         if not isinstance(graph_outputs, torch.Tensor):
             raise TypeError("Encoder-decoder CUDA Graph replay must return hidden states.")
-        return runner.restore_encoder_decoder_output(
-            key,
-            graph_outputs,
-            model_inputs,
-        )
-
-    def _maybe_forward_feature_graph(
-        self, encoder_requests: list[LlmRequest]
-    ) -> tuple[torch.Tensor, list[int]] | None:
-        runner = self._cuda_graph_runner
-        if not runner.enabled or not runner.feature_mode:
-            return None
-
-        fixed_seq_len = runner.config.fixed_seq_len
-        features: list[torch.Tensor] = []
-        for request in encoder_requests:
-            feature = request.py_encoder_input_features
-            if (
-                feature is None
-                or int(request.encoder_output_len) != fixed_seq_len
-                or tuple(feature.shape) != (1, *runner.config.feature_shape)
-                or feature.dtype != runner.config.feature_dtype
-            ):
-                logger.warning_once(
-                    "Encoder CUDA Graph request features do not match the "
-                    "captured contract; the encoder phase stays eager.",
-                    key="encoder_cuda_graph_feature_contract_warning",
-                )
-                return None
-            features.append(feature)
-
-        sequence_lengths = [fixed_seq_len] * len(encoder_requests)
-        output = self._forward_feature_graph(
-            features=features,
-            sequence_lengths=sequence_lengths,
-            request_ids=[request.py_request_id for request in encoder_requests],
-        )
-        if output is None:
-            return None
-        real_tokens = fixed_seq_len * len(encoder_requests)
-        return output[:real_tokens].clone(), sequence_lengths
-
-    def _forward_feature_graph(
-        self,
-        *,
-        features: list[torch.Tensor],
-        sequence_lengths: list[int],
-        request_ids: list[int],
-    ) -> torch.Tensor | None:
-        runner = self._cuda_graph_runner
-        fixed_seq_len = runner.config.fixed_seq_len
-        graph_inputs = {
-            "seq_lens": sequence_lengths,
-            "input_features": features,
-        }
-        with runner.pad_batch(graph_inputs, len(sequence_lengths)) as padded_inputs:
-            padded_sequence_lengths = padded_inputs["seq_lens"]
-            padded_request_ids = list(request_ids) + [
-                -(index + 1) for index in range(len(padded_sequence_lengths) - len(request_ids))
-            ]
-            graph_metadata, key = runner.captured_graph_metadata(padded_inputs)
-            if key is None:
-                eager_metadata = self._build_attention_metadata(
-                    padded_sequence_lengths,
-                    padded_request_ids,
-                )
-                graph_metadata, key = runner.maybe_get_cuda_graph(
-                    padded_inputs,
-                    eager_metadata,
-                )
-            if key is None:
-                return None
-            padded_inputs["attn_metadata"] = graph_metadata
-
-            capture_output = None
-            if runner.needs_capture(key):
-                padded_batch_size, padded_num_tokens, _ = key
-                graph_metadata.prepare_encoder_cuda_graph_replay(
-                    [fixed_seq_len] * padded_batch_size,
-                    padded_num_tokens,
-                )
-                capture_output = runner.capture(
-                    key,
-                    self._forward_feature_graph_inputs,
-                    padded_inputs,
-                )
-            if runner.is_warmup_only:
-                return capture_output
-            return runner.replay(key, padded_inputs)
+        if graph_runner.feature_mode:
+            return graph_outputs[: sum(prepared.sequence_lengths)].clone()
+        return graph_runner.restore_encoder_decoder_output(key, graph_outputs, prepared.kwargs)
 
     def _forward_feature_graph_inputs(self, inputs: dict[str, Any]) -> torch.Tensor:
         return self._forward_encoder_stack(

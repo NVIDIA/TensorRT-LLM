@@ -24,6 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -236,7 +237,9 @@ class TestWarmupCleanup(unittest.TestCase):
             enabled=True,
             is_warmup_only=True,
         )
-        model_engine.model = SimpleNamespace(modules=lambda: [])
+        model_engine.model = SimpleNamespace(
+            modules=lambda: [], model_config=SimpleNamespace(is_encoder_decoder=True)
+        )
         model_engine._torch_compile_piecewise_cuda_graph = False
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
@@ -252,7 +255,8 @@ class TestWarmupCleanup(unittest.TestCase):
             feature_mode=False,
             allow_capture=allow_capture,
         )
-        model_engine.encoder_cuda_graph_runner = runner
+        model_engine._runner = object.__new__(EncoderDecoderRunner)
+        model_engine._runner._encoder_cuda_graph_runner = runner
         resource_manager = object()
         warmup_states = []
 
@@ -260,9 +264,9 @@ class TestWarmupCleanup(unittest.TestCase):
             patch.object(model_engine, "_capture_generation_cuda_graphs") as generation,
             patch.object(model_engine, "_capture_mixed_encoder_decoder_cuda_graphs") as mixed,
             patch.object(
-                model_engine,
-                "_capture_encoder_cuda_graphs_enc_dec",
-                side_effect=lambda _: warmup_states.append(runner.is_warmup_only),
+                model_engine._runner,
+                "_run_encoder_capture_pass",
+                side_effect=lambda *_: warmup_states.append(runner.is_warmup_only),
             ) as encoder,
         ):
             model_engine._run_cuda_graph_warmup(resource_manager)
@@ -446,7 +450,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (
@@ -559,7 +563,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (
@@ -650,7 +654,7 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: (kv_cache_manager if key == "kv_cache" else None)
+                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
             )
 
             with (

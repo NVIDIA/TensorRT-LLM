@@ -139,7 +139,13 @@ class NoKVCacheRunner(ABC):
         resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
+        **model_inputs: Any,
     ) -> PreparedInputs:
+        if model_inputs:
+            raise NotImplementedError(
+                "NoKVCacheRunner does not support additional model inputs. "
+                f"Unsupported keys: {sorted(model_inputs)}"
+            )
         if resource_manager is None:
             raise ValueError("NoKVCacheRunner requires a resource manager.")
         runner_config = self._config
@@ -388,12 +394,14 @@ class NoKVCacheRunner(ABC):
         runtime_draft_len: int,
         moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
+        **model_inputs: Any,
     ) -> dict[str, Any]:
         prepared = self.prepare_inputs(
             scheduled_requests,
             resource_manager=resource_manager,
             cuda_graph_lora_manager=cuda_graph_lora_manager,
             runtime_draft_len=runtime_draft_len,
+            **model_inputs,
         )
         with MoeLoadBalancerIterContext(moe_load_balancer):
             return self._forward_step(

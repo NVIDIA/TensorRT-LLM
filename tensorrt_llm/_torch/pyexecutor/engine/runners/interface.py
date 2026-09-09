@@ -64,7 +64,11 @@ class RunnerDeps:
 
 
 class ModelRunner(Protocol):
-    """Run a model family through its four lifecycle phases."""
+    """Run a model family through its lifecycle.
+
+    ``model_inputs`` carries model-specific inputs for the scheduled batch,
+    not scheduling or lifecycle controls. Supported keys depend on the runner.
+    """
 
     def prepare_inputs(
         self,
@@ -73,7 +77,15 @@ class ModelRunner(Protocol):
         resource_manager: ResourceManager | None,
         cuda_graph_lora_manager: CudaGraphLoraManager | None,
         runtime_draft_len: int,
-    ) -> PreparedInputs: ...
+        **model_inputs: Any,
+    ) -> PreparedInputs:
+        """Prepare scheduled and model-specific inputs for execution.
+
+        Implementations must validate model-specific inputs and reject unsupported
+        keys or overrides of runner-managed fields. Graph compatibility is decided
+        here, before execution; inputs must not be silently ignored.
+        """
+        ...
 
     def warmup(self, resource_manager: ResourceManager | None) -> None: ...
 
@@ -90,4 +102,7 @@ class ModelRunner(Protocol):
         runtime_draft_len: int,
         moe_load_balancer: MoeLoadBalancer | None,
         gather_context_logits: bool,
-    ) -> dict[str, Any]: ...
+        **model_inputs: Any,
+    ) -> dict[str, Any]:
+        """Pass model-specific inputs to ``prepare_inputs`` and execute its result."""
+        ...
