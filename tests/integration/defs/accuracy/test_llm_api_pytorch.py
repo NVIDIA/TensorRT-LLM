@@ -616,8 +616,10 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                               enable_padding=True),
         )
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True, free_gpu_memory_fraction=0.8
-        )  # both one-model and two-model supports this feature
+            enable_block_reuse=True,
+            free_gpu_memory_fraction=0.8,
+            use_kv_cache_manager_v2=True,
+        )
 
         pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
         target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
