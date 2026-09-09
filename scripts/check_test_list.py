@@ -45,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
@@ -945,41 +946,43 @@ def install_python_dependencies(llm_src: str) -> None:
     )
 
 
-def _collection_pytest_env(llm_src: str) -> dict[str, str]:
-    """Env for stubbed ``pytest --co``: PYTHONPATH + bindings stub flags.
-
-    LLM_MODELS_ROOT is deliberately left alone: helpers degrade gracefully when
-    no models root exists, but an empty one makes model lookups fail.
-    """
+def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
+    """Env for stubbed ``pytest --co``: PYTHONPATH + bindings stub flags."""
     existing = os.environ.get("PYTHONPATH", "")
     pythonpath = os.pathsep.join(p for p in (llm_src, existing) if p)
     return {
         **os.environ,
         "PYTHONPATH": pythonpath,
         "TRT_LLM_NO_LIB_INIT": "1",
+        # Override any caller LLM_MODELS_ROOT. Collection only interpolates the
+        # path into class-body constants; an empty directory keeps the models
+        # NFS share off the Check Test List pod.
+        "LLM_MODELS_ROOT": models_root,
     }
 
 
 def _run_collection_pytest(llm_src: str, test_list: str) -> None:
     """Run pytest --co with the collection bindings stub plugin."""
     defs_dir = os.path.join(llm_src, "tests", "integration", "defs")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-p",
-            "stubify_bindings",
-            f"--test-list={test_list}",
-            f"--output-dir={llm_src}",
-            "-s",
-            "--co",
-            "-q",
-        ],
-        check=True,
-        cwd=defs_dir,
-        env=_collection_pytest_env(llm_src),
-    )
+    with tempfile.TemporaryDirectory(
+            prefix="trtllm-collection-models-root-") as models_root:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-p",
+                "stubify_bindings",
+                f"--test-list={test_list}",
+                f"--output-dir={llm_src}",
+                "-s",
+                "--co",
+                "-q",
+            ],
+            check=True,
+            cwd=defs_dir,
+            env=_collection_pytest_env(llm_src, models_root),
+        )
 
 
 def verify_l0_test_lists(llm_src):
