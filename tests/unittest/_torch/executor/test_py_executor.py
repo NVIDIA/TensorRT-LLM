@@ -15,6 +15,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -3599,3 +3600,51 @@ def test_non_last_pp_rank_drains_every_relay_send():
 
     waited = sorted(call.args[1] for call in executor.wait_on_pp_send_handles.call_args_list)
     assert waited == [0, 1, 2, 3]
+
+
+def test_iter_stats_buffer_evicts_oldest_entry_in_constant_time():
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = True
+    executor.max_stats_len = 2
+    executor.stats_lock = threading.Lock()
+    executor.stats = deque()
+    executor.dist = types.SimpleNamespace(pp_size=1, tp_size=1)
+    first, second, third = Mock(), Mock(), Mock()
+
+    executor._append_iter_stats(first)
+    executor._append_iter_stats(second)
+    executor._append_iter_stats(third)
+
+    assert isinstance(executor.stats, deque)
+    assert [entry[0] for entry in executor.stats] == [second, third]
+    assert [entry[0] for entry in executor.get_latest_iteration_stats()] == [second, third]
+    assert not executor.stats
+
+
+def test_iter_stats_profiler_does_not_create_or_sync_cuda_events():
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.iter_counter = 0
+    executor.profile_start_iters = set()
+    executor.profile_stop_iters = set()
+    executor.is_warmup = False
+    executor.print_log = False
+    executor.enable_iter_perf_stats = True
+    executor._iter_adp_dummy_ctx_tokens = 0
+    executor._iter_adp_dummy_gen_tokens = 0
+
+    with (
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.get_calibrator") as calibrator,
+        patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.get_global_profiler",
+            return_value=None,
+        ),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.Event") as cuda_event,
+    ):
+        with executor._profiler() as profile_step:
+            profile_step()
+            profile_step()
+
+    cuda_event.assert_not_called()
+    calibrator.return_value.pre_step.assert_called()
+    assert executor._latest_host_step_time_ms is not None

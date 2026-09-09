@@ -43,11 +43,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
-    _ITERATION_STATS_OPTIONAL_FIELDS,
-    _ITERATION_STATS_SCALAR_FIELDS,
-    ADPIterStatsBuffer,
-)
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats, SpecDecodingStats
 
@@ -180,23 +176,37 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
         ``IterationStats``)
 
     Per-request aggregation reads:
-      * ``executor_request_queue.get_request_queue().queue`` — source for
-        ``num_queued_context_requests`` / ``num_queued_ctx_tokens``
+      * ``executor_request_queue.get_queued_request_stats()`` — cached source
+        for queued request and token counters
       * ``model_engine.iter_states`` — stubbed as the post-forward side
         channel so regression tests can verify ``_update_iter_stats`` uses
         the explicit scheduled-batch stats argument instead.
     """
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import QueuedRequestStats
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.bindings.executor import RequestType
 
     fake = MagicMock()
     fake.max_num_active_requests = 64
     fake.iter_counter = 1
     fake.executor_request_queue.get_request_queue_size.return_value = len(queued_items)
-    fake.executor_request_queue.get_request_queue.return_value.queue = queued_items
+    queued_stats = QueuedRequestStats()
+    for item in queued_items:
+        if not item.is_normal_request or item.request is None:
+            continue
+        token_count = len(item.request.input_token_ids)
+        if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+            queued_stats.num_gen_requests += 1
+            queued_stats.num_gen_kv_tokens += token_count
+        else:
+            queued_stats.num_context_requests += 1
+            queued_stats.num_ctx_tokens += token_count
+    fake.executor_request_queue.get_queued_request_stats.return_value = queued_stats
     fake.resource_manager.resource_managers.get.return_value = None
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=model_engine_iter_states)
     fake.enable_attention_dp = enable_attention_dp
+    fake._iter_stats_interval = 1
     # Bind the real dummy-request predicate: a bare MagicMock auto-generates a
     # child Mock for attribute access (always truthy when called), which would
     # classify every request as dummy and zero out all per-request aggregates.
@@ -293,6 +303,46 @@ def test_empty_iteration():
     assert ifb.num_queued_gen_requests == 0
     assert ifb.num_queued_gen_kv_tokens == 0
     assert ifb.num_paused_kv_tokens == 0
+
+
+def test_unsampled_iteration_skips_gpu_and_kv_snapshots():
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self([], None)
+    fake_self._iter_stats_interval = 10
+    kv_cache_manager = MagicMock()
+    fake_self.resource_manager.resource_managers.get.return_value = kv_cache_manager
+    stats = IterationStats()
+    stats.iter = 1
+    stats.inflight_batching_stats = InflightBatchingStats()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info"
+    ) as mem_get_info:
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=0,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+            scheduled_batch_stats=None,
+        )
+
+    mem_get_info.assert_not_called()
+    kv_cache_manager.get_kv_cache_stats.assert_not_called()
+    kv_cache_manager.get_iteration_stats.assert_not_called()
+    assert fake_self._latest_kv_iter_stats is None
+
+
+@pytest.mark.parametrize("iteration, expected", [(0, True), (9, False), (10, True)])
+def test_rich_iteration_stats_sampling_cadence(iteration, expected):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = types.SimpleNamespace(_iter_stats_interval=10)
+    stats = types.SimpleNamespace(iter=iteration)
+
+    assert PyExecutor._should_collect_rich_iter_stats(fake_self, stats) is expected
 
 
 def test_prefill_only_no_prefix_cache():
@@ -767,6 +817,57 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
     return buffer
 
 
+def test_nonzero_attention_dp_rank_queues_compact_stats_without_full_update():
+    """Nonzero ADP ranks should only construct the allgather payload."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, ScheduledBatchStats
+
+    scheduled_stats = ScheduledBatchStats(
+        num_ctx_requests=1,
+        num_ctx_tokens=100,
+        num_ctx_kv_tokens=10,
+        num_gen_requests=2,
+        num_gen_kv_tokens=20,
+        num_paused_requests=3,
+        num_paused_kv_tokens=30,
+    )
+    iter_stats = IterationStats()
+    iter_stats.iter = 9
+    batch_state = types.SimpleNamespace(
+        iter_start_time=0.0,
+        iter_stats=iter_stats,
+        gpu_forward_events_from_perf_pool=True,
+        gpu_forward_start_event="start",
+        gpu_forward_end_event="end",
+        scheduled_batch_stats=scheduled_stats,
+        scheduled_requests=_StubScheduledBatch(),
+    )
+    fake_self = types.SimpleNamespace(
+        enable_attention_dp=True,
+        dist=types.SimpleNamespace(rank=1),
+        perf_manager=MagicMock(),
+        _adp_iter_stats=MagicMock(),
+        _collect_scheduled_batch_stats=MagicMock(),
+        _update_iter_stats=MagicMock(),
+        _populate_req_stats=MagicMock(),
+    )
+
+    PyExecutor._process_iter_stats(fake_self, [], [], batch_state)
+
+    fake_self.perf_manager.release_forward_timing_events.assert_called_once_with("start", "end")
+    fake_self._collect_scheduled_batch_stats.assert_not_called()
+    fake_self._update_iter_stats.assert_not_called()
+    fake_self._populate_req_stats.assert_not_called()
+    payload = fake_self._adp_iter_stats.queue_payload.call_args.args[0]
+    assert payload.iter_stats_iter == 9
+    assert payload.num_context_requests == 1
+    assert payload.num_ctx_tokens == 100
+    assert payload.num_ctx_kv_tokens == 10
+    assert payload.num_gen_requests == 2
+    assert payload.num_gen_kv_tokens == 20
+    assert payload.num_paused_requests == 3
+    assert payload.num_paused_kv_tokens == 30
+
+
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     """Verify ADP fanout emits one rank-local row per rank with queue on rank 0."""
     # Rank 0 emits one stats row per ADP rank. Scheduled fields stay
@@ -809,22 +910,9 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert len(records) == 2
 
     rank0_record = records[0]
-    rank0_row = rank0_record.stats
-    rank0_ifb = rank0_row.inflight_batching_stats
     assert rank0_record.attention_dp_rank == 0
-    assert rank0_row.iter_latency_ms == 12.5
-    assert rank0_ifb.num_context_requests == 1
-    assert rank0_ifb.num_ctx_tokens == 100
-    assert rank0_ifb.num_ctx_kv_tokens == 10
-    assert rank0_ifb.num_gen_requests == 2
-    assert rank0_ifb.num_gen_kv_tokens == 20
-    assert rank0_ifb.num_paused_requests == 1
-    assert rank0_ifb.num_paused_kv_tokens == 5
-    assert rank0_ifb.num_scheduled_requests == 3
-    assert rank0_ifb.num_queued_context_requests == 7
-    assert rank0_ifb.num_queued_ctx_tokens == 700
-    assert rank0_ifb.num_queued_gen_requests == 8
-    assert rank0_ifb.num_queued_gen_kv_tokens == 800
+    assert rank0_record.stats is rank0_stats
+    assert rank0_record.rank_iter_stats is rank0_state.iter_stats
     assert rank0_record.req_stats == ["req-stats"]
     assert rank0_record.kv_iter_stats == {0: "pending-kv"}
     assert rank0_record.host_step_time_ms == 11.0
@@ -832,24 +920,16 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_record.gpu_forward_time_ms == 7.0
 
     rank1_record = records[1]
-    rank1_row = rank1_record.stats
-    rank1_ifb = rank1_row.inflight_batching_stats
     assert rank1_record.attention_dp_rank == 1
-    assert rank1_row.iter_latency_ms == 12.5
-    assert rank1_ifb.num_context_requests == 3
-    assert rank1_ifb.num_ctx_tokens == 300
-    assert rank1_ifb.num_ctx_kv_tokens == 30
-    assert rank1_ifb.num_gen_requests == 4
-    assert rank1_ifb.num_gen_kv_tokens == 40
-    assert rank1_ifb.num_paused_requests == 2
-    assert rank1_ifb.num_paused_kv_tokens == 25
-    assert rank1_ifb.num_scheduled_requests == 7
-    # Expected to be zero/None because queued/request/KV stats are reported
-    # only on rank 0.
-    assert rank1_ifb.num_queued_context_requests == 0
-    assert rank1_ifb.num_queued_ctx_tokens == 0
-    assert rank1_ifb.num_queued_gen_requests == 0
-    assert rank1_ifb.num_queued_gen_kv_tokens == 0
+    assert rank1_record.stats is rank0_stats
+    assert rank1_record.rank_iter_stats is rank1_state.iter_stats
+    assert rank1_record.rank_iter_stats.num_context_requests == 3
+    assert rank1_record.rank_iter_stats.num_ctx_tokens == 300
+    assert rank1_record.rank_iter_stats.num_ctx_kv_tokens == 30
+    assert rank1_record.rank_iter_stats.num_gen_requests == 4
+    assert rank1_record.rank_iter_stats.num_gen_kv_tokens == 40
+    assert rank1_record.rank_iter_stats.num_paused_requests == 2
+    assert rank1_record.rank_iter_stats.num_paused_kv_tokens == 25
     assert rank1_record.req_stats is None
     assert rank1_record.kv_iter_stats is None
     assert rank1_record.host_step_time_ms == 11.0
@@ -950,22 +1030,6 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     assert next_payload.num_context_requests == 0
     assert 9 in buffer._synthetic_iters
     assert 10 in buffer._payloads
-
-
-def test_attention_dp_fanout_copy_lists_cover_iteration_stats_fields():
-    """Guard the hardcoded field lists used when cloning rank-0 stats."""
-    actual_fields = {
-        field
-        for field in dir(IterationStats())
-        if not field.startswith("_") and field != "to_json_str"
-    }
-    copied_fields = (
-        set(_ITERATION_STATS_SCALAR_FIELDS)
-        | set(_ITERATION_STATS_OPTIONAL_FIELDS)
-        | {"inflight_batching_stats"}
-    )
-
-    assert copied_fields == actual_fields
 
 
 # ---------------------------------------------------------------------------
@@ -1069,3 +1133,31 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
+
+
+def test_update_iter_stats_finalizes_idle_active_request_count():
+    """The last completed batch must clear the running-request gauge."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    fake_self = _build_fake_self(queued_items=[], model_engine_iter_states=None)
+    stats = IterationStats()
+    stats.iter = 10
+    stats.num_active_requests = 1
+    stats.inflight_batching_stats = InflightBatchingStats()
+
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.mem_get_info",
+        return_value=(1 << 30, 1 << 30),
+    ):
+        PyExecutor._update_iter_stats(
+            fake_self,
+            stats,
+            iter_latency_ms=10.0,
+            num_completed_requests=1,
+            scheduled_batch=_StubScheduledBatch(),
+            micro_batch_id=0,
+            num_active_requests=0,
+        )
+
+    assert stats.num_active_requests == 0
+    assert stats.num_completed_requests == 1

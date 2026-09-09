@@ -54,6 +54,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
 
 if TYPE_CHECKING:
     from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -82,6 +83,32 @@ def _init_hf_modules():
 
 
 _init_hf_modules()
+
+
+def _apply_attention_dp_payload(stats_dict: dict,
+                                payload: "RankIterStatsPayload",
+                                rank: int) -> None:
+    """Overlay compact rank-local counters on a shared IterationStats JSON dict."""
+    ifb = stats_dict["inflightBatchingStats"]
+    ifb["numContextRequests"] = payload.num_context_requests
+    ifb["numCtxTokens"] = payload.num_ctx_tokens
+    ifb["numCtxKvTokens"] = payload.num_ctx_kv_tokens
+    ifb["numGenRequests"] = payload.num_gen_requests
+    ifb["numGenKvTokens"] = payload.num_gen_kv_tokens
+    ifb["numPausedRequests"] = payload.num_paused_requests
+    ifb["numPausedKvTokens"] = payload.num_paused_kv_tokens
+    ifb["numScheduledRequests"] = (payload.num_context_requests +
+                                   payload.num_gen_requests)
+
+    if rank != 0:
+        stats_dict["numQueuedRequests"] = 0
+        stats_dict["numCompletedRequests"] = 0
+        stats_dict["numNewActiveRequests"] = 0
+        stats_dict["newActiveRequestsQueueLatencyMS"] = 0.0
+        ifb["numQueuedContextRequests"] = 0
+        ifb["numQueuedCtxTokens"] = 0
+        ifb["numQueuedGenRequests"] = 0
+        ifb["numQueuedGenKvTokens"] = 0
 
 
 class BaseWorker(GenerationExecutor):
@@ -1064,12 +1091,12 @@ class BaseWorker(GenerationExecutor):
         return startup_metrics
 
     @staticmethod
-    def _stats_serializer(stats) -> str:
+    def _stats_to_dict(stats, base_stats_dict: Optional[dict] = None) -> dict:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
-        # Already serialized on the producing rank via allgather — just emit.
+        # Already converted on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
-            return json.dumps(stats[1])
+            return stats[1]
 
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
@@ -1080,13 +1107,32 @@ class BaseWorker(GenerationExecutor):
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        attention_dp_payload = stats[8] if len(stats) > 8 else None
+        stats_sample_interval = stats[9] if len(stats) > 9 else 1
 
-        stats_dict = json.loads(iteration_stats.to_json_str())
+        if base_stats_dict is None:
+            stats_dict = json.loads(iteration_stats.to_json_str())
+        else:
+            stats_dict = dict(base_stats_dict)
+            if "inflightBatchingStats" in stats_dict:
+                stats_dict["inflightBatchingStats"] = dict(
+                    stats_dict["inflightBatchingStats"])
+        rich_stats_sampled = stats_dict.get("iter",
+                                            0) % stats_sample_interval == 0
+        stats_dict["statsCollectionInterval"] = stats_sample_interval
+        stats_dict["statsCollectionSampled"] = rich_stats_sampled
+        if not rich_stats_sampled:
+            stats_dict.pop("gpuMemUsage", None)
+            stats_dict.pop("cpuMemUsage", None)
+            stats_dict.pop("pinnedMemUsage", None)
         # Always tag the row so Dynamo's adapter can read
         # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
         # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
         stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
                                          attention_dp_rank)
+        if attention_dp_payload is not None:
+            _apply_attention_dp_payload(stats_dict, attention_dp_payload,
+                                        stats_dict["attentionDpRank"])
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []
@@ -1123,8 +1169,31 @@ class BaseWorker(GenerationExecutor):
         if scheduler_mode is not None:
             stats_dict["schedulerMode"] = scheduler_mode
 
-        # Convert back to JSON string
-        return json.dumps(stats_dict)
+        return stats_dict
+
+    @staticmethod
+    def _stats_batch_to_dict(stats_batch: list) -> list[dict]:
+        """Convert a batch while parsing each shared IterationStats snapshot once."""
+        base_stats_by_id = {}
+        result = []
+        for stats in stats_batch:
+            if (isinstance(stats, tuple) and len(stats) == 2
+                    and stats[0] == "per_rank_dict"):
+                result.append(stats[1])
+                continue
+            iteration_stats = stats[0]
+            stats_id = id(iteration_stats)
+            if stats_id not in base_stats_by_id:
+                base_stats_by_id[stats_id] = json.loads(
+                    iteration_stats.to_json_str())
+            result.append(
+                BaseWorker._stats_to_dict(stats, base_stats_by_id[stats_id]))
+        return result
+
+    @staticmethod
+    def _stats_serializer(stats) -> str:
+        """Serialize one stats row for compatibility with string consumers."""
+        return json.dumps(BaseWorker._stats_to_dict(stats))
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:

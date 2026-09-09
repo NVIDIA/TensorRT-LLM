@@ -6,6 +6,7 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -39,6 +40,10 @@ class RequestQueueItem:
     # See ``PyExecutor.control_action``.
     control_requires_drain: bool = True
     control_id: Optional[str] = None
+    _stats_counted: bool = dataclasses.field(default=False,
+                                             init=False,
+                                             repr=False,
+                                             compare=False)
 
     @property
     def is_shutdown_request(self):
@@ -52,6 +57,14 @@ class RequestQueueItem:
     @property
     def is_control_request(self):
         return self.id == CONTROL_REQUEST_ID
+
+
+@dataclasses.dataclass
+class QueuedRequestStats:
+    num_context_requests: int = 0
+    num_ctx_tokens: int = 0
+    num_gen_requests: int = 0
+    num_gen_kv_tokens: int = 0
 
 
 class ExecutorRequestQueue:
@@ -68,6 +81,8 @@ class ExecutorRequestQueue:
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.max_batch_size = max_batch_size
         self.enqueue_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._queued_stats = QueuedRequestStats()
         self.next_request_id = max_batch_size
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
@@ -204,10 +219,14 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
-                self.request_queue.put(
-                    RequestQueueItem(req_id,
-                                     request,
-                                     child_req_ids=child_req_ids))
+                item = RequestQueueItem(req_id,
+                                        request,
+                                        child_req_ids=child_req_ids)
+                self._update_queued_stats(item, 1)
+                # queue.Queue is unbounded here, so put() cannot fail. Mark
+                # the item counted before publishing it to the consumer;
+                # otherwise a fast dequeue can miss the matching decrement.
+                self.request_queue.put(item)
                 req_ids.append(req_id)
         return req_ids
 
@@ -271,12 +290,15 @@ class ExecutorRequestQueue:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
                 # if queue is empty and want to wait, wait
-                items.append(self.request_queue.get(timeout=timeout_secs))
+                item = self.request_queue.get(timeout=timeout_secs)
+                items.append(item)
+                self._update_queued_stats(item, -1)
             else:
                 # if not empty or don't want to wait, just return all items in queue
                 while True:
                     queue_item = self.request_queue.get_nowait()
                     items.append(queue_item)
+                    self._update_queued_stats(queue_item, -1)
         except queue.Empty:
             pass
 
@@ -296,6 +318,7 @@ class ExecutorRequestQueue:
             try:
                 item = self.request_queue.get(timeout=remaining_timeout)
                 items.append(item)
+                self._update_queued_stats(item, -1)
             except queue.Empty:
                 break
 
@@ -306,6 +329,31 @@ class ExecutorRequestQueue:
 
     def get_request_queue(self) -> queue.Queue[RequestQueueItem]:
         return self.request_queue
+
+    def _update_queued_stats(self, item: RequestQueueItem,
+                             direction: int) -> None:
+        if not item.is_normal_request or item.request is None:
+            return
+        if (direction > 0) == item._stats_counted:
+            return
+        try:
+            token_count = len(item.request.input_token_ids)
+        except (AttributeError, TypeError):
+            return
+
+        with self._stats_lock:
+            if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                self._queued_stats.num_gen_requests += direction
+                self._queued_stats.num_gen_kv_tokens += direction * token_count
+            else:
+                self._queued_stats.num_context_requests += direction
+                self._queued_stats.num_ctx_tokens += direction * token_count
+            item._stats_counted = direction > 0
+
+    def get_queued_request_stats(self) -> QueuedRequestStats:
+        """Return exact queue aggregates without scanning queued requests."""
+        with self._stats_lock:
+            return dataclasses.replace(self._queued_stats)
 
     def calculate_queue_latency(self, request_items: List[RequestQueueItem],
                                 now: float) -> float:

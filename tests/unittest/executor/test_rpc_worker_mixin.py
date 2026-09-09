@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from queue import Queue
 
 import pytest
@@ -51,6 +52,12 @@ class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
             return None
         return f"processed-{response}"
 
+    def fetch_stats(self):
+        return ["first", "second"]
+
+    def _stats_batch_to_dict(self, stats):
+        return [{"value": stat} for stat in stats]
+
 
 def test_fetch_responses_processes_and_filters_engine_responses():
     worker = _RpcWorkerStub()
@@ -62,3 +69,12 @@ def test_fetch_responses_processes_and_filters_engine_responses():
     assert worker.callback_responses == ["forward", "consume", None]
     assert worker.handler_responses == ["processed-forward", "temporary-error"]
     assert responses == ["processed-forward", "temporary-error"]
+
+
+@pytest.mark.parametrize("method", ["fetch_stats_async", "fetch_stats_wait_async"])
+def test_fetch_stats_returns_one_typed_batch(method):
+    worker = _RpcWorkerStub()
+
+    stats = asyncio.run(getattr(worker, method)())
+
+    assert stats == [{"value": "first"}, {"value": "second"}]
