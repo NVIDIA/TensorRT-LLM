@@ -9080,11 +9080,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    # The disaggregated arm pins the production serving shape (overlap
-    # scheduler on), so the combinations are listed instead of a full grid.
-    @parametrize_with_ids("disagg,overlap_scheduler", [(False, False),
-                                                       (False, True),
-                                                       (True, True)])
+    @parametrize_with_ids("disagg", [False, True])
+    @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
