@@ -974,13 +974,79 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_seqs,
                     max_blocks=max_blocks)
 
+            # Build per-locality-domain block offsets for fork-join attention.
+            if self.locality_domain_enabled:
+                self._ensure_locality_domain_workspaces()
+                num_locality_domains = self.kv_cache_manager.num_locality_domains
+
+                if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+                    self._locality_domain_host_total_kv_lens_buf = [
+                        torch.zeros(2, dtype=torch.int, device='cpu')
+                        for _ in range(num_locality_domains)
+                    ]
+
+                self.locality_domain_kv_cache_block_offsets = (
+                    self.build_locality_domain_block_offsets(
+                        self.kv_cache_block_offsets,
+                        '_locality_domain_block_offsets_buf'))
+
+                if (self.draft_kv_cache_manager is not None and getattr(
+                        self.draft_kv_cache_manager, 'fork_join_attn', False)):
+                    self.draft_locality_domain_kv_cache_block_offsets = (
+                        self.build_locality_domain_block_offsets(
+                            self.draft_kv_cache_block_offsets,
+                            '_draft_locality_domain_block_offsets_buf'))
+
+                num_ctx = self.num_contexts
+                for locality_domain_idx in range(num_locality_domains):
+                    ctx_start = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx]
+                    ctx_end = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx + 1]
+                    gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx]
+                    gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx + 1]
+                    num_ctx_reqs = ctx_end - ctx_start
+                    num_gen_reqs = gen_end - gen_start
+
+                    if self.is_cuda_graph:
+                        # CUDA graph capture bakes host-side launch scalars into
+                        # thop.attention. Use conservative per-domain bounds so a graph
+                        # captured for one decode length can replay for later, longer
+                        # decode steps with the same request split.
+                        ctx_total_kv_length = self.max_seq_len * num_ctx_reqs
+                        gen_total_kv_length = self.max_seq_len * num_gen_reqs
+                    else:
+                        ctx_total_kv_length = (
+                            kv_lens[ctx_start:ctx_end].sum().item()
+                            if num_ctx_reqs > 0 else 0)
+                        gen_total_kv_length = (
+                            kv_lens[gen_start:gen_end].sum().item()
+                            if num_gen_reqs > 0 else 0)
+                    buf = self._locality_domain_host_total_kv_lens_buf[
+                        locality_domain_idx]
+                    buf[0] = ctx_total_kv_length
+                    buf[1] = gen_total_kv_length
+
+                self.locality_domain_mla_gen_state = [None
+                                                      ] * num_locality_domains
+
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
         # eventually mMaxSeqLenKv.
+        # Under locality-domain CUDA graphs, host-side launch scalars are captured per
+        # sub-call, so use conservative bounds while keeping the device sequence
+        # tensors and prompt lengths actual.
+        if self.is_cuda_graph and self.locality_domain_enabled:
+            kv_lens_runtime = torch.full_like(kv_lens[:self.num_seqs],
+                                              self.max_seq_len)
+        else:
+            kv_lens_runtime = kv_lens[:self.num_seqs]
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
-            kv_lens=kv_lens[:self.num_seqs],
+            kv_lens=kv_lens_runtime,
             prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
             prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
             host_request_types=self.host_request_types[:self.num_seqs],
