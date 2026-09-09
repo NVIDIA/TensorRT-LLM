@@ -543,6 +543,23 @@ class KVCacheManager(BaseResourceManager):
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+
+        # Only an explicit request is worth a warning. The resolved value alone
+        # cannot say that: `auto` is rewritten to a concrete True at config-load
+        # time, and engine build can still demote V2 to V1 afterwards (a KV
+        # connector, or beam search), so a True here is often the resolver's,
+        # not the user's. Read both through getattr: this constructor is also
+        # handed the bindings `executor.KvCacheConfig`, which mirrors the C++
+        # fields only, and a config that cannot express the request is a request
+        # that was never made.
+        if (getattr(kv_cache_config, "enable_swa_scratch_reuse", False) is True
+                and getattr(kv_cache_config, "_swa_scratch_reuse_was_explicit",
+                            False)):
+            logger.warning(
+                "kv_cache_config.enable_swa_scratch_reuse is set but the V1 KV cache "
+                "manager is in use; SWA scratch reuse is a V2-only feature and is "
+                "silently ignored here. Set kv_cache_config.use_kv_cache_manager_v2=True "
+                "to use it.")
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size

@@ -163,10 +163,11 @@ def test_deepseek_v4_kv_cache_defaults_and_v2_preference(monkeypatch):
     )
     defaults = DeepseekV4ForCausalLM.get_model_defaults(None)
 
+    # SWA scratch reuse is a global default resolved by
+    # llm_utils._resolve_swa_scratch_reuse_auto, not a per-model opt-in.
     assert defaults == {
         "kv_cache_config": {
             "tokens_per_block": 128,
-            "enable_swa_scratch_reuse": True,
         }
     }
     assert DeepseekV4ForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
@@ -199,7 +200,6 @@ def test_deepseek_v4_fp8_ds_mla_uses_256_token_blocks(monkeypatch) -> None:
     assert defaults == {
         "kv_cache_config": {
             "tokens_per_block": 256,
-            "enable_swa_scratch_reuse": True,
         }
     }
 

@@ -20,7 +20,7 @@ import sys
 import weakref
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+from typing import Any, Dict, List, NewType, Optional, Tuple, TypeAlias, cast
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -567,11 +567,112 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return self._paged_kv_indices[:self.num_generation_blocks +
                                       self.num_context_blocks]
 
+    def _primary_pool_id(self) -> int:
+        """Page-index space that ``_paged_kv_indices`` defaults to."""
+        if self._vswa_layer_to_pool is None:
+            return 0
+        return self._vswa_layer_to_pool.get(0, 0)
+
+    def _prepare_shared_page_index_spaces(self) -> None:
+        """Fill every per-layer page-index space from one table per group.
+
+        Each layer still gets its own index space and its own FlashInfer plan
+        -- layers sharing a plan must have identical page indices, and
+        PER_LAYER addressing makes them differ by ``layer_offset``. What the
+        layer count must not drive is *host* work, which is what regressed
+        Gemma4 by 2.8x TPOT: the flat gather, the pinned staging and the H2D
+        ran once per layer.
+
+        So the layer-independent parts are built once per ``(pool, scale)``
+        group and every space in that group is derived from them on device::
+
+            index_L = base + valid * (((rot + layer_offset_L) % scale) // kv)
+
+        Because space ids are handed out grouped, a group's spaces are a
+        contiguous row range and the whole fan-out is one broadcasted op.
+        """
+        assert self._vswa_layer_to_pool is not None
+        total_idx = sum(self.num_blocks)
+        self._block_rect_stamp += 1
+        self._vswa_pool_indices_cache = {}
+        self._host_pool_indices = {}
+        self._group_host_base = {}
+        self._group_of_space = {}
+
+        for gi, (key, layers) in enumerate(self._index_group_layers.items()):
+            rep_layer = layers[0]
+            base, rot, valid = \
+                self.kv_cache_manager.get_batch_cache_indices_flat_shared(
+                    self.request_ids, self.num_blocks, rep_layer)
+            self._sanitize_swa_shared_page_indices(base, valid, rep_layer)
+            base_buf = getattr(self, f'_group_base_{gi}')
+            valid_buf = getattr(self, f'_group_valid_{gi}')
+            base_buf[:total_idx].copy_(base, non_blocking=True)
+            valid_buf[:total_idx].copy_(valid, non_blocking=True)
+            self._group_host_base[key] = base
+
+            lo, hi = self._index_group_rows[key]
+            # Only the live extent: the fan-out runs in prepare(), outside any
+            # graph, so the stale tail of the buffer is never read -- writing
+            # it would move tens of MB per iteration for nothing.
+            n = total_idx
+            dst = self._space_index_buf[lo:hi, :n]
+            src = base_buf[:n].unsqueeze(0)
+            mask = valid_buf[:n].unsqueeze(0)
+            offsets = self._group_offsets_dev[key]
+            scale = self._layer_index_scale[rep_layer]
+            if rot is None:
+                # No request in this batch owns scratch blocks -- every decode
+                # step, and any prefill chunk shorter than the window. The
+                # rotation vanishes and the per-layer term is a plain shift.
+                # Accumulated in place: a `mask * offsets` temporary would be
+                # a fresh [num_spaces, n] allocation every iteration.
+                torch.mul(mask, offsets // self._layer_index_div, out=dst)
+                dst.add_(src)
+            else:
+                if self.is_cuda_graph:
+                    # A generation request cannot own scratch blocks: its
+                    # input range is the single block at the head of the
+                    # sequence, which is never out-of-window. CUDA graphs are
+                    # decode-only, so a rotation here means the invariant
+                    # broke; fail rather than emit a wrong page table.
+                    raise RuntimeError(
+                        "SWA scratch blocks appeared in a CUDA-graph batch "
+                        f"(pool group {key}). Generation requests must never "
+                        "hold scratch slots.")
+                rot_buf = getattr(self, f'_group_rot_{gi}')
+                rot_buf[:total_idx].copy_(rot, non_blocking=True)
+                torch.add(rot_buf[:n].unsqueeze(0), offsets, out=dst)
+                dst.remainder_(scale)
+                dst.div_(self._layer_index_div, rounding_mode='floor')
+                dst.mul_(mask)
+                dst.add_(src)
+
+            for row, layer_idx in enumerate(layers):
+                space = lo + row
+                self._vswa_pool_indices_cache[space] = \
+                    self._space_index_buf[space]
+                # Layer-independent on purpose: the decode block table adds
+                # this space's own shift on device, so every space in the
+                # group shares one host mirror instead of building its own.
+                self._host_pool_indices[space] = base
+                self._group_of_space[space] = key
+
+        primary_pool_id = self._primary_pool_id()
+        self._vswa_active_pool_id = primary_pool_id
+        self._host_paged_kv_indices = self._host_pool_indices[primary_pool_id]
+        src = self._vswa_pool_indices_cache[primary_pool_id][:total_idx]
+        self._paged_kv_indices[:total_idx].copy_(src, non_blocking=True)
+
     def get_paged_kv_indices_for_layer(self, layer_idx: int) -> torch.Tensor:
         """Return page indices for the pool that *layer_idx* belongs to.
 
         For non-VSWA models this returns the default shared indices.
         For VSWA models it returns the pool-specific indices.
+
+        Under SWA scratch reuse the pool cache holds the layer-independent
+        table, so this materializes the layer first -- the returned view is
+        ``_paged_kv_indices``, exactly what the layer's kernels read.
         """
         if (self._vswa_layer_to_pool is None
                 or self._vswa_pool_indices_cache is None):
@@ -582,15 +683,23 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         total_blocks = self.num_generation_blocks + self.num_context_blocks
         return self._vswa_pool_indices_cache[pool_id][:total_blocks]
 
-    def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
-                                   layer_idx: int) -> None:
-        """Replace evicted SWA pages with a safe in-range page index."""
+    def _layer_can_evict_pages(self, layer_idx: int) -> bool:
+        """Whether *layer_idx* can lose pages for falling out of its window.
+
+        A full-attention layer never does, so a BAD_PAGE_INDEX on one is a
+        real bug rather than an eviction and must not be papered over.
+        """
         window_vec = getattr(self.kv_cache_manager, 'max_attention_window_vec',
                              None)
         if not window_vec:
-            return
+            return False
         local_layer_idx = self.kv_cache_manager.layer_offsets[layer_idx]
-        if window_vec[local_layer_idx] is None:
+        return window_vec[local_layer_idx] is not None
+
+    def _sanitize_swa_page_indices(self, page_indices: torch.Tensor,
+                                   layer_idx: int) -> None:
+        """Replace evicted SWA pages with a safe in-range page index."""
+        if not self._layer_can_evict_pages(layer_idx):
             return
 
         # KVCacheManagerV2 marks evicted out-of-window pages with -1.
@@ -598,6 +707,35 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # keep masked positions in range. The SWA mask excludes their values
         # from the attention result.
         page_indices.masked_fill_(page_indices == BAD_PAGE_INDEX, 0)
+
+    def _sanitize_swa_shared_page_indices(self, base: torch.Tensor,
+                                          valid: torch.Tensor,
+                                          rep_layer: int) -> None:
+        """``_sanitize_swa_page_indices`` for the layer-independent form.
+
+        The shared path never materializes a table on the host, so the
+        sentinel has to be removed from the decomposition instead. An evicted
+        block arrives as ``base == BAD_PAGE_INDEX`` with ``valid == 0``, and
+        the device fan-out would carry it through to -1 -- which under
+        PER_LAYER addressing is off the front of the pool group's buffer.
+
+        Rewriting it to ``base = 0, valid = 1`` makes every space in the group
+        derive ``layer_offset // kv_factor``: that layer's own page 0, in
+        range, and dropped from the result by the SWA mask exactly as on the
+        per-layer path. It also fixes the decode block table, which keys its
+        own validity off the same sentinel.
+
+        Scratch blocks are untouched -- they leave the manager already
+        addressable, with a real base and ``valid == 1``.
+        """
+        if not self._layer_can_evict_pages(rep_layer):
+            return
+        base_np = base.numpy()
+        evicted = base_np == BAD_PAGE_INDEX
+        if not evicted.any():
+            return
+        base_np[evicted] = 0
+        valid.numpy()[evicted] = 1
 
     def swap_paged_kv_indices_for_layer(self, layer_idx: int) -> None:
         """Copy pool-specific page indices into the shared buffer.
@@ -753,7 +891,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 destination[:total_blocks].copy_(source[:total_blocks],
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = destination
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._primary_pool_id()
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = self._host_pool_indices[
                 primary_pool_id]
@@ -1039,6 +1177,43 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # use the indices that match its pool's buffer.
         self._vswa_layer_to_pool: Optional[Dict[int, int]] = None
         self._vswa_pool_indices_cache: Optional[Dict[int, torch.Tensor]] = None
+        # SWA scratch reuse: page indices are PER_LAYER, but only by a scalar
+        # `layer_offset` plus (for scratch blocks) a rotation inside the slot.
+        # Both are applied on device from the group's shared table, so these
+        # caches hold one entry per (pool, scale) group -- never one per layer.
+        self._per_layer_index_spaces: bool = False
+        # `_layer_index_offset` is the raw sub-page offset the scratch rotation
+        # wraps; `_layer_index_shift` is that offset already divided by
+        # kv_factor, which is what a non-scratch block adds. They are not
+        # interchangeable -- see _prepare_shared_page_index_spaces.
+        self._layer_index_offset: Dict[int, int] = {}
+        self._layer_index_shift: Dict[int, int] = {}
+        self._layer_index_scale: Dict[int, int] = {}
+        # (pool, scale) group -> contiguous row range in `_space_index_buf`
+        # and the layers occupying it, in row order.
+        self._index_group_rows: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._index_group_layers: Dict[Tuple[int, int], List[int]] = {}
+        self._group_offsets_dev: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._space_index_buf: Optional[torch.Tensor] = None
+        # Per-iteration host mirror of each group's layer-independent table,
+        # reused by every space in that group when building block tables.
+        self._group_host_base: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._group_of_space: Dict[int, Tuple[int, int]] = {}
+        # Per-iteration cache of the group decode block rectangle. The stamp
+        # is bumped in prepare() so a stale rectangle can never be reused
+        # across iterations.
+        self._block_rect_stamp: int = 0
+        self._block_rect_cache: Dict[Tuple[int, int], Any] = {}
+        self._block_rect_host: Dict[Tuple[int, int], Any] = {}
+        self._block_rect_dev: Dict[Tuple[int, int], Any] = {}
+        # One allocation backing every space's decode block table, so a
+        # group's tables are contiguous and fill in a single broadcast.
+        self._group_block_filled: Dict[Tuple[int, int], Any] = {}
+        # space -> its wrappers, so a group's decode block tables can be
+        # filled together even though each owns its own allocation.
+        self._space_wrappers: Dict[int, Any] = {}
+        self._index_group_layer_spaces: Dict[Tuple[int, int], List[int]] = {}
+        self._layer_index_div: int = 1
 
         if self.kv_cache_manager is not None:
             blocks_in_primary_pool = self.kv_cache_manager.blocks_in_primary_pool
@@ -1071,35 +1246,122 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             mgr = self.kv_cache_manager
             get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
             layer_space: Dict[int, int] = {}
+            # With SWA scratch reuse the page index is genuinely per-layer: a
+            # scratch block's sub-page rotates with block position, so it
+            # cannot be folded into a per-layer base pointer the way a fixed
+            # layer offset can. Every layer therefore needs its own index
+            # space AND its own FlashInfer plan -- layers sharing a plan must
+            # have identical indices, which PER_LAYER addressing breaks. What
+            # the space count must not do is multiply *host* work: the tables
+            # differ only by `layer_offset`, so they are built once per
+            # (pool, scale) group and fanned out on device by
+            # _prepare_shared_page_index_spaces().
+            per_layer_indices = getattr(mgr, 'enable_swa_scratch_reuse', False)
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
-                space_ids = {}
+                groups: Dict[Tuple[int, int], List[int]] = {}
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
                            get_scale(layer_idx))
-                    space_ids.setdefault(key, len(space_ids))
-                    layer_space[layer_idx] = space_ids[key]
+                    groups.setdefault(key, []).append(layer_idx)
+                if per_layer_indices:
+                    # Space ids are handed out grouped, not in layer order, so
+                    # each group owns a contiguous row range of the fan-out
+                    # buffer and can be filled with one batched op.
+                    next_id = 0
+                    for key, layers in groups.items():
+                        self._index_group_rows[key] = (next_id,
+                                                       next_id + len(layers))
+                        self._index_group_layers[key] = list(layers)
+                        for layer_idx in layers:
+                            layer_space[layer_idx] = next_id
+                            next_id += 1
+                else:
+                    for space, (key, layers) in enumerate(groups.items()):
+                        for layer_idx in layers:
+                            layer_space[layer_idx] = space
             if layer_space and (getattr(mgr, 'is_vswa', False)
+                                or per_layer_indices
                                 or len(set(layer_space.values())) > 1):
+                self._per_layer_index_spaces = per_layer_indices
                 self._vswa_layer_to_pool = {}
                 self._vswa_pool_to_rep_layer: Dict[int, int] = {}
                 for layer_idx, pool_id in layer_space.items():
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx
+                num_spaces = len(set(self._vswa_layer_to_pool.values()))
                 # Pre-allocate VSWA pool cache buffers.  These must be
                 # stable (never reallocated) so that CUDA-graph-recorded
                 # copies reference valid addresses across replays.
                 # max_num_blocks (computed above) covers ALL pools so that
                 # secondary pool buffers are large enough.
-                for pool_id in set(self._vswa_layer_to_pool.values()):
-                    buf_key = f'_vswa_pool_buf_{pool_id}'
-                    if getattr(self, buf_key, None) is None:
-                        setattr(
-                            self, buf_key,
-                            torch.empty(max_num_blocks,
-                                        dtype=torch.int,
-                                        device='cuda'))
+                if per_layer_indices:
+                    # One contiguous allocation, one row per space, so a
+                    # group's rows are a slice and the fan-out is a single
+                    # broadcasted op instead of one host build per layer.
+                    # Same total bytes as the per-space buffers it replaces.
+                    if getattr(self, '_space_index_buf', None) is None:
+                        self._space_index_buf = torch.empty(
+                            (num_spaces, max_num_blocks),
+                            dtype=torch.int,
+                            device='cuda')
+                    for pool_id in range(num_spaces):
+                        setattr(self, f'_vswa_pool_buf_{pool_id}',
+                                self._space_index_buf[pool_id])
+                else:
+                    for pool_id in set(self._vswa_layer_to_pool.values()):
+                        buf_key = f'_vswa_pool_buf_{pool_id}'
+                        if getattr(self, buf_key, None) is None:
+                            setattr(
+                                self, buf_key,
+                                torch.empty(max_num_blocks,
+                                            dtype=torch.int,
+                                            device='cuda'))
+                if per_layer_indices:
+                    # `_layer_index_offset` is the raw sub-page offset the
+                    # scratch rotation wraps; `_layer_index_shift` is that
+                    # offset already divided by kv_factor, which is what a
+                    # non-scratch block adds. Not interchangeable.
+                    self._layer_index_offset = {
+                        layer_idx: mgr.get_layer_page_index_offset(layer_idx)
+                        for layer_idx in self._vswa_layer_to_pool
+                    }
+                    self._layer_index_shift = {
+                        layer_idx: offset // mgr.kv_factor
+                        for layer_idx, offset in
+                        self._layer_index_offset.items()
+                    }
+                    self._layer_index_scale = {
+                        layer_idx: get_scale(layer_idx)
+                        for layer_idx in self._vswa_layer_to_pool
+                    }
+                    self._layer_index_div = mgr.kv_factor
+                    # One set of group buffers, not one per layer: `valid`
+                    # gates the per-layer term so BAD_PAGE_INDEX survives it,
+                    # `rot` carries the scratch rotation.
+                    for gi in range(len(self._index_group_rows)):
+                        for prefix in ('_group_base_', '_group_valid_',
+                                       '_group_rot_'):
+                            buf_key = f'{prefix}{gi}'
+                            if getattr(self, buf_key, None) is None:
+                                setattr(
+                                    self, buf_key,
+                                    torch.empty(max_num_blocks,
+                                                dtype=torch.int,
+                                                device='cuda'))
+                    self._group_offsets_dev = {}
+                    for gi, (key, layers) in enumerate(
+                            self._index_group_layers.items()):
+                        self._group_offsets_dev[key] = torch.tensor(
+                            [[self._layer_index_offset[layer]]
+                             for layer in layers],
+                            dtype=torch.int,
+                            device='cuda')
+                        lo, _ = self._index_group_rows[key]
+                        self._index_group_layer_spaces[key] = [
+                            lo + i for i in range(len(layers))
+                        ]
         # Stable buffers for FlashInfer MLA decode; required for CUDA graphs.
         self._mla_qo_indptr_buf = self.get_empty(
             buffers,
@@ -1413,6 +1675,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # rebuild rather than failing the forward.
                 return None
             wrappers.decode_block_tables = block_tables
+        if self._per_layer_index_spaces:
+            self._space_wrappers[plan_params.kv_pool_id] = wrappers
         host_block_tables = wrappers.host_decode_block_tables
         if host_block_tables is None or host_block_tables.size(1) < max_n:
             host_width = min(max(64, 1 << (max_n - 1).bit_length()),
@@ -1431,13 +1695,128 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # Rewriting the host buffer is safe: _plan_with_params synchronizes
         # the stream before planning, so the previous plan's H2D has
         # completed.
-        block_tables[:num_gens, :max_n].copy_(
-            host_block_tables[:num_gens, :max_n], non_blocking=True)
+        if self._per_layer_index_spaces:
+            # Content is layer-independent up to each space's own offset, so
+            # take it from the group rectangle instead of scattering per space.
+            if not self._fill_group_block_tables(
+                    plan_params.kv_pool_id, num_gens, max_n, gen_num_blocks,
+                    host_paged_kv_indices):
+                return None
+        else:
+            block_tables[:num_gens, :max_n].copy_(
+                host_block_tables[:num_gens, :max_n], non_blocking=True)
         # Seed the extent used by `prepare()` to clear entries if the first graph replay has fewer
         # requests or a narrower block table.
         wrappers.decode_block_table_active_rows = num_gens
         wrappers.decode_block_table_active_width = max_n
         return block_tables[:num_gens]
+
+    def _group_decode_block_rect(self, space: int, rows: int, width: int,
+                                 row_lens: "np.ndarray",
+                                 host_indices: torch.Tensor):
+        """Layer-independent decode block rectangle for ``space``'s group.
+
+        Built once per group per iteration and reused by every space in it, so
+        the host scatter runs twice rather than once per layer -- that loop,
+        not the H2D copies, was the second half of the Gemma4 regression.
+        Each space then adds its own ``layer_offset // kv_factor`` on device.
+
+        The mask cannot be derived from the *values*: a padded entry and a
+        genuine page 0 are the same int32, and giving padding the offset turns
+        it into a real page id owned by another layer.
+        """
+        key = self._group_of_space.get(space)
+        if key is None:
+            return None
+        stamp = (self._block_rect_stamp, rows, width)
+        cached = self._block_rect_cache.get(key)
+        if cached is not None and cached[0] == stamp:
+            return cached[1], cached[2]
+
+        host = self._block_rect_host.get(key)
+        if (host is None or host[0].size(0) < rows or host[0].size(1) < width):
+            host = (torch.zeros((self.max_num_requests, width),
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned()),
+                    torch.zeros((self.max_num_requests, width),
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned()))
+            self._block_rect_host[key] = host
+        dev = self._block_rect_dev.get(key)
+        if dev is None or dev[0].size(0) < rows or dev[0].size(1) < width:
+            try:
+                dev = (torch.zeros((self.max_num_requests, width),
+                                   dtype=torch.int32,
+                                   device='cuda'),
+                       torch.zeros((self.max_num_requests, width),
+                                   dtype=torch.int32,
+                                   device='cuda'))
+            except torch.OutOfMemoryError:
+                return None
+            self._block_rect_dev[key] = dev
+
+        table = host[0].numpy()[:rows, :width]
+        valid = host[1].numpy()[:rows, :width]
+        table[:] = 0
+        live = np.arange(width)[None, :] < row_lens[:rows, None]
+        flat = host_indices.numpy(
+        )[self.num_context_blocks:self.num_context_blocks + int(row_lens.sum())]
+        table[live] = flat
+        valid[:] = live & (table != BAD_PAGE_INDEX)
+        dev[0][:rows, :width].copy_(host[0][:rows, :width], non_blocking=True)
+        dev[1][:rows, :width].copy_(host[1][:rows, :width], non_blocking=True)
+        self._block_rect_cache[key] = (stamp, dev[0], dev[1])
+        return dev[0], dev[1]
+
+    def _fill_group_block_tables(self, space: int, rows: int, width: int,
+                                 row_lens: "np.ndarray",
+                                 host_indices: torch.Tensor) -> bool:
+        """Write the decode block tables of ``space``'s whole group at once.
+
+        Every space in the group differs only by its own
+        ``layer_offset // kv_factor``, so the tables are a broadcast of one
+        rectangle. They cannot share an allocation -- one contiguous buffer
+        wide enough for ``max_blocks_per_seq`` across every space runs to
+        hundreds of MB and fails against a 90%-committed KV pool, while the
+        same bytes succeed as one table per space -- so the batching uses
+        foreach ops instead: three launches per group rather than one per
+        space.
+
+        Filling the whole group when any of its spaces asks is free (the
+        content is the same work either way); the stamp keeps it to once per
+        rectangle per iteration.
+        """
+        key = self._group_of_space.get(space)
+        if key is None:
+            return False
+        destinations, shifts = [], []
+        for member in self._index_group_layer_spaces.get(key, ()):
+            wrappers = self._space_wrappers.get(member)
+            table = None if wrappers is None else wrappers.decode_block_tables
+            if table is None or table.size(0) < rows or table.size(1) < width:
+                continue
+            destinations.append(table[:rows, :width])
+            shifts.append(
+                self._layer_index_shift[self._vswa_pool_to_rep_layer[member]])
+        if not destinations:
+            return False
+        # Keyed on the member count too: a wrapper that plans later in the
+        # same iteration must not be left holding a stale table.
+        stamp = (self._block_rect_stamp, rows, width, len(destinations))
+        if self._group_block_filled.get(key) == stamp:
+            return True
+        rect = self._group_decode_block_rect(space, rows, width, row_lens,
+                                             host_indices)
+        if rect is None:
+            return False
+        shared, valid = rect
+        shared_view = shared[:rows, :width]
+        valid_view = valid[:rows, :width]
+        torch._foreach_copy_(destinations, [valid_view] * len(destinations))
+        torch._foreach_mul_(destinations, shifts)
+        torch._foreach_add_(destinations, [shared_view] * len(destinations))
+        self._group_block_filled[key] = stamp
+        return True
 
     def _clean_cached_plans(self, *, defer_plan: bool):
         for plan_params in list(self._plan_params_to_wrappers.keys()):
@@ -1581,61 +1960,72 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
-        # indices of used cache blocks for each sequence
-        primary_layer_idx = None
-        if self._vswa_layer_to_pool is not None:
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            primary_layer_idx = self._vswa_pool_to_rep_layer[primary_pool_id]
+        # indices of used cache blocks for each sequence.
+        if self._per_layer_index_spaces:
+            self._prepare_shared_page_index_spaces()
         else:
-            layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets', {})
-            primary_layer_idx = next(iter(layer_offsets), None)
+            primary_layer_idx = None
+            if self._vswa_layer_to_pool is not None:
+                primary_pool_id = self._primary_pool_id()
+                primary_layer_idx = \
+                    self._vswa_pool_to_rep_layer[primary_pool_id]
+            else:
+                layer_offsets = getattr(self.kv_cache_manager, 'layer_offsets',
+                                        {})
+                primary_layer_idx = next(iter(layer_offsets), None)
 
-        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
-            self.request_ids, self.num_blocks, layer_idx=primary_layer_idx)
-        if primary_layer_idx is not None:
-            self._sanitize_swa_page_indices(paged_kv_indices, primary_layer_idx)
+            paged_kv_indices = \
+                self.kv_cache_manager.get_batch_cache_indices_flat(
+                    self.request_ids,
+                    self.num_blocks,
+                    layer_idx=primary_layer_idx)
+            if primary_layer_idx is not None:
+                self._sanitize_swa_page_indices(paged_kv_indices,
+                                                primary_layer_idx)
 
-        self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
-            paged_kv_indices, non_blocking=True)
+            self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
+                paged_kv_indices, non_blocking=True)
 
-        # Retain a host mirror of _paged_kv_indices: decode plans build the
-        # trtllm-gen block tables from host data, with no GPU round trips.
-        # The VSWA block below re-points the mirror at the active pool's
-        # copy whenever the device buffer is swapped.
-        self._host_paged_kv_indices = paged_kv_indices
+            # Retain a host mirror of _paged_kv_indices: decode plans build the
+            # trtllm-gen block tables from host data, with no GPU round trips.
+            # The VSWA block below re-points the mirror at the active pool's
+            # copy whenever the device buffer is swapped.
+            self._host_paged_kv_indices = paged_kv_indices
 
-        # VSWA: build per-pool page index CUDA tensors so each layer can use
-        # the indices that match its own pool's buffer.  Tensors live on CUDA
-        # so that forward_impl swap via copy_() is device-to-device (CUDA-graph
-        # capturable).
-        if self._vswa_layer_to_pool is not None:
-            unique_pools = set(self._vswa_layer_to_pool.values())
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
-            # Use dedicated pre-allocated buffers for each pool's indices.
-            # These buffers are created in __post_init__ so their addresses
-            # stay stable across CUDA-graph replays.
-            total_idx = paged_kv_indices.size(0)
-            primary_buf = getattr(self, f'_vswa_pool_buf_{primary_pool_id}')
-            primary_buf[:total_idx].copy_(self._paged_kv_indices[:total_idx],
-                                          non_blocking=True)
-            self._vswa_pool_indices_cache = {
-                primary_pool_id: primary_buf,
-            }
-            self._host_pool_indices = {primary_pool_id: paged_kv_indices}
-            for pool_id in unique_pools:
-                if pool_id == primary_pool_id:
-                    continue
-                rep_layer = self._vswa_pool_to_rep_layer[pool_id]
-                pool_indices = \
-                    self.kv_cache_manager.get_batch_cache_indices_flat(
-                        self.request_ids, self.num_blocks, layer_idx=rep_layer)
-                self._sanitize_swa_page_indices(pool_indices, rep_layer)
-                buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
-                buf[:pool_indices.size(0)].copy_(pool_indices,
-                                                 non_blocking=True)
-                self._vswa_pool_indices_cache[pool_id] = buf
-                self._host_pool_indices[pool_id] = pool_indices
-            self._vswa_active_pool_id = primary_pool_id
+            # VSWA: build per-pool page index CUDA tensors so each layer can use
+            # the indices that match its own pool's buffer.  Tensors live on CUDA
+            # so that forward_impl swap via copy_() is device-to-device (CUDA-graph
+            # capturable).
+            if self._vswa_layer_to_pool is not None:
+                unique_pools = set(self._vswa_layer_to_pool.values())
+                primary_pool_id = self._primary_pool_id()
+                # Use dedicated pre-allocated buffers for each pool's indices.
+                # These buffers are created in __post_init__ so their addresses
+                # stay stable across CUDA-graph replays.
+                total_idx = paged_kv_indices.size(0)
+                primary_buf = getattr(self, f'_vswa_pool_buf_{primary_pool_id}')
+                primary_buf[:total_idx].copy_(
+                    self._paged_kv_indices[:total_idx], non_blocking=True)
+                self._vswa_pool_indices_cache = {
+                    primary_pool_id: primary_buf,
+                }
+                self._host_pool_indices = {primary_pool_id: paged_kv_indices}
+                for pool_id in unique_pools:
+                    if pool_id == primary_pool_id:
+                        continue
+                    rep_layer = self._vswa_pool_to_rep_layer[pool_id]
+                    pool_indices = \
+                        self.kv_cache_manager.get_batch_cache_indices_flat(
+                            self.request_ids,
+                            self.num_blocks,
+                            layer_idx=rep_layer)
+                    self._sanitize_swa_page_indices(pool_indices, rep_layer)
+                    buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
+                    buf[:pool_indices.size(0)].copy_(pool_indices,
+                                                     non_blocking=True)
+                    self._vswa_pool_indices_cache[pool_id] = buf
+                    self._host_pool_indices[pool_id] = pool_indices
+                self._vswa_active_pool_id = primary_pool_id
 
         # number of tokens in the last cache block used by each sequence,
         # derived from the logical rather than reservation-width page count.
@@ -1747,7 +2137,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # VSWA: restore primary pool indices as the default.
         if (self._vswa_layer_to_pool is not None
                 and self._vswa_pool_indices_cache is not None):
-            primary_pool_id = self._vswa_layer_to_pool.get(0, 0)
+            primary_pool_id = self._primary_pool_id()
             total_blocks = self.num_generation_blocks + self.num_context_blocks
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
@@ -1799,32 +2189,52 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         pin_memory=prefer_pinned())
                     wrappers.host_decode_block_tables = host_block_tables
 
-                # Build only the live (or previously live) rectangle on the host. This preserves
-                # padded-row zeroing when batch size shrinks without launching full-capacity
-                # `arange`, `gather`, `where`, `zero`, and copy kernels on every decode step.
-                host_table = host_block_tables[:update_rows, :update_width]
-                host_table.zero_()
+                # Rows past the live batch are being cleared, so they carry
+                # zero live blocks: the group rectangle zeroes them and the
+                # mask keeps them from taking the layer offset.
+                row_lens = np.zeros(update_rows, dtype=np.int64)
+                live_rows = min(rows, update_rows)
+                row_lens[:live_rows] = np.asarray(
+                    num_blocks_per_row[:live_rows], dtype=np.int64)
                 host_pool_indices = self._host_pool_indices[pool_id]
-                # Pool indices are flattened as context blocks followed by each generation request's
-                # blocks.
-                source_offset = self.num_context_blocks
-                # This loop scales with the number of generation requests. Vectorizing ragged
-                # rows would require padded mask or index tensor, so keep contiguous row copies
-                # until profiling identifies this as a CPU bottleneck.
-                for row, num_blocks_for_row in enumerate(num_blocks_per_row):
-                    num_blocks_for_row = int(num_blocks_for_row)
-                    copy_width = min(num_blocks_for_row, table_width)
-                    host_table[row, :copy_width].copy_(
-                        host_pool_indices[source_offset:source_offset +
-                                          copy_width])
-                    # Advance by the uncropped count so the next request starts at the correct
-                    # offset even if this row hit `table_width`.
-                    source_offset += num_blocks_for_row
-                # Keep the graph-captured device address stable and transfer only the compact
-                # rectangle prepared in pinned host memory.
-                block_tables[:update_rows, :update_width].copy_(
-                    host_block_tables[:update_rows, :update_width],
-                    non_blocking=True)
+                if self._per_layer_index_spaces:
+                    # One host scatter per (pool, scale) group serves every
+                    # space in it; the per-space step is a single device add.
+                    # The row-at-a-time loop this replaces ran once per
+                    # generation request per space -- 1920 copies an iteration
+                    # on Gemma4 -- and was half the regression.
+                    self._space_wrappers[pool_id] = wrappers
+                    if not self._fill_group_block_tables(
+                            pool_id, update_rows, update_width, row_lens,
+                            host_pool_indices):
+                        continue
+                else:
+                    # Build only the live (or previously live) rectangle on the host. This preserves
+                    # padded-row zeroing when batch size shrinks without launching full-capacity
+                    # `arange`, `gather`, `where`, `zero`, and copy kernels on every decode step.
+                    host_table = host_block_tables[:update_rows, :update_width]
+                    host_table.zero_()
+                    # Pool indices are flattened as context blocks followed by each generation
+                    # request's blocks.
+                    source_offset = self.num_context_blocks
+                    # This loop scales with the number of generation requests. Vectorizing ragged
+                    # rows would require padded mask or index tensor, so keep contiguous row copies
+                    # until profiling identifies this as a CPU bottleneck.
+                    for row, num_blocks_for_row in enumerate(
+                            num_blocks_per_row):
+                        num_blocks_for_row = int(num_blocks_for_row)
+                        copy_width = min(num_blocks_for_row, table_width)
+                        host_table[row, :copy_width].copy_(
+                            host_pool_indices[source_offset:source_offset +
+                                              copy_width])
+                        # Advance by the uncropped count so the next request starts at the correct
+                        # offset even if this row hit `table_width`.
+                        source_offset += num_blocks_for_row
+                    # Keep the graph-captured device address stable and transfer only the compact
+                    # rectangle prepared in pinned host memory.
+                    block_tables[:update_rows, :update_width].copy_(
+                        host_block_tables[:update_rows, :update_width],
+                        non_blocking=True)
                 wrappers.decode_block_table_active_rows = rows
                 wrappers.decode_block_table_active_width = active_width
                 kv_lens_buf = getattr(decode_wrapper, '_kv_lens_buffer', None)
@@ -2507,7 +2917,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 )
             return
 
-        # Key and Value
+        # Key and Value. The manager decides the addressing mode: with SWA
+        # scratch reuse the page indices are PER_LAYER, so the buffer must be
+        # based at the pool group rather than at this layer's sub-page. See
+        # KVCacheManagerV2.page_index_mode -- indices and buffer are derived
+        # from one source so they cannot disagree.
         kv_cache = metadata.kv_cache_manager.get_buffers(
             self.layer_idx, kv_layout=metadata.kv_layout)
 

@@ -928,6 +928,8 @@ def _build_gemma4_kv_cache_manager(
     batch_size=1,
     enable_swa_eviction: bool = False,
     quant_config: QuantConfig | None = None,
+    enable_swa_scratch_reuse=False,
+    max_attention_window_override=None,
 ):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
@@ -992,11 +994,20 @@ def _build_gemma4_kv_cache_manager(
         max_attn_window = [
             swa_window if lt == "sliding_attention" else max_seq_len for lt in layer_types
         ]
+    if max_attention_window_override is not None:
+        # SWA scratch reuse only produces blocks when a prefill chunk runs past
+        # the window, so a scratch test has to pin a window well below
+        # max_seq_len rather than the near-max default above.
+        max_attn_window = [
+            max_attention_window_override if lt == "sliding_attention" else max_seq_len
+            for lt in layer_types
+        ]
 
     kv_cache_config = KvCacheConfigV2(
         max_tokens=num_blocks * tokens_per_block,
         enable_block_reuse=False,
         max_attention_window=max_attn_window,
+        enable_swa_scratch_reuse=enable_swa_scratch_reuse,
     )
     return KVCacheManagerV2(
         kv_cache_config,
@@ -4386,6 +4397,363 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
             "the caller no longer loops per-image, so the metadata must allow "
             "cross-image batching.",
         )
+
+
+class TestGemma4SwaScratchPageIndices(unittest.TestCase):
+    """SWA scratch reuse: per-layer page indices, derived without per-layer host work.
+
+    ``kv_cache_manager_v2.get_batch_cache_indices_flat(..., layer_idx)`` is the
+    reference: it is what CI has been running, and what the index cross-check
+    validated against the device kernel. The FlashInfer backend no longer calls
+    it once per layer -- it builds one layer-independent table per
+    ``(pool, scale)`` group and derives each layer on device -- so these tests
+    pin the derivation to the reference and pin the space count that made the
+    per-layer version 12x more expensive in ``prepare()``.
+    """
+
+    _get_kv_cache_manager = staticmethod(_build_gemma4_kv_cache_manager)
+
+    NUM_BLOCKS = 64
+    TOKENS_PER_BLOCK = 32
+    SLIDING_WINDOW = 128
+    # 32 blocks of prompt against a 128-token window: 28 of them are already
+    # out-of-window at the end of the chunk that writes them, so they are the
+    # scratch range. A prompt shorter than the window produces none at all --
+    # which is exactly why the perf-sanity shape (ISL 1000, window 1024) never
+    # exercises this path.
+    PROMPT_LEN = 1024
+
+    def _prepared_metadata(self, num_blocks=None):
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+        from tensorrt_llm._torch.metadata import KVCacheParams
+
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["sliding_window"] = self.SLIDING_WINDOW
+        config = Gemma4TextConfig(**config_dict)
+        kv_cache_manager = self._get_kv_cache_manager(
+            config,
+            num_blocks=self.NUM_BLOCKS if num_blocks is None else num_blocks,
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            enable_swa_scratch_reuse=True,
+            max_attention_window_override=self.SLIDING_WINDOW,
+        )
+        if not kv_cache_manager.enable_swa_scratch_reuse:
+            kv_cache_manager.shutdown()
+            self.skipTest("KV cache manager declined SWA scratch reuse for this shape")
+
+        request_ids = [1]
+        kv_cache_manager.add_dummy_requests(request_ids, [self.PROMPT_LEN])
+
+        metadata_cls = get_attention_backend("FLASHINFER").Metadata
+        metadata = metadata_cls(
+            seq_lens=torch.tensor([self.PROMPT_LEN], dtype=torch.int),
+            num_contexts=1,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0],
+            ),
+            max_num_requests=1,
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=[self.PROMPT_LEN],
+        )
+        with torch.inference_mode():
+            metadata.prepare()
+        return config, kv_cache_manager, metadata, request_ids
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_host_table_builds_do_not_scale_with_layers(self):
+        """The regression lock.
+
+        Every layer needs its own page-index space -- layers sharing a
+        FlashInfer plan must have identical indices, which PER_LAYER
+        addressing breaks -- so the space count is *not* the thing to hold
+        down. What must not scale with layers is host work in ``prepare()``:
+        building one flat table per layer is what cost Gemma4 2.8x TPOT.
+        The layer-independent build runs once per (pool, page-index scale)
+        group; the rest is a device fan-out.
+        """
+        config, kv_cache_manager, metadata, _ = self._prepared_metadata()
+        try:
+            expected_groups = {
+                (
+                    kv_cache_manager.layer_to_pool_mapping_dict[
+                        kv_cache_manager.layer_offsets[layer_idx]
+                    ],
+                    kv_cache_manager.get_layer_page_index_scale(layer_idx),
+                )
+                for layer_idx in kv_cache_manager.layer_offsets
+            }
+            self.assertEqual(set(metadata._index_group_layers), expected_groups)
+            self.assertLess(
+                len(expected_groups),
+                config.num_hidden_layers,
+                "Test shape must have fewer groups than layers or it cannot "
+                "distinguish per-group from per-layer host work",
+            )
+
+            calls = []
+            original = type(kv_cache_manager).get_batch_cache_indices_flat_shared
+
+            def counting(mgr, *args, **kwargs):
+                calls.append(args[-1] if args else None)
+                return original(mgr, *args, **kwargs)
+
+            with (
+                unittest.mock.patch.object(
+                    type(kv_cache_manager),
+                    "get_batch_cache_indices_flat_shared",
+                    counting,
+                ),
+                torch.inference_mode(),
+            ):
+                metadata.prepare()
+
+            self.assertEqual(
+                len(calls),
+                len(expected_groups),
+                f"prepare() built {len(calls)} host tables for "
+                f"{len(expected_groups)} (pool, scale) groups across "
+                f"{config.num_hidden_layers} layers; it must build one per "
+                "group, not one per layer",
+            )
+        finally:
+            kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_derived_indices_match_the_per_layer_reference(self):
+        """Every layer's derived table must equal the per-layer builder's.
+
+        A mismatch here is silent at runtime: attention reads another layer's
+        pages and returns plausible output. The check is exact, per layer, and
+        includes the scratch blocks -- the assertion below fails the test if the
+        shape stopped producing any, so this cannot quietly become decorative.
+        """
+        config, kv_cache_manager, metadata, request_ids = self._prepared_metadata()
+        try:
+            pool_ids = {
+                kv_cache_manager.layer_to_pool_mapping_dict[
+                    kv_cache_manager.layer_offsets[layer_idx]
+                ]
+                for layer_idx in kv_cache_manager.layer_offsets
+            }
+            kv_cache = kv_cache_manager.kv_cache_map[request_ids[0]]
+            self.assertTrue(
+                any(kv_cache.get_scratch_desc(pool_id) is not None for pool_id in pool_ids),
+                "Test shape produced no scratch blocks; it no longer exercises the scratch path",
+            )
+
+            for layer_idx in range(config.num_hidden_layers):
+                if layer_idx not in kv_cache_manager.layer_offsets:
+                    continue
+                expected = kv_cache_manager.get_batch_cache_indices_flat(
+                    request_ids, metadata.num_blocks, layer_idx=layer_idx
+                )
+                got = metadata.get_paged_kv_indices_for_layer(layer_idx)
+                self.assertEqual(
+                    got[: expected.numel()].cpu().tolist(),
+                    expected.tolist(),
+                    f"Layer {layer_idx} derived page indices diverge from the per-layer reference",
+                )
+        finally:
+            kv_cache_manager.shutdown()
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_derived_indices_stay_inside_each_layer_buffer(self):
+        """PER_LAYER indices address the pool group, so bounds are per buffer."""
+        config, kv_cache_manager, metadata, _ = self._prepared_metadata()
+        try:
+            for layer_idx in range(config.num_hidden_layers):
+                buf = kv_cache_manager.get_buffers(layer_idx, kv_layout=metadata.kv_layout)
+                if buf is None:
+                    continue
+                indices = metadata.get_paged_kv_indices_for_layer(layer_idx)
+                if indices.numel() == 0:
+                    continue
+                addressable = indices[indices >= 0]
+                if addressable.numel() == 0:
+                    continue
+                self.assertLess(
+                    int(addressable.max().item()),
+                    buf.shape[0],
+                    f"Layer {layer_idx} page index escapes its pool buffer",
+                )
+        finally:
+            kv_cache_manager.shutdown()
+
+
+class TestGemma4SwaScratchEvictedPages(unittest.TestCase):
+    """An evicted out-of-window page must not reach FlashInfer as the sentinel.
+
+    KVCacheManagerV2 marks a page that has fallen out of a layer's window with
+    BAD_PAGE_INDEX. FlashInfer may dereference a page id before it applies
+    ``window_left``, so the per-layer path rewrites the sentinel to page 0
+    before planning (``_sanitize_swa_page_indices``). The shared path builds no
+    host table to rewrite -- the per-layer term is applied on device -- so the
+    sentinel has to come out of the layer-independent decomposition instead.
+    Leaving it there is worse under PER_LAYER addressing than under SHARED:
+    -1 is off the front of the pool group's buffer, not merely the wrong page.
+    """
+
+    from tensorrt_llm._torch.attention.backends.flashinfer import (  # noqa: E402
+        FlashInferAttentionMetadata as _Meta,
+    )
+
+    LAYER = 3
+
+    def _meta(self, window):
+        meta = object.__new__(self._Meta)
+        meta.kv_cache_manager = SimpleNamespace(
+            max_attention_window_vec=[window],
+            layer_offsets={self.LAYER: 0},
+        )
+        return meta
+
+    def _parts(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+        # page 5, a block evicted for falling out of the window, page 7.
+        base = torch.tensor([5, BAD_PAGE_INDEX, 7], dtype=torch.int32)
+        valid = torch.tensor([1, 0, 1], dtype=torch.int32)
+        return base, valid
+
+    def test_evicted_entry_is_made_addressable(self):
+        base, valid = self._parts()
+        meta = self._meta(window=1024)
+        meta._sanitize_swa_shared_page_indices(base, valid, self.LAYER)
+        # base 0 paired with valid 1 is what makes the device fan-out land on
+        # `layer_offset // kv_factor` for this entry -- the layer's own page 0,
+        # inside its buffer, and thrown away again by the SWA mask. Either half
+        # alone is wrong: valid 0 keeps the sentinel, and base 0 with valid 0
+        # addresses layer 0's first page.
+        self.assertEqual(base.tolist(), [5, 0, 7])
+        self.assertEqual(valid.tolist(), [1, 1, 1])
+
+    def test_full_attention_layer_keeps_the_sentinel(self):
+        """A layer with no window cannot evict, so a -1 on it is a real bug.
+
+        Rewriting it here would turn an allocation failure into plausible
+        output read from another layer's pages.
+        """
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+        base, valid = self._parts()
+        meta = self._meta(window=None)
+        meta._sanitize_swa_shared_page_indices(base, valid, self.LAYER)
+        self.assertEqual(base.tolist(), [5, BAD_PAGE_INDEX, 7])
+        self.assertEqual(valid.tolist(), [1, 0, 1])
+
+
+class TestGemma4SwaScratchDecodeBlockTable(unittest.TestCase):
+    """The decode block tables' per-group derivation.
+
+    Content is built once per ``(pool, scale)`` group and every space in that
+    group gets its own ``layer_offset // kv_factor`` in one broadcast op --
+    replacing a row-at-a-time host loop that ran once per generation request
+    per space.
+
+    The mask that gates that offset cannot come from the table's *values*: a
+    padded entry and a genuine page 0 are the same int32, so a value-derived
+    mask hands padding a real page id belonging to another layer, which is a
+    correctness bug this class pins.
+    """
+
+    from tensorrt_llm._torch.attention.backends.flashinfer import (  # noqa: E402
+        FlashInferAttentionMetadata as _Meta,
+    )
+
+    WIDTH, SHIFT = 6, 7
+    ROW_LENS = [1, 4, 0]  # live blocks per generation request
+    GROUP = ("g", 0)
+
+    def _fixture(self):
+        import numpy as np
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+        rows = len(self.ROW_LENS)
+        meta = object.__new__(self._Meta)
+        meta._per_layer_index_spaces = True
+        meta.max_num_requests = rows
+        meta.num_context_blocks = 2  # context blocks precede generation blocks
+        meta.is_cuda_graph = False
+        meta._max_num_blocks_per_seq = self.WIDTH
+        meta._block_rect_stamp = 1
+        meta._block_rect_cache = {}
+        meta._block_rect_host = {}
+        meta._block_rect_dev = {}
+        meta._group_block_filled = {}
+        meta._group_of_space = {0: self.GROUP, 1: self.GROUP}
+        meta._index_group_layer_spaces = {self.GROUP: [0, 1]}
+        meta._vswa_pool_to_rep_layer = {0: 0, 1: 1}
+        meta._layer_index_shift = {0: 0, 1: self.SHIFT}
+        # Each space owns its table; the group is filled in one foreach pass.
+        meta._tables = [
+            torch.zeros((rows, self.WIDTH), dtype=torch.int32, device="cuda") for _ in range(2)
+        ]
+        meta._space_wrappers = {
+            i: SimpleNamespace(decode_block_tables=t) for i, t in enumerate(meta._tables)
+        }
+        # Two context blocks, then row 0: page 0 (indistinguishable from
+        # padding by value); row 1: pages 10, 11, an evicted block, 12.
+        host_indices = torch.tensor([99, 98, 0, 10, 11, BAD_PAGE_INDEX, 12], dtype=torch.int32)
+        return meta, host_indices, np.asarray(self.ROW_LENS), rows
+
+    def _filled(self, meta, space, rows):
+        return meta._tables[space][:rows, : self.WIDTH].cpu().numpy()
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs CUDA")
+    def test_padding_never_receives_the_layer_offset(self):
+        meta, host_indices, row_lens, rows = self._fixture()
+        self.assertTrue(meta._fill_group_block_tables(1, rows, self.WIDTH, row_lens, host_indices))
+        got = self._filled(meta, 1, rows)
+        # Padding stays 0; giving it `shift` would make it page id `shift`,
+        # a real page owned by another layer of this same pool group.
+        self.assertEqual(got[0, 1:].tolist(), [0] * (self.WIDTH - 1))
+        self.assertEqual(got[1, 4:].tolist(), [0] * (self.WIDTH - 4))
+        self.assertEqual(got[2].tolist(), [0] * self.WIDTH)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs CUDA")
+    def test_live_entries_gain_exactly_the_layer_offset(self):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+        meta, host_indices, row_lens, rows = self._fixture()
+        meta._fill_group_block_tables(1, rows, self.WIDTH, row_lens, host_indices)
+        got = self._filled(meta, 1, rows)
+        # A genuine page 0 must be shifted even though padding zeros are not.
+        self.assertEqual(int(got[0, 0]), 0 + self.SHIFT)
+        # The sentinel is fed in directly here. In a real iteration
+        # _prepare_shared_page_index_spaces has already removed it, so this
+        # pins the primitive's own contract rather than a reachable state.
+        self.assertEqual(
+            got[1, :4].tolist(),
+            [10 + self.SHIFT, 11 + self.SHIFT, BAD_PAGE_INDEX, 12 + self.SHIFT],
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "needs CUDA")
+    def test_one_call_fills_every_space_in_the_group(self):
+        """The point of the shared allocation: one fill, all spaces."""
+        meta, host_indices, row_lens, rows = self._fixture()
+        meta._fill_group_block_tables(1, rows, self.WIDTH, row_lens, host_indices)
+        zero_shift = self._filled(meta, 0, rows)
+        shifted = self._filled(meta, 1, rows)
+        # Space 0 has offset 0, so it is the rectangle itself.
+        self.assertEqual(int(zero_shift[0, 0]), 0)
+        self.assertEqual(int(shifted[0, 0]) - int(zero_shift[0, 0]), self.SHIFT)
+        # Padding is untouched in both.
+        self.assertEqual(shifted[0, 1:].tolist(), zero_shift[0, 1:].tolist())
+        # And the host rectangle was built once.
+        self.assertEqual(len(meta._block_rect_cache), 1)
 
 
 if __name__ == "__main__":
