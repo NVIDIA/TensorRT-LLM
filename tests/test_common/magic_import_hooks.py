@@ -34,6 +34,7 @@ files resolve their imports. See ``_check_sys_path`` below.
 
 import os
 import sys
+from pathlib import PurePath
 
 import pytest
 
@@ -150,6 +151,16 @@ def pytest_runtest_protocol(item, nextitem):
         MagicFinder.purge_magic_sys_modules()
 
 
+def _within(path: str, directory: str) -> bool:
+    """Whether ``path`` is ``directory`` itself or sits below it.
+
+    Compared as whole path components, so a sibling whose name merely starts
+    with the directory's -- ``.venv-3.12-notes`` beside ``.venv-3.12`` -- is not
+    treated as being inside it.
+    """
+    return PurePath(path).is_relative_to(directory)
+
+
 def _project_relative(entry: str) -> str | None:
     """Path of ``entry`` relative to the project root, or None if outside it.
 
@@ -158,7 +169,7 @@ def _project_relative(entry: str) -> str | None:
     """
     root = os.path.realpath(MagicFinder.project_root)
     resolved = os.path.realpath(entry or os.getcwd())
-    if resolved != root and not resolved.startswith(root + os.sep):
+    if not _within(resolved, root):
         return None
     return os.path.relpath(resolved, root)
 
@@ -192,10 +203,33 @@ def _under_exempt_tree(relative: str) -> bool:
     nested path such as a build directory matches its whole tree.
     """
     for tree in _NON_TEST_TREES:
-        prefix = tree.replace("/", os.sep)
-        if relative == prefix or relative.startswith(prefix + os.sep):
+        if _within(relative, tree.replace("/", os.sep)):
             return True
     return False
+
+
+# Prefixes of the running interpreter's own installation. A virtual environment
+# inside the project root is supported first-party layout, not something a test
+# did: scripts/build_wheel.py defaults to ``<project>/.venv-<pyver>``, .gitignore
+# blesses ``venv/`` and ``.venv-*/``, and the Jenkins PLC job creates one in the
+# workspace. So the interpreter's own bin/ and lib/ may legitimately sit under
+# the root, and no test file can author them -- exempting them leaves the check
+# its teeth.
+#
+# Every install scheme puts scripts and site-packages under one of these four
+# (see sysconfig._INSTALL_SCHEMES, whose paths are all rooted at {base},
+# {platbase} or {installed_base}), so naming the prefixes covers them without
+# asking sysconfig -- which answers get_path() by importing _sysconfigdata_*
+# through sys.path, and so raises once a test has stubbed sys.path.
+_INTERPRETER_ROOTS = frozenset(
+    os.path.realpath(prefix)
+    for prefix in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+)
+
+
+def _under_interpreter_root(resolved: str) -> bool:
+    """Whether an already-resolved path is part of the interpreter's install."""
+    return any(_within(resolved, root) for root in _INTERPRETER_ROOTS)
 
 
 def _expected_entries(config) -> set[str]:
@@ -244,7 +278,10 @@ def _check_sys_path(config) -> list[str]:
             continue
         if _under_exempt_tree(relative):
             continue
-        if _is_pytest_basedir(os.path.join(root, relative)):
+        resolved = os.path.join(root, relative)
+        if _under_interpreter_root(resolved):
+            continue
+        if _is_pytest_basedir(resolved):
             continue
         if relative not in unexpected:
             unexpected.append(relative)
