@@ -1077,7 +1077,7 @@ def run_transfer_test(
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
             )
             gen_request.py_disaggregated_params = DisaggregatedParams(
-                ctx_request_id=ctx_rid,
+                ctx_request_id=unique_rid,
                 ctx_dp_rank=ctx_dp_rank,
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
