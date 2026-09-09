@@ -4883,6 +4883,13 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable attention data parallel.",
         status="beta")
 
+    enable_locality_domains: bool = Field(
+        default=False,
+        description=
+        "Enable locality domain execution for supported PyTorch backend ops.",
+        status="prototype",
+    )
+
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
         description="Enable LM head TP in attention dp.",
