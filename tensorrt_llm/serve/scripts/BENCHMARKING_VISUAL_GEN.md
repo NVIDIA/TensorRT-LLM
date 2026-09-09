@@ -104,6 +104,11 @@ requests — **one sample per request**.
 ### Latency breakdown
 
 ```mermaid
+---
+config:
+  sequence:
+    noteMargin: 4
+---
 sequenceDiagram
     participant C as benchmark_visual_gen<br/>(client)
     participant S as trtllm-serve
@@ -120,7 +125,6 @@ sequenceDiagram
         C->>S: POST /v1/videos
         S-->>C: 202 + job id
         C->>S: GET /v1/videos/{id}
-        Note over C,S: every --poll-interval
         S-->>C: status: postprocessing
         Note over C,S: ends gen_latency
         S-->>C: status: completed
