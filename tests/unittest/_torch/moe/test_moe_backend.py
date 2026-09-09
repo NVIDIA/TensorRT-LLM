@@ -1041,6 +1041,7 @@ def _make_megamoe_cutedsl_minimax_problem(
         swiglu_gptoss_style=True,
         bias=bias,
         activation=activation.name,
+        activation_constants=frozenset({"alpha", "beta", "clamp"}),
     )
 
 
