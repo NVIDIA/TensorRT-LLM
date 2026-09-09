@@ -143,7 +143,59 @@ class TopK(nn.Module):
                 row_ends,
                 output_indices,
             )
-        if self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
+        if self.prefill_implementation == TopKImplementation.CUTE_DSL_GVR:
+            # hint-free k derives from the output width; pin it to the module's k
+            assert output_indices.shape[1] == self.top_k
+            if not self.gvr_self_sampling:
+                # the temporal (hint) GVR engine has no prefill form
+                logger.warning_once(
+                    "temporal GVR has no prefill engine; using the CUDA radix prefill Top-K.",
+                    key="gvr_temporal_prefill_radix",
+                )
+            elif scores.shape[1] <= self.top_k:
+                # every row is short (nv <= k): the exact radix path emits the
+                # identity/-1 answer without reading logits — cheaper than a
+                # zero-work self-sampling launch. Deliberate, no warning.
+                pass
+            elif self._selfsampling_prefill_ok(scores):
+                from ..cute_dsl_kernels.blackwell.top_k import (
+                    selfsampling_topk_prefill_ready,
+                    selfsampling_topk_run_prefill,
+                )
+
+                if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
+                    scores, output_indices
+                ):
+                    # the engine never JIT-compiles under capture; an engine
+                    # missed by warmup takes the exact radix path in the graph
+                    logger.warning_once(
+                        "self-sampling GVR prefill engine is not compiled for this "
+                        "shape and cannot JIT under CUDA graph capture; using the "
+                        "CUDA radix prefill Top-K.",
+                        key="selfsampling_topk_prefill_capture_radix",
+                    )
+                else:
+                    logger.info_once(
+                        "self-sampling GVR prefill top-K engaged "
+                        f"(K={self.top_k}, cr={self.compress_ratio}, hint-free).",
+                        key="selfsampling_topk_prefill_engaged",
+                    )
+                    # ks/ke are already in compressed column units; run_prefill
+                    # writes the local (column - ks) frame with -1 pad and no
+                    # host reads (envelope from scores.shape[1]).
+                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    return output_indices
+            else:
+                # engine hardware-format gate missed (e.g. a non-fp4 layer with
+                # an odd DeepGEMM width, or a bf16 producer): exact radix.
+                logger.warning_once(
+                    "self-sampling GVR prefill is selected but the scores do "
+                    "not satisfy the engine's hardware-format gate "
+                    f"(dtype={scores.dtype}, strides={tuple(scores.stride())}); "
+                    "falling back to the CUDA radix prefill Top-K.",
+                    key="selfsampling_topk_prefill_fallthrough",
+                )
+        elif self.prefill_implementation == TopKImplementation.CUTE_DSL_RADIX:
             # Keep the op's reread policy default; only its copy width is tuned.
             torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
                 scores,
@@ -154,7 +206,7 @@ class TopK(nn.Module):
                 _CUTE_DSL_PREFILL_COPY_BITS,
             )
             return output_indices
-        if self.prefill_implementation != TopKImplementation.CUDA_RADIX:
+        elif self.prefill_implementation != TopKImplementation.CUDA_RADIX:
             raise NotImplementedError(
                 f"{self.prefill_implementation.value} does not support prefill Top-K"
             )
@@ -166,6 +218,20 @@ class TopK(nn.Module):
             self.top_k,
         )
         return output_indices
+
+    def _selfsampling_prefill_ok(self, scores: torch.Tensor) -> bool:
+        """Engine format gate: fp32 row-major scores with a float4-aligned row
+        stride and a 16B base (the DeepGEMM prefill logits arena)."""
+        return (
+            scores.dtype == torch.float32
+            and scores.stride(1) == 1
+            and scores.stride(0) % 4 == 0
+            and scores.data_ptr() % 16 == 0
+        )
+
+    @staticmethod
+    def _prefill_capturing(scores: torch.Tensor) -> bool:
+        return scores.is_cuda and torch.cuda.is_current_stream_capturing()
 
     def _forward_decode(
         self,
