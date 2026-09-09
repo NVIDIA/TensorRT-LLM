@@ -151,13 +151,11 @@ void initBindings(nb::module_& m)
         .def("pause", &GenLlmReq::pause, nb::arg("max_input_len"))
         .def_prop_rw("max_sent_token_len", &GenLlmReq::getMaxSentTokenLen, &GenLlmReq::setMaxSentTokenLen)
         .def_prop_ro("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
-        .def_prop_ro("mrope_rotary_cos_sin", &GenLlmReq::getMropeRotaryCosSin)
         .def_prop_rw("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
         .def_prop_rw("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
         .def_prop_ro("context_logits", &GenLlmReq::getContextLogitsHost)
         .def_prop_ro("generation_logits", &GenLlmReq::getGenerationLogitsHost)
         .def_prop_ro("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
-        .def_prop_ro("mrope_position_deltas", &GenLlmReq::getMropePositionDeltas)
         .def_prop_ro("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_prop_rw("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
         .def_prop_rw("decoding_iter", &GenLlmReq::getDecodingIter, &GenLlmReq::setDecodingIter)
@@ -374,8 +372,6 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
                 std::optional<std::vector<std::optional<std::string>>> multimodal_uuids,
-                std::optional<at::Tensor> mrope_rotary_cos_sin,
-                std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                 std::optional<at::Tensor> lora_config,
                 std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
@@ -407,27 +403,25 @@ void initBindings(nb::module_& m)
 
                 auto prompt_embedding_table_tensor_ptr = makeOptionalTensor(prompt_embedding_table);
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
-                auto mrope_rotary_cos_sin_tensor_ptr = makeOptionalTensor(mrope_rotary_cos_sin);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
                 auto encoder_input_features_tensor_ptr = makeOptionalTensor(encoder_input_features);
 
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_uuids, mrope_rotary_cos_sin_tensor_ptr,
-                    mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
-                    draft_tokens, exclude_input_from_output, encoder_input_tokens, return_encoder_output, client_id,
-                    priority, encoder_input_features_tensor_ptr, encoder_output_length, llm_request_type,
-                    input_token_extra_ids, return_perf_metrics, allotted_time_ms, context_phase_params, arrival_time,
-                    std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
-                    multimodal_run_lengths, std::move(cache_salt)};
+                    multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr,
+                    lora_config_tensor_ptr, kv_cache_retention_config, return_log_probs, return_context_logits,
+                    return_generation_logits, draft_tokens, exclude_input_from_output, encoder_input_tokens,
+                    return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
+                    encoder_output_length, llm_request_type, input_token_extra_ids, return_perf_metrics,
+                    allotted_time_ms, context_phase_params, arrival_time, std::move(agent_hierarchy),
+                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
+                    std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("prompt_embedding_table") = std::nullopt,
             nb::arg("prompt_vocab_size") = std::nullopt, nb::arg("multimodal_hashes") = std::nullopt,
             nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
-            nb::arg("multimodal_uuids") = std::nullopt, nb::arg("mrope_rotary_cos_sin") = std::nullopt,
-            nb::arg("mrope_position_deltas") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
+            nb::arg("multimodal_uuids") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
             nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
             nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
             nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,

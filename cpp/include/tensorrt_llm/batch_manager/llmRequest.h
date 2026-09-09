@@ -123,8 +123,6 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
-        std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
-        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
@@ -165,8 +163,6 @@ public:
         , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
         , mMultimodalRunPositions(std::move(multimodalRunPositions))
         , mMultimodalRunLengths(std::move(multimodalRunLengths))
-        , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
-        , mMropePositionDeltas(mropePositionDeltas)
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
@@ -336,13 +332,6 @@ public:
                     = std::make_shared<VecTokenExtraIds>(pTuningConfig->getInputTokenExtraIds().value());
             }
         }
-        auto mRopeConfig = req.getMropeConfig();
-        if (mRopeConfig)
-        {
-            mMropeRotaryCosSin = executor::detail::toITensor(mRopeConfig.value().getMRopeRotaryCosSin());
-            mMropePositionDeltas = mRopeConfig.value().getMRopePositionDeltas();
-        }
-
         auto multimodalInput = req.getMultimodalInput();
         if (multimodalInput)
         {
@@ -913,16 +902,6 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunLengths() const
     {
         return mMultimodalRunLengths;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr> getMropeRotaryCosSin() const
-    {
-        return mMropeRotaryCosSin;
-    }
-
-    [[nodiscard]] std::optional<SizeType32> getMropePositionDeltas() const
-    {
-        return mMropePositionDeltas;
     }
 
     [[nodiscard]] std::optional<LoraTaskIdType> getLoraTaskId() const
@@ -1936,9 +1915,6 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuOffsets{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunLengths{std::nullopt};
-    std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
-    std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
-
     std::optional<LoraTaskIdType> mLoraTaskId{std::nullopt};
     std::optional<TensorPtr> mLoraWeights{std::nullopt};
     std::optional<TensorPtr> mLoraConfig{std::nullopt};
@@ -2173,8 +2149,6 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
-        std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
@@ -2209,9 +2183,8 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
-            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
-            std::move(loraConfig), std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits,
-            returnGenerationLogits,
+            loraTaskId, std::move(loraWeights), std::move(loraConfig), std::move(kvCacheRetentionConfig),
+            returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             excludeInputFromOutput,
