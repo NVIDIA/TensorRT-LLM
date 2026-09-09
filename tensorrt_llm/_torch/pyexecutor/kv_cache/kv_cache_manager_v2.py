@@ -1369,11 +1369,22 @@ class KVCacheManagerV2(BaseResourceManager):
                         self._pool_layer_ids_by_role.setdefault(
                             (pool_id, buffer_id.role), buffer_id.layer_id
                         )
-        # num_pools is the logical layer-group count. With SWA scratch reuse,
-        # scratch slot IDs are only valid with per-layer page indices, so the
-        # attention op sees one virtual pool per local layer while the
-        # underlying manager can still group layers.
-        if self.enable_swa_scratch_reuse:
+        # A lifecycle group can contain different page sizes in separate
+        # physical pools (e.g. Gemma's heterogeneous head dimensions). Those
+        # layers cannot share a pool pointer or page-index scale. Use the
+        # per-layer conversion path, also required for SWA scratch slots,
+        # while keeping the underlying lifecycle grouping unchanged.
+        self._use_per_layer_page_tables = self.enable_swa_scratch_reuse or any(
+            len(
+                {
+                    self.impl.get_page_stride(layer_id, self._get_pool_roles(pool_id)[0])
+                    for layer_id in layer_ids
+                }
+            )
+            > 1
+            for pool_id, layer_ids in enumerate(self.impl.layer_grouping)
+        )
+        if self._use_per_layer_page_tables:
             self.num_attention_op_pools = self.num_local_layers
         else:
             self.num_attention_op_pools = self.num_pools
@@ -1492,7 +1503,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 pool_id = self.impl.get_layer_group_id(layer_id)
                 role_a, _ = self._get_pool_roles(pool_id)
@@ -1658,7 +1669,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
 
     def _kv_pool_mapping_offset(
@@ -4363,7 +4374,7 @@ class KVCacheManagerV2(BaseResourceManager):
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
         assert copy_idx.shape[0] == num_seqs
 
-        if self.enable_swa_scratch_reuse:
+        if self._use_per_layer_page_tables:
             self._copy_batch_block_offsets_per_layer(
                 dst_tensor, request_ids, copy_idx, num_contexts, num_seqs
             )

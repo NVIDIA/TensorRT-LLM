@@ -158,7 +158,8 @@ class TestExtraBuffersCacheConfig(unittest.TestCase):
             del mgr
 
     def test_page_table_uses_physical_pool_representative(self):
-        mgr = KVCacheManagerV2(**_make_kwargs(head_dim=[64, 192, 64, 192]))
+        # Equal page sizes exercise the shared page-table path.
+        mgr = KVCacheManagerV2(**_make_kwargs())
         real_impl = mgr.impl
         try:
             pool_id = 0
