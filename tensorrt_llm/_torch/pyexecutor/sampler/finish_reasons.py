@@ -661,9 +661,11 @@ class FinishReasonsHandler:
         assert seq_lens.numel() == seq_slots.numel()
         assert seq_slots.dtype == torch.int64 and seq_lens.dtype in (torch.int32, torch.int64)
         assert new_tokens.is_contiguous()
+        # One row past the real slots: the sampler's new_tokens buffer carries a
+        # scratch row for CUDA graph padding (see TorchSampler.dummy_slot_row).
         assert new_tokens.shape == (
             self._max_tokens,
-            self._max_num_sequences,
+            self._max_num_sequences + 1,
             self._max_beam_width,
         )
         return self._fused_tile_fits and seq_slots.numel() > 0

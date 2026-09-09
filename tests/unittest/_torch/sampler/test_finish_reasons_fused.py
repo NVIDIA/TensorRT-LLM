@@ -30,7 +30,11 @@ def test_fused_matches_tensor_ops(max_tokens: int, max_beam_width: int) -> None:
     seq_slots = torch.tensor([3, 0, 4], dtype=torch.int64, device="cuda")
     seq_lens = torch.tensor([7, 13, 15], dtype=torch.int32, device="cuda")
     new_tokens = torch.randint(
-        0, 50, (max_tokens, max_num_sequences, max_beam_width), dtype=torch.int32, device="cuda"
+        0,
+        50,
+        (max_tokens, max_num_sequences + 1, max_beam_width),
+        dtype=torch.int32,
+        device="cuda",
     )
     new_tokens[0, 4, 0] = end_id  # one slot finishes on the end ID, one on max length
 

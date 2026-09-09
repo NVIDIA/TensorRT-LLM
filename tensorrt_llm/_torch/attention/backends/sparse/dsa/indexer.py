@@ -754,9 +754,19 @@ class Indexer(nn.Module):
                 if self.use_cute_dsl_topk
                 else TopKImplementation.CUDA_RADIX
             )
+        # Prefill uses the self-sampling engine on exactly the layers where the
+        # decode dispatch picks it; the temporal-hint engine has no prefill form.
+        prefill_top_k_implementation = (
+            TopKImplementation.CUTE_DSL_GVR
+            if (
+                decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
+                and self._use_self_sampling_topk
+            )
+            else TopKImplementation.CUDA_RADIX
+        )
         self.top_k = TopK(
             self.index_topk,
-            prefill_implementation=TopKImplementation.CUDA_RADIX,
+            prefill_implementation=prefill_top_k_implementation,
             decode_implementation=decode_top_k_implementation,
             compress_ratio=self.compress_ratio,
             gvr_self_sampling=self._use_self_sampling_topk,

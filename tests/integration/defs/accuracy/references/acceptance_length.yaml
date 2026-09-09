@@ -66,7 +66,7 @@ TestQwen3_30B_A3B::test_eagle3_accuracy[dynamic]:
 TestQwen3_5_35B_A3B::test_bf16_mtp:
   ref_al: 3.504435
   min_al: 3.32921325
-TestQwen3_8_Flash_Next::test_fp8_1gpu_mtp3_trtllm_ple_offload:
+TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_trtllm_ple_offload:
   ref_al: 1.890148
   min_al: 1.7956406
 # The usual 95% tolerance for these low values is below the no-acceptance
