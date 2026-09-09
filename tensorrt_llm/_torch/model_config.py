@@ -29,6 +29,7 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
@@ -278,6 +279,10 @@ class ModelConfig(Generic[TConfig]):
     use_cute_dsl_bf16_bmm: bool = False
     use_cute_dsl_bf16_gemm: bool = False
 
+    # locality domain execution policy (controls partitioned linear/MoE execution)
+    locality_domain_policy: LocalityDomainPolicy = field(
+        default_factory=LocalityDomainPolicy)
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
@@ -359,6 +364,8 @@ class ModelConfig(Generic[TConfig]):
             self._moe_max_num_tokens_is_default = self.moe_max_num_tokens is None
         if self.moe_max_num_tokens is None:
             self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
+
+        self.extra_attrs["locality_domain_policy"] = self.locality_domain_policy
 
     def is_moe_max_num_tokens_default(self) -> bool:
         """Whether ``moe_max_num_tokens`` was derived rather than configured.
@@ -1006,6 +1013,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = sparse_attention_config.q_split_threshold
                 indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
                 enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                use_gvr_emission = sparse_attention_config.use_gvr_emission
                 indexer_k_dtype = sparse_attention_config.indexer_k_dtype
             else:
                 index_n_heads = pretrained_config.index_n_heads
@@ -1019,6 +1028,8 @@ class ModelConfig(Generic[TConfig]):
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
+                use_self_sampling_topk = True
+                use_gvr_emission = False
                 default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
                 )
                 indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
@@ -1035,6 +1046,8 @@ class ModelConfig(Generic[TConfig]):
             indexer_config['q_split_threshold'] = q_split_threshold
             indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
             indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['use_self_sampling_topk'] = use_self_sampling_topk
+            indexer_config['use_gvr_emission'] = use_gvr_emission
             indexer_config['indexer_k_dtype'] = indexer_k_dtype
             return indexer_config
 
@@ -1072,6 +1085,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
+                        use_gvr_emission = sparse_attention_config.use_gvr_emission
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
@@ -1084,6 +1099,8 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_paged_mqa_logits = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        use_self_sampling_topk = True
+                        use_gvr_emission = False
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1100,6 +1117,8 @@ class ModelConfig(Generic[TConfig]):
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
+                            use_self_sampling_topk=use_self_sampling_topk,
+                            use_gvr_emission=use_gvr_emission,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)

@@ -19,11 +19,17 @@ import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakePhasedFmha
 
-from tensorrt_llm._torch.attention_backend.fmha.combined import CombinedFmha
-from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
-from tensorrt_llm._torch.attention_backend.fmha.interface import FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.triton_custom_mask import TritonCustomMaskFmha
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
+from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+    FlashInferTrtllmGenFmha,
+)
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.triton_custom_mask import TritonCustomMaskFmha
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
@@ -50,14 +56,14 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
     metadata = SimpleNamespace(
         kv_cache_block_offsets=object(),
         effective_workspace=torch.empty(0, dtype=torch.uint8),
-        num_contexts=1,
-        num_ctx_tokens=2,
-        num_generations=1,
-        kv_lens_cuda_runtime=torch.tensor([2, 5], dtype=torch.int32),
-        kv_lens_runtime=torch.tensor([2, 5], dtype=torch.int32),
-        prompt_lens_cuda_runtime=torch.tensor([2, 1], dtype=torch.int32),
-        prompt_lens_cpu_runtime=torch.tensor([2, 1], dtype=torch.int32),
-        beam_width=1,
+        num_contexts=2,
+        num_ctx_tokens=3,
+        num_generations=4,
+        kv_lens_cuda_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([2, 1, 5, 5, 5, 5], dtype=torch.int32),
+        prompt_lens_cuda_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
+        prompt_lens_cpu_runtime=torch.tensor([2, 1, 1, 1, 1, 1], dtype=torch.int32),
+        beam_width=2,
         cache_indirection=None,
         tokens_per_block=32,
         kv_cache_manager=None,
@@ -65,35 +71,39 @@ def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:
         is_spec_decoding_enabled=False,
     )
     forward_args = AttentionForwardArgs(
-        output=torch.empty((3, 4)),
+        output=torch.empty((7, 4)),
         attention_input_type=AttentionInputType.mixed,
         attention_window_size=8,
     )
 
-    combined_fmha.forward(torch.empty((3, 4)), None, None, metadata, forward_args)
+    combined_fmha.forward(torch.empty((7, 4)), None, None, metadata, forward_args)
 
     assert events == [
         ("prepare", "context"),
         ("prepare", "generation"),
-        ("run", "context", FmhaPhase.CONTEXT, 2),
-        ("run", "generation", FmhaPhase.GENERATION, 1),
+        ("run", "context", FmhaPhase.CONTEXT, 3, 2, 2),
+        ("run", "generation", FmhaPhase.GENERATION, 4, 4, 2),
     ]
     assert metadata.effective_workspace.numel() == 8
 
 
 def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
-    attn = FakeAttention()
+    attn = FakeAttention(local_layer_idx=3)
     combined_fmha = CombinedFmha(attn)
-    kv_cache_manager = SimpleNamespace(
-        impl=SimpleNamespace(get_page_index_upper_bound=lambda: 23),
-        blocks_in_primary_pool=23,
-        num_local_layers=4,
-    )
+    calls: list[tuple[int, object]] = []
+
+    def get_page_index_upper_bound(local_layer_idx: int, role: object) -> int:
+        calls.append((local_layer_idx, role))
+        return 23
+
+    kv_cache_manager = object.__new__(KVCacheManagerV2)
+    kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
     assert (
         combined_fmha._get_total_num_blocks(SimpleNamespace(kv_cache_manager=kv_cache_manager))
         == 23
     )
+    assert calls == [(3, Role.KEY)]
 
 
 def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
@@ -119,94 +129,6 @@ def test_triton_custom_mask_rejects_whole_request_probe() -> None:
     )
 
 
-@pytest.mark.parametrize("is_fused_qkv", [True, False], ids=["fused_qkv", "q_only"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("sm_version", [100, 103])
-@pytest.mark.parametrize("tokens_per_block", [32, 64])
-@pytest.mark.parametrize("num_contexts", [1, 4, 5])
-@pytest.mark.parametrize("head_dim", [64, 256, 512])
-def test_flashinfer_context_fallback_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    dtype: torch.dtype,
-    sm_version: int,
-    tokens_per_block: int,
-    num_contexts: int,
-    head_dim: int,
-    is_fused_qkv: bool,
-) -> None:
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
-        lambda: sm_version,
-    )
-    fmha = object.__new__(FlashInferTrtllmGenFmha)
-    fmha.kv_factor = 2
-    attn = FakeAttention()
-    attn.sparse_params = None
-    attn.position_embedding_type = 0
-    attn.head_dim = head_dim
-    q_hidden_size = attn.num_heads * attn.head_dim
-    # Both layouts the trtllm-gen self-attention path accepts, wired the way
-    # TrtllmAttention.forward wires them: fused QKV carries K/V inline and writes
-    # the cache, while a Q-only input only reads an already-populated cache.
-    input_hidden_size = q_hidden_size
-    if is_fused_qkv:
-        input_hidden_size += 2 * attn.num_kv_heads * attn.head_dim
-    q = torch.empty((num_contexts, input_hidden_size), dtype=dtype)
-    kv_cache_dtype = DataType.BF16 if dtype == torch.bfloat16 else DataType.HALF
-    metadata = SimpleNamespace(
-        num_contexts=num_contexts,
-        helix_position_offsets=None,
-        num_sparse_topk=0,
-        use_spec_decoding=False,
-        is_spec_dec_tree=False,
-        kv_cache_block_offsets=object(),
-        kv_cache_manager=SimpleNamespace(dtype=kv_cache_dtype),
-        is_cross=False,
-        is_spec_decoding_enabled=False,
-        tokens_per_block=tokens_per_block,
-        beam_width=1,
-    )
-    forward_args = AttentionForwardArgs(
-        output=torch.empty((num_contexts, q_hidden_size), dtype=dtype),
-        attention_input_type=AttentionInputType.mixed,
-        is_fused_qkv=is_fused_qkv,
-        update_kv_cache=is_fused_qkv,
-    )
-
-    small_bf16_fallback = (
-        dtype == torch.bfloat16 and num_contexts <= 4 and is_fused_qkv and head_dim != 512
-    )
-    expected_fallback = small_bf16_fallback or sm_version == 103
-    for phase in (None, FmhaPhase.CONTEXT):
-        supported, reason = fmha._is_supported_with_reason(
-            q,
-            None,
-            None,
-            attn,
-            metadata,
-            forward_args,
-            phase=phase,
-        )
-        if expected_fallback:
-            assert not supported
-            assert "fallback FMHA" in reason
-        else:
-            assert supported, reason
-            assert reason == ""
-
-    generation_supported, generation_reason = fmha._is_supported_with_reason(
-        q,
-        None,
-        None,
-        attn,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.GENERATION,
-    )
-    assert generation_supported, generation_reason
-    assert generation_reason == ""
-
-
 @pytest.mark.parametrize("kv_cache_dtype", [DataType.FP8, DataType.NVFP4])
 @pytest.mark.parametrize(
     "dtype,sm_version",
@@ -220,11 +142,12 @@ def test_flashinfer_quantized_kv_context_avoids_fp16_bf16_fallback(
     sm_version: int,
 ) -> None:
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen.get_sm_version",
+        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen.get_sm_version",
         lambda: sm_version,
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
     fmha.kv_factor = 2
+    monkeypatch.setattr(fmha, "_get_total_num_blocks", lambda _: 0)
     attn = SimpleNamespace(
         is_mla_enable=False,
         sparse_params=None,

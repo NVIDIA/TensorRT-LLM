@@ -17,13 +17,13 @@ from typing import Callable
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.fmha.interface import Fmha, FmhaPhase
-from tensorrt_llm._torch.attention_backend.fmha.phased import FmhaParams, PhasedFmha
-from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPhase
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams, PhasedFmha
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 
 
 class FakeAttention:
-    def __init__(self) -> None:
+    def __init__(self, local_layer_idx: int = 0) -> None:
         self.is_mla_enable = False
         self.kv_lora_rank = None
         self.v_head_dim = None
@@ -31,8 +31,8 @@ class FakeAttention:
         self.num_heads = 1
         self.num_kv_heads = 1
         self.predicted_tokens_per_seq = 1
-        self.flashinfer_mla_backend = None
         self.has_fp8_kv_cache = False
+        self.local_layer_idx = local_layer_idx
 
 
 class FakePhasedFmha(PhasedFmha):
@@ -81,10 +81,28 @@ class FakePhasedFmha(PhasedFmha):
             workspace.resize_(self._workspace_size)
 
     def run_context(self, params: FmhaParams) -> None:
-        self._events.append(("run", self._name, FmhaPhase.CONTEXT, params.num_tokens))
+        self._events.append(
+            (
+                "run",
+                self._name,
+                FmhaPhase.CONTEXT,
+                params.num_tokens,
+                params.batch_size,
+                params.num_requests,
+            )
+        )
 
     def run_generation(self, params: FmhaParams) -> None:
-        self._events.append(("run", self._name, FmhaPhase.GENERATION, params.num_tokens))
+        self._events.append(
+            (
+                "run",
+                self._name,
+                FmhaPhase.GENERATION,
+                params.num_tokens,
+                params.batch_size,
+                params.num_requests,
+            )
+        )
 
 
 class FakeFmha(Fmha):

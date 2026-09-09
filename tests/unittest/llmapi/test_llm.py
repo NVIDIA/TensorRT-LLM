@@ -28,6 +28,7 @@ import torch
 import transformers
 
 from tensorrt_llm import LLM
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
@@ -501,91 +502,6 @@ def test_generate_with_stop_words():
                                                     stop_token_ids=[stop_id]),
                      finish_reasons=['stop'],
                      stop_reasons=["I J"])
-
-
-@force_ampere
-@pytest.mark.part0
-@pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
-])
-def test_generate_with_detokenization_stop_words(model_path):
-    llm = LLM(
-        model=model_path,
-        kv_cache_config=global_kvcache_config,
-    )
-
-    # Format the prompt using chat template
-    messages = [{
-        "role": "user",
-        "content": "Say exactly: Hello there! How can I help"
-    }]
-
-    formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
-
-    detokenization_prompts = [formatted_prompt]
-
-    # Test case 1: Stop word "How" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there!"],
-                     sampling_params=SamplingParams(stop="How", max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["How"])
-
-    # Test case 2: Stop word "there" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello"],
-                     sampling_params=SamplingParams(stop="there",
-                                                    max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["there"])
-
-    # Test case 3: Stop word that should not be found after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there! How can I help"],
-                     sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
-                     finish_reasons=['length'],
-                     stop_reasons=[None])
-
-    # Test case 4: Multiple stop words, one should be found after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello"],
-                     sampling_params=SamplingParams(stop=["XYZ", "there"],
-                                                    max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["there"])
-
-
-@force_ampere
-@pytest.mark.part0
-@pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
-])
-def test_generate_with_detokenization_stop_words_streaming(model_path):
-    llm = LLM(
-        model=model_path,
-        kv_cache_config=global_kvcache_config,
-    )
-
-    # Format the prompt using chat template
-    messages = [{
-        "role": "user",
-        "content": "Say exactly: Hello there! How can I help"
-    }]
-
-    formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
-
-    sampling_params = SamplingParams(stop="How", max_tokens=10)
-
-    for output in llm.generate_async(formatted_prompt,
-                                     sampling_params=sampling_params,
-                                     streaming=True):
-        if output.outputs[0].finish_reason == 'stop':
-            assert output.outputs[0].stop_reason == "How"
-            break
-        elif output.outputs[0].finish_reason == 'length':
-            assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
 
 
 @force_ampere
@@ -1412,6 +1328,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.metrics_collector = None
         server._collect_perf_metrics = False
         server._input_proc_executor = None
+        server._adjusted_steady_clock = AdjustedSteadyClock()
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],

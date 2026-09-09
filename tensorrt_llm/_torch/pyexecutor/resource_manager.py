@@ -65,12 +65,12 @@ PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheMana
 WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention_backend.interface import \
+    from tensorrt_llm._torch.attention.backends.interface import \
         AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
 
-    from .kv_cache_manager_v2 import KVCacheManagerV2
+    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -1447,7 +1447,7 @@ class KVCacheManager(BaseResourceManager):
         # applies to it.
         if self.kv_cache_type != CacheTypeCpp.CROSS:
             if not self.is_draft:
-                from .kv_cache_manager_v2 import \
+                from .kv_cache.kv_cache_manager_v2 import \
                     _update_kv_cache_draft_token_location
 
                 _update_kv_cache_draft_token_location(self, scheduled_batch,
@@ -2576,10 +2576,10 @@ class KVCacheManager(BaseResourceManager):
             # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
             # AttentionMetadata.create_cross_metadata() sets
             # cross_md.kv_cache_manager = cross_kv_cache_manager
-            # (attention_backend/interface.py), and then
+            # (attention/backends/interface.py), and then
             # TrtllmAttentionMetadata.prepare() calls
             # self.kv_cache_manager.copy_batch_block_offsets(...)
-            # (attention_backend/trtllm.py), which dispatches here on the
+            # (attention/backends/trtllm.py), which dispatches here on the
             # cross manager.
             num_gen_requests = len(request_ids) - num_context
             expected_num_seqs = num_context + num_gen_requests * beam_width
@@ -2819,7 +2819,7 @@ class KVCacheCompressionManager(BaseResourceManager):
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
     ) -> None:
         """Bind the target and optional draft KVCMs after their construction."""
-        from .kv_cache_manager_v2 import KVCacheManagerV2
+        from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise TypeError("KV-cache compression requires KVCacheManagerV2")

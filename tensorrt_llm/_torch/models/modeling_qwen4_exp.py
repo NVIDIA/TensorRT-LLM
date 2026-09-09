@@ -30,9 +30,9 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.sparse.qsa.indexer import QSAIndexer
-from ..attention_backend.sparse.qsa.params import QSASparseParams
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.sparse.qsa.indexer import QSAIndexer
+from ..attention.backends.sparse.qsa.params import QSASparseParams
 from ..distributed import AllReduce, AllReduceParams, allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -50,7 +50,7 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_qwen3 import Qwen3Attention
-from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules
+from .modeling_qwen3_5 import _normalize_qwen35_exclude_modules, _normalize_qwen35_quant_config_dict
 from .modeling_qwen3_next import Qwen3NextSparseMoeBlock
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -1119,6 +1119,7 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         _normalize_qwen35_exclude_modules(model_config)
+        _normalize_qwen35_quant_config_dict(model_config)
         spec_config = getattr(model_config, "spec_config", None)
         if spec_config is not None and spec_config.spec_dec_mode.is_mtp_one_model():
             # The checkpoint contains one trained layer. Multi-token drafting

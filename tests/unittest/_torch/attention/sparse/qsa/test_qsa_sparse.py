@@ -6,17 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.qsa import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa import (
     QSAMambaHybridCacheManagerV2,
     QSASparseMetadataParams,
     QSASparseParams,
 )
-from tensorrt_llm._torch.attention_backend.sparse.qsa.indexer import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     QSAIndexer,
     _position_coordinates,
     average_pool_qsa_keys,
 )
-from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     _expand_launch,
     _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
@@ -26,8 +26,8 @@ from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
-from tensorrt_llm._torch.attention_backend.sparse.qsa.metadata import QSAAttentionMetadata
-from tensorrt_llm._torch.attention_backend.sparse.qsa.module import (
+from tensorrt_llm._torch.attention.backends.sparse.qsa.metadata import QSAAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     _store_paged_kv_reference,
     expand_qsa_block_indices,
     qsa_sparse_gqa,
@@ -110,7 +110,7 @@ def test_expand_launch_splits_columns_only_for_narrow_batches(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_expand_qsa_blocks_rejects_non_unit_inner_stride() -> None:
     """Only stride(0) reaches the kernel, so the other axes must be dense."""
-    from tensorrt_llm._torch.attention_backend.sparse.qsa.kernels import (
+    from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
         triton_expand_qsa_block_indices,
     )
 
@@ -162,7 +162,7 @@ def test_expand_qsa_blocks_column_split_matches_whole_row(
         **arguments,
     )
     monkeypatch.setattr(
-        "tensorrt_llm._torch.attention_backend.sparse.qsa.kernels._EXPAND_ROWS_FILLING_DEVICE",
+        "tensorrt_llm._torch.attention.backends.sparse.qsa.kernels._EXPAND_ROWS_FILLING_DEVICE",
         0,
     )
     whole_row = expand_qsa_block_indices(

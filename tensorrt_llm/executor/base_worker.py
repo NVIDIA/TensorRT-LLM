@@ -53,7 +53,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
 if TYPE_CHECKING:
-    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [
@@ -200,7 +200,6 @@ class BaseWorker(GenerationExecutor):
                     self.llm_args.checkpoint_loader,
                     self.llm_args.checkpoint_format,
                     mx_config=self.llm_args.mx_config,
-                    mx_model_name=self.llm_args.model,
                     checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
                     load_format=self.llm_args.load_format,
                     partial_model_loading=partial_model_loading,
