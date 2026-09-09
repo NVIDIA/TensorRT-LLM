@@ -1943,6 +1943,34 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def test_cuda_graph_warmup_reserves_one_generation_token(self):
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = Mock()
+        resource_manager.get_resource_manager.side_effect = (
+            lambda key: kv_cache_manager
+            if key == model_engine.kv_cache_manager_key else None)
+
+        kv_cache_manager.get_num_free_blocks = Mock(return_value=8)
+        kv_cache_manager.max_seq_len = 2048
+        kv_cache_manager.get_num_available_tokens = Mock(return_value=100)
+        kv_cache_manager.add_dummy_requests = Mock(side_effect=[
+            [Mock(), Mock(), Mock()],
+            [Mock()],
+        ])
+        model_engine._get_draft_kv_cache_manager = Mock(return_value=None)
+
+        model_engine._create_cuda_graph_warmup_request(resource_manager,
+                                                       batch_size=4,
+                                                       draft_len=0,
+                                                       max_seq_len=512)
+
+        self.assertEqual(
+            kv_cache_manager.add_dummy_requests.call_args_list[1].
+            kwargs["token_nums"],
+            [99],
+        )
+        kv_cache_manager.shutdown()
+
     def test_pad_batch_strips_cudagraph_dummies_on_exception(self) -> None:
         # The strip must fire even when the body raises. This is the
         # critical property of `finally` vs. a plain trailing statement —
