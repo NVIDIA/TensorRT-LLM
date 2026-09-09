@@ -187,7 +187,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp1] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp3_no_adp] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestGlm4MoeSpeculativeDecoding::test_glm4_moe_mtp TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestGlm4MoeSpeculativeDecoding::test_glm4_moe_mtp TIMEOUT (60)
   - accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8] TIMEOUT (60)
   - accuracy/test_glm52.py::TestGLM52NVFP4::test_mtp_index_share[tp_size=8-ep_size=8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy TIMEOUT (240)
