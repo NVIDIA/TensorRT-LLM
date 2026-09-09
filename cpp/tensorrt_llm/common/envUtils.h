@@ -158,6 +158,15 @@ bool getEnvKVCachePoolUseFabricMemory();
 // Whether to disable coalescing of contiguous NIXL transfer descriptors (coalescing is on by default).
 bool getEnvNixlDisableCoalesce();
 
+// Pure resolver (exposed for unit testing): a null or empty value yields the
+// default lock path, otherwise the value is used verbatim.
+std::string resolveNixlPortLockPath(char const* envValue);
+
+// Path to the file lock that serializes NIXL listen-port selection across
+// colocated agents. Defaults to "/tmp/trtllm_nixl_port.lock"; override with
+// TRTLLM_NIXL_PORT_LOCK_PATH to avoid collisions on a shared /tmp (e.g. multi-tenant hosts).
+std::string getEnvNixlPortLockPath();
+
 bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.

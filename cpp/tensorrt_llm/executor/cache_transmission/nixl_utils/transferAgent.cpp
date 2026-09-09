@@ -420,10 +420,11 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     nixl_status_t status;
     if (config.useListenThread)
     {
-        FileLock lock("/tmp/trtllm_nixl_port.lock");
+        auto const lockPath = common::getEnvNixlPortLockPath();
+        FileLock lock(lockPath);
         if (!lock.lock())
         {
-            TLLM_THROW("Failed to lock /tmp/trtllm_nixl_port.lock");
+            TLLM_THROW("Failed to lock %s", lockPath.c_str());
         }
         uint16_t port = getAvailablePort();
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
