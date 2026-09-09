@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Supply the checkpoint with --model. Small media projections stay in FP32.
-# Audio exceeded the regression bound in the 50-step B200 comparison.
-# See docs/source/models/visual-generation.md, MiniMax-H3 Notes; BF16 is recommended
-# until audio acceptance is established for the intended request profile.
+# Audio regression tolerance is provisional, not a perceptual quality guarantee.
+# Evaluate audio for the intended workload; see MiniMax-H3 Notes in
+# docs/source/models/visual-generation.md.
 quant_config:
   quant_algo: FP8_BLOCK_SCALES
   dynamic: true

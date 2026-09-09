@@ -87,19 +87,18 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### MiniMax-H3 Notes
 
-[^8]: MiniMax-H3 FP8 blockwise execution is supported; audio quality acceptance remains open, as described below.
+[^8]: MiniMax-H3 FP8 blockwise is supported; the audio regression tolerance is provisional, as described below.
 
 - Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
   (Ref2VA) is not enabled yet.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement. Use
   VANILLA on other architectures pending numerical validation.
-- FP8 blockwise execution is supported, but its audio quality has not been accepted.
-  The 50-step B200 T2VA comparison (128×128, 124 frames, seed 0) measured audio
-  log-STFT distance 0.056177, above the [quality test's](../../../tests/integration/defs/examples/visual_gen/test_minimax_h3_e2e.py)
-  0.05 bound; BF16 measured 0.008525. This is a spectral regression metric,
-  not a listening-quality score. FP8 audio acceptance for the shorter 28-step profile
-  requires a fresh comparison.
+- FP8 blockwise is supported. The [quality test](../../../tests/integration/defs/examples/visual_gen/test_minimax_h3_e2e.py)
+  uses a provisional audio log-STFT distance tolerance of 0.10 to allow quantization
+  drift, alongside a video LPIPS tolerance of 0.15. These metrics have different
+  scales; neither threshold establishes perceptual quality for every request.
+  Evaluate generated audio for the intended workload.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

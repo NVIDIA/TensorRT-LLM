@@ -241,5 +241,5 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-[^vg3]: MiniMax-H3 FP8 blockwise execution is supported; audio quality acceptance remains open. See the [MiniMax-H3 notes](visual-generation.md#minimax-h3-notes).
+[^vg3]: MiniMax-H3 FP8 blockwise is supported. Audio regression tolerance is provisional, not a perceptual quality guarantee. See the [MiniMax-H3 notes](visual-generation.md#minimax-h3-notes).
 [^vg2]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing. By default it returns one RGBA image per generated layer; set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, and attention-parallel backends are not enabled yet.

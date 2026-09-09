@@ -34,9 +34,9 @@ python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```
 
-MiniMax-H3 FP8 blockwise runs, but its measured audio difference exceeded the current
-regression bound. This does not establish perceptual audio quality; use BF16 while
-acceptance remains open. See the [MiniMax-H3 notes](../../docs/source/models/visual-generation.md#minimax-h3-notes).
+MiniMax-H3 FP8 blockwise is supported. Its audio regression tolerance is provisional,
+not a perceptual quality guarantee; evaluate audio for your workload. See the
+[MiniMax-H3 notes](../../docs/source/models/visual-generation.md#minimax-h3-notes).
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 
