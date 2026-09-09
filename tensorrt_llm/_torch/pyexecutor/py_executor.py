@@ -3837,7 +3837,23 @@ class PyExecutor:
         return [local_status]
 
     def _check_disagg_transfer_progress_when_idle(self) -> None:
-        """Reap completed context KV transfers so their blocks can be freed."""
+        """Reap completed context KV transfers so their blocks can be freed.
+
+        A synchronous GEN receive blocks rank-locally, so a multi-rank worker
+        must not enter the context status collective here. A single-rank
+        worker cannot diverge and polls only while a send is in flight.
+        """
+        uses_synchronous_gen_transfer = (
+            not self._uses_async_disagg_gen_transfer()
+            and not self._is_disagg_gen_only_no_context_benchmark())
+        should_poll_synchronous_context_status = (
+            uses_synchronous_gen_transfer
+            and self._dist_size(self.dist, "world_size") == 1
+            and self.async_transfer_manager.has_any_inflight_requests())
+        if (uses_synchronous_gen_transfer
+                and not should_poll_synchronous_context_status):
+            return
+
         self._check_disagg_ctx_cache_transfer_status(0)
 
     def _pace_idle_disagg_loop(self) -> None:

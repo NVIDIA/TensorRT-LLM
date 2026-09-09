@@ -1169,12 +1169,49 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_allreduce.assert_not_called()
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
 
+    def test_sync_transfer_skips_idle_progress_collectives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
+
+        executor.dist.allreduce.assert_not_called()
+        executor.dist.tp_allreduce.assert_not_called()
+        executor.dist.tp_cp_allgather.assert_not_called()
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
+    def test_sync_single_rank_ctx_skips_poll_without_inflight_transfer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = False
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(executor)
+
+        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+
     def test_sync_single_rank_ctx_reaps_idle_transfer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "1")
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = True
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
 
@@ -1266,6 +1303,49 @@ class TestDisaggTransferIdleProgress:
             requests=[error_request],
             charge_budget=False,
         )
+
+
+class TestIdleDisaggLoopPacing:
+    """Pacing must cost nothing unless a KV transfer is what holds the loop back."""
+
+    @staticmethod
+    def _make_request(*, init_state: bool = False, transfer_in_progress: bool = False) -> Mock:
+        req = Mock()
+        req.is_disagg_generation_init_state = init_state
+        req.is_disagg_generation_transmission_in_progress = transfer_in_progress
+        return req
+
+    @pytest.mark.parametrize(
+        "has_transceiver, ctx_inflight, request_kwargs, expect_sleep",
+        [
+            pytest.param(False, True, {"init_state": True}, False, id="not_disagg"),
+            pytest.param(True, False, {}, False, id="nothing_pending"),
+            pytest.param(True, True, {}, True, id="context_send_inflight"),
+            pytest.param(True, False, {"init_state": True}, True, id="gen_awaiting_transfer"),
+            pytest.param(
+                True, False, {"transfer_in_progress": True}, True, id="gen_receive_inflight"
+            ),
+        ],
+    )
+    def test_paces_only_when_a_transfer_can_unblock_the_loop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        has_transceiver: bool,
+        ctx_inflight: bool,
+        request_kwargs: dict,
+        expect_sleep: bool,
+    ) -> None:
+        sleep = Mock()
+        monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.time.sleep", sleep)
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock() if has_transceiver else None
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = ctx_inflight
+        executor.active_requests = [self._make_request(**request_kwargs)]
+
+        PyExecutor._pace_idle_disagg_loop(executor)
+
+        assert sleep.called is expect_sleep
 
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
