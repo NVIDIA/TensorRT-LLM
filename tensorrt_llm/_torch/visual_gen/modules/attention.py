@@ -1,9 +1,9 @@
+import functools
 from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
@@ -600,6 +600,15 @@ class Attention(nn.Module):
             return out.flatten(2)
 
     @staticmethod
+    @functools.lru_cache(maxsize=128)
+    def _cu_seqlens_kv_cached(kv_lens: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Depends only on kv_lens (constant across a sampling loop), not K/V content."""
+        cu_list = [0]
+        for n in kv_lens:
+            cu_list.append(cu_list[-1] + n)
+        return torch.tensor(cu_list, dtype=torch.int32, device=device)
+
+    @staticmethod
     def pack_ragged_kv(
         k: torch.Tensor, v: torch.Tensor, kv_lens: List[int]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -614,9 +623,7 @@ class Attention(nn.Module):
             v_parts.append(v[i, :n])
         k_ragged = torch.cat(k_parts, dim=0)
         v_ragged = torch.cat(v_parts, dim=0)
-        cu_seqlens_kv = F.pad(
-            torch.tensor(kv_lens, dtype=torch.int32, device=k.device).cumsum(dim=0), (1, 0)
-        ).to(torch.int32)
+        cu_seqlens_kv = Attention._cu_seqlens_kv_cached(tuple(kv_lens), k.device)
         return k_ragged, v_ragged, cu_seqlens_kv
 
     def _attn_impl_varlen_kv(
