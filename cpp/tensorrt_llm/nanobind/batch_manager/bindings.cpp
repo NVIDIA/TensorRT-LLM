@@ -500,8 +500,6 @@ void initBindings(nb::module_& m)
                 self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
                 return std::make_tuple(nb::bytes(serialized_result.data(), serialized_result.size()), is_final);
             })
-        .def("move_prompt_embedding_table_to_gpu", &tb::LlmRequest::movePromptEmbeddingTableToGpu, nb::arg("manager"))
-        .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, nb::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
         .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))

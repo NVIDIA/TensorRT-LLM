@@ -355,29 +355,6 @@ std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType request
     return childReq;
 }
 
-void LlmRequest::movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager)
-{
-    if (!mPromptEmbeddingTable.has_value()
-        || mPromptEmbeddingTable.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-
-    TensorPtr gpuPromptEmbeddingTable = manager.copyFrom(*mPromptEmbeddingTable.value(), runtime::MemoryType::kGPU);
-    mPromptEmbeddingTable = gpuPromptEmbeddingTable;
-}
-
-void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
-{
-    if (!mLoraWeights.has_value() || mLoraWeights.value()->getMemoryType() == runtime::MemoryType::kGPU)
-    {
-        return;
-    }
-    // TODO for tp / pp models we only need to move the bit that belong on the local device
-    TensorPtr gpuLoraWeights = manager.copyFrom(*mLoraWeights.value(), runtime::MemoryType::kGPU);
-    mLoraWeights = gpuLoraWeights;
-}
-
 void LlmRequest::removeLoraTensors()
 {
     mLoraWeights.reset();
