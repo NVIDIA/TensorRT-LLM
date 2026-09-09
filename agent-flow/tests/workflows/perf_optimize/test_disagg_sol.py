@@ -371,7 +371,7 @@ def test_two_campaigns_may_not_share_one_checkout(tmp_path):
 
 
 def test_a_track_with_no_sweep_or_no_checkout_is_refused_by_name(tmp_path):
-    with pytest.raises(disagg_sol.DisaggSolError, match=r"sweep given for track\(s\) \['gen'\]"):
+    with pytest.raises(disagg_sol.DisaggSolError, match=r"neither a sweep of their own"):
         disagg_sol.launch_plan(
             BASE,
             sweeps={"ctx": _sweeps(tmp_path)["ctx"]},
@@ -766,3 +766,121 @@ def test_only_the_unready_halves_are_named_to_the_designer(tmp_path):
     )
     assert "['gen']" in seen[0]
     assert "'ctx'" not in seen[0]
+
+
+# ------------------------------------------------------- deriving the sweep
+
+
+DESIGN_SWEEP = {
+    "model_id": "deepseek-ai/DeepSeek-V4-Pro",
+    "isl": 8192,
+    "osl": 1024,
+    "gen_configs": [
+        [1, 1, 4, 64, 64, False, "0.9", 0, 0, "1,2,4,8,16,32,64"],
+        [1, 1, 8, 64, 64, False, "0.9", 0, 0, "1,2,4,8,16,32,64"],
+        [1, 1, 16, 32, 32, True, "0.9", 0, 0, "16,64,512,1024,2048"],
+    ],
+    "benchmarks": [
+        {"isl": 8192, "osl": 1, "max_batch": [1, 2, 4], "tp_size": [4, 8], "ratio": [0.8]}
+    ],
+    "gpu_overrides": {"GB300": {"benchmarks": [{"max_batch": [2]}]}},
+}
+
+
+def _design_sweep(tmp_path):
+    import yaml as _yaml
+
+    p = tmp_path / "sweep_design" / "8k1k_sol_mtp0.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(_yaml.safe_dump(DESIGN_SWEEP))
+    return p
+
+
+def test_a_campaign_cannot_run_the_whole_measured_space(tmp_path):
+    """Two shapes at one concurrency both land in `concurrency_<c>`.
+
+    That is what `_place` refuses, so the design sweep -- which is the whole
+    space -- is not something a campaign can freeze on. Hence the cut.
+    """
+    import yaml as _yaml
+
+    from agent_flow.workflows.perf_optimize import bench_cli
+
+    cases = bench_cli.gen_cases(_yaml.safe_load(_design_sweep(tmp_path).read_text()))
+    at_64 = [c for c in cases if (c["config"] or {}).get("concurrency") == 64]
+    assert len({c["name"] for c in at_64}) > 1  # tep_4 and tep_8 collide
+
+
+def test_the_derived_sweep_keeps_one_row_at_the_selected_point(tmp_path):
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path),
+        "gen",
+        {"shape": "tep_8_eplb0_mtp0", "concurrency": 64},
+        into=tmp_path / "ws",
+    )
+    got = _yaml.safe_load(out.read_text())
+    assert len(got["gen_configs"]) == 1
+    assert got["gen_configs"][0][2] == 8  # tp_size
+    assert got["gen_configs"][0][9] == "64"  # this point only, not the ladder
+
+
+def test_everything_but_the_row_filter_comes_from_the_design_sweep(tmp_path):
+    """So the campaign measures what the selection was made on.
+
+    The two campaigns this layer replaces differed from their own recorded
+    point in three fields at once, and nothing noticed.
+    """
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path),
+        "gen",
+        {"shape": "tep_4_eplb0_mtp0", "concurrency": 32},
+        into=tmp_path / "ws",
+    )
+    got = _yaml.safe_load(out.read_text())
+    assert got["model_id"] == DESIGN_SWEEP["model_id"]
+    assert (got["isl"], got["osl"]) == (8192, 1024)
+    assert got["_derived_from"]["design_sweep"].endswith("8k1k_sol_mtp0.yaml")
+
+
+def test_the_ctx_cut_narrows_both_axes_and_drops_the_override_table(tmp_path):
+    import yaml as _yaml
+
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path), "ctx", {"ctx_gpus": 8, "max_batch": 4}, into=tmp_path / "ws"
+    )
+    got = _yaml.safe_load(out.read_text())
+    assert got["benchmarks"] == [
+        {"isl": 8192, "osl": 1, "max_batch": [4], "tp_size": [8], "ratio": [0.8]}
+    ]
+    assert "gpu_overrides" not in got
+
+
+def test_a_derived_sweep_is_written_only_inside_the_campaign_workspace(tmp_path):
+    """The blunt rule an earlier module in this package lacked.
+
+    It took an output path as a free parameter and would have overwritten a
+    curated config other people maintain -- unrecoverable in a way a wrong
+    measurement is not.
+    """
+    ws = tmp_path / "ws"
+    out = disagg_sol.derive_sweep_at_point(
+        _design_sweep(tmp_path), "gen", {"shape": "tep_8_eplb0_mtp0", "concurrency": 1}, into=ws
+    )
+    assert out.parent == ws.resolve()
+    assert out.name == disagg_sol.DERIVED_SWEEP_NAME
+    # the design's own sweep is untouched
+    assert "1,2,4,8,16,32,64" in _design_sweep(tmp_path).read_text()
+
+
+def test_a_point_the_design_sweep_cannot_produce_is_refused(tmp_path):
+    with pytest.raises(disagg_sol.DisaggSolError, match="0 rows matching"):
+        disagg_sol.derive_sweep_at_point(
+            _design_sweep(tmp_path),
+            "gen",
+            {"shape": "dep_32_eplb0_mtp0", "concurrency": 4096},
+            into=tmp_path / "ws",
+        )
