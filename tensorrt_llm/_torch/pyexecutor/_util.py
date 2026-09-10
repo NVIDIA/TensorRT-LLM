@@ -25,6 +25,8 @@ from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  is_sm_100f, prefer_pinned,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.registry import \
+    input_processor_requires_encoder_features
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -1962,6 +1964,10 @@ class KvCacheCreator:
     def _is_encoder_decoder(self) -> bool:
         return self._model_engine.model.model_config.is_encoder_decoder
 
+    def _encoder_input_is_features(self) -> bool:
+        return input_processor_requires_encoder_features(
+            type(self._model_engine.model))
+
     @staticmethod
     def _get_config_int_attr(config, names: tuple[str, ...]) -> Optional[int]:
         for name in names:
@@ -2089,6 +2095,16 @@ class KvCacheCreator:
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
         cross_kv_cache_config = base_kv_cache_config.model_copy()
+        if (cross_kv_cache_config.enable_block_reuse
+                and self._encoder_input_is_features()):
+            # Cross blocks are keyed on encoder token ids; a feature-driven
+            # encoder has none, so reuse can never hit and the C++ scheduler
+            # must not be asked for a cross prefix-reuse summary.
+            logger.info(
+                "Disabling block reuse for the cross-KV cache: the encoder "
+                "takes feature tensors, so requests carry no encoder tokens "
+                "to key cross blocks on.")
+            cross_kv_cache_config.enable_block_reuse = False
         split_any_budget = False
 
         free_fraction = base_kv_cache_config.free_gpu_memory_fraction
