@@ -56,11 +56,7 @@ class TelemetryField:
 
     @classmethod
     def categorical(cls, *allowed_values: Any) -> "TelemetryField":
-        """Build a categorical allowlist field from the recognized values.
-
-        This is the escape hatch for an otherwise unsafe categorical branch,
-        such as a bare string. Capture is limited to these exact typed values.
-        """
+        """Allow capture only for the specified values and their exact types."""
         return cls(allowed_values=tuple(allowed_values))
 
     def as_json_schema_extra(self) -> dict[str, Any]:
