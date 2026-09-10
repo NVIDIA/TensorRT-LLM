@@ -32,11 +32,15 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/thop/moeWorkspaceReservationRule.h"
+
 #include "tensorrt_llm/kernels/cuda_graph_grouped_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <set>
+#include <vector>
 
 #include <ATen/native/cuda/Resize.h>
 
@@ -361,6 +365,12 @@ public:
     {
         std::lock_guard<std::mutex> lock(mMutex);
         mStreamWorkspaces.clear();
+        // Safe here and only here: clearWorkspaces() is the point at which the
+        // caller has asserted no captured graph will replay against these.
+        mCaptureWorkspace = WorkspaceInfo();
+        mCaptureWorkspaceFrozen = false;
+        mRetiredCaptureWorkspaces.clear();
+        mEagerStreams.clear();
         freeProfileWorkspace();
     }
 
@@ -1070,6 +1080,34 @@ private:
     char* mProfileWorkspace = nullptr;
     std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
 
+    // Serves CUDA graph captures so that no MoE workspace is allocated while a
+    // graph is capturing. See getWorkspaceInfo() for why that matters.
+    WorkspaceInfo mCaptureWorkspace;
+    // Set once a capture has read the reservation: from then on it may not be
+    // freed, only parked, because a graph has baked its address in.
+    bool mCaptureWorkspaceFrozen = false;
+    // Grown-past reservations a captured graph may still read. Held, not freed,
+    // until clearWorkspaces().
+    std::vector<torch::Tensor> mRetiredCaptureWorkspaces;
+    // Distinct streams MoE has run on OUTSIDE a capture. More than one means a
+    // single shared reservation cannot be ordered against concurrent use.
+    std::set<cudaStream_t> mEagerStreams;
+    // Warn once per runner, not once per MoE layer per graph.
+    bool mCaptureReservationWarned = false;
+
+    // On by default: the allocate-under-capture path it replaces can strand a
+    // block in a destroyed graph pool. TLLM_MOE_CAPTURE_WORKSPACE_RESERVE=0
+    // restores the old behaviour if a deployment needs it.
+    static bool reserveCaptureWorkspace()
+    {
+        static bool const enabled = []
+        {
+            char const* env = std::getenv("TLLM_MOE_CAPTURE_WORKSPACE_RESERVE");
+            return !(env != nullptr && env[0] == '0' && env[1] == '\0');
+        }();
+        return enabled;
+    }
+
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
     bool mUseINT8WoqPerChannel = false;
@@ -1279,13 +1317,102 @@ private:
             experts_per_token, activation_type, parallelismConfig, use_lora, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
-        auto& workspace_info = mStreamWorkspaces[stream];
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
         int64_t const total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
 
         bool is_capturing = tensorrt_llm::common::isCapturing(stream);
+
+        // Do not allocate while a CUDA graph is capturing.
+        //
+        // The path below reallocates unconditionally under capture, so the block
+        // comes from the graph's PrivatePool while mStreamWorkspaces caches it
+        // for the life of the process. That ownership inversion is the SIGSEGV:
+        // torch's allocator erases a PrivatePool once its cudaMalloc_count
+        // reaches 0 -- which is not the same as "this pool has no live blocks"
+        // -- and the cached workspace then holds a pointer into a destroyed
+        // pool. Freeing it later walks a dangling free-block tree.
+        //
+        // Ordering the teardown is not enough: torch.cuda.graph.__enter__ calls
+        // empty_cache() before EVERY capture, so the pool holding a cached
+        // workspace can be erased at the start of a later capture, not only at
+        // shutdown. The allocation has to leave the pool instead.
+        //
+        // Serving captures from an eagerly allocated buffer does that. The
+        // engine runs warmup forwards with the capture's own inputs immediately
+        // before each capture, so an eager call has already sized the
+        // reservation by the time the first graph is captured. The buffer is
+        // scratch consumed within one MoE call and graphs replay serialized on
+        // the model stream, so one buffer serves them all -- which is already
+        // true today, because MoERunner.runner_dict keys on dtypes and quant
+        // flags rather than on the layer, so every MoE layer shares this
+        // instance and this map entry.
+        //
+        // Freezing at the first capture is what makes it safe: growing the
+        // reservation afterwards would free memory a captured graph has baked a
+        // pointer to. Each exit below is self-disabling -- a layout the
+        // reservation cannot serve falls back to the old path for that capture
+        // rather than failing.
+        if (reserveCaptureWorkspace() && !is_capturing)
+        {
+            mEagerStreams.insert(stream);
+        }
+        // The decision lives in moeWorkspaceReservationRule.h, on plain types, so
+        // it can be exercised without a GPU or a build; see
+        // cpp/tests/unit_tests/thop/moeWorkspaceReservationRuleTest.cpp. A second
+        // copy of the predicate here is how two predicates drift apart.
+        namespace rule = ::tensorrt_llm::moe_reservation;
+        rule::ReservationState const reservationState{reserveCaptureWorkspace(), is_capturing, mEagerStreams.size(),
+            mCaptureWorkspace.workspace.numel(), total_workspace_size, mCaptureWorkspaceFrozen};
+        switch (rule::reservationAction(reservationState))
+        {
+        case rule::ReservationAction::ServeReservation:
+            mCaptureWorkspaceFrozen = true;
+            mCaptureWorkspace.src_to_dest_map = common::nextWorkspacePtr(
+                static_cast<int8_t*>(mCaptureWorkspace.workspace.data_ptr()), moe_workspace_size);
+            return mCaptureWorkspace;
+
+        case rule::ReservationAction::DeclineMultiStream:
+            // Guarded: a capture reaches this once per MoE layer per graph.
+            if (!mCaptureReservationWarned)
+            {
+                mCaptureReservationWarned = true;
+                TLLM_LOG_WARNING(
+                    "MoE has run on %zu streams, so sharing one capture workspace is not safe; falling back to "
+                    "allocating under CUDA graph capture, which can strand the block in a destroyed graph pool.",
+                    mEagerStreams.size());
+            }
+            break;
+
+        case rule::ReservationAction::DeclineTooSmall:
+            if (!mCaptureReservationWarned)
+            {
+                mCaptureReservationWarned = true;
+                TLLM_LOG_WARNING(
+                    "MoE capture workspace reservation is %ld bytes but this capture needs %ld; falling back to "
+                    "allocating under capture for it. Graphs are not being captured in descending size order.",
+                    static_cast<long>(mCaptureWorkspace.workspace.numel()), static_cast<long>(total_workspace_size));
+            }
+            break;
+
+        case rule::ReservationAction::GrowReservation:
+            if (rule::growthMustPark(reservationState))
+            {
+                // A captured graph already reads the current reservation, so it
+                // cannot be freed -- park it until clearWorkspaces() and grow
+                // into a new one that later captures will use.
+                mRetiredCaptureWorkspaces.push_back(mCaptureWorkspace.workspace);
+            }
+            mCaptureWorkspace = WorkspaceInfo();
+            mCaptureWorkspace.workspace = torch::empty({static_cast<long>(total_workspace_size)},
+                torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
+            break;
+
+        case rule::ReservationAction::UseStreamWorkspace: break;
+        }
+
+        auto& workspace_info = mStreamWorkspaces[stream];
         // Always allocate workspace when capturing cuda graph to avoid illegal memory access during replay
         if (is_capturing || workspace_info.workspace.numel() < total_workspace_size)
         {
