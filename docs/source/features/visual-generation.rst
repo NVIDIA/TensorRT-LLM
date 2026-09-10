@@ -18,3 +18,15 @@ For supported models and an overview of VisualGen, see
    CUDA Graphs <visualgen-cuda-graph>
    Quantized Attention <visualgen-quantized-attention>
    Sparse Attention <visualgen-sparse-attention>
+
+Related technical blogs
+-----------------------
+
+These articles explain the design choices and benchmark results behind
+VisualGen optimizations:
+
+* :doc:`Scaling video generation across NVL72 <../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM>`
+  covers multi-GPU parallelism and scaling results.
+* :doc:`Quantization and sparse attention for video generation <../blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM>`
+  covers GEMM quantization, quantized attention, and Skip Softmax Attention,
+  including performance and visual-quality trade-offs.
