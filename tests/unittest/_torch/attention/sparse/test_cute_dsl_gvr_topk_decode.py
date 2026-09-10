@@ -1995,3 +1995,227 @@ def test_cute_dsl_gvr_topk_decode_mtp_hostile_hint(next_n, hint, _intree_only):
     )
     torch.cuda.synchronize()
     _assert_exact_topk(out, logits, seq_lens, top_k, next_n, cr)
+
+
+def test_plan_emission_prescore_list_floor():
+    """Prescore lines open the list tier from PRESCORE_LIST_MIN_N; without them
+    the floor stays at LIST_EMIT_MIN_N and the batch cap at LIST_EMIT_MAX_B."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_routing import (
+        LIST_EMIT_MIN_N,
+        PRESCORE_LIST_MAX_B,
+        PRESCORE_LIST_MIN_N,
+        plan_emission,
+    )
+
+    n_mid = (PRESCORE_LIST_MIN_N + LIST_EMIT_MIN_N) // 2
+    assert plan_emission(8, n_mid, 1024, True, compress_ratio=4, prescore=True) == "list"
+    assert plan_emission(8, n_mid, 1024, True, compress_ratio=4) != "list"
+    assert plan_emission(PRESCORE_LIST_MAX_B, LIST_EMIT_MIN_N, 1024, True, prescore=True) == "list"
+    assert plan_emission(PRESCORE_LIST_MAX_B, LIST_EMIT_MIN_N, 1024, True) != "list"
+    # list-or-nothing under the prescore: below the floor or past the batch cap
+    # the step stays on the stock path instead of the closed-loop tiers
+    assert plan_emission(1, PRESCORE_LIST_MIN_N // 2, 1024, True, prescore=True) == "none"
+    assert (
+        plan_emission(PRESCORE_LIST_MAX_B + 1, LIST_EMIT_MIN_N, 1024, True, prescore=True) == "none"
+    )
+    assert plan_emission(1, PRESCORE_LIST_MIN_N // 2, 1024, True) in ("counts", "rungs", "none")
+
+
+# ---------------------------------------------------------------------------
+# Single-band list consumer (prescore tier) driven directly against the
+# emitter contract: segment C at 2*LIST_SEG_A holds the exact >= t0 set,
+# cand_ctl = {n0, void, n1, n2}, seed col 3 = n0; the epilogue mirrors the
+# indices + neighbour flags into the prior and resets the ps_hist row.
+# ---------------------------------------------------------------------------
+
+_SB_TOP_K = (512, 1024, 2048)
+_SB_N = (16384, 65536, 262144)
+_SB_MODES = ("K", "1.1K", "1.6K", "1.6K_t1", "kC")
+_SB_DATA = ("randn", "relu")
+_SB_FALLBACKS = ("void", "n0_lt_k", "n0_gt_cap", "short", "n0_gt_kc")
+
+
+def _sb_kernel_geometry(top_k):
+    """(kC, seg_total) of the variant the op compiles for the single-band list."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+        LIST_SEG_A,
+        LIST_WIDTH,
+    )
+
+    k = _GvrTopKKernel(
+        cutlass.Float32,
+        top_k,
+        cluster_size=1,
+        use_ext_counts=True,
+        use_ext_cand=True,
+        cand_cap=LIST_WIDTH,
+        accept_cap=LIST_SEG_A,
+        cand_single_band=True,
+        emit_prev=True,
+        return_output_values=False,
+        r0_qfracs=(0.85, 0.35),
+    )
+    return k.kC, k.seg_total
+
+
+def _sb_neighbour_flags(idx, n_eff, bitmap_words):
+    """emit_prev flags of one row: bit0 p-1, bit1 p+1, bit2 p+2 selected (probe
+    positions clamped to [0, N-1], bit2 dropped past the row end); all 7 when
+    the row does not fit the smem bitmap."""
+    if n_eff > 32 * bitmap_words:
+        return torch.full_like(idx, 7, dtype=torch.uint8)
+    last = n_eff - 1
+    p = idx.long().clamp(0, last)
+    member = torch.zeros(n_eff, dtype=torch.bool, device=idx.device)
+    member[p] = True
+    b0 = member[(p - 1).clamp(min=0)].int()
+    b1 = member[(p + 1).clamp(max=last)].int()
+    b2 = (member[(p + 2).clamp(max=last)] & (p + 2 <= last)).int()
+    return (b0 | (b1 << 1) | (b2 << 2)).to(torch.uint8)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("top_k", list(_SB_TOP_K))
+@pytest.mark.parametrize("n_comp", [16384, 65536, pytest.param(262144, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("n0_mode", list(_SB_MODES))
+@pytest.mark.parametrize("data", list(_SB_DATA))
+def test_cute_dsl_gvr_topk_decode_single_band_direct(top_k, n_comp, n0_mode, data, tie_aware_check):
+    """Three admitted single-band rows (n0 = K / 1.1K / 1.6K / kC at the t0
+    dense cut, or n1 in [K, kC] at the t1 filtered cut) plus one stock-fallback
+    row per batch (void, n0 < K, n0 > list_cap, kC < n0 with no line in band,
+    N < K). Value-exact against torch.topk on every row; admitted rows also
+    pin prev_out == output, the host neighbour-flag reference and the ps_hist
+    row reset."""
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_emission import (
+        LIST_CAP_C,
+        LIST_SEG_A,
+        LIST_WIDTH,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_prescore_fp4 import HIST_WORDS
+
+    batch, dev = 4, "cuda"
+    kc, seg_total = _sb_kernel_geometry(top_k)
+    cell = _SB_TOP_K.index(top_k) * len(_SB_N) + _SB_N.index(n_comp)
+    cell = (cell * len(_SB_MODES) + _SB_MODES.index(n0_mode)) * len(_SB_DATA)
+    cell += _SB_DATA.index(data)
+    fb_row = cell % batch
+    fb_kind = _SB_FALLBACKS[cell % len(_SB_FALLBACKS)]
+    if fb_kind == "n0_gt_cap" and n_comp <= LIST_CAP_C + top_k:
+        fb_kind = "n0_gt_kc"
+    g = torch.Generator(device=dev).manual_seed(1000 + cell)
+    logits = torch.randn(batch, n_comp, generator=g, device=dev)
+    if data == "relu":
+        logits = logits.relu()
+    logits = logits.contiguous()
+    seq_lens = torch.full((batch,), n_comp, dtype=torch.int32, device=dev)
+    if fb_kind == "short":
+        seq_lens[fb_row] = top_k - 5
+    n_eff = seq_lens.long()
+
+    k = top_k
+    targets = {
+        "K": (k, k // 2, k // 4),
+        "1.1K": (11 * k // 10, k // 2, k // 4),
+        "1.6K": (8 * k // 5, k // 2, k // 4),
+        "1.6K_t1": (8 * k // 5, 6 * k // 5, k // 2),
+        "kC": (kc, k // 2, k // 4),
+    }[n0_mode]
+    fb_targets = {
+        "void": (11 * k // 10, k // 2, k // 4),
+        "n0_lt_k": (k // 2, k // 4, k // 8),
+        "n0_gt_cap": (LIST_CAP_C + k // 2, k // 2, k // 4),
+        "short": (k, k // 2, k // 4),
+        "n0_gt_kc": (kc + k // 2, k // 2, k // 4),
+    }[fb_kind]
+    lines = torch.cat(
+        [
+            _lines_at_counts(
+                logits[r : r + 1], n_eff[r : r + 1], fb_targets if r == fb_row else targets
+            )
+            for r in range(batch)
+        ]
+    )
+    seed_row = _pack_seed_row(logits, n_eff, lines)
+    counts = seed_row[:, 3:6].int()
+    seed_row[:, 4:] = 0.0
+    cand_vals = torch.full((batch, LIST_WIDTH), float("nan"), dtype=torch.float32, device=dev)
+    cand_idx = torch.full((batch, LIST_WIDTH), -7, dtype=torch.int32, device=dev)
+    cand_ctl = torch.zeros((batch, 4), dtype=torch.int32, device=dev)
+    base = 2 * LIST_SEG_A
+    for r in range(batch):
+        ne = int(n_eff[r])
+        row = logits[r, :ne]
+        hits = torch.nonzero(row >= lines[r, 0], as_tuple=False).flatten()
+        n0 = int(hits.numel())
+        assert n0 == int(counts[r, 0])
+        perm = hits[torch.randperm(n0, generator=g, device=dev)]
+        nwr = min(n0, LIST_CAP_C)
+        cand_vals[r, base : base + nwr] = row[perm[:nwr]]
+        cand_idx[r, base : base + nwr] = perm[:nwr].int()
+        cand_ctl[r, 0] = n0
+        cand_ctl[r, 2] = counts[r, 1]
+        cand_ctl[r, 3] = counts[r, 2]
+    if fb_kind == "void":
+        cand_ctl[fb_row, 1] = 1
+    n0_fb = int(cand_ctl[fb_row, 0])
+    if fb_kind == "n0_lt_k":
+        assert n0_fb < top_k
+    elif fb_kind == "n0_gt_cap":
+        assert n0_fb > LIST_CAP_C
+    elif fb_kind == "n0_gt_kc":
+        assert kc < n0_fb <= LIST_CAP_C and int(cand_ctl[fb_row, 2]) < top_k
+    for r in range(batch):
+        if r != fb_row:
+            assert top_k <= int(cand_ctl[r, 0]) <= LIST_CAP_C
+    pos = torch.arange(n_comp, device=dev)[None, :]
+    noise = torch.randn(logits.shape, generator=g, device=dev)
+    pert = torch.where(pos < n_eff[:, None], logits + 0.5 * noise, float("-inf"))
+    pre_idx = pert.topk(top_k, dim=-1).indices.int().contiguous()
+    out = torch.full((batch, top_k), -1, dtype=torch.int32, device=dev)
+    prev_out = torch.ones((batch, top_k), dtype=torch.int32, device=dev)
+    prev_flags = torch.ones((batch, top_k), dtype=torch.uint8, device=dev)
+    ps_hist = torch.ones((batch, HIST_WORDS), dtype=torch.int32, device=dev)
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+        max_seq_len=n_comp,
+        cluster_size=1,
+        seed_thr=seed_row,
+        cand_vals=cand_vals,
+        cand_idx=cand_idx,
+        cand_ctl=cand_ctl,
+        accept_cap=LIST_SEG_A,
+        cand_single_band=True,
+        prev_out=prev_out,
+        prev_flags=prev_flags,
+        ps_hist=ps_hist,
+    )
+    torch.cuda.synchronize()
+
+    for r in range(batch):
+        tag = f"row {r} ({'fallback ' + fb_kind if r == fb_row else n0_mode})"
+        ne = int(n_eff[r])
+        k_eff = min(top_k, ne)
+        idx = out[r]
+        assert bool((idx[k_eff:] == -1).all()), f"{tag}: short-row pad"
+        sel = idx[:k_eff].long()
+        assert int(sel.min()) >= 0 and int(sel.max()) < ne, f"{tag}: index range"
+        assert sel.unique().numel() == k_eff, f"{tag}: duplicate indices"
+        row = logits[r, :ne]
+        assert torch.equal(row[sel].sort().values, row.topk(k_eff).values.sort().values), (
+            f"{tag}: selected values differ from torch.topk"
+        )
+        if r == fb_row:
+            continue
+        assert torch.equal(prev_out[r], idx), f"{tag}: prev_out mirror"
+        assert torch.equal(prev_flags[r], _sb_neighbour_flags(idx, ne, seg_total)), (
+            f"{tag}: neighbour flags"
+        )
+        assert not bool(ps_hist[r].any()), f"{tag}: ps_hist row not reset"
+    keep = [r for r in range(batch) if not (r == fb_row and fb_kind == "short")]
+    tie_aware_check(out[keep], logits[keep], seq_lens[keep], top_k, 1, 1)

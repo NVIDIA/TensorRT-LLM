@@ -67,6 +67,10 @@ class TopK(nn.Module):
         self._gvr_emission_state = None
         self._gvr_emission_route = None
         self._gvr_emission_armed = False
+        # prescore tier (see prepare_gvr_emission): this step's list rows
+        # carry sound lines + a single-band list; the consumer mirrors
+        # its indices/flags into the prior for the next step's prescore
+        self._gvr_prescore_step = False
 
     @property
     def needs_gvr_prior(self) -> bool:
@@ -431,6 +435,8 @@ class TopK(nn.Module):
                 self._gvr_emission_route,
                 num_rows,
                 state.block_max[:num_rows] if state.block_max is not None else None,
+                single_band=self._gvr_prescore_step,
+                prev_out=gvr_prior_indices if self._gvr_prescore_step else None,
             )
             self._gvr_emission_armed = False
         torch.ops.trtllm.cute_dsl_gvr_topk_decode(
@@ -453,6 +459,7 @@ class TopK(nn.Module):
         n_comp: int,
         num_sms: int,
         gvr_prior_indices: torch.Tensor,
+        prescore: dict | None = None,
     ) -> dict:
         """Plan the emission-assisted GVR tier for this decode step.
 
@@ -469,6 +476,19 @@ class TopK(nn.Module):
             num_sms: Device SM count.
             gvr_prior_indices: Caller-owned previous-selection state;
                 defines the emission state's row capacity and device.
+            prescore: Prescore-tier inputs (FP4 indexer cache), or None
+                for the closed-loop lines. Keys: ``q`` ``[B, 1, H, D//2]``
+                packed FP4, ``q_sf`` ``[B, H]`` int32 packed UE8M0,
+                ``k_cache`` (paged indexer K pool), ``weights``
+                ``[B, H]`` fp32, ``block_table`` ``[B, blocks]`` int32,
+                ``kv_lens`` ``[B]`` int32 compressed lengths,
+                ``head_dim``, ``tokens_per_block``, ``record_bytes``.
+                On list-tier steps the prescore kernel re-scores the prior
+                (plus neighbours and the newest positions) on the current
+                query and writes a sound lower bound of the k-th score as
+                the seed line; the scorer then emits every position at or
+                above it into one list segment, and the Top-K epilogue
+                mirrors its indices and neighbour flags into the prior.
         """
         # the emission/xstate writes are undeclared mutations (see the op's
         # schema note), so the tier is eager / CUDA-graph only
@@ -476,27 +496,65 @@ class TopK(nn.Module):
             return {}
         from ..cute_dsl_kernels.blackwell.top_k.gvr_emission import (
             LIST_EMIT_MIN_N,
+            PRESCORE_LIST_MAX_B,
+            PRESCORE_LIST_MIN_N,
             GvrEmissionState,
         )
 
+        prescore_static = prescore is not None
+        list_min_n = PRESCORE_LIST_MIN_N if prescore_static else LIST_EMIT_MIN_N
         if self._gvr_emission_state is None:
             self._gvr_emission_state = GvrEmissionState(
                 max_rows=gvr_prior_indices.shape[0],
                 top_k=self.top_k,
                 device=gvr_prior_indices.device,
-                enable_list_tier=n_comp >= LIST_EMIT_MIN_N,
+                # the list tier is only reachable from list_min_n; skip its
+                # large candidate buffers when the engine's static length
+                # cannot get there
+                enable_list_tier=n_comp >= list_min_n,
                 own_prior=False,
+                # single-band emission repays the list far past the 3-band
+                # batch cap; the scratch is shared across layers
+                cand_rows_cap=PRESCORE_LIST_MAX_B if prescore_static else None,
             )
         state = self._gvr_emission_state
         emit_tier, self._gvr_emission_route = state.plan(
-            batch, n_comp, num_sms, compress_ratio=max(self.compress_ratio, 1)
+            batch,
+            n_comp,
+            num_sms,
+            compress_ratio=max(self.compress_ratio, 1),
+            list_max_b=state.cand_rows_cap if prescore_static else None,
+            prescore=prescore_static,
+            list_min_n=list_min_n,
         )
         self._gvr_emission_armed = self._gvr_emission_route.tier != "none"
-        if emit_tier in ("counts", "list", "rungs"):
-            state.update_seed_rows(batch, emit_tier)
+        prescore_ok = prescore_static and emit_tier == "list"
+        single_band = prescore_ok
+        self._gvr_prescore_step = single_band
+        if prescore_ok:
+            state.ensure_prescore(prescore["tokens_per_block"], prescore["record_bytes"], num_sms)
+            state.prescore_lines(
+                batch,
+                prescore["q"],
+                prescore["k_cache"],
+                prescore["weights"],
+                prescore["block_table"],
+                prescore["kv_lens"],
+                prescore["head_dim"],
+                n_comp,
+                q_sf=prescore["q_sf"],
+                prev_topk=gvr_prior_indices,
+            )
+        else:
+            if prescore_static:
+                # no epilogue flags this step: the next prescore treats every
+                # neighbour as a duplicate (drops the sample, stays sound)
+                state.prev_flags[:batch].fill_(7)
+            if emit_tier in ("counts", "list", "rungs"):
+                state.update_seed_rows(batch, emit_tier)
         kwargs: dict = {}
         if emit_tier in ("counts", "list"):
-            kwargs = state.indexer_emit_kwargs(emit_tier, batch)
+            kwargs = state.indexer_emit_kwargs(emit_tier, batch, single_band=single_band)
         if self._gvr_emission_route.attach_block_max or emit_tier in ("counts", "list"):
             kwargs["block_max_out"] = state.ensure_block_max(n_comp)[:batch]
         return kwargs
@@ -507,6 +565,13 @@ class TopK(nn.Module):
         invalid and routes those rows to the stock path in-kernel."""
         if self._gvr_emission_state is not None:
             self._gvr_emission_state.xstate[rows].zero_()
+            # no neighbour flags for a seeded row yet: every neighbour
+            # sample counts as a duplicate until the first top-k epilogue
+            self._gvr_emission_state.prev_flags[rows] = 7
+            if self._gvr_emission_state.cand_ctl is not None:
+                # the fused prescore accumulates into a histogram the top-k
+                # resets; a slot that never reached that epilogue starts clean
+                self._gvr_emission_state.ps_hist[rows].zero_()
 
     def update_gvr_prior_from_prefill(
         self,

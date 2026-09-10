@@ -41,6 +41,7 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 from ..utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 from .block_scan import warp_scan
+from .gvr_prescore_fp4 import HIST_WORDS as PS_HIST_WORDS
 
 
 def _env_flag(name: str) -> bool:
@@ -323,7 +324,7 @@ class GvrTopKKernel:
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
         kc_diet: Optional[bool] = None,
-        pdl_wait_late: bool = False,
+        pdl_wait_late: Optional[bool] = None,
         p4_fine_rangetest: Optional[bool] = None,
         p4_scat_rangetest: bool = False,
         enable_r0: bool = True,
@@ -351,9 +352,11 @@ class GvrTopKKernel:
         use_ext_counts: bool = False,
         ext_rungs: bool = False,
         use_ext_cand: bool = False,
+        cand_single_band: bool = False,
         cand_cap: int = 5120,
         cand_rung: int = 0,
         emit_xstate: bool = False,
+        emit_prev: bool = False,
     ):
         # Redundant-warp sync reduction: every warp replays the block
         # reduce + decision from the same staged SMEM partials in the
@@ -584,27 +587,30 @@ class GvrTopKKernel:
         # stay byte-identical (the DSL sizes the launch from the last-traced
         # SmemAllocator only; see GvrTopKLBKernel).
         # pdl_wait_late: move the PDL wait past the prologue so that work
-        # overlaps the producer's tail. Off by default: the entry-point
-        # wait is what upstream emits.
+        # overlaps the producer's tail; emission-assisted kernels default
+        # to it, the stock kernel keeps the entry-point wait.
+        if pdl_wait_late is None:
+            pdl_wait_late = bool(use_ext_counts or use_ext_cand or ext_rungs)
         self.pdl_wait_late = bool(pdl_wait_late)
         if kc_diet is None:
             kc_diet = cluster_size == 1
         if enable_r0 and top_k == 512 and kc_diet and self.kC > 3072:
             self.kC = 3072
-        # K2048 R0 Phase-4 histogram diet: 2048 -> 512 bins (2026-07-19
-        # paired nsys cold-L2 A/B on B200, all cells exact). The P4 zero /
-        # atomic build / serial scan all shrink 4x; the deeper boundary-bin
-        # recursion costs less than the saved passes at kC=6144 candidates.
-        # Measured vs this head: real V3.2 decode captures geomean +6.1%
-        # (fp32) / +10.9% (bf16) / +6.3% (fp16); favorable synthetic
-        # +5.2-11.0%, adverse synthetic +5.1-10.6%; no losing cell
-        # (fp32 min 0.994, bf16 min 1.035, fp16 min 0.999). Gated on
-        # enable_r0 so the retained secant path (which shares GvrParams
-        # and its own P4 histogram) stays byte-identical. P1b reuses this
-        # buffer and needs >= 256 bins, so 512 is safe. K512/K1024
-        # measured as a wash under the same protocol and stay stock.
-        if enable_r0 and top_k == 2048 and self.kNumBins > 512:
-            self.kNumBins = 512
+        # K2048 R0 Phase-4 histogram diet. Gated on enable_r0 so the
+        # retained secant path (which shares GvrParams and its own P4
+        # histogram) stays byte-identical; an explicit num_bins wins. P1b
+        # reuses this buffer and needs >= 256 bins. fp32 keeps 1024 bins:
+        # with the tail pair buffer no longer capped by the bin count, the
+        # straddling class at 512 bins costs more in the exact tail than
+        # the wider zero/build/scan passes save.
+        if enable_r0 and top_k == 2048 and num_bins is None:
+            diet = 1024 if dtype == cutlass.Float32 else 512
+            if self.kNumBins > diet:
+                self.kNumBins = diet
+        # Histogram allocation slots: >= kNumBins, and always enough tail
+        # room past _PAIR_BASE for _PAIR_MAX pairs, so kNumBins never caps
+        # the tail pair buffer.
+        self.kHistSlots = max(self.kNumBins, _PAIR_BASE + 2 * _PAIR_MAX)
         # p4_fine_rangetest: filter the fine recursion by value range
         # instead of recomputing each candidate's bin. OFF - the two are
         # not fp32-equivalent, and the scatter still classifies by bin
@@ -657,6 +663,23 @@ class GvrTopKKernel:
         # <= cand_cap and the collect rung's exact count is in [K, kC];
         # ineligible rows fall through to the ext-counts path.
         self.use_ext_cand = bool(use_ext_cand)
+        # cand_single_band: the emitter collected EVERY >= t0 hit into
+        # segment C only with exact ballot claims (pad-free, A/B untouched).
+        # The t0 cut is a dense mapped copy of the C prefix; the tighter
+        # lines (whose exact counts n1/n2 come from the seed counters) need
+        # the value-FILTERED walk because C is not partitioned by line.
+        # Admission reads the emitter's exact #(>= t0) from packed row col 3.
+        self.cand_single_band = bool(cand_single_band) and bool(use_ext_cand)
+        # emit_prev: at the end of the row, mirror the final indices into
+        # prev_out and emit per-entry neighbour-duplicate flags (bit0: p-1,
+        # bit1: p+1, bit2: p+2 is also a top-k index) computed from a bitmap
+        # of the row staged in the dead smem_keys. Feeds the next step's
+        # prescore (no host copy, no bitmap kernel).
+        self.emit_prev = bool(emit_prev)
+        if self.emit_prev and cluster_size != 1:
+            raise ValueError("emit_prev requires cluster_size == 1")
+        if self.emit_prev and self.top_k % self.num_threads != 0:
+            raise ValueError("emit_prev requires top_k % num_threads == 0")
         if kc_override is not None:
             # physical candidate-buffer capacity override (B* search)
             self.kC = int(kc_override)
@@ -825,9 +848,9 @@ class GvrTopKKernel:
             if self.p4_fine_rangetest or self.p4_scat_rangetest:
                 raise ValueError("p4_no_fine is incompatible with the range-test arms")
         if self.p4_exact_tail and self.p4_tail_fast and self.p4_tail_v3:
-            if _pair_cap_for(self.kNumBins) < 1:
+            if _pair_cap_for(self.kHistSlots) < 1:
                 raise ValueError(
-                    f"kNumBins={self.kNumBins} leaves no room for the tail pair buffer"
+                    f"kHistSlots={self.kHistSlots} leaves no room for the tail pair buffer"
                 )
         # p1r_rescue: rebuild the refine bracket from the row when the
         # seed bracket is degenerate (e.g. the zero-init prev_topk every
@@ -4022,7 +4045,7 @@ class GvrTopKKernel:
     ):
         kK = cutlass.const_expr(self.top_k)
         kBins = cutlass.const_expr(self.kNumBins)
-        pair_cap = cutlass.const_expr(_pair_cap_for(self.kNumBins))
+        pair_cap = cutlass.const_expr(_pair_cap_for(self.kHistSlots))
         num_threads = cutlass.const_expr(self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
         bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
@@ -4058,11 +4081,16 @@ class GvrTopKKernel:
                     # them); min := cut line by construction.
                     if cutlass.const_expr(ext_min is not None):
                         bmin_r = ext_min
-                    for w in cutlass.range_constexpr(self.num_warps):
-                        vmax = cutlass.Float32(
-                            llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
+                    # lane-parallel fold of the staged per-warp maxima: lane w
+                    # reads slot w, one warp reduce settles it (same inputs in
+                    # the same order on every warp, so it stays bit-identical)
+                    # instead of a num_warps-deep dependent read chain.
+                    vmax_l = cutlass.Float32(self.NEG_FLT_MAX)
+                    if lane < cutlass.Int32(self.num_warps):
+                        vmax_l = cutlass.Float32(
+                            llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[lane].ir_value())
                         )
-                        bmax_r = cute.arch.fmax(bmax_r, vmax)
+                    bmax_r = self.warp_reduce_max_f32(vmax_l)
                     if bmax_r <= bmin_r:
                         bmax_r = bmin_r + cutlass.Float32(1e-6)
             if run_stock_range:
@@ -4120,6 +4148,8 @@ class GvrTopKKernel:
                 cute.arch.barrier()
             range1 = bmax_r - bmin_r
             inv1 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range1
+            if cutlass.const_expr(_P4_SUB_DBG):
+                sc1 = cute.arch.clock64()  # build start, every row (debug only)
             i7 = tidx
             while i7 < cand_count:
                 vk = smem_keys[i7]
@@ -5684,6 +5714,9 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor,  # [numRows, CAP] fp32 scores (or None)
         cand_idx: cute.Tensor,  # [numRows, CAP] int32 positions (or None)
         cand_ctl: cute.Tensor,  # [numRows, 4] int32 {n0, void, n1, n2} (or None)
+        prev_out: cute.Tensor,  # [numRows, top_k] int32 (emit_prev) or None
+        prev_flags: cute.Tensor,  # [numRows, top_k] uint8 (emit_prev) or None
+        ps_hist: cute.Tensor,  # [numRows, HIST_WORDS] int32 (cand_single_band) or None
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -5742,6 +5775,9 @@ class GvrTopKKernel:
             cand_vals=cand_vals,
             cand_idx=cand_idx,
             cand_ctl=cand_ctl,
+            prev_out=prev_out,
+            prev_flags=prev_flags,
+            ps_hist=ps_hist,
         )
 
     @cute.jit
@@ -5760,6 +5796,9 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor = None,  # [numRows, CAP] fp32 (ext cand)
         cand_idx: cute.Tensor = None,  # [numRows, CAP] int32 (ext cand)
         cand_ctl: cute.Tensor = None,  # [numRows, 4] int32 (ext cand)
+        prev_out: cute.Tensor = None,  # [numRows, top_k] int32 (emit_prev)
+        prev_flags: cute.Tensor = None,  # [numRows, top_k] uint8 (emit_prev)
+        ps_hist: cute.Tensor = None,  # [numRows, HIST_WORDS] int32 (cand_single_band)
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -5781,7 +5820,6 @@ class GvrTopKKernel:
         num_threads = cutlass.const_expr(self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
         kC = cutlass.const_expr(self.kC)
-        kNumBins = cutlass.const_expr(self.kNumBins)
         cluster_size = cutlass.const_expr(self.cluster_size)
 
         warp_id = tidx // self.WARP_SIZE
@@ -5874,6 +5912,14 @@ class GvrTopKKernel:
         else:
             output_values_row = None
         output_indices_row = output_indices[row_idx, None]
+        if cutlass.const_expr(self.emit_prev):
+            if cutlass.const_expr(prev_out is None or prev_flags is None):
+                raise ValueError("emit_prev kernels require prev_out and prev_flags")
+            prev_out_row = prev_out[row_idx, None]
+            prev_flags_row = prev_flags[row_idx, None]
+        else:
+            prev_out_row = None
+            prev_flags_row = None
         pre_idx_count = pre_idx.shape[1]
 
         if cutlass.const_expr(not self.pdl_wait_late):
@@ -5920,10 +5966,10 @@ class GvrTopKKernel:
                 layout=cute.make_ordered_layout((kC,), order=(0,)),
                 byte_alignment=128,
             )
-        # histogram[kNumBins] int32 (P4 only)
+        # histogram[kHistSlots] int32 (P4 only)
         smem_hist = smem.allocate_tensor(
             element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout((kNumBins,), order=(0,)),
+            layout=cute.make_ordered_layout((cutlass.const_expr(self.kHistSlots),), order=(0,)),
             byte_alignment=128,
         )
         # per_thread_counts[BLOCK_SIZE] int32 (P2/P3 cached counts)
@@ -6115,6 +6161,16 @@ class GvrTopKKernel:
         # seed_thr / cand are first touched below.
         if cutlass.const_expr(self.pdl_wait_late):
             griddepcontrol_wait()
+        if cutlass.const_expr(self.cand_single_band and ps_hist is not None):
+            # the emitter (this grid's producer) has read the prescore histogram:
+            # reset the row for the next step; idempotent across the row's CTAs
+            ps_hist_row = ps_hist[row_idx, None]
+            for jz in cutlass.range_constexpr(
+                (PS_HIST_WORDS + self.num_threads - 1) // self.num_threads
+            ):
+                iz = tidx + cutlass.Int32(jz * self.num_threads)
+                if iz < cutlass.Int32(PS_HIST_WORDS):
+                    ps_hist_row[iz] = cutlass.Int32(0)
 
         # ---- Per-row dispatch ----
         # Three branches:
@@ -6206,6 +6262,8 @@ class GvrTopKKernel:
                         xstate_row=xstate_row,
                         cand_vals_row=cand_vals_row,
                         cand_idx_row=cand_idx_row,
+                        prev_out_row=prev_out_row,
+                        prev_flags_row=prev_flags_row,
                         cand_ctl_row=cand_ctl_row,
                         smem_active=smem_active,
                         s_active_cnt=s_active_cnt,
@@ -6257,6 +6315,8 @@ class GvrTopKKernel:
                             xstate_row=xstate_row,
                             cand_vals_row=cand_vals_row,
                             cand_idx_row=cand_idx_row,
+                            prev_out_row=prev_out_row,
+                            prev_flags_row=prev_flags_row,
                             cand_ctl_row=cand_ctl_row,
                             smem_active=smem_active,
                             s_active_cnt=s_active_cnt,
@@ -6305,6 +6365,8 @@ class GvrTopKKernel:
                     xstate_row=xstate_row,
                     cand_vals_row=cand_vals_row,
                     cand_idx_row=cand_idx_row,
+                    prev_out_row=prev_out_row,
+                    prev_flags_row=prev_flags_row,
                     cand_ctl_row=cand_ctl_row,
                     smem_active=smem_active,
                     s_active_cnt=s_active_cnt,
@@ -6360,6 +6422,8 @@ class GvrTopKKernel:
         smem_active=None,
         s_active_cnt=None,
         smem_stage=None,  # self_scan: [stage_rows, 4] fp32 cp.async staging
+        prev_out_row=None,  # emit_prev: this row's prev mirror
+        prev_flags_row=None,  # emit_prev: this row's neighbour flags
     ):
         """Run Phase 1-4 + final cluster barrier on a given row slice.
 
@@ -6422,13 +6486,19 @@ class GvrTopKKernel:
             ):
                 claimed_p = cutlass.Int32(cand_ctl_row[0])
                 void_p = cutlass.Int32(cand_ctl_row[1])
+                # single-band rows admit on the emitter's exact #(>= t0)
+                # (packed row col 3); 3-band rows keep the claimed total
+                # (pads are re-measured in the walk, real_c demotes)
+                lb_p = claimed_p
+                if cutlass.const_expr(self.cand_single_band):
+                    lb_p = cutlass.Int32(seed_thr_row[3])
                 # real (non-parked) lines only: the skip stages the raw
                 # lines into the threshold scratch, and a parked line
                 # (1e30) would poison every later bracket. Parked rows
                 # keep Phase 1; the list take below is independent.
                 if (
                     void_p == cutlass.Int32(0)
-                    and claimed_p >= cutlass.Int32(self.top_k + 64)
+                    and lb_p >= cutlass.Int32(self.top_k)
                     and claimed_p <= cutlass.Int32(self.list_cap)
                     and seed_thr_row[0] < cutlass.Float32(1e37)
                     and seed_thr_row[0] > cutlass.Float32(-1e37)
@@ -6667,9 +6737,9 @@ class GvrTopKKernel:
             #   1. some n_i in [K, B*] -> cut at the tightest, one pass
             #   2. every line straddles/overshoots -> histogram over the
             #      list clamped between the two known bracket lines
-            #   3. void, or n0 < K + 64 (emitter sentinel bound) -> fall
-            #      back. The slack also lets accepted cuts load without
-            #      an overflow net: count and load are the same compare.
+            #   3. void, or n0 < K -> fall back. n0 counts real emissions
+            #      (>= t0), so n0 >= K already guarantees the top K are in
+            #      the list; sentinel slots past n0 are -inf and never rank.
             # cs>1 and 16-bit dtypes keep the plain fallback.
             take_cand = cutlass.Int32(0)
             # Python bool: with every list/scan feature off, the stock
@@ -6717,12 +6787,21 @@ class GvrTopKKernel:
                 lenB = n1_c - n2_c + spillA
                 if lenB > cutlass.Int32(segA):
                     lenB = cutlass.Int32(segA)
+                if cutlass.const_expr(self.cand_single_band):
+                    # everything lives in C; the shared src mapping
+                    # (j >= lenA + lenB -> 2*segA + ...) then routes every
+                    # ordinal into the C range
+                    lenA = cutlass.Int32(0)
+                    lenB = cutlass.Int32(0)
                 lenC = claimed_c - lenA - lenB
                 total_l = claimed_c
                 usable = cutlass.Int32(0)
+                lb_c = claimed_c
+                if cutlass.const_expr(self.cand_single_band):
+                    lb_c = cutlass.Int32(seed_thr_row[3])
                 if (
                     void_c == cutlass.Int32(0)
-                    and claimed_c >= cutlass.Int32(self.top_k + 64)
+                    and lb_c >= cutlass.Int32(self.top_k)
                     and claimed_c <= cutlass.Int32(self.list_cap)
                 ):
                     usable = cutlass.Int32(1)
@@ -6738,7 +6817,40 @@ class GvrTopKKernel:
                 if cutlass.const_expr(True):
                     vbase = cand_vals_row.iterator.toint()
                     ibase = cand_idx_row.iterator.toint()
-                if usable == cutlass.Int32(1):
+                usable_sb = usable
+                if cutlass.const_expr(not self.cand_single_band):
+                    usable_sb = cutlass.Int32(0)
+                if cutlass.const_expr(True):
+                    if usable_sb == cutlass.Int32(1):
+                        # tightest line whose exact count fits [K, B*];
+                        # the cut is applied by the FILTERED walk below
+                        # (line_cut stays 0), so no prefix-completeness
+                        # requirement - coverage extends to any
+                        # claimed <= list_cap.
+                        if n2_c >= kK_l and n2_c <= bs_l:
+                            cut_t = seed_thr_row[2]
+                            cut_n = n2_c
+                            anch_t = seed_thr_row[2]
+                            have = cutlass.Int32(1)
+                        if have == cutlass.Int32(0) and n1_c >= kK_l and n1_c <= bs_l:
+                            cut_t = seed_thr_row[1]
+                            cut_n = n1_c
+                            anch_t = seed_thr_row[1]
+                            have = cutlass.Int32(1)
+                        if have == cutlass.Int32(0) and claimed_c <= bs_l:
+                            # single-band lists are pad-free (exact claims:
+                            # claimed == #(>= t0)), so the t0 cut is a dense
+                            # mapped copy of the C prefix - no filtering
+                            cut_t = seed_thr_row[0]
+                            cut_n = claimed_c
+                            anch_t = seed_thr_row[0]
+                            have = cutlass.Int32(1)
+                            line_cut = cutlass.Int32(1)
+                usable_nb = usable
+                if cutlass.const_expr(self.cand_single_band):
+                    # 3-band prefix cuts are invalid on single-band lists
+                    usable_nb = cutlass.Int32(0)
+                if usable_nb == cutlass.Int32(1):
                     # cut = tightest line in [K, B*]; anchor = loosest.
                     if n2_c >= kK_l and n2_c <= bs_l:
                         cut_t = seed_thr_row[2]
@@ -8195,6 +8307,76 @@ class GvrTopKKernel:
                             ifp = ifp + cutlass.Int32(self.num_threads)
                         cute.arch.barrier()
 
+        if cutlass.const_expr(self.emit_prev):
+            # ---- emit_prev epilogue: every output_indices_row store above is
+            # complete after this barrier (same CTA). Bitmap of the row's
+            # indices in the dead smem_keys (seg_total words = 32*seg_total
+            # positions); rows longer than that get all-duplicate flags
+            # (drops every neighbour sample: the sound direction).
+            cute.arch.barrier()
+            K_ = cutlass.const_expr(self.top_k)
+            n_bm_words = cutlass.const_expr(self.seg_total)
+            bm = cute.make_tensor(
+                cute.recast_ptr(smem_keys.iterator, dtype=cutlass.Int32),
+                cute.make_ordered_layout((n_bm_words,), order=(0,)),
+            )
+            last_p = N - cutlass.Int32(1)
+            fits = N <= cutlass.Int32(n_bm_words * 32)
+            nwords = (N + cutlass.Int32(31)) >> 5
+            iz = tidx
+            while iz < nwords:
+                if fits:
+                    bm[iz] = cutlass.Int32(0)
+                iz = iz + cutlass.Int32(num_threads)
+            cute.arch.barrier()
+            # each thread owns K/num_threads entries: read them once
+            PER_T = cutlass.const_expr(K_ // num_threads)
+            idx_f = cute.make_fragment(PER_T, cutlass.Int32)
+            for jj in cutlass.range_constexpr(PER_T):
+                ii = tidx + cutlass.Int32(jj * num_threads)
+                idx_o = output_indices_row[ii]
+                idx_f[jj] = idx_o
+                prev_out_row[ii] = idx_o
+                p_o = idx_o
+                if p_o < cutlass.Int32(0):
+                    p_o = cutlass.Int32(0)
+                if p_o > last_p:
+                    p_o = last_p
+                if fits:
+                    cute.arch.atomic_or(
+                        bm.iterator + (p_o >> 5),
+                        cutlass.Int32(1) << (p_o & cutlass.Int32(31)),
+                        sem="relaxed",
+                        scope="cta",
+                    )
+            cute.arch.barrier()
+            for jj in cutlass.range_constexpr(PER_T):
+                ii = tidx + cutlass.Int32(jj * num_threads)
+                p_o = idx_f[jj]
+                if p_o < cutlass.Int32(0):
+                    p_o = cutlass.Int32(0)
+                if p_o > last_p:
+                    p_o = last_p
+                fl = cutlass.Int32(7)
+                if fits:
+                    pm = p_o - cutlass.Int32(1)
+                    if pm < cutlass.Int32(0):
+                        pm = cutlass.Int32(0)
+                    p1 = p_o + cutlass.Int32(1)
+                    if p1 > last_p:
+                        p1 = last_p
+                    p2 = p_o + cutlass.Int32(2)
+                    if p2 > last_p:
+                        p2 = last_p
+                    b0 = (bm[pm >> 5] >> (pm & cutlass.Int32(31))) & cutlass.Int32(1)
+                    b1 = (bm[p1 >> 5] >> (p1 & cutlass.Int32(31))) & cutlass.Int32(1)
+                    b2 = (bm[p2 >> 5] >> (p2 & cutlass.Int32(31))) & cutlass.Int32(1)
+                    if p_o + cutlass.Int32(2) > last_p:
+                        b2 = cutlass.Int32(0)
+                    fl = b0 | (b1 << 1) | (b2 << 2)
+                prev_flags_row[ii] = cutlass.Uint8(fl)
+            cute.arch.barrier()
+
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
         # until the leader's gather + Phase 4 finish. Skipped at
         # do_cluster_sync=False (no peers; short-row degrade non-leaders
@@ -8224,6 +8406,9 @@ class GvrTopKKernel:
         cand_vals: cute.Tensor = None,  # [num_rows, CAP] fp32 (ext cand)
         cand_idx: cute.Tensor = None,  # [num_rows, CAP] int32 (ext cand)
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 (ext cand)
+        prev_out: cute.Tensor = None,  # [num_rows, top_k] int32 (emit_prev)
+        prev_flags: cute.Tensor = None,  # [num_rows, top_k] uint8 (emit_prev)
+        ps_hist: cute.Tensor = None,  # [num_rows, HIST_WORDS] int32 (cand_single_band)
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
@@ -8252,6 +8437,9 @@ class GvrTopKKernel:
             cand_vals,
             cand_idx,
             cand_ctl,
+            prev_out,
+            prev_flags,
+            ps_hist,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
