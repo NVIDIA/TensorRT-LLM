@@ -998,7 +998,9 @@ def launch_plan(
             sweep = Path(sweeps[track])
             verify_sweep_matches_point(sweep, track, point)
         else:
-            sweep = derive_sweep_at_point(Path(design_sweeps[track]), track, point, into=workspace)
+            sweep = derive_sweep_at_point(
+                Path(design_sweeps[track]), track, point, into=workspace, repo=repo
+            )
         launches.append(
             CampaignLaunch(
                 track=track,
