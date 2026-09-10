@@ -1005,3 +1005,32 @@ def test_a_design_that_already_exists_is_not_paid_for_again(tmp_path):
     assert ran == []  # the designer was never started
     assert record["design_dir"].endswith("sweep_design")
     assert "design_dir_redirected" in record
+
+
+def test_a_redirected_design_carries_its_sweep_with_it(tmp_path):
+    """`design_dir` and `design_sweep` are two fields naming one thing.
+
+    A sweep path still rooted at the requested directory names a file that
+    was never written, and the failure arrives after the points have been
+    read and the point chosen -- the most expensive moment to find a path
+    problem.
+    """
+    requested = tmp_path / "model" / "sweep_design2"
+    actual = tmp_path / "model" / "sweep_design"
+    actual.mkdir(parents=True)
+    (actual / "8k1k_sol_mtp0.yaml").write_text("gen_configs: []\n")
+    got = disagg_sol.rebase_design_sweep(requested / "8k1k_sol_mtp0.yaml", requested, actual)
+    assert got == actual / "8k1k_sol_mtp0.yaml"
+
+
+def test_a_sweep_that_exists_where_stated_is_left_alone(tmp_path):
+    here = tmp_path / "elsewhere.yaml"
+    here.write_text("gen_configs: []\n")
+    assert disagg_sol.rebase_design_sweep(here, tmp_path / "a", tmp_path / "b") == here
+
+
+def test_a_sweep_pointing_outside_the_design_is_a_deliberate_choice(tmp_path):
+    """Not under the requested directory, so not this redirection's business."""
+    outside = tmp_path / "curated" / "sweep.yaml"
+    got = disagg_sol.rebase_design_sweep(outside, tmp_path / "a", tmp_path / "b")
+    assert got == outside

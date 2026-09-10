@@ -648,6 +648,30 @@ def resolve_design_dir(requested: Path, wanted: Sequence[str]) -> tuple[Path, st
     return found[0], DESIGN_REDIRECTED.format(requested=requested, actual=found[0])
 
 
+def rebase_design_sweep(stated: Path, requested: Path, actual: Path) -> Path:
+    """Carry a redirected design's sweep along with its directory.
+
+    ``design_dir`` and ``design_sweep`` are two fields naming one thing: the
+    sweep is a file the design writes inside its own directory. When the
+    design turns out to be somewhere other than where it was asked for, a
+    sweep path still rooted at the requested directory names a file that was
+    never written -- and the failure arrives late, after the points have been
+    read and the operating point chosen, which is the most expensive moment
+    to discover a path problem.
+
+    Only a sweep that sat under the requested directory is moved, and only
+    when the file is not where it was stated. A path pointing somewhere else
+    entirely was a deliberate choice and is left alone.
+    """
+    stated, requested, actual = Path(stated), Path(requested), Path(actual)
+    if stated.is_file() or requested == actual:
+        return stated
+    try:
+        return actual / stated.relative_to(requested)
+    except ValueError:
+        return stated
+
+
 def campaign_workspace(root: Path, track: str, label: str) -> Path:
     """Each half gets its own, and the name says which half it is.
 
@@ -999,6 +1023,7 @@ def supervise(
     # paying for one that already exists next door is the expensive half of
     # this mistake -- and the reason the agent resumed a neighbour in the
     # first place was to avoid exactly that.
+    requested_design = design
     design, redirect = resolve_design_dir(design, wanted)
     unready = [t for t in wanted if not established(design, t)]
     if unready and designer is not None:
@@ -1051,6 +1076,8 @@ def supervise(
     block = _block(base).get(DESIGN_KEY)
     block = block if isinstance(block, Mapping) else {}
     stated_sweep = block.get(DESIGN_SWEEP_KEY)
+    if stated_sweep and redirect:
+        stated_sweep = rebase_design_sweep(Path(stated_sweep), requested_design, design)
     launches = launch_plan(
         base,
         sweeps=sweeps,
