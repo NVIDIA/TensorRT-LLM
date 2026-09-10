@@ -292,8 +292,8 @@ def test_cuda_graph_replay_multiple_calls_shared_runner(distinct_layers: bool) -
         if not distinct_layers and layer_inputs:
             layer_inputs.append(layer_inputs[0])
             continue
-        input_seed = 1000 + layer_idx if distinct_layers else 1000
-        adapter_seed = 1100 + 10 * layer_idx if distinct_layers else 1100
+        input_seed = 1000 + layer_idx
+        adapter_seed = 1100 + 10 * layer_idx
         x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
             num_tokens,
             hidden_size,

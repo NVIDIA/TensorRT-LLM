@@ -18,8 +18,9 @@ op:
     global `max_rank`.
 
 `CudaGraphLoraParams` allocates pinned host buffers and moves a small tensor to
-CUDA at construction, so these require a GPU, but no weights and no
-`trtllm::fused_moe` op.
+CUDA at construction, so tests exercising it require a GPU, but no weights and
+no `trtllm::fused_moe` op. The workspace-reservation test patches it out and
+intentionally runs on CPU.
 """
 
 from types import SimpleNamespace
