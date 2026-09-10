@@ -43,7 +43,7 @@ _flash_attn_fwd_import_error = None
 try:
     _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import _flash_attn_fwd
-except (ImportError, OSError) as e:
+except (AttributeError, ImportError, OSError) as e:
     _flash_attn_fwd = None
     _flash_attn_fwd_import_error = e
 
