@@ -596,6 +596,42 @@ class TestStorageManagerLocalized(unittest.TestCase):
             self.storage_manager.num_slots(PoolGroupIndex(0))
 
     # ------------------------------------------------------------------
+    # Test 2b: a domain id must not be forwarded to non-localized storage
+    # ------------------------------------------------------------------
+    def test_new_slots_for_pool_group_spills_to_host_with_locality_domain_id(self) -> None:
+        """Spilling a domain-pinned cache to host must not forward the domain id.
+
+        Host and disk storage inherit the base signature, which takes no
+        locality_domain_id, so forwarding it raises TypeError.
+        """
+        self.storage_manager = self._make_localized_sm(num_layers=2, host_quota=_256MB)
+        sm = self.storage_manager
+        host_level = GPU_LEVEL + 1
+        self.assertGreater(sm.num_cache_levels, host_level, "test needs a host tier")
+        self.assertNotIsInstance(
+            sm._levels[host_level].storage,
+            GpuCacheLevelStorage,
+            "host tier must not be GPU storage",
+        )
+
+        slots = sm.new_slots_for_pool_group(host_level, PoolGroupIndex(0), 1, locality_domain_id=1)
+        self.assertEqual(len(slots), 1)
+        self.assertIsNone(slots[0].locality_domain_id)
+        sm.release_slot(LifeCycleId(0), host_level, slots[0])
+
+    def test_new_slots_spills_to_host_with_locality_domain_id(self) -> None:
+        """Same for the multi-life-cycle new_slots() entry point."""
+        self.storage_manager = self._make_localized_sm(num_layers=2, host_quota=_256MB)
+        sm = self.storage_manager
+        host_level = GPU_LEVEL + 1
+        num_slots = [0] * sm.num_life_cycles
+        num_slots[LifeCycleId(0)] = 1
+
+        ret = sm.new_slots(host_level, num_slots, locality_domain_id=1)
+        self.assertEqual(len(ret[LifeCycleId(0)]), 1)
+        sm.release_slot(LifeCycleId(0), host_level, ret[LifeCycleId(0)][0])
+
+    # ------------------------------------------------------------------
     # Test 3: both locality domains receive equal slot counts (symmetric quota split)
     # ------------------------------------------------------------------
     def test_num_slots_per_locality_domain_are_equal(self) -> None:

@@ -365,7 +365,7 @@ class StorageManager:
         )
 
         def free_slots(pg: PoolGroupIndex) -> int:
-            if locality_domain_id is not None:
+            if localized_gpu_storage:
                 return storage.get_num_free_slots(pg, locality_domain_id)
             return storage.get_num_free_slots(pg)
 
@@ -382,7 +382,7 @@ class StorageManager:
         try:
             for life_cycle in typed_range(self.num_life_cycles):
                 pg_idx = lc2pg[life_cycle]
-                if locality_domain_id is not None:
+                if localized_gpu_storage:
                     ret[life_cycle] = storage.allocate_multiple(
                         pg_idx, num_slots[life_cycle], locality_domain_id
                     )
@@ -393,7 +393,7 @@ class StorageManager:
             for lc, slots in typed_enumerate(ret):
                 pg_idx = lc2pg[lc]
                 for s in slots:
-                    if locality_domain_id is not None:
+                    if localized_gpu_storage:
                         storage.release(pg_idx, s, locality_domain_id)
                     else:
                         storage.release(pg_idx, s)
@@ -422,7 +422,7 @@ class StorageManager:
         )
 
         def free_slots() -> int:
-            if locality_domain_id is not None:
+            if localized_gpu_storage:
                 return storage.get_num_free_slots(pg_idx, locality_domain_id)
             return storage.get_num_free_slots(pg_idx)
 
@@ -438,7 +438,7 @@ class StorageManager:
             )
         assert num_slots <= free_slots()
         try:
-            if locality_domain_id is not None:
+            if localized_gpu_storage:
                 return storage.allocate_multiple(pg_idx, num_slots, locality_domain_id)
             return storage.allocate_multiple(pg_idx, num_slots)
         except Exception:
