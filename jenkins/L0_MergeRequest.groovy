@@ -1086,6 +1086,12 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def coverageContext = _cbtsCoverageAudit(pipeline)
         def coverageDb = coverageContext?.db
         def coveragePilotEligible = coverageContext?.pilotEligible ?: false
+        def coveragePatchInput = null
+        if (coverageDb?.patch_input) {
+            coveragePatchInput = new groovy.json.JsonSlurper().parseText(
+                readFile("${LLM_ROOT}/${coverageDb.patch_input}"))
+            changedFiles = (coveragePatchInput.changed_files ?: []).unique()
+        }
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -1098,10 +1104,14 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
         def diffs = [:]
         if (filesNeedingDiff) {
-            def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
-            def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
-                : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            def fileChanges = coveragePatchInput?.diffs
+            if (fileChanges == null) {
+                def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+                fileChanges = githubPrApiUrl != null
+                    ? getGithubMRChangedFileWithFallback(
+                        pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+                    : getGitlabMRChangedFile(pipeline, "getFileChanges")
+            }
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
                 [(filePath): fileChanges[filePath] ?: ""]
@@ -1196,7 +1206,8 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
 }
 
 // Resolve pilot application eligibility, then fetch and audit the touch DB for
-// every PR. Returns {db, pilotEligible}; db is null on a non-fatal preparation failure.
+// every PR. Returns {db, pilotEligible}; db contains artifact.py's prepared paths
+// and compatibility-diff metadata, or is null on a non-fatal preparation failure.
 def _cbtsCoverageAudit(pipeline)
 {
     def pilotEligible = false
@@ -1207,7 +1218,13 @@ def _cbtsCoverageAudit(pipeline)
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
         def readyJson = ""
         def prAuthor = ""
-        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+            string(credentialsId: 'default-llm-repo', variable: 'CBTS_COVERAGE_GIT_REPO'),
+        ]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
@@ -1225,6 +1242,16 @@ def _cbtsCoverageAudit(pipeline)
             return [db: null, pilotEligible: pilotEligible]
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        if (ready.patch_diff_kind == "cumulative") {
+            pipeline.echo("CBTS audit: Tier 2 will use cumulative diff " +
+                          "${ready.patch_diff_base_commit.take(10)}.." +
+                          "${ready.patch_diff_head_commit.take(10)}, not the GitHub PR diff " +
+                          "${ready.pr_base_commit.take(10)}.." +
+                          "${ready.patch_diff_head_commit.take(10)}")
+        } else {
+            pipeline.echo("CBTS audit: coverage compatibility used GitHub PR diff " +
+                          "${ready.patch_diff_base_commit.take(10)}..${ready.patch_diff_head_commit.take(10)}")
+        }
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
