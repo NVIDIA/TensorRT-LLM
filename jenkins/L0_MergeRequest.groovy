@@ -781,12 +781,6 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
 def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", filePaths=[]) {
     def wrapperBuildNumber = globalVars[ACTION_INFO]?.get("parents")?.getAt(0)?.get("build_number")?.toString()
     def headCommit = env.gitlabCommit?.toString()
-    if (!(wrapperBuildNumber ==~ /\d+/)) {
-        pipeline.error("Cannot use internal Git mirror fallback: missing or invalid wrapper build number.")
-    }
-    if (!(headCommit ==~ /[0-9a-fA-F]{40}/)) {
-        pipeline.error("Cannot use internal Git mirror fallback: missing or invalid PR head commit.")
-    }
     def baseRef = "refs/heads/prjob/${wrapperBuildNumber}/base"
     pipeline.withEnv(["GIT_DIFF_BASE_REF=${baseRef}"]) {
         withCredentials([gitUsernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', gitToolName: 'Default'),]) {
@@ -796,33 +790,17 @@ def getGitMirrorMRChangedFile(pipeline, globalVars, function, filePath="", fileP
     def baseCommit = pipeline.sh(script: "git -C ${LLM_ROOT} rev-parse FETCH_HEAD", returnStdout: true).trim()
     pipeline.echo("Using internal Git mirror diff: ${baseCommit}...${headCommit}")
 
-    def encodedNameStatus = pipeline.sh(
-        script: """
-            name_status_file=\$(mktemp)
-            trap 'rm -f "\${name_status_file}"' EXIT
-            git -C ${LLM_ROOT} diff --name-status --find-renames -z ${baseCommit} ${headCommit} > "\${name_status_file}"
-            base64 < "\${name_status_file}"
-        """,
+    def nameStatus = pipeline.sh(
+        script: "git -C ${LLM_ROOT} -c core.quotepath=false diff --name-status --find-renames ${baseCommit} ${headCommit}",
         returnStdout: true
-    ).readLines().join()
-    def fields = new String(encodedNameStatus.decodeBase64(), "UTF-8")
-        .tokenize(Character.toString((char) 0))
-    def changedFiles = []
-    def fieldIndex = 0
-    while (fieldIndex < fields.size()) {
-        def status = fields[fieldIndex++]
-        def pathCount = status.startsWith("R") || status.startsWith("C") ? 2 : 1
-        if (fieldIndex + pathCount > fields.size()) {
-            pipeline.error("Malformed internal Git mirror name-status record.")
-        }
-        changedFiles << [status: status, paths: fields.subList(fieldIndex, fieldIndex + pathCount).toList()]
-        fieldIndex += pathCount
+    )
+    def changedFiles = nameStatus.readLines().collect { line ->
+        def fields = line.split('\t', -1)
+        [status: fields[0], paths: fields.drop(1).findAll { it }]
     }
     if (function == "getChangedFileList") {
         return changedFiles.collectMany { changedFile ->
-            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")
-                ? changedFile.paths.reverse()
-                : changedFile.paths
+            changedFile.status.startsWith("R") || changedFile.status.startsWith("C")? changedFile.paths.reverse(): changedFile.paths
         }
     }
 
