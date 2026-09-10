@@ -82,6 +82,71 @@ def get_model_yaml_config(model_label: str,
     # Pattern-based configurations for models matching specific substrings
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
+        # MAX NVFP4 TP8/MTP3: accuracy PR #18071. The curated
+        # qwen3.8-low-latency-mtp3.yaml targets a different FP8 TP16 recipe.
+        {
+            'patterns': ['qwen3.8_max_fp4_mtp-serve-pytorch'],
+            'config': {
+                'trust_remote_code': True,
+                'max_seq_len': 8192,
+                'enable_attention_dp': False,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.8,
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        # Flash-Next single-GPU MTP3 with PLE host offload: PR #18585.
+        # The server environment is set in test_perf.py.
+        {
+            'patterns': ['qwen3.8_flash_next_'],
+            'config': {
+                'trust_remote_code': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 16,
+                },
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.5,
+                    'enable_block_reuse': False,
+                    'mamba_ssm_cache_dtype': 'bfloat16',
+                },
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp8_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['qwen3.8_flash_next_fp4_mtp'],
+            'config': {
+                'moe_config': {
+                    'backend': 'CUTEDSL',
+                },
+            }
+        },
         # Deepseek default cases
         {
             'patterns': ['deepseek_r1'],

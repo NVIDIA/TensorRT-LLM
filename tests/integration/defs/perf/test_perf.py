@@ -33,7 +33,8 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
 
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
-from ..conftest import get_device_count, llm_models_root, trt_environment
+from ..conftest import (check_device_contain, get_device_count,
+                        get_host_total_memory, llm_models_root, trt_environment)
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
@@ -58,6 +59,11 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+QWEN38_MTP_MODELS = {
+    "qwen3.8_max_fp4_mtp",
+    "qwen3.8_flash_next_fp8_mtp",
+    "qwen3.8_flash_next_fp4_mtp",
+}
 KIMI_K3_SERVER_ENV = {
     "KIMI_K3_FP8_WEIGHT_READ": "1",
     "KIMI_K3_FP8_WEIGHT_READ_GATE_UP": "1",
@@ -65,6 +71,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
     "minimax_m3_fp4",
@@ -104,6 +111,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
     "qwen3_235b_a22b_fp4_eagle3",
     "gpt_oss_120b_eagle3",
@@ -1482,6 +1490,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_commands(self):
         num_gpus = self._config.num_gpus
 
+        if self._config.model_name == "qwen3.8_max_fp4_mtp":
+            if not check_device_contain(["B300", "GB300"]):
+                pytest.skip("Qwen3.8 MAX NVFP4 TP8 requires B300 or GB300")
+        if self._config.model_name.startswith("qwen3.8_flash_next_"):
+            required_memory_mb = (98304 if "fp8" in self._config.model_name else
+                                  131072)
+            if get_host_total_memory() < required_memory_mb:
+                pytest.skip(
+                    f"Flash-Next PLE offload requires {required_memory_mb} MiB host memory"
+                )
+
         if is_windows() and num_gpus > 1:
             pytest.skip(
                 "multi-gpu not supported on Windows yet, skipped for now")
@@ -1517,11 +1536,15 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
             server_env = os.environ.copy()
+            if self._config.model_name.startswith("qwen3.8_flash_next_"):
+                server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
             if self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
-            if self._config.model_name in NEMOTRON_SUPER_MODELS:
+            if self._config.model_name in QWEN38_MTP_MODELS:
+                server_timeout = 5400
+            elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
