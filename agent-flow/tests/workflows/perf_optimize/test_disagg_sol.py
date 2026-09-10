@@ -884,3 +884,90 @@ def test_a_point_the_design_sweep_cannot_produce_is_refused(tmp_path):
             {"shape": "dep_32_eplb0_mtp0", "concurrency": 4096},
             into=tmp_path / "ws",
         )
+
+
+# ------------------------------------------------- where the design landed
+
+
+def _established_at(root: Path, name: str) -> Path:
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / disagg_sol.DESIGN_STATE).write_text(json.dumps({"phase": "PHASE3_DONE"}))
+    _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
+    _shape_run(d, "bm_tep4", [(1, 4, "False", 0, 0, 214.0, 53.0)])
+    return d
+
+
+def test_the_requested_design_is_used_when_it_is_the_established_one(tmp_path):
+    d = _established_at(tmp_path / "model", "sweep_design2")
+    got, note = disagg_sol.resolve_design_dir(d, ["ctx", "gen"])
+    assert got == d
+    assert note is None
+
+
+def test_a_design_established_next_door_is_followed_and_recorded(tmp_path):
+    """Resuming an existing design instead of re-probing is the right call.
+
+    It saved roughly twenty node-hours on the run this was written after.
+    Refusing it would forbid a correct decision; following it silently would
+    leave every later artefact citing a directory the spec never named.
+    """
+    model = tmp_path / "model"
+    actual = _established_at(model, "sweep_design")
+    requested = model / "sweep_design2"
+    requested.mkdir()
+
+    got, note = disagg_sol.resolve_design_dir(requested, ["ctx", "gen"])
+    assert got == actual
+    assert "sweep_design2" in note and "sweep_design" in note
+    assert "Point the spec at" in note
+
+
+def test_two_established_designs_side_by_side_are_refused(tmp_path):
+    """Which measurement to freeze on is not this layer's question."""
+    model = tmp_path / "model"
+    _established_at(model, "sweep_design")
+    _established_at(model, "sweep_design_b")
+    with pytest.raises(disagg_sol.DisaggSolError, match="is not something this layer may pick"):
+        disagg_sol.resolve_design_dir(model / "sweep_design2", ["ctx", "gen"])
+
+
+def test_an_unestablished_neighbour_is_not_followed(tmp_path):
+    """The search admits only directories that measured what is wanted.
+
+    A supervisor that hunts the filesystem for something that looks like a
+    design will eventually find one that is not.
+    """
+    model = tmp_path / "model"
+    empty = model / "sweep_design"
+    empty.mkdir(parents=True)
+    (empty / disagg_sol.DESIGN_STATE).write_text(json.dumps({"phase": "PHASE2"}))
+    requested = model / "sweep_design2"
+    got, note = disagg_sol.resolve_design_dir(requested, ["gen"])
+    assert got == requested and note is None
+
+
+def test_the_redirection_travels_in_the_run_record(tmp_path):
+    """A reader must not have to already know."""
+    model = tmp_path / "model"
+    _established_at(model, "sweep_design")
+    requested = model / "sweep_design2"
+    requested.mkdir()
+    spec = {
+        "checkpoint_path": "/ckpt",
+        FIELD: {
+            "tracks": ["gen"],
+            "design": {"design_dir": str(requested), "prefer": "interactive"},
+        },
+    }
+    record = disagg_sol.supervise(
+        spec,
+        sweeps={"gen": _sweeps(tmp_path)["gen"]},
+        repos={"gen": tmp_path / "rg"},
+        workspace_root=tmp_path / "wsr",
+        label="t",
+        dry_run=True,
+        designer=lambda instruction: None,  # the design is already next door
+    )
+    assert record["design_dir"].endswith("sweep_design")
+    assert "design_dir_redirected" in record
