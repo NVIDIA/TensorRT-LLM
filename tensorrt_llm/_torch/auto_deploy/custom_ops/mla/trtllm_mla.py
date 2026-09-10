@@ -61,7 +61,6 @@ from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
-from tensorrt_llm._torch.attention.backends.fmha.interface import ensure_fmha_scheduler_counter
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PositionEmbeddingType,
@@ -312,10 +311,7 @@ class _TrtllmMLAPlanner:
         self._cu_kv_decode_host = torch.zeros(
             max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
-        # Placeholder sized for the MLA tile counter alone; ``ensure_decode_buffers``
-        # grows it to what the multi-CTA-KV path needs once ``num_heads`` is known.
-        # int32, not uint32: the native side reads it via ``data_ptr<int32_t>()``.
-        self.fmha_scheduler_counter_decode = torch.zeros(1, dtype=torch.int32, device=device)
+        self.fmha_scheduler_counter_decode = torch.empty(1, dtype=torch.uint32, device=device)
 
         # Chunked-prefill metadata (cache-reused / chunked-prefill path).
         # Upper bound on iteration count: with chunk_size = max_seq_len (set in
@@ -557,11 +553,7 @@ class _TrtllmMLAPlanner:
         self._decode_buf_dtype = dtype
         gen_head_size = kv_lora_rank + qk_rope_head_dim
 
-        # The scheduler counter doubles as the trtllm-gen multi-CTA-KV counter, which
-        # is indexed per (sequence, head) pair rather than as a single tile counter.
-        self.fmha_scheduler_counter_decode = ensure_fmha_scheduler_counter(
-            None, device, num_heads, max_tokens
-        )
+        self.fmha_scheduler_counter_decode = torch.empty(1, dtype=torch.uint32, device=device)
 
         self.cu_q_decode = (
             torch.arange(max_tokens + 1, dtype=torch.int32, device=device) * num_heads

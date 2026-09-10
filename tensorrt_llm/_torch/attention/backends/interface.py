@@ -932,7 +932,7 @@ class AttentionForwardArgs:
     cu_kv_seqlens: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32,
                                                          default=None)
     fmha_scheduler_counter: Optional[torch.Tensor] = cpp_metadata(
-        ctype=torch.int32, default=None)
+        ctype=torch.uint32, default=None)
     mla_bmm1_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
                                                           default=None)
     mla_bmm2_scale: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32,
