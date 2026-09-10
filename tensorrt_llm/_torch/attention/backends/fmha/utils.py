@@ -19,6 +19,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -117,6 +118,43 @@ def get_trtllm_gen_context_workspace_size(
 @lru_cache(maxsize=None)
 def get_multi_processor_count_for_device(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def get_multi_ctas_kv_counter_size(
+    device: torch.device, num_heads: int, max_num_sequences: int
+) -> int:
+    """Bytes needed by the trtllm-gen multi-CTA KV counter semaphores.
+
+    Sized by flashinfer, which owns the kernels that address this buffer, so the two
+    cannot drift.
+    """
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        max_num_sequences, num_heads, get_multi_processor_count_for_device(device_index)
+    )
+
+
+def get_multi_ctas_kv_counter(
+    counter: Optional[torch.Tensor],
+    device: torch.device,
+    num_heads: int,
+    max_num_sequences: int,
+) -> torch.Tensor:
+    """Return the counter buffer, allocating it zeroed when it does not fit.
+
+    The trtllm-gen kernels reset the semaphores at the end of every launch, so the
+    buffer only needs zeroing at allocation.
+    """
+    required_size = get_multi_ctas_kv_counter_size(device, num_heads, max_num_sequences)
+    if (
+        counter is None
+        or counter.device != device
+        or counter.numel() * counter.element_size() < required_size
+    ):
+        counter = torch.zeros(required_size, dtype=torch.uint8, device=device)
+    return counter
 
 
 def get_bmm1_scale(attn: "TrtllmAttention") -> float:

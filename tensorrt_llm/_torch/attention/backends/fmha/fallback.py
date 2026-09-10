@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Dict, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 
@@ -26,8 +26,9 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.internal import thop
 
 from ..sparse.params import SparseRuntimeParams
-from .interface import FmhaPhase, ensure_fmha_scheduler_counter
+from .interface import FmhaPhase, StaticAttentionConfig
 from .phased import FmhaParams, PhasedFmha
+from .utils import get_multi_ctas_kv_counter
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -36,49 +37,45 @@ if TYPE_CHECKING:
     )
 
 
-# ``TrtllmAttention`` caches a scheduler counter per layer, but the entry points below
-# are ``@staticmethod``s with no instance to hang one off, so they share a per-device
-# buffer. Keeping it cached rather than allocating per call also keeps the pointer
-# stable across CUDA graph replays.
-_SCHEDULER_COUNTERS: Dict[torch.device, torch.Tensor] = {}
-
-
-def _cached_scheduler_counter(
-    device: torch.device, num_heads: int, max_num_sequences: int
-) -> torch.Tensor:
-    counter = ensure_fmha_scheduler_counter(
-        _SCHEDULER_COUNTERS.get(device), device, num_heads, max_num_sequences
-    )
-    _SCHEDULER_COUNTERS[device] = counter
-    return counter
-
-
-@torch._dynamo.disable
-def _query_workspace_size(
-    op: "thop.AttentionOp",
-    tp: "thop.FmhaParams",
+def _set_context_workspace_shape(
+    params: FmhaParams,
     *,
-    num_tokens: int,
-    max_attention_window_size: int,
-    num_gen_tokens: int,
-    max_blocks_per_sequence: int,
+    num_contexts: int,
+    num_ctx_tokens: int,
+    host_context_lengths: torch.Tensor,
+    host_past_key_value_lengths: torch.Tensor,
     host_total_kv_lens: torch.Tensor,
-) -> int:
-    """Ask the native op how much scratch this call needs.
+    max_context_q_len_override: Optional[int],
+) -> None:
+    """Set the active context extents consumed by native workspace sizing."""
+    if num_contexts <= 0 or num_ctx_tokens <= 0:
+        params.num_seqs = 0
+        params.num_requests = 0
+        params.num_tokens = 0
+        params.input_seq_length = 0
+        params.max_past_kv_length = 0
+        params.total_kv_len = 0
+        return
 
-    Dynamo-disabled: reading a host tensor element graph-breaks, and a break
-    around a bound nanobind method drops the receiver, so the resumed frame
-    calls it unbound. Keeping the read and the call in one untraced function
-    avoids that entirely -- none of this is graph work anyway.
-    """
-    return op.get_attention_workspace_size(
-        tp,
-        num_tokens,
-        max_attention_window_size,
-        num_gen_tokens,
-        max_blocks_per_sequence,
-        int(host_total_kv_lens[0]),
-    )
+    max_context_q_len = int(host_context_lengths[:num_contexts].max())
+    max_past_kv_len = int(host_past_key_value_lengths[:num_contexts].max())
+    if max_context_q_len_override is not None:
+        override = int(max_context_q_len_override)
+        if override < max_context_q_len or override < max_past_kv_len:
+            raise ValueError(
+                f"max_context_q_len_override ({override}) must be >= the computed max "
+                f"context q length ({max_context_q_len}) and max past kv length "
+                f"({max_past_kv_len})."
+            )
+        max_context_q_len = override
+        max_past_kv_len = override
+
+    params.num_seqs = num_contexts
+    params.num_requests = num_contexts
+    params.num_tokens = num_ctx_tokens
+    params.input_seq_length = max_context_q_len
+    params.max_past_kv_length = max_past_kv_len
+    params.total_kv_len = int(host_total_kv_lens[0])
 
 
 class FallbackFmha(PhasedFmha):
@@ -86,6 +83,10 @@ class FallbackFmha(PhasedFmha):
 
     REQUIRES_PAGED_KV = False
     supports_skip_correction = True
+
+    def __init__(self, attn: "TrtllmAttention"):
+        super().__init__(attn)
+        self._multi_ctas_kv_counter: Optional[torch.Tensor] = None
 
     @staticmethod
     def run_auto_deploy_mha(
@@ -139,10 +140,10 @@ class FallbackFmha(PhasedFmha):
                 f"num_ctx_tokens={num_ctx_tokens}."
             )
 
-        # The generation kernels dereference the scheduler counter unconditionally in
-        # multi-block mode; this entry point has no other source for it.
-        scheduler_counter = (
-            _cached_scheduler_counter(qkv_or_q.device, num_heads, max_num_requests)
+        # The generation kernels dereference the counter unconditionally in multi-block
+        # mode; this entry point has no other source for it.
+        multi_ctas_kv_counter = (
+            get_multi_ctas_kv_counter(None, qkv_or_q.device, num_heads, max_num_requests)
             if num_generations > 0
             else None
         )
@@ -151,8 +152,8 @@ class FallbackFmha(PhasedFmha):
             arguments,
             layer_idx=0,
             beam_width=1,
+            multi_ctas_kv_counter=multi_ctas_kv_counter,
             fwd=AttentionForwardArgs(
-                fmha_scheduler_counter=scheduler_counter,
                 chunked_prefill_buffer_batch_size=max_num_requests,
                 sparse_runtime_params=SparseRuntimeParams(sparse_attn_indices_block_size=1),
             ),
@@ -174,20 +175,27 @@ class FallbackFmha(PhasedFmha):
             cyclic_attention_window_size=attention_window_size,
             max_attention_window_size=attention_window_size,
         )
+        _set_context_workspace_shape(
+            params,
+            num_contexts=num_contexts,
+            num_ctx_tokens=num_ctx_tokens,
+            host_context_lengths=host_context_lengths,
+            host_past_key_value_lengths=host_past_key_value_lengths,
+            host_total_kv_lens=host_total_kv_lens,
+            max_context_q_len_override=None,
+        )
         thop_params = params.to_thop_params()
 
         # No layer object to hang an op off, so this entry point builds one per call --
         # the behaviour every caller had before ops became reusable.
-        op = thop.AttentionOp()
+        op = thop.AttentionOp(StaticAttentionConfig.from_params(params).to_thop_config())
 
-        workspace_size = _query_workspace_size(
-            op,
+        workspace_size = op.get_attention_workspace_size(
             thop_params,
-            num_tokens=num_tokens,
-            max_attention_window_size=attention_window_size,
-            num_gen_tokens=num_gen_tokens,
-            max_blocks_per_sequence=kv_cache_block_offsets.size(-1),
-            host_total_kv_lens=host_total_kv_lens,
+            num_tokens,
+            attention_window_size,
+            num_gen_tokens,
+            kv_cache_block_offsets.size(-1),
         )
         if workspace.numel() < workspace_size:
             workspace.resize_(workspace_size)
@@ -396,18 +404,19 @@ class FallbackFmha(PhasedFmha):
                 f"num_ctx_tokens={num_ctx_tokens}."
             )
 
-        # Generation requires a scheduler counter: it backs both the MMHA/XQA
-        # multi-block counter and the MLA FMHA tile counter, and neither consumer
-        # checks for null.
-        if num_generations > 0 and fmha_scheduler_counter is None:
-            fmha_scheduler_counter = _cached_scheduler_counter(
-                q.device, num_heads, max_num_sequences or max_num_requests
+        # Generation requires an FMHA-owned multi-CTA scratch buffer in addition to
+        # MLA's caller-owned scheduler counter.
+        multi_ctas_kv_counter = None
+        if num_generations > 0:
+            multi_ctas_kv_counter = get_multi_ctas_kv_counter(
+                None, q.device, num_heads, max_num_sequences or max_num_requests
             )
 
         params = FmhaParams._from_arguments(
             arguments,
             qkv_or_q=q,
             layer_idx=local_layer_idx,
+            multi_ctas_kv_counter=multi_ctas_kv_counter,
             fwd=AttentionForwardArgs(
                 fmha_scheduler_counter=fmha_scheduler_counter,
                 chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size or 1,
@@ -439,20 +448,27 @@ class FallbackFmha(PhasedFmha):
                 else cache_indirection.size(2)
             ),
         )
+        _set_context_workspace_shape(
+            params,
+            num_contexts=num_contexts,
+            num_ctx_tokens=num_ctx_tokens,
+            host_context_lengths=host_context_lengths,
+            host_past_key_value_lengths=host_past_key_value_lengths,
+            host_total_kv_lens=host_total_kv_lens,
+            max_context_q_len_override=max_context_q_len_override,
+        )
         tp = params.to_thop_params()
-        op = thop.AttentionOp()
+        op = thop.AttentionOp(StaticAttentionConfig.from_params(params).to_thop_config())
 
         max_blocks_per_sequence = (
             kv_cache_block_offsets.size(-1) if kv_cache_block_offsets is not None else 0
         )
-        workspace_size = _query_workspace_size(
-            op,
+        workspace_size = op.get_attention_workspace_size(
             tp,
-            num_tokens=num_tokens,
-            max_attention_window_size=attention_window_size,
-            num_gen_tokens=num_gen_tokens,
-            max_blocks_per_sequence=max_blocks_per_sequence,
-            host_total_kv_lens=host_total_kv_lens,
+            num_tokens,
+            attention_window_size,
+            num_gen_tokens,
+            max_blocks_per_sequence,
         )
         if workspace.numel() < workspace_size:
             workspace.resize_(workspace_size)
@@ -528,14 +544,32 @@ class FallbackFmha(PhasedFmha):
         params: FmhaParams,
         metadata: "TrtllmAttentionMetadata",
     ) -> None:
-        tp = self._to_thop_params(params)
         q = cast(torch.Tensor, params.qkv_or_q)
         workspace = cast(torch.Tensor, params.workspace)
         fwd = cast(AttentionForwardArgs, params.fwd)
 
+        if metadata.num_generations > 0:
+            self._multi_ctas_kv_counter = get_multi_ctas_kv_counter(
+                self._multi_ctas_kv_counter,
+                q.device,
+                self.attn.num_heads,
+                metadata.max_num_sequences or metadata.max_num_requests,
+            )
+        params.multi_ctas_kv_counter = self._multi_ctas_kv_counter
         num_tokens = q.size(0)
         is_gen_only = fwd.attention_input_type == AttentionInputType.generation_only
         num_gen_tokens = num_tokens if is_gen_only else num_tokens - metadata.num_ctx_tokens
+        _set_context_workspace_shape(
+            params,
+            num_contexts=0 if is_gen_only else metadata.num_contexts,
+            num_ctx_tokens=0 if is_gen_only else metadata.num_ctx_tokens,
+            host_context_lengths=cast(torch.Tensor, params.host_context_lengths),
+            host_past_key_value_lengths=cast(torch.Tensor, params.host_past_key_value_lengths),
+            host_total_kv_lens=metadata.host_total_kv_lens,
+            max_context_q_len_override=params.max_context_q_len_override,
+        )
+        tp = self._to_thop_params(params)
+
         kv_cache_block_offsets = params.kv_cache_block_offsets
         use_kv_cache = kv_cache_block_offsets is not None
         max_blocks_per_sequence = kv_cache_block_offsets.size(-1) if use_kv_cache else 0
@@ -544,14 +578,12 @@ class FallbackFmha(PhasedFmha):
             if metadata.effective_beam_width == 1
             else params.max_attention_window_size
         )
-        workspace_size = _query_workspace_size(
-            self.attn.attention_op(params),
+        workspace_size = self.attn.attention_op(params).get_attention_workspace_size(
             tp,
-            num_tokens=num_tokens,
-            max_attention_window_size=max_attention_window_size,
-            num_gen_tokens=num_gen_tokens,
-            max_blocks_per_sequence=max_blocks_per_sequence,
-            host_total_kv_lens=metadata.host_total_kv_lens,
+            num_tokens,
+            max_attention_window_size,
+            num_gen_tokens,
+            max_blocks_per_sequence,
         )
         if workspace.numel() < workspace_size:
             workspace.resize_(workspace_size)

@@ -30,8 +30,6 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
 
-from tensorrt_llm._torch.attention.backends.fmha.interface import (
-    ensure_fmha_scheduler_counter, fmha_scheduler_counter_elements)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -43,6 +41,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs)
+from .fmha.interface import StaticAttentionConfig
 from .fmha.manager import FmhaManager
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -1496,7 +1495,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: FmhaManager
-        self._fmha_scheduler_counter: Optional[torch.Tensor] = None
         # Owns this layer's native attention op. Built on first use rather than here:
         # `__init__` can run under a meta device or before CUDA is ready, while
         # initializing the op creates a cuBLAS handle and the FMHA kernel runners.
@@ -1514,17 +1512,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         object because the KV cache manager, not the layer, owns `tokens_per_block`.
         """
         if self._attention_op is None:
-            config = thop.StaticAttentionConfig()
-            config.num_heads = params.num_heads
-            config.num_kv_heads = params.num_kv_heads
-            config.head_size = params.head_size
-            config.tokens_per_block = params.tokens_per_block
-            config.is_mla_enable = params.is_mla_enable
-            config.kv_lora_rank = params.kv_lora_rank
-            config.qk_rope_head_dim = params.qk_rope_head_dim
-            config.quant_mode = params.quant_mode
-            config.skip_correction_threshold = self.skip_correction_threshold
-            self._attention_op = thop.AttentionOp(config)
+            config = StaticAttentionConfig.from_params(
+                params,
+                skip_correction_threshold=self.skip_correction_threshold,
+            )
+            self._attention_op = thop.AttentionOp(config.to_thop_config())
         return self._attention_op
 
     def release(self) -> None:
@@ -1823,56 +1815,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def rope_original_max_positions(self) -> int:
         return self.rope_params.original_max_positions
 
-    def _ensure_fmha_scheduler_counter(
-        self,
-        q: torch.Tensor,
-        metadata: TrtllmAttentionMetadata,
-        forward_args: AttentionForwardArgs,
-    ) -> None:
-        needs_generation_counter = (forward_args.attention_input_type
-                                    != AttentionInputType.context_only
-                                    and metadata.num_generations > 0)
-        sparse_runtime_params = forward_args.sparse_runtime_params
-        sparse_attn_indices = sparse_runtime_params.sparse_attn_indices
-        sparse_kv_indices = sparse_runtime_params.sparse_kv_indices
-        # The context kernels take the multi-CTA-KV counter on any trtllm-gen sparse
-        # path. That is the non-paged sparse-attention case (indices without offsets)
-        # and, for MLA, the sparse-KV case -- mirroring useTllmGenSparseAttention() in
-        # cpp/tensorrt_llm/thop/attentionOp.h.
-        has_unpaged_sparse_attn = (sparse_attn_indices is not None
-                                   and sparse_attn_indices.numel() > 0
-                                   and sparse_runtime_params.sparse_attn_offsets
-                                   is None)
-        has_sparse_mla = (self.is_mla_enable and sparse_kv_indices is not None
-                          and sparse_kv_indices.numel() > 0)
-        needs_sparse_context_counter = ((has_unpaged_sparse_attn
-                                         or has_sparse_mla)
-                                        and forward_args.attention_input_type
-                                        != AttentionInputType.generation_only
-                                        and metadata.num_contexts > 0)
-        if not needs_generation_counter and not needs_sparse_context_counter:
-            return
-
-        max_num_sequences = (metadata.max_num_sequences
-                             or metadata.max_num_requests)
-        required_elements = fmha_scheduler_counter_elements(
-            q.device, self.num_heads, max_num_sequences)
-
-        # Prefer a caller-supplied buffer that already satisfies the contract, so the
-        # sparse backends keep writing into the tensor they also read back.
-        counter = forward_args.fmha_scheduler_counter
-        if (counter is not None and counter.device == q.device
-                and counter.dtype == torch.int32
-                and counter.numel() >= required_elements):
-            counter.zero_()
-            return
-
-        cached = ensure_fmha_scheduler_counter(self._fmha_scheduler_counter,
-                                               q.device, self.num_heads,
-                                               max_num_sequences)
-        self._fmha_scheduler_counter = cached
-        forward_args.fmha_scheduler_counter = cached
-
     def forward(
         self,
         q: torch.Tensor,
@@ -2028,8 +1970,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
             self, q, k, metadata, forward_args)
-
-        self._ensure_fmha_scheduler_counter(q, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is invalidated whenever FlashMLA inputs change. The metadata

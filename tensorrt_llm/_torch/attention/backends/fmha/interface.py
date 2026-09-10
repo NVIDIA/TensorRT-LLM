@@ -45,24 +45,152 @@ if TYPE_CHECKING:
 
 @dataclass(kw_only=True, slots=True)
 class StaticAttentionConfig:
-    """The part of an attention layer's shape that never changes.
-
-    Passed once when the native op is built, so the op can derive its head counts,
-    parallel layout and MLA flags up front. Everything that varies between calls --
-    the mask type, the output dtype, speculative decoding -- stays in FmhaParams.
-    """
+    """The attention-layer configuration used to build native kernel runners."""
 
     num_heads: int = cpp_metadata(default=0)
     num_kv_heads: int = cpp_metadata(default=0)
     head_size: int = cpp_metadata(default=0)
     tokens_per_block: int = cpp_metadata(default=0)
+    type: DataType = cpp_metadata(default=None)
+    is_fp8_out: bool = cpp_metadata(default=False)
+    is_fp4_out: bool = cpp_metadata(default=False)
+    use_kv_cache: bool = cpp_metadata(default=False)
+    paged_context_fmha: bool = cpp_metadata(default=False)
+    position_embedding_type: PositionEmbeddingType = cpp_metadata(default=0)
+    mask_type: AttentionMaskType = cpp_metadata(default=1)
+    q_scaling: float = cpp_metadata(default=1.0)
+    rotary_embedding_dim: int = cpp_metadata(default=0)
+    attn_logit_softcapping_scale: float = cpp_metadata(default=0.0)
+    remove_padding: bool = cpp_metadata(default=True)
+    cross_attention: bool = cpp_metadata(default=False)
+    dense_context_fmha: bool = cpp_metadata(default=False)
+    fuses_dsv4_inv_rope_fp8_quant: bool = cpp_metadata(default=False)
+    use_sparse_attention: bool = cpp_metadata(default=False)
+    use_tllm_gen_sparse_attention: bool = cpp_metadata(default=False)
+    use_nvfp4_mla_kv_cache: bool = cpp_metadata(default=False)
+    is_spec_decoding_enabled: bool = cpp_metadata(default=False)
+    spec_decoding_target_max_gen_len: int = cpp_metadata(default=0)
     is_mla_enable: bool = cpp_metadata(default=False)
-    # Only the two MLA dimensions the op's own shape depends on.
+    q_lora_rank: int = cpp_metadata(default=0)
     kv_lora_rank: int = cpp_metadata(default=0)
+    qk_nope_head_dim: int = cpp_metadata(default=0)
     qk_rope_head_dim: int = cpp_metadata(default=0)
+    v_head_dim: int = cpp_metadata(default=0)
+    predicted_tokens_per_seq: int = cpp_metadata(default=1)
+    mla_layer_num: int = cpp_metadata(default=0)
+    rope_append: bool = cpp_metadata(default=True)
+    sage_attn_num_elts_per_blk_q: int = cpp_metadata(default=0)
+    sage_attn_num_elts_per_blk_k: int = cpp_metadata(default=0)
+    sage_attn_num_elts_per_blk_v: int = cpp_metadata(default=0)
+    sage_attn_qk_int8: bool = cpp_metadata(default=False)
     quant_mode: QuantMode = cpp_metadata(default=0)
-    # Base-2 row-max threshold below which the MLA kernels skip correction.
     skip_correction_threshold: float = cpp_metadata(default=0.0)
+
+    @classmethod
+    def from_params(
+        cls,
+        params: FmhaParams,
+        *,
+        skip_correction_threshold: float = 0.0,
+    ) -> StaticAttentionConfig:
+        """Capture the fixed runner-selection inputs from one attention call."""
+        from tensorrt_llm._utils import torch_dtype_to_binding
+
+        if params.qkv_or_q is None:
+            raise RuntimeError("StaticAttentionConfig requires qkv_or_q.")
+        if params.output is None:
+            raise RuntimeError("StaticAttentionConfig requires output.")
+        if params.fwd is None:
+            raise RuntimeError("StaticAttentionConfig requires forward args.")
+
+        from tensorrt_llm.quantization.mode import QuantMode
+
+        quant_mode = QuantMode(params.quant_mode)
+        sparse = params.fwd.sparse_runtime_params
+        has_sparse_attn_indices = (
+            sparse.sparse_attn_indices is not None and sparse.sparse_attn_indices.numel() > 0
+        )
+        has_sparse_attention = (
+            sparse.sparse_kv_indices is not None and sparse.sparse_kv_indices.numel() > 0
+        ) or has_sparse_attn_indices
+        has_paged_sparse_attention = (
+            has_sparse_attn_indices
+            and sparse.sparse_attn_offsets is not None
+            and sparse.sparse_attn_offsets.numel() > 0
+        )
+        use_tllm_gen_sparse_attention = has_sparse_attn_indices and not has_paged_sparse_attention
+        use_kv_cache = (
+            params.kv_cache_block_offsets is not None
+            and params.host_kv_cache_pool_pointers is not None
+            and params.host_kv_cache_pool_mapping is not None
+        )
+        rotary_embedding_dim = (
+            params.rope_params.dim
+            if params.rope_params is not None
+            else params.rotary_embedding_dim
+        )
+        mla_layer_num = (
+            params.host_kv_cache_pool_mapping.size(0)
+            if params.host_kv_cache_pool_mapping is not None
+            else 0
+        )
+        target_max_gen_len = params.spec_decoding_target_max_gen_len
+        if params.spec_decoding_target_max_draft_tokens is not None and target_max_gen_len == 0:
+            target_max_gen_len = params.spec_decoding_target_max_draft_tokens + 1
+
+        return cls(
+            num_heads=params.num_heads,
+            num_kv_heads=params.num_kv_heads,
+            head_size=params.head_size,
+            tokens_per_block=params.tokens_per_block,
+            type=torch_dtype_to_binding(params.qkv_or_q.dtype),
+            is_fp8_out=params.output.dtype == torch.float8_e4m3fn,
+            is_fp4_out=params.output.dtype == torch.uint8,
+            use_kv_cache=use_kv_cache,
+            paged_context_fmha=params.paged_context_fmha,
+            position_embedding_type=params.position_embedding_type,
+            mask_type=params.mask_type,
+            q_scaling=params.q_scaling,
+            rotary_embedding_dim=rotary_embedding_dim,
+            attn_logit_softcapping_scale=params.attn_logit_softcapping_scale,
+            remove_padding=params.remove_padding,
+            cross_attention=params.is_cross,
+            dense_context_fmha=params.dense_context_fmha,
+            fuses_dsv4_inv_rope_fp8_quant=params.fwd.enable_dsv4_epilogue_fusion,
+            use_sparse_attention=has_sparse_attention,
+            use_tllm_gen_sparse_attention=use_tllm_gen_sparse_attention,
+            use_nvfp4_mla_kv_cache=(
+                quant_mode.has_fp4_kv_cache()
+                and use_tllm_gen_sparse_attention
+                and sparse.sparse_attn_kv_lens is None
+                and sparse.aux_kv_cache_pool_ptr is not None
+            ),
+            is_spec_decoding_enabled=params.is_spec_decoding_enabled,
+            spec_decoding_target_max_gen_len=target_max_gen_len,
+            is_mla_enable=params.is_mla_enable,
+            q_lora_rank=params.q_lora_rank or 0,
+            kv_lora_rank=params.kv_lora_rank,
+            qk_nope_head_dim=params.qk_nope_head_dim,
+            qk_rope_head_dim=params.qk_rope_head_dim,
+            v_head_dim=params.v_head_dim or 0,
+            predicted_tokens_per_seq=params.predicted_tokens_per_seq,
+            mla_layer_num=mla_layer_num,
+            rope_append=params.rope_append is not False,
+            sage_attn_num_elts_per_blk_q=params.fwd.sage_attn_num_elts_per_blk_q,
+            sage_attn_num_elts_per_blk_k=params.fwd.sage_attn_num_elts_per_blk_k,
+            sage_attn_num_elts_per_blk_v=params.fwd.sage_attn_num_elts_per_blk_v,
+            sage_attn_qk_int8=params.fwd.sage_attn_qk_int8,
+            quant_mode=quant_mode,
+            skip_correction_threshold=skip_correction_threshold,
+        )
+
+    def to_thop_config(self) -> Any:
+        """Build the native constructor configuration."""
+        from tensorrt_llm.bindings.internal import thop
+
+        target = thop.StaticAttentionConfig()
+        _lower_struct(target, self)
+        return target
 
 
 @dataclass(slots=True)
@@ -255,7 +383,7 @@ class FmhaParams:
     sage_attn_sfs_k: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32, default=None)
     sage_attn_sfs_v: Optional[torch.Tensor] = cpp_metadata(ctype=torch.float32, default=None)
     attention_mask_stride: int = cpp_metadata(default=0)
-    semaphores: Optional[torch.Tensor] = cpp_metadata(ctype=torch.int32, default=None)
+    multi_ctas_kv_counter: Optional[torch.Tensor] = cpp_metadata(ctype=None, default=None)
     cross_kv_length: int = cpp_metadata(default=0)
     num_encoder_tokens: int = cpp_metadata(default=0)
     relative_attention_bias_stride: int = cpp_metadata(default=0)
@@ -332,46 +460,6 @@ class FmhaPhase(str, Enum):
 
     CONTEXT = "context"
     GENERATION = "generation"
-
-
-def fmha_scheduler_counter_elements(
-    device: torch.device, num_heads: int, max_num_sequences: int
-) -> int:
-    """Number of int32 slots the multi-block scheduler counter needs.
-
-    Python owns this buffer, so the sizing rule lives here, once. MMHA indexes it per
-    (sequence, head) pair; the SM count is the lower bound that covers a kernel
-    splitting a single head across several blocks.
-    """
-    return max(
-        num_heads * max_num_sequences,
-        torch.cuda.get_device_properties(device).multi_processor_count,
-    )
-
-
-def ensure_fmha_scheduler_counter(
-    counter: Optional[torch.Tensor],
-    device: torch.device,
-    num_heads: int,
-    max_num_sequences: int,
-) -> torch.Tensor:
-    """Return a zeroed scheduler counter, reusing ``counter`` when it already fits.
-
-    The generation kernels dereference this buffer without a null check -- MMHA at
-    ``params.block_counter[bhi]``, XQA at ``semaphores[idxSeq]`` -- so every caller that
-    dispatches a generation phase must supply one. int32 specifically, not any 4-byte
-    dtype: the native side reads it through ``data_ptr<int32_t>()``, which type-checks.
-    """
-    required_elements = fmha_scheduler_counter_elements(device, num_heads, max_num_sequences)
-    if (
-        counter is None
-        or counter.device != device
-        or counter.dtype != torch.int32
-        or counter.numel() < required_elements
-    ):
-        counter = torch.empty(required_elements, dtype=torch.int32, device=device)
-    counter.zero_()
-    return counter
 
 
 class Fmha(ABC):

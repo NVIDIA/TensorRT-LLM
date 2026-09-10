@@ -185,6 +185,7 @@ class PhasedFmha(Fmha):
             q_scaling=attn.q_scaling,
             quant_mode=attn.quant_mode,
             position_embedding_type=attn.position_embedding_type,
+            mask_type=forward_args.mask_type,
             predicted_tokens_per_seq=attn.predicted_tokens_per_seq,
             attention_chunk_size=attn.attention_chunk_size,
             has_fp8_kv_cache=bool(getattr(attn, "has_fp8_kv_cache", False)),
