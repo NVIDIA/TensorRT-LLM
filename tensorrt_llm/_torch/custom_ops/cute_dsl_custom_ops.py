@@ -9727,7 +9727,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     when ``emit_hit_stats`` is set.
             Returns:
                 logits [B*next_n, max_context_len]; with emit_block_meta,
-                the tuple (logits, block_max, hit_stats).
+                the tuple (logits, block_max, hit_stats). Only columns
+                [0, context_lens[b]) of a row are defined: the buffer is a
+                persistent arena, the aligned padding tile holds GEMM
+                garbage and the tail whatever earlier launches left there.
 
             The optional emission tensors (``block_max_out`` /
             ``seed_thr`` / ``cand_*``) are written by the kernel but

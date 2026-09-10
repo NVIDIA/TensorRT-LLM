@@ -1046,7 +1046,12 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
     )
     torch.cuda.synchronize()
     lf = logits.float()
-    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+    # the logits buffer is a persistent arena: only [0, ctx) of each row is
+    # written, the tail keeps whatever earlier launches left there
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        assert not torch.isnan(lf[row, :ctx]).any(), f"NaN logits: row={row} ctx={ctx}"
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
 
     pairs = cand.view(num_rows, cap, 2)
     vals_bits = pairs[..., 0]
