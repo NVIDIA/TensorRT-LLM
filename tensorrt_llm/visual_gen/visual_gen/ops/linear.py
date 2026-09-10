@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Any, List, Optional
 
 import torch
@@ -33,6 +34,11 @@ from visual_gen.utils.auto_tuner import TunableParam
 from visual_gen.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+WAN_FP8_WEIGHT_CACHE = (
+    os.environ.get("VISUAL_GEN_WAN_OPTIMIZATIONS", "0") == "1"
+    and os.environ.get("VISUAL_GEN_WAN_FP8_WEIGHT_CACHE", "1") == "1"
+)
 
 try:
     import visual_gen.csrc._C
@@ -296,7 +302,6 @@ class TeMXFP8Blockwise32Linear(BaseLinear):
             outp_type,
             quantization_params=None,
             bias=bias,
-            use_split_accumulator=False,
         )
         return output
 
@@ -348,6 +353,25 @@ class TeFp8PerTensorLinear(BaseLinear):
         self.quantizer_cur = Float8CurrentScalingQuantizer(
             fp8_dtype=tex.DType.kFloat8E4M3, device="cuda"
         )
+        self._cached_weight_key = None
+        self._cached_weight_fp8 = None
+
+    @torch.compiler.disable()
+    def _get_cached_weight(self, weight, weight_scale):
+        weight_key = (
+            weight.data_ptr(), weight._version, tuple(weight.shape),
+            weight_scale.data_ptr(), weight_scale._version,
+        )
+        if self._cached_weight_key != weight_key:
+            self._cached_weight_fp8 = Float8Tensor(
+                shape=weight.t().shape,
+                dtype=torch.bfloat16,
+                data=weight.t().contiguous().view(torch.uint8),
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                fp8_scale_inv=weight_scale.flatten().to(dtype=torch.float32),
+            )
+            self._cached_weight_key = weight_key
+        return self._cached_weight_fp8
 
     def __call__(
         self,
@@ -367,14 +391,23 @@ class TeFp8PerTensorLinear(BaseLinear):
             if bias.dtype != torch.bfloat16:
                 bias = bias.to(torch.bfloat16)
 
-        input_fp8_te = self.quantizer_cur.quantize(input)
-        w_fp8_te = Float8Tensor(
-            shape=weight.t().shape,
-            dtype=torch.bfloat16,
-            data=weight.t().contiguous().view(torch.uint8),
-            fp8_dtype=tex.DType.kFloat8E4M3,
-            fp8_scale_inv=weight_scale.flatten().to(dtype=torch.float32),
-        )
+        # Wan fused boundary kernels may already provide a TE-compatible
+        # current-scaled Float8Tensor. Reusing it avoids a second amax/cast
+        # pass; ordinary tensors retain the exact baseline path.
+        if isinstance(input, Float8Tensor):
+            input_fp8_te = input
+        else:
+            input_fp8_te = self.quantizer_cur.quantize(input)
+        if WAN_FP8_WEIGHT_CACHE:
+            w_fp8_te = self._get_cached_weight(weight, weight_scale)
+        else:
+            w_fp8_te = Float8Tensor(
+                shape=weight.t().shape,
+                dtype=torch.bfloat16,
+                data=weight.t().contiguous().view(torch.uint8),
+                fp8_dtype=tex.DType.kFloat8E4M3,
+                fp8_scale_inv=weight_scale.flatten().to(dtype=torch.float32),
+            )
         if hasgelu:
             gelu_in = torch.randn(
                 (input.shape[0], weight.shape[1]), dtype=torch.bfloat16, device="cuda"
@@ -389,7 +422,7 @@ class TeFp8PerTensorLinear(BaseLinear):
             )
         else:
             output, *_ = ext.general_gemm(
-                A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias
+                A=w_fp8_te, B=input_fp8_te, out_dtype=torch.bfloat16, bias=bias,
             )
 
         if output.dim() != len(origin_shape):
