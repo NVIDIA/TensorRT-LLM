@@ -78,6 +78,37 @@ def _strided_cache(num_pages: int, page_size: int = 128, stride_scale: int = 7) 
     return backing[::stride_scale]
 
 
+def _guarded_cache(
+    num_pages: int, page_size: int = 128, stride_scale: int = 7, guard_pages: int = 2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate a strided cache flanked by zeroed guard regions.
+
+    Returns the cache view plus the backing below and above it. A store from a
+    negative slot lands below the base and one from an out-of-range slot lands
+    above the last page, so both stay inspectable rather than depending on a
+    fault that an out-of-bounds FP8 store may never raise.
+    """
+    total_pages = num_pages + 2 * guard_pages
+    backing = torch.zeros(
+        total_pages * stride_scale,
+        1,
+        page_size,
+        128,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    first = guard_pages * stride_scale
+    last = (guard_pages + num_pages) * stride_scale
+    view = backing[first:last:stride_scale]
+    assert view.shape[0] == num_pages
+    return view, backing[:first], backing[last:]
+
+
+def _assert_all_zero(*regions: torch.Tensor) -> None:
+    for region in regions:
+        assert torch.count_nonzero(region.reshape(-1).view(torch.uint8)).item() == 0
+
+
 def _run(
     qk: torch.Tensor,
     cache: torch.Tensor,
@@ -161,6 +192,55 @@ def test_minimax_m3_fp8_indexer_defensively_skips_invalid_direct_op_slots() -> N
     _assert_fp8_close(cache[0, 0, 0], k_ref[0])
     assert torch.count_nonzero(backing[0].view(torch.uint8)).item() == 0
     assert torch.count_nonzero(backing[2].view(torch.uint8)).item() == 0
+
+
+@pytest.mark.parametrize("num_live_tokens", [0, 4])
+@pytest.mark.parametrize("tail_slot", [-1, 4 * 128, 4 * 128 + 61, 5 * 128 + 127])
+def test_minimax_m3_fp8_indexer_ignores_a_padded_slot_tail(
+    tail_slot: int, num_live_tokens: int
+) -> None:
+    """Rows past the live prefix must leave every cache byte untouched.
+
+    A direct caller can hand the kernel a padded token height whose trailing
+    slots are the -1 sentinel or a stale out-of-range id, which the two guards
+    have to drop. The failure modes differ: -1 truncates to page 0 at offset
+    -1, one token below the cache base, while an out-of-range page scatters
+    above the pool. The tail slots start at the first page past the end and
+    stay inside the guard region, so a regression trips an assert rather than
+    faulting.
+    """
+    torch.manual_seed(2468)
+    num_heads_q = 4
+    page_size = 128
+    num_pages = 4
+    padded_tokens = 17
+
+    qk = torch.randn(padded_tokens, (num_heads_q + 1) * 128, dtype=torch.bfloat16, device="cuda")
+    q_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    position_ids = torch.arange(padded_tokens, dtype=torch.int32, device="cuda") + 1024
+
+    cache, below, above = _guarded_cache(num_pages, page_size)
+    slots = torch.full((padded_tokens,), tail_slot, dtype=torch.int32, device="cuda")
+    # One page per live row, so a stray tail store cannot be mistaken for one.
+    pages = torch.arange(num_live_tokens, dtype=torch.int32, device="cuda")
+    within = (pages * 37) % page_size
+    slots[:num_live_tokens] = pages * page_size + within
+
+    q_out = _run(qk, cache, slots, q_weight, k_weight, position_ids, num_heads_q)
+    q_ref, k_ref = _reference(qk, num_heads_q, q_weight, k_weight, position_ids)
+
+    # Only the cache store is slot-gated; index-Q is produced for every row.
+    _assert_fp8_close(q_out, q_ref)
+    _assert_all_zero(below, above)
+    if num_live_tokens:
+        _assert_fp8_close(cache[pages.long(), 0, within.long()], k_ref[:num_live_tokens])
+
+    # A tail store landing on a valid page at the wrong offset would clear both
+    # guard regions, so require every unwritten slot to stay zero as well.
+    written = torch.zeros(num_pages, page_size, dtype=torch.bool, device="cuda")
+    written[pages.long(), within.long()] = True
+    _assert_all_zero(cache[:, 0][~written])
 
 
 def test_minimax_m3_fp8_indexer_cuda_graph_replay_updates_outputs() -> None:
