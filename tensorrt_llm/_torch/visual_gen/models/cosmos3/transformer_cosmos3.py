@@ -74,13 +74,14 @@ def _resolve_cosmos3_cross_attention_backend(
     attn2d_size = visual_gen_mapping.attn2d_row_size * visual_gen_mapping.attn2d_col_size
     if attn2d_size > 1:
         raise ValueError(
-            "Cosmos3 cross-attention with Attention2D does not support the "
-            "CUTEDSL backend for unequal text lengths. Use attention backend FA4."
+            "Cosmos3 cross-attention with Attention2D cannot use the CUTEDSL "
+            "backend because request prompt lengths may differ. Use attention "
+            "backend FA4."
         )
     if visual_gen_mapping.ulysses_size > 1:
         raise ValueError(
-            "Cosmos3 cross-attention with Ulysses does not support the "
-            "CUTEDSL backend for unequal text lengths. Use attention backend "
+            "Cosmos3 cross-attention with Ulysses cannot use the CUTEDSL backend "
+            "because request prompt lengths may differ. Use attention backend "
             "VANILLA or FA4."
         )
     return backend
