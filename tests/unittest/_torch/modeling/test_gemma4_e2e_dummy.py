@@ -48,6 +48,7 @@ _GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
+from tensorrt_llm._torch.pyexecutor.hang_diagnostics import HANG_DIAGNOSTICS_ENV  # noqa: E402
 from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
 
 # These dummy models are tiny, but the default KV-cache fraction sizes the pool
@@ -233,8 +234,10 @@ def test_e2e_text_e2b_dummy():
 
 
 @requires_gemma4_transformers
-def test_e2e_text_31b_dummy():
+def test_e2e_text_31b_dummy(monkeypatch):
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""
+    # Preserve worker phase and CUDA completion state if this rare CI stall recurs.
+    monkeypatch.setenv(HANG_DIAGNOSTICS_ENV, "1")
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["31B"])
     try:
         llm = LLM(
