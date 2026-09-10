@@ -1577,8 +1577,7 @@ def test_hybrid_mtp_layout_honors_explicit_base_partition():
             assert cache_cost == (64 * (rank + 1), 2400)
 
 
-@pytest.mark.parametrize("for_budget_split", [False, True])
-def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state(for_budget_split):
+def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
     model_config = _hybrid_cache_sizing_model_config(
         [
             "linear_attention",
@@ -1599,7 +1598,6 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state(for_budget_split
             kv_cache_config=KvCacheConfig(enable_block_reuse=False),
             spec_config=spec_config,
             use_separate_draft_kv_cache=True,
-            for_budget_split=for_budget_split,
         )
         assert target_cost == (64, 2400)
 
@@ -1620,7 +1618,6 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state(for_budget_split
             num_layers=1,
             spec_config=spec_config,
             is_draft=True,
-            for_budget_split=for_budget_split,
         )
         assert draft_cost == (64 * rank, 0)
 
