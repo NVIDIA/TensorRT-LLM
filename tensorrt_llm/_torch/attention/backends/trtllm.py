@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
 
+from itertools import accumulate
+
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -36,6 +38,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...locality_domain.runtime import LocalityDomainRuntime
 from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs)
@@ -242,6 +245,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         return min(self.max_seq_len, self.max_num_tokens)
 
+    # Locality domain two-kernel attention fields (backend-specific, not in interface.py)
+    locality_domain_enabled: bool = False
+    locality_domain_runtime: Optional[LocalityDomainRuntime] = None
+    locality_domain_num_ctx_tokens: Optional[List[int]] = None
+    locality_domain_num_gen_tokens: Optional[List[int]] = None
+    # Cumulative boundary arrays of length N+1 (N = num_locality_domains).
+    # locality_domain_ctx_req_splits[i]..[i+1] is the range of context requests
+    # belonging to locality domain i.
+    locality_domain_ctx_req_splits: Optional[List[int]] = None
+    locality_domain_gen_req_splits: Optional[List[int]] = None
+    locality_domain_ctx_token_splits: Optional[List[int]] = None
+    locality_domain_gen_token_splits: Optional[List[int]] = None
+    locality_domain_kv_cache_block_offsets: Optional[List[torch.Tensor]] = None
+    draft_locality_domain_kv_cache_block_offsets: Optional[List[
+        torch.Tensor]] = None
+    # Per-locality-domain MLA generation state computed by mla_rope_generation.
+    locality_domain_mla_gen_state: Optional[List[Optional[dict]]] = None
+    # Pre-allocated per-locality-domain workspaces.
+    locality_domain_workspaces: Optional[List[torch.Tensor]] = None
+    locality_domain_cuda_graph_workspaces: Optional[List[torch.Tensor]] = None
+
     @property
     def max_seq_len(self) -> int:
         """
@@ -387,6 +411,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cuda',
                 dtype=torch.int8,
             )
+
+        self._ensure_locality_domain_workspaces()
 
         if self.kv_cache_manager is not None:
             num_attention_op_pools = getattr(self.kv_cache_manager,
@@ -559,6 +585,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
 
+    def _ensure_locality_domain_workspaces(self) -> None:
+        if not self.locality_domain_enabled:
+            return
+
+        num_locality_domains = (self.kv_cache_manager.num_locality_domains
+                                if self.kv_cache_manager is not None else 2)
+        if (not self.is_cuda_graph and
+            (self.locality_domain_workspaces is None
+             or len(self.locality_domain_workspaces) != num_locality_domains)):
+            self.locality_domain_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
+        if (self.locality_domain_cuda_graph_workspaces is None
+                or len(self.locality_domain_cuda_graph_workspaces)
+                != num_locality_domains):
+            self.locality_domain_cuda_graph_workspaces = [
+                torch.empty(0, device='cuda', dtype=torch.int8)
+                for _ in range(num_locality_domains)
+            ]
+
     def update_for_spec_dec(self) -> None:
         # MTP updates kv_lens_cuda in-place between sub-steps, which changes
         # cache_seq_lens seen by the C++ attention op.  Invalidate the metadata
@@ -572,6 +619,92 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # buffers below must be rebuilt before the next MLA layer reads them.
         self._mla_scheduler_buffers_valid = False
         self._mla_ctx_cu_seqlens_valid = False
+
+        if (not self.locality_domain_enabled or self.kv_cache_manager is None
+                or self.request_ids is None):
+            return
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        sequence_lengths = self.seq_lens[:self.num_seqs].tolist()
+
+        per_locality_domain_ctx_reqs = [0] * num_locality_domains
+        per_locality_domain_ctx_tokens = [0] * num_locality_domains
+        per_locality_domain_gen_reqs = [0] * num_locality_domains
+        per_locality_domain_gen_tokens = [0] * num_locality_domains
+
+        def locality_domain_from_splits(splits: Optional[List[int]],
+                                        local_req_idx: int) -> Optional[int]:
+            if splits is None:
+                return None
+            for locality_domain_idx in range(len(splits) - 1):
+                if splits[locality_domain_idx] <= local_req_idx < splits[
+                        locality_domain_idx + 1]:
+                    return locality_domain_idx
+            return None
+
+        old_ctx_req_splits = self.locality_domain_ctx_req_splits
+        old_gen_req_splits = self.locality_domain_gen_req_splits
+        for req_idx, request_id in enumerate(self.request_ids[:self.num_seqs]):
+            if req_idx < self.num_contexts:
+                locality_domain_id = locality_domain_from_splits(
+                    old_ctx_req_splits, req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_ctx_reqs[locality_domain_id] += 1
+                per_locality_domain_ctx_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+            else:
+                gen_req_idx = req_idx - self.num_contexts
+                locality_domain_id = locality_domain_from_splits(
+                    old_gen_req_splits, gen_req_idx)
+                if locality_domain_id is None:
+                    locality_domain_id = self.kv_cache_manager.get_locality_domain(
+                        request_id)
+                per_locality_domain_gen_reqs[locality_domain_id] += 1
+                per_locality_domain_gen_tokens[
+                    locality_domain_id] += sequence_lengths[req_idx]
+        self.locality_domain_ctx_req_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_reqs))
+        self.locality_domain_gen_req_splits = [0] + list(
+            accumulate(per_locality_domain_gen_reqs))
+        self.locality_domain_ctx_token_splits = [0] + list(
+            accumulate(per_locality_domain_ctx_tokens))
+        self.locality_domain_gen_token_splits = [0] + list(
+            accumulate(per_locality_domain_gen_tokens))
+        self.locality_domain_num_ctx_tokens = per_locality_domain_ctx_tokens
+        self.locality_domain_num_gen_tokens = per_locality_domain_gen_tokens
+
+        if self.host_request_types is not None:
+            self.host_request_types[:self.num_contexts].fill_(0)
+            self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
+
+        if self.kv_cache_block_offsets is not None:
+            self.locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.kv_cache_block_offsets,
+                    '_locality_domain_block_offsets_buf'))
+
+        if self.draft_kv_cache_block_offsets is not None:
+            self.draft_locality_domain_kv_cache_block_offsets = (
+                self.build_locality_domain_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    '_draft_locality_domain_block_offsets_buf'))
+
+        if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+            self._locality_domain_host_total_kv_lens_buf = [
+                torch.zeros(2, dtype=torch.int, device='cpu')
+                for _ in range(num_locality_domains)
+            ]
+
+        if self.is_cuda_graph:
+            for locality_domain_idx in range(num_locality_domains):
+                buf = self._locality_domain_host_total_kv_lens_buf[
+                    locality_domain_idx]
+                buf[0] = self.max_seq_len * per_locality_domain_ctx_reqs[
+                    locality_domain_idx]
+                buf[1] = self.max_seq_len * per_locality_domain_gen_reqs[
+                    locality_domain_idx]
 
     def update_helix_param(
         self,
@@ -598,6 +731,51 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
             self.helix_is_inactive_rank[:batch_size].copy_(
                 self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+
+    def build_locality_domain_block_offsets(
+        self,
+        source_block_offsets: Optional[torch.Tensor],
+        buffer_attr: str,
+    ) -> Optional[List[torch.Tensor]]:
+        if (not self.locality_domain_enabled or source_block_offsets is None
+                or self.kv_cache_manager is None):
+            return None
+
+        num_locality_domains = self.kv_cache_manager.num_locality_domains
+        buffers = getattr(self, buffer_attr, None)
+        if buffers is None:
+            buffers = [
+                torch.zeros_like(source_block_offsets)
+                for _ in range(num_locality_domains)
+            ]
+            setattr(self, buffer_attr, buffers)
+
+        packed_block_offsets = []
+        num_ctx = self.num_contexts
+        for locality_domain_idx in range(num_locality_domains):
+            ctx_start = self.locality_domain_ctx_req_splits[locality_domain_idx]
+            ctx_end = self.locality_domain_ctx_req_splits[locality_domain_idx +
+                                                          1]
+            gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx]
+            gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                locality_domain_idx + 1]
+            num_ctx_reqs = ctx_end - ctx_start
+            num_gen_reqs = gen_end - gen_start
+            num_seqs = num_ctx_reqs + num_gen_reqs
+            block_offsets = buffers[locality_domain_idx]
+            block_offsets.zero_()
+            if num_seqs > 0:
+                if num_ctx_reqs > 0:
+                    block_offsets[:, :num_ctx_reqs].copy_(
+                        source_block_offsets[:, ctx_start:ctx_end],
+                        non_blocking=True)
+                if num_gen_reqs > 0:
+                    block_offsets[:, num_ctx_reqs:num_seqs].copy_(
+                        source_block_offsets[:, gen_start:gen_end],
+                        non_blocking=True)
+            packed_block_offsets.append(block_offsets)
+        return packed_block_offsets
 
     def _bind_runtime_views(
         self,
@@ -796,13 +974,79 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_seqs,
                     max_blocks=max_blocks)
 
+            # Build per-locality-domain block offsets for fork-join attention.
+            if self.locality_domain_enabled:
+                self._ensure_locality_domain_workspaces()
+                num_locality_domains = self.kv_cache_manager.num_locality_domains
+
+                if not hasattr(self, '_locality_domain_host_total_kv_lens_buf'):
+                    self._locality_domain_host_total_kv_lens_buf = [
+                        torch.zeros(2, dtype=torch.int, device='cpu')
+                        for _ in range(num_locality_domains)
+                    ]
+
+                self.locality_domain_kv_cache_block_offsets = (
+                    self.build_locality_domain_block_offsets(
+                        self.kv_cache_block_offsets,
+                        '_locality_domain_block_offsets_buf'))
+
+                if (self.draft_kv_cache_manager is not None and getattr(
+                        self.draft_kv_cache_manager, 'fork_join_attn', False)):
+                    self.draft_locality_domain_kv_cache_block_offsets = (
+                        self.build_locality_domain_block_offsets(
+                            self.draft_kv_cache_block_offsets,
+                            '_draft_locality_domain_block_offsets_buf'))
+
+                num_ctx = self.num_contexts
+                for locality_domain_idx in range(num_locality_domains):
+                    ctx_start = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx]
+                    ctx_end = self.locality_domain_ctx_req_splits[
+                        locality_domain_idx + 1]
+                    gen_start = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx]
+                    gen_end = num_ctx + self.locality_domain_gen_req_splits[
+                        locality_domain_idx + 1]
+                    num_ctx_reqs = ctx_end - ctx_start
+                    num_gen_reqs = gen_end - gen_start
+
+                    if self.is_cuda_graph:
+                        # CUDA graph capture bakes host-side launch scalars into
+                        # thop.attention. Use conservative per-domain bounds so a graph
+                        # captured for one decode length can replay for later, longer
+                        # decode steps with the same request split.
+                        ctx_total_kv_length = self.max_seq_len * num_ctx_reqs
+                        gen_total_kv_length = self.max_seq_len * num_gen_reqs
+                    else:
+                        ctx_total_kv_length = (
+                            kv_lens[ctx_start:ctx_end].sum().item()
+                            if num_ctx_reqs > 0 else 0)
+                        gen_total_kv_length = (
+                            kv_lens[gen_start:gen_end].sum().item()
+                            if num_gen_reqs > 0 else 0)
+                    buf = self._locality_domain_host_total_kv_lens_buf[
+                        locality_domain_idx]
+                    buf[0] = ctx_total_kv_length
+                    buf[1] = gen_total_kv_length
+
+                self.locality_domain_mla_gen_state = [None
+                                                      ] * num_locality_domains
+
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
         # kv_lens_runtime, which becomes host_past_key_value_lengths and
         # eventually mMaxSeqLenKv.
+        # Under locality-domain CUDA graphs, host-side launch scalars are captured per
+        # sub-call, so use conservative bounds while keeping the device sequence
+        # tensors and prompt lengths actual.
+        if self.is_cuda_graph and self.locality_domain_enabled:
+            kv_lens_runtime = torch.full_like(kv_lens[:self.num_seqs],
+                                              self.max_seq_len)
+        else:
+            kv_lens_runtime = kv_lens[:self.num_seqs]
         self._bind_runtime_views(
             kv_lens_cuda=self.kv_lens_cuda[:self.num_seqs],
-            kv_lens=kv_lens[:self.num_seqs],
+            kv_lens=kv_lens_runtime,
             prompt_lens_cuda=self.prompt_lens_cuda[:self.num_seqs],
             prompt_lens_cpu=self.prompt_lens_cpu[:self.num_seqs],
             host_request_types=self.host_request_types[:self.num_seqs],
@@ -1375,6 +1619,328 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
         return not (sm < 100 or sm in [120, 121])
+
+
+def _get_generation_only_token_splits(
+    metadata: TrtllmAttentionMetadata,
+    total_gen_tokens: Optional[int],
+) -> Tuple[List[int], List[int]]:
+    gen_token_splits = metadata.locality_domain_gen_token_splits
+    per_locality_domain_gen_tokens = metadata.locality_domain_num_gen_tokens
+
+    if (total_gen_tokens is None or gen_token_splits is None
+            or per_locality_domain_gen_tokens is None
+            or metadata.num_generations == 0):
+        return gen_token_splits, per_locality_domain_gen_tokens
+
+    expected_total_gen_tokens = gen_token_splits[-1]
+    if total_gen_tokens == expected_total_gen_tokens:
+        return gen_token_splits, per_locality_domain_gen_tokens
+
+    # MTP draft forwards can shrink the live q/fused_q tensor without
+    # rebuilding the cached locality domain token splits. Request ordering is still
+    # locality domain-contiguous, so rebuild generation token boundaries from the
+    # current token count for this forward.
+    if total_gen_tokens % metadata.num_generations != 0:
+        raise RuntimeError(
+            "locality domain generation-only attention received a token count that "
+            "cannot be partitioned evenly across generation requests: "
+            f"{total_gen_tokens=} {metadata.num_generations=}")
+
+    tokens_per_generation_request = total_gen_tokens // metadata.num_generations
+    current_gen_token_splits = [0]
+    current_per_locality_domain_gen_tokens = []
+    for locality_domain_idx in range(
+            len(metadata.locality_domain_gen_req_splits) - 1):
+        num_gen_reqs = (
+            metadata.locality_domain_gen_req_splits[locality_domain_idx + 1] -
+            metadata.locality_domain_gen_req_splits[locality_domain_idx])
+        locality_domain_gen_tokens = num_gen_reqs * tokens_per_generation_request
+        current_per_locality_domain_gen_tokens.append(
+            locality_domain_gen_tokens)
+        current_gen_token_splits.append(current_gen_token_splits[-1] +
+                                        locality_domain_gen_tokens)
+
+    return current_gen_token_splits, current_per_locality_domain_gen_tokens
+
+
+def _build_locality_domain_slices(metadata: TrtllmAttentionMetadata,
+                                  locality_domain_id: int,
+                                  attention_input_type: AttentionInputType,
+                                  total_gen_tokens: Optional[int] = None,
+                                  dense_ctx_kv: bool = False):
+    """Build per-locality domain request/token slices and metadata tensors.
+
+    Returns a dict with per-locality domain counts, slices, and metadata tensors,
+    or None if this locality domain has no tokens for the given phase.
+
+    When ``dense_ctx_kv`` is True (MLA cached-KV / chunked-prefill context),
+    ctx k/v rows are laid out by per-request KV length (cached+new or
+    chunk-sized), not by per-request Q length. The returned
+    ``ctx_kv_token_start/end`` give the per-locality domain k/v slice for that layout;
+    callers continue to use ``ctx_token_start/end`` for q/q_pe. When False,
+    the KV range equals the Q range (current behavior).
+    """
+    num_ctx = metadata.num_contexts
+    ctx_req_splits = metadata.locality_domain_ctx_req_splits
+    gen_req_splits = metadata.locality_domain_gen_req_splits
+    ctx_token_splits = metadata.locality_domain_ctx_token_splits
+    gen_token_splits = metadata.locality_domain_gen_token_splits
+    total_ctx_tokens = sum(metadata.locality_domain_num_ctx_tokens)
+    sum(metadata.locality_domain_num_gen_tokens)
+    if attention_input_type == AttentionInputType.generation_only:
+        gen_token_splits, _ = _get_generation_only_token_splits(
+            metadata, total_gen_tokens)
+
+    # Request slices via cumulative boundary arrays
+    ctx_req_start = ctx_req_splits[locality_domain_id]
+    ctx_req_end = ctx_req_splits[locality_domain_id + 1]
+    gen_req_start = num_ctx + gen_req_splits[locality_domain_id]
+    gen_req_end = num_ctx + gen_req_splits[locality_domain_id + 1]
+
+    # Token slices depend on attention_input_type
+    if attention_input_type == AttentionInputType.generation_only:
+        ctx_token_start, ctx_token_end = 0, 0
+        gen_token_start = gen_token_splits[locality_domain_id]
+        gen_token_end = gen_token_splits[locality_domain_id + 1]
+    elif attention_input_type == AttentionInputType.context_only:
+        # context_only: q/k/v tensors have ONLY context tokens.
+        # Gen token slices must be zero so _locality_domain_cat_slices returns a
+        # view (preserving strides) instead of torch.cat (which makes
+        # a contiguous copy).  A contiguous V copy breaks the TMA
+        # descriptor stride assumption in the FMHA kernel.
+        ctx_token_start = ctx_token_splits[locality_domain_id]
+        ctx_token_end = ctx_token_splits[locality_domain_id + 1]
+        gen_token_start, gen_token_end = 0, 0
+    else:
+        # mixed: combined [ctx_tokens | gen_tokens] layout
+        ctx_token_start = ctx_token_splits[locality_domain_id]
+        ctx_token_end = ctx_token_splits[locality_domain_id + 1]
+        gen_token_start = total_ctx_tokens + gen_token_splits[locality_domain_id]
+        gen_token_end = total_ctx_tokens + gen_token_splits[locality_domain_id +
+                                                            1]
+
+    # For generation_only (MLA), exclude context requests from per-request
+    # metadata.  The mla_rope_generation C++ kernel expects token tensors
+    # and per-request metadata to be consistent — token buffers have only
+    # gen tokens, so the metadata must also cover only gen requests.
+    if attention_input_type == AttentionInputType.generation_only:
+        ctx_req_start = ctx_req_end  # zero-width context range
+
+    num_ctx_reqs = ctx_req_end - ctx_req_start
+    num_gen_reqs = gen_req_end - gen_req_start
+    num_ctx_tokens = ctx_token_end - ctx_token_start
+    num_gen_tokens = gen_token_end - gen_token_start
+    num_tokens = num_ctx_tokens + num_gen_tokens
+
+    # Dense-KV ctx slicing: rows of k/v are laid out by per-req kv_len
+    # (cached+new or chunk-sized), contiguous per request. The per-locality domain
+    # boundary is the running sum of ``kv_lens_runtime`` over preceding
+    # locality domains' ctx requests. Derived dynamically so chunked prefill (which
+    # rewrites ``kv_lens_runtime`` per loop iter) works without extra
+    # metadata. When not dense, fall through to the Q range.
+    if dense_ctx_kv and attention_input_type == AttentionInputType.context_only:
+        assert metadata.kv_lens_runtime is not None, (
+            "dense_ctx_kv requires kv_lens_runtime to be prepared")
+        all_ctx_kv_lens = metadata.kv_lens_runtime[:num_ctx]
+        ctx_kv_token_start = int(
+            all_ctx_kv_lens[:ctx_req_splits[locality_domain_id]].sum().item())
+        ctx_kv_token_end = int(
+            all_ctx_kv_lens[:ctx_req_splits[locality_domain_id +
+                                            1]].sum().item())
+    else:
+        ctx_kv_token_start = ctx_token_start
+        ctx_kv_token_end = ctx_token_end
+
+    if num_tokens == 0:
+        return None
+    if attention_input_type == AttentionInputType.context_only and num_ctx_tokens == 0:
+        return None
+    if attention_input_type == AttentionInputType.generation_only and num_gen_tokens == 0:
+        return None
+
+    # Per-request metadata: repack ctx + gen contiguously
+    num_seqs = num_ctx_reqs + num_gen_reqs
+    if num_seqs == 0:
+        return None
+    if attention_input_type == AttentionInputType.generation_only:
+        # Gen-only: context range is empty (ctx_req_start==ctx_req_end),
+        # use views directly.
+        # Eliminates torch.cat allocations — CUDA-graph-safe.
+        sequence_lengths = metadata.kv_lens_cuda_runtime[
+            gen_req_start:gen_req_end]
+        kv_lengths = metadata.kv_lens_runtime[gen_req_start:gen_req_end]
+        prompt_lengths_cuda = metadata.prompt_lens_cuda_runtime[
+            gen_req_start:gen_req_end]
+        prompt_lengths_cpu = metadata.prompt_lens_cpu_runtime[
+            gen_req_start:gen_req_end]
+        host_context_lengths = prompt_lengths_cpu
+        if metadata.is_cuda_graph:
+            # attentionOp.cpp captures max(host_context_lengths) as a launch
+            # scalar. Use the same graph launch bounds as host KV lengths for
+            # gen-only locality domain graphs so a graph captured on a short prompt can
+            # replay on later, longer prompts.
+            host_context_lengths = kv_lengths
+        request_types = metadata.host_request_types_runtime[
+            gen_req_start:gen_req_end]
+        host_total_kv_lengths = metadata._locality_domain_host_total_kv_lens_buf[
+            locality_domain_id]
+    else:
+        sequence_lengths = torch.cat([
+            metadata.kv_lens_cuda_runtime[ctx_req_start:ctx_req_end],
+            metadata.kv_lens_cuda_runtime[gen_req_start:gen_req_end]
+        ])
+        kv_lengths = torch.cat([
+            metadata.kv_lens_runtime[ctx_req_start:ctx_req_end],
+            metadata.kv_lens_runtime[gen_req_start:gen_req_end]
+        ])
+        prompt_lengths_cuda = torch.cat([
+            metadata.prompt_lens_cuda_runtime[ctx_req_start:ctx_req_end],
+            metadata.prompt_lens_cuda_runtime[gen_req_start:gen_req_end]
+        ])
+        prompt_lengths_cpu = torch.cat([
+            metadata.prompt_lens_cpu_runtime[ctx_req_start:ctx_req_end],
+            metadata.prompt_lens_cpu_runtime[gen_req_start:gen_req_end]
+        ])
+        host_context_lengths = prompt_lengths_cpu
+        request_types = torch.cat([
+            metadata.host_request_types_runtime[ctx_req_start:ctx_req_end],
+            metadata.host_request_types_runtime[gen_req_start:gen_req_end]
+        ])
+        if dense_ctx_kv:
+            # Dense-KV callers (MLA cached-KV / chunked-prefill context) rebind
+            # ``metadata.kv_lens_runtime`` per call to reflect the actual row
+            # count of the passed k/v, so the stale
+            # ``_locality_domain_host_total_kv_lens_buf`` captured at prepare() no longer
+            # matches the kernel inputs. Recompute from the live runtime tensor.
+            host_total_kv_lengths = torch.tensor([
+                int(metadata.kv_lens_runtime[ctx_req_start:ctx_req_end].sum().
+                    item()),
+                int(metadata.kv_lens_runtime[gen_req_start:gen_req_end].sum().
+                    item())
+            ],
+                                                 dtype=torch.int,
+                                                 device='cpu')
+        else:
+            host_total_kv_lengths = metadata._locality_domain_host_total_kv_lens_buf[
+                locality_domain_id]
+
+    # The KV cache manager is shared across locality domains; per-locality domain addressing
+    # is encoded in the block offsets (KVCacheManagerV2 uses a single
+    # canonical pool pointer, with the locality domain-specific virtual-memory
+    # offset baked into the global page indices).
+    kv_cache_manager = metadata.kv_cache_manager
+
+    # The per-locality domain block offsets tensor is laid out as
+    # [ctx_block_offsets | gen_block_offsets].  For generation_only, the
+    # C++ kernel uses num_ctx_reqs=0 and expects gen entries at position 0.
+    # Re-index the block offsets so gen entries start at position 0.
+    block_offsets = metadata.locality_domain_kv_cache_block_offsets[
+        locality_domain_id]
+    if attention_input_type == AttentionInputType.generation_only and num_gen_reqs > 0:
+        # Compute the ctx count in the block offsets layout (from
+        # prepare_batch, which packs ctx requests before gen requests).
+        num_ctx_in_block_offsets = (ctx_req_splits[locality_domain_id + 1] -
+                                    ctx_req_splits[locality_domain_id])
+        if num_ctx_in_block_offsets > 0:
+            gen_block_offsets = torch.zeros_like(block_offsets)
+            gen_block_offsets[:, :num_gen_reqs].copy_(
+                block_offsets[:, num_ctx_in_block_offsets:
+                              num_ctx_in_block_offsets + num_gen_reqs])
+            block_offsets = gen_block_offsets
+
+    return {
+        'ctx_req_start': ctx_req_start,
+        'ctx_req_end': ctx_req_end,
+        'gen_req_start': gen_req_start,
+        'gen_req_end': gen_req_end,
+        'ctx_token_start': ctx_token_start,
+        'ctx_token_end': ctx_token_end,
+        'ctx_kv_token_start': ctx_kv_token_start,
+        'ctx_kv_token_end': ctx_kv_token_end,
+        'gen_token_start': gen_token_start,
+        'gen_token_end': gen_token_end,
+        'num_ctx_reqs': num_ctx_reqs,
+        'num_gen_reqs': num_gen_reqs,
+        'num_ctx_tokens': num_ctx_tokens,
+        'num_gen_tokens': num_gen_tokens,
+        'num_tokens': num_tokens,
+        'num_seqs': num_seqs,
+        'sequence_lengths': sequence_lengths,
+        'kv_lengths': kv_lengths,
+        'prompt_lengths_cuda': prompt_lengths_cuda,
+        'prompt_lengths_cpu': prompt_lengths_cpu,
+        'host_context_lengths': host_context_lengths,
+        'request_types': request_types,
+        'host_total_kv_lengths': host_total_kv_lengths,
+        'block_offsets': block_offsets,
+        'pool_pointers': kv_cache_manager.kv_cache_pool_pointers,
+        'pool_mapping': metadata.host_kv_cache_pool_mapping,
+        'kv_cache_manager': kv_cache_manager,
+    }
+
+
+def _locality_domain_cat_slices(t, ctx_token_start, ctx_token_end,
+                                gen_token_start, gen_token_end, num_ctx_tokens,
+                                num_gen_tokens):
+    """Cat context and generation token slices for a locality domain."""
+    if t is None:
+        return None
+    if num_ctx_tokens > 0 and num_gen_tokens > 0:
+        return torch.cat([
+            t[ctx_token_start:ctx_token_end], t[gen_token_start:gen_token_end]
+        ],
+                         dim=0)
+    return t[ctx_token_start:ctx_token_end] if num_gen_tokens == 0 else t[
+        gen_token_start:gen_token_end]
+
+
+def _slice_cu_seqlens(cu_seqlens: torch.Tensor, start: int,
+                      end: int) -> torch.Tensor:
+    sliced = cu_seqlens[start:end + 1] - cu_seqlens[start]
+    return sliced.contiguous()
+
+
+def _prepare_locality_domain_mla_gen_state_from_full(
+    metadata: TrtllmAttentionMetadata,
+    cu_q_seqlens: torch.Tensor,
+    cu_kv_seqlens: torch.Tensor,
+    fmha_scheduler_counter: torch.Tensor,
+    mla_bmm1_scale: Optional[torch.Tensor],
+    mla_bmm2_scale: Optional[torch.Tensor],
+    total_gen_tokens: int,
+) -> None:
+    num_locality_domains = metadata.kv_cache_manager.num_locality_domains
+    metadata.locality_domain_mla_gen_state = [None] * num_locality_domains
+    for locality_domain_id in range(num_locality_domains):
+        locality_domain_slice = _build_locality_domain_slices(
+            metadata,
+            locality_domain_id,
+            AttentionInputType.generation_only,
+            total_gen_tokens=total_gen_tokens,
+        )
+        if locality_domain_slice is None:
+            continue
+
+        gen_req_start = locality_domain_slice[
+            'gen_req_start'] - metadata.num_contexts
+        gen_req_end = locality_domain_slice[
+            'gen_req_end'] - metadata.num_contexts
+        counter = (torch.empty_like(fmha_scheduler_counter)
+                   if fmha_scheduler_counter is not None else None)
+        if counter is not None:
+            counter.zero_()
+        cu_q_seqlens_locality_domain = _slice_cu_seqlens(
+            cu_q_seqlens, gen_req_start, gen_req_end)
+        cu_kv_seqlens_locality_domain = _slice_cu_seqlens(
+            cu_kv_seqlens, gen_req_start, gen_req_end)
+        metadata.locality_domain_mla_gen_state[locality_domain_id] = {
+            'cu_q_seqlens': cu_q_seqlens_locality_domain,
+            'cu_kv_seqlens': cu_kv_seqlens_locality_domain,
+            'fmha_scheduler_counter': counter,
+            'mla_bmm1_scale': mla_bmm1_scale,
+            'mla_bmm2_scale': mla_bmm2_scale,
+        }
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):

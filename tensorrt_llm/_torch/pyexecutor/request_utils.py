@@ -270,7 +270,11 @@ def merge_requests_to_llm_requests(
     req_with_children = []
     for req_item in new_requests:
         req = executor_request_to_llm_request(
-            req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
+            req_item.id,
+            req_item.request,
+            req_item.child_req_ids,
+            exclude_last_generation_logits,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -314,6 +318,7 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            locality_domain_id=req_item.locality_domain_id,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)

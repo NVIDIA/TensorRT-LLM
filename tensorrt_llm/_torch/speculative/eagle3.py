@@ -956,7 +956,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
 
         with self.draft_kv_cache_context(
-                attn_metadata, draft_kv_cache_manager) as draft_attn_metadata:
+                attn_metadata,
+                draft_kv_cache_manager,
+                enable_draft_locality_domain_forkjoin=True
+        ) as draft_attn_metadata:
             attn_metadata = draft_attn_metadata
             inputs["attn_metadata"] = draft_attn_metadata
             if uses_dsa_mtp_metadata and is_dsa_cache_manager(

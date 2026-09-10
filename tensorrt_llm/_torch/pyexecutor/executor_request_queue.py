@@ -32,6 +32,7 @@ class RequestQueueItem:
     request: Optional[ExecutorRequest] = None
     _ = dataclasses.KW_ONLY
     child_req_ids: Optional[list] = None
+    locality_domain_id: Optional[int] = None
     is_canceled_request: bool = False
     # Only meaningful for control requests. True = drain active/waiting
     # queues before firing the action. False = fire at the next scheduler

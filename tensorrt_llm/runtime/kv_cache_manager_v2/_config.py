@@ -44,6 +44,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int  # in bytes
+    enable_locality_domains: bool = False
 
     @property
     def tier(self) -> CacheTier:
@@ -51,6 +52,9 @@ class GpuCacheTierConfig:
 
     def assert_valid(self) -> None:
         assert self.quota > 0, "Quota must be positive"
+        assert isinstance(self.enable_locality_domains, bool), (
+            "enable_locality_domains must be a bool"
+        )
 
 
 @dataclass(slots=True)
