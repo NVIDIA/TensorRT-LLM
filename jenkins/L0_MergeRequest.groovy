@@ -918,31 +918,24 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
     if (globalVars[CACHED_CHANGED_FILE_LIST] != null) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
-    def changedFileList = []
     try {
+        def changedFileList = []
         if (githubPrApiUrl != null) {
             changedFileList = getGithubMRChangedFileWithFallback(pipeline, globalVars, "getChangedFileList")
         } else {
             changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
+        def changedFileListStr = changedFileList.join(",\n")
+        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+        globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
+        return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        if (githubPrApiUrl != null) {
-            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                error "Failed to get the changed-file list from both the GitHub API and internal Git mirror. " +
-                      "Continuing with an empty list. Error: ${e.toString()}"
-            }
-        } else {
-            pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
-        }
+        pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
-    globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
-    return globalVars[CACHED_CHANGED_FILE_LIST]
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
