@@ -840,11 +840,10 @@ class BasePipeline(nn.Module):
         short denoising loop with dummy inputs for each shape, triggering
         torch.compile, CUDA graph capture (if enabled), and autotuner tuning.
 
-        With autotuning enabled, tactics are selected with CUDA graph capture
-        disabled, then a second pass captures graphs when requested. On
-        multiple ranks, tactics are also merged across ranks at ``autotune()``
-        exit before graph capture, so every rank bakes the same tactic into its
-        graphs.
+        With autotuning enabled, a single rank tunes and captures in one pass.
+        On multiple ranks, tactics are tuned with capture off, merged across
+        ranks at ``autotune()`` exit, then recaptured — so every rank bakes the
+        same tactic into its graphs.
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         OOM is not caught — if a warmup shape OOMs, the server fails fast at startup.
@@ -861,9 +860,8 @@ class BasePipeline(nn.Module):
         )
         warmup_start = time.time()
 
-        # Autotuner tuning knobs: cache path from the shared environment
-        # variable, plus (multi-rank only) a world-group communicator that
-        # drives the post-tune cross-rank merge.
+        # Autotuner tuning knobs: cache path from env, plus (multi-rank only) a
+        # world-group communicator that drives the post-tune cross-rank merge.
         enable_autotune = self.pipeline_config.torch_compile.enable_autotune
         cache_path = None
         post_tune_merge_dist = None
@@ -877,10 +875,14 @@ class BasePipeline(nn.Module):
         try:
             if not enable_autotune:
                 self._run_warmup_pass(shapes, steps)
+            elif post_tune_merge_dist is None:
+                # Single rank: nothing to merge; tune and capture in one pass.
+                with autotune(cache_path=cache_path, skip_dynamic_tuning_buckets=True):
+                    self._run_warmup_pass(shapes, steps)
             else:
-                # Tune eagerly with capture disabled, just as the LLM executor
-                # does. If CUDA graphs are enabled, capture them in a second
-                # pass after cache save and any cross-rank tactic merge.
+                # Multi rank: tune with capture off, merge tactics across ranks
+                # at autotune() exit, then recapture from the merged tactics
+                # (only needed when CUDA graphs are enabled).
                 with (
                     self.disallow_cuda_graph_capture(),
                     autotune(
