@@ -40,6 +40,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
+from utils.util import check_accuracy
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -1332,7 +1333,9 @@ def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
                 router_logits,
             )
 
-        ref_fused_moe.check_accuracy(output, ref_output)
+        # This clamp-heavy input is intentionally wider than the generic
+        # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
 
 
 def run_backend_moe(

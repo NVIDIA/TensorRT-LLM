@@ -110,6 +110,7 @@ class _M3CompositionAllReduce(nn.Module):
         return value * 4
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "scheduler_kind, expected, reduced_input",
     [
@@ -149,6 +150,7 @@ def test_minimax_m3_moe_reduces_only_local_terms(
     assert moe.allreduce.params == [None]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "scheduler_kind, expected_post_fusion",
     [
