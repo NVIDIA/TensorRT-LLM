@@ -30,6 +30,7 @@ import torch
 from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
 
 from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -423,6 +424,80 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             self.assertEqual(
                 attn.num_key_value_heads, expected_kv_heads, f"Layer {i} kv_heads mismatch"
             )
+
+    def test_variable_window_bounds_reach_attention_backend(self):
+        model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
+        model_config.attn_backend = "TRTLLM"
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+        hidden_states = torch.zeros(4, GEMMA4_SMALL_CONFIG["hidden_size"])
+        qkv = torch.zeros(4, 1)
+        q = torch.zeros(4, 1)
+        k = torch.zeros(4, 1)
+        v = torch.zeros(4, 1)
+        backend_output = torch.zeros_like(hidden_states)
+        starts = torch.tensor([0, 0, 0, 3], dtype=torch.int32)
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+        attn_metadata = SimpleNamespace(num_tokens=4)
+
+        with (
+            unittest.mock.patch.object(attn.qkv_proj, "forward", return_value=qkv),
+            unittest.mock.patch.object(attn, "preprocess_qkv", return_value=(q, k, v, None)),
+            unittest.mock.patch.object(attn, "convert_qkv", return_value=(q, k, v)),
+            unittest.mock.patch.object(
+                attn.attn, "forward", return_value=backend_output
+            ) as backend_forward,
+            unittest.mock.patch.object(attn.o_proj, "forward", return_value=backend_output),
+        ):
+            attn(
+                position_ids=None,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                variable_window_token_starts=starts,
+                variable_window_token_ends=ends,
+            )
+
+        forward_args = backend_forward.call_args.kwargs["forward_args"]
+        self.assertIs(forward_args.variable_window_token_starts, starts)
+        self.assertIs(forward_args.variable_window_token_ends, ends)
+
+    def test_compiled_attention_propagates_variable_window_bounds(self):
+        model_config = _make_model_config(GEMMA4_SMALL_CONFIG)
+        model_config.attn_backend = "TRTLLM"
+        attn = Gemma4Attention(model_config, layer_idx=0, is_sliding=True)
+        q = torch.zeros(4, 1)
+        output = torch.zeros_like(q)
+        starts = torch.tensor([0, 0, 0, 3], dtype=torch.int32)
+        ends = torch.tensor([0, 2, 2, 3], dtype=torch.int32)
+
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.is_torch_compiling",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.create_attn_outputs",
+                return_value=[output],
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.attention.maybe_bcg_attn_custom_op_inplace"
+            ) as inplace_attention,
+        ):
+            actual = attn.forward_impl(
+                q,
+                None,
+                None,
+                SimpleNamespace(),
+                PredefinedAttentionMask.CAUSAL,
+                attn.attention_window_size,
+                None,
+                None,
+                variable_window_token_starts=starts,
+                variable_window_token_ends=ends,
+            )
+
+        self.assertIs(actual, output)
+        self.assertIs(inplace_attention.call_args.args[8], starts)
+        self.assertIs(inplace_attention.call_args.args[9], ends)
 
 
 class TestGemma4HfWeightMapper(unittest.TestCase):
