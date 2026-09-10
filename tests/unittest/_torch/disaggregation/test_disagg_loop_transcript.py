@@ -76,11 +76,6 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
 
         setattr(coordinator, name, record)
 
-    def admit(fitting):
-        calls.append(("admit", fitting))
-        return fitting, False
-
-    coordinator.admit = admit
     return coordinator
 
 
@@ -205,7 +200,6 @@ _SCHEDULE_HEAD = [
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
-    ("admit", []),
     ("receive_gen_init", []),
     ("poll_progress_when_idle",),
 ]
@@ -249,9 +243,9 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
 
 
 def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
-    """The PP loop admits inside schedule propagation, checks transfer timeouts
-    only on the retry and executed-batch paths, and flushes responses only from
-    executed-batch handling, so an idle iteration has none of those."""
+    """The PP loop checks transfer timeouts only on the retry and executed-batch
+    paths, and flushes responses only from executed-batch handling, so an idle
+    iteration has none of those."""
     calls = []
     PyExecutor._executor_loop_pp(_pp_executor(monkeypatch, calls, rank=0))
 
@@ -261,7 +255,6 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
-            ("admit", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
             ("pace_idle",),
@@ -271,8 +264,8 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
 
 
 def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
-    """A non-first rank does not admit; it reverts KV for candidates its local
-    scheduler picked but the first rank did not admit."""
+    """A non-first rank reverts KV for candidates its local scheduler picked
+    but the first rank's canonical schedule did not include."""
     calls = []
     PyExecutor._executor_loop_pp(_pp_executor(monkeypatch, calls, rank=1))
 

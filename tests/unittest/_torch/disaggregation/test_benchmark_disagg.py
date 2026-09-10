@@ -23,7 +23,7 @@ cover:
 - ADP dummy suppression during fill vs taper-down
 - ADP router imbalance regression (nvbug 6071070)
 - Non-blocking behaviour of `_prepare_and_schedule_batch`
-- Insufficient-KV fail-fast vs transfer-admission backpressure
+- Insufficient-KV fail-fast during the benchmark fill phase
 """
 
 from unittest.mock import Mock, patch
@@ -1358,20 +1358,16 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
-        """The admitted subset is prepared and passed to the idle check."""
-        admitted_req = _make_active_request(in_init=True)
-        deferred_req = _make_active_request(in_init=True)
-        candidates = [admitted_req, deferred_req]
-        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
-        ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
+    def test_fitting_init_requests_are_prepared_for_transfer(self) -> None:
+        """Every scheduler-fitting INIT request is prepared for KV transfer."""
+        fitting = [_make_active_request(in_init=True), _make_active_request(in_init=True)]
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=fitting)
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
-        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
+        ex._prepare_disagg_gen_init.assert_called_once_with(fitting)
         ex._check_disagg_transfer_progress_when_idle.assert_called_once_with()
         ex._handle_errors.assert_not_called()
 
@@ -1382,30 +1378,6 @@ class TestFailFastDuringBenchmarkFill:
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex._handle_errors.assert_not_called()
-
-    def test_transfer_admission_backpressure_does_not_kill(self, monkeypatch):
-        """NVBug 6438658: admission backpressure is not KV exhaustion.
-
-        Args:
-            monkeypatch: Pytest fixture used to select asynchronous transfer
-                behavior.
-        """
-        monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
-        monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
-        fitting_req = _make_active_request(in_init=True)
-        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
-
-        result, _ = ex._prepare_and_schedule_batch()
-
-        assert result is not None, (
-            "Fail-fast should NOT fire when the scheduler fit an INIT request "
-            "that transfer admission temporarily deferred"
-        )
-        ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
-        ex._prepare_disagg_gen_init.assert_called_once_with([])
-        ex._check_disagg_ctx_cache_transfer_status.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1437,7 +1409,6 @@ class TestFailFastDuringBenchmarkFill:
         all_rank_status[-1] = (True, True)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
@@ -1449,8 +1420,8 @@ class TestFailFastDuringBenchmarkFill:
         ex._handle_errors.assert_called_once()
         assert "one or more requests" in ex._handle_errors.call_args.args[0]
 
-    def test_attention_dp_backpressure_without_terminal_peer_does_not_kill(self):
-        """Admission backpressure stays non-terminal on every rank."""
+    def test_attention_dp_without_terminal_peer_does_not_kill(self):
+        """A fitting INIT request stays non-terminal on every rank."""
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
         ex.enable_attention_dp = True
@@ -1460,7 +1431,6 @@ class TestFailFastDuringBenchmarkFill:
             (True, False),
             (True, False),
         ]
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
         ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()

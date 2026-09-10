@@ -63,21 +63,13 @@ def test_real_coordinator_forwards_each_method_to_its_delegate(name: str) -> Non
     for other in fields(DisaggLoopDelegates):
         if other.name != name:
             getattr(delegates, other.name).assert_not_called()
-    expected = getattr(delegates, name).return_value if name == "admit" else None
-    assert result is expected
-
-
-def test_noop_coordinator_admits_everything_unchanged() -> None:
-    """Without a transceiver, scheduler-fitting gen-init requests must pass
-    through unfiltered and never report a transfer-budget block."""
-    fitting = [object(), object()]
-    assert NoopDisaggCoordinator().admit(fitting) == (fitting, False)
+    assert result is None
 
 
 def test_noop_coordinator_accepts_every_loop_call() -> None:
     """Loops call the coordinator unconditionally, so the no-op variant must
     accept every call the real one does."""
     noop = NoopDisaggCoordinator()
-    for name in _public_methods(DisaggTransferCoordinator) - {"admit"}:
+    for name in _public_methods(DisaggTransferCoordinator):
         params = inspect.signature(getattr(noop, name)).parameters
         getattr(noop, name)(*[Mock() for _ in params])

@@ -124,10 +124,6 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
-    @property
-    def consumes_transfer_buffer(self) -> bool:
-        return False
-
     def __init__(
         self,
         mapping: Mapping,
