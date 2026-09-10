@@ -416,6 +416,29 @@ class TestRequestTimeBreakdown(unittest.TestCase):
         finally:
             os.unlink(temp_file)
 
+    def test_parse_records_matches_parse_json_file(self):
+        """In-memory parsing must be the same reduction, not a second implementation.
+
+        benchmark_serving reduces the records it already holds instead of writing them
+        out and reading them back, so that an unwritable output directory costs the
+        artifact rather than the measurement. That is only safe while the two paths
+        agree.
+        """
+        with tempfile.NamedTemporaryFile(mode='w',
+                                         suffix='.jsonl',
+                                         delete=False) as f:
+            for record in self.test_data:
+                f.write(json.dumps(record) + '\n')
+            temp_file = f.name
+
+        try:
+            from_file = self.analyzer.parse_json_file(temp_file)
+        finally:
+            os.unlink(temp_file)
+
+        from_memory = self.analyzer.parse_records(self.test_data)
+        self.assertEqual(from_memory, from_file)
+
     def test_read_new_disagg_metrics_for_benchmark(self):
         """Test reading only new combined records from a metrics directory."""
         with tempfile.TemporaryDirectory() as output_dir:

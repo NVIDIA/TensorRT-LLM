@@ -92,7 +92,13 @@ def _load_module() -> types.ModuleType:
     defs_pkg = stub("defs")
     defs_pkg.__path__ = []
     perf_pkg = stub("defs.perf")
-    perf_pkg.__path__ = []
+    # Real search path, so a sibling that test_perf_sanity.py imports and that
+    # needs no stub -- one that is deliberately stdlib-only, like
+    # time_breakdown_metrics -- resolves to the real module instead of raising
+    # ModuleNotFoundError. The heavy siblings below still win, because an entry
+    # already in sys.modules is never looked up on __path__. Without this, every
+    # new stdlib-only sibling breaks this file until a stub is added here.
+    perf_pkg.__path__ = [str(module_path.parent)]
     stubs = {
         "defs": defs_pkg,
         "defs.perf": perf_pkg,
