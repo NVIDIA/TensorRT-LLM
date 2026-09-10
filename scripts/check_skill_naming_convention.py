@@ -43,13 +43,17 @@ SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 FRONTMATTER_RE = re.compile(r"\A(?:<!--.*?-->\s*)*---\n(.*?)\n---\n?", re.DOTALL)
 
 
+class FrontmatterError(ValueError):
+    """Report structurally invalid frontmatter after successful YAML parsing."""
+
+
 def load_frontmatter_name(path: Path) -> str | None:
     m = FRONTMATTER_RE.match(path.read_text())
     if not m:
         return None
     data = yaml.safe_load(m.group(1)) or {}
     if not isinstance(data, dict):
-        raise yaml.YAMLError("frontmatter root must be a mapping")
+        raise FrontmatterError("frontmatter root must be a mapping")
     name = data.get("name")
     return name if isinstance(name, str) else None
 
@@ -85,7 +89,19 @@ def main() -> int:
             fm_name = load_frontmatter_name(path)
         except yaml.YAMLError as exc:
             problem = getattr(exc, "problem", None) or str(exc)
+            mark = getattr(exc, "problem_mark", None)
+            if mark is not None:
+                problem = (
+                    f"{problem} (frontmatter line {mark.line + 1}, "
+                    f"column {mark.column + 1})"
+                )
             violations.append(f"{rel}: invalid YAML frontmatter: {problem}")
+            continue
+        except FrontmatterError as exc:
+            violations.append(f"{rel}: invalid frontmatter: {exc}")
+            continue
+        except (OSError, UnicodeDecodeError) as exc:
+            violations.append(f"{rel}: failed to read frontmatter: {exc}")
             continue
 
         if fm_name is None:
