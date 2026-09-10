@@ -27,7 +27,7 @@ from tensorrt_llm._torch.models.checkpoints.mistral.weight_mapper import \
 from tensorrt_llm._torch.models.modeling_mistral_large3 import (
     Mistral3Gate, MistralLarge3ForCausalLM)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    MultimodalModelMixin, PreparedLlmInputs)
+    MultimodalEncoderContractError, MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
 from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
@@ -936,7 +936,9 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         multimodal_params: Sequence[MultimodalParams],
     ) -> torch.Tensor:
         if (self._vision_tower is None or self._multi_modal_projector is None):
-            raise ValueError(
+            # Contract error, not a server fault: see the matching raise in
+            # Qwen3-VL's encode_multimodal_inputs.
+            raise MultimodalEncoderContractError(
                 "Raw multimodal inputs require a local multimodal encoder.")
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
