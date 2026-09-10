@@ -864,9 +864,12 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         n_valid = per_token_valid_blocks(
             qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, causal=True, block_size=page_size
         )
-        # One entry per query token.
+        # One entry per query token. clamp_min(1) as on the eager path: a
+        # zero-valid row would NaN the GQA row.
         total_q = int(n_valid.shape[0])
-        self.msa_n_valid_blocks[:total_q].copy_(n_valid.to(torch.int32), non_blocking=True)
+        self.msa_n_valid_blocks[:total_q].copy_(
+            n_valid.clamp_min(1).to(torch.int32), non_blocking=True
+        )
 
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.

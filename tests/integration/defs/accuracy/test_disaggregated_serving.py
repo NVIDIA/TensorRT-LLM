@@ -62,9 +62,7 @@ class Result(GenerationResultBase):
         return self
 
 
-DuckLLM = namedtuple('DuckLLM',
-                     ['args', 'tokenizer', 'generate_async', 'router_url'],
-                     defaults=(None, ))
+DuckLLM = namedtuple('DuckLLM', ['args', 'tokenizer', 'generate_async'])
 
 # Timeout for the entire test
 DEFAULT_TEST_TIMEOUT = 3600
@@ -542,8 +540,7 @@ def launch_disaggregated_llm(
 
         tokenizer = load_hf_tokenizer(model_name)
         try:
-            yield DuckLLM(args, tokenizer, generate_async,
-                          f"http://localhost:{serve_port}")
+            yield DuckLLM(args, tokenizer, generate_async)
         finally:
             if enable_perf:
                 _show_kvcache_time(kv_cache_perf_dir)
