@@ -1222,13 +1222,12 @@ class TestDisaggTransferIdleProgress:
         executor.dist = Mock(tp_size=1, cp_size=1, world_size=1)
         executor.async_transfer_manager = Mock()
         executor.async_transfer_manager.has_any_inflight_requests.return_value = False
-        executor._check_disagg_gen_cache_transfer_status = Mock()
-        executor._check_disagg_ctx_cache_transfer_status = Mock()
+        executor._disagg_coordinator = Mock()
 
         PyExecutor._check_disagg_transfer_progress_when_idle(executor)
 
-        executor._check_disagg_gen_cache_transfer_status.assert_not_called()
-        executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        executor._disagg_coordinator.reap_gen_receives.assert_not_called()
+        executor._disagg_coordinator.reap_context_sends.assert_not_called()
 
     def test_sync_single_rank_ctx_reaps_idle_transfer(
         self, monkeypatch: pytest.MonkeyPatch
