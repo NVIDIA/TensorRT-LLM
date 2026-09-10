@@ -67,13 +67,9 @@ class CoverageArtifactTest(unittest.TestCase):
             _git(repo, "config", "user.email", "cbts@example.com")
             _git(repo, "config", "user.name", "CBTS Test")
             source = repo / "source.py"
-            source.write_text("first\nold\nlast\n")
-            _git(repo, "add", "source.py")
-            _git(repo, "commit", "-m", "older coverage revision")
-            older_db = _git(repo, "rev-parse", "HEAD")
-
             source.write_text("first\nbase\nlast\n")
-            _git(repo, "commit", "-am", "base")
+            _git(repo, "add", "source.py")
+            _git(repo, "commit", "-m", "base")
             base = _git(repo, "rev-parse", "HEAD")
 
             _git(repo, "checkout", "-b", "pr")
@@ -94,22 +90,12 @@ class CoverageArtifactTest(unittest.TestCase):
             _git(repo, "checkout", "pr")
 
             self.assertEqual(
-                artifact._patch_apply_status(base, head, clean_db, repo, str(repo)).status,
-                "clean",
+                artifact._patch_apply_status(base, head, clean_db, repo, str(repo)), "clean"
             )
             self.assertEqual(
-                artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)).status,
+                artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)),
                 "conflict",
             )
-            cumulative = artifact._patch_apply_status(
-                base, head, older_db, repo, str(repo), db_drift_status="ahead"
-            )
-            self.assertEqual(cumulative.status, "clean")
-            self.assertEqual(cumulative.diff_base_commit, older_db)
-            self.assertEqual(cumulative.changed_files, ["source.py"])
-            assert cumulative.diffs is not None
-            self.assertIn("-old", cumulative.diffs["source.py"])
-            self.assertIn("+pr", cumulative.diffs["source.py"])
 
     def test_accepts_artifact_collected_at_pr_base(self) -> None:
         with (
@@ -179,11 +165,7 @@ class CoverageArtifactTest(unittest.TestCase):
             with (
                 mock.patch.object(artifact, "merge_base", return_value="pr-base"),
                 mock.patch.object(artifact, "select_tarball", return_value=selection) as select,
-                mock.patch.object(
-                    artifact,
-                    "_patch_apply_status",
-                    return_value=artifact._PatchApplyResult("clean", "pr-base"),
-                ) as apply,
+                mock.patch.object(artifact, "_patch_apply_status", return_value="clean") as apply,
                 mock.patch.object(artifact, "download", side_effect=download),
                 mock.patch.object(artifact, "extract", side_effect=extract),
             ):
@@ -192,9 +174,7 @@ class CoverageArtifactTest(unittest.TestCase):
             self.assertIsNotNone(ready)
             assert ready is not None
             select.assert_called_once_with("pr-base")
-            apply.assert_called_once_with(
-                "pr-base", "pr-head", "coverage-commit", db_drift_status="ahead"
-            )
+            apply.assert_called_once_with("pr-base", "pr-head", "coverage-commit")
             connection = sqlite3.connect(ready["path"])
             try:
                 tests = {
