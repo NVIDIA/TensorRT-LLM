@@ -17,6 +17,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
+    CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
 from tensorrt_llm.logger import logger
@@ -80,6 +82,16 @@ class BaseCheckpointLoader(ABC):
         """Whether the last load wrote weights directly into the model."""
         return False
 
+    def activate_weight_session(
+            self,
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: BaseWeightMapper | None = None) -> None:
+        """Activate deferred advisory work before model materialization."""
+        del weight_mapper
+        if readiness_error is not None:
+            raise readiness_error
+
     def is_post_transform_weights_preloaded(self) -> bool:
         """Whether the last direct preload delivered post-transform weights.
 
@@ -89,6 +101,11 @@ class BaseCheckpointLoader(ABC):
         verified and the incoming bytes can safely skip module transform hooks.
         """
         return False
+
+    def build_checkpoint_catalog(self, checkpoint_dir: str,
+                                 **kwargs) -> CheckpointCatalog | None:
+        """Return source metadata for shadow planning when available."""
+        return None
 
     def post_load_apply(self,
                         model: nn.Module,

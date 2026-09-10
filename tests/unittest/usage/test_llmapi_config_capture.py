@@ -698,7 +698,7 @@ def test_collect_llm_api_config_captures_gms_load_format():
 
 
 def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
-    for policy in ("auto", "rank_striped_read_ahead"):
+    for policy in ("auto", "rank_striped_read_ahead", "bounded_rank_striped_read_ahead"):
         args = TorchLlmArgs(
             model="/customer/private/Llama",
             skip_tokenizer_init=True,

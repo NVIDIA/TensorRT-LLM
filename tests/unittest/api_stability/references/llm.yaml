@@ -128,7 +128,7 @@ methods:
         default: null
         status: prototype
       checkpoint_io_policy:
-        annotation: Literal['auto', 'native', 'rank_striped_read_ahead']
+        annotation: Literal['auto', 'native', 'rank_striped_read_ahead', 'bounded_rank_striped_read_ahead']
         default: auto
         status: prototype
       mx_config:

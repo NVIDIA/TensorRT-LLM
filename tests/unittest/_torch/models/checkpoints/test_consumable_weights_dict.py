@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
+
+import torch
+
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 
@@ -66,6 +70,16 @@ def test_index_stays_correct_across_deletion_and_clear():
     assert weights.mark_consumed("b") == 0
 
 
+def test_mark_consumed_keys_ignores_duplicate_requests():
+    reports = []
+    tensor = torch.zeros(8, dtype=torch.uint8)
+    weights = ConsumableWeightsDict({"a.weight": tensor})
+    weights.set_consumption_observer(lambda *report: reports.append(report))
+
+    assert weights.mark_consumed_keys(["a.weight", "a.weight"]) == 1
+    assert reports == [(tensor.nbytes, 1, 1)]
+
+
 def test_take_ownership_empties_a_consumable_source():
     """The derived mapping aliases the source, so the source must let go.
 
@@ -118,3 +132,72 @@ def test_rename_by_params_map_leaves_a_plain_dict_alone():
 
     assert not isinstance(renamed, ConsumableWeightsDict)
     assert len(weights) == 1
+
+
+def test_consumption_observer_survives_identity_preserving_rename():
+    reports = []
+    tensor = torch.zeros(8, dtype=torch.uint8)
+    source = ConsumableWeightsDict({"old.weight": tensor})
+    source.set_consumption_observer(lambda *report: reports.append(report))
+
+    renamed = ConsumableWeightsDict.take_ownership(source, {"new.weight": tensor})
+    assert renamed.mark_consumed("new") == 1
+
+    assert reports == [(tensor.nbytes, 1, 1)]
+
+
+def test_consumption_observer_does_not_credit_transformed_replacement():
+    reports = []
+    raw = torch.zeros(8, dtype=torch.uint8)
+    transformed = raw.to(torch.float32)
+    source = ConsumableWeightsDict({"old.weight": raw})
+    source.set_consumption_observer(lambda *report: reports.append(report))
+
+    derived = ConsumableWeightsDict.take_ownership(source, {"new.weight": transformed})
+    assert derived.mark_consumed("new") == 1
+
+    assert reports == [(0, 1, 0)]
+
+
+def test_consumption_observer_handles_concurrent_consumers():
+    reports = []
+    report_lock = threading.Lock()
+
+    def observe(*report):
+        with report_lock:
+            reports.append(report)
+
+    weights = ConsumableWeightsDict(
+        {
+            "a.weight": torch.zeros(3, dtype=torch.uint8),
+            "b.weight": torch.zeros(5, dtype=torch.uint8),
+        },
+        consumption_observer=observe,
+    )
+    threads = [
+        threading.Thread(target=weights.mark_consumed, args=(prefix,)) for prefix in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(report[0] for report in reports) == 8
+    assert sum(report[1] for report in reports) == 2
+    assert sum(report[2] for report in reports) == 2
+
+
+def test_deletion_and_clear_do_not_imply_consumption():
+    reports = []
+    weights = ConsumableWeightsDict(
+        {
+            "a.weight": torch.zeros(3, dtype=torch.uint8),
+            "b.weight": torch.zeros(5, dtype=torch.uint8),
+        },
+        consumption_observer=lambda *report: reports.append(report),
+    )
+
+    del weights["a.weight"]
+    weights.clear()
+
+    assert reports == []

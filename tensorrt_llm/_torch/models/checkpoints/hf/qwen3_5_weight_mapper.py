@@ -694,5 +694,5 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             packed_weights, allow_partial_loading=allow_partial_loading
         )
         if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
-            return ConsumableWeightsDict(processed_weights)
+            return ConsumableWeightsDict.take_ownership(weights, processed_weights)
         return processed_weights

@@ -91,8 +91,15 @@ def test_generation_config_auto_rejects_autodeploy() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("policy",
-                         ["auto", "native", "rank_striped_read_ahead"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "auto",
+        "native",
+        "rank_striped_read_ahead",
+        "bounded_rank_striped_read_ahead",
+    ],
+)
 def test_checkpoint_io_policy_defaults_to_auto_and_accepts_supported_values(
         policy: str) -> None:
     assert TorchLlmArgs(model=llama_model_path).checkpoint_io_policy == "auto"

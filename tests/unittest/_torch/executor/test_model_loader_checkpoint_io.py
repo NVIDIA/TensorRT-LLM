@@ -4,15 +4,25 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Iterator, Literal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import (
+    CheckpointCatalog,
+    CheckpointTensor,
+)
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.checkpoint_loader import MistralCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
+    WeightDemand,
+    WeightLoadOrderConfidence,
+    WeightLoadPlan,
+    WeightLoadPlanCoverage,
+)
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
@@ -23,6 +33,11 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
+
+_RANK_STRIPED_POLICIES = (
+    "rank_striped_read_ahead",
+    "bounded_rank_striped_read_ahead",
+)
 
 
 @pytest.mark.parametrize("loader_cls", [MistralCheckpointLoader, MXCheckpointLoader])
@@ -61,6 +76,22 @@ def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
     assert status.selected == "rank_striped_read_ahead"
 
 
+def test_bounded_rank_striped_is_explicit_only() -> None:
+    bounded = _construct_checkpoint_loader(
+        "pytorch",
+        None,
+        "HF",
+        checkpoint_io_policy="bounded_rank_striped_read_ahead",
+    )
+    automatic = _construct_checkpoint_loader("pytorch", None, "HF", checkpoint_io_policy="auto")
+
+    assert bounded.weight_loader.checkpoint_io_policy == ("bounded_rank_striped_read_ahead")
+    assert bounded.weight_loader.last_checkpoint_io_status.selected == (
+        "bounded_rank_striped_read_ahead"
+    )
+    assert automatic.weight_loader.checkpoint_io_policy == ("rank_striped_read_ahead")
+
+
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
@@ -69,10 +100,12 @@ def test_construct_checkpoint_loader_selects_rank_striped_for_builtin_hf(
         ({"partial_model_loading": True}, "partial model loading"),
     ],
 )
+@pytest.mark.parametrize("checkpoint_io_policy", _RANK_STRIPED_POLICIES)
 def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
     monkeypatch: pytest.MonkeyPatch,
     kwargs: dict[str, Any],
     reason: str,
+    checkpoint_io_policy: str,
 ) -> None:
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
@@ -83,24 +116,26 @@ def test_construct_checkpoint_loader_falls_back_before_incompatible_request(
         "pytorch",
         None,
         checkpoint_format,
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=checkpoint_io_policy,
         **options,
     )
 
     assert loader.weight_loader.checkpoint_io_policy == "native"
     status = loader.weight_loader.last_checkpoint_io_status
-    assert status.requested == "rank_striped_read_ahead"
+    assert status.requested == checkpoint_io_policy
     assert status.selected == "native"
     assert reason in status.fallback_reason
     warning.assert_called_once()
     assert "selected=native" in warning.call_args.args[0]
 
 
+@pytest.mark.parametrize("checkpoint_io_policy", _RANK_STRIPED_POLICIES)
 def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    checkpoint_io_policy: str,
 ) -> None:
     provided_loader = HfCheckpointLoader(
-        weight_loader=HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+        weight_loader=HfWeightLoader(checkpoint_io_policy=checkpoint_io_policy)
     )
     warning = MagicMock()
     monkeypatch.setattr(model_loader_module.logger, "warning", warning)
@@ -109,13 +144,13 @@ def test_construct_checkpoint_loader_preserves_explicit_loader_on_fallback(
         "pytorch",
         provided_loader,
         "HF",
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=checkpoint_io_policy,
     )
 
     assert loader is provided_loader
     assert provided_loader.weight_loader.checkpoint_io_policy == "native"
     status = provided_loader.weight_loader.last_checkpoint_io_status
-    assert status.requested == "rank_striped_read_ahead"
+    assert status.requested == checkpoint_io_policy
     assert status.selected == "native"
     assert "explicit checkpoint loader" in status.fallback_reason
     warning.assert_called_once()
@@ -153,14 +188,16 @@ def test_auto_selects_native_for_incompatible_config_without_warning(
     assert any("selected=native" in call.args[0] for call in info.call_args_list)
 
 
+@pytest.mark.parametrize("checkpoint_io_policy", _RANK_STRIPED_POLICIES)
 def test_static_native_selection_skips_rank_striped_setup(
     monkeypatch: pytest.MonkeyPatch,
+    checkpoint_io_policy: str,
 ) -> None:
     loader = _construct_checkpoint_loader(
         "pytorch",
         None,
         "HF",
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=checkpoint_io_policy,
         partial_model_loading=True,
     )
     native_weights = {"native": object()}
@@ -176,8 +213,10 @@ def test_static_native_selection_skips_rank_striped_setup(
     active_communicator.assert_not_called()
 
 
+@pytest.mark.parametrize("checkpoint_io_policy", _RANK_STRIPED_POLICIES)
 def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
     monkeypatch: pytest.MonkeyPatch,
+    checkpoint_io_policy: str,
 ) -> None:
     class _CustomWeightLoader:
         def __init__(self) -> None:
@@ -200,15 +239,17 @@ def test_construct_checkpoint_loader_preserves_custom_hf_weight_loader(
         "pytorch",
         None,
         "HF",
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=checkpoint_io_policy,
     )
     assert isinstance(fallback_loader.weight_loader, _CustomWeightLoader)
     warning.assert_called_once()
     assert "selected=native" in warning.call_args.args[0]
 
 
+@pytest.mark.parametrize("checkpoint_io_policy", _RANK_STRIPED_POLICIES)
 def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
     monkeypatch: pytest.MonkeyPatch,
+    checkpoint_io_policy: str,
 ) -> None:
     class _CustomCheckpointLoader(HfCheckpointLoader):
         pass
@@ -225,7 +266,7 @@ def test_construct_checkpoint_loader_detects_custom_hf_wrapper(
         "pytorch",
         None,
         "HF",
-        checkpoint_io_policy="rank_striped_read_ahead",
+        checkpoint_io_policy=checkpoint_io_policy,
     )
 
     assert isinstance(loader, _CustomCheckpointLoader)
@@ -246,6 +287,8 @@ class _SessionCheckpointLoader:
         self.events = events
         self.checkpoint_dir = checkpoint_dir
         self.weights = {"model.weight": object()} if weights is None else weights
+        self.initialized_weight_mapper = object()
+        self.activation_mappers: list[object | None] = []
 
     @contextmanager
     def open_weight_session(
@@ -265,7 +308,18 @@ class _SessionCheckpointLoader:
     def get_initialized_weight_mapper(self, model: object, config: object) -> object:
         del model, config
         self.events.append("mapper_init")
-        return object()
+        return self.initialized_weight_mapper
+
+    def activate_weight_session(
+        self,
+        readiness_error: BaseException | None = None,
+        *,
+        weight_mapper: object | None = None,
+    ) -> None:
+        self.activation_mappers.append(weight_mapper)
+        self.events.append("session_activate")
+        if readiness_error is not None:
+            raise readiness_error
 
 
 def test_legacy_weight_session_defers_load_until_enter() -> None:
@@ -342,19 +396,233 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     assert events == [
         "session_enter",
         "mapper_init",
+        "session_activate",
         "materialize",
         "session_exit",
     ]
     assert "checkpoint_preparation_seconds" in loader.metrics
     assert "weight_population_seconds" in loader.metrics
     assert "checkpoint_finalization_seconds" in loader.metrics
+    assert checkpoint_loader.activation_mappers == [checkpoint_loader.initialized_weight_mapper]
+
+
+def test_shadow_plan_disabled_does_not_call_inspection_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", raising=False)
+    checkpoint_loader = SimpleNamespace(build_checkpoint_catalog=MagicMock())
+    weight_mapper = SimpleNamespace(build_weight_load_plan=MagicMock())
+
+    result = model_loader_module._inspect_shadow_weight_load_plan(
+        checkpoint_loader, "/checkpoint", weight_mapper, mapping=object()
+    )
+
+    assert result is None
+    checkpoint_loader.build_checkpoint_catalog.assert_not_called()
+    weight_mapper.build_weight_load_plan.assert_not_called()
+
+
+def test_shadow_plan_is_advisory_and_preserves_materialization_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("model.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("model.weight",), (0,)),),
+    )
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events)
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
+    )
+    weight_mapper = SimpleNamespace(
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
+    )
+    checkpoint_loader.get_initialized_weight_mapper = MagicMock(
+        side_effect=lambda *_args: events.append("mapper_init") or weight_mapper
+    )
+    model = MagicMock()
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader._call_load_weights = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    )
+
+    loader._materialize_checkpoint_weights(
+        checkpoint_loader,
+        "/checkpoint",
+        model,
+        object(),
+        {"mapping": object()},
+    )
+
+    assert events == [
+        "session_enter",
+        "mapper_init",
+        "catalog",
+        "plan",
+        "session_activate",
+        "materialize",
+        "session_exit",
+    ]
+    loader._call_load_weights.assert_called_once()
+
+
+@pytest.mark.parametrize("failure_site", ["catalog", "plan"])
+def test_shadow_plan_failure_warns_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_site: str,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "true")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("model.weight"),))
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_module.logger, "warning", warning)
+    checkpoint_loader = SimpleNamespace(
+        build_checkpoint_catalog=(
+            MagicMock(side_effect=ValueError("catalog failure"))
+            if failure_site == "catalog"
+            else MagicMock(return_value=catalog)
+        )
+    )
+    weight_mapper = SimpleNamespace(
+        build_weight_load_plan=(
+            MagicMock(side_effect=ValueError("plan failure"))
+            if failure_site == "plan"
+            else MagicMock(side_effect=AssertionError("plan must not be called"))
+        )
+    )
+
+    result = model_loader_module._inspect_shadow_weight_load_plan(
+        checkpoint_loader, "/checkpoint", weight_mapper
+    )
+
+    assert result is None
+    warning.assert_called_once()
+    assert "continuing with the unchanged loader" in warning.call_args.args[0]
+    if failure_site == "catalog":
+        weight_mapper.build_weight_load_plan.assert_not_called()
+
+
+def test_target_mapper_failure_reaches_activation_before_session_finish() -> None:
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events)
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader._call_load_weights = MagicMock()
+    mapper_error = ValueError("target mapper failed")
+
+    def fail_mapper_init(*_args: object) -> None:
+        events.append("mapper_init")
+        raise mapper_error
+
+    checkpoint_loader.get_initialized_weight_mapper = fail_mapper_init
+
+    with pytest.raises(ValueError, match="target mapper failed") as raised:
+        loader._materialize_checkpoint_weights(
+            checkpoint_loader,
+            "/checkpoint",
+            MagicMock(),
+            object(),
+            {"mapping": object()},
+        )
+
+    assert raised.value is mapper_error
+    assert events == [
+        "session_enter",
+        "mapper_init",
+        "session_activate",
+        "session_exit",
+    ]
+    loader._call_load_weights.assert_not_called()
+
+
+def test_preload_readiness_failure_is_coordinated_before_activation_start() -> None:
+    communicator = MagicMock()
+    communicator.Get_size.return_value = 2
+    communicator.allgather.return_value = [None, "OSError: peer preload status failed"]
+
+    def run_rank(local_error: BaseException | None):
+        events = []
+        checkpoint_loader = _SessionCheckpointLoader(events)
+        loader = ModelLoader.__new__(ModelLoader)
+        loader._metrics = {}
+        loader._call_load_weights = MagicMock()
+        bounded_loader = HfWeightLoader(checkpoint_io_policy="bounded_rank_striped_read_ahead")
+        session = MagicMock()
+        session.active_communicator = communicator
+        bounded_loader._pending_read_ahead_session = session
+
+        def check_preloaded() -> bool:
+            events.append("preload_check")
+            if local_error is not None:
+                raise local_error
+            return False
+
+        def activate(
+            readiness_error: BaseException | None = None,
+            *,
+            weight_mapper: object | None = None,
+        ) -> None:
+            events.append("session_activate")
+            bounded_loader.activate_weight_session(readiness_error, weight_mapper=weight_mapper)
+
+        checkpoint_loader.is_weights_preloaded = check_preloaded
+        checkpoint_loader.activate_weight_session = activate
+
+        with pytest.raises((RuntimeError, OSError)) as raised:
+            loader._materialize_checkpoint_weights(
+                checkpoint_loader,
+                "/checkpoint",
+                MagicMock(),
+                object(),
+                {"mapping": object()},
+            )
+
+        expected_events = ["session_enter", "preload_check"]
+        if local_error is None:
+            expected_events.append("mapper_init")
+        expected_events.extend(["session_activate", "session_exit"])
+        assert events == expected_events
+        session.start.assert_not_called()
+        session.disable.assert_called_once()
+        loader._call_load_weights.assert_not_called()
+        return raised.value
+
+    peer_error = OSError("peer preload status failed")
+    successful_rank_error = run_rank(None)
+    failing_rank_error = run_rank(peer_error)
+
+    assert isinstance(successful_rank_error, RuntimeError)
+    assert failing_rank_error is peer_error
+    assert communicator.allgather.call_args_list == [
+        call(None),
+        call("OSError: peer preload status failed"),
+    ]
 
 
 def test_draft_session_spans_mapper_and_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("draft.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("draft.weight",), (0,)),),
+    )
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
+    )
     model = MagicMock()
     model.draft_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(architectures=["DraftForCausalLM"])
@@ -368,6 +636,7 @@ def test_draft_session_spans_mapper_and_materialization(
     )
     draft_mapper = MagicMock()
     draft_mapper.init_model_and_config.side_effect = lambda *_args: events.append("mapper_init")
+    draft_mapper.build_weight_load_plan.side_effect = lambda _catalog: events.append("plan") or plan
     monkeypatch.setattr(
         model_loader_module.AutoCheckpointMapper, "get", MagicMock(return_value=draft_mapper)
     )
@@ -377,24 +646,80 @@ def test_draft_session_spans_mapper_and_materialization(
     assert events == [
         "session_enter",
         "mapper_init",
+        "catalog",
+        "plan",
+        "session_activate",
         "materialize",
         "session_exit",
     ]
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
     assert "draft_checkpoint_finalization_seconds" in loader.metrics
+    assert checkpoint_loader.activation_mappers == [draft_mapper]
 
 
-def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None:
+def test_draft_mapper_failure_reaches_activation_before_session_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     events = []
     checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
+    model = MagicMock()
+    model.draft_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DraftForCausalLM"])
+    )
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader.spec_config = SimpleNamespace(speculative_model="/draft")
+    loader.mapping = object()
+    loader._call_load_weights = MagicMock()
+    mapper_error = ValueError("draft mapper failed")
+
+    def fail_mapper_lookup(*_args: object) -> None:
+        events.append("mapper_init")
+        raise mapper_error
+
+    monkeypatch.setattr(model_loader_module.AutoCheckpointMapper, "get", fail_mapper_lookup)
+
+    with pytest.raises(ValueError, match="draft mapper failed") as raised:
+        loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+
+    assert raised.value is mapper_error
+    assert events == [
+        "session_enter",
+        "mapper_init",
+        "session_activate",
+        "session_exit",
+    ]
+    loader._call_load_weights.assert_not_called()
+
+
+def test_mtp_draft_session_reuses_target_mapper_during_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRTLLM_SHADOW_WEIGHT_LOAD_PLAN", "1")
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
+    catalog = CheckpointCatalog(objects=(), tensors=(CheckpointTensor("draft.weight"),))
+    plan = WeightLoadPlan(
+        catalog_id=catalog.catalog_id,
+        rank=0,
+        world_size=1,
+        coverage=WeightLoadPlanCoverage.CONSERVATIVE,
+        ordering=WeightLoadOrderConfidence.OPAQUE,
+        demands=(WeightDemand("all", ("draft.weight",), (0,)),),
+    )
+    checkpoint_loader.build_checkpoint_catalog = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("catalog") or catalog
+    )
     model = MagicMock()
     model.draft_config = None
     loader = ModelLoader.__new__(ModelLoader)
     loader._metrics = {}
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
-    loader.weight_mapper = object()
+    loader.weight_mapper = SimpleNamespace(
+        build_weight_load_plan=MagicMock(side_effect=lambda _catalog: events.append("plan") or plan)
+    )
     loader._call_load_weights = MagicMock(
         side_effect=lambda *_args, **_kwargs: events.append("materialize")
     )
@@ -402,7 +727,14 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None
     loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
 
     assert loader._call_load_weights.call_args.args[2] is loader.weight_mapper
-    assert events == ["session_enter", "materialize", "session_exit"]
+    assert events == [
+        "session_enter",
+        "catalog",
+        "plan",
+        "session_activate",
+        "materialize",
+        "session_exit",
+    ]
     assert "draft_checkpoint_preparation_seconds" in loader.metrics
     assert "draft_weight_population_seconds" in loader.metrics
     assert "draft_checkpoint_finalization_seconds" in loader.metrics

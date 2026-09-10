@@ -1419,10 +1419,9 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
         if key not in matched_keys:
             renamed_weights[key] = weights[key]
 
-    # Preserve ConsumableWeightsDict type if that's what was passed in
-    if is_consumable:
-        return ConsumableWeightsDict(renamed_weights)
-    return renamed_weights
+    # Transfer the observer together with ownership of the source tensors.
+    return (ConsumableWeightsDict.take_ownership(weights, renamed_weights)
+            if is_consumable else renamed_weights)
 
 
 def filter_weights(prefix, weights: Dict):
