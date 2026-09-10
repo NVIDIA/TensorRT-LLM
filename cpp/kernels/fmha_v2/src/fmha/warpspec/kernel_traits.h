@@ -32,6 +32,29 @@ namespace ws
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Picks the BMM1 instruction traits for a warp-specialized kernel whose BMM2 is QGMMA e4m3.
+// SageAttention is INT8 QK with e4m3 PV: BMM1 is IGMMA int8 -> int32. Plain FP8 attention runs
+// both GEMMs in e4m3. A template-template argument cannot be chosen with std::conditional_t,
+// hence this selector.
+template <bool SAGE>
+struct Bmm1_traits_selector;
+
+template <>
+struct Bmm1_traits_selector<false>
+{
+    template <int GMMA_M, int GMMA_N, int GMMA_K, bool GMMA_A_RF, bool GMMA_B_RF>
+    using type = Hopper_qgmma_e4m3_fp32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, GMMA_B_RF>;
+};
+
+template <>
+struct Bmm1_traits_selector<true>
+{
+    template <int GMMA_M, int GMMA_N, int GMMA_K, bool GMMA_A_RF, bool GMMA_B_RF>
+    using type = Hopper_igmma_int8_int32_traits<GMMA_M, GMMA_N, GMMA_K, GMMA_A_RF, GMMA_B_RF>;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <
     // The instruction trait template for initializing BMM1 and BMM2 traits.
     template <int, int, int, bool, bool> class Instruction_traits,
@@ -77,9 +100,16 @@ template <
     // The output type (only used by fp8 kernels).
     typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0,
+    // The BMM2 instruction traits. Defaults to the BMM1 ones; SageAttention overrides BMM1 to
+    // IGMMA int8 while BMM2 stays QGMMA e4m3, so the two differ there.
+    template <int, int, int, bool, bool> class Instruction_traits_o = Instruction_traits>
 struct Kernel_traits
 {
+
+    // The BMM2 input element type. Every V/O shared-memory buffer is sized from this rather than
+    // from the BMM1 element type, which SageAttention makes int8.
+    using Element_data_type_o = typename Instruction_traits_o<STEP_Q_, STEP_KV_, 0, false, false>::A_type;
 
     // The step size in query sequence dimension (M of BMM1 and BMM2).
     enum
@@ -184,11 +214,26 @@ struct Kernel_traits
         SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_
     };
 
+    // SageAttention quantizes with the groups the BMM1 fragment hands each thread. A thread owns
+    // STEP_KV / 4 keys, so a block of SAGE_BLOCK_SIZE_K_ keys splits them into this many chunks.
+    enum
+    {
+        SAGE_K_CHUNKS = SAGE_BLOCK_SIZE_K_ > 0 ? STEP_KV_ / (4 * SAGE_BLOCK_SIZE_K_) : 1
+    };
+
+    // SAGE_BLOCK_SIZE_V_ counts channels, not tokens: 1 means one scale per channel. V is
+    // quantized along the channel (head-dim) axis, which is the N dimension of BMM2, so the scale
+    // is constant along the BMM2 reduction and applies once after the wgmma chain.
+    enum
+    {
+        SAGE_V_PER_CHANNEL = SAGE_BLOCK_SIZE_V_ == 1
+    };
+
     // Whether the dma group transposes the v tile explicitly.
     enum
     {
-        DMA_GROUP_TRANSPOSE_V
-        = (std::is_same<Element_data_type, fmha::e4m3_t>::value || std::is_same<Element_data_type, fmha::e5m2_t>::value)
+        DMA_GROUP_TRANSPOSE_V = (std::is_same<Element_data_type_o, fmha::e4m3_t>::value
+            || std::is_same<Element_data_type_o, fmha::e5m2_t>::value)
     };
 
     // The number of smem scratch buffer for staging V transpose for Hopper QGMMA
@@ -410,7 +455,7 @@ struct Kernel_traits
 
     // The instruction traits for the BMM2.
     // FP16/BF16 K = 16, FP8 K = 32.
-    using Traits_o = Instruction_traits<STEP_Q, DV, GMMA_K, true, false>;
+    using Traits_o = Instruction_traits_o<STEP_Q, DV, GMMA_K, true, false>;
 
     // The CTA description for BMM1.
     using Cta_tile_p =
@@ -461,9 +506,9 @@ struct Kernel_traits
     // The q, k, v tile buffer.
     using Buffer_q_t = cuda::std::array<Element_data_type, D * STEP_Q * Q_BUFFERS>;
     using Buffer_k_t = cuda::std::array<Element_data_type, D * STEP_KV * KV_BUFFERS>;
-    using Buffer_v_t = cuda::std::array<Element_data_type, DV * STEP_KV * KV_BUFFERS>;
+    using Buffer_v_t = cuda::std::array<Element_data_type_o, DV * STEP_KV * KV_BUFFERS>;
     // We need one kv buffer to explicitly transose fp8 smem_tile.
-    using Buffer_v_scratch_t = cuda::std::array<Element_data_type, DV * STEP_KV * V_SCRATCH_BUFFERS>;
+    using Buffer_v_scratch_t = cuda::std::array<Element_data_type_o, DV * STEP_KV * V_SCRATCH_BUFFERS>;
 
     // The smem bytes of q, k, v tiles.
     enum
@@ -608,18 +653,21 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     // The sage attention block size for Q, K and V
     int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
 struct Kernel_traits_Hopper_qgmma_e4m3_fp32
-    : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
-          NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_,
-          ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
-          RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_,
-          SAGE_BLOCK_SIZE_V_>
+    : public Kernel_traits<Bmm1_traits_selector<(SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0
+                               || SAGE_BLOCK_SIZE_V_ > 0)>::template type,
+          STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_, NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_,
+          ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_,
+          USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType,
+          SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, Hopper_qgmma_e4m3_fp32_traits>
 {
 
     // Base class.
-    using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
-        NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_,
-        SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_,
-        ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
+    using Base = Kernel_traits<Bmm1_traits_selector<(SAGE_BLOCK_SIZE_Q_ > 0 || SAGE_BLOCK_SIZE_K_ > 0
+                                   || SAGE_BLOCK_SIZE_V_ > 0)>::template type,
+        STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_, NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_,
+        ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_,
+        USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType,
+        SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_, Hopper_qgmma_e4m3_fp32_traits>;
 
     enum
     {
@@ -660,7 +708,7 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     using Buffer_v_scratch_t = typename Base::Buffer_v_scratch_t;
     // Extra O buffer if TMA is used for epilogue
     using Element_data_type = typename Base::Element_data_type;
-    using Buffer_o_t = cuda::std::array<Element_data_type, Base::DV * Base::STEP_Q * O_BUFFERS>;
+    using Buffer_o_t = cuda::std::array<typename Base::Element_data_type_o, Base::DV * Base::STEP_Q * O_BUFFERS>;
 
     // The struct of shared memory buffers.
     struct __align__(128) Shared

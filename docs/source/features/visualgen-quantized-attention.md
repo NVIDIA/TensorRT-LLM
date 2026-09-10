@@ -9,8 +9,8 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
   - [Choosing and Tuning a Recipe](#choosing-and-tuning-a-recipe)
   - [Configuration Surface](#configuration-surface)
 - [QK16PV8 Attention Kernels in the CUTEDSL Backend](#qk16pv8-attention-kernels-in-the-cutedsl-backend)
-- [SageAttention (TRTLLM)](#sageattention-trtllm)
-- [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8--nvfp4-cutedsl--flashinfer)
+- [SageAttention in the `TRTLLM` backend](#sageattention-in-the-trtllm-backend)
+- [MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends](#mxfp8-and-nvfp4-in-the-cutedsl-and-flashinfer-backends)
 - [Interaction With Other Features](#interaction-with-other-features)
 
 ## Overview
@@ -25,8 +25,9 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 
 | Backend | `qk_dtype` | `v_dtype` | `(q, k, v)` block sizes | Common name |
 |---|---|---|---|---|
-| `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) |
-| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) |
+| `TRTLLM` | `int8` | `fp8` | `(2, 16, 1)` | SageAttention (INT8 QK) for Hopper |
+| `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) for Blackwell |
+| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) for Blackwell |
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
 | `CUTEDSL` | `mxfp8` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | MXFP8 Q/K |
 | `CUTEDSL` | `nvfp4` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | NVFP4 Q/K |
@@ -43,7 +44,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - QK16PV8 keeps Q/K in BF16 and only quantizes V, making it the most conservative quantized-attention recipe.
 - On B200/GB200, SageAttention with INT8 Q/K typically matches QK16PV8 quality while delivering higher end-to-end throughput.
 - On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the `TRTLLM` backend is preferred for the surrounding workload.
-- For SageAttention with INT8 Q/K, the default `(1, 16, 1)` block-size recipe works well for most cases. Use `(1, 4, 1)` when video quality is not satisfactory.
+- For SageAttention with INT8 Q/K, the default `(2, 16, 1)` or `(1, 16, 1)` block-size recipes works well for most cases. Use `(1, 4, 1)` when video quality is not satisfactory.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
@@ -105,8 +106,9 @@ attention_config:
 
 **Requirements and behavior.**
 
-- SageAttention is supported on B200/GB200 and B300/GB300 GPUs.
-- On B200/GB200, use the recommended `qk_dtype: "int8"` recipe.
+- SageAttention is supported on H100/H200/H800/H20, B200/GB200, and B300/GB300 GPUs.
+- On H100/H200/H800/H20, only one recipe with fixed `qk_dtype: "int8"` is supported.
+- On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
 - On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.
 
 **Configuration.**
@@ -140,6 +142,8 @@ attention_config:
     k_block_size: 16
     v_block_size: 1
 ```
+
+For Hopper SageAttention, set `q_block_size` to `2`.
 
 ## MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends
 

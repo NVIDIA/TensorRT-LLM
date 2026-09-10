@@ -843,8 +843,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         = mNumAttnHeads * dim_k_per_head; // Assuming effective num_kv_heads = head_num for layout
     int const total_v_dim_all_heads
         = mNumAttnHeads * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
-    bool const useSageAttnSeparateQkv = mEnableContextFMHA && !mIsMLAEnabled && mFmhaDispatcher->isSeparateQAndKvInput()
-        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
+    bool const useSageAttnSeparateQkv = mEnableContextFMHA && useSageAttn() && mFmhaDispatcher->isSeparateQAndKvInput();
 
     // Packed fp8 qkv buffer size for normal fp8 context FMHA
     size_t fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
@@ -889,15 +888,17 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         fp8_v_buf_size = total_kv_len * static_cast<size_t>(local_hidden_units_kv);
     }
 
-    int32_t const q_max_n_blk
-        = mSageAttnNumEltsPerBlkQ > 0 ? tc::divUp(max_num_tokens, mSageAttnNumEltsPerBlkQ) + batch_size - 1 : 0;
-    int32_t const k_max_n_blk
-        = mSageAttnNumEltsPerBlkK > 0 ? tc::divUp(total_kv_len, mSageAttnNumEltsPerBlkK) + batch_size - 1 : 0;
+    bool const hopperSage = useHopperSageAttn();
+    int32_t const q_max_n_blk = tc::getSageScaleHeadStride(
+        tc::getSageQPartition(hopperSage), mSageAttnNumEltsPerBlkQ, max_num_tokens, batch_size);
+    int32_t const k_max_n_blk = tc::getSageScaleHeadStride(
+        tc::getSageKPartition(hopperSage), mSageAttnNumEltsPerBlkK, total_kv_len, batch_size);
+    int32_t const v_max_n_blk
+        = mSageAttnNumEltsPerBlkV > 0 ? tc::divUp(local_hidden_units_kv, mSageAttnNumEltsPerBlkV) : 0;
     size_t const sage_q_sfs_buffer_size = sizeof(float) * mNumAttnHeads * static_cast<size_t>(q_max_n_blk);
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
-    size_t const sage_v_sfs_buffer_size = mSageAttnNumEltsPerBlkV > 0
-        ? sizeof(float) * tc::divUp(local_hidden_units_kv, std::max(1, mSageAttnNumEltsPerBlkV))
-        : 0;
+    size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
+    size_t const sage_k_mean_buffer_size = mSageAttnSmoothK ? sizeof(float) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * input_seq_length;
     size_t const encoder_padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * batch_size * cross_kv_length;
@@ -940,6 +941,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
     workspaceSizes.sageQScale = sage_q_sfs_buffer_size;
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
+    workspaceSizes.sageKMean = sage_k_mean_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = AttentionWorkspaceManager::buildContextLayout(workspaceSizes).totalSize;
@@ -1583,8 +1585,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t fp8_q_buf_size = 0;
     size_t fp8_k_buf_size = 0;
     size_t fp8_v_buf_size = 0;
-    bool const useSageAttnSeparateQkv = mEnableContextFMHA && !mIsMLAEnabled && mFmhaDispatcher->isSeparateQAndKvInput()
-        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
+    // SageAttention has no unfused fallback. Falling back would silently run unquantized
+    // attention, silently giving wrong results. Need to report it upfront.
+    TLLM_CHECK_WITH_INFO(!sageAttnRequested() || useSageAttn(),
+        "SageAttention requires the FP8 context FMHA path and does not apply to MLA.");
+    TLLM_CHECK_WITH_INFO(!useSageAttn() || mEnableContextFMHA,
+        "Sage Attention requires contextFMHA with no unfused fallback, but the supplied configuration is unsupported.");
+
+    bool const useSageAttnSeparateQkv = mEnableContextFMHA && useSageAttn() && mFmhaDispatcher->isSeparateQAndKvInput();
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
         fp8_q_buf_size = params.num_tokens * static_cast<size_t>(total_q_dim_all_heads);
@@ -1609,17 +1617,17 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fp8_v_buf_size = params.total_kv_len * static_cast<size_t>(local_hidden_units_kv);
     }
 
-    int32_t const q_max_n_blk = mSageAttnNumEltsPerBlkQ > 0
-        ? tc::divUp(params.num_tokens, mSageAttnNumEltsPerBlkQ) + params.batch_size - 1
-        : 0;
-    int32_t const k_max_n_blk = mSageAttnNumEltsPerBlkK > 0
-        ? tc::divUp(params.total_kv_len, mSageAttnNumEltsPerBlkK) + params.batch_size - 1
-        : 0;
+    bool const hopperSage = useHopperSageAttn();
+    int32_t const q_max_n_blk = tc::getSageScaleHeadStride(
+        tc::getSageQPartition(hopperSage), mSageAttnNumEltsPerBlkQ, params.num_tokens, params.batch_size);
+    int32_t const k_max_n_blk = tc::getSageScaleHeadStride(
+        tc::getSageKPartition(hopperSage), mSageAttnNumEltsPerBlkK, params.total_kv_len, params.batch_size);
     int32_t const v_max_n_blk
         = mSageAttnNumEltsPerBlkV > 0 ? tc::divUp(local_hidden_units_kv, mSageAttnNumEltsPerBlkV) : 0;
     size_t const sage_q_sfs_buffer_size = sizeof(float) * mNumAttnHeads * static_cast<size_t>(q_max_n_blk);
     size_t const sage_k_sfs_buffer_size = sizeof(float) * mNumAttnKVHeads * static_cast<size_t>(k_max_n_blk);
-    size_t const sage_v_sfs_buffer_size = sizeof(float) * v_max_n_blk;
+    size_t const sage_v_sfs_buffer_size = sizeof(float) * static_cast<size_t>(v_max_n_blk);
+    size_t const sage_k_mean_buffer_size = mSageAttnSmoothK ? sizeof(float) * local_hidden_units_kv : 0;
 
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;
@@ -1665,6 +1673,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     workspaceSizes.sageQScale = sage_q_sfs_buffer_size;
     workspaceSizes.sageKScale = sage_k_sfs_buffer_size;
     workspaceSizes.sageVScale = sage_v_sfs_buffer_size;
+    workspaceSizes.sageKMean = sage_k_mean_buffer_size;
     workspaceSizes.cpWorkspace = cpWorkspaceSize;
     workspaceSizes.fmhaMultiCtasKvScratch = fmha_multi_ctas_kv_scratch_size;
     auto const workspaceLayout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes);
@@ -1939,16 +1948,26 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         }
         else if (useSageAttnSeparateQkv)
         {
-            TLLM_CHECK_WITH_INFO(mFP8ContextFMHA, "SageAttention kernel runs under mFP8ContextFMHA option.");
-            TLLM_CHECK_WITH_INFO(mFmhaDispatcher->isSupported(), "SageAttention has no unfused fallback implemented.");
             TLLM_CHECK_WITH_INFO(mMaskType == AttentionMaskType::PADDING,
                 "SageAttention only supports dense (padding) mask, got mask type %d.", static_cast<int>(mMaskType));
             TLLM_CHECK_WITH_INFO(
                 mSageAttnNumEltsPerBlkQ > 0 && mSageAttnNumEltsPerBlkK > 0 && mSageAttnNumEltsPerBlkV == 1,
                 "SageQuant requires positive block sizes for Q and K while the block size for V must be 1.");
+            // A zero stride means the quantizer has no kernel for this block size, which would
+            // otherwise surface as an empty scale buffer deep inside invokeSageQuant().
+            TLLM_CHECK_WITH_INFO(q_max_n_blk > 0 && k_max_n_blk > 0,
+                "No SageQuant kernel on sm_%d for block sizes (q, k, v) = (%d, %d, %d) with qk_int8=%s. SM90 "
+                "requires (2, 16, 1) together with INT8 Q/K; SM100 requires q/k block sizes of 1, 4 or 16.",
+                mSM, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV,
+                mSageAttnQkInt8 ? "true" : "false");
             TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
                 "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
+            // Reduction buffers must be initialized prior to invokeSageQuant().
             check_cuda_error(cudaMemsetAsync(workspaceViews.sageVScale, 0, sage_v_sfs_buffer_size, stream));
+            if (mSageAttnSmoothK)
+            {
+                check_cuda_error(cudaMemsetAsync(workspaceViews.sageKMean, 0, sage_k_mean_buffer_size, stream));
+            }
 
             // Common params for sageQuant
             tc::SageQuantParams sageQuantParams{};
@@ -1958,16 +1977,20 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             sageQuantParams.vStage = 0;
             sageQuantParams.sumSeqLensV = params.total_kv_len;
             sageQuantParams.numHeadsV = mNumAttnKVHeads;
+            sageQuantParams.kSmooth = mSageAttnSmoothK;
             sageQuantParams.ptrV = params.v_ptr;
             sageQuantParams.ptrVQuant = workspaceViews.fp8VBuf;
             sageQuantParams.ptrVScale = workspaceViews.sageVScale;
+            sageQuantParams.ptrKForMean = params.k_ptr;
+            sageQuantParams.ptrKMean = workspaceViews.sageKMean;
             sageQuantParams.smCount = mMultiProcessorCount;
             sageQuantParams.stream = stream;
 
-            // Quantize into Fp8Q, SfsQ, SfsV
+            // Quantize into Q, SfsQ, SfsV
             sageQuantParams.sumSeqLensQk = params.num_tokens;
             sageQuantParams.batchSize = params.batch_size;
             sageQuantParams.numHeads = mNumAttnHeads;
+            sageQuantParams.partition = tc::getSageQPartition(hopperSage);
             sageQuantParams.tokenBlockSize = mSageAttnNumEltsPerBlkQ;
             sageQuantParams.ptrCuSeqLensQk = contextCuQSeqlens;
             sageQuantParams.ptrQk = attention_input;
@@ -1976,10 +1999,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             sageQuantParams.vStage = 1;
             tc::invokeSageQuant(sageQuantParams);
 
-            // Quantize into Fp8K, SfsK, Fp8V
+            // Quantize into K, SfsK, V
             sageQuantParams.sumSeqLensQk = params.total_kv_len;
             sageQuantParams.batchSize = params.batch_size;
             sageQuantParams.numHeads = mNumAttnKVHeads;
+            sageQuantParams.partition = tc::getSageKPartition(hopperSage);
             sageQuantParams.tokenBlockSize = mSageAttnNumEltsPerBlkK;
             sageQuantParams.ptrCuSeqLensQk = contextCuKvSeqlens;
             sageQuantParams.ptrQk = params.k_ptr;
@@ -2077,16 +2101,23 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.fp8QBuf);
             fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
             fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
-            // Set sage attention scaling factor pointers.
-            fmhaParams.qScalePtr = workspaceViews.sageQScale;
-            fmhaParams.kScalePtr = workspaceViews.sageKScale;
-            fmhaParams.vScalePtr = workspaceViews.sageVScale;
         }
         else
         {
             fmhaParams.qkvPtr = mFP8ContextFMHA ? reinterpret_cast<void const*>(workspaceViews.fp8QkvBuf)
                                                 : reinterpret_cast<void const*>(attention_input);
             fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.qBuf);
+        }
+
+        if (useSageAttnSeparateQkv)
+        {
+            // SageAttention scaling factors.
+            fmhaParams.qScalePtr = workspaceViews.sageQScale;
+            fmhaParams.kScalePtr = workspaceViews.sageKScale;
+            fmhaParams.vScalePtr = workspaceViews.sageVScale;
+            fmhaParams.qMaxNBlock = q_max_n_blk;
+            fmhaParams.kMaxNBlock = k_max_n_blk;
+            fmhaParams.vMaxNBlock = v_max_n_blk;
         }
         // TODO: add contiguous kv buffer (cross-attention).
         fmhaParams.kvPtr = nullptr;
@@ -2984,8 +3015,7 @@ int AttentionOp::initialize() noexcept
         // Construct the fmha runner.
         MHARunnerFixedParams fmhaParams{};
 
-        bool const useSageAttn = mFP8ContextFMHA && !mIsMLAEnabled
-            && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
+        bool const useSageAttn = this->useSageAttn();
 
         // Pre-checked during constructing.
         Data_type data_type, data_type_kv;
