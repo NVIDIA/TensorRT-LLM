@@ -3127,6 +3127,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.hasAlibi = isALiBi();
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
+        fmhaParams.useSpcompress = mUsesSpcompress;
         fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
         fmhaParams.fusesDsv4InvRopeFp8Quant = mFusesDsv4InvRopeFp8Quant;
 
