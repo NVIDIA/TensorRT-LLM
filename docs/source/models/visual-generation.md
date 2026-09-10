@@ -163,8 +163,7 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 - Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
   (Ref2VA) is not enabled yet.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
-  model-specific restriction, not a general VisualGen backend requirement. Use
-  VANILLA on other architectures pending numerical validation.
+  model-specific restriction, not a general VisualGen backend requirement.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 

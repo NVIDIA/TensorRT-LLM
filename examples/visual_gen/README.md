@@ -23,7 +23,7 @@ python models/glm_image.py
 python models/wan_t2v.py --visual_gen_args configs/wan2.2-t2v-fp4-1gpu.yaml
 python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --image /path/to/image.png
 python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
-# FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml (see audio-quality note below).
+# FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
@@ -34,9 +34,8 @@ python models/qwen_image_edit.py --visual_gen_args configs/qwen-image-edit-2511-
 python models/hunyuan_t2v.py --visual_gen_args configs/hunyuan-t2v-fp8-1gpu.yaml
 ```
 
-MiniMax-H3 FP8 blockwise is supported. Its audio regression tolerance is provisional,
-not a perceptual quality guarantee; evaluate audio for your workload. See the
-[MiniMax-H3 notes](../../docs/source/models/visual-generation.md#minimax-h3-notes).
+See the [MiniMax-H3 notes](../../docs/source/models/visual-generation.md#minimax-h3-notes)
+for supported tasks, the TRTLLM attention restriction, and checkpoint licensing.
 
 Install deps from the repo root: `pip install -r requirements-dev.txt`.
 

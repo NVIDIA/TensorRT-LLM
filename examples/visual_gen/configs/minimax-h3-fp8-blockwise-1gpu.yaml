@@ -2,9 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Supply the checkpoint with --model. Small media projections stay in FP32.
-# Audio regression tolerance is provisional, not a perceptual quality guarantee.
-# Evaluate audio for the intended workload; see MiniMax-H3 Notes in
-# docs/source/models/visual-generation.md.
 quant_config:
   quant_algo: FP8_BLOCK_SCALES
   dynamic: true

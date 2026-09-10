@@ -427,31 +427,6 @@ class MiniMaxH3TransformerBlock(nn.Module):
         return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
-# Weight quantization is only wired for the load-time (dynamic) path, where
-# DynamicLinearWeightLoader quantizes the released BF16 checkpoint.  NVFP4 uses
-# the loader's fused-QKV path so the packed QKV projection shares one scale.
-# FP8 blockwise keeps the small FP32 media projections unquantized.
-_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4})
-
-# NVFP4 additionally needs runtime activation quantization.  The loader only
-# writes ``weight_scale`` / ``weight_scale_2``, so ``Linear.input_scale`` stays
-# uninitialized; NVFP4LinearMethod only derives it from the activations when
-# ``force_dynamic_quantization`` is set, and otherwise reads that uninitialized
-# scale.  Measured on B200 with an uncalibrated checkpoint, that is the
-# difference between ~15% and ~105% relative error, and it fails silently, so
-# require the flag rather than let it through.
-_FORCE_DYNAMIC_QUANT_ALGOS = frozenset({QuantAlgo.NVFP4})
-
-
-# Only the vanilla backend can express this model's padding.  TRTLLM and CUTEDSL
-# accept ``key_padding_mask`` through ``**kwargs`` and silently drop it.  FA4
-# accepts it but reduces it to ``seqused_k = mask.sum(dim=1)``, which assumes the
-# valid positions form a prefix. Custom transformer inputs may put padding
-# between modalities instead. The normal pipeline never inserts padding, but
-# reject these custom layouts rather than silently attend to their dummy rows.
-_KEY_PADDING_MASK_BACKENDS = frozenset({"VANILLA"})
-
-
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
     """MiniMax-H3's dense single-stream joint audio-video transformer.
 
@@ -468,10 +443,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "sharding requires a model-specific gather contract."
             )
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
-        self._supports_key_padding_mask = self._attn_backend in _KEY_PADDING_MASK_BACKENDS
+        # Only VANILLA supports arbitrary padding between packed modalities.
+        self._supports_key_padding_mask = self._attn_backend == "VANILLA"
         quant_algo = model_config.quant_config.quant_algo
+        # TODO: Support calibrated checkpoints in load_weights before enabling static quantization.
         if quant_algo is not None and not (
-            quant_algo in _DYNAMIC_QUANT_ALGOS and model_config.dynamic_weight_quant
+            quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.NVFP4)
+            and model_config.dynamic_weight_quant
         ):
             raise NotImplementedError(
                 "MiniMax-H3 supports BF16, or dynamically quantized FP8 / FP8_BLOCK_SCALES / NVFP4 weights only."
@@ -486,7 +464,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self._projection_act_dtype = (
             model_config.torch_dtype if quant_algo == QuantAlgo.NVFP4 else torch.float32
         )
-        if quant_algo in _FORCE_DYNAMIC_QUANT_ALGOS and not model_config.force_dynamic_quantization:
+        # The dynamic loader does not initialize NVFP4's static activation scale.
+        if quant_algo == QuantAlgo.NVFP4 and not model_config.force_dynamic_quantization:
             raise NotImplementedError(
                 f"MiniMax-H3 {quant_algo.name} requires force_dynamic_quantization=True; "
                 "the dynamic loader does not calibrate Linear.input_scale, so the "
@@ -773,7 +752,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     "Padded packed sequences (negative token_tags) need an attention "
                     "backend that honours key_padding_mask; the "
                     f"{self._attn_backend} backend cannot express it. Use "
-                    f"{', '.join(sorted(_KEY_PADDING_MASK_BACKENDS))}."
+                    "VANILLA."
                 )
             key_padding_mask = (
                 (token_tags >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
