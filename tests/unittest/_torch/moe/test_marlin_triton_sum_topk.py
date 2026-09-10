@@ -70,12 +70,11 @@ def test_noncontiguous_fallback_matches_triton() -> None:
     torch.manual_seed(42)
     base = torch.randn((num_tokens * top_k, hidden_size), dtype=torch.bfloat16, device="cuda")
 
-    # Make a non-contiguous view (transpose then transpose back gives a strided tensor)
-    non_contig = base.T.T
-    # confirm it's actually non-contiguous after the round-trip transpose
-    # (if not, fall back to as_strided to force non-contiguity)
-    if non_contig.is_contiguous():
-        non_contig = base.as_strided(base.shape, (hidden_size + 1, 1))
+    # Build a non-contiguous view via padded backing storage: stride along dim-0
+    # is (hidden_size + 1) instead of hidden_size, so is_contiguous() returns False.
+    padded = torch.empty((num_tokens * top_k, hidden_size + 1), dtype=torch.bfloat16, device="cuda")
+    padded[:, :hidden_size].copy_(base)
+    non_contig = padded[:, :hidden_size]
     assert not non_contig.is_contiguous(), "test setup error: tensor should be non-contiguous"
 
     aten_out = _aten_reference(non_contig, num_tokens, top_k, hidden_size, torch.bfloat16)

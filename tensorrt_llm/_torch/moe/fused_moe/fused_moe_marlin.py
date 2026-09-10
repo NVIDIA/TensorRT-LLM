@@ -95,6 +95,8 @@ def _sum_topk_expert_outputs(
     output = torch.empty(
         (num_tokens, hidden_size), dtype=output_dtype, device=expert_outputs.device
     )
+    if num_tokens == 0:
+        return output
     grid = (num_tokens, triton.cdiv(hidden_size, _SUM_TOPK_BLOCK_H))
     _sum_topk_kernel[grid](
         expert_outputs,
