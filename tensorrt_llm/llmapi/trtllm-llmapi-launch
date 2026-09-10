@@ -88,10 +88,6 @@ PY
 }
 
 function configure_flashinfer_workspace {
-    if [ -n "$FLASHINFER_WORKSPACE_BASE" ]; then
-        return
-    fi
-
     local workspace_root="${HOME:+$HOME/.cache/tensorrt_llm/flashinfer}"
     if [ -n "$TRTLLM_CACHE_DIR" ]; then
         local cache_root="$TRTLLM_CACHE_DIR"
@@ -104,6 +100,11 @@ function configure_flashinfer_workspace {
             cache_root="${cache_root/#\~/$HOME}"
         fi
         workspace_root="${cache_root%/}/flashinfer"
+    fi
+
+    if [ -n "$FLASHINFER_WORKSPACE_BASE" ] && \
+        [ "$FLASHINFER_WORKSPACE_BASE" != "$workspace_root" ]; then
+        return
     fi
 
     # PMI_RANK or PMI_ID still proves that this process is launcher-managed

@@ -276,6 +276,7 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
     env["PMI_RANK"] = "0"
     env["HOME"] = str(tmp_path / "home")
     env["TRTLLM_CACHE_DIR"] = "~/unified"
+    env["FLASHINFER_WORKSPACE_BASE"] = str(cache_root / "flashinfer")
     env["PATH"] = f"{stub_bin}{os.pathsep}{env['PATH']}"
 
     launcher = Path(__file__).parents[
