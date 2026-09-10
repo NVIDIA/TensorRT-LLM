@@ -97,7 +97,7 @@ void initBindings(nb::module_& m)
             "Phased attention MLA generation pass.", nb::call_guard<nb::gil_scoped_release>())
         .def("get_attention_workspace_size", &torch_ext::AttentionOp::getAttentionWorkspaceSize, nb::arg("params"),
             nb::arg("num_tokens"), nb::arg("max_attention_window_size"), nb::arg("num_gen_tokens"),
-            nb::arg("max_blocks_per_sequence"), nb::arg("ctx_total_kv_len") = 0,
+            nb::arg("max_blocks_per_sequence"),
             "Max of the context/generation workspace byte requirements for sizing FmhaParams.workspace.",
             nb::call_guard<nb::gil_scoped_release>());
 

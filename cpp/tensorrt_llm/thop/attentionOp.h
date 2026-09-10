@@ -167,6 +167,12 @@ struct FmhaParams
         return workspace.data_ptr();
     }
 
+    /// The multi-CTA-KV counter semaphores are an opaque byte-sized scratch buffer.
+    void* getMultiCtasKvCounter() const
+    {
+        return multi_ctas_kv_counter.has_value() ? multi_ctas_kv_counter.value().data_ptr() : nullptr;
+    }
+
     void* getOutput() const
     {
         return output.data_ptr();
@@ -359,10 +365,9 @@ public:
     using PositionEmbeddingType = tensorrt_llm::kernels::PositionEmbeddingType;
     using AttentionMaskType = tensorrt_llm::kernels::AttentionMaskType;
 
-    /// Derives the per-call state into \p p and builds the kernel runners. `mMaskType`
-    /// and the other derived fields change between calls, so this runs on every call.
-    /// `mMultiBlockMode` is deliberately left out: it is a per-call runtime knob read
-    /// from `p.runtime_perf_knobs` at generation time.
+    /// Derives the per-call state into \p p. Kernel runners are fixed by the constructor;
+    /// `mMultiBlockMode` remains a per-call runtime knob read from
+    /// `p.runtime_perf_knobs` at generation time.
     int prepare(FmhaParams& p, bool isGen);
 
     /// One per entry point, instantiated per activation dtype. prepare() is called from
@@ -385,7 +390,7 @@ public:
 
     /// Max of the context and generation workspace byte requirements.
     int64_t getAttentionWorkspaceSize(FmhaParams const& params, int64_t numTokens, int64_t maxAttentionWindowSize,
-        int64_t numGenTokens, int64_t maxBlocksPerSequence, int64_t ctxTotalKvLen);
+        int64_t numGenTokens, int64_t maxBlocksPerSequence);
 
     [[nodiscard]] size_t getFmhaMultiCtasKvScratchSize(FmhaParams const& p) const noexcept;
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
@@ -568,7 +573,7 @@ public:
         return mSM;
     }
 
-    [[nodiscard]] bool supportsNvFp4Output(FmhaParams const& p) const
+    [[nodiscard]] bool supportsNvFp4Output() const
     {
         return mEnableContextFMHA && mEnableXQA;
     }
@@ -618,6 +623,9 @@ public:
 #endif
 
 private:
+    void initialize(FmhaParams const& p);
+    int finishPrepare(FmhaParams& p, bool isGen);
+
     static constexpr int kReservedMaxSeqLenTilePerSeq = 64;
 
     int mSM = tensorrt_llm::common::getSMVersion();
