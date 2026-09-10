@@ -26,12 +26,14 @@ from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_ca
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
+    KVCacheManagerV2Pair,
     _extend_swa_windows_for_reuse,
     _KVCacheManagerInitStatus,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -874,6 +876,141 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert list(kv_cache.committed_tokens) == list(range(4, 10))
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing
+
+
+def _draft_admission_manager(kv_cache: Mock | None) -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = True
+    manager.num_extra_kv_tokens = 6
+    manager._mirror_draft_kv_cache = Mock(return_value=kv_cache)
+    manager._resume_and_restore = Mock(return_value=True)
+    return manager
+
+
+def _draft_admission_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=1,
+        context_current_position=128,
+        context_chunk_size=64,
+        py_draft_tokens=list(range(7)),
+        is_first_context_chunk=True,
+        use_draft_model=False,
+        py_draft_ctx_pre_resize_cap=999,
+    )
+
+
+def test_prepare_draft_disagg_gen_init_reserves_full_context() -> None:
+    kv_cache = Mock(capacity=64)
+
+    def resize(capacity: int) -> bool:
+        kv_cache.capacity = capacity
+        return True
+
+    kv_cache.resize.side_effect = resize
+    manager = _draft_admission_manager(kv_cache)
+    request = _draft_admission_request()
+
+    assert manager._prepare_draft_disagg_gen_init(request)
+
+    kv_cache.resize.assert_called_once_with(205)
+    assert request.py_draft_ctx_pre_resize_cap == 64
+    assert request.use_draft_model is False
+
+
+def test_prepare_draft_disagg_gen_init_resize_failure_is_retryable() -> None:
+    kv_cache = Mock(capacity=64)
+    kv_cache.resize.return_value = False
+    manager = _draft_admission_manager(kv_cache)
+    request = _draft_admission_request()
+
+    assert not manager._prepare_draft_disagg_gen_init(request)
+
+    kv_cache.suspend.assert_called_once_with()
+    assert request.py_draft_ctx_pre_resize_cap is None
+    assert request.use_draft_model is False
+
+
+def test_prepare_draft_disagg_gen_init_index_pressure_is_retryable() -> None:
+    manager = _draft_admission_manager(None)
+    request = _draft_admission_request()
+
+    assert not manager._prepare_draft_disagg_gen_init(request)
+
+    manager._resume_and_restore.assert_not_called()
+    assert request.py_draft_ctx_pre_resize_cap is None
+    assert request.use_draft_model is False
+
+
+def test_kv_cache_manager_v2_pair_coordinates_all_lifecycle_operations() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.prepare_disagg_gen_init.return_value = True
+    draft._prepare_draft_disagg_gen_init.return_value = True
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert pair.prepare_disagg_gen_init(request)
+    pair.suspend_request(request)
+    pair.free_resources(request)
+    pair.revert_allocate_context(request)
+    pair.release_index_slot(request.py_request_id)
+
+    target.prepare_disagg_gen_init.assert_called_once_with(request)
+    draft._prepare_draft_disagg_gen_init.assert_called_once_with(request)
+    for manager in (target, draft):
+        manager.suspend_request.assert_called_once_with(request)
+        manager.free_resources.assert_called_once_with(request)
+        manager.revert_allocate_context.assert_called_once_with(request)
+        manager.release_index_slot.assert_called_once_with(request.py_request_id)
+
+
+def test_kv_cache_manager_v2_pair_rolls_back_both_pools_on_draft_failure() -> None:
+    target = Mock(is_draft=False)
+    draft = Mock(is_draft=True)
+    target.prepare_disagg_gen_init.return_value = True
+    draft._prepare_draft_disagg_gen_init.return_value = False
+    pair = KVCacheManagerV2Pair(target, draft)
+    request = _draft_admission_request()
+
+    assert not pair.prepare_disagg_gen_init(request)
+
+    target.suspend_request.assert_called_once_with(request)
+    draft.suspend_request.assert_called_once_with(request)
+
+
+def test_resource_manager_builds_one_shared_v2_pair() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+
+    resource_manager = ResourceManager(
+        {
+            ResourceManagerType.KV_CACHE_MANAGER: target,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft,
+        }
+    )
+
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
+
+
+def test_resource_manager_refreshes_v2_pair_when_draft_is_registered() -> None:
+    target = object.__new__(KVCacheManagerV2)
+    target.is_draft = False
+    draft = object.__new__(KVCacheManagerV2)
+    draft.is_draft = True
+    resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: target})
+
+    target_only_pair = resource_manager.kv_cache_manager_pair
+    assert target_only_pair.target is target
+    assert target_only_pair.draft is None
+
+    resource_manager.register_resource_manager(ResourceManagerType.DRAFT_KV_CACHE_MANAGER, draft)
+
+    assert resource_manager.kv_cache_manager_pair is not target_only_pair
+    assert resource_manager.kv_cache_manager_pair.target is target
+    assert resource_manager.kv_cache_manager_pair.draft is draft
 
 
 def test_generation_allocation_reserves_dynamic_width() -> None:

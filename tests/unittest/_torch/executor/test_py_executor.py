@@ -957,6 +957,15 @@ class TestDisaggTransferAdmissionController:
         assert wait_for_progress
         executor._revert_ctx_alloc.assert_called_once_with([candidate])
 
+    def test_revert_ctx_alloc_reverts_target_and_draft(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_manager_pair = Mock()
+        request = _make_disagg_transfer_request(1, 32)
+
+        PyExecutor._revert_ctx_alloc(executor, [request])
+
+        executor.kv_cache_manager_pair.revert_allocate_context.assert_called_once_with(request)
+
     def test_async_python_v2_pp1_bypasses_transfer_budget(self) -> None:
         executor = object.__new__(PyExecutor)
         _set_disagg_transceiver_capability(executor, consumes_transfer_buffer=False)

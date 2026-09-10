@@ -163,23 +163,30 @@ class KVCacheV2Scheduler(RequestScheduler):
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
         enable_recompute_pause: bool = True,
+        kv_cache_manager_pair: object | None = None,  # KVCacheManagerV2Pair
     ) -> None:
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
             scheduler_capacity if scheduler_capacity is not None else max_batch_size
         )
-        from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, KVCacheManagerV2Pair
 
         assert isinstance(kv_cache_manager, KVCacheManagerV2), (
             f"KVCacheV2Scheduler requires KVCacheManagerV2, got {type(kv_cache_manager).__name__}"
         )
         self.kv_cache_manager = kv_cache_manager
-        self.draft_kv_cache_manager = draft_kv_cache_manager
+        self.kv_cache_manager_pair = kv_cache_manager_pair or KVCacheManagerV2Pair(
+            kv_cache_manager, draft_kv_cache_manager
+        )
+        assert self.kv_cache_manager_pair.target is kv_cache_manager
+        if draft_kv_cache_manager is not None:
+            assert self.kv_cache_manager_pair.draft is draft_kv_cache_manager
+        self.draft_kv_cache_manager = self.kv_cache_manager_pair.draft
         self.enable_joint_kv_cache_reuse = kv_cache_manager.enable_joint_kv_cache_reuse
         # The draft pool to keep in lockstep with the target, or None when
         # unpaired. Resolved once so the admission paths cannot disagree.
         self._joint_draft_manager = (
-            draft_kv_cache_manager if self.enable_joint_kv_cache_reuse else None
+            self.draft_kv_cache_manager if self.enable_joint_kv_cache_reuse else None
         )
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
@@ -210,7 +217,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         self.has_cp_helix = kv_cache_manager._has_cp_helix
         draft_mgr_name = (
-            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None"
+            type(self.kv_cache_manager_pair.draft).__name__
+            if self.kv_cache_manager_pair.draft is not None
+            else "None"
         )
         cross_mgr_name = (
             type(cross_kv_cache_manager).__name__ if cross_kv_cache_manager is not None else "None"
@@ -697,11 +706,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         Returns ``(action, tokens)``.  *tokens* is 0 because disagg requests
         don't participate in the forward pass token budget.
         """
-        # Cache-transceiver mode disables the separate one-model draft manager,
-        # so disagg generation init has no paired-reuse path. Supporting one
-        # would also require draft KV transfer and history_length=prompt_len.
-        if not self.kv_cache_manager.prepare_disagg_gen_init(req):
-            logger.debug("prepare_disagg_gen_init failed for request %s", req.py_request_id)
+        if not self.kv_cache_manager_pair.prepare_disagg_gen_init(req):
+            logger.debug("Joint KV admission failed for request %s", req.py_request_id)
             return ScheduleAction.SKIP, 0
         return ScheduleAction.SCHEDULED, 0
 
@@ -1317,17 +1323,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         fail if it needs to load a different adapter into a full cache.
         """
         self._clear_request_runtime_state(req)
-        self.kv_cache_manager.suspend_request(req)
-        if self.draft_kv_cache_manager is not None:
-            self.draft_kv_cache_manager.suspend_request(req)
+        self.kv_cache_manager_pair.suspend_request(req)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
     def _free_kv_caches(self, req: LlmRequest) -> None:
-        self.kv_cache_manager.free_resources(req)
-        if self.draft_kv_cache_manager is not None:
-            self.draft_kv_cache_manager.free_resources(req)
+        self.kv_cache_manager_pair.free_resources(req)
 
     def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
         """A started request whose KV cache is still active on GPU.

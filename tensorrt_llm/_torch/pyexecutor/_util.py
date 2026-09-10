@@ -3437,12 +3437,12 @@ def create_py_executor_instance(
             peft_cache_manager=peft_cache_manager.impl
             if peft_cache_manager is not None else None,
             scheduler_capacity=v2_scheduler_capacity,
-            draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
+            kv_cache_manager_pair=resource_manager.kv_cache_manager_pair,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

@@ -164,6 +164,7 @@ def make_kv_cache_manager(
     prepare_context_fn=None,
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
+    prepare_draft_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
     can_evict=False,
     enable_joint_kv_cache_reuse=False,
@@ -171,8 +172,10 @@ def make_kv_cache_manager(
     block_reuse_policy=BlockReusePolicy.PER_REQUEST,
     first_new_block_fn=None,
     is_vswa=False,
+    is_draft=False,
 ):
     mgr = Mock()
+    mgr.is_draft = is_draft
     mgr.tokens_per_block = tokens_per_block
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
@@ -197,6 +200,9 @@ def make_kv_cache_manager(
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
+    mgr._prepare_draft_disagg_gen_init.side_effect = prepare_draft_disagg_gen_init_fn or (
+        lambda req: True
+    )
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr._resume_and_restore.return_value = True
 
@@ -1687,6 +1693,46 @@ class TestDisagg:
         reqs = [make_disagg_request(0), make_disagg_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_joint_target_draft_admission_succeeds(self):
+        target_mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager(is_draft=True)
+        sched = make_scheduler(target_mgr, draft_kv_cache_manager=draft_mgr)
+        req = make_disagg_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+        target_mgr.prepare_disagg_gen_init.assert_called_once_with(req)
+        draft_mgr._prepare_draft_disagg_gen_init.assert_called_once_with(req)
+
+    def test_disagg_draft_admission_failure_rolls_back_both_pools(self):
+        target_mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager(
+            prepare_draft_disagg_gen_init_fn=lambda req: req.request_id == 1,
+            is_draft=True,
+        )
+        sched = make_scheduler(target_mgr, draft_kv_cache_manager=draft_mgr)
+        reqs = [make_disagg_request(0), make_disagg_request(1)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        target_mgr.suspend_request.assert_called_once_with(reqs[0])
+        draft_mgr.suspend_request.assert_called_once_with(reqs[0])
+
+    def test_disagg_target_admission_failure_does_not_touch_draft(self):
+        target_mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req: False)
+        draft_mgr = make_kv_cache_manager(is_draft=True)
+        sched = make_scheduler(target_mgr, draft_kv_cache_manager=draft_mgr)
+        req = make_disagg_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == []
+        draft_mgr._prepare_draft_disagg_gen_init.assert_not_called()
+        target_mgr.suspend_request.assert_not_called()
+        draft_mgr.suspend_request.assert_not_called()
 
     def test_disagg_uses_prepare_disagg_gen_init_api(self):
         """Scheduler routes disagg through prepare_disagg_gen_init (not
