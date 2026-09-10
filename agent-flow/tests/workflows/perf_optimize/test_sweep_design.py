@@ -97,3 +97,21 @@ def test_the_irreversible_phases_are_excluded_with_the_reason(tmp_path):
     text = _instruction(tmp_path)
     assert "irreversible" in text
     assert "accept rate" in text
+
+
+def test_the_skill_s_submission_gates_are_answered_in_advance(tmp_path):
+    """A non-interactive design has no turn in which an answer could arrive.
+
+    `SKILL.md` gates every submission on user confirmation "unless the user
+    said to run end-to-end". Without that clause the agent does exactly what
+    it is told: it prints the case count and node estimate, asks, and the
+    `--print` session ends -- so the design terminates having measured
+    nothing, and the caller sees only "the design was never established".
+    Observed on the first real run: 38 jobs / 145 nodes reported, then exit 0.
+    """
+    text = _instruction(tmp_path)
+    assert "Run END-TO-END" in text
+    assert "this instruction is the confirmation" in text.lower()
+    assert "no second turn" in text
+    # ...and it still asks for the estimate, which is the useful half of a gate
+    assert "node estimate" in text
