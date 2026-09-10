@@ -152,7 +152,7 @@ precedence.
 
 The directories are created by their respective consumers when needed.
 TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
-these unified defaults (with the exception of FlashInfer - see below). The
+these unified defaults (with the exceptions described below). The
 configured values are forwarded to dynamically spawned MPI workers.
 
 Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
@@ -166,6 +166,9 @@ during cache read/writes, at the cost of limiting cache sharing. To disable
 workspace isolation, either set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`,
 or set `FLASHINFER_WORKSPACE_BASE` to a different path from the one assigned
 under `TRTLLM_CACHE_DIR`.
+
+Ray workers similarly isolate the unified `DG_JIT_CACHE_DIR` by rank and GPU.
+Set `TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0` to disable this behavior.
 
 ### FlashInfer JIT workspaces for MPI workers
 
