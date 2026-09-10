@@ -231,9 +231,6 @@ if(NVRTC_DYNAMIC_LINKING)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc nvrtc_builtins)
 else()
-  # The DLFW base images ship no libnvrtc_static.a, so this branch fails there
-  # with `Target "nvrtc_wrapper_src" links to: CUDA::nvrtc_static but the target
-  # was not found`. Build with -DNVRTC_DYNAMIC_LINKING=ON on those images.
   set(NVRTC_LIB CUDA::nvrtc_static)
   set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
   list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
