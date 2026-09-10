@@ -19,9 +19,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     merge_attention_forward_args,
 )
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX

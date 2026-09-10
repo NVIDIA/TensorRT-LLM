@@ -66,8 +66,8 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import (
     _TorchRotaryEmbedding,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
@@ -2123,7 +2123,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,))
+    kv_fp8, _ = DSAVanillaIndexer.quantize_fp8(kv, (0,))
     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
@@ -2168,7 +2168,7 @@ def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8, _ = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
 
     logits = deep_gemm.fp8_mqa_logits(
         q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
