@@ -80,6 +80,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
@@ -733,6 +734,39 @@ def _augment_tokens_with_contiguous_mm_metadata(
         )
 
     return result
+
+
+def _first_new_block_key(
+    tokens: Sequence[TokenIdExt],
+    tokens_per_block: int,
+    reuse_scope: ReuseScope,
+    num_reusable_tokens: int,
+) -> bytes | None:
+    """Key of the first block *tokens* would commit past its reusable prefix.
+
+    *num_reusable_tokens* is what ``probe_reuse`` reports for the same
+    ``(reuse_scope, tokens)``, i.e. the window-aware, pruned prefix length.
+    Returns None when that block would be partial: a partial block is never
+    committed, so it has no key yet.
+
+    Split out from ``KVCacheManagerV2.probe_first_new_block_key`` so the key math
+    can be exercised against a real radix tree without a full model runtime.
+    """
+    # Integer division also covers a partial (mid-block) match: that block is
+    # still the first one this sequence completes and commits.
+    block_index = num_reusable_tokens // tokens_per_block
+    num_tokens_needed = (block_index + 1) * tokens_per_block
+    if num_tokens_needed > len(tokens):
+        return None
+    # A block key depends only on the tokens preceding it, so hashing the
+    # truncated prefix is exact -- and keeps both the token marshalling and the
+    # hash chain proportional to the block we want, not to the whole prompt.
+    key = None
+    for _, key in sequence_to_blockchain_keys(
+        tokens_per_block, reuse_scope, tokens[:num_tokens_needed]
+    ):
+        pass
+    return key
 
 
 def _locate_accepted_draft_tokens(requests: List[LlmRequest]):
@@ -4537,6 +4571,50 @@ class KVCacheManagerV2(BaseResourceManager):
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
         )
+
+    def probe_first_new_block_key(self, req: LlmRequest) -> bytes | None:
+        """Key of the first block whose pages *req* would commit, or None.
+
+        The identity of the first block this request contributes to the radix
+        tree. The scheduler uses it to defer duplicate requests that would
+        otherwise recompute the same prefix in the same iteration.
+
+        Read-only: no pages are acquired and nothing is inserted into the tree,
+        so the result is advisory in exactly the same way ``probe_reuse`` is.
+
+        Two things the caller depends on:
+
+        * The key is derived from the *pruned* reuse length, i.e. the first
+          block this request would **commit pages for** -- not the first block
+          key absent from the tree. Under VSWA these differ: a sliding-window
+          life cycle keeps its tree node when its page is released
+          (``Block.clear_stale_blocks_after_page_unlink`` only removes the
+          subtree for full attention / sink blocks), so a node may exist with no
+          usable page. ``probe_reuse`` already accounts for window staleness via
+          ``_prune_match`` / ``AttnLifeCycle.get_stale_range``, so variable
+          window sizes need no extra guard here.
+        * The token sequence has to be the one ``prepare_context_cache`` matches
+          on, or the probe keys a different block than the request actually
+          commits and the deduplication silently never fires. Both go through
+          ``_context_reuse_tokens``, which owns the last-token exclusion and the
+          draft lookahead that ``reuse_match_backoff`` adds as match evidence.
+
+        Returns None when block reuse is off, when the request has no tokens, or
+        when the first contributed block is not full -- there is no committed
+        block to key on yet.
+        """
+        if not self.enable_block_reuse:
+            return None
+        tokens = self._context_reuse_tokens(req)
+        # Length test rather than truthiness: on the C++ backend this is the
+        # request's zero-copy int32 view, and an array has no truth value.
+        if len(tokens) == 0:
+            # A 1-token prompt marshals to an empty sequence: the last token is
+            # excluded, so there is nothing to look up and nothing to contribute.
+            return None
+        scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
+        num_reusable = self.impl.probe_reuse(scope, tokens)
+        return _first_new_block_key(tokens, self.tokens_per_block, scope, num_reusable)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.
