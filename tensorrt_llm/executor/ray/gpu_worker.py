@@ -73,12 +73,24 @@ class RayWorkerWrapper:
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
-        # Keep the existing per-worker fallback unless the cache was configured
-        # explicitly or through TRTLLM_CACHE_DIR before this actor started.
-        os.environ.setdefault(
-            "DG_JIT_CACHE_DIR",
-            os.path.join(tempfile.gettempdir(),
-                         f"deep_gemm_rank{rank}_gpu{self.gpu}"))
+        if os.environ.get("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", "1") != "0":
+            cache_dir = os.environ.get("TRTLLM_CACHE_DIR")
+            if (cache_dir
+                    and os.environ.get("DG_JIT_CACHE_DIR") == os.path.join(
+                        os.path.expanduser(cache_dir), "deep_gemm")):
+                logger.warning_once(
+                    "TRTLLM_CACHE_DIR keeps DeepGEMM isolation enabled; set "
+                    "TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0 for better cache "
+                    "reuse at the risk of concurrent writes.",
+                    key="deep_gemm_unified_cache_isolation")
+                os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
+                    os.environ["DG_JIT_CACHE_DIR"],
+                    f"deep_gemm_rank{rank}_gpu{self.gpu}")
+            else:
+                os.environ.setdefault(
+                    "DG_JIT_CACHE_DIR",
+                    os.path.join(tempfile.gettempdir(),
+                                 f"deep_gemm_rank{rank}_gpu{self.gpu}"))
 
         torch.cuda.set_device(self.local_gpu)
 
