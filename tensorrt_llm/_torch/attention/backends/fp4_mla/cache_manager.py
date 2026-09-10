@@ -4,7 +4,7 @@
 
 import math
 from dataclasses import dataclass, replace
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -12,13 +12,19 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
     DataRole,
+    KVCacheManagerConfig,
     LayerId,
     PageIndexMode,
 )
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from . import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -137,6 +143,11 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
         self._stream.synchronize()
 
     @property
+    def fp4_mla_hp_pool_size(self) -> int:
+        """Number of BF16 tokens in each layer's rewind-capable HP ring."""
+        return self._fp4_mla_hp_pool_size
+
+    @property
     def blocks_in_primary_pool(self) -> int:
         return self._role_encoded_page_capacity(self._cache_manager_layer_ids[0], Role.KEY)
 
@@ -158,7 +169,7 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
             * torch.empty((), dtype=torch.bfloat16).element_size()
         )
 
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole):
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         storage_head_dim = self._storage_head_dim(local_layer_idx)
         role_sizes = {
             Role.KEY: math.ceil(storage_head_dim / 2),
@@ -199,7 +210,7 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
             result[local_layer] = buffers
         return result
 
-    def _build_cache_config(self, config):
+    def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         cache_layers = list(config.layers)
         self._cache_manager_layer_ids = [LayerId(i) for i in range(self.num_local_layers)]
         self._hp_manager_layer_ids = []
@@ -542,7 +553,7 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
             (1, self._fp4_mla_hp_pool_size * self.head_dim_per_layer[0]),
         ).permute(1, 0, 2, 3)
 
-    def _get_runtime_cache_size_layer_components(self):
+    def _get_runtime_cache_size_layer_components(self) -> tuple[list[int], list[Optional[int]]]:
         sizes = [
             self.get_layer_bytes_per_token(local_layer, Role.ALL)
             for local_layer in range(self.num_local_layers)
@@ -565,7 +576,16 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
         return sum(sizes)
 
     @staticmethod
-    def get_cache_size_per_token(model_config, mapping, num_layers=None, **kwargs):
+    def get_cache_size_per_token(
+        model_config: "ModelConfig",
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        spec_config: Optional["DecodingBaseConfig"] = None,
+        max_batch_size: Optional[int] = None,
+        **kwargs: object,
+    ) -> tuple[int, int]:
         config = model_config.pretrained_config
         logical_head_dim = int(config.kv_lora_rank + config.qk_rope_head_dim)
         backend = _fp4_mla_attention_backend()
@@ -576,7 +596,6 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
             )
         residual = FP4_MLA_K_RESIDUAL_DIM if backend in _FP4_MLA_K_RESIDUAL_BACKENDS else 0
         storage_head_dim = logical_head_dim + residual
-        tokens_per_block = int(kwargs["tokens_per_block"])
         v_scale_page = get_fp4_mla_v_scale_pool_size(config.kv_lora_rank, tokens_per_block)
         per_layer = (
             math.ceil(storage_head_dim / 2)
@@ -588,11 +607,9 @@ class Fp4MlaKVCacheManagerV2(KVCacheManagerV2):
         local_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        spec_config = kwargs.get("spec_config")
         rewind = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
         hp_bytes = (HP_BLOCK_SIZE + rewind) * logical_head_dim * 2 * local_layers
-        max_batch_size = int(kwargs.get("max_batch_size") or 0)
-        return per_layer * local_layers, hp_bytes * max_batch_size * mapping.pp_size
+        return per_layer * local_layers, hp_bytes * (max_batch_size or 0) * mapping.pp_size
 
 
 __all__ = ["Fp4MlaKVCacheManagerV2", "Fp4MlaPageTableSpec"]

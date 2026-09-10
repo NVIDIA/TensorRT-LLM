@@ -77,21 +77,8 @@ def _compile_cutedsl(*args, **kwargs):
         stdout_filter.finish()
 
 
-_EXPLICIT_TORCH_STREAM: torch.cuda.Stream | None = None
-
-
 def _current_cu_stream() -> cuda.CUstream:
-    """Return the active PyTorch stream as a CUDA driver stream.
-
-    cuda2ctl capture cannot reliably query the default null stream.  Keep the
-    default behavior for normal pytest/AModel runs, but allow SMART wrappers to
-    request an explicit stream through the environment.
-    """
-    global _EXPLICIT_TORCH_STREAM
-    if os.environ.get("DKG_MLA_EXPLICIT_STREAM") == "1":
-        if _EXPLICIT_TORCH_STREAM is None:
-            _EXPLICIT_TORCH_STREAM = torch.cuda.Stream()
-        torch.cuda.set_stream(_EXPLICIT_TORCH_STREAM)
+    """Use the caller's stream for launch ordering and CUDA graph capture."""
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
