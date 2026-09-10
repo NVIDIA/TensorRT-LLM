@@ -160,6 +160,58 @@ class TestBaseWorkerSleepGuards:
             getattr(w, method)(["kv_cache"])
 
 
+class TestBaseWorkerRetrySemantics:
+    def test_releasing_an_already_parked_tag_is_a_noop(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        w.sleep(["model"])
+
+        w.engine.begin_sleep_transition.assert_not_called()
+
+    def test_releasing_an_additional_tag_while_parked_conflicts(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="additional tags"):
+            w.sleep(["model", "kv_cache"])
+
+    def test_resuming_active_tags_is_a_noop(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "running",
+                "parked_tags": [],
+            }
+        )
+
+        w.wakeup(["model"])
+
+        w.engine.begin_wakeup_transition.assert_not_called()
+
+    def test_transitional_state_rejects_operations(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parking",
+                "parked_tags": [],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="state is 'parking'"):
+            w.sleep(["model"])
+
+
 # ---------------------------------------------------------------------------
 # _multi_rank_sleep_wakeup serialisation via _sleep_wakeup_lock
 # ---------------------------------------------------------------------------
@@ -1610,15 +1662,15 @@ class TestSingleRankLockAcquired:
 class TestProxyCollectiveRpcGuards:
     """Guard-path tests for both IPC and RPC proxy collective_rpc() shims."""
 
-    def test_multirank_allowed_for_sleep_wakeup(self, cls):
-        """Sleep and wakeup may be called with model_world_size > 1.
+    def test_multirank_allowed_for_runtime_memory_control(self, cls):
+        """Runtime-memory methods may be called with model_world_size > 1.
 
         Both are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise
         and the call must be forwarded to rpc_client.
         """
         from unittest.mock import MagicMock as _MM
 
-        for method_name in ("sleep", "wakeup"):
+        for method_name in ("get_memory_status", "sleep", "wakeup"):
             mock_call = _MM()
             mock_call.remote.return_value = "ok"
             mock_client = _MM()

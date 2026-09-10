@@ -255,6 +255,7 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor/test_overlap_scheduler.py
     - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" TIMEOUT (90)
+    - unittest/executor/test_ray_sleep_state.py
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_postproc_workers.py
