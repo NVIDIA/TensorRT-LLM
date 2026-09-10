@@ -15,7 +15,7 @@
 
 import asyncio
 import itertools
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -293,6 +293,54 @@ async def test_llm_manager_stops_draining_when_a_request_fails():
     # would delay it until hang_latency.
     assert elapsed < hang_latency, (
         "Drain waited for the hung request instead of surfacing the failure."
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_bounds_iteration_log_shutdown(monkeypatch):
+    import tensorrt_llm.bench.benchmark.utils.asynchronous as asynchronous
+
+    manager = LlmManager(
+        llm=MagicMock(spec=LLM),
+        outbox=asyncio.Queue(),
+        streaming=False,
+    )
+    manager._backend_task = asyncio.create_task(asyncio.sleep(0))
+    manager._iteration_log_task = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setattr(asynchronous, "ITERATION_LOG_DRAIN_TIMEOUT", 0.01, raising=False)
+
+    await asyncio.wait_for(manager.stop(), timeout=1)
+
+    assert manager._iteration_log_task.done()
+
+
+@pytest.mark.asyncio
+async def test_iteration_log_worker_uses_bounded_nonblocking_socket(monkeypatch):
+    import tensorrt_llm.bench.benchmark.utils.asynchronous as asynchronous
+
+    async def stats():
+        yield {"iter": 1}
+
+    llm = MagicMock(spec=LLM)
+    llm.get_stats_async.side_effect = lambda _: stats()
+    manager = LlmManager(llm=llm, outbox=asyncio.Queue(), streaming=False)
+    manager.request_seen.set()
+    manager._stop.set()
+
+    socket = MagicMock()
+    socket.send_json = AsyncMock()
+    context = MagicMock()
+    context.socket.return_value = socket
+    monkeypatch.setattr(asynchronous.Context, "instance", MagicMock(return_value=context))
+
+    await manager.iteration_worker("ipc:///tmp/iteration-log")
+
+    socket.setsockopt.assert_called_once_with(
+        asynchronous.LINGER, asynchronous.ITERATION_LOG_LINGER_MS
+    )
+    assert socket.send_json.await_count == 2
+    assert all(
+        call.kwargs["flags"] == asynchronous.NOBLOCK for call in socket.send_json.await_args_list
     )
 
 
