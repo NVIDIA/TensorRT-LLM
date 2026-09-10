@@ -2503,7 +2503,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertIs(text_forward.call_args.kwargs["local_variable_window_token_ends"], ends)
 
     @torch.no_grad()
-    def test_unsupported_variable_window_uses_dense_bidirectional_mask(self) -> None:
+    def test_sm107_variable_window_uses_dense_bidirectional_mask(self) -> None:
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
         config_dict["use_bidirectional_attention"] = "vision"
         config = Gemma4TextConfig(**config_dict)
@@ -2517,6 +2517,8 @@ class TestGemma4HFComparison(unittest.TestCase):
         attn_metadata = fake_metadata_type()
         attn_metadata.num_contexts = 1
         attn_metadata.padded_num_tokens = None
+        attn_metadata.tokens_per_block = 32
+        attn_metadata.use_paged_context_fmha = True
 
         with (
             unittest.mock.patch(
@@ -2526,9 +2528,13 @@ class TestGemma4HFComparison(unittest.TestCase):
                 "tensorrt_llm._torch.models.modeling_gemma4.TrtllmAttentionMetadata",
                 fake_metadata_type,
             ),
-            unittest.mock.patch.object(
-                model, "_supports_variable_window_attention", return_value=False
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention.backends.trtllm.get_sm_version",
+                return_value=107,
             ),
+            unittest.mock.patch.object(
+                torch.ops.trtllm, "attention_supports_variable_window"
+            ) as support_op,
             unittest.mock.patch.object(
                 model, "get_attention_variable_window"
             ) as get_variable_window,
@@ -2545,6 +2551,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             )
 
         self.assertIs(actual, output)
+        support_op.assert_not_called()
         get_variable_window.assert_not_called()
         get_attention_mask.assert_called_once_with(
             mm_token_type_ids=token_type_ids,

@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <torch/extension.h>
 #include <tuple>
 #include <type_traits>
@@ -1611,6 +1612,12 @@ bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t con
     int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
     int64_t const quant_mode, bool const use_paged_context_fmha)
 {
+    auto const smVersion = tensorrt_llm::common::getSMVersion();
+    if (smVersion != 100 && smVersion != 103)
+    {
+        return false;
+    }
+
     auto op = std::make_shared<AttentionOp>();
     op->mType = tensorrt_llm::runtime::TorchUtils::dataType(dtype);
     op->mNumHeads = num_heads;
@@ -1627,6 +1634,8 @@ bool attention_supports_variable_window(c10::ScalarType const dtype, int64_t con
     auto cache_key = op->data();
     using CacheKey = decltype(cache_key);
     static std::unordered_map<CacheKey, bool, OpCustomHash<CacheKey>> op_cache;
+    static std::mutex op_cache_mutex;
+    std::lock_guard<std::mutex> const lock(op_cache_mutex);
     if (auto it = op_cache.find(cache_key); it != op_cache.end())
     {
         return it->second;
