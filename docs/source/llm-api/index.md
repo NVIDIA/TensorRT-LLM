@@ -152,18 +152,20 @@ precedence.
 
 The directories are created by their respective consumers when needed.
 TensorRT-LLM does not add cache locking, cleanup, or per-rank isolation for
-these unified defaults. The configured values are forwarded to dynamically
-spawned MPI workers.
+these unified defaults (with the exception of FlashInfer - see below). The
+configured values are forwarded to dynamically spawned MPI workers.
 
 Configuring `TRTLLM_DG_CACHE_DIR`, either directly or through
 `TRTLLM_CACHE_DIR`, also defaults `TRTLLM_DG_JIT_DUMP_CUBIN` to `1` so its
 NVRTC-generated cubins are persisted. An explicitly configured dump setting
 still takes precedence.
 
-When unified caching configures `FLASHINFER_WORKSPACE_BASE`, that value takes
-precedence over the automatic FlashInfer workspace isolation described below.
-Use distinct `TRTLLM_CACHE_DIR` values when concurrent processes must not share
-their FlashInfer workspace.
+Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation
+mechanism described below still applies. This will prevent race conditions
+during cache read/writes, at the cost of limiting cache sharing. To disable
+workspace isolation, either set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`,
+or set `FLASHINFER_WORKSPACE_BASE` to a different path from the one assigned
+under `TRTLLM_CACHE_DIR`.
 
 ### FlashInfer JIT workspaces for MPI workers
 
@@ -186,7 +188,8 @@ process-unique temporary workspace that is removed when the process exits.
 Persistent cache reuse is not available for this fallback.
 
 An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence in both
-launch modes. An explicitly configured `FLASHINFER_CUBIN_DIR` is also preserved.
+launch modes, while setting `TRTLLM_CACHE_DIR` does not. An explicitly configured 
+`FLASHINFER_CUBIN_DIR` is also preserved.
 
 ### Cannot quit after generation
 

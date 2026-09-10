@@ -289,8 +289,10 @@ def test_llmapi_launch_respects_unified_cache_root(tmp_path: Path) -> None:
         timeout=10,
     )
 
-    assert f"FLASHINFER_WORKSPACE_BASE={cache_root / 'flashinfer'}" in result.stdout
-    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED" not in result.stdout
+    workspace = cache_root / "flashinfer" / "rank-0"
+    assert f"FLASHINFER_WORKSPACE_BASE={workspace}" in result.stdout
+    assert "TRTLLM_FLASHINFER_WORKSPACE_MANAGED=1" in result.stdout
+    assert "better cache reuse" in result.stderr
 
 
 @pytest.mark.cpu_only

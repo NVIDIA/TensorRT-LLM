@@ -88,10 +88,12 @@ PY
 }
 
 function configure_flashinfer_workspace {
-    # Mirror the Python unified-cache default before importing TensorRT-LLM.
-    # An explicitly configured unified root is user-owned and must not be
-    # replaced by the launcher's automatic per-rank workspace isolation.
-    if [ -z "$FLASHINFER_WORKSPACE_BASE" ] && [ -n "$TRTLLM_CACHE_DIR" ]; then
+    if [ -n "$FLASHINFER_WORKSPACE_BASE" ]; then
+        return
+    fi
+
+    local workspace_root="${HOME:+$HOME/.cache/tensorrt_llm/flashinfer}"
+    if [ -n "$TRTLLM_CACHE_DIR" ]; then
         local cache_root="$TRTLLM_CACHE_DIR"
         if [[ "$cache_root" == "~" || "$cache_root" == "~/"* ]]; then
             if [ -z "$HOME" ]; then
@@ -101,16 +103,20 @@ function configure_flashinfer_workspace {
             fi
             cache_root="${cache_root/#\~/$HOME}"
         fi
-        export FLASHINFER_WORKSPACE_BASE="${cache_root%/}/flashinfer"
+        workspace_root="${cache_root%/}/flashinfer"
     fi
 
     # PMI_RANK or PMI_ID still proves that this process is launcher-managed
     # when PMI_SIZE is unavailable. Isolate even rank 0 in that case so rank-0
     # processes from concurrent jobs cannot share FlashInfer's default workspace.
-    if [ -n "$FLASHINFER_WORKSPACE_BASE" ] || \
-        { [ "$tllm_mpi_size" -le 1 ] && [ -z "$PMI_RANK" ] && [ -z "$PMI_ID" ]; } || \
+    if { [ "$tllm_mpi_size" -le 1 ] && [ -z "$PMI_RANK" ] && [ -z "$PMI_ID" ]; } || \
         [ "${TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS:-1}" = "0" ]; then
+        [ -n "$TRTLLM_CACHE_DIR" ] && export FLASHINFER_WORKSPACE_BASE="$workspace_root"
         return
+    fi
+
+    if [ -n "$TRTLLM_CACHE_DIR" ]; then
+        log_stderr "Warning: FlashInfer isolation remains enabled; set TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0 for better cache reuse at the risk of concurrent writes."
     fi
 
     # Do not overwrite a descriptor inherited from the launcher caller. A
@@ -121,13 +127,11 @@ function configure_flashinfer_workspace {
         return
     fi
 
-    if [ -z "$HOME" ]; then
+    if [ -z "$workspace_root" ]; then
         log_stderr "HOME is unset; persistent FlashInfer JIT workspace isolation is unavailable"
         use_unique_flashinfer_workspace
         return
     fi
-
-    local workspace_root="$HOME/.cache/tensorrt_llm/flashinfer"
     if ! mkdir -p "$workspace_root"; then
         log_stderr "Failed to create the persistent FlashInfer JIT workspace root: $workspace_root"
         use_unique_flashinfer_workspace
