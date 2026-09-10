@@ -173,12 +173,8 @@ def test_invalid_padded_config_id_is_excluded_from_duplicate_tracking(mod: Modul
         ]
     )
 
-    assert errors.count(
-        "models[1]: 'config_id' must not have leading or trailing whitespace."
-    ) == 1
-    assert errors.count(
-        "models[2]: 'config_id' must not have leading or trailing whitespace."
-    ) == 1
+    assert errors.count("models[1]: 'config_id' must not have leading or trailing whitespace.") == 1
+    assert errors.count("models[2]: 'config_id' must not have leading or trailing whitespace.") == 1
     assert not any("Duplicate model/config pair" in error for error in errors)
     assert not any("identical yaml_extra" in error for error in errors)
 

@@ -114,9 +114,7 @@ def validate_models(models: typing.Any) -> list[str]:
 
         config_id = model_entry.get("config_id", DEFAULT_CONFIG_ID)
         config_id_ok = (
-            isinstance(config_id, str)
-            and bool(config_id)
-            and config_id == config_id.strip()
+            isinstance(config_id, str) and bool(config_id) and config_id == config_id.strip()
         )
         if not config_id_ok:
             if not isinstance(config_id, str) or not config_id.strip():
