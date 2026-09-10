@@ -168,8 +168,23 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 ### Triggering CI
 
 The contributor open-PR caps are implemented in `.github/workflows/pr-rate-limit.yml`;
-see `CONTRIBUTING.md` for the default five/ten-open-PR caps based on merge history, exemptions and manual recovery. Its mocked API tests
+see `CONTRIBUTING.md` for the default five/ten-open-PR caps based on merge history and exemptions. Its mocked API tests
 run with `node --test .github/scripts/pr_rate_limit.test.js` and are registered in Release Checks.
+
+Administrators can set `PR_RATE_LIMIT_MAX_OPEN` (default five) and
+`PR_RATE_LIMIT_MAX_OPEN_ESTABLISHED` (default ten) to positive integers, and exempt trusted
+logins through the comma-separated `PR_RATE_LIMIT_EXEMPT_USERS` repository variable.
+Set `PR_RATE_LIMIT_DRY_RUN=true` to log decisions without commenting or closing.
+Incomplete history, invalid caps and permission-check 403/404 responses warn and skip moderation;
+other API failures fail the job. Independent CI jobs are not gated by this workflow.
+
+All moderation runs share a serial queue, including default-branch manual dispatch.
+The queue holds up to 100 pending runs; overflow cancels additional runs. Monitor warnings,
+failures and canceled **Contributor Open PR Limit** runs in Actions. After resolving a problem,
+rerun the job or choose **Run workflow** on the default branch and enter the affected PR number.
+Recovery uses the same exemptions, dry-run setting and cap. It reuses the original bot comment,
+whose count reflects the first evaluation. Recovery is manual; there is no scheduled sweep or
+instantaneous-cap guarantee while runs are queued or GitHub is unavailable.
 
 CI is triggered by posting comments on the PR. Basic commands:
 - `/bot run` — trigger the standard CI pipeline

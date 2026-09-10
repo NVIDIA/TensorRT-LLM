@@ -30,11 +30,13 @@ permissions:
   pull-requests: write
   issues: read
 
-# Serialize retries for one PR, not all submissions by an author: a shared
-# author group can discard pending runs during the very burst we must handle.
+# Serialize all moderation, including manual recovery, so separate PRs cannot
+# close against the same capacity snapshot. queue: max retains up to 100 pending
+# runs; monitor canceled runs and manually reevaluate affected PRs on overflow.
 concurrency:
-  group: pr-rate-limit-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: pr-rate-limit
   cancel-in-progress: false
+  queue: max
 
 jobs:
   rate-limit:

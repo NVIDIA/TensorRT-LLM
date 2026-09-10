@@ -96,9 +96,11 @@ test('first five pass; sixth receives explanation before closure', async () => {
   assert.equal(writes[1].state, 'closed');
 });
 test('counts drafts but excludes closed PRs, ordinary issues and another author', async () => {
-  const history = Array.from({ length: 5 }, (_, i) => pr(i + 1, { draft: true }));
-  history.push(pr(-2, { state: 'closed' }), pr(0, { pull_request: undefined }), pr(-1, { user: { id: 99 } }));
-  assert.equal((await run({ history })).writes.length, 2);
+  const excluded = [pr(-2, { state: 'closed' }), pr(0, { pull_request: undefined }), pr(-1, { user: { id: 99 } })];
+  assert.deepEqual((await run({ history: [...Array.from({ length: 4 }, (_, i) => pr(i + 1, { draft: true })), ...excluded] })).writes, []);
+  const { writes } = await run({ history: [...Array.from({ length: 5 }, (_, i) => pr(i + 1, { draft: true })), ...excluded] });
+  assert.deepEqual(writes.map((w) => w.kind), ['comment', 'close']);
+  assert.match(writes[0].body, /currently have 6 open PRs/);
 });
 
 
@@ -182,12 +184,12 @@ test('successful comment survives a close failure and is not duplicated on retry
   const comments = [{ user: { login: 'github-actions[bot]' }, body: writes[0].body }];
   assert.deepEqual((await run({ comments })).writes.map((w) => w.kind), ['close']);
 });
-test('workflow uses trusted inline code, minimal permissions and per-PR concurrency', () => {
+test('workflow uses trusted inline code, minimal permissions and a shared moderation queue', () => {
   assert.match(workflow, /pull_request_target:/);
   assert.match(workflow, /types: \[opened, reopened, ready_for_review\]/);
   assert.match(workflow, /pull-requests: write/);
   assert.match(workflow, /issues: read/);
-  assert.match(workflow, /group: pr-rate-limit-\$\{\{ github.event.pull_request.number \|\| inputs.pr_number \}\}/);
+  assert.match(workflow, /concurrency:\n  group: pr-rate-limit\n  cancel-in-progress: false\n  queue: max/);
   assert.doesNotMatch(workflow, /actions\/checkout|head.sha|secrets\./);
 });
 
