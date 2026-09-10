@@ -18,7 +18,10 @@ import tensorrt_llm._torch.pyexecutor._util as _util
 from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.config_utils import resolve_vocab_size
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
+    MixedMambaHybridCacheManager,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -82,9 +85,11 @@ def _dense_config():
     )
 
 
-def _capture_manager_kwargs(pretrained_config, base_cls):
+def _capture_manager_kwargs(pretrained_config, base_cls, kv_cache_config=None):
     """Route a config through _create_kv_cache_manager, capture the ctor kwargs."""
     captured: dict[str, object] = {}
+    if kv_cache_config is None:
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=True)
 
     class RecordingManager(base_cls):
         def __init__(self, *args: object, **kwargs: object) -> None:
@@ -94,7 +99,7 @@ def _capture_manager_kwargs(pretrained_config, base_cls):
         model_engine=None,
         kv_cache_manager_cls=RecordingManager,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
-        kv_cache_config=KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=True),
+        kv_cache_config=kv_cache_config,
         tokens_per_block=64,
         max_seq_len=2048,
         max_batch_size=4,
@@ -128,6 +133,25 @@ def _capture_manager_kwargs(pretrained_config, base_cls):
 def test_branch_forwards_vocab_size_to_the_manager(config_factory, base_cls):
     kwargs = _capture_manager_kwargs(config_factory(), base_cls)
     assert kwargs["vocab_size"] == _VOCAB_SIZE
+
+
+def test_v1_hybrid_manager_is_not_given_vocab_size():
+    """The forwarding is gated on KVCacheManagerV2, and it has to stay that way.
+
+    ``MixedMambaHybridCacheManager`` takes no ``**kwargs``, so lifting
+    ``vocab_size`` out of that ``issubclass`` gate would not degrade to a
+    silently ignored argument: it would raise TypeError while the manager is
+    being built, before the model serves anything.
+    """
+    kwargs = _capture_manager_kwargs(
+        _qwen3_5_hybrid_config(),
+        MixedMambaHybridCacheManager,
+        KvCacheConfig(enable_block_reuse=False, use_kv_cache_manager_v2=False),
+    )
+    assert "vocab_size" not in kwargs
+    # The V1 managers pick their conv-state layout by model_type, so this also
+    # pins that the V1 branch still gets its own kwargs.
+    assert kwargs["model_type"] == "qwen3_next"
 
 
 def test_util_resolves_vocab_size_instead_of_reading_the_attribute():
