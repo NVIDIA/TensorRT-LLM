@@ -38,6 +38,8 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeMiniMaxH3Transformer:
     def __init__(self) -> None:

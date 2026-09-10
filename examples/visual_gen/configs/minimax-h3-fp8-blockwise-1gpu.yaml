@@ -18,6 +18,6 @@ attention_config:
 compilation_config:
   skip_warmup: false
   resolutions:
-    - [512, 512]
+    - [544, 960]
   num_frames:
     - 124

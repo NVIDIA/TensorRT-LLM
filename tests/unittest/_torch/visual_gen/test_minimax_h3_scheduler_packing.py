@@ -39,6 +39,8 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize(
     ("shift", "expected_sigmas"),

@@ -88,9 +88,14 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
-        # GLM conditions on the explicit timestep labels while integrating with
-        # shifted sigmas. Diffusers 0.40 recomputes the labels from those sigmas;
-        # preserve the checkpoint's pre-0.40 conditioning schedule instead.
+        # Diffusers 0.40 recomputes timestep labels from shifted sigmas, changing
+        # GLM's transformer conditioning. Restore pre-0.40 labels for backward
+        # compatibility, not as a claim of better quality; keep shifted sigmas.
+        # TODO: On a Diffusers upgrade, check the upstream GLM resolution in
+        # https://github.com/huggingface/diffusers/issues/14461 and compare its
+        # timestep/sigma schedules. Before removing this override, rerun GLM
+        # scheduler parity and T2I/I2I quality tests against the aligned reference;
+        # update regression expectations and goldens only for an accepted change.
         scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)

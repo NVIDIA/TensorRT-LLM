@@ -35,7 +35,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
-| `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video |
+| `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
@@ -58,49 +58,20 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **FLUX.1** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** | Yes | Yes | Yes | Yes | No | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FastWan 2.2** | Yes | Yes | No | No | No | No [^7] | No | No | Yes | Yes | Yes | No | No | No | No |
-| **LTX-2** | Yes | Yes | Yes [^4] | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
-| **MiniMax-H3** | Yes [^8] | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
-| **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
+| **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
-
-[^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
-
-[^2]: `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires `CUTEDSL` on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.
-
-[^3]: Wan 2.2 has two stage transformers; TeaCache requires explicit `teacache.coefficients` (high-noise) and `teacache.coefficients_2` (low-noise). There is no built-in coefficient table for Wan 2.2.
-
-[^4]: LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set `teacache.coefficients` explicitly when enabling TeaCache.
-
-[^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition through `trtllm-serve` image-edit routing and returns one RGBA image per generated layer by default. Set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, and Tensor Parallelism are not enabled for this pipeline yet.
-
-[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
-
-### MiniMax-H3 Notes
-
-[^8]: MiniMax-H3 FP8 blockwise is supported; the audio regression tolerance is provisional, as described below.
-
-- Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
-  (Ref2VA) is not enabled yet.
-- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
-  model-specific restriction, not a general VisualGen backend requirement. Use
-  VANILLA on other architectures pending numerical validation.
-- FP8 blockwise is supported. The [quality test](../../../tests/integration/defs/examples/visual_gen/test_minimax_h3_e2e.py)
-  uses a provisional audio log-STFT distance tolerance of 0.10 to allow quantization
-  drift, alongside a video LPIPS tolerance of 0.15. These metrics have different
-  scales; neither threshold establishes perceptual quality for every request.
-  Evaluate generated audio for the intended workload.
-- The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
-  restricts use by territory. Obtain legal approval before downloading or running the weights.
 
 ## Quick Start
 
@@ -139,6 +110,12 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 `response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject such requests with HTTP 400; the same switch also rejects a reference sent with `format="path"`, since both ask the server to trust a local filesystem path. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ### Reference Inputs
+
+Qwen-Image-Layered supports BF16 image-conditioned layer decomposition through
+`trtllm-serve` image-edit routing. It returns one RGBA image per generated layer;
+set `extra_params.save_layers_to_grid` to `true` to pack layers into one saveable
+image grid. Quantization, cache acceleration, attention-parallel/Sage/VSA backends,
+and Tensor Parallelism are not enabled for this pipeline yet.
 
 Conditioning references are supplied through the typed fields `image_reference`, `video_reference`, and `audio_reference`. Each field takes a single reference or a list. A reference is `MediaRef(content=..., format=...)`, and `format` is required.
 
@@ -180,6 +157,16 @@ params.image_reference = [
 FLUX.2 and Qwen-Image-Edit accept a list of reference images on `image_reference`.
 
 The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/serve/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for request examples.
+
+## MiniMax-H3 Notes
+
+- Text-to-video (T2VA) and first/last-frame-to-video (FL2VA) are supported. Reference-to-video
+  (Ref2VA) is not enabled yet.
+- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
+  model-specific restriction, not a general VisualGen backend requirement. Use
+  VANILLA on other architectures pending numerical validation.
+- The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
+  restricts use by territory. Obtain legal approval before downloading or running the weights.
 
 ## Optimizations
 
@@ -306,6 +293,8 @@ VisualGen CUDA graphs capture transformer forward calls during denoising and rep
 
 Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
 
+FastWan 2.2 is a 3-step distilled model; TeaCache and Cache-DiT are not applicable.
+
 #### TeaCache
 
 TeaCache caches transformer outputs when timestep embeddings change slowly between denoising steps, skipping redundant computation. Enable via `VisualGenArgs.cache_config` (YAML or programmatic):
@@ -321,6 +310,11 @@ cache_config:
 | `teacache_thresh` | float | `0.2` | Accumulated timestep-embedding distance threshold. A step is skipped when the accumulated polynomial-rescaled L1 change stays below this value; higher values cache more aggressively (more speedup, possible quality loss). The example configs use `0.6` for FLUX.1 and `0.2` for all other supported models. |
 | `use_ret_steps` | bool | `false` | Enable retention-step caching variant. |
 | `coefficients` | list[float] | per-model | Polynomial coefficients used by the TeaCache decision function. Set automatically at load time based on the checkpoint. |
+
+Wan 2.2 and LTX-2 have no built-in TeaCache coefficient tables. Set
+`cache_config.coefficients` explicitly for LTX-2. Wan 2.2 requires both
+`cache_config.coefficients` for its high-noise transformer and
+`cache_config.coefficients_2` for its low-noise transformer.
 
 #### Cache-DiT
 
@@ -410,7 +404,7 @@ CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components betw
 
 Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
 
-- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs.
+- **CFG Parallelism** (`cfg_size: 2`): Splits positive/negative guidance prompts across GPUs. FLUX uses embedded guidance without a separate negative prompt path; CFG parallelism is not applicable to FLUX or the distilled FastWan 2.2 model.
 - **Ulysses Parallelism** (`ulysses_size: N`): Splits the sequence dimension across GPUs for longer sequences.
     - **Async Ulysses A2A pipeline** (`async_ulysses: true` in `parallel_config`): Overlaps per-rank V/Q/K projection compute with the cross-rank all-to-all on a dedicated side stream. Requires `ulysses_size > 1` and an NVLink-connected GPU domain (uses PyTorch `_SymmetricMemory` with CUDA IPC for peer pushes; not currently supported across nodes without MNNVL). Currently wired for WAN and LTX-2 self-attention.
 - **Parallel VAE** (`parallel_vae_size: N`): Shards the final VAE decode along a spatial axis (constraint: `parallel_vae_size ≤ world_size`; WAN/Cosmos3 only).

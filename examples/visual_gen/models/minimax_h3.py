@@ -46,9 +46,11 @@ def main() -> None:
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
-    # Inherit the model's 28-step default, also used by the reference app.
-    params.height = 512
-    params.width = 512
+    # Match the reference app's 960x544 canvas and seed; inherit 28 steps and
+    # 124 frames at 24 FPS (the app's aligned 5-second request).
+    params.height = 544
+    params.width = 960
+    params.seed = 42
 
     output = visual_gen.generate(
         inputs=(
