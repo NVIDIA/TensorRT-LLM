@@ -6,7 +6,9 @@ import math
 
 import torch
 
-from .mxe4m3_mxe2m1_block_scale_moe_runner import mxe4m3_mxe2m1_block_scale_moe_runner as moe
+from tensorrt_llm._torch.staircase.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (
+    mxe4m3_mxe2m1_block_scale_moe_runner as moe,
+)
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 

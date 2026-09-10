@@ -15,6 +15,13 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  # Staircase collective entries. Each spawns its own 4-rank job rather than
+  # using the mpi_pool_executor fixture: their cases read module-global rank
+  # state and several assert on communicator state the previous case left
+  # behind, so they are one ordered sequence inside one job, and a broken
+  # collective hangs rather than raising -- the launcher's deadline is what
+  # keeps that from wedging the run, and the fixture has none.
+  - unittest/_torch/staircase/comm
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
