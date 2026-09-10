@@ -294,6 +294,22 @@ __host__ __device__ __forceinline__ int computeProtoTransferSize(HelixFieldInfo 
 // Main All-to-All Kernel
 // ============================================================================
 
+//! Exchange one entry per peer rank over the MNNVL FIFOs, both directions in one
+//! launch.
+//!
+//! blockIdx.z picks the role: a block is either a sender or a receiver for one
+//! (peer, channel) pair. The sender stages an entry's fields into shared memory
+//! with TMA, packs them with LL128Proto and pushes the result into the peer's
+//! FIFO; the receiver pops, unpacks and writes out. Both walk their channel's
+//! entries strided by the channel count, entryIdx = channel, channel +
+//! runChannelCount, ...
+//!
+//! params.zeroKvMask, when non-null, marks entries this rank owns no KV for.
+//! They are rewritten in shared memory before packing -- see the sanitization
+//! block below -- which is why it costs no extra global traffic.
+//!
+//! \tparam ALLOW_VARIABLE_FIELD1 field 1 carries more than one (max, sum) pair
+//!         per entry, i.e. the fifo v1 layout where an entry is (token, head).
 template <bool ALLOW_VARIABLE_FIELD1>
 __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 {

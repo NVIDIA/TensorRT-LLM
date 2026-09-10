@@ -40,6 +40,7 @@ was checked out of tree at cp16.
 
 import pickle
 import sys
+import time
 
 import _torch.attention.multi_gpu.helix_test_utils as helix_utils
 import cloudpickle
@@ -65,9 +66,38 @@ MPI.pickle.__init__(
 WORLD_SIZE = 2
 NUM_HEADS = 6  # heads this rank owns after TP/CP splitting
 VALUE_DIM = 512  # kv_lora_rank
+# Generous: the barrier only has to outlast a CUDA graph capture, and a false
+# timeout would be a flaky test. It exists to bound a hang, not to be tight.
+BARRIER_TIMEOUT_S = 300.0
 # bf16 partials through an fp32 combine. Three orders below the ~1.0 scale of
 # the data, and loose on purpose: the failure this hunts is NaN, not rounding.
 TOLERANCE = 2e-2
+
+
+def _bounded_barrier(comm, label: str, timeout_s: float = BARRIER_TIMEOUT_S):
+    """Barrier that fails instead of hanging when a peer never arrives.
+
+    The two barriers here bracket a collective CUDA graph capture. With a plain
+    ``comm.barrier()``, a rank that dies during capture leaves its peers blocked
+    forever and the run reports as a hang -- no traceback, no failing assertion,
+    just a job that has to be killed. Polling a non-blocking barrier turns that
+    into a normal test failure that names the rank and the phase.
+
+    Deliberately no ``MPI_Abort``: these tests share an ``MPIPoolExecutor`` with
+    the rest of the session, and aborting the world would take unrelated tests
+    down with it. Raising is enough for the executor to surface the failure.
+    """
+    request = comm.Ibarrier()
+    deadline = time.monotonic() + timeout_s
+    while not request.Test():
+        if time.monotonic() > deadline:
+            request.Cancel()
+            raise TimeoutError(
+                f"rank {comm.Get_rank()} waited {timeout_s:.0f}s at the '{label}' "
+                f"barrier; a peer never arrived (most likely it died during CUDA "
+                f"graph capture)"
+            )
+        time.sleep(0.01)
 
 
 def _zero_kv_mask(rank: int, world_size: int, num_tokens: int, device: torch.device):
@@ -164,14 +194,14 @@ def _zero_kv_rank(rank, world_size, num_tokens, comms_medium, use_cuda_graph, wi
                 )
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
-        comm.barrier()
+        _bounded_barrier(comm, "before capture")
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = _helix_post_process(
                 partial_o, stats, mapping, NUM_HEADS, VALUE_DIM, zero_kv_mask=zero_kv_mask
             )
         torch.cuda.synchronize()
-        comm.barrier()
+        _bounded_barrier(comm, "after capture")
         graph.replay()
         torch.cuda.synchronize()
     else:
