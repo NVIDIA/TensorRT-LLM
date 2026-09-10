@@ -1576,7 +1576,6 @@
    "unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]": 105.24084607329843,
    "unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]": 129.26791205533596,
    "unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]": 737.5263775720165,
-   "unittest/tools/test_perf_sanity_matching.py": 23.070881556683588,
    "unittest/tools/test_unittest_culprits.py": 22.74008013937282,
    "unittest/usage": 29.950440784313727,
    "unittest/usage/test_e2e_capture.py": 20.434414677276745,
