@@ -57,7 +57,7 @@ class TelemetryField:
     @classmethod
     def categorical(cls, *allowed_values: Any) -> "TelemetryField":
         """Allow capture only for the specified values and their exact types."""
-        return cls(allowed_values=tuple(allowed_values))
+        return cls(allowed_values=allowed_values)
 
     def as_json_schema_extra(self) -> dict[str, Any]:
         return {"allowed_values": list(self.allowed_values)}
