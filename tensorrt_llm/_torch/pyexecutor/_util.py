@@ -149,6 +149,10 @@ def get_kv_cache_manager_cls(
     quant_config = getattr(model_config, "quant_config", None)
     if (is_mla(config) and quant_config is not None
             and quant_config.quant_mode.has_fp4_kv_cache()):
+        if kv_cache_config.use_kv_cache_manager_v2 is False:
+            raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+        if model_config.attn_backend != "TRTLLM":
+            raise ValueError("FP4 MLA requires the TRTLLM attention backend.")
         if is_disagg:
             raise NotImplementedError(
                 "FP4 MLA disaggregated serving requires the follow-up "
@@ -158,6 +162,8 @@ def get_kv_cache_manager_cls(
                 "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
                 "support hybrid linear-attention models.")
         if sparse_attn_config is not None:
+            sparse_attn_algorithm = (sparse_attn_algorithm
+                                     or type(sparse_attn_config).__name__)
             raise NotImplementedError(
                 "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
                 f"support sparse attention algorithm {sparse_attn_algorithm!r}."

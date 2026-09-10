@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
@@ -6,10 +9,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
+from tensorrt_llm._torch.pyexecutor.config_utils import uses_fp4_mla_attention
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
+    validate_fp4_mla_config,
 )
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -144,13 +150,53 @@ def _mock_sm107(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_validate_and_set_kv_cache_quant_downgrades_nvfp4_on_sm107(
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "nvfp4"])
+@pytest.mark.parametrize("chunked_prefill", [False, True])
+@pytest.mark.parametrize(
+    "mla,backend,sparse,hybrid,expected",
+    [
+        (False, "TRTLLM", False, False, QuantAlgo.FP8),
+        (True, "TRTLLM", False, False, QuantAlgo.NVFP4),
+        (True, "FLASHINFER", False, False, QuantAlgo.FP8),
+        (True, "TRTLLM", True, False, QuantAlgo.FP8),
+        (True, "TRTLLM", False, True, QuantAlgo.FP8),
+    ],
+)
+def test_validate_and_set_kv_cache_quant_resolves_nvfp4_on_sm107(
     monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str,
+    chunked_prefill: bool,
+    mla: bool,
+    backend: str,
+    sparse: bool,
+    hybrid: bool,
+    expected: QuantAlgo,
 ) -> None:
     _mock_sm107(monkeypatch)
-    model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
-    validate_and_set_kv_cache_quant(model_config, "nvfp4")
-    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    model_config = ModelConfig(
+        pretrained_config=types.SimpleNamespace(
+            kv_lora_rank=512 if mla else None,
+            qk_rope_head_dim=64 if mla else None,
+            hybrid_override_pattern="M*" if hybrid else None,
+        ),
+        attn_backend=backend,
+        sparse_attention_config=DeepSeekSparseAttentionConfig() if sparse else None,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        quant_config_dict={"layer": QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)},
+    )
+    validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+    assert model_config.quant_config.kv_cache_quant_algo == expected
+    assert model_config.quant_config_dict["layer"].kv_cache_quant_algo == expected
+    assert uses_fp4_mla_attention(model_config) == (expected == QuantAlgo.NVFP4)
+    llm_args = types.SimpleNamespace(
+        enable_chunked_prefill=chunked_prefill,
+        kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2=True),
+    )
+    if expected == QuantAlgo.NVFP4 and chunked_prefill:
+        with pytest.raises(ValueError, match="does not support chunked prefill"):
+            validate_fp4_mla_config(model_config, llm_args)
+    else:
+        validate_fp4_mla_config(model_config, llm_args)
 
 
 def _make_mixed_precision_model_config():

@@ -378,6 +378,15 @@ The FMHA package is split by role:
 - `fmha/combined.py` composes different context and generation implementations
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA context and no-dequant decode.
+  The core implementation requires dense TRTLLM MLA, BF16 absorption weights,
+  fused RoPE with duplicated rotary tables, and KV Cache Manager V2. It uses
+  FP8 context attention with an FP4 cache update and FP4 generation attention.
+  Chunked prefill and context parallelism are rejected before KV allocation.
+  Cached-context attention is not implemented, so executor block reuse remains
+  disabled even though the manager supports full-block reuse of its pools.
+  Disaggregated serving is reserved for the follow-up integration. On SM107,
+  this dense TRTLLM path keeps NVFP4 KV quantization; unsupported profiles retain
+  the existing FP8 fallback.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through

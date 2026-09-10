@@ -29,15 +29,17 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
 _DataType = tensorrt_llm.bindings.DataType
 _CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
 
 
-def _swizzled_sf_offset(row_idx: int, col_idx: int, sf_per_token: int) -> int:
+def _swizzled_sf_offset(
+    row_idx: int | torch.Tensor, col_idx: int | torch.Tensor, sf_per_token: int
+) -> int | torch.Tensor:
     padded_cols = ((sf_per_token + 3) // 4) * 4
     return (
         col_idx % 4
@@ -282,37 +284,17 @@ def _dequant_fp4_swizzled(
     )
     fp4_bytes = fp4_tensor.view(torch.uint8)
     sf_flat = sf_tensor.view(torch.float8_e4m3fn).reshape(-1)
-    out = torch.empty(
-        (fp4_bytes.shape[0], logical_dim),
-        dtype=torch.float32,
-        device=fp4_tensor.device,
-    )
+    # Unpack all rows at once, preserving low-nibble/high-nibble order.
+    packed = fp4_bytes[:, : (logical_dim + 1) // 2]
+    nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1)
+    nibbles = nibbles.flatten(1)[:, :logical_dim]
+    values = fp4_values[(nibbles & 0x07).long()]
+    values = torch.where((nibbles & 0x08) != 0, -values, values)
 
-    for row_idx in range(fp4_bytes.shape[0]):
-        for sf_col in range(sf_per_token):
-            start = sf_col * FP4_BLOCK_SIZE
-            packed = fp4_bytes[row_idx, start // 2 : start // 2 + 8]
-            low = packed & 0x0F
-            high = (packed >> 4) & 0x0F
-            vals = torch.empty(FP4_BLOCK_SIZE, dtype=torch.float32, device=fp4_tensor.device)
-            low_sign = torch.where(
-                (low & 0x08) != 0,
-                -torch.ones_like(low, dtype=torch.float32),
-                torch.ones_like(low, dtype=torch.float32),
-            )
-            high_sign = torch.where(
-                (high & 0x08) != 0,
-                -torch.ones_like(high, dtype=torch.float32),
-                torch.ones_like(high, dtype=torch.float32),
-            )
-            vals[0::2] = fp4_values[(low & 0x07).long()] * low_sign
-            vals[1::2] = fp4_values[(high & 0x07).long()] * high_sign
-            sf_offset = _swizzled_sf_offset(row_idx, sf_col, sf_per_token)
-            out[row_idx, start : start + FP4_BLOCK_SIZE] = (
-                vals * sf_flat[sf_offset].float() / global_scale
-            )
-
-    return out
+    rows = torch.arange(fp4_bytes.shape[0], device=fp4_tensor.device)[:, None]
+    cols = torch.arange(logical_dim, device=fp4_tensor.device)[None, :] // FP4_BLOCK_SIZE
+    offsets = _swizzled_sf_offset(rows, cols, sf_per_token)
+    return values * sf_flat.float()[offsets] / global_scale
 
 
 def _duplicate_tail_groups(tensor: torch.Tensor, residual_dim: int) -> torch.Tensor:
@@ -351,7 +333,7 @@ def _create_fp4_mla_v2_manager(
     max_tokens: int,
     max_seq_len: int,
     max_batch_size: int,
-    spec_config=None,
+    spec_config: DecodingBaseConfig | None = None,
     enable_block_reuse: bool = False,
 ) -> Fp4MlaKVCacheManagerV2:
     return Fp4MlaKVCacheManagerV2(
@@ -376,7 +358,9 @@ def _create_fp4_mla_v2_manager(
     )
 
 
-def _build_multi_seq_metadata(kv_cache_manager, *, seq_lens, page_size):
+def _build_multi_seq_metadata(
+    kv_cache_manager: Fp4MlaKVCacheManagerV2, *, seq_lens: list[int], page_size: int
+) -> SimpleNamespace:
     device = torch.device("cuda")
     num_seqs = len(seq_lens)
     request_ids = list(range(num_seqs))
@@ -563,12 +547,12 @@ def _materialize_reference_cache_tokens(
 
 def _build_fp4_mla_attention_decode_case(
     *,
-    seq_lens,
-    num_heads,
-    seed,
-    query_len_per_seq=1,
-    enable_block_reuse=False,
-):
+    seq_lens: list[int],
+    num_heads: int,
+    seed: int,
+    query_len_per_seq: int = 1,
+    enable_block_reuse: bool = False,
+) -> tuple[Fp4MlaKVCacheManagerV2, SimpleNamespace, torch.Tensor, int, int]:
     torch.manual_seed(seed)
     device = torch.device("cuda")
 
@@ -583,7 +567,9 @@ def _build_fp4_mla_attention_decode_case(
     context_seq_lens = [seq_len - query_len_per_seq for seq_len in seq_lens]
     if min(context_seq_lens) <= 0:
         raise ValueError("FP4 MLA decode cases require a non-empty context for every sequence.")
-    spec_config = MTPDecodingConfig(max_draft_len=3) if query_len_per_seq == 4 else None
+    spec_config = (
+        MTPDecodingConfig(max_draft_len=query_len_per_seq - 1) if query_len_per_seq > 1 else None
+    )
 
     kv_cache_manager = _create_fp4_mla_v2_manager(
         max_tokens=max_tokens,
@@ -741,13 +727,13 @@ def _build_fp4_mla_attention_decode_case(
 
 
 def _fp4_mla_attention_decode_reference(
-    metadata,
-    q_nope,
-    q_pe,
+    metadata: SimpleNamespace,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
     *,
-    sm_scale,
-    kv_lora_rank,
-    qk_rope_head_dim,
+    sm_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
 ) -> torch.Tensor:
     head_dim = kv_lora_rank + qk_rope_head_dim
     storage = _materialize_reference_cache_storage(metadata, 0, head_dim)

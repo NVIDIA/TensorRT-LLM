@@ -67,12 +67,21 @@ def _execute_fp8_context_with_cache_update(
     start_event.record(current_stream)
     # Launch the auxiliary work first so the main stream cannot drain the
     # attention queue before the cache update has been submitted.
-    with torch.cuda.stream(aux_stream):
-        aux_stream.wait_event(start_event)
-        cache_update_fn()
-        done_event.record(aux_stream)
-    attention_fn()
-    current_stream.wait_event(done_event)
+    joined = False
+    try:
+        with torch.cuda.stream(aux_stream):
+            aux_stream.wait_event(start_event)
+            cache_update_fn()
+            done_event.record(aux_stream)
+        attention_fn()
+        current_stream.wait_event(done_event)
+        joined = True
+    finally:
+        if not joined:
+            # Either callback may enqueue work before raising, and done_event
+            # may not have been recorded. Drain before scratch or KV pages can
+            # be released/reused; the successful path stays asynchronous.
+            aux_stream.synchronize()
 
 
 @dataclass(frozen=True, slots=True)

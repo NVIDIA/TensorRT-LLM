@@ -944,12 +944,9 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size].clamp_(
                 min=runtime_draft_len)
             attn_metadata.on_update_kv_lens()
-            attn_metadata.update_for_spec_dec()
-        elif getattr(attn_metadata, "kv_lens_cuda_runtime", None) is not None:
-            attn_metadata.kv_lens_cuda_runtime[num_contexts:batch_size] -= (
-                runtime_draft_len + 1 -
-                num_accepted_tokens[num_contexts:batch_size])
-            attn_metadata.update_for_spec_dec()
+            if getattr(attn_metadata, "high_precision_kv_pool",
+                       None) is not None:
+                attn_metadata.update_for_spec_dec()
 
         if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
             for i in range(num_contexts, batch_size):

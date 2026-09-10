@@ -43,7 +43,7 @@ from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
-                           uses_vswa_kv_cache_layout)
+                           uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -196,45 +196,6 @@ def _set_model_engines_cache_reuse(model_engines, cache_reuse: bool):
         if engine is None:
             continue
         engine.attn_runtime_features.cache_reuse = cache_reuse
-
-
-def _has_fp4_kv_cache(model_config, kv_cache_config) -> bool:
-    kv_cache_quant_algo = getattr(getattr(model_config, "quant_config", None),
-                                  "kv_cache_quant_algo", None)
-    fp4_quant_values = {
-        QuantAlgo.NVFP4,
-        getattr(QuantAlgo.NVFP4, "value", None),
-        "NVFP4",
-    }
-    kv_cache_dtype = getattr(kv_cache_config, "dtype", None)
-    return ((isinstance(kv_cache_dtype, str)
-             and kv_cache_dtype.lower() == "nvfp4")
-            or (isinstance(kv_cache_quant_algo, str)
-                and kv_cache_quant_algo.upper() == "NVFP4")
-            or kv_cache_quant_algo in fp4_quant_values)
-
-
-def _uses_fp4_mla_attention(model_config, kv_cache_config) -> bool:
-    return (_has_fp4_kv_cache(model_config, kv_cache_config)
-            and getattr(model_config, "attn_backend", None) == "TRTLLM")
-
-
-def _configure_fp4_mla_speculative_kv_cache(spec_config, config, model_config,
-                                            kv_cache_config, model) -> None:
-    if (spec_config is None or not spec_config.spec_dec_mode.use_one_engine()
-            or not is_mla(config)
-            or not _uses_fp4_mla_attention(model_config, kv_cache_config)):
-        return
-
-    # FP4 MLA side pools live on attention metadata and are not switched by
-    # draft_kv_cache_context. Keep target and one-model draft layers in one
-    # manager so their global layer IDs address distinct HP/V-scale state.
-    spec_config._allow_separate_draft_kv_cache = False
-    if hasattr(model, 'use_separate_draft_kv_cache'):
-        model.use_separate_draft_kv_cache = False
-    spec_worker = getattr(model, 'spec_worker', None)
-    if spec_worker is not None:
-        spec_worker.use_separate_draft_kv_cache = False
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -704,40 +665,38 @@ def _create_py_executor_impl(
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    _configure_fp4_mla_speculative_kv_cache(
-        spec_config,
-        config,
-        model_engine.model.model_config,
-        kv_cache_config,
-        model_engine.model,
-    )
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
     if is_mla(config):
-        if _uses_fp4_mla_attention(model_engine.model.model_config,
-                                   kv_cache_config):
+        if uses_fp4_mla_attention(model_engine.model.model_config):
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
             kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
             )
-        else:
-            if model_engine.model.model_config.enable_flash_mla:
-                tokens_per_block = 64
-                # Propagate the override back to kv_cache_config so any consumer
-                # that later reads llm_args.kv_cache_config.tokens_per_block sees
-                # the effective value. KvCacheConnectorScheduler subclasses
-                # (LMCache, Dynamo KVBM) are instantiated further down via
-                # scheduler_cls(llm_args) and size their block pools from
-                # llm_args.kv_cache_config.tokens_per_block. Without this the
-                # connector's block size desynced from the KVCacheManager's
-                # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
-                # forced 64), producing a frozen cache_block_ids view to the
-                # connector and silently-corrupted decode KV (#13320).
-                kv_cache_config.tokens_per_block = tokens_per_block
-                logger.info(
-                    f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
-                )
+            if kv_cache_config.enable_block_reuse:
+                logger.warning(
+                    "FP4 MLA cached-context attention is not supported yet; "
+                    "disabling KV cache block reuse.")
+                kv_cache_config.enable_block_reuse = False
+                _set_model_engines_cache_reuse(
+                    [model_engine, draft_model_engine], False)
+        elif model_engine.model.model_config.enable_flash_mla:
+            tokens_per_block = 64
+            # Propagate the override back to kv_cache_config so any consumer
+            # that later reads llm_args.kv_cache_config.tokens_per_block sees
+            # the effective value. KvCacheConnectorScheduler subclasses
+            # (LMCache, Dynamo KVBM) are instantiated further down via
+            # scheduler_cls(llm_args) and size their block pools from
+            # llm_args.kv_cache_config.tokens_per_block. Without this the
+            # connector's block size desynced from the KVCacheManager's
+            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
+            # forced 64), producing a frozen cache_block_ids view to the
+            # connector and silently-corrupted decode KV (#13320).
+            kv_cache_config.tokens_per_block = tokens_per_block
+            logger.info(
+                f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
+            )
 
         sm_version = get_sm_version()
         if (kv_cache_config.enable_block_reuse and sm_version

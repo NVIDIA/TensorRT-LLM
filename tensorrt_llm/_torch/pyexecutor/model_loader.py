@@ -51,8 +51,9 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, resolve_hf_torch_dtype,
-                           resolve_ssm_cache_dtype)
+from .config_utils import (is_hybrid_linear, is_mla, resolve_hf_torch_dtype,
+                           resolve_ssm_cache_dtype, supports_fp4_mla_attention,
+                           uses_fp4_mla_attention)
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -157,9 +158,9 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
-    if (torch.cuda.is_available() and get_sm_version() == 107
-            and effective_kv_cache_quant
-            in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)):
+    if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
+            and not supports_fp4_mla_attention(model_config)
+            and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -201,6 +202,32 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     if model_config.quant_config_dict is not None:
         for layer_quant_config in model_config.quant_config_dict.values():
             layer_quant_config.kv_cache_quant_algo = mapped_pyt_quant
+
+
+def validate_fp4_mla_config(model_config: ModelConfig,
+                            llm_args: TorchLlmArgs) -> None:
+    """Validate FP4 MLA before model construction and KV-cache allocation."""
+    if not (is_mla(model_config.pretrained_config)
+            and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
+        return
+    if not supports_fp4_mla_attention(model_config):
+        raise ValueError(
+            "FP4 MLA requires the TRTLLM attention backend with dense MLA; "
+            "sparse and hybrid linear attention are not supported.")
+    if model_config.mapping.cp_size != 1:
+        raise ValueError("FP4 MLA does not support context parallelism.")
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
+    if llm_args.enable_chunked_prefill:
+        raise ValueError(
+            "FP4 MLA does not support chunked prefill or cached context; "
+            "set enable_chunked_prefill=False.")
+
+    spec_config = model_config.spec_config
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        # HP/V-scale side pools are not switched by draft_kv_cache_context.
+        # Set this before models and workers consult the shared predicate.
+        spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -760,6 +787,21 @@ class ModelLoader:
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        if (original_kv_cache_manager_setting == "auto" and
+            (llm_args.kv_cache_config.dtype == "nvfp4" or
+             (llm_args.kv_cache_config.dtype == "auto"
+              and config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4))):
+            # Resolve FP4 MLA before the generic model preference turns auto
+            # into False. Keep an explicit False distinguishable and reject it
+            # during FP4 validation instead of silently overriding the user.
+            fp4_mla_config = copy.copy(config)
+            fp4_mla_config.attn_backend = llm_args.attn_backend
+            fp4_mla_config.sparse_attention_config = llm_args.sparse_attention_config
+            if supports_fp4_mla_attention(fp4_mla_config):
+                validate_and_set_kv_cache_quant(fp4_mla_config,
+                                                llm_args.kv_cache_config.dtype)
+                if uses_fp4_mla_attention(fp4_mla_config):
+                    llm_args.kv_cache_config.use_kv_cache_manager_v2 = True
         _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
                                           config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
@@ -1843,6 +1885,7 @@ class ModelLoader:
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
+        validate_fp4_mla_config(config, self.llm_args)
         validate_and_set_mamba_ssm_cache_dtype(
             config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
             self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,

@@ -1192,9 +1192,9 @@ def _get_fp4_mla_hp_pool_layout(
 ) -> tuple[int, int]:
     """Return the manager-owned HP ring size and per-token head dimension."""
     manager = getattr(metadata, "kv_cache_manager", None)
-    if manager is None or not hasattr(manager, "_fp4_mla_hp_pool_size"):
+    if manager is None or not hasattr(manager, "fp4_mla_hp_pool_size"):
         raise ValueError("FP4 MLA requires a V2 manager-owned HP ring.")
-    hp_pool_size = int(manager._fp4_mla_hp_pool_size)
+    hp_pool_size = manager.fp4_mla_hp_pool_size
     if (
         hp_pool_size < HP_BLOCK_SIZE
         or pool.ndim != 4
@@ -2585,7 +2585,7 @@ def _update_triton_v_packed_cache(
         return None
     if page_ids.numel() == 0:
         return None
-    from .fp4_mla_triton import fp4_mla_repack_v_cache
+    from .fp4_mla_triton import fp4_mla_repack_v_cache_triton
 
     def _tma_alloc(size: int, alignment: int, stream):
         return torch.empty(size, device=kv_cache.device, dtype=torch.int8)
@@ -2599,7 +2599,7 @@ def _update_triton_v_packed_cache(
         dtype=torch.uint8,
         device=kv_cache.device,
     )
-    fp4_mla_repack_v_cache(
+    fp4_mla_repack_v_cache_triton(
         v_packed,
         kv_cache,
         page_ids,

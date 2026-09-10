@@ -341,20 +341,50 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_no_rubin
     @pytest.mark.skip_less_device_memory(60000)
-    def test_nvfp4_mla_gsm8k(self):
+    def test_nvfp4_mla_gsm8k(self, monkeypatch):
+        from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import \
+            Fp4MlaFmha
+        from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import \
+            Fp4MlaKVCacheManagerV2
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttention
+        from tensorrt_llm._torch.attention.mla import MLA
+
+        # Inspect the actual worker's quantization, cache pools and FMHA choice.
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         kv_cache_config = KvCacheConfig(dtype="nvfp4",
-                                        free_gpu_memory_fraction=0.75)
+                                        free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=True,
+                                        enable_block_reuse=False)
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
                 attn_backend="TRTLLM",
                 kv_cache_config=kv_cache_config,
+                enable_chunked_prefill=False,
                 max_num_tokens=8192,
                 max_batch_size=1350,
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            executor = llm._executor.engine
+            quant_config = executor.model_engine.model.model_config.quant_config
+            assert quant_config.quant_algo == QuantAlgo.NVFP4
+            assert quant_config.quant_mode.has_fp4_kv_cache()
+            manager = executor.kv_cache_manager
+            assert isinstance(manager, Fp4MlaKVCacheManagerV2)
+            assert manager.get_mla_v_scale_pool().numel() > 0
+            assert manager.get_fp4_mla_hp_pool().numel() > 0
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            mla_layers = [
+                module.mqa for module in executor.model_engine.model.modules()
+                if isinstance(module, MLA)
+            ]
+            assert mla_layers
+            for layer in mla_layers:
+                assert isinstance(layer, TrtllmAttention)
+                assert layer.has_fp4_kv_cache
+                assert any(
+                    isinstance(fmha, Fp4MlaFmha)
+                    for fmha in layer._fmha_manager._cache.values())
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
