@@ -885,20 +885,34 @@ def _dsv4_kernel(
         # would have fetched with cp.async.  The SCALE plane keeps the original
         # 16-lane-per-page decomposition and all 64 per-thread arrivals.
         pgw = 2 * (warp_idx - 12)
-        bsl0 = I32(0)
+        jq0 = I32(0)
+        if jq0 >= ntl:
+            jq0 = I32(0)
+        bq0 = jq0 & (RBT - 1)
         if cutlass.const_expr(NLOC <= RBT):
-            bsl0 = ntl - 1
-        pg0 = cute.arch.make_warp_uniform(sBT[bsl0 * 4 + pgw])
-        pg1 = cute.arch.make_warp_uniform(sBT[bsl0 * 4 + pgw + 1])
-        for j in cutlass.range(ntl, unroll=1):
-            i = crk + (ntl - 1 - j) * CSd
-            s = j % STAGES
-            if j >= STAGES:
-                cute.arch.mbarrier_wait(ab_empty + s, ((j // STAGES) - 1) & 1)
+            bq0 = ntl - 1 - jq0
+        pa0 = cute.arch.make_warp_uniform(sBT[bq0 * 4 + pgw])
+        pb0 = cute.arch.make_warp_uniform(sBT[bq0 * 4 + pgw + 1])
+        jq1 = I32(1)
+        if jq1 >= ntl:
+            jq1 = I32(0)
+        bq1 = jq1 & (RBT - 1)
+        if cutlass.const_expr(NLOC <= RBT):
+            bq1 = ntl - 1 - jq1
+        pa1 = cute.arch.make_warp_uniform(sBT[bq1 * 4 + pgw])
+        pb1 = cute.arch.make_warp_uniform(sBT[bq1 * 4 + pgw + 1])
+        for j in cutlass.range(0, ntl, 2, unroll=1):
+            j0 = j + 0
+            s0 = j0 % STAGES
+            h0 = j0 < ntl
+            j1 = j + 1
+            s1 = j1 % STAGES
+            h1 = j1 < ntl
+            if h1 and (j1 >= STAGES):
+                cute.arch.mbarrier_wait(ab_empty + s1, ((j1 // STAGES) - 1) & 1)
+            elif h0 and (j0 >= STAGES):
+                cute.arch.mbarrier_wait(ab_empty + s0, ((j0 // STAGES) - 1) & 1)
             if cutlass.const_expr(NLOC > RBT):
-                # refill the ring half that fell dead 64 tiles ago with tiles
-                # [j+64, j+192); its first reader (the L2 prefetch) is >= 60
-                # tiles away. Both producer warps take the same branch.
                 if ((j & 127) == 64) and (j + 64 < ntl):
                     for r in cutlass.range_constexpr(8):
                         e = lt * 8 + r
@@ -907,65 +921,105 @@ def _dsv4_kernel(
                         if (jj < ntl) and (gi < MAXB):
                             sBT[(jj & (RBT - 1)) * 4 + (e & 3)] = gBT[gi]
                     cute.arch.barrier(barrier_id=2, number_of_threads=P_THREADS)
-            if cutlass.const_expr(_ASM):
-                jf = j + PFD
-                if cutlass.const_expr(NCOMP >= 32768):
-                    jf = j + 2
-                if jf < ntl:
-                    bsf = jf & (RBT - 1)
-                    if cutlass.const_expr(NLOC <= RBT):
-                        bsf = ntl - 1 - jf
-                    pgf = sBT[bsf * 4 + pgt]
-                    base = kv_ptr.toint() + cutlass.Int64(pgf) * PGB
-                    _pfl2(base + tkt * 128)
-                    if tkt == 0:
-                        _pfl2(base + 2048)
-            # scale plane keeps the per-half-warp page; data plane is per warp
-            # ids of tile j are already in pg0/pg1; fetch tile j+1's now, overlapping this tile's issue
-            jn = j + 1
-            if jn >= ntl:
-                jn = j
-            bsn = jn & (RBT - 1)
+            # no L2 prefetch on single-CTA long rows: the ring path's TMA already hits L2 and the
+            # prefetch only costs producer issue slots there (-1 to -1.8% scan without it)
+            if cutlass.const_expr(_ASM and not (CS == 1 and NLOC > RBT)):
+                for q in cutlass.range_constexpr(2):
+                    jf = j + q + PFD
+                    if cutlass.const_expr(NCOMP >= 32768):
+                        jf = j + q + 2
+                    if jf < ntl:
+                        bsf = jf & (RBT - 1)
+                        if cutlass.const_expr(NLOC <= RBT):
+                            bsf = ntl - 1 - jf
+                        pgf = sBT[bsf * 4 + pgt]
+                        base = kv_ptr.toint() + cutlass.Int64(pgf) * PGB
+                        _pfl2(base + tkt * 128)
+                        if tkt == 0:
+                            _pfl2(base + 2048)
+            jn0 = j + 2
+            if jn0 >= ntl:
+                jn0 = j
+            bn0 = jn0 & (RBT - 1)
             if cutlass.const_expr(NLOC <= RBT):
-                bsn = ntl - 1 - jn
-            pg0n = cute.arch.make_warp_uniform(sBT[bsn * 4 + pgw])
-            pg1n = cute.arch.make_warp_uniform(sBT[bsn * 4 + pgw + 1])
-            pg = pg0
-            if pgt != pgw:
-                pg = pg1
-            # One elected expect_tx per producer warp covers both of that warp's
-            # page transactions; two warps therefore account for the full
-            # 4 * PAGE * DIMB = 8192 bytes of the tile on the same full barrier.
+                bn0 = ntl - 1 - jn0
+            na0 = cute.arch.make_warp_uniform(sBT[bn0 * 4 + pgw])
+            nb0 = cute.arch.make_warp_uniform(sBT[bn0 * 4 + pgw + 1])
+            jn1 = j + 3
+            if jn1 >= ntl:
+                jn1 = jn0
+            bn1 = jn1 & (RBT - 1)
+            if cutlass.const_expr(NLOC <= RBT):
+                bn1 = ntl - 1 - jn1
+            na1 = cute.arch.make_warp_uniform(sBT[bn1 * 4 + pgw])
+            nb1 = cute.arch.make_warp_uniform(sBT[bn1 * 4 + pgw + 1])
             with cute.arch.elect_one():
-                cute.arch.mbarrier_expect_tx(ab_full + s, 2 * PAGE * DIMB)
+                cute.arch.mbarrier_expect_tx(ab_full + s0, 2 * PAGE * DIMB)
             cute.copy(
-                tma_atom_k,
-                gK_tma[(None, pg0)],
-                sK_tma[(None, pgw, s)],
-                tma_bar_ptr=ab_full + s,
+                tma_atom_k, gK_tma[(None, pa0)], sK_tma[(None, pgw, s0)], tma_bar_ptr=ab_full + s0
             )
             cute.copy(
                 tma_atom_k,
-                gK_tma[(None, pg1)],
-                sK_tma[(None, pgw + 1, s)],
-                tma_bar_ptr=ab_full + s,
+                gK_tma[(None, pb0)],
+                sK_tma[(None, pgw + 1, s0)],
+                tma_bar_ptr=ab_full + s0,
             )
+            if h1:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_expect_tx(ab_full + s1, 2 * PAGE * DIMB)
+                cute.copy(
+                    tma_atom_k,
+                    gK_tma[(None, pa1)],
+                    sK_tma[(None, pgw, s1)],
+                    tma_bar_ptr=ab_full + s1,
+                )
+                cute.copy(
+                    tma_atom_k,
+                    gK_tma[(None, pb1)],
+                    sK_tma[(None, pgw + 1, s1)],
+                    tma_bar_ptr=ab_full + s1,
+                )
+            pgq0 = pa0
+            if pgt != pgw:
+                pgq0 = pb0
             for r in cutlass.range_constexpr(PAGE // PPP):
                 tk = tkt + PPP * r
                 gsf = cute.make_tensor(
                     cute.make_ptr(
                         U32,
-                        kv_ptr.toint() + cutlass.Int64(pg) * PGB + 2048 + tk * 4,
+                        kv_ptr.toint() + cutlass.Int64(pgq0) * PGB + 2048 + tk * 4,
                         GMEM,
                         assumed_align=4,
                     ),
                     cute.make_layout(1),
                 )
-                dsf = cute.make_tensor(sSFA_raw + (s * 128 + tk * 4 + pgt), cute.make_layout(1))
+                dsf = cute.make_tensor(sSFA_raw + (s0 * 128 + tk * 4 + pgt), cute.make_layout(1))
                 cute.copy(g2s_u32, gsf, dsf)
-            cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + s)
-            pg0 = pg0n
-            pg1 = pg1n
+            cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + s0)
+            if h1:
+                pgq1 = pa1
+                if pgt != pgw:
+                    pgq1 = pb1
+                for r in cutlass.range_constexpr(PAGE // PPP):
+                    tk = tkt + PPP * r
+                    gsf = cute.make_tensor(
+                        cute.make_ptr(
+                            U32,
+                            kv_ptr.toint() + cutlass.Int64(pgq1) * PGB + 2048 + tk * 4,
+                            GMEM,
+                            assumed_align=4,
+                        ),
+                        cute.make_layout(1),
+                    )
+                    dsf = cute.make_tensor(
+                        sSFA_raw + (s1 * 128 + tk * 4 + pgt), cute.make_layout(1)
+                    )
+                    cute.copy(g2s_u32, gsf, dsf)
+                cute.arch.cp_async_mbarrier_arrive_noinc(ab_full + s1)
+            pa0 = na0
+            pb0 = nb0
+            pa1 = na1
+            pb1 = nb1
 
     # ---------------- mma warp ----------------
     elif warp_idx == M_WARP:
