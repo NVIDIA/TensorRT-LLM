@@ -10,6 +10,7 @@ This feature is in **beta** stage. APIs, supported models, and optimization opti
   - [Configuration Surface](#configuration-surface)
 - [QK16PV8 Attention Kernels in the CUTEDSL Backend](#qk16pv8-attention-kernels-in-the-cutedsl-backend)
 - [SageAttention (TRTLLM)](#sageattention-trtllm)
+- [FP8 and MXFP8 in the cuDNN Backend](#fp8-and-mxfp8-in-the-cudnn-backend)
 - [MXFP8 / NVFP4 (CUTEDSL / FlashInfer)](#mxfp8--nvfp4-cutedsl--flashinfer)
 - [Interaction With Other Features](#interaction-with-other-features)
 
@@ -27,6 +28,8 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 |---|---|---|---|---|
 | `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) |
 | `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)` | SageAttention (FP8 QK) |
+| `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
+| `CUDNN` | `mxfp8` | `mxfp8` | `(0, 0, 0)` | cuDNN MXFP8 |
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
 | `CUTEDSL` | `mxfp8` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | MXFP8 Q/K |
 | `CUTEDSL` | `nvfp4` | `fp8` | `(0, 0, 0)`, `(0, 0, 1)` | NVFP4 Q/K |
@@ -44,6 +47,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - On B200/GB200, SageAttention with INT8 Q/K typically matches QK16PV8 quality while delivering higher end-to-end throughput.
 - On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the `TRTLLM` backend is preferred for the surrounding workload.
 - For SageAttention with INT8 Q/K, the default `(1, 16, 1)` block-size recipe works well for most cases. Use `(1, 4, 1)` when video quality is not satisfactory.
+- The `CUDNN` backend requires Q/K and V to use the same format. Use `fp8` for per-tensor scaling or `mxfp8` for block scaling.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
@@ -53,12 +57,12 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `qk_dtype` | `"bf16" \| "int8" \| "fp8" \| "mxfp8" \| "nvfp4"` | `"bf16"` | Q/K element format for BMM1. `bf16` leaves Q/K unquantized. |
-| `v_dtype` | `"fp8" \| "nvfp4"` | `"fp8"` | V element format for BMM2. |
+| `v_dtype` | `"fp8" \| "mxfp8" \| "nvfp4"` | `"fp8"` | V element or block-scaled format for BMM2. |
 | `q_block_size` | int ≥ 0 | `0` | Q tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `k_block_size` | int ≥ 0 | `0` | K tokens per SageAttention quantization block. `0` outside SageAttention. |
-| `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. |
+| `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
 
-Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
+Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 
 ## QK16PV8 Attention Kernels in the CUTEDSL Backend
 
@@ -140,6 +144,56 @@ attention_config:
     k_block_size: 16
     v_block_size: 1
 ```
+
+## FP8 and MXFP8 in the cuDNN Backend
+
+**What it does.** The `CUDNN` backend uses cuDNN fused SDPA. Its quantized recipes use the same format for BMM1 and BMM2:
+
+- **FP8** quantizes Q, K, and V to FP8 e4m3 with one scale per tensor.
+- **MXFP8** applies block scaling to Q/K along the head dimension and to V along the sequence dimension.
+
+Omit `quant_attention_config` to use the same backend for unquantized FP16 or BF16 attention.
+
+**Requirements and behavior.**
+
+- Quantized cuDNN attention requires an SM100 or SM103 Blackwell GPU.
+- The cuDNN backend requires cuDNN 9.1 or later. MXFP8 additionally requires cuDNN 9.21 or later.
+- Quantized attention supports head dimensions of 32, 64, 96, and 128.
+- Self-attention, cross-attention, MHA, GQA, MQA, full attention, and causal attention are supported. Key padding masks are not supported.
+
+**Configuration.**
+
+```python
+from tensorrt_llm import VisualGenArgs
+from tensorrt_llm.visual_gen import AttentionConfig, QuantAttentionConfig
+
+args = VisualGenArgs(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    attention_config=AttentionConfig(
+        backend="CUDNN",
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="mxfp8",
+            v_dtype="mxfp8",
+            q_block_size=0,
+            k_block_size=0,
+            v_block_size=0,
+        ),
+    ),
+)
+```
+
+```yaml
+attention_config:
+  backend: CUDNN
+  quant_attention_config:
+    qk_dtype: mxfp8
+    v_dtype: mxfp8
+    q_block_size: 0
+    k_block_size: 0
+    v_block_size: 0
+```
+
+For per-tensor FP8, set both `qk_dtype` and `v_dtype` to `fp8`.
 
 ## MXFP8 and NVFP4 in the `CUTEDSL` and `FlashInfer` backends
 

@@ -12,7 +12,7 @@ Visual generation models based on diffusion transformers (DiT) have become the s
 TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion models, with a pipeline architecture separate from the LLM inference path. Key capabilities include:
 
 - A shared pipeline abstraction covering the denoising loop, guidance strategies, and component loading.
-- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
+- Pluggable attention backends: PyTorch SDPA (`VANILLA`), TRT-LLM kernels (`TRTLLM`), cuDNN fused SDPA (`CUDNN`), FlashInfer FP16/BF16 dense prefill (`FLASHINFER`), TRT-LLM CuTe DSL kernels (`CUTEDSL`, Blackwell-class GPUs), and Flash Attention 4 (`FA4`).
 - Quantization support (dynamic and static) using the [ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) configuration format.
 - Quantized attention support: see [VisualGen Quantized Attention](../features/visualgen-quantized-attention.md).
 - Sparse attention support: see [VisualGen Sparse Attention](../features/visualgen-sparse-attention.md).
