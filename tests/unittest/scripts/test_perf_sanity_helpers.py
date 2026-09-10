@@ -23,6 +23,10 @@ pytest.importorskip("torch._inductor")
 
 __extra_import_path__ = ["~/tests/integration"]
 from defs.perf import test_perf_sanity as perf_sanity  # noqa: E402
+from defs.perf.perf_regression_utils import (  # noqa: E402
+    calculate_baseline_metrics,
+    prepare_regressive_test_cases,
+)
 
 
 def test_run_benchmark_with_log_returns_successful_output(tmp_path: Path) -> None:
@@ -628,3 +632,187 @@ def test_every_gated_metric_is_actually_emitted() -> None:
     """A gated metric the log never carries is skipped by 'not in new_data'."""
     emitted = {f"d_{name}" for name in perf_sanity.GEN_ONLY_DEVICE_STEP_TIME_METRICS}
     assert set(perf_sanity.GEN_ONLY_REGRESSION_METRICS) <= emitted
+
+
+def _regression_row(gate: list, baseline: dict, measured: dict) -> dict:
+    """Row the real regression pipeline produces for *measured* against *baseline*.
+
+    Driven through prepare_regressive_test_cases rather than asserting list
+    membership: membership is the input, and every property below is about what
+    the pipeline then decides with it. A single history day pins the derived
+    fallback baseline on *baseline* whichever percentile the metric's direction
+    selects, since every percentile of a one-element series is that element. The
+    first argument is only tested for None (the network-failure bail-out), so its
+    contents do not matter.
+    """
+    new_data_dict = {0: {"s_test_case_name": "unit", **measured}}
+    prepare_regressive_test_cases(
+        {},
+        None,
+        {0: [dict(baseline, ts_created="2026-09-01")]},
+        new_data_dict,
+        perf_sanity.MAXIMIZE_METRICS,
+        perf_sanity.MINIMIZE_METRICS,
+        gate,
+    )
+    return new_data_dict[0]
+
+
+def test_tpot_is_classified_as_a_latency() -> None:
+    """TPOT is "Time per Output Token (ms)", not a rate.
+
+    benchmark_serving computes it as (e2e_latency - ttft) / (output_len - 1), so
+    it is a latency like its ttft/itl/e2el siblings. d_al is pinned alongside
+    because it is the one non-rate on the maximize side -- mean accepted draft
+    tokens per iteration is a count, and more of them is better -- so a later
+    substring-driven sweep of the tpot trio must not carry it along.
+    """
+    for statistic in ("d_mean_tpot", "d_median_tpot", "d_p99_tpot"):
+        assert statistic in perf_sanity.MINIMIZE_METRICS
+        assert statistic not in perf_sanity.MAXIMIZE_METRICS
+    assert "d_al" in perf_sanity.MAXIMIZE_METRICS
+
+
+def test_a_slower_tpot_can_actually_fail_a_build() -> None:
+    """A gate on a maximize metric tests new < baseline*(1-threshold).
+
+    A rising latency never satisfies that, so while TPOT sat on the maximize side
+    a lane could name a TPOT statistic and still be gated on nothing. Graded on
+    the verdict, and in both directions, so a gate that simply always fires would
+    not pass either (https://nvbugs/6706765).
+    """
+    assert _regression_row(["d_p99_tpot"], {"d_p99_tpot": 6.08}, {"d_p99_tpot": 15.24})[
+        "b_is_regression"
+    ]
+    assert not _regression_row(["d_p99_tpot"], {"d_p99_tpot": 6.08}, {"d_p99_tpot": 5.5})[
+        "b_is_regression"
+    ]
+
+
+def test_a_slower_tpot_is_reported_as_a_regression() -> None:
+    """The sign a human reads off the CI report, which no pass/fail check covers.
+
+    prepare_regressive_test_cases emits a diff line for every metric it has a
+    baseline for, before it consults the gate at all, so an empty gate isolates
+    the reported sign from any verdict. The measured 2.5x p99 TPOT slowdown of
+    nvbugs/6706765 printed diff=+150.66% -- a 2.5x degradation indistinguishable
+    from a 150% improvement.
+    """
+    row = _regression_row([], {"d_p99_tpot": 6.08}, {"d_p99_tpot": 15.24})
+
+    assert "d_p99_tpot: value=15.2400 baseline=6.0800" in row["s_regression_info"]
+    assert "diff=-150.66%" in row["s_regression_info"]
+
+
+def test_a_tpot_baseline_tracks_the_steady_state_not_the_worst_day() -> None:
+    """calculate_baseline_metrics takes P95 for maximize and P5 for minimize.
+
+    So the direction also decides which end of the smoothed history becomes the
+    bar. On the maximize side a single stall day used to raise the bar that the
+    next run is compared against; assert the baseline sits at the steady state,
+    with the mutated-direction value alongside to show the difference is material
+    rather than rounding.
+    """
+    history = [
+        {"ts_created": f"2026-09-0{day}", "d_median_tpot": value}
+        for day, value in enumerate([5.0, 5.1, 4.9, 12.0, 5.0], start=1)
+    ]
+
+    baseline = calculate_baseline_metrics(
+        history, None, perf_sanity.MAXIMIZE_METRICS, perf_sanity.MINIMIZE_METRICS
+    )["d_median_tpot"]
+    as_maximize = calculate_baseline_metrics(history, None, ["d_median_tpot"], [])["d_median_tpot"]
+
+    assert baseline == pytest.approx(5.0, abs=0.2)
+    assert as_maximize > baseline * 1.4
+
+
+# One rank identity as an MPI launcher actually exports it, measured under
+# `mpirun -np 1` inside the CI container image. Spelled out rather than read from
+# os.environ so the test says the same thing on a developer laptop.
+_LAUNCHER_IDENTITY = {
+    "OMPI_COMM_WORLD_RANK": "0",
+    "OMPI_COMM_WORLD_SIZE": "1",
+    "OMPI_COMM_WORLD_LOCAL_RANK": "0",
+    "OMPI_MCA_ess": "^singleton",
+    "OMPI_MCA_ess_base_jobid": "3826286593",
+    "OMPI_MCA_pmix": "^s1,s2,cray,isolated",
+    "OMPI_MCA_orte_hnp_uri": "3826286592.0;tcp://10.0.0.1:39633",
+    "OMPI_MCA_orte_local_daemon_uri": "3826286592.0;tcp://10.0.0.1:39633",
+    "OMPI_MCA_orte_precondition_transports": "0000000000000000-0000000000000000",
+    "OMPI_UNIVERSE_SIZE": "1",
+    "PMIX_RANK": "0",
+    "PMIX_NAMESPACE": "3826286593",
+    "PMIX_SERVER_URI21": "3826286592.0;tcp4://127.0.0.1:39633",
+    "SLURM_PROCID": "0",
+    "SLURM_LOCALID": "0",
+    "SLURM_STEPID": "33",
+    "SLURM_SRUN_COMM_HOST": "10.0.0.1",
+}
+
+# What the same environment says about the ALLOCATION rather than about this
+# process's place in it. The child runs its own MPI_Comm_spawn, and OMPI's Slurm
+# resource allocator reads SLURM_NODELIST / SLURM_TASKS_PER_NODE by name to size
+# it, so stripping these converts the bug into MPI_ERR_SPAWN instead of fixing it.
+_ALLOCATION_FACTS = {
+    "SLURM_NODELIST": "node-gpu-2",
+    "SLURM_TASKS_PER_NODE": "1",
+    "SLURM_NTASKS": "1",
+    "SLURM_NNODES": "1",
+    "SLURM_JOB_ID": "1871020",
+    "SLURM_JOB_NODELIST": "node-gpu-2",
+    "SLURM_STEP_GPUS": "0",
+    "SLURM_GPUS_ON_NODE": "1",
+    "OMPI_MCA_rmaps_base_oversubscribe": "1",
+    "OMPI_MCA_hwloc_base_binding_policy": "none",
+    "OMPI_MCA_plm_slurm_args": "--external-launcher",
+}
+
+
+def test_trtllm_child_env_drops_every_launcher_identity_variable() -> None:
+    """A child that imports tensorrt_llm must not inherit its launcher's identity.
+
+    tensorrt_llm/_utils.py does `from mpi4py import MPI` at module scope, so
+    MPI_Init_thread runs on import. With any of these present the child tries to
+    (re-)join the launcher's job and aborts on a NULL communicator -- the server
+    before launch_server can publish --report_addr (surfacing only as an exit
+    code), the benchmark client with an empty results log
+    (https://nvbugs/6706765).
+    """
+    cleaned = perf_sanity.trtllm_child_env({**_LAUNCHER_IDENTITY, **_ALLOCATION_FACTS})
+
+    assert not [k for k in _LAUNCHER_IDENTITY if k in cleaned]
+
+
+def test_trtllm_child_env_keeps_the_allocation_the_child_spawns_into() -> None:
+    """Stripping the allocation too would just move the failure, not remove it.
+
+    The child's own MPI_Comm_spawn sizes itself through OMPI's Slurm resource
+    allocator, which requires SLURM_NODELIST and SLURM_TASKS_PER_NODE by name and
+    FORCE-TERMINATEs without them. So this is the half of the environment that has
+    to survive, and it is asserted separately from the half that must not.
+    """
+    cleaned = perf_sanity.trtllm_child_env({**_LAUNCHER_IDENTITY, **_ALLOCATION_FACTS})
+
+    assert {k: cleaned.get(k) for k in _ALLOCATION_FACTS} == _ALLOCATION_FACTS
+    # Non-vacuity: the two halves are disjoint, so neither assertion above is
+    # trivially satisfied by the other's keys.
+    assert not set(_LAUNCHER_IDENTITY) & set(_ALLOCATION_FACTS)
+
+
+def test_trtllm_child_env_preserves_unrelated_variables() -> None:
+    """Everything the lane actually needs must ride through untouched.
+
+    The child is the real server: it needs the model cache, the venv, and any
+    per-config env the lane set. A prefix list that swept these would break the
+    run in a way no MPI assertion above would notice.
+    """
+    payload = {
+        "LLM_MODELS_ROOT": "/code/llm-models",
+        "PATH": "/usr/bin",
+        "VIRTUAL_ENV": "/code/venv",
+        "TRTLLM_MOE_BACKEND": "TRTLLM",
+        "CUDA_VISIBLE_DEVICES": "0",
+    }
+
+    assert perf_sanity.trtllm_child_env(dict(payload)) == payload
