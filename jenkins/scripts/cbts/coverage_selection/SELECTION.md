@@ -189,8 +189,9 @@ There is no local-git path for measuring lag. The CI checkout is `depth: 1, noTa
 single-SHA refspec (`trtllm_utils.checkoutSpec`), so the coverage revision is not available there.
 The conflict check creates a temporary repository and fetches the checked-out PR head locally.
 The base and DB revisions come from `CBTS_COVERAGE_GIT_REPO`, bound to the same authenticated
-`default-llm-repo` internal mirror used by normal CI checkouts. The public GitHub repository is
-only a local-command fallback. The temporary repository never changes the CI checkout or its index.
+`default-llm-repo` internal mirror used by normal CI checkouts. A missing mirror setting fails the
+check closed instead of falling back to the public Git repository. The temporary repository never
+changes the CI checkout or its index.
 
 The compare API answers unless the revision has not reached the public mirror yet (404) or the
 token is missing (403 — the 60/h anonymous quota is shared across NVIDIA's egress IP and is

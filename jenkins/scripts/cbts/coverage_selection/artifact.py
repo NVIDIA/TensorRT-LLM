@@ -69,7 +69,6 @@ COVERAGE_GIT_REPO_ENV = "CBTS_COVERAGE_GIT_REPO"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
-_GITHUB_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Cover the 30-commit freshness window plus missing or unsuccessful builds.
 _MAX_PROBE = 50
@@ -244,7 +243,13 @@ def _patch_apply_status(
 ) -> _PatchApplyStatus:
     """Check a squashed PR commit against the DB revision."""
     repo_source = repo_root.resolve()
-    main_repo = upstream_url or os.environ.get(COVERAGE_GIT_REPO_ENV) or _GITHUB_GIT_REPO
+    main_repo = upstream_url or os.environ.get(COVERAGE_GIT_REPO_ENV)
+    if not main_repo:
+        print(
+            f"[artifact] {COVERAGE_GIT_REPO_ENV} is required for the patch check",
+            file=sys.stderr,
+        )
+        return "unknown"
     checked_out_head = _run_git(["rev-parse", "HEAD"], cwd=repo_source)
     if (
         checked_out_head is None
