@@ -485,6 +485,24 @@ methods:
     parameters: {}
     return_annotation: bytes
     status: prototype
+  get_memory_status:
+    parameters: {}
+    return_annotation: tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus
+    status: prototype
+  release:
+    parameters:
+      tags:
+        annotation: Optional[Sequence[tensorrt_llm.llmapi.llm_args.ExecutorMemoryType | str]]
+        default: null
+    return_annotation: None
+    status: prototype
+  resume:
+    parameters:
+      tags:
+        annotation: Optional[Sequence[tensorrt_llm.llmapi.llm_args.ExecutorMemoryType | str]]
+        default: null
+    return_annotation: None
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None
