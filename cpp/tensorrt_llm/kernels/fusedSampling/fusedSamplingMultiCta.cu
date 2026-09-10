@@ -170,12 +170,15 @@ __global__ void smallBatchSplitOutputKernel(FusedSamplingParams params)
         }
         reinterpret_cast<float4*>(rowProbs)[v] = out;
     }
-    // Clamp against prologueEnd rather than begin: a slice narrower than one float4
-    // leaves vecBegin > vecEnd, and a tail starting at vecEnd * 4 would then re-walk
-    // indices the prologue already covered and double-count localProbMass. The static
-    // assert on kSmallBatchSplitMinVocab makes that unreachable, but the tail should
-    // not depend on it.
-    int const tailBegin = vecEnd * 4 > prologueEnd ? vecEnd * 4 : prologueEnd;
+    // The tail picks up wherever the prologue and the vectorized loop stopped, but never
+    // below begin: an unaligned row leaves vecBegin == vecEnd == prologueEnd == 0, and a
+    // tail starting there would overwrite the scratch header the finalize CTA still has to
+    // read. Taking prologueEnd into account as well keeps a slice narrower than one float4
+    // (vecBegin > vecEnd) from re-walking indices the prologue already covered and
+    // double-counting localProbMass; the static assert on kSmallBatchSplitMinVocab makes
+    // that unreachable today, but the tail should not depend on it.
+    int const covered = vecEnd * 4 > prologueEnd ? vecEnd * 4 : prologueEnd;
+    int const tailBegin = covered > begin ? covered : begin;
     for (int i = tailBegin + tid; i < splitEnd; i += blockDim.x)
     {
         float const p = weightOf(rowLogits, i, rp.tempInv, rowStats.max) * scale;
