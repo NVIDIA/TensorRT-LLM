@@ -201,13 +201,21 @@ class Compressor(nn.Module):
         # kernels accept bf16 or fp32 kv_score and convert values to fp32
         # internally for state updates and online-softmax accumulation.
         kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight)
+        use_incremental_hca = (
+            self.incremental_hca and metadata.kv_cache_manager.incremental_hca_enabled
+        )
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
 
         # Run compression kernels
         if num_contexts > 0:
-            torch.ops.trtllm.compressor_prefill_reduction(
+            prefill_op = (
+                torch.ops.trtllm.compressor_prefill_reduction_incremental
+                if use_incremental_hca
+                else torch.ops.trtllm.compressor_prefill_reduction
+            )
+            prefill_op(
                 kv_score[:num_ctx_tokens],
                 self.ape,
                 paged_kv_state,
@@ -231,9 +239,6 @@ class Compressor(nn.Module):
             next_n = metadata.num_gen_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
-            use_incremental_hca = (
-                self.incremental_hca and metadata.kv_cache_manager.incremental_hca_enabled
-            )
             compressor_op = (
                 torch.ops.trtllm.compressor_paged_kv_compress_incremental
                 if use_incremental_hca
@@ -256,14 +261,6 @@ class Compressor(nn.Module):
                 self.compress_ratio,
                 next_n,
             )
-            if use_incremental_hca:
-                # CUDA-graph metadata owns a reserved backing buffer, and the
-                # graph key fixes both counts. Replay updates only the buffer
-                # contents, so this generation view keeps the captured address
-                # and storage offset stable.
-                compressor_args += (
-                    metadata.hca_summary_valid_cuda[num_contexts : num_contexts + num_generations],
-                )
             compressor_op(*compressor_args)
 
         # Scatter to cache with appropriate quantization (all modes fused)

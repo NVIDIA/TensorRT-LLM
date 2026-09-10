@@ -23,7 +23,7 @@
 // into fewer compressed tokens via learned weighted averaging (online softmax),
 // then post-processes and scatters results into a paged KV cache.
 //
-// Three kernels are provided:
+// Four kernel paths are provided:
 //
 //   1. pagedKvCompressKernel  — Decode path (single/few new tokens per batch).
 //      Loads prior compressor state from paged memory, performs online softmax
@@ -35,7 +35,12 @@
 //      softmax reduction over the input sequence. Also saves compressor state
 //      for any remainder tokens that don't form a complete chunk.
 //
-//   3. postProcessScatterKernel — Fused post-processing + paged cache write.
+//   3. incrementalHcaPrefillKernel / incrementalHcaDecodeKernel — Optional
+//      ratio-128 HCA path. Prefill emits complete windows and saves one
+//      associative (value, LSE) summary for its incomplete tail. Decode merges
+//      only new tokens into that summary and checkpoints each speculative token.
+//
+//   4. postProcessScatterKernel — Fused post-processing + paged cache write.
 //      Takes compressed output tokens and applies: RMSNorm → RoPE → Hadamard
 //      transform → optional V4-Pro QDQ → scatter to paged KV cache. Supports
 //      default, FP8, and V4-Pro MXFP8/MXFP4 QDQ cache modes.
@@ -305,16 +310,15 @@ __device__ __forceinline__ void mergeLseValue(
     newValue = fmaf(oldWeight, oldValue - kv, kv);
 }
 
-// Lazy incremental HCA decode path. Prefill keeps the original raw state layout.
-// On the first decode step for a sequence, the current incomplete CR=128 window is
-// converted once (at most 127 raw tokens). Subsequent steps load the prefix saved at
-// startPos-1 and process only the new tokens.
+// Incremental HCA decode path. Prefill stores the current CR=128 tail as an
+// associative summary at its final token. Decode extends that summary and saves
+// every new prefix so speculative decoding can rewind to any accepted token.
 template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int NEXT_N>
 __global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
-    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp,
-    bool const* __restrict__ summary_valid, int page_size, int max_blocks, int out_elem_bytes)
+    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks,
+    int out_elem_bytes)
 {
     using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
@@ -348,78 +352,23 @@ __global__ void incrementalHcaDecodeKernel(void const* __restrict__ kv_score_raw
     int const startChunkOffset = startPos % COMPRESS_RATIO;
     if (startChunkOffset != 0)
     {
-        if (summary_valid[batchIdx])
-        {
-            int const prevTokenIdx = startPos - 1;
-            int const prevLogicalBlock = prevTokenIdx / page_size;
-            int const prevBlockOffset = prevTokenIdx % page_size;
-            int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
-            int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
-            int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
-            int64_t const prevScoreBase
-                = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
-            StateVecT const prevValueRaw = reinterpret_cast<StateVecT const*>(&pagedKv[prevKvBase])[effectiveTid];
-            StateVecT const prevLseRaw = reinterpret_cast<StateVecT const*>(&pagedScore[prevScoreBase])[effectiveTid];
-            auto const* prevValues = reinterpret_cast<StateElemT const*>(&prevValueRaw);
-            auto const* prevLse = reinterpret_cast<StateElemT const*>(&prevLseRaw);
+        int const prevTokenIdx = startPos - 1;
+        int const prevLogicalBlock = prevTokenIdx / page_size;
+        int const prevBlockOffset = prevTokenIdx % page_size;
+        int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
+        int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
+        int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
+        int64_t const prevScoreBase = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
+        StateVecT const prevValueRaw = reinterpret_cast<StateVecT const*>(&pagedKv[prevKvBase])[effectiveTid];
+        StateVecT const prevLseRaw = reinterpret_cast<StateVecT const*>(&pagedScore[prevScoreBase])[effectiveTid];
+        auto const* prevValues = reinterpret_cast<StateElemT const*>(&prevValueRaw);
+        auto const* prevLse = reinterpret_cast<StateElemT const*>(&prevLseRaw);
 
 #pragma unroll
-            for (int i = 0; i < VEC; ++i)
-            {
-                values[i] = static_cast<float>(prevValues[i]);
-                lse[i] = static_cast<float>(prevLse[i]);
-            }
-        }
-        else
+        for (int i = 0; i < VEC; ++i)
         {
-            int const chunkStart = startPos - startChunkOffset;
-            float rmax[VEC], rsum[VEC], rwsum[VEC];
-#pragma unroll
-            for (int i = 0; i < VEC; ++i)
-            {
-                rmax[i] = -INFINITY;
-                rsum[i] = 0.0F;
-                rwsum[i] = 0.0F;
-            }
-            for (int tokenIdx = chunkStart; tokenIdx < startPos; ++tokenIdx)
-            {
-                int const logicalBlock = tokenIdx / page_size;
-                int const blockOffset = tokenIdx % page_size;
-                int const physicalKv = block_table_kv[batchIdx * max_blocks + logicalBlock];
-                int const physicalScore = block_table_score[batchIdx * max_blocks + logicalBlock];
-                decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, pageStride, HEAD_DIM,
-                    physicalKv, physicalScore, blockOffset, 0, effectiveTid, rmax, rsum, rwsum);
-            }
-#pragma unroll
-            for (int i = 0; i < VEC; ++i)
-            {
-                values[i] = rwsum[i] / rsum[i];
-                lse[i] = rmax[i] + logf(rsum[i]);
-            }
-
-            // Materialize the conversion endpoint as well. Besides making
-            // the next normal step O(NEXT_N), this preserves correctness if
-            // speculative decoding rewinds all tokens from this launch.
-            StateVecT valueOut;
-            StateVecT lseOut;
-            auto* valueOutElems = reinterpret_cast<StateElemT*>(&valueOut);
-            auto* lseOutElems = reinterpret_cast<StateElemT*>(&lseOut);
-#pragma unroll
-            for (int i = 0; i < VEC; ++i)
-            {
-                valueOutElems[i] = static_cast<StateElemT>(values[i]);
-                lseOutElems[i] = static_cast<StateElemT>(lse[i]);
-            }
-            int const prevTokenIdx = startPos - 1;
-            int const prevLogicalBlock = prevTokenIdx / page_size;
-            int const prevBlockOffset = prevTokenIdx % page_size;
-            int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
-            int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
-            int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
-            int64_t const prevScoreBase
-                = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
-            reinterpret_cast<StateVecT*>(&pagedKv[prevKvBase])[effectiveTid] = valueOut;
-            reinterpret_cast<StateVecT*>(&pagedScore[prevScoreBase])[effectiveTid] = lseOut;
+            values[i] = static_cast<float>(prevValues[i]);
+            lse[i] = static_cast<float>(prevLse[i]);
         }
     }
 
@@ -897,8 +846,7 @@ FOREACH_DECODE_CONFIG(INST_DECODE)
 
 #define INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, NN)                                                                     \
     template __global__ void incrementalHcaDecodeKernel<HD, KV_EB, 4, NN>(void const*, float const*, void*, void*,     \
-        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, bool const*, int, int,  \
-        int);
+        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
 
 #define INST_INCREMENTAL_HCA_DECODE_NN(HD, KV_EB)                                                                      \
     INST_INCREMENTAL_HCA_DECODE(HD, KV_EB, 1)                                                                          \
@@ -996,9 +944,8 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
 void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
-    int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, bool const* summary_valid, int batch_size, int page_size,
-    int max_blocks, int head_dim, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
-    cudaStream_t stream)
+    int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
+    int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(state_elem_bytes == 4, "Incremental HCA compression requires FP32 compressor state");
     TLLM_CHECK_WITH_INFO(
@@ -1018,7 +965,7 @@ void incrementalHcaCompressLaunch(void const* kv_score, float const* ape, void* 
     {                                                                                                                  \
         incrementalHcaDecodeKernel<HD, KV_EB, kStateElemBytes, NN><<<grid, threads, 0, stream>>>(kv_score, ape,        \
             paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,        \
-            summary_valid, page_size, max_blocks, out_elem_bytes);                                                     \
+            page_size, max_blocks, out_elem_bytes);                                                                    \
         return;                                                                                                        \
     }
 
@@ -1105,6 +1052,217 @@ __device__ __forceinline__ void prefillSoftmaxVec(void const* __restrict__ kv_sc
             rmax[i + j] = nm;
         }
     }
+}
+
+// Incremental CR=128 prefill. Complete windows produce compressed outputs,
+// while the final incomplete window is reduced to one (value, LSE) summary at
+// kvLen-1. Chunked prefill loads the previous endpoint summary instead of
+// retaining or rescanning raw state for the unfinished window.
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int NUM_RED_WARPS = 4>
+__global__ void incrementalHcaPrefillKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
+    void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
+    int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
+    int32_t const* __restrict__ start_pos_arr, int32_t const* __restrict__ cu_seq_lens,
+    int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks, int out_elem_bytes)
+{
+    using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    constexpr int kCompressRatio = 128;
+    constexpr int kMaxElemBytes = (KV_SCORE_ELEM_BYTES > STATE_ELEM_BYTES) ? KV_SCORE_ELEM_BYTES : STATE_ELEM_BYTES;
+    constexpr int kMaxVec = 16 / kMaxElemBytes;
+    constexpr int kVec = (HEAD_DIM / kMaxVec >= 32) ? kMaxVec : (HEAD_DIM / 32);
+    constexpr int kThreadsBase = HEAD_DIM / kVec;
+    constexpr int kHeadBlocks = (kThreadsBase > 32) ? (kThreadsBase / 32) : 1;
+    constexpr int kThreadsInner = kThreadsBase / kHeadBlocks;
+    constexpr int kElementsPerBlock = kThreadsInner * kVec;
+    using StateVecT = typename VecType<kVec * STATE_ELEM_BYTES>::type;
+
+    static_assert(STATE_ELEM_BYTES == 4, "Incremental HCA requires FP32 state");
+    static_assert(NUM_RED_WARPS == 4, "Incremental HCA prefill requires four reduction warps");
+
+    int const tid = threadIdx.x % kThreadsInner;
+    int const reductionWarp = threadIdx.x / kThreadsInner;
+    int const batchIdx = blockIdx.x;
+    int const localTaskIdx = blockIdx.y;
+    int const headBlock = blockIdx.z;
+    int const effectiveTid = headBlock * kThreadsInner + tid;
+
+    int const startPos = start_pos_arr[batchIdx];
+    int const kvLen = kv_lens[batchIdx];
+    int const inputOffset = cu_seq_lens[batchIdx];
+    int const outputOffset = cu_kv_comp[batchIdx];
+    int const firstWindowIdx = startPos / kCompressRatio;
+    int const lastCompleteWindow = kvLen / kCompressRatio;
+    int const numOutputs = lastCompleteWindow - firstWindowIdx;
+    int const remainder = kvLen % kCompressRatio;
+
+    bool const writesOutput = localTaskIdx < numOutputs;
+    bool const writesTailSummary = localTaskIdx == numOutputs && remainder != 0;
+    if (!writesOutput && !writesTailSummary)
+    {
+        return;
+    }
+
+    int const windowIdx = writesOutput ? firstWindowIdx + localTaskIdx : lastCompleteWindow;
+    int const windowStart = windowIdx * kCompressRatio;
+    int const newTokenBegin = max(windowStart, startPos);
+    int const newTokenEnd = writesOutput ? windowStart + kCompressRatio : kvLen;
+    bool const hasPriorSummary = startPos > windowStart;
+
+    auto* pagedKv = reinterpret_cast<StateElemT*>(paged_kv_raw);
+    auto* pagedScore = reinterpret_cast<StateElemT*>(paged_score_raw);
+    int64_t const pageStride = static_cast<int64_t>(page_size) * HEAD_DIM;
+
+    float runningMax[kVec];
+    float runningSum[kVec];
+    float runningWeightedSum[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i)
+    {
+        runningMax[i] = -INFINITY;
+        runningSum[i] = 0.0F;
+        runningWeightedSum[i] = 0.0F;
+    }
+
+    // One reduction warp owns the previous summary so it participates exactly
+    // once in the cross-warp merge.
+    if (hasPriorSummary && reductionWarp == 0)
+    {
+        int const prevTokenIdx = startPos - 1;
+        int const prevLogicalBlock = prevTokenIdx / page_size;
+        int const prevBlockOffset = prevTokenIdx % page_size;
+        int const prevPhysicalKv = block_table_kv[batchIdx * max_blocks + prevLogicalBlock];
+        int const prevPhysicalScore = block_table_score[batchIdx * max_blocks + prevLogicalBlock];
+        int64_t const prevKvBase = static_cast<int64_t>(prevPhysicalKv) * pageStride + prevBlockOffset * HEAD_DIM;
+        int64_t const prevScoreBase = static_cast<int64_t>(prevPhysicalScore) * pageStride + prevBlockOffset * HEAD_DIM;
+        StateVecT const valueRaw = reinterpret_cast<StateVecT const*>(&pagedKv[prevKvBase])[effectiveTid];
+        StateVecT const lseRaw = reinterpret_cast<StateVecT const*>(&pagedScore[prevScoreBase])[effectiveTid];
+        auto const* values = reinterpret_cast<StateElemT const*>(&valueRaw);
+        auto const* lse = reinterpret_cast<StateElemT const*>(&lseRaw);
+
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+        {
+            runningMax[i] = static_cast<float>(lse[i]);
+            runningSum[i] = 1.0F;
+            runningWeightedSum[i] = static_cast<float>(values[i]);
+        }
+    }
+
+    int const newTokenCount = newTokenEnd - newTokenBegin;
+    int const warpTokenBegin = newTokenBegin + newTokenCount * reductionWarp / NUM_RED_WARPS;
+    int const warpTokenEnd = newTokenBegin + newTokenCount * (reductionWarp + 1) / NUM_RED_WARPS;
+    for (int tokenIdx = warpTokenBegin; tokenIdx < warpTokenEnd; ++tokenIdx)
+    {
+        int const inputRow = tokenIdx - startPos;
+        int const chunkOffset = tokenIdx % kCompressRatio;
+        int64_t const row = static_cast<int64_t>(inputOffset + inputRow) * 2 * HEAD_DIM;
+        prefillSoftmaxVec<HEAD_DIM, KV_SCORE_ELEM_BYTES, kVec>(kv_score_raw, ape, row, 0, chunkOffset * HEAD_DIM,
+            HEAD_DIM, effectiveTid, runningMax, runningSum, runningWeightedSum);
+    }
+
+    extern __shared__ float shared[];
+    float* sharedMax = shared;
+    float* sharedSum = sharedMax + NUM_RED_WARPS * kElementsPerBlock;
+    float* sharedWeightedSum = sharedSum + NUM_RED_WARPS * kElementsPerBlock;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i)
+    {
+        int const localElement = tid * kVec + i;
+        sharedMax[reductionWarp * kElementsPerBlock + localElement] = runningMax[i];
+        sharedSum[reductionWarp * kElementsPerBlock + localElement] = runningSum[i];
+        sharedWeightedSum[reductionWarp * kElementsPerBlock + localElement] = runningWeightedSum[i];
+    }
+    __syncthreads();
+
+    if (reductionWarp != 0)
+    {
+        return;
+    }
+
+    for (int warp = 1; warp < NUM_RED_WARPS; ++warp)
+    {
+#pragma unroll
+        for (int i = 0; i < kVec; ++i)
+        {
+            int const localElement = tid * kVec + i;
+            float const otherSum = sharedSum[warp * kElementsPerBlock + localElement];
+            if (otherSum == 0.0F)
+            {
+                continue;
+            }
+            float const otherMax = sharedMax[warp * kElementsPerBlock + localElement];
+            float const otherWeightedSum = sharedWeightedSum[warp * kElementsPerBlock + localElement];
+            if (runningSum[i] == 0.0F)
+            {
+                runningMax[i] = otherMax;
+                runningSum[i] = otherSum;
+                runningWeightedSum[i] = otherWeightedSum;
+                continue;
+            }
+            float const newMax = fmaxf(runningMax[i], otherMax);
+            float const selfScale = expf(runningMax[i] - newMax);
+            float const otherScale = expf(otherMax - newMax);
+            runningSum[i] = runningSum[i] * selfScale + otherSum * otherScale;
+            runningWeightedSum[i] = runningWeightedSum[i] * selfScale + otherWeightedSum * otherScale;
+            runningMax[i] = newMax;
+        }
+    }
+
+    float values[kVec];
+    float lse[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i)
+    {
+        values[i] = runningWeightedSum[i] / runningSum[i];
+        lse[i] = runningMax[i] + logf(runningSum[i]);
+    }
+
+    if (writesOutput)
+    {
+        int64_t const outputBase = static_cast<int64_t>(outputOffset + localTaskIdx) * HEAD_DIM + effectiveTid * kVec;
+        if (out_elem_bytes == 2)
+        {
+            __nv_bfloat16 packed[kVec];
+#pragma unroll
+            for (int i = 0; i < kVec; ++i)
+            {
+                packed[i] = __float2bfloat16_rn(values[i]);
+            }
+            using OutVecT = typename VecType<kVec * 2>::type;
+            *reinterpret_cast<OutVecT*>(&reinterpret_cast<__nv_bfloat16*>(output_raw)[outputBase])
+                = *reinterpret_cast<OutVecT const*>(packed);
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < kVec; i += 4)
+            {
+                *reinterpret_cast<float4*>(&reinterpret_cast<float*>(output_raw)[outputBase + i])
+                    = *reinterpret_cast<float4 const*>(&values[i]);
+            }
+        }
+        return;
+    }
+
+    StateVecT valueOut;
+    StateVecT lseOut;
+    auto* valueOutElements = reinterpret_cast<StateElemT*>(&valueOut);
+    auto* lseOutElements = reinterpret_cast<StateElemT*>(&lseOut);
+#pragma unroll
+    for (int i = 0; i < kVec; ++i)
+    {
+        valueOutElements[i] = static_cast<StateElemT>(values[i]);
+        lseOutElements[i] = static_cast<StateElemT>(lse[i]);
+    }
+    int const tailTokenIdx = kvLen - 1;
+    int const tailLogicalBlock = tailTokenIdx / page_size;
+    int const tailBlockOffset = tailTokenIdx % page_size;
+    int const tailPhysicalKv = block_table_kv[batchIdx * max_blocks + tailLogicalBlock];
+    int const tailPhysicalScore = block_table_score[batchIdx * max_blocks + tailLogicalBlock];
+    int64_t const tailKvBase = static_cast<int64_t>(tailPhysicalKv) * pageStride + tailBlockOffset * HEAD_DIM;
+    int64_t const tailScoreBase = static_cast<int64_t>(tailPhysicalScore) * pageStride + tailBlockOffset * HEAD_DIM;
+    reinterpret_cast<StateVecT*>(&pagedKv[tailKvBase])[effectiveTid] = valueOut;
+    reinterpret_cast<StateVecT*>(&pagedScore[tailScoreBase])[effectiveTid] = lseOut;
 }
 
 template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO, int NUM_RED_WARPS = 1>
@@ -1476,6 +1634,17 @@ INST_PREFILL_DTYPES(512, 128, 4)
 #undef INST_PREFILL_DTYPES
 #undef INST_PREFILL
 
+#define INST_INCREMENTAL_HCA_PREFILL(HD, KV_EB)                                                                        \
+    template __global__ void incrementalHcaPrefillKernel<HD, KV_EB, 4, 4>(void const*, float const*, void*, void*,     \
+        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*, int,    \
+        int, int);
+
+INST_INCREMENTAL_HCA_PREFILL(128, 2)
+INST_INCREMENTAL_HCA_PREFILL(128, 4)
+INST_INCREMENTAL_HCA_PREFILL(512, 2)
+INST_INCREMENTAL_HCA_PREFILL(512, 4)
+#undef INST_INCREMENTAL_HCA_PREFILL
+
 // ============================================================================
 // Prefill Launch Wrapper
 //
@@ -1488,6 +1657,48 @@ static inline int prefillVec(int head_dim, int elem_bytes_for_vec)
 {
     int max_vec = 16 / elem_bytes_for_vec;
     return (head_dim / max_vec >= 32) ? max_vec : (head_dim / 32);
+}
+
+void incrementalHcaPrefillLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
+    int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
+    int32_t const* start_pos, int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size,
+    int max_blocks, int head_dim, int max_outputs, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
+    cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(state_elem_bytes == 4, "Incremental HCA prefill requires FP32 compressor state");
+    TLLM_CHECK_WITH_INFO(
+        kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4, "Incremental HCA prefill requires BF16/FP32 input");
+    TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 512, "Incremental HCA prefill requires head_dim 128 or 512");
+
+    constexpr int kStateElemBytes = 4;
+    constexpr int kNumReductionWarps = 4;
+    constexpr int kMaxVec = 16 / kStateElemBytes;
+    int const vec = (head_dim / kMaxVec >= 32) ? kMaxVec : (head_dim / 32);
+    int const threadsBase = head_dim / vec;
+    int const headBlocks = (threadsBase > 32) ? (threadsBase / 32) : 1;
+    int const threadsInner = threadsBase / headBlocks;
+    int const threads = threadsInner * kNumReductionWarps;
+    int const elementsPerBlock = threadsInner * vec;
+    int const sharedBytes = 3 * kNumReductionWarps * elementsPerBlock * static_cast<int>(sizeof(float));
+    dim3 const grid(batch_size, max_outputs + 1, headBlocks);
+
+#define TRY_LAUNCH_INCREMENTAL_HCA_PREFILL(HD, KV_EB)                                                                  \
+    if (head_dim == HD && kv_score_elem_bytes == KV_EB)                                                                \
+    {                                                                                                                  \
+        incrementalHcaPrefillKernel<HD, KV_EB, kStateElemBytes, kNumReductionWarps>                                    \
+            <<<grid, threads, sharedBytes, stream>>>(kv_score, ape, paged_kv, paged_score, block_table_kv,             \
+                block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp, page_size, max_blocks,         \
+                out_elem_bytes);                                                                                       \
+        return;                                                                                                        \
+    }
+
+    TRY_LAUNCH_INCREMENTAL_HCA_PREFILL(128, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA_PREFILL(128, 4)
+    TRY_LAUNCH_INCREMENTAL_HCA_PREFILL(512, 2)
+    TRY_LAUNCH_INCREMENTAL_HCA_PREFILL(512, 4)
+#undef TRY_LAUNCH_INCREMENTAL_HCA_PREFILL
+
+    TLLM_THROW("Incremental HCA prefill: no matching instantiation for HD=%d, kv_eb=%d", head_dim, kv_score_elem_bytes);
 }
 
 void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,

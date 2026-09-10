@@ -281,21 +281,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cached_token_lens_cuda, device="cpu", pin_memory=prefer_pinned()
         )
 
-        if self.kv_cache_manager.incremental_hca_enabled:
-            self.hca_summary_valid_cuda = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.max_num_sequences,),
-                cache_name="hca_summary_valid_cuda",
-                dtype=torch.bool,
-                capture_graph=capture_graph,
-            )
-            self.hca_summary_valid = torch.empty_like(
-                self.hca_summary_valid_cuda, device="cpu", pin_memory=prefer_pinned()
-            )
-        else:
-            self.hca_summary_valid_cuda = None
-            self.hca_summary_valid = None
-
         # Cache buffer data pointers are constant after KV cache allocation,
         # so compute them once during initialization instead of every prepare().
         self._init_cache_buffer_data_pointers()
@@ -339,10 +324,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 beam_width=self.beam_width,
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
-            )
-        if self.hca_summary_valid_cuda is not None:
-            self.hca_summary_valid_cuda[: self.num_seqs].copy_(
-                self.hca_summary_valid[: self.num_seqs], non_blocking=True
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
@@ -538,7 +519,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,
             self.num_contexts,
-            self.hca_summary_valid,
         )
 
         # Prepare the draft manager's tables before the generic prepare copies
