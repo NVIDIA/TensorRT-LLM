@@ -1449,12 +1449,16 @@ class TestSplitKVScratchReset(unittest.TestCase):
         plan_info[flashinfer_backend._FI_DECODE_PLAN_SPLIT_KV] = int(split_kv)
         return plan_info
 
-    def _reset(self, workspace: torch.Tensor, wrapper) -> None:
+    def _reset(self, workspace: torch.Tensor, wrapper, *,
+               is_decode: bool) -> None:
         # Unbound call: the method needs nothing from the metadata but the
         # workspace buffer, and constructing one requires a GPU.
         FlashInferAttentionMetadata.zero_planned_split_kv_scratch(
-            SimpleNamespace(workspace_buffer=workspace), wrapper,
-            self.NUM_QO_HEADS, self.HEAD_DIM)
+            SimpleNamespace(workspace_buffer=workspace),
+            wrapper,
+            self.NUM_QO_HEADS,
+            self.HEAD_DIM,
+            is_decode=is_decode)
 
     def _assert_reset_extent(self, workspace: torch.Tensor, num_rows: int):
         v_bytes = num_rows * self.HEAD_DIM * flashinfer_backend._FI_SIZEOF_FLOAT
@@ -1476,7 +1480,9 @@ class TestSplitKVScratchReset(unittest.TestCase):
 
     def test_resets_exactly_the_planned_prefill_extent(self):
         workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
-        self._reset(workspace, SimpleNamespace(_plan_info=self._plan_info()))
+        self._reset(workspace,
+                    SimpleNamespace(_plan_info=self._plan_info()),
+                    is_decode=False)
         # The prefill plan sizes the scratch per query tile:
         # padded_batch_size * cta_tile_q * num_qo_heads rows.
         self._assert_reset_extent(
@@ -1486,7 +1492,8 @@ class TestSplitKVScratchReset(unittest.TestCase):
     def test_resets_exactly_the_planned_decode_extent(self):
         workspace = torch.full((1 << 20, ), self.FILL, dtype=torch.uint8)
         self._reset(workspace,
-                    SimpleNamespace(_plan_info=self._decode_plan_info()))
+                    SimpleNamespace(_plan_info=self._decode_plan_info()),
+                    is_decode=True)
         # The decode plan has one query row per request, so there is no
         # cta_tile_q factor: padded_batch_size * num_qo_heads rows.
         self._assert_reset_extent(workspace,
@@ -1494,15 +1501,35 @@ class TestSplitKVScratchReset(unittest.TestCase):
 
     def test_no_op_without_a_split_kv_plan(self):
         untouched = torch.full((1 << 16, ), self.FILL, dtype=torch.uint8)
-        for wrapper in (
-                SimpleNamespace(_plan_info=self._plan_info(split_kv=False)),
-                SimpleNamespace(_plan_info=self._decode_plan_info(
-                    split_kv=False)),
-                # An unrecognized plan layout (e.g. the 9-entry SM90 prefill
-                # plan) must be left alone.
-                SimpleNamespace(_plan_info=[1] * 9),
-                SimpleNamespace(_plan_info=None),
-                SimpleNamespace(),
+        for wrapper, is_decode in (
+                # Non-splitting prefill and decode plans have no partials.
+            (SimpleNamespace(_plan_info=self._plan_info(split_kv=False)), False
+             ),
+            (SimpleNamespace(_plan_info=self._decode_plan_info(split_kv=False)),
+             True),
+                # A prefill wrapper on another backend (e.g. the 9-entry SM90
+                # prefill plan) has a length these offsets do not describe and
+                # must be left alone.
+            (SimpleNamespace(_plan_info=[1] * 9), False),
+            (SimpleNamespace(_plan_info=None), False),
+            (SimpleNamespace(), True),
         ):
-            self._reset(untouched, wrapper)
+            self._reset(untouched, wrapper, is_decode=is_decode)
             self.assertTrue(untouched.eq(self.FILL).all())
+
+    def test_version_guard_rejects_unpinned_flashinfer(self):
+        # The opt-in per-pass reset pins the plan-info offsets to a known
+        # FlashInfer version; an unrecognized version must fail loudly rather
+        # than zero the wrong workspace bytes.
+        original = flashinfer_backend.flashinfer
+        try:
+            flashinfer_backend.flashinfer = SimpleNamespace(
+                __version__="0.0.0-unpinned")
+            with self.assertRaises(RuntimeError):
+                flashinfer_backend._assert_split_kv_reset_supported()
+            flashinfer_backend.flashinfer = SimpleNamespace(
+                __version__=flashinfer_backend.
+                _FI_SPLIT_KV_SUPPORTED_VERSIONS[0])
+            flashinfer_backend._assert_split_kv_reset_supported()
+        finally:
+            flashinfer_backend.flashinfer = original

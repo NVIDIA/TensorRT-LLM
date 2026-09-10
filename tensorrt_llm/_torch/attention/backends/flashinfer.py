@@ -278,9 +278,14 @@ class FlashInferWrappers:
 
 # Field order of the plan-info vector returned by FlashInfer's FA2
 # batch-prefill plan (``PrefillPlanInfo::ToVector``,
-# include/flashinfer/attention/scheduler.cuh). The batch-decode plan
-# (``DecodePlanInfo::ToVector``, same file) returns a 10-entry vector with a
-# different order, so the length identifies the layout.
+# include/flashinfer/attention/scheduler.cuh) and its batch-decode plan
+# (``DecodePlanInfo::ToVector``, same file, a 10-entry vector in a different
+# order). The caller tells ``zero_planned_split_kv_scratch`` whether it holds a
+# prefill or a decode wrapper, so the layout is selected by that flag rather
+# than guessed from the vector length; the length is then only used to confirm
+# the wrapper is on the FA2/decode plan these offsets are valid for (any other
+# backend has a different length and is skipped). These offsets are pinned to a
+# specific FlashInfer version: see ``_FI_SPLIT_KV_SUPPORTED_VERSIONS``.
 _FI_PREFILL_PLAN_INFO_LEN = 15
 _FI_PLAN_PADDED_BATCH_SIZE = 0
 _FI_PLAN_CTA_TILE_Q = 3
@@ -308,6 +313,41 @@ _FI_SIZEOF_FLOAT = 4
 # value is neutral on both counts: m becomes finite immediately, exp2(s - m)
 # underflows to 0 against any real partial, and no NaN is reachable.
 _FI_NEUTRAL_LSE = -3.0e38
+
+# The per-pass split-KV scratch reset is defensive hardening, not a fix for a
+# known reproducer: on current FlashInfer the merge only reads tiles the same
+# pass wrote, so the stale-partial hazard it guards against cannot be
+# constructed. It is therefore opt-in via this env var (default off) and adds a
+# few-MiB memset per attention layer per pass. The allocation-time zero of the
+# workspace is unconditional; only this per-pass reset is gated.
+_FI_SPLIT_KV_RESET_ENABLED = os.environ.get(
+    "TLLM_FLASHINFER_RESET_SPLIT_KV_SCRATCH", "0") == "1"
+
+# The plan-info field offsets above are read straight from FlashInfer's
+# ``ToVector`` order, which is not part of a stable API and can be reordered by
+# a version bump. Pin the versions the offsets were derived against; when the
+# reset is enabled, a mismatch fails loudly at metadata build time (below)
+# rather than silently zeroing the wrong bytes at run time.
+_FI_SPLIT_KV_SUPPORTED_VERSIONS = ("0.6.18", )
+
+
+def _assert_split_kv_reset_supported() -> None:
+    """Reject an unpinned FlashInfer when the opt-in per-pass reset is on.
+
+    The split-KV scratch offsets are pinned to
+    ``_FI_SPLIT_KV_SUPPORTED_VERSIONS``; on any other FlashInfer version the
+    ``PrefillPlanInfo``/``DecodePlanInfo`` layout may have moved, so fail loudly
+    instead of touching the wrong workspace bytes.
+    """
+    version = getattr(flashinfer, "__version__", None)
+    if version not in _FI_SPLIT_KV_SUPPORTED_VERSIONS:
+        raise RuntimeError(
+            "TLLM_FLASHINFER_RESET_SPLIT_KV_SCRATCH is enabled, but the "
+            f"installed flashinfer-python ({version}) is not one of the "
+            f"versions the split-KV plan-info offsets were derived against "
+            f"({', '.join(_FI_SPLIT_KV_SUPPORTED_VERSIONS)}). Re-derive the "
+            "offsets from scheduler.cuh and update "
+            "_FI_SPLIT_KV_SUPPORTED_VERSIONS, or unset the env var.")
 
 
 @dataclass(kw_only=True)
@@ -1022,14 +1062,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,
             )
-            # This buffer is run scratch: FlashInfer carves per-tile partial
-            # outputs and log-sum-exps out of it for split-KV attention and
-            # merges them afterwards. The merge can cover a tile the attention
-            # kernel did not write, so uninitialized contents reach the
-            # attention result. Zero it once so the first pass cannot read
-            # whatever the allocation happened to land on;
-            # _zero_planned_split_kv_scratch() below keeps later passes clean.
+            # This buffer is reused run scratch: FlashInfer carves per-tile
+            # split-KV partial outputs and log-sum-exps out of it and merges
+            # them afterwards, and it is never cleared between plans. Zero it
+            # once at allocation so the merged attention result cannot depend on
+            # whatever the allocation happened to land on. This is cheap (one
+            # memset per engine) and unconditional; the optional per-pass reset
+            # in zero_planned_split_kv_scratch() extends the same guarantee to
+            # later passes and is off by default.
             self.workspace_buffer.zero_()
+            if _FI_SPLIT_KV_RESET_ENABLED:
+                _assert_split_kv_reset_supported()
 
         self.paged_kv_indptr_decode = torch.empty((self.max_num_requests + 1, ),
                                                   device='cuda',
@@ -1543,63 +1586,83 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 self._plan_with_params(plan_params)
 
     def zero_planned_split_kv_scratch(self, wrapper, num_qo_heads: int,
-                                      head_dim_vo: int) -> None:
+                                      head_dim_vo: int, *,
+                                      is_decode: bool) -> None:
         """Reset the split-KV partials the wrapper's current plan will use.
 
-        With split-KV the attention kernel writes a partial output (``tmp_v``)
-        and a log-sum-exp (``tmp_s``) per scheduled tile into the shared float
-        workspace, and a merge pass combines them. A tile the merge covers
-        that this pass's attention kernel did not write returns whatever the
-        buffer already held -- an earlier, differently shaped plan's partials,
-        whose log-sum-exps can carry ``-inf`` for chunks with no keys in the
-        attention window. Merging those yields a non-finite attention row.
-        Non-finite outputs have been observed this way under CUDA graphs with
-        changing batch composition.
+        Defensive hardening, not a fix for a known reproducer: the shared float
+        workspace is reused scratch that is never cleared between plans, and
+        this makes the merged attention result independent of any earlier
+        plan's partials by construction rather than relying on FlashInfer's
+        scheduler invariant (the merge only reads tiles the same pass wrote)
+        holding for every plan shape and version. With split-KV the attention
+        kernel writes a partial output (``tmp_v``) and a log-sum-exp (``tmp_s``)
+        per scheduled tile and a merge pass combines them; this zeroes ``tmp_v``
+        and fills ``tmp_s`` with the neutral sentinel over just this plan's
+        extent (a few MB out of the 320 MB workspace).
 
-        Zeroing the workspace once at allocation only covers the first pass,
-        so the reset has to happen per pass. Only this plan's extent is
-        touched: a few MB out of the 320 MB workspace.
+        ``is_decode`` selects the plan-info layout: the caller knows whether it
+        holds a prefill or a decode wrapper, so the layout is not guessed from
+        the vector length. The length is then checked only to confirm the
+        wrapper is on the FA2 (prefill) or batch-decode plan these offsets are
+        valid for; any other backend has a different length and is left alone.
+        A FlashInfer version whose layout could differ is rejected up front by
+        ``_assert_split_kv_reset_supported`` when the reset is enabled, so a
+        silent length drift within a supported version is not reachable here.
 
         Call this immediately before ``wrapper.run()``, not after the plan: a
-        CUDA graph is captured around the run and replayed without
-        re-planning, so a reset placed at plan time would execute once and
-        every replay would attend over whatever the previous replay left.
-        Placed here it is captured into the graph and re-runs on each replay.
-        Plan reuse (a wrapper kept planned across steps) is fine for the same
-        reason -- the extent is read from the wrapper's live plan info, and
-        everything it depends on is fixed for the life of a captured graph.
+        CUDA graph is captured around the run and replayed without re-planning,
+        so a reset placed at plan time would execute once and every replay would
+        attend over whatever the previous replay left. Placed here it is
+        captured into the graph and re-runs on each replay. Plan reuse (a
+        wrapper kept planned across steps) is fine for the same reason -- the
+        extent is read from the wrapper's live plan info, and everything it
+        depends on is fixed for the life of a captured graph.
         """
         plan_info = getattr(wrapper, "_plan_info", None)
         if plan_info is None or self.workspace_buffer is None:
             return
         plan_info = list(plan_info)
-        # The FA2 batch-prefill plan returns 15 entries; the batch-decode plan
-        # returns 10 in a different order, so the length picks out the layout.
         # The extents mirror the plans' allocations: prefill sizes tmp_v as
         # padded_batch_size * cta_tile_q * num_qo_heads * head_dim rows of
         # float, decode as padded_batch_size * num_qo_heads * head_dim (one
         # query row per request, no query tiling); tmp_s is the same without
         # the head_dim factor.
-        if len(plan_info) == _FI_PREFILL_PLAN_INFO_LEN:
-            if not plan_info[_FI_PLAN_SPLIT_KV]:
-                # No split, no partials and no merge.
+        if is_decode:
+            if len(plan_info) != _FI_DECODE_PLAN_INFO_LEN:
+                # Not the FA2 batch-decode plan these offsets describe.
                 return
-            num_rows = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
-                        plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
-            v_offset = plan_info[_FI_PLAN_V_OFFSET]
-            s_offset = plan_info[_FI_PLAN_S_OFFSET]
-        elif len(plan_info) == _FI_DECODE_PLAN_INFO_LEN:
             if not plan_info[_FI_DECODE_PLAN_SPLIT_KV]:
+                # No split, no partials and no merge.
                 return
             num_rows = (plan_info[_FI_DECODE_PLAN_PADDED_BATCH_SIZE] *
                         num_qo_heads)
             v_offset = plan_info[_FI_DECODE_PLAN_V_OFFSET]
             s_offset = plan_info[_FI_DECODE_PLAN_S_OFFSET]
         else:
-            # Some other wrapper's plan layout; leave it alone.
-            return
+            if len(plan_info) != _FI_PREFILL_PLAN_INFO_LEN:
+                # Some other prefill backend's plan layout; leave it alone.
+                return
+            if not plan_info[_FI_PLAN_SPLIT_KV]:
+                return
+            num_rows = (plan_info[_FI_PLAN_PADDED_BATCH_SIZE] *
+                        plan_info[_FI_PLAN_CTA_TILE_Q] * num_qo_heads)
+            v_offset = plan_info[_FI_PLAN_V_OFFSET]
+            s_offset = plan_info[_FI_PLAN_S_OFFSET]
         v_bytes = num_rows * head_dim_vo * _FI_SIZEOF_FLOAT
         s_bytes = num_rows * _FI_SIZEOF_FLOAT
+        # Defensive bounds check: an offset/size past the workspace end would
+        # mean the pinned layout no longer matches this FlashInfer build, so
+        # fail loudly rather than zeroing memory outside the plan's two ranges.
+        total = self.workspace_buffer.numel()
+        if (v_offset < 0 or s_offset < 0 or v_offset + v_bytes > total
+                or s_offset + s_bytes > total):
+            raise RuntimeError(
+                "FlashInfer split-KV scratch extent is out of range "
+                f"(is_decode={is_decode}): tmp_v=[{v_offset}, "
+                f"{v_offset + v_bytes}), tmp_s=[{s_offset}, {s_offset + s_bytes}"
+                f"), workspace={total} bytes. The plan-info offsets are likely "
+                "stale for this flashinfer-python version.")
         # workspace_buffer is uint8, so these are byte ranges. Both offsets are
         # 16-byte aligned by FlashInfer's allocator, so the float view is safe.
         # tmp_v is a partial output and contributes nothing once its weight is
@@ -2620,8 +2683,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                     attention_mask_data=attention_mask_data,
                 )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
-            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
-                                                   self.head_dim)
+            if _FI_SPLIT_KV_RESET_ENABLED:
+                metadata.zero_planned_split_kv_scratch(wrapper,
+                                                       self.num_heads,
+                                                       self.head_dim,
+                                                       is_decode=False)
             if isinstance(wrapper,
                           flashinfer.BatchPrefillWithPagedKVCacheWrapper):
                 wrapper.run(
@@ -2685,16 +2751,22 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
         def prefill_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_prefill_wrapper(plan_params)
-            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
-                                                   self.head_dim)
+            if _FI_SPLIT_KV_RESET_ENABLED:
+                metadata.zero_planned_split_kv_scratch(wrapper,
+                                                       self.num_heads,
+                                                       self.head_dim,
+                                                       is_decode=False)
             wrapper.run(q[:num_ctx_tokens],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
 
         def decode_forward(plan_params: PlanParams, out: torch.Tensor):
             wrapper = metadata.get_decode_wrapper(plan_params)
-            metadata.zero_planned_split_kv_scratch(wrapper, self.num_heads,
-                                                   self.head_dim)
+            if _FI_SPLIT_KV_RESET_ENABLED:
+                metadata.zero_planned_split_kv_scratch(wrapper,
+                                                       self.num_heads,
+                                                       self.head_dim,
+                                                       is_decode=True)
             wrapper.run(q[num_ctx_tokens:],
                         kv_cache,
                         out=out.view(-1, self.num_heads, self.head_dim))
