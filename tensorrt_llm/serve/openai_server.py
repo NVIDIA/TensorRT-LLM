@@ -709,6 +709,15 @@ class OpenAIServer(_VideoRoutesMixin):
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
         self._rl_control_api_key = rl_control_api_key
         self.server_role = server_role
+        # One-shot latch: True once health() has asked the OS to shut this
+        # process down via SIGINT after observing a fatal engine error.
+        # Distinct from the executor/proxy's own `doing_shutdown` (owned by
+        # proxy.py and flipped autonomously by its background error-monitor
+        # thread the moment a fatal error is detected, independent of any
+        # /health probe) — this flag tracks only whether *this frontend* has
+        # already fired the signal, so repeated health probes don't
+        # re-raise SIGINT.
+        self._shutdown_signal_sent = False
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -1667,13 +1676,20 @@ class OpenAIServer(_VideoRoutesMixin):
             # pod doesn't linger as a zombie that accepts connections but never
             # produces tokens.  Uses SIGINT (not SIGTERM) to match the
             # existing CppExecutorError handlers and let uvicorn perform
-            # its graceful shutdown sequence.  The doing_shutdown guard
-            # ensures we only send SIGINT once — repeated health probes
-            # won't stack signals during an in-progress teardown.
+            # its graceful shutdown sequence.  The executor's own
+            # `doing_shutdown` is *not* a reliable "have we already
+            # signaled" gate here: GenerationExecutorProxy's background
+            # error-monitor thread flips it to True autonomously as soon as
+            # it detects a dead MPI rank, independent of (and typically
+            # before) any /health call, which would make this guard
+            # permanently unsatisfiable. `_shutdown_signal_sent` is a
+            # frontend-owned one-shot latch instead, so repeated health
+            # probes won't stack signals during an in-progress teardown.
             executor = getattr(self.generator, '_executor', None)
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
+                if not self._shutdown_signal_sent:
+                    self._shutdown_signal_sent = True
                     logger.error(
                         "Health check detected fatal engine error, initiating "
                         f"server shutdown: {executor._fatal_error}")
